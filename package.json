@@ -1,0 +1,51 @@
+{
+  "name": "klypix-mcp",
+  "version": "1.0.0",
+  "description": "An open, local-first, agent-neutral canvas file your AI reads and writes over MCP — works with Claude, Cursor, Cline, any model.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "canvas",
+    "agent",
+    "agent-memory",
+    "local-first",
+    "klypix",
+    "whiteboard",
+    "spatial",
+    "ai"
+  ],
+  "homepage": "https://klypix.com",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dahshanlabs/klypix-mcp"
+  },
+  "bin": {
+    "klypix-mcp": "bin/klypix-mcp.mjs",
+    "klypix-read": "bin/klypix-read.mjs",
+    "klypix-write": "bin/klypix-write.mjs",
+    "klypix-append": "bin/klypix-append.mjs"
+  },
+  "main": "index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./format": "./src/klypix-format.mjs"
+  },
+  "files": [
+    "src",
+    "bin",
+    "index.mjs",
+    "FORMAT.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "jszip": "^3.10.1",
+    "zod": "^4.3.6"
+  }
+}

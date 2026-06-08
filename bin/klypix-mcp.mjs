@@ -110,16 +110,36 @@ server.registerTool('list_canvases', {
     return { content: [{ type: 'text', text: `# Canvases in ${VAULT}\n\n${rows.join('\n')}` }] };
 });
 
+const IMG_RE = /\.(png|jpe?g|gif|webp|bmp)$/i;
+const IMG_MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp' };
+
 server.registerTool('read_canvas', {
     title: 'Read a KLYPIX canvas',
-    description: 'Read a canvas as structured markdown: every card, the connection graph, [[wikilinks]], #tags, and an asset list. Accepts a filename, vault-relative path, or absolute path.',
-    inputSchema: { canvas: z.string().describe('Canvas filename, vault-relative path, or absolute path.') },
+    description: 'Read a canvas as structured markdown (every card, the connection graph, [[wikilinks]], #tags) AND return its images so you can SEE them, not just their filenames. Pass the canvas TITLE directly (e.g. "SS2") — a filename, vault-relative path, or absolute path also work; you do NOT need to list or search first.',
+    inputSchema: { canvas: z.string().describe('Canvas title or filename (e.g. "SS2"), vault-relative path, or absolute path.') },
 }, async ({ canvas }) => {
     const file = resolveCanvas(canvas);
     if (!file) return { content: [{ type: 'text', text: `Canvas not found: ${canvas} (vault: ${VAULT})` }], isError: true };
     try {
-        const { struct } = await parseKlypix(fs.readFileSync(file));
-        return { content: [{ type: 'text', text: structToMarkdown(struct) }] };
+        const { struct, zip, assetPaths } = await parseKlypix(fs.readFileSync(file));
+        const content = [{ type: 'text', text: structToMarkdown(struct) }];
+        // Return image assets as actual image content so a vision-capable model
+        // SEES them — the whole point of a multimodal canvas. Capped (count +
+        // per-image size) so the response stays sane.
+        let included = 0;
+        for (const p of assetPaths) {
+            if (included >= 8) break;
+            if (!IMG_RE.test(p)) continue;
+            try {
+                const b64 = await zip.file(p).async('base64');
+                if (!b64 || b64.length > 7_000_000) continue; // skip > ~5MB
+                const ext = p.split('.').pop().toLowerCase();
+                content.push({ type: 'image', data: b64, mimeType: IMG_MIME[ext] || 'image/png' });
+                included++;
+            } catch { /* skip unreadable asset */ }
+        }
+        if (included > 0) content.push({ type: 'text', text: `\n(${included} image${included > 1 ? 's' : ''} from this canvas are attached above — read them directly.)` });
+        return { content };
     } catch (e) {
         return { content: [{ type: 'text', text: `Failed to read ${file}: ${e.message}` }], isError: true };
     }
@@ -136,13 +156,18 @@ server.registerTool('search_canvases', {
     for (const f of walkVault()) {
         let struct;
         try { ({ struct } = await parseKlypix(fs.readFileSync(f))); } catch { continue; }
+        const rel = path.relative(VAULT, f);
+        // Match the canvas TITLE + FILENAME too — not just card text — so
+        // searching a canvas by its name (e.g. "SS2") actually finds it.
+        const nameMatch = (struct.title || '').toLowerCase().includes(q) || rel.toLowerCase().includes(q);
         const matched = struct.cards.filter(c =>
             (c.title || '').toLowerCase().includes(q) ||
             String(c.text || '').toLowerCase().includes(q) ||
             (c.tags || []).some(t => ('#' + t).toLowerCase().includes(q)));
-        if (matched.length) {
-            hits.push(`## ${path.relative(VAULT, f)} — "${struct.title}"\n` +
-                matched.slice(0, 6).map(c => `- ${c.title || '(card)'}: ${String(c.text || '').replace(/\s+/g, ' ').slice(0, 120)}`).join('\n'));
+        if (nameMatch || matched.length) {
+            const head = `## ${rel} — "${struct.title}"${nameMatch && !matched.length ? '  (name/title match)' : ''}`;
+            const body = matched.slice(0, 6).map(c => `- ${c.title || '(card)'}: ${String(c.text || '').replace(/\s+/g, ' ').slice(0, 120)}`).join('\n');
+            hits.push(matched.length ? `${head}\n${body}` : head);
         }
     }
     return { content: [{ type: 'text', text: hits.length ? `# Matches for "${query}"\n\n${hits.join('\n\n')}` : `No matches for "${query}" in ${VAULT}.` }] };

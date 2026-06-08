@@ -165,13 +165,39 @@ server.registerTool('search_canvases', {
             String(c.text || '').toLowerCase().includes(q) ||
             (c.tags || []).some(t => ('#' + t).toLowerCase().includes(q)));
         if (nameMatch || matched.length) {
-            const head = `## ${rel} — "${struct.title}"${nameMatch && !matched.length ? '  (name/title match)' : ''}`;
-            const body = matched.slice(0, 6).map(c => `- ${c.title || '(card)'}: ${String(c.text || '').replace(/\s+/g, ' ').slice(0, 120)}`).join('\n');
+            // Rich hits: type + id + position + tags + a longer snippet, so the
+            // agent can FIND a card (and tell duplicates apart) before it WRITES.
+            const head = `## ${rel} — "${struct.title}" · ${struct.counts.cards} cards, ${struct.counts.connections} connections${nameMatch && !matched.length ? '  (name/title match)' : ''}`;
+            const body = matched.slice(0, 8).map(c => {
+                const pos = (c.pos && c.pos.x != null) ? ` @(${Math.round(c.pos.x)},${Math.round(c.pos.y)})` : '';
+                const tags = (c.tags && c.tags.length) ? ' ' + c.tags.map(t => '#' + t).join(' ') : '';
+                return `- [${c.type}] "${c.title || '(card)'}" (${c.id})${pos}${tags}\n    ${String(c.text || '').replace(/\s+/g, ' ').slice(0, 240)}`;
+            }).join('\n');
             hits.push(matched.length ? `${head}\n${body}` : head);
         }
     }
     return { content: [{ type: 'text', text: hits.length ? `# Matches for "${query}"\n\n${hits.join('\n\n')}` : `No matches for "${query}" in ${VAULT}.` }] };
 });
+
+// Format the cards (optionally only a set of new ids) + connection graph so an
+// agent that just wrote can chain follow-ups: reference card IDs, place near a
+// position, or draw an arrow to something it created. Additive — appended after
+// the human-readable line.
+function cardDetailBlock(struct, onlyIds) {
+    const cards = onlyIds ? struct.cards.filter(c => onlyIds.has(c.id)) : struct.cards;
+    if (!cards.length) return '';
+    const lines = cards.map(c => {
+        const pos = (c.pos && c.pos.x != null) ? `(${Math.round(c.pos.x)},${Math.round(c.pos.y)})` : '(?)';
+        const tags = (c.tags && c.tags.length) ? ' ' + c.tags.map(t => '#' + t).join(' ') : '';
+        const title = c.title || (c.text ? String(c.text).replace(/\s+/g, ' ').slice(0, 40) : '(untitled)');
+        return `- ${c.id} · ${c.type} · ${pos} · "${title}"${tags}`;
+    });
+    let out = `\n\nCards you can reference (id · type · pos · title):\n${lines.join('\n')}`;
+    if (struct.connections && struct.connections.length) {
+        out += `\nConnections: ` + struct.connections.map(cn => `${cn.from} ${cn.relationship ? '—' + cn.relationship + '→' : '→'} ${cn.to}`).join('; ');
+    }
+    return out;
+}
 
 server.registerTool('create_canvas', {
     title: 'Create a KLYPIX canvas',
@@ -189,7 +215,9 @@ server.registerTool('create_canvas', {
         const name = filename ? safeName(filename.replace(IS_CANVAS, '')) : safeName(title);
         const out = path.join(VAULT, name);
         await atomicWrite(out, buf);
-        return { content: [{ type: 'text', text: `Created ${out} — ${cards.length} cards, ${(connections || []).length} connections. Open it in KLYPIX (Canvas → Open).` }] };
+        let detail = '';
+        try { const { struct } = await parseKlypix(buf); detail = cardDetailBlock(struct); } catch { /* detail is optional */ }
+        return { content: [{ type: 'text', text: `Created ${out} — ${cards.length} cards, ${(connections || []).length} connections. Open it in KLYPIX (Canvas → Open).${detail}` }] };
     } catch (e) {
         return { content: [{ type: 'text', text: `Create failed: ${e.message}` }], isError: true };
     }
@@ -207,9 +235,18 @@ server.registerTool('add_to_canvas', {
     const file = resolveCanvas(canvas);
     if (!file) return { content: [{ type: 'text', text: `Canvas not found: ${canvas}` }], isError: true };
     try {
-        const buf = await appendToKlypix(fs.readFileSync(file), { cards, connections });
+        const original = fs.readFileSync(file);
+        // Snapshot existing ids so we can report ONLY the newly-added cards back.
+        let beforeIds = new Set();
+        try { const b = await parseKlypix(original); beforeIds = new Set(b.struct.cards.map(c => c.id)); } catch { /* new/legacy → treat all as new */ }
+        const buf = await appendToKlypix(original, { cards, connections });
         await atomicWrite(file, buf);
-        return { content: [{ type: 'text', text: `Added ${cards.length} card(s) to ${path.relative(VAULT, file)}. Reopen the canvas in KLYPIX to see them.` }] };
+        let detail = '';
+        try {
+            const { struct } = await parseKlypix(buf);
+            detail = cardDetailBlock(struct, new Set(struct.cards.map(c => c.id).filter(id => !beforeIds.has(id))));
+        } catch { /* detail is optional */ }
+        return { content: [{ type: 'text', text: `Added ${cards.length} card(s) to ${path.relative(VAULT, file)}. Reopen the canvas in KLYPIX to see them.${detail}` }] };
     } catch (e) {
         return { content: [{ type: 'text', text: `Add failed: ${e.message}` }], isError: true };
     }

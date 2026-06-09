@@ -1,6 +1,6 @@
 {
   "name": "klypix-mcp",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "An open, local-first, agent-neutral canvas file your AI reads and writes over MCP — works with Claude, Cursor, Cline, any model.",
   "type": "module",
   "license": "MIT",
@@ -46,6 +46,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "jszip": "^3.10.1",
-    "zod": "^4.3.6"
+    "zod": "^4.3.6",
+    "fractional-indexing": "^3.2.0"
   }
 }

@@ -9,6 +9,18 @@
 import JSZip from 'jszip';
 import path from 'path';
 import fs from 'fs';
+import { generateKeyBetween } from 'fractional-indexing';
+
+// Valid fractional-indexing z-keys. Hand-rolled keys (e.g. 'a0000' / 'z00013')
+// are REJECTED by the fractional-indexing lib the KLYPIX app uses and crash it
+// the moment you edit such a canvas — so the writer MUST emit lib-valid keys.
+// makeZKeyGen() returns an increasing-key generator starting just above `after`
+// (or from the bottom if `after` is null/invalid).
+const isValidZKey = (k) => { try { generateKeyBetween(k, null); return true; } catch { return false; } };
+function makeZKeyGen(after = null) {
+    let last = (after && isValidZKey(after)) ? after : null;
+    return () => (last = generateKeyBetween(last, null));
+}
 
 export const WIKILINK = /\[\[([^[\]]+)\]\]/g;
 export const TAG = /(^|\s)(#[a-zA-Z][\w-]*)/g;
@@ -181,6 +193,7 @@ export async function buildKlypix(spec) {
     const COL_W = 380, GAP_Y = 70, START = 80;
     const positions = {};
     let zi = 0;
+    const nextZKey = makeZKeyGen();
     order.forEach((id, idx) => {
         const card = cards[idByIndex.indexOf(id)];
         const { w, h } = sizeFor(card);
@@ -188,7 +201,7 @@ export async function buildKlypix(spec) {
         positions[id] = {
             x: card.x ?? (START + col * COL_W),
             y: card.y ?? (START + row * (180 + GAP_Y) + (col % 2) * 12),
-            w, h, zKey: 'a' + String(idx).padStart(4, '0'), zIndex: zi++, parentId: null,
+            w, h, zKey: nextZKey(), zIndex: zi++, parentId: null,
         };
     });
 
@@ -278,6 +291,10 @@ export async function appendToKlypix(buffer, addition) {
     };
 
     canvas.order = Array.isArray(canvas.order) ? canvas.order : [];
+    // New cards go above the existing top — generate valid keys starting just
+    // above the highest existing VALID key (ignoring any legacy bad keys).
+    const existingTop = Object.values(canvas.positions || {}).map(p => p && p.zKey).filter(k => k && isValidZKey(k)).sort().pop() || null;
+    const nextZKey = makeZKeyGen(existingTop);
     for (const a of added) {
         zip.file(`items/${shard(a.id)}/${a.id}.json`, JSON.stringify({
             type: 'text', locked: false, createdAt: now, createdBy: 'agent',
@@ -287,8 +304,7 @@ export async function appendToKlypix(buffer, addition) {
             fontWeight: a.card.heading ? 'bold' : 'normal', fontStyle: 'normal',
             textDecoration: 'none', textAlign: 'left', verticalAlign: 'top',
         }));
-        // 'z' prefix sorts new cards above existing ones (which use 'a…').
-        canvas.positions[a.id] = { x: a.x, y: a.y, w: a.w, h: a.h, zKey: 'z' + String(a.z).padStart(5, '0'), zIndex: a.z, parentId: null };
+        canvas.positions[a.id] = { x: a.x, y: a.y, w: a.w, h: a.h, zKey: nextZKey(), zIndex: a.z, parentId: null };
         canvas.order.push(a.id);
     }
 
@@ -345,6 +361,7 @@ export async function buildKlypixMap(spec) {
     const titleToId = new Map(); // card title -> id (for connections)
     const firstLine = (t) => String(t ?? '').split('\n').map(s => s.trim()).find(Boolean) || '';
     let z = 0;
+    const nextZKey = makeZKeyGen();
 
     // Shelf-pack areas into rows of `cols`; each row's height = tallest area.
     let rowTopY = START, rowMaxH = 0, colX = START, colIdx = 0;
@@ -370,7 +387,7 @@ export async function buildKlypixMap(spec) {
             title: area.title || `Area ${ai + 1}`, collapsed: false, scopeLocked: false,
             borderColor: area.color || '#10b981',
         };
-        positions[ctnId] = { x: ax, y: ay, w: AREA_W, h: areaH, zKey: 'a' + String(z).padStart(4, '0'), zIndex: z, parentId: null };
+        positions[ctnId] = { x: ax, y: ay, w: AREA_W, h: areaH, zKey: nextZKey(), zIndex: z, parentId: null };
         order.push(ctnId); z++;
 
         let cy = ay + TITLE_BAR + PAD;
@@ -388,7 +405,7 @@ export async function buildKlypixMap(spec) {
                 textDecoration: 'none', textAlign: 'left', verticalAlign: 'top',
                 fontFamily: 'Thmanyah Sans',
             };
-            positions[id] = { x: ax + PAD, y: cy, w: CARD_W, h, zKey: 'a' + String(z).padStart(4, '0'), zIndex: z, parentId: ctnId };
+            positions[id] = { x: ax + PAD, y: cy, w: CARD_W, h, zKey: nextZKey(), zIndex: z, parentId: ctnId };
             order.push(id); z++;
             const t = firstLine(c.text).toLowerCase();
             if (t && !titleToId.has(t)) titleToId.set(t, id);

@@ -109,9 +109,14 @@ export async function parseKlypix(buffer) {
             links: it.type === 'text' ? extractLinks(it.content) : [],
             tags: it.type === 'text' ? extractTags(it.content) : [],
             pos: { x: it.x, y: it.y },
+            createdAt: Number(it.createdAt) || 0,
+            parentId: it.parentId ?? null,
+            // Parent container's title — the card's "area" in brain terms.
+            area: it.parentId ? (cardTitle(items[it.parentId]) || null) : null,
         })),
         connections: connections.map(c => ({
             from: titleOf(c.fromId), to: titleOf(c.toId),
+            fromId: c.fromId, toId: c.toId,        // raw ids — for graph analysis (brainInsights)
             relationship: c.relationship || null, label: c.label || null,
         })),
         assets: assetPaths.map(p => path.basename(p)),
@@ -298,6 +303,7 @@ export async function appendToKlypix(buffer, addition) {
     for (const a of added) {
         zip.file(`items/${shard(a.id)}/${a.id}.json`, JSON.stringify({
             type: 'text', locked: false, createdAt: now, createdBy: 'agent',
+            ...(a.card.createdVia ? { createdVia: String(a.card.createdVia) } : {}),
             content: String(a.card.text), fontSize: FONT,
             color: a.card.color || '#1a1a1f', border: !!a.card.border, borderColor: '#1e1e2e',
             heading: !!a.card.heading, fontFamily: 'Thmanyah Sans',
@@ -333,6 +339,720 @@ export async function appendToKlypix(buffer, addition) {
     try { await parseKlypix(out); }
     catch (e) { throw new Error('append produced an unparseable .klypix — aborting to protect the brain: ' + (e?.message || e)); }
     return out;
+}
+
+// ── Area-grouped layout (project brain) ──────────────────────────────────────
+// Captured decisions carry an [Area]; these route cards INTO titled area
+// containers (find-or-create) so the brain stays a clean areas-as-containers map
+// instead of a rightward strip. Non-destructive, valid z-keys, atomic round-trip.
+const BRAIN_GEOM = { TITLE_BAR: 40, PAD: 14, CARD_GAP: 10, CARD_W: 300, FONT: 12, LINE_H: 17, START: 80, COL_GAP: 44 };
+BRAIN_GEOM.AREA_W = BRAIN_GEOM.CARD_W + BRAIN_GEOM.PAD * 2;
+
+// Chars that fit on one rendered line. The bordered card has 10px L/R padding,
+// so the text area is CARD_W-20; use a conservative char width (font*0.62) so a
+// wrapped line never RE-wraps in-app (which would double a card's height).
+function brainCPL() { return Math.max(8, Math.floor((BRAIN_GEOM.CARD_W - 24) / (BRAIN_GEOM.FONT * 0.62))); }
+
+// Hard-wrap text to ~CARD_W by inserting newlines at word boundaries. KLYPIX text
+// cards show a long SINGLE line as-typed (no auto-wrap until you resize), so a
+// captured decision with no newlines runs off the box. Baking in line breaks
+// makes brain cards render as tidy multi-line blocks regardless of that.
+function wrapText(text, cpl = brainCPL()) {
+    const out = [];
+    for (const para of String(text ?? '').split('\n')) {
+        if (para.length <= cpl) { out.push(para); continue; }
+        let line = '';
+        for (const tok of para.split(/(\s+)/)) {
+            if (line && (line + tok).trimEnd().length > cpl) { out.push(line.trimEnd()); line = tok.replace(/^\s+/, ''); }
+            else line += tok;
+            while (line.length > cpl) { out.push(line.slice(0, cpl)); line = line.slice(cpl); } // break an over-long word
+        }
+        if (line.trim()) out.push(line.trimEnd());
+    }
+    return out.join('\n');
+}
+
+function measureCardH(text) {
+    // text is hard-wrapped to ≤CPL, so the \n-line count is the rendered line
+    // count. Match the bordered card (lineHeight 1.35*font + 8/8 vertical padding
+    // + border) and over-estimate slightly → small gaps, never overlap.
+    const lines = Math.max(1, String(text ?? '').split('\n').length);
+    return Math.max(40, Math.ceil(lines * BRAIN_GEOM.FONT * 1.45) + 26);
+}
+// Container the next NEW area goes to the right of the rightmost item.
+function nextContainerX(canvas) {
+    const all = Object.values(canvas.positions);
+    return all.length ? Math.max(...all.map(p => (p.x || 0) + (p.w || BRAIN_GEOM.AREA_W))) + BRAIN_GEOM.COL_GAP : BRAIN_GEOM.START;
+}
+// Bottom y of a container's current children (where the next card stacks).
+function containerChildBottom(canvas, ctnId) {
+    const ctn = canvas.positions[ctnId];
+    let cy = ctn.y + BRAIN_GEOM.TITLE_BAR + BRAIN_GEOM.PAD;
+    for (const id of canvas.order) {
+        const p = canvas.positions[id];
+        if (p && p.parentId === ctnId) cy = Math.max(cy, p.y + (p.h || 40) + BRAIN_GEOM.CARD_GAP);
+    }
+    return cy;
+}
+// Best-effort area name for a card: "Area: …" first-line prefix → first #tag → 'Notes'.
+function areaOfCard(card) {
+    const line1 = String(card.text || '').split('\n')[0].trim();
+    const m = line1.match(/^([^:\n]{1,40}):\s+\S/);
+    if (m) return m[1].trim();
+    if (Array.isArray(card.tags) && card.tags[0]) return String(card.tags[0]);
+    return 'Notes';
+}
+async function finalizeBrainZip(zip, canvas, manifest, now) {
+    if (manifest) {
+        manifest.updatedAt = new Date(now).toISOString();
+        manifest.stats = manifest.stats || {};
+        manifest.stats.itemCount = canvas.order.length;
+        zip.file('manifest.json', JSON.stringify(manifest));
+    }
+    zip.file('canvas.json', JSON.stringify(canvas));
+    const out = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+    try { await parseKlypix(out); }
+    catch (e) { throw new Error('brain write produced an unparseable .klypix — aborting to protect the brain: ' + (e?.message || e)); }
+    return out;
+}
+
+// Append cards routed INTO their [Area] container (find-or-create), so captures
+// self-organize. addition.cards = [{ text, color?, area? }]. Non-destructive to
+// existing items. Falls back to the flat appender for legacy/no-positions files.
+export async function appendIntoContainers(buffer, addition) {
+    const { zip, canvas, manifest, isV4, struct } = await parseKlypix(buffer);
+    if (!isV4 || !canvas.positions) return appendToKlypix(buffer, addition);
+    const newCards = (addition?.cards || []).filter(c => c && typeof c.text === 'string' && c.text.trim());
+    if (newCards.length === 0) throw new Error('nothing to add — provide cards[] with text');
+
+    const now = Date.now();
+    const rand = () => Math.random().toString(36).slice(2, 10);
+    const G = BRAIN_GEOM;
+    canvas.order = Array.isArray(canvas.order) ? canvas.order : [];
+    const existingTop = Object.values(canvas.positions).map(p => p && p.zKey).filter(k => k && isValidZKey(k)).sort().pop() || null;
+    const nextZKey = makeZKeyGen(existingTop);
+
+    const byTitle = new Map();
+    for (const c of struct.cards) if (c.type === 'container') { const t = (c.title || '').trim().toLowerCase(); if (t && !byTitle.has(t)) byTitle.set(t, c.id); }
+    let ctnX = nextContainerX(canvas);
+    const ensureContainer = (area) => {
+        const key = area.toLowerCase();
+        let id = byTitle.get(key);
+        if (id) return id;
+        id = `ctn_${rand()}`;
+        zip.file(`items/${shard(id)}/${id}.json`, JSON.stringify({
+            type: 'container', locked: false, createdAt: now, createdBy: 'agent',
+            title: area, collapsed: false, scopeLocked: false, borderColor: '#10b981',
+        }));
+        canvas.positions[id] = { x: ctnX, y: G.START, w: G.AREA_W, h: G.TITLE_BAR + G.PAD * 2, zKey: nextZKey(), zIndex: canvas.order.length, parentId: null };
+        canvas.order.push(id);
+        byTitle.set(key, id);
+        ctnX += G.AREA_W + G.COL_GAP;
+        return id;
+    };
+
+    for (const card of newCards) {
+        const area = (card.area || areaOfCard(card)).toString().trim() || 'Notes';
+        const ctnId = ensureContainer(area);
+        const ctn = canvas.positions[ctnId];
+        const wrapped = wrapText(String(card.text));
+        const h = measureCardH(wrapped);
+        const cy = containerChildBottom(canvas, ctnId);
+        const id = `txt_${rand()}`;
+        zip.file(`items/${shard(id)}/${id}.json`, JSON.stringify({
+            type: 'text', locked: false, createdAt: now, createdBy: 'agent',
+            // Provenance: WHICH agent remembered this (claude-code / cursor /
+            // cline / …) — additive field, ignored by older readers.
+            ...(card.createdVia ? { createdVia: String(card.createdVia) } : {}),
+            content: wrapped, fontSize: G.FONT,
+            color: card.color || '#e8e8ed', border: true, borderColor: card.borderColor || card.color || 'rgba(16,185,129,0.45)',
+            fillColor: 'rgba(18,18,26,0.85)', heading: !!card.heading, fontFamily: 'Thmanyah Sans',
+            fontWeight: card.heading ? 'bold' : 'normal', fontStyle: 'normal',
+            textDecoration: 'none', textAlign: 'left', verticalAlign: 'top',
+        }));
+        canvas.positions[id] = { x: ctn.x + G.PAD, y: cy, w: G.CARD_W, h, zKey: nextZKey(), zIndex: canvas.order.length, parentId: ctnId };
+        canvas.order.push(id);
+        ctn.h = (cy + h + G.PAD) - ctn.y;
+    }
+    return finalizeBrainZip(zip, canvas, manifest, now);
+}
+
+// Tidy an EXISTING brain: re-parent every root-level text card into its [Area]
+// container (find-or-create), grouping the messy strip into clean areas. Moves
+// cards (keeps their ids → connections preserved); never drops a card. Caller
+// should back up first; this round-trip-verifies before returning.
+export async function tidyBrain(buffer) {
+    const { zip, canvas, manifest, isV4, struct } = await parseKlypix(buffer);
+    if (!isV4 || !canvas.positions) throw new Error('tidy supports v4 .klypix only');
+    const now = Date.now();
+    const rand = () => Math.random().toString(36).slice(2, 10);
+    const G = BRAIN_GEOM;
+    canvas.order = Array.isArray(canvas.order) ? canvas.order : [];
+    const top = Object.values(canvas.positions).map(p => p && p.zKey).filter(k => k && isValidZKey(k)).sort().pop() || null;
+    const nextZKey = makeZKeyGen(top);
+
+    // Normalize every text card to the compact brain font (so the render matches
+    // our height measure → no overlap) + cache each card's measured height.
+    const meta = new Map(); // id -> { h }
+    for (const c of struct.cards) {
+        if (c.type === 'container') continue;
+        const wrapped = wrapText(String(c.text ?? ''));
+        let createdAt = 0;
+        const ip = `items/${shard(c.id)}/${c.id}.json`;
+        try { const f = zip.file(ip); if (f) { const j = JSON.parse(await f.async('string')); createdAt = Number(j.createdAt) || 0; j.fontSize = G.FONT; j.content = wrapped; zip.file(ip, JSON.stringify(j)); } } catch { /* leave as-is */ }
+        meta.set(c.id, { h: measureCardH(wrapped), createdAt });
+    }
+
+    const containerIds = new Set(struct.cards.filter(c => c.type === 'container').map(c => c.id));
+    const byTitle = new Map();
+    for (const c of struct.cards) if (c.type === 'container') { const t = (c.title || '').trim().toLowerCase(); if (t && !byTitle.has(t)) byTitle.set(t, c.id); }
+
+    // Group ROOT text cards by [Area].
+    const rootText = struct.cards.filter(c => c.type !== 'container' && canvas.positions[c.id] && canvas.positions[c.id].parentId == null);
+    const groups = new Map(); // key -> { title, ids: [] }
+    for (const c of rootText) { const a = areaOfCard(c); const k = a.toLowerCase(); if (!groups.has(k)) groups.set(k, { title: a, ids: [] }); groups.get(k).ids.push(c.id); }
+
+    let moved = 0;
+    const assignTo = (ctnId, ids) => { for (const id of ids) { const p = canvas.positions[id]; canvas.positions[id] = { ...p, parentId: ctnId, zKey: (p && p.zKey && isValidZKey(p.zKey)) ? p.zKey : nextZKey() }; moved++; } };
+    // Ensure a container exists for each area (create if missing); route root cards in.
+    for (const grp of groups.values()) {
+        const key = grp.title.toLowerCase();
+        let ctnId = byTitle.get(key);
+        if (!ctnId) {
+            ctnId = `ctn_${rand()}`;
+            zip.file(`items/${shard(ctnId)}/${ctnId}.json`, JSON.stringify({ type: 'container', locked: false, createdAt: now, createdBy: 'agent', title: grp.title, collapsed: false, scopeLocked: false, borderColor: '#10b981' }));
+            canvas.order.push(ctnId);
+            canvas.positions[ctnId] = { x: G.START, y: G.START, w: G.AREA_W, h: G.TITLE_BAR + G.PAD * 2, zKey: nextZKey(), zIndex: canvas.order.length, parentId: null };
+            byTitle.set(key, ctnId); containerIds.add(ctnId);
+        }
+        assignTo(ctnId, grp.ids);
+    }
+
+    // UNIFIED LAYOUT — re-flow each container's children (chronological, compact
+    // heights) AND shelf-pack ALL containers into one grid by their TRUE height, so
+    // a container that grew (new captures) never overlaps its neighbor below.
+    const childrenOf = (cid) => canvas.order
+        .filter(id => canvas.positions[id] && canvas.positions[id].parentId === cid)
+        .sort((a, b) => (meta.get(a)?.createdAt || 0) - (meta.get(b)?.createdAt || 0));
+    const heightOf = (cid) => { const inner = childrenOf(cid).reduce((s, id) => s + (meta.get(id)?.h || 40) + G.CARD_GAP, 0); return Math.max(G.TITLE_BAR + G.PAD * 2, G.TITLE_BAR + G.PAD + inner + G.PAD); };
+    const orderedCtns = canvas.order.filter(id => containerIds.has(id) && canvas.positions[id]);
+    const cols = Math.max(1, Math.min(4, Math.ceil(Math.sqrt(Math.max(1, orderedCtns.length)))));
+    let colIdx = 0, rowTopY = G.START, rowMaxH = 0, colX = G.START;
+    for (const cid of orderedCtns) {
+        const h = heightOf(cid);
+        if (colIdx >= cols) { rowTopY += rowMaxH + G.COL_GAP; rowMaxH = 0; colIdx = 0; colX = G.START; }
+        canvas.positions[cid] = { ...canvas.positions[cid], x: colX, y: rowTopY, w: G.AREA_W, h };
+        let cy = rowTopY + G.TITLE_BAR + G.PAD;
+        for (const kid of childrenOf(cid)) { const kh = meta.get(kid)?.h || 40; canvas.positions[kid] = { ...canvas.positions[kid], x: colX + G.PAD, y: cy, w: G.CARD_W, h: kh }; cy += kh + G.CARD_GAP; }
+        colX += G.AREA_W + G.COL_GAP; colIdx++; rowMaxH = Math.max(rowMaxH, h);
+    }
+
+    const out = await finalizeBrainZip(zip, canvas, manifest, now);
+    return { buffer: out, moved, containers: byTitle.size };
+}
+
+// ── Tiered brain brief ───────────────────────────────────────────────────────
+// A compact, token-bounded session brief: area map + open questions + recent
+// decisions + milestones. Everything older stays in the file, reachable via the
+// klypix-canvas MCP search or `--full`. Keeps the session-start cost flat as
+// the brain grows (the full markdown scales with history; this doesn't).
+export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMilestones = 8, maxConnections = 30 } = {}) {
+    const cutoff = Date.now() - recentDays * 86_400_000;
+    const texts = struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim());
+    const containers = struct.cards.filter(c => c.type === 'container');
+    const isArchived = (c) => /^archive$/i.test(c.area || '');
+    // 📌 FOCUS — the human steers agent attention SPATIALLY: any card dragged
+    // into a container titled "Focus" (any decoration: "📌 Focus", "Focus
+    // (drag cards here)") leads every brief, full text, regardless of age.
+    const isFocus = (c) => /(^|\s)focus\b/i.test(c.area || '');
+    const live = texts.filter(c => !isArchived(c));
+    const focus = live.filter(isFocus);
+    const rest = live.filter(c => !isFocus(c));
+    const open = rest.filter(c => /❓/.test(c.text));
+    const miles = rest.filter(c => /🏁/.test(c.text) && !/❓/.test(c.text));
+    const plain = rest.filter(c => !open.includes(c) && !miles.includes(c));
+    const recent = plain.filter(c => c.createdAt >= cutoff).sort((a, b) => b.createdAt - a.createdAt).slice(0, maxRecent);
+    const archivedCount = texts.length - live.length;
+
+    const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+    // HEADLINE = first sentence-ish, hard-capped — the brief is a scannable
+    // changelog; the agent pulls any card's full text via the MCP when needed.
+    const headline = (c, max = 160) => {
+        const t = flat(c.text);
+        const stop = t.search(/(?<=[.!?])\s/);
+        const h = stop > 40 && stop < max ? t.slice(0, stop) : t;
+        return h.length > max ? h.slice(0, max - 1).trimEnd() + '…' : h;
+    };
+    const day = (ts) => ts ? new Date(ts).toISOString().slice(0, 10) : '';
+
+    // TOKEN BUDGET (≈ chars/4): sections are added in priority order — Focus,
+    // Open, Areas, Milestones, Recent, Connections — and Recent stops when the
+    // budget is hit. The brief stays ~flat forever no matter how active a week.
+    const BUDGET_CHARS = 11_000; // ≈ 2.7k tokens
+    let used = 0;
+    const out = [];
+    const push = (...lines) => { for (const l of lines) { out.push(l); used += l.length + 1; } };
+
+    push(`# ${struct.title} — brain brief`);
+    push(`*${struct.format} · ${struct.counts.cards} cards · ${struct.counts.connections} connections · tiered brief (focus + open + last ${recentDays}d headlines); full cards via klypix-canvas MCP search*`);
+    if (focus.length) {
+        push('', '## 📌 Human focus (cards the human placed here — act on these first)');
+        for (const c of focus) push(`- ${flat(c.text)}`);
+    }
+    if (open.length) { push('', '## Open questions'); for (const c of open) push(`- ${flat(c.text)}`); }
+    // ⚠️ Conflicts — pairs flagged conflicts_with (e.g. by parallel sessions);
+    // surfaced HIGH so the next session reconciles them, not buries them.
+    const conflicts = (struct.connections || []).filter(c => c.relationship === 'conflicts_with');
+    if (conflicts.length) { push('', '## ⚠️ Conflicts to reconcile (parallel decisions that may disagree)'); for (const c of conflicts.slice(0, 10)) push(`- ${flat(c.from)}  ⚔️  ${flat(c.to)}`); }
+    const areaCounts = containers
+        .filter(c => !/^archive$/i.test(c.title || ''))
+        .map(c => `${flat(c.title)} (${texts.filter(t => t.parentId === c.id).length})`);
+    if (areaCounts.length) { push('', '## Areas', areaCounts.join(' · ')); }
+    if (miles.length) {
+        push('', '## Milestones');
+        for (const c of miles.sort((a, b) => b.createdAt - a.createdAt).slice(0, maxMilestones)) push(`- ${headline(c)}`);
+    }
+    let shownRecent = 0;
+    if (recent.length) {
+        push('', `## Recent decisions (last ${recentDays}d — headlines)`);
+        const byArea = new Map();
+        for (const c of recent) { const a = flat(c.area) || 'Notes'; if (!byArea.has(a)) byArea.set(a, []); byArea.get(a).push(c); }
+        outer: for (const [a, cs] of byArea) {
+            push(`### ${a}`);
+            for (const c of cs) {
+                if (used > BUDGET_CHARS) break outer;
+                push(`- ${day(c.createdAt)} ${headline(c)}`);
+                shownRecent++;
+            }
+        }
+    }
+    if (struct.connections.length && used <= BUDGET_CHARS) {
+        push('', '## Connections');
+        for (const cn of struct.connections.slice(0, maxConnections)) push(`- ${cn.from} → ${cn.to}${cn.label || cn.relationship ? ` (${cn.label || cn.relationship})` : ''}`);
+    }
+    const hidden = [];
+    const unshown = plain.length - shownRecent;
+    if (unshown > 0) hidden.push(`${unshown} older/over-budget decision${unshown === 1 ? '' : 's'}`);
+    if (archivedCount > 0) hidden.push(`${archivedCount} archived/superseded`);
+    if (hidden.length) push('', `*${hidden.join(' + ')} not shown — search the full brain via the klypix-canvas MCP (search/read tools) or \`node ~/.claude/project-brain/global-brain-hook.mjs --full\`.*`);
+    return out.join('\n') + '\n';
+}
+
+// ── Relevance ranking ─────────────────────────────────────────────────────
+// ONE shared lexical ranker so the per-prompt retrieval hook (and, later, the
+// MCP search) rank cards the SAME way — no third divergent scorer. Weights
+// mirror the MCP convention: title 3, tag 2, body 1, plus a gentle recency
+// tiebreak. Pure + node-runnable (no embeddings / network) so the Stop/prompt
+// hooks can call it with zero extra deps. `#file-…`/`#dir-…` tags (added at
+// capture) are what make a git-diff token match a card precisely.
+const STOPWORDS = new Set(['the', 'and', 'for', 'that', 'this', 'with', 'from', 'have', 'has', 'was', 'were', 'are', 'you', 'your', 'not', 'but', 'its', 'into', 'out', 'can', 'will', 'use', 'using', 'about', 'what', 'when', 'why', 'how', 'add', 'fix', 'make', 'need', 'want', 'let', 'see', 'get', 'got', 'now', 'all', 'any', 'via', 'per', 'etc', 'should', 'could', 'would', 'does', 'did', 'still', 'just', 'like', 'also', 'then', 'than', 'them', 'they']);
+export function queryTokens(s) {
+    return [...new Set(String(s || '').toLowerCase().match(/[a-z0-9][a-z0-9_-]{2,}/g) || [])].filter(t => !STOPWORDS.has(t));
+}
+const wordsOf = (s) => new Set(String(s || '').toLowerCase().match(/[a-z0-9][a-z0-9_-]{1,}/g) || []);
+export function scoreCardsAgainstQuery(struct, query, { topK = 6, minScore = 2, recentDays = 30 } = {}) {
+    const tokens = Array.isArray(query) ? query.filter(Boolean) : queryTokens(query);
+    if (!tokens.length || !struct || !Array.isArray(struct.cards)) return [];
+    const cutoff = Date.now() - recentDays * 86_400_000;
+    const isArchived = (c) => /^archive$/i.test(c.area || '');
+    const scored = [];
+    for (const c of struct.cards) {
+        if (c.type === 'container' || isArchived(c) || !(c.text || '').trim()) continue;
+        // WORD-level matching (not substring) so "app" can't hit "append-klypix"
+        // and "main" can't hit "domain". Tag match is on the tag's STEM (the
+        // slug after #file-/#dir-/#) so a git-diff token (slugify(basename))
+        // lands EXACTLY on its #file- anchor — the precise signal, weighted = a
+        // title hit so ONE anchored file match (3 + 0.5 recency) clears minScore.
+        const titleW = wordsOf(c.title);
+        const bodyW = wordsOf(c.text);
+        const tagStems = new Set((c.tags || []).map(t => String(t).toLowerCase().replace(/^#/, '').replace(/^(file|dir)-/, '')).filter(Boolean));
+        let score = 0;
+        for (const tok of tokens) {
+            if (titleW.has(tok)) score += 3;
+            else if (tagStems.has(tok)) score += 3;
+            else if (bodyW.has(tok)) score += 1;
+        }
+        if (score <= 0) continue;
+        if ((c.createdAt || 0) >= cutoff) score += 0.5; // gentle recency tiebreak, never dominant
+        scored.push({ card: c, score });
+    }
+    scored.sort((a, b) => b.score - a.score || (b.card.createdAt || 0) - (a.card.createdAt || 0));
+    return scored.filter(s => s.score >= minScore).slice(0, topK);
+}
+
+// ── Conflict candidate detection ───────────────────────────────────────────
+// REAL conflicts only — a conflict is two decisions that genuinely CONTRADICT
+// (you can't honor both about the same thing). Topical similarity, duplication,
+// and sequential supersession are explicitly NOT conflicts and must never be
+// flagged (no false-conflict dump). This is a cheap LEXICAL pre-filter that
+// returns CANDIDATES only — same-subject, not-already-connected pairs where at
+// least one card uses explicit REVERSAL language. Candidates mean nothing on
+// their own: the caller (brain-conflicts.mjs) confirms each with an LLM
+// contradiction-check before anything is ever drawn or surfaced. No verifier →
+// nothing surfaces. Pure + node-runnable.
+// Strong reversal/contradiction terms ONLY — deliberately NOT bare "not"/"don't"
+// (too common → false positives). A candidate still has to clear the LLM gate.
+const OPPOSITION_RE = /\b(instead of|reverted?|no longer|dropp(?:ed|ing)?|deprecat\w*|abandon\w*|replaced?\b|supersed\w*|changed from|switch(?:ed)? (?:from|to)|rolled? back|overrod|overrides?|contradic\w*|disagree\w*|conflicts? with|reversed?\b)/i;
+export function detectConflicts(struct, { minOverlap = 0.45, topK = 12 } = {}) {
+    if (!struct || !Array.isArray(struct.cards)) return [];
+    const isArchived = (c) => /^archive$/i.test(c.area || '');
+    const live = struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim() && !isArchived(c));
+    const wset = new Map(live.map(c => [c.id, new Set(queryTokens(c.text))]));
+    const connected = new Set();
+    for (const e of struct.connections || []) { connected.add(e.fromId + '|' + e.toId); connected.add(e.toId + '|' + e.fromId); }
+    const out = [];
+    for (let i = 0; i < live.length; i++) {
+        for (let j = i + 1; j < live.length; j++) {
+            const a = live[i], b = live[j];
+            if (connected.has(a.id + '|' + b.id)) continue;
+            const A = wset.get(a.id), B = wset.get(b.id);
+            if (A.size < 4 || B.size < 4) continue;
+            let inter = 0; for (const t of A) if (B.has(t)) inter++;
+            const overlap = inter / Math.min(A.size, B.size); // overlap coefficient — same subject?
+            // Must be same-subject AND carry an explicit reversal signal. Pure
+            // similarity / duplication is NOT a candidate (that was the dump).
+            if (overlap < minOverlap) continue;
+            if (!(OPPOSITION_RE.test(a.text) || OPPOSITION_RE.test(b.text))) continue;
+            out.push({ aId: a.id, bId: b.id, a: a.text, b: b.text, area: a.area, overlap: Math.round(overlap * 100) / 100 });
+        }
+    }
+    out.sort((x, y) => y.overlap - x.overlap);
+    return out.slice(0, topK);
+}
+
+// ── Brain insights ───────────────────────────────────────────────────────────
+// "What matters here, and what am I forgetting?" — a deterministic structural
+// read of the brain (borrowed from graphify's GRAPH_REPORT, applied to the
+// AUTHORED brain, not derived code). Surfaces:
+//   • hubs       — the most-connected cards (load-bearing decisions)
+//   • orphans    — decision/milestone cards with NO connections (isolated;
+//                  maybe forgotten — link them or archive them)
+//   • stale ❓   — open questions older than `staleDays` (aging unknowns)
+//   • areas      — live-card count per area (what's growing / dormant)
+// Pure + node-runnable: no LLM, no network. The agent renders/acts on it.
+export function brainInsights(struct, { staleDays = 21, topHubs = 6 } = {}) {
+    const cutoff = Date.now() - staleDays * 86_400_000;
+    const isArchived = (c) => /^archive$/i.test(c.area || '');
+    const cards = struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim());
+    const live = cards.filter(c => !isArchived(c));
+    const deg = new Map();
+    for (const cn of struct.connections) {
+        if (cn.fromId) deg.set(cn.fromId, (deg.get(cn.fromId) || 0) + 1);
+        if (cn.toId) deg.set(cn.toId, (deg.get(cn.toId) || 0) + 1);
+    }
+    const headline = (c) => String(c.text || '').replace(/\s+/g, ' ').trim().replace(/^(.*?)([.!?](\s|$)|$)/, '$1').slice(0, 120);
+    const isQuestion = (c) => /❓/.test(c.text);
+    const hubs = live
+        .map(c => ({ id: c.id, area: c.area, degree: deg.get(c.id) || 0, headline: headline(c) }))
+        .filter(x => x.degree > 0)
+        .sort((a, b) => b.degree - a.degree)
+        .slice(0, topHubs);
+    const orphans = live
+        .filter(c => !isQuestion(c) && !/🌿|⤵/.test(c.text) && !(deg.get(c.id) > 0))
+        .map(c => ({ id: c.id, area: c.area, headline: headline(c), age: c.createdAt }));
+    const staleQuestions = live
+        .filter(c => isQuestion(c) && (c.createdAt || 0) < cutoff)
+        .map(c => ({ id: c.id, area: c.area, headline: headline(c), age: c.createdAt }))
+        .sort((a, b) => (a.age || 0) - (b.age || 0));
+    const areas = struct.cards
+        .filter(c => c.type === 'container' && !/^archive$/i.test(c.title || ''))
+        .map(c => ({ title: c.title, count: cards.filter(t => t.parentId === c.id).length }))
+        .sort((a, b) => b.count - a.count);
+    return {
+        hubs, orphans, staleQuestions, areas,
+        totals: { live: live.length, archived: cards.length - live.length, connections: struct.connections.length },
+    };
+}
+
+// Render brainInsights as a compact markdown report (used by the MCP tool).
+export function insightsToMarkdown(ins, title = 'brain') {
+    const out = [`# ${title} — insights`, `*${ins.totals.live} live cards · ${ins.totals.archived} archived · ${ins.totals.connections} connections*`];
+    if (ins.hubs.length) { out.push('', '## 🪢 Hubs (most-connected — the load-bearing cards)'); for (const h of ins.hubs) out.push(`- (${h.degree}) [${h.area || '?'}] ${h.headline}`); }
+    if (ins.orphans.length) { out.push('', `## 🔌 Orphaned decisions (${ins.orphans.length} — no connections; link them or archive)`); for (const o of ins.orphans.slice(0, 12)) out.push(`- [${o.area || '?'}] ${o.headline}`); if (ins.orphans.length > 12) out.push(`- …and ${ins.orphans.length - 12} more`); }
+    if (ins.staleQuestions.length) { out.push('', `## ⏳ Stale open questions (${ins.staleQuestions.length} — unresolved & aging)`); for (const q of ins.staleQuestions.slice(0, 12)) out.push(`- [${q.area || '?'}] ${q.headline}`); }
+    out.push('', '## 📍 Areas (by live cards)', ins.areas.map(a => `${a.title} (${a.count})`).join(' · ') || '(none)');
+    if (!ins.hubs.length && !ins.orphans.length && !ins.staleQuestions.length) out.push('', '_Brain is small/tidy — no hubs, orphans, or stale questions to flag yet._');
+    return out.join('\n') + '\n';
+}
+
+// Append raw connections (by id) to a brain — additive, never deletes, skips
+// self-links / duplicates / dangling ids, verifies a round-trip parse. Used by
+// the brain_connect tool to densify a sparse brain into a real graph.
+export async function addBrainConnections(buffer, edges) {
+    const { zip, canvas, manifest, isV4 } = await parseKlypix(buffer);
+    if (!isV4 || !canvas.positions) throw new Error('connections need a v4 .klypix');
+    canvas.connections = Array.isArray(canvas.connections) ? canvas.connections : [];
+    const linked = (a, b) => canvas.connections.some(c => (c.fromId === a && c.toId === b) || (c.fromId === b && c.toId === a));
+    const rand = () => Math.random().toString(36).slice(2, 10);
+    let added = 0;
+    for (const e of edges || []) {
+        if (!e.fromId || !e.toId || e.fromId === e.toId) continue;
+        if (!canvas.positions[e.fromId] || !canvas.positions[e.toId]) continue; // both must exist
+        if (linked(e.fromId, e.toId)) continue;
+        canvas.connections.push({
+            id: `con_${rand()}`, fromId: e.fromId, toId: e.toId,
+            relationship: REL.has(e.relationship) ? e.relationship : 'relates_to',
+            label: typeof e.label === 'string' ? e.label : undefined,
+            arrowHead: true, width: 2, color: typeof e.color === 'string' ? e.color : '#10b981', style: 'solid',
+        });
+        added++;
+    }
+    if (!added) return { buffer, added: 0 };
+    const out = await finalizeBrainZip(zip, canvas, manifest, Date.now());
+    return { buffer: out, added };
+}
+
+// Structural connection suggestions — pure, no embeddings (the fallback when
+// the on-device model isn't installed, and the twin of the in-app Connect
+// button). Signals, strongest first: an unlinked [[title]] mention (3), a
+// shared topical tag ACROSS areas (2), a shared tag within an area (1). The
+// area-name tag is dropped (redundant with containment), and — crucially —
+// each card keeps at most `maxPerCard` links, so a tag shared by ten cards
+// can't explode into a 45-edge clique. Mirrors the semantic pass's discipline.
+export function proposeStructuralConnections(struct, { maxPerCard = 2 } = {}) {
+    const live = struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim() && !/^archive$/i.test(c.area || ''));
+    const linked = new Set(struct.connections.map(c => [c.fromId, c.toId].sort().join('|')));
+    const titleIx = live.filter(c => (c.title || '').trim()).map(c => ({ id: c.id, t: c.title.trim().toLowerCase() }));
+    const tagsOf = (c) => (c.tags || [])
+        .map(t => String(t).toLowerCase().replace(/^#/, ''))
+        .filter(t => t && t !== 'area' && t !== String(c.area || '').toLowerCase());
+    const cand = [];
+    for (const c of live) {
+        for (const link of (c.links || [])) {
+            const want = String(link).trim().toLowerCase();
+            const tgt = titleIx.find(e => e.id !== c.id && (e.t === want || e.t.startsWith(want)));
+            if (tgt) cand.push({ a: c.id, b: tgt.id, score: 3, why: 'mention' });
+        }
+        const ct = tagsOf(c);
+        if (!ct.length) continue;
+        for (const d of live) {
+            if (d.id <= c.id) continue;
+            if (tagsOf(d).some(t => ct.includes(t))) cand.push({ a: c.id, b: d.id, score: c.area !== d.area ? 2 : 1, why: 'shared tag' });
+        }
+    }
+    cand.sort((x, y) => y.score - x.score);
+    const per = new Map();
+    const edges = [];
+    for (const e of cand) {
+        if (e.a === e.b) continue;
+        const key = [e.a, e.b].sort().join('|');
+        if (linked.has(key)) continue;
+        if ((per.get(e.a) || 0) >= maxPerCard || (per.get(e.b) || 0) >= maxPerCard) continue;
+        linked.add(key);
+        per.set(e.a, (per.get(e.a) || 0) + 1);
+        per.set(e.b, (per.get(e.b) || 0) + 1);
+        edges.push({ fromId: e.a, toId: e.b, why: e.why });
+    }
+    return edges;
+}
+
+// ── Atomic brain capture: supersede + append + resolve + auto-link ──────────
+// One verified write per capture batch. Beyond appendIntoContainers it adds:
+//   • SUPERSEDE — a new decision that heavily overlaps an existing live card in
+//     the same area archives the old one (↩︎ prefix, gray, → Archive) and draws
+//     an old→new "superseded by" arrow, instead of stacking a contradiction.
+//   • RESOLVE — resolutions[] (the ✓ marker) finds the best-matching live card
+//     in the area, stamps "✅ <date>: <note>" onto it and archives it; if no
+//     match, the note lands as a 🏁 milestone so nothing is lost.
+//   • AUTO-LINK — [[Title]] in a new card's text becomes a real connection to
+//     the card/container whose title matches (the graph stops being decorative).
+const tokenSet = (s) => new Set(String(s || '').toLowerCase().replace(/\[\[|\]\]/g, ' ').split(/[^\p{L}\p{N}]+/u).filter(w => w.length >= 4));
+const overlapScore = (a, b) => {
+    if (a.size < 4 || b.size < 4) return 0;            // too short to judge
+    let hit = 0; for (const w of a) if (b.has(w)) hit++;
+    return hit / Math.min(a.size, b.size);
+};
+export async function captureIntoBrain(buffer, { cards = [], resolutions = [], updates = [] } = {}) {
+    const SUPERSEDE_AT = 0.6, RESOLVE_AT = 0.3, UPDATE_AT = 0.45;
+    let work = buffer;
+    const stats = { added: 0, superseded: 0, resolved: 0, linked: 0, updated: 0 };
+
+    // Pass 1 — resolutions + supersede marking operate on EXISTING cards.
+    if (resolutions.length || cards.length || updates.length) {
+        const { zip, canvas, manifest, isV4, struct } = await parseKlypix(work);
+        if (!isV4 || !canvas.positions) {
+            // Legacy file — no surgery possible; degrade to plain append.
+            return { buffer: await appendToKlypix(work, { cards }), stats };
+        }
+        const now = Date.now();
+        const today = new Date(now).toISOString().slice(0, 10);
+        const rand = () => Math.random().toString(36).slice(2, 10);
+        const top = Object.values(canvas.positions).map(p => p && p.zKey).filter(k => k && isValidZKey(k)).sort().pop() || null;
+        const nextZKey = makeZKeyGen(top);
+        const byTitle = new Map();
+        for (const c of struct.cards) if (c.type === 'container') { const t = (c.title || '').trim().toLowerCase(); if (t && !byTitle.has(t)) byTitle.set(t, c.id); }
+        const ensureArchive = () => {
+            let id = byTitle.get('archive');
+            if (id) return id;
+            id = `ctn_${rand()}`;
+            const G = BRAIN_GEOM;
+            zip.file(`items/${shard(id)}/${id}.json`, JSON.stringify({ type: 'container', locked: false, createdAt: now, createdBy: 'agent', title: 'Archive', collapsed: false, scopeLocked: false, borderColor: 'rgba(120,120,135,0.6)' }));
+            canvas.positions[id] = { x: nextContainerX(canvas), y: G.START, w: G.AREA_W, h: G.TITLE_BAR + G.PAD * 2, zKey: nextZKey(), zIndex: canvas.order.length, parentId: null };
+            canvas.order.push(id);
+            byTitle.set('archive', id);
+            return id;
+        };
+        const liveTextCards = () => struct.cards.filter(c =>
+            c.type !== 'container' && (c.text || '').trim()
+            && !/^archive$/i.test(c.area || '')
+            && !/↩|✅/.test(c.text));
+        const rewriteCard = async (id, mutate) => {
+            const ip = `items/${shard(id)}/${id}.json`;
+            const f = zip.file(ip); if (!f) return false;
+            const j = JSON.parse(await f.async('string'));
+            mutate(j);
+            j.content = wrapText(String(j.content || ''));
+            zip.file(ip, JSON.stringify(j));
+            const pos = canvas.positions[id];
+            if (pos) canvas.positions[id] = { ...pos, h: measureCardH(j.content) };
+            return true;
+        };
+        const archiveCard = async (id) => {
+            const arc = ensureArchive();
+            // The Archive is readable STORAGE, not a vector-scaled layout: un-bake
+            // any group-shrink (font/width baked tiny) by restoring the frozen
+            // authored baseline and dropping it, so the card sits in the Archive
+            // at full readable size and re-seeds cleanly if the Archive is resized.
+            let authoredW = null;
+            const ip = `items/${shard(id)}/${id}.json`;
+            const f = zip.file(ip);
+            if (f) {
+                const j = JSON.parse(await f.async('string'));
+                const a = j.authoredInParent;
+                if (a) {
+                    if (j.type === 'text' && a.fontSize) j.fontSize = a.fontSize;
+                    if (a.authoredWidth != null) j.authoredWidth = a.authoredWidth;
+                    authoredW = a.w || null;
+                    delete j.authoredInParent;
+                    zip.file(ip, JSON.stringify(j));
+                }
+            }
+            const pos = canvas.positions[id];
+            if (pos) canvas.positions[id] = { ...pos, parentId: arc, ...(authoredW ? { w: authoredW } : {}) };
+        };
+        canvas.connections = Array.isArray(canvas.connections) ? canvas.connections : [];
+
+        // RESOLVE (✓ markers) — best live match in the area; ❓ cards preferred.
+        const milestonesFallback = [];
+        for (const r of resolutions) {
+            const rTok = tokenSet(r.text);
+            let best = null, bestScore = 0;
+            for (const c of liveTextCards()) {
+                if (r.area && (c.area || '').toLowerCase() !== r.area.toLowerCase()) continue;
+                const s = overlapScore(rTok, tokenSet(c.text)) + (/❓/.test(c.text) ? 0.15 : 0);
+                if (s > bestScore) { bestScore = s; best = c; }
+            }
+            if (best && bestScore >= RESOLVE_AT) {
+                await rewriteCard(best.id, j => {
+                    j.content = `${j.content}\n✅ ${today}: ${r.text}`;
+                    j.borderColor = 'rgba(16,185,129,0.35)';
+                });
+                await archiveCard(best.id);
+                best.text += ` ✅ ${r.text}`; // keep in-memory struct honest for later matching
+                stats.resolved++;
+            } else {
+                milestonesFallback.push({ text: (r.area ? `${r.area}: ` : '') + `🏁 ${r.text}`, area: r.area, borderColor: 'rgba(59,130,246,0.8)' });
+            }
+        }
+
+        // UPDATE (~ markers) — rewrite a matching card IN PLACE: for small
+        // corrections that don't deserve supersession history. Content is
+        // replaced (area prefix + tag preserved), createdAt bumped so the
+        // brief treats it as fresh. No match → falls through as a new card.
+        for (const u of updates) {
+            const uTok = tokenSet(u.text);
+            let best = null, bestScore = 0;
+            for (const c of liveTextCards()) {
+                if (u.area && (c.area || '').toLowerCase() !== u.area.toLowerCase()) continue;
+                const s = overlapScore(uTok, tokenSet(c.text));
+                if (s > bestScore) { bestScore = s; best = c; }
+            }
+            if (best && bestScore >= UPDATE_AT) {
+                const tag = u.area ? `\n#${u.area.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : '';
+                await rewriteCard(best.id, j => {
+                    j.content = (u.area ? `${u.area}: ` : '') + u.text + tag;
+                    j.createdAt = now;
+                    j.borderColor = 'rgba(16,185,129,0.6)';
+                    if (u.createdVia) j.createdVia = String(u.createdVia);
+                });
+                best.text = u.text;
+                stats.updated++;
+            } else {
+                cards.push({ text: (u.area ? `${u.area}: ` : '') + u.text + (u.area ? `\n#${u.area.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : ''), area: u.area, createdVia: u.createdVia });
+            }
+        }
+
+        // SUPERSEDE — pre-mark old cards that a NEW decision replaces. The arrow
+        // to the new card is drawn in pass 2 (after the new ids exist), matched
+        // back by remembering which old card each new card displaced.
+        for (const card of cards) {
+            if (/❓|🏁/.test(card.text)) continue; // only plain decisions supersede
+            const nTok = tokenSet(card.text);
+            const area = (card.area || '').toLowerCase();
+            let best = null, bestScore = 0;
+            for (const c of liveTextCards()) {
+                if (area && (c.area || '').toLowerCase() !== area) continue;
+                const s = overlapScore(nTok, tokenSet(c.text));
+                if (s > bestScore) { bestScore = s; best = c; }
+            }
+            if (best && bestScore >= SUPERSEDE_AT) {
+                await rewriteCard(best.id, j => {
+                    j.content = `↩︎ superseded ${today}\n${j.content}`;
+                    j.borderColor = 'rgba(120,120,135,0.5)';
+                });
+                await archiveCard(best.id);
+                best.text = `↩︎ ${best.text}`;
+                card.__supersedes = best.id;
+                stats.superseded++;
+            }
+        }
+
+        cards.push(...milestonesFallback);
+        work = await finalizeBrainZip(zip, canvas, manifest, now);
+    }
+
+    // Pass 2 — append the new cards (existing self-organizing path), then wire
+    // connections: supersede arrows + [[wikilink]] auto-links.
+    if (cards.length) {
+        work = await appendIntoContainers(work, { cards });
+        stats.added = cards.length;
+        const { zip, canvas, manifest, struct } = await parseKlypix(work);
+        const now = Date.now();
+        const rand = () => Math.random().toString(36).slice(2, 10);
+        canvas.connections = Array.isArray(canvas.connections) ? canvas.connections : [];
+        const hasConn = (a, b) => canvas.connections.some(cn => (cn.fromId === a && cn.toId === b) || (cn.fromId === b && cn.toId === a));
+        const addConn = (fromId, toId, label, relationship) => {
+            if (!fromId || !toId || fromId === toId || hasConn(fromId, toId)) return;
+            canvas.connections.push({ id: `con_${rand()}`, fromId, toId, relationship, label, arrowHead: true, width: 2, color: '#10b981', style: 'solid' });
+            stats.linked++;
+        };
+        // Locate each appended card by exact text match (newest first wins).
+        const findNew = (text) => {
+            const flatT = wrapText(String(text));
+            for (let i = struct.cards.length - 1; i >= 0; i--) {
+                const c = struct.cards[i];
+                if (c.type !== 'container' && (c.text || '') === flatT) return c;
+            }
+            return null;
+        };
+        const titleIndex = struct.cards
+            .filter(c => (c.title || '').trim())
+            .map(c => ({ id: c.id, t: c.title.trim().toLowerCase() }));
+        for (const card of cards) {
+            const created = findNew(card.text);
+            if (!created) continue;
+            if (card.__supersedes) addConn(card.__supersedes, created.id, 'superseded by', undefined);
+            for (const link of (created.links || [])) {
+                const want = String(link).trim().toLowerCase();
+                if (!want) continue;
+                const target = titleIndex.find(e => e.id !== created.id && (e.t === want || e.t.startsWith(want)));
+                if (target) addConn(created.id, target.id, undefined, 'relates_to');
+            }
+        }
+        work = await finalizeBrainZip(zip, canvas, manifest, now);
+    }
+
+    return { buffer: work, stats };
 }
 
 /**

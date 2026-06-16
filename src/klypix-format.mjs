@@ -688,6 +688,47 @@ export function scoreCardsAgainstQuery(struct, query, { topK = 6, minScore = 2, 
     return scored.filter(s => s.score >= minScore).slice(0, topK);
 }
 
+// ── Repeat / redundancy detection ("you already did this in another session") ─
+// The PRECISION-first sibling of scoreCardsAgainstQuery. Instead of "related
+// context" it answers a sharper question: is the user about to REDO work that's
+// already DONE? It scans COMPLETED-work cards ONLY — 🏁 shipped, ✅ resolved,
+// ↩︎ superseded — and INCLUDES the Archive (resolved/superseded cards live there,
+// which the relevance ranker deliberately skips). Deliberately strict: a high
+// score floor + ≥2 distinct query-token hits, because for a NUDGE a false "you
+// already did this" is costly (erodes trust) while a miss is cheap (the loose
+// recall list still shows below). Returns each card's `kind` so the caller can
+// say "reuse it" (shipped/resolved) vs "see what replaced it" (superseded).
+// Pure + node-runnable; reuses the one shared tokenizer — no divergent scorer.
+export function detectRepeatWork(struct, query, { topK = 2, minScore = 5, minTokens = 2 } = {}) {
+    const tokens = Array.isArray(query) ? query.filter(Boolean) : queryTokens(query);
+    if (tokens.length < minTokens || !struct || !Array.isArray(struct.cards)) return [];
+    const kindOf = (t) => /🏁/.test(t) ? 'shipped' : /✅/.test(t) ? 'resolved' : /↩/.test(t) ? 'superseded' : null;
+    const rank = { shipped: 2, resolved: 2, superseded: 1 };
+    const out = [];
+    for (const c of struct.cards) {
+        if (c.type === 'container' || !(c.text || '').trim()) continue;
+        const kind = kindOf(c.text);
+        if (!kind) continue;                          // only COMPLETED-work cards qualify
+        // Score the first MEANINGFUL line, not a marker stamp: supersede/resolve
+        // prepend "↩︎ superseded <date>" / lead with "✅ …", which would otherwise
+        // become the title and hide the real content from title-weighted matching.
+        const firstMeaningful = String(c.text).split('\n').map(s => s.trim()).filter(Boolean).find(l => !/^[↩✅🏁]/u.test(l));
+        const titleW = wordsOf(firstMeaningful || c.title);
+        const bodyW = wordsOf(c.text);
+        const tagStems = new Set((c.tags || []).map(t => String(t).toLowerCase().replace(/^#/, '').replace(/^(file|dir)-/, '')).filter(Boolean));
+        let score = 0, matched = 0;
+        for (const tok of tokens) {
+            if (titleW.has(tok)) { score += 3; matched++; }
+            else if (tagStems.has(tok)) { score += 3; matched++; }
+            else if (bodyW.has(tok)) { score += 1; matched++; }
+        }
+        if (matched < minTokens || score < minScore) continue;   // precision-first floor
+        out.push({ card: c, score, kind });
+    }
+    out.sort((a, b) => b.score - a.score || (rank[b.kind] - rank[a.kind]) || (b.card.createdAt || 0) - (a.card.createdAt || 0));
+    return out.slice(0, topK);
+}
+
 // ── Conflict candidate detection ───────────────────────────────────────────
 // REAL conflicts only — a conflict is two decisions that genuinely CONTRADICT
 // (you can't honor both about the same thing). Topical similarity, duplication,

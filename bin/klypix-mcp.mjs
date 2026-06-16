@@ -305,9 +305,17 @@ server.registerTool('search_all_brains', {
     let qv = null;
     if (pipe) { try { [qv] = await embedTexts(pipe, [q]); } catch { /* lexical only */ } }
 
+    // Current-project locality prior: a card from the project you're working in
+    // should outrank an equally-relevant card from an unrelated project (the
+    // "cross-project search drowned my own project's cards" complaint). The boost
+    // below is modest + mode-aware — never enough to bury a much stronger foreign hit.
+    let curKey = null;
+    try { const cb = resolveCanvas('brain') || resolveCanvas('brain.klypix'); if (cb) curKey = path.resolve(cb).replace(/\\/g, '/').toLowerCase(); } catch { /* no current brain */ }
     const fresh = Date.now() - 30 * 86_400_000;
     const scored = [];
     for (const b of brains) {
+        let isCur = false;
+        try { isCur = !!curKey && path.resolve(b.path).replace(/\\/g, '/').toLowerCase() === curKey; } catch { /* */ }
         let struct;
         try { ({ struct } = await parseKlypix(fs.readFileSync(b.path))); } catch { continue; }
         let vecs = null;
@@ -340,8 +348,9 @@ server.registerTool('search_all_brains', {
             if (asOfTs == null) {
                 if ((c.createdAt || 0) >= fresh) score += 0.5;
                 if (isArchived) score -= 1;
+                if (isCur) score += sem != null ? 1.5 : 1; // current-project locality prior
             }
-            scored.push({ score, sem, project: b.project || path.basename(path.dirname(b.path)), area: c.area, c });
+            scored.push({ score, sem, cur: isCur, project: b.project || path.basename(path.dirname(b.path)), area: c.area, c });
         }
     }
     if (!scored.length) return { content: [{ type: 'text', text: `No matches for "${query}" across ${brains.length} registered brain(s).` }] };
@@ -349,7 +358,7 @@ server.registerTool('search_all_brains', {
     const top = scored.slice(0, 20);
     const lines = top.map(h => {
         const when = h.c.createdAt ? new Date(h.c.createdAt).toISOString().slice(0, 10) : '';
-        return `- [${h.project}${h.area ? ' › ' + h.area : ''}] ${when} ${String(h.c.text || '').replace(/\s+/g, ' ').slice(0, 240)}`;
+        return `- ${h.cur ? '★ ' : ''}[${h.project}${h.area ? ' › ' + h.area : ''}] ${when} ${String(h.c.text || '').replace(/\s+/g, ' ').slice(0, 240)}`;
     });
     const mode = qv ? 'semantic+lexical (on-device)' : 'lexical (semantic model warming — retry for semantic ranking)';
     const asOfNote = asOfTs != null ? ` · as of ${as_of}` : '';
@@ -520,3 +529,8 @@ server.registerTool('add_to_canvas', {
 const transport = new StdioServerTransport();
 await server.connect(transport);
 log(`ready · vault=${VAULT}`);
+// Pre-warm the on-device embedder in the BACKGROUND so the first cross-project
+// search of a session is already semantic, not a lexical fallback while the
+// MiniLM model loads. getEmbedder() memoizes + swallows its own errors, so this
+// is a safe fire-and-forget (no await → zero added startup latency).
+getEmbedder().then(p => log(p ? 'semantic ready (pre-warmed)' : 'semantic unavailable — lexical only')).catch(() => {});

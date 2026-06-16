@@ -113,6 +113,9 @@ export async function parseKlypix(buffer) {
             parentId: it.parentId ?? null,
             // Parent container's title — the card's "area" in brain terms.
             area: it.parentId ? (cardTitle(items[it.parentId]) || null) : null,
+            // Evidence anchors (file:line / PR#) with the git blob OID stamped at
+            // capture-time — lets the hook flag a card whose cited code drifted.
+            evidence: Array.isArray(it.evidence) && it.evidence.length ? it.evidence : null,
         })),
         connections: connections.map(c => ({
             from: titleOf(c.fromId), to: titleOf(c.toId),
@@ -464,6 +467,8 @@ export async function appendIntoContainers(buffer, addition) {
             // Provenance: WHICH agent remembered this (claude-code / cursor /
             // cline / …) — additive field, ignored by older readers.
             ...(card.createdVia ? { createdVia: String(card.createdVia) } : {}),
+            // Evidence anchors (file:line / PR#) — additive, ignored by older readers.
+            ...(Array.isArray(card.evidence) && card.evidence.length ? { evidence: card.evidence } : {}),
             content: wrapped, fontSize: G.FONT,
             color: card.color || '#e8e8ed', border: true, borderColor: card.borderColor || card.color || 'rgba(16,185,129,0.45)',
             fillColor: 'rgba(18,18,26,0.85)', heading: !!card.heading, fontFamily: 'Thmanyah Sans',
@@ -556,7 +561,7 @@ export async function tidyBrain(buffer) {
 // decisions + milestones. Everything older stays in the file, reachable via the
 // klypix-canvas MCP search or `--full`. Keeps the session-start cost flat as
 // the brain grows (the full markdown scales with history; this doesn't).
-export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMilestones = 8, maxConnections = 30 } = {}) {
+export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMilestones = 8, maxConnections = 30, freshness = null } = {}) {
     const cutoff = Date.now() - recentDays * 86_400_000;
     const texts = struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim());
     const containers = struct.cards.filter(c => c.type === 'container');
@@ -575,6 +580,9 @@ export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMile
     const archivedCount = texts.length - live.length;
 
     const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+    // Freshness badge (✅ verified / ⚠️ drifted / 🌱 unverified) for code-anchored
+    // cards — supplied by the git-aware hook; absent → no badge. Trust at a glance.
+    const fr = (c) => (freshness && freshness[c.id]) ? freshness[c.id] + ' ' : '';
     // HEADLINE = first sentence-ish, hard-capped — the brief is a scannable
     // changelog; the agent pulls any card's full text via the MCP when needed.
     const headline = (c, max = 160) => {
@@ -597,9 +605,9 @@ export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMile
     push(`*${struct.format} · ${struct.counts.cards} cards · ${struct.counts.connections} connections · tiered brief (focus + open + last ${recentDays}d headlines); full cards via klypix-canvas MCP search*`);
     if (focus.length) {
         push('', '## 📌 Human focus (cards the human placed here — act on these first)');
-        for (const c of focus) push(`- ${flat(c.text)}`);
+        for (const c of focus) push(`- ${fr(c)}${flat(c.text)}`);
     }
-    if (open.length) { push('', '## Open questions'); for (const c of open) push(`- ${flat(c.text)}`); }
+    if (open.length) { push('', '## Open questions'); for (const c of open) push(`- ${fr(c)}${flat(c.text)}`); }
     // ⚠️ Conflicts — pairs flagged conflicts_with (e.g. by parallel sessions);
     // surfaced HIGH so the next session reconciles them, not buries them.
     const conflicts = (struct.connections || []).filter(c => c.relationship === 'conflicts_with');
@@ -610,7 +618,7 @@ export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMile
     if (areaCounts.length) { push('', '## Areas', areaCounts.join(' · ')); }
     if (miles.length) {
         push('', '## Milestones');
-        for (const c of miles.sort((a, b) => b.createdAt - a.createdAt).slice(0, maxMilestones)) push(`- ${headline(c)}`);
+        for (const c of miles.sort((a, b) => b.createdAt - a.createdAt).slice(0, maxMilestones)) push(`- ${fr(c)}${headline(c)}`);
     }
     let shownRecent = 0;
     if (recent.length) {
@@ -621,7 +629,7 @@ export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMile
             push(`### ${a}`);
             for (const c of cs) {
                 if (used > BUDGET_CHARS) break outer;
-                push(`- ${day(c.createdAt)} ${headline(c)}`);
+                push(`- ${fr(c)}${day(c.createdAt)} ${headline(c)}`);
                 shownRecent++;
             }
         }
@@ -863,9 +871,9 @@ const overlapScore = (a, b) => {
     return hit / Math.min(a.size, b.size);
 };
 export async function captureIntoBrain(buffer, { cards = [], resolutions = [], updates = [] } = {}) {
-    const SUPERSEDE_AT = 0.6, RESOLVE_AT = 0.3, UPDATE_AT = 0.45;
+    const SUPERSEDE_AT = 0.6, RESOLVE_AT = 0.3, UPDATE_AT = 0.45, CLOSE_AT = 0.25;
     let work = buffer;
-    const stats = { added: 0, superseded: 0, resolved: 0, linked: 0, updated: 0 };
+    const stats = { added: 0, superseded: 0, resolved: 0, linked: 0, updated: 0, closed: 0 };
 
     // Pass 1 — resolutions + supersede marking operate on EXISTING cards.
     if (resolutions.length || cards.length || updates.length) {
@@ -974,11 +982,14 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                     j.createdAt = now;
                     j.borderColor = 'rgba(16,185,129,0.6)';
                     if (u.createdVia) j.createdVia = String(u.createdVia);
+                    // Self-heal: a ~ update re-stamps the evidence (fresh OID +
+                    // verifiedAt), so confirming/correcting a drifted fact marks it ✅.
+                    if (Array.isArray(u.evidence) && u.evidence.length) j.evidence = u.evidence;
                 });
                 best.text = u.text;
                 stats.updated++;
             } else {
-                cards.push({ text: (u.area ? `${u.area}: ` : '') + u.text + (u.area ? `\n#${u.area.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : ''), area: u.area, createdVia: u.createdVia });
+                cards.push({ text: (u.area ? `${u.area}: ` : '') + u.text + (u.area ? `\n#${u.area.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : ''), area: u.area, createdVia: u.createdVia, ...(Array.isArray(u.evidence) && u.evidence.length ? { evidence: u.evidence } : {}) });
             }
         }
 
@@ -1004,6 +1015,38 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                 best.text = `↩︎ ${best.text}`;
                 card.__supersedes = best.id;
                 stats.superseded++;
+            }
+        }
+
+        // CLOSE-LINK — a card carrying `closes` resolves the (often cross-area)
+        // strategy/question card that SPAWNED it: stamp ✅, archive it, and draw a
+        // "closed by" arrow in pass 2. Unlike supersede (same-area, high lexical
+        // overlap), a shipped milestone rarely echoes the strategy's prose — so
+        // this matches across ALL areas, prefers an explicit [[wikilink]]/title
+        // hit, and otherwise fires on only a low overlap. This is the fix for
+        // "strategy cards never get closed out when their feature actually ships".
+        for (const card of cards) {
+            const target = (card.closes || '').toString().trim();
+            if (!target) continue;
+            const wantTitle = target.replace(/^\[\[/, '').replace(/\]\]$/, '').trim().toLowerCase();
+            const tTok = tokenSet(target);
+            let best = null, bestScore = 0;
+            for (const c of liveTextCards()) {
+                const ct = (c.title || '').trim().toLowerCase();
+                if (ct && wantTitle && (ct === wantTitle || ct.startsWith(wantTitle) || wantTitle.startsWith(ct))) { best = c; bestScore = 1; break; }
+                const s = overlapScore(tTok, tokenSet(c.text));
+                if (s > bestScore) { bestScore = s; best = c; }
+            }
+            if (best && bestScore >= CLOSE_AT) {
+                const ship = String(card.text).replace(/\s+/g, ' ').replace(/^[^:\n]{1,40}:\s*/, '').replace(/^🏁\s*/, '').trim().slice(0, 80);
+                await rewriteCard(best.id, j => {
+                    j.content = `${j.content}\n✅ ${today}: closed by → ${ship}`;
+                    j.borderColor = 'rgba(16,185,129,0.35)';
+                });
+                await archiveCard(best.id);
+                best.text = `✅ ${best.text}`;
+                card.__closes = best.id;
+                stats.closed++;
             }
         }
 
@@ -1042,6 +1085,7 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
             const created = findNew(card.text);
             if (!created) continue;
             if (card.__supersedes) addConn(card.__supersedes, created.id, 'superseded by', undefined);
+            if (card.__closes) addConn(card.__closes, created.id, 'closed by', undefined);
             for (const link of (created.links || [])) {
                 const want = String(link).trim().toLowerCase();
                 if (!want) continue;

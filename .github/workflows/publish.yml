@@ -1,0 +1,29 @@
+name: Publish to npm (OIDC Trusted Publishing)
+
+# Publishes klypix-mcp to npm with NO token/secret — npm trusts this workflow via
+# OIDC Trusted Publishing (configured on npmjs.com → package → Settings → Trusted
+# Publisher). Fires when a GitHub Release is published; manual run also allowed.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write        # REQUIRED for OIDC trusted publishing + provenance
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      # OIDC trusted publishing needs a recent npm (>= 11.5.1); setup-node ships an
+      # older bundled npm, so upgrade to guarantee support.
+      - name: Upgrade npm (OIDC trusted publishing support)
+        run: npm install -g npm@latest
+      - name: Publish (OIDC, with provenance)
+        run: npm publish --provenance --access public

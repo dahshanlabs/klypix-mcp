@@ -1,29 +1,54 @@
-name: Publish to npm (OIDC Trusted Publishing)
+name: Publish to npm
 
-# Publishes klypix-mcp to npm with NO token/secret — npm trusts this workflow via
-# OIDC Trusted Publishing (configured on npmjs.com → package → Settings → Trusted
-# Publisher). Fires when a GitHub Release is published; manual run also allowed.
+# Publish klypix-mcp to npm via OIDC Trusted Publishing — NO token, NO secret.
+# npm trusts this exact workflow (configured at npmjs.com → package → Settings →
+# Trusted Publisher: dahshanlabs/klypix-mcp · publish.yml). Fires on a published
+# GitHub Release; workflow_dispatch allows manual re-runs.
+#
+# Verified requirements (official npm docs, OIDC trusted publishing GA 2025-07-31):
+#   - npm CLI >= 11.5.1   (guaranteed below by `npm install -g npm@latest`)
+#   - Node.js >= 22.14.0  (node 24 ships npm 11.x and is well above the floor)
+#   - permissions id-token:write (mints the OIDC token) + contents:read
+#   - GitHub-hosted runner (self-hosted not supported)
+#   - Trusted Publisher configured on npm BEFORE the first run
 on:
   release:
     types: [published]
   workflow_dispatch:
 
 permissions:
-  contents: read
-  id-token: write        # REQUIRED for OIDC trusted publishing + provenance
+  id-token: write   # REQUIRED: lets GitHub Actions mint the OIDC token npm exchanges
+  contents: read    # checkout
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
-          node-version: 22
-          registry-url: https://registry.npmjs.org
-      # OIDC trusted publishing needs a recent npm (>= 11.5.1); setup-node ships an
-      # older bundled npm, so upgrade to guarantee support.
-      - name: Upgrade npm (OIDC trusted publishing support)
-        run: npm install -g npm@latest
-      - name: Publish (OIDC, with provenance)
-        run: npm publish --provenance --access public
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      # MAKE-OR-BREAK: npm must be >= 11.5.1 for OIDC trusted publishing; older npm
+      # silently falls back to token auth and fails. Upgrade + print to confirm.
+      - name: Ensure npm supports OIDC trusted publishing (>= 11.5.1)
+        run: |
+          npm install -g npm@latest
+          npm --version
+
+      # `npm publish` needs no runtime deps (plain ESM, no build/prepublish script),
+      # so skip the heavy optional ML dep (@huggingface/transformers) — keep a
+      # deterministic core-tree check only. (--omit=optional avoids a flaky native
+      # download that has zero bearing on the published tarball.)
+      - name: Install (core deps only, deterministic)
+        run: npm ci --omit=optional
+
+      # Tokenless: do NOT set NODE_AUTH_TOKEN / NPM_TOKEN. setup-node writes an
+      # empty-token .npmrc line which npm >= 11.5.1 ignores under OIDC. Provenance
+      # is generated AUTOMATICALLY (public repo + public package); no flag needed.
+      - name: Publish (OIDC, auto-provenance)
+        run: npm publish --access public

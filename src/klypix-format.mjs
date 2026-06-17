@@ -911,8 +911,15 @@ const overlapScore = (a, b) => {
     let hit = 0; for (const w of a) if (b.has(w)) hit++;
     return hit / Math.min(a.size, b.size);
 };
+// Fraction of the TARGET set present in `hay` — the right metric for "is this the
+// card the user named in `closes:`?". Unlike overlapScore it has NO ≥4-token
+// floor, because a close-target is a deliberate, often-short title/phrase (a
+// subset of the card), not an accidental same-size similarity. (That floor was why
+// a real `closes: v1.2.0 staged as a github draft` — only 3 long tokens — silently
+// failed to fire.)
+const coverageOf = (target, hay) => { if (!target.size) return 0; let h = 0; for (const w of target) if (hay.has(w)) h++; return h / target.size; };
 export async function captureIntoBrain(buffer, { cards = [], resolutions = [], updates = [] } = {}) {
-    const SUPERSEDE_AT = 0.6, RESOLVE_AT = 0.3, UPDATE_AT = 0.45, CLOSE_AT = 0.25;
+    const SUPERSEDE_AT = 0.6, RESOLVE_AT = 0.3, UPDATE_AT = 0.45, CLOSE_COVER_AT = 0.6;
     let work = buffer;
     const stats = { added: 0, superseded: 0, resolved: 0, linked: 0, updated: 0, closed: 0 };
 
@@ -1074,11 +1081,14 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
             let best = null, bestScore = 0;
             for (const c of liveTextCards()) {
                 const ct = (c.title || '').trim().toLowerCase();
-                if (ct && wantTitle && (ct === wantTitle || ct.startsWith(wantTitle) || wantTitle.startsWith(ct))) { best = c; bestScore = 1; break; }
-                const s = overlapScore(tTok, tokenSet(c.text));
-                if (s > bestScore) { bestScore = s; best = c; }
+                // Title fast-path: exact / prefix / or the card title CONTAINS the
+                // target (handles the common "Area: <title> (extra…)" card title).
+                if (ct && wantTitle.length >= 6 && (ct === wantTitle || ct.startsWith(wantTitle) || wantTitle.startsWith(ct) || ct.includes(wantTitle))) { best = c; bestScore = 1; break; }
+                // Else target-coverage (≥2 tokens, no floor): a short deliberate
+                // close-target whose tokens are present in a card is a precise hit.
+                if (tTok.size >= 2) { const cov = coverageOf(tTok, tokenSet(c.text)); if (cov > bestScore) { bestScore = cov; best = c; } }
             }
-            if (best && bestScore >= CLOSE_AT) {
+            if (best && bestScore >= CLOSE_COVER_AT) {
                 const ship = String(card.text).replace(/\s+/g, ' ').replace(/^[^:\n]{1,40}:\s*/, '').replace(/^🏁\s*/, '').trim().slice(0, 80);
                 await rewriteCard(best.id, j => {
                     j.content = `${j.content}\n✅ ${today}: closed by → ${ship}`;

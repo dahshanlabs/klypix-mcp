@@ -14,6 +14,13 @@ messy project at once. `klypix-mcp` fixes that with a single portable file:
   the loop — read it with Claude today, GPT tomorrow, a local model next week.
   No vendor can take it away.
 
+> **The shared memory layer for your multi-agent stack.** A2A moves the messages
+> between agents; MCP connects an agent to its tools; **`.klypix` is the owned,
+> multimodal context both layers read and write.** KLYPIX ships *two* faces over
+> one engine — an **MCP server** (`klypix-mcp`) and an **A2A agent**
+> (`klypix-a2a`) — so whichever protocol your stack speaks, the memory node is
+> the same portable file you own. See **[A2A.md](A2A.md)**.
+
 ## Quick start (60 seconds)
 
 ```bash
@@ -47,6 +54,22 @@ notes into a board,"* or *"add a card with the decision we just made."*
 | `search_canvases` | Search across canvases by name + content |
 | `create_canvas` | Create a new `.klypix` from cards + connections |
 | `add_to_canvas` | Append cards/connections to an existing canvas (positions preserved) |
+
+## Also speaks A2A (Agent-to-Agent)
+
+The same engine is exposed as an **A2A agent** so other agents and orchestrators
+can delegate memory tasks to KLYPIX as a discoverable peer:
+
+```bash
+npx -p klypix-mcp klypix-a2a --vault ./canvases     # 127.0.0.1:41241
+# Agent Card: http://127.0.0.1:41241/.well-known/agent-card.json
+```
+
+Skills: `make_board`, `remember`, `recall`, `read_canvas`, `list_canvases`,
+`brain_insights`, `search_all_brains`. Unlike a typical A2A agent that returns
+text, KLYPIX returns the **`.klypix` board itself** as a multimodal artifact.
+Full protocol details (JSON-RPC methods, message shapes, streaming) in
+**[A2A.md](A2A.md)**.
 
 ## Use it as a library
 

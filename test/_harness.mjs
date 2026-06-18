@@ -59,9 +59,11 @@ export async function seedRoadmap(vault) {
 }
 
 // Drive the server through one client session; return a map of {label: text}.
-export async function driveServer(vault) {
+// binPath overrides which server file to spawn (e.g. the desktop-bundled copy),
+// so the SAME drive sequence verifies any layout against the same baseline.
+export async function driveServer(vault, binPath = BIN) {
   const client = new Client({ name: 'klypix-test', version: '1.0.0' }, { capabilities: {} });
-  const transport = new StdioClientTransport({ command: process.execPath, args: [BIN, '--vault', vault] });
+  const transport = new StdioClientTransport({ command: process.execPath, args: [binPath, '--vault', vault] });
   await client.connect(transport);
 
   const out = {};

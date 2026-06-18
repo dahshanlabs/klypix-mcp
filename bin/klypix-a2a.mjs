@@ -36,7 +36,16 @@ import {
 } from '../src/klypix-core.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const PKG = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+// Resolve the package version across layouts: the published package (bin/ →
+// ../package.json) and the desktop-bundled FLAT layout (~/.claude/project-brain/,
+// ./package.json, which may carry no version) — degrade gracefully either way.
+function readVersion() {
+  for (const p of [path.join(__dirname, '..', 'package.json'), path.join(__dirname, 'package.json')]) {
+    try { const v = JSON.parse(fs.readFileSync(p, 'utf8')).version; if (v) return v; } catch { /* try next */ }
+  }
+  return '1.x';
+}
+const PKG = { version: readVersion() };
 const log = (...a) => console.error('[klypix-a2a]', ...a);
 
 const arg = (flag) => { const i = process.argv.indexOf(flag); return i >= 0 ? process.argv[i + 1] : undefined; };

@@ -688,6 +688,53 @@ export function scoreCardsAgainstQuery(struct, query, { topK = 6, minScore = 2, 
     return scored.filter(s => s.score >= minScore).slice(0, topK);
 }
 
+// ── External-state reconcile — migration omission tripwire ───────────────────
+// The brain is a NARRATION-capture system: a fact exists only if someone wrote a
+// 🧠 marker or a rationale-bearing commit body. Applying a DB migration to prod
+// is an OBSERVED side-effect that narrates nothing, so it silently never lands —
+// and the brain can't tell a *committed* migration from an *applied* one. These
+// two pure functions are the portable seam that closes that blind spot WITHOUT
+// making the brain omniscient: no I/O, no DB probe, no network, no credentials. A
+// collector (the Claude-Code hook, or the brain_reconcile MCP tool) hands them
+// the migration FILES found on disk; they return the ones NO LIVE card references,
+// so the surface can PROMPT the human to confirm the rollout — never assert it.
+// Recall-first by design: ANY plausible hit counts as "recorded", erring toward
+// silence over a false nag.
+const MIG_STOP = new Set(['migration', 'migrations', 'sql', 'create', 'alter', 'table', 'drop', 'add', 'update', 'init', 'schema', 'public', 'new', 'fix', 'set', 'col', 'column', 'index']);
+// Split on EVERY non-alphanumeric (unlike the shared wordsOf, which keeps _- glued)
+// so `20260620000000_canvas_blob_size_limit` and the `#file-…` tag both tokenize
+// into the same words a card's prose carries — the precise match signal.
+const migWords = (s) => new Set(String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').split(' ').filter(Boolean));
+export function migrationSignature(file) {
+    const orig = String(file || '').replace(/\\/g, '/');
+    const base = orig.split('/').pop() || '';
+    const stem = base.replace(/\.[a-z0-9]+$/i, '');
+    const ts = (stem.match(/^\d{8,}/) || [''])[0];                      // leading timestamp id (Supabase/Prisma/Knex)
+    const distinctive = stem.replace(/^\d{8,}[_-]?/, '')               // drop the timestamp prefix → the descriptive name
+        .split(/[^a-z0-9]+/i).map(t => t.toLowerCase())
+        .filter(t => t.length >= 3 && !MIG_STOP.has(t));
+    return { path: orig, file: base, ts, distinctive };
+}
+// A migration is "recorded" if some LIVE (non-archived) card mentions its timestamp
+// id OR every distinctive word of its name (so "canvas" alone never claims to record
+// canvas_blob_size_limit, but a card carrying the #file-<stem> tag or the applied-
+// marker prose does). Returns the UNrecorded ones (capped); [] when there are no
+// migrations (plain projects stay silent).
+export function findUnrecordedMigrations(struct, files, { max = 6 } = {}) {
+    const empty = { gaps: [], total: 0, scanned: 0 };
+    const sigs = (files || []).map(migrationSignature).filter(s => s.ts || s.distinctive.length);
+    if (!sigs.length || !struct || !Array.isArray(struct.cards)) return empty;
+    const isArchived = (c) => /^archive$/i.test(c.area || '');
+    const cardWords = struct.cards
+        .filter(c => c && c.type !== 'container' && !isArchived(c))
+        .map(c => migWords(String(c.text || '') + ' ' + (c.tags || []).join(' ')));
+    const recorded = (sig) => cardWords.some(ws =>
+        (sig.ts && ws.has(sig.ts))
+        || (sig.distinctive.length > 0 && sig.distinctive.every(t => ws.has(t))));
+    const unrecorded = sigs.filter(s => !recorded(s));
+    return { gaps: unrecorded.slice(0, max).map(s => ({ file: s.file, path: s.path, ts: s.ts })), total: unrecorded.length, scanned: sigs.length };
+}
+
 // ── Repeat / redundancy detection ("you already did this in another session") ─
 // The PRECISION-first sibling of scoreCardsAgainstQuery. Instead of "related
 // context" it answers a sharper question: is the user about to REDO work that's

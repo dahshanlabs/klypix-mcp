@@ -24,6 +24,7 @@ import { z } from 'zod';
 import {
   parseKlypix, buildKlypix, buildKlypixMap, appendToKlypix, structToMarkdown,
   brainInsights, insightsToMarkdown, addBrainConnections, proposeStructuralConnections, atomicWrite,
+  findUnrecordedMigrations,
 } from './klypix-format.mjs';
 
 // ── Card / connection input shape (single source for every face) ─────────────
@@ -323,6 +324,46 @@ export async function opBrainInsights({ vault, canvas, staleDays }) {
   } catch (e) {
     return err(`Insights failed: ${e.message}`);
   }
+}
+
+// ── Migration reconcile (external-state omission tripwire) ────────────────────
+// Lists committed migration files under a project root (Supabase / Rails / Prisma
+// / Knex / generic layouts) and feeds them to the pure findUnrecordedMigrations(),
+// returning the ones no live brain card records. Portable: pure fs, no DB, no
+// network, no credentials — it flags "committed but unmentioned", NEVER claims
+// "applied to prod". Degrades to a clean message for a project with no migrations.
+const MIGRATION_DIRS = ['supabase/migrations', 'db/migrate', 'db/migrations', 'prisma/migrations', 'migrations'];
+export function collectMigrationFiles(root) {
+  const out = [];
+  for (const rel of MIGRATION_DIRS) {
+    const abs = path.join(root, ...rel.split('/'));
+    let entries;
+    try { entries = fs.readdirSync(abs, { withFileTypes: true }); } catch { continue; }
+    for (const e of entries) {
+      if (e.isFile() && /\.sql$/i.test(e.name)) out.push(rel + '/' + e.name);
+      // Prisma nests each migration in its own folder holding a migration.sql.
+      else if (e.isDirectory()) {
+        try { if (fs.statSync(path.join(abs, e.name, 'migration.sql')).isFile()) out.push(rel + '/' + e.name + '/migration.sql'); } catch { /* not a prisma migration dir */ }
+      }
+    }
+  }
+  return out;
+}
+export async function opBrainReconcile({ vault, canvas, root }) {
+  const file = resolveCanvas(vault, canvas || 'brain') || resolveCanvas(vault, 'brain.klypix');
+  if (!file) return err(`No brain canvas found in ${vault}. Pass canvas: "<name>".`);
+  let struct;
+  try { ({ struct } = await parseKlypix(fs.readFileSync(file))); } catch (e) { return err(`Read failed: ${e.message}`); }
+  // Migrations live in the CODE repo (usually beside brain.klypix), not in a
+  // separate canvas vault — so default the root to the brain file's folder.
+  const repoRoot = root ? path.resolve(root) : path.dirname(file);
+  const files = collectMigrationFiles(repoRoot);
+  if (!files.length) return { blocks: [text(`No migration files under ${repoRoot} (looked in: ${MIGRATION_DIRS.join(', ')}). Nothing to reconcile.`)] };
+  const { gaps, total } = findUnrecordedMigrations(struct, files, { max: 20 });
+  if (!gaps.length) return { blocks: [text(`✓ All ${files.length} migration(s) under ${path.basename(repoRoot)} are referenced by a brain card — no unrecorded rollouts.`)] };
+  const lines = gaps.map(g => `- \`${g.path}\` — committed, but no brain card mentions it. If applied to prod, record it:\n    \`🧠 BRAIN [DB] !: migration ${g.file.replace(/\.sql$/i, '')} applied to prod ev: ${g.path}\``);
+  const more = total > gaps.length ? `\n\n…and ${total - gaps.length} more.` : '';
+  return { blocks: [text(`# ⚠️ ${total} migration(s) committed but unrecorded in the brain\n_The brain can't see prod — it flags migrations that are in git but unmentioned, so you can confirm the rollout. It never asserts a migration was applied. To dismiss one without applying, record any card that names it (e.g. "committed, not applied")._\n\n${lines.join('\n')}${more}`)] };
 }
 
 export async function opBrainConnect({ vault, canvas, apply = false, max = 24, threshold = 0.45, log = () => {} }) {

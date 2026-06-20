@@ -23,7 +23,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import {
   resolveVault, getEmbedder, buildKlypixMap, cardSchema, connSchema,
   opListCanvases, opReadCanvas, opSearchCanvases, opSearchAllBrains,
-  opBrainInsights, opBrainConnect, opCreateCanvas, opAddToCanvas,
+  opBrainInsights, opBrainConnect, opBrainReconcile, opCreateCanvas, opAddToCanvas,
 } from '../src/klypix-core.mjs';
 
 // IMPORTANT: stdout is the JSON-RPC channel. Never console.log — only stderr.
@@ -111,6 +111,15 @@ server.registerTool('brain_connect', {
     threshold: z.number().optional().describe('Min semantic similarity 0–1 to link (default 0.45). Higher = fewer, tighter links.'),
   },
 }, async ({ canvas, apply, max, threshold }) => toContent(await opBrainConnect({ vault: VAULT, canvas, apply, max, threshold, log })));
+
+server.registerTool('brain_reconcile', {
+  title: 'Reconcile the brain against committed migrations (find unrecorded rollouts)',
+  description: 'External-state check the brain otherwise CANNOT do: a brain only knows facts someone narrated (a marker, a commit body), so a DB migration APPLIED to prod — which narrates nothing — silently never lands. This lists committed migration files (Supabase / Rails / Prisma / Knex / generic) under the project and flags any that NO brain card references, so you can confirm the rollout with one marker. It reads ONLY the filesystem — never the database, never the network — and never claims a migration was applied, only that it is unrecorded. Defaults to the migrations dir beside the project brain; pass root to point elsewhere. Run it when you want to be sure the brain reflects what actually shipped.',
+  inputSchema: {
+    canvas: z.string().optional().describe('Brain canvas filename/path. Defaults to the project brain ("brain").'),
+    root: z.string().optional().describe("Project root holding the migrations dir (default: the brain file's folder)."),
+  },
+}, async ({ canvas, root }) => toContent(await opBrainReconcile({ vault: VAULT, canvas, root })));
 
 server.registerTool('create_canvas', {
   title: 'Create a KLYPIX canvas',

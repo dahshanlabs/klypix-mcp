@@ -110,8 +110,16 @@ export function getEmbedder(log = () => {}) {
       let t;
       try { t = await import('@huggingface/transformers'); }
       catch {
-        const local = path.join(PB_DIR, 'semantic', 'node_modules', '@huggingface', 'transformers', 'dist', 'transformers.mjs');
-        t = await import(new URL('file:///' + local.replace(/\\/g, '/')).href);
+        // The optional dep ships dist/transformers.node.mjs on v4 (Node build) and
+        // dist/transformers.mjs on older lines — try both so a correct one-click
+        // install resolves regardless of version.
+        const base = path.join(PB_DIR, 'semantic', 'node_modules', '@huggingface', 'transformers', 'dist');
+        let lastErr;
+        for (const f of ['transformers.node.mjs', 'transformers.mjs']) {
+          try { t = await import(new URL('file:///' + path.join(base, f).replace(/\\/g, '/')).href); lastErr = null; break; }
+          catch (e) { lastErr = e; }
+        }
+        if (!t) throw lastErr;
       }
       t.env.cacheDir = path.join(PB_DIR, 'hf-cache');
       return await t.pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2', { dtype: 'q8' });

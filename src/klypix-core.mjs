@@ -24,7 +24,7 @@ import { z } from 'zod';
 import {
   parseKlypix, buildKlypix, buildKlypixMap, appendToKlypix, structToMarkdown,
   brainInsights, insightsToMarkdown, addBrainConnections, proposeStructuralConnections, atomicWrite,
-  findUnrecordedMigrations,
+  findUnrecordedMigrations, captureIntoBrain, tidyBrain, noteToCaptureInput,
 } from './klypix-format.mjs';
 
 // ── Card / connection input shape (single source for every face) ─────────────
@@ -462,6 +462,32 @@ export async function opAddToCanvas({ vault, canvas, cards, connections, via }) 
     };
   } catch (e) {
     return err(`Add failed: ${e.message}`);
+  }
+}
+
+// brain_note — the DELIBERATE, marker-aware write every agent (not just the
+// Claude-Code Stop hook) can make on demand. Routes through the SAME captureInto-
+// Brain engine the hook uses, so supersede / resolve / close-link / dedup behave
+// identically to a harvested 🧠 marker. The agent-neutral half of "the brain is an
+// open file any agent reads AND writes": a hookless client (Cursor/Cline/Desktop)
+// can now record a decision, ask an open question, mark a milestone, resolve a card,
+// or correct one — with the full lifecycle, not just a flat append.
+export async function opBrainNote({ vault, canvas, text: noteText, area, marker = '', closes, via }) {
+  const file = resolveCanvas(vault, canvas || 'brain') || resolveCanvas(vault, 'brain.klypix');
+  if (!file) return err(`No brain canvas found in ${vault}. Pass canvas: "<name>".`);
+  if (!noteText || !String(noteText).trim()) return err('brain_note needs a non-empty text.');
+  if (!['', '?', '!', '✓', '~'].includes(marker)) return err(`Invalid marker "${marker}" — use: (none)=decision · ?=open question · !=milestone · ✓=resolve a matching card · ~=update a matching card.`);
+  const input = noteToCaptureInput({ text: noteText, area, marker, closes: closes || '', createdVia: via || 'mcp' });
+  try {
+    const res = await captureIntoBrain(fs.readFileSync(file), input);
+    let out = res.buffer; try { out = (await tidyBrain(res.buffer)).buffer; } catch { /* keep append result if tidy fails */ }
+    await atomicWrite(file, out);
+    const s = res.stats || {};
+    const bits = [`${s.added || 0} added`];
+    for (const k of ['resolved', 'updated', 'closed', 'superseded', 'linked']) if (s[k]) bits.push(`${s[k]} ${k}`);
+    return { blocks: [text(`✓ brain_note → ${path.relative(vault, file)} (${bits.join(' · ')}). Reopen the brain in KLYPIX to see it.`)] };
+  } catch (e) {
+    return err(`brain_note failed (brain unchanged): ${e.message}`);
   }
 }
 

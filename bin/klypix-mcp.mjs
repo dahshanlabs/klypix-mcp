@@ -23,7 +23,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import {
   resolveVault, getEmbedder, buildKlypixMap, cardSchema, connSchema,
   opListCanvases, opReadCanvas, opSearchCanvases, opSearchAllBrains,
-  opBrainInsights, opBrainConnect, opBrainReconcile, opCreateCanvas, opAddToCanvas,
+  opBrainInsights, opBrainConnect, opBrainReconcile, opCreateCanvas, opAddToCanvas, opBrainNote,
 } from '../src/klypix-core.mjs';
 
 // IMPORTANT: stdout is the JSON-RPC channel. Never console.log — only stderr.
@@ -145,6 +145,21 @@ server.registerTool('add_to_canvas', {
   // initialize handshake — cursor / claude / cline).
   let via; try { via = server.server.getClientVersion()?.name; } catch { /* optional */ }
   return toContent(await opAddToCanvas({ vault: VAULT, canvas, cards, connections, via }));
+});
+
+server.registerTool('brain_note', {
+  title: 'Write a deliberate note to the project brain (decision / question / milestone / resolve / update)',
+  description: 'Record something in the project brain ON DEMAND — the agent-neutral twin of the Claude-Code capture hook, so any client (Cursor / Cline / Desktop) can write the brain, not just read it. Unlike add_to_canvas (a flat append), this routes through the brain\'s capture engine, so a new decision SUPERSEDES a heavily-overlapping older one, ✓ RESOLVES/archives a matching card, closes: resolves the strategy/question a milestone fulfils, and ~ UPDATES a card in place — the full decision lifecycle, with dedup. Use it to remember a decision, ask an open question, mark a milestone, resolve a finished item, or correct a card. Defaults to the project brain ("brain").',
+  inputSchema: {
+    text: z.string().describe('The note — one concise idea; the first line becomes the card title.'),
+    marker: z.enum(['', '?', '!', '✓', '~']).optional().describe('(none)=decision · ?=open question · !=milestone · ✓=resolve+archive the best-matching card · ~=update the matching card in place. Default: decision.'),
+    area: z.string().optional().describe('Area/topic — routes the card into that titled container and becomes a #tag (e.g. "Auth", "Release").'),
+    closes: z.string().optional().describe('Title or [[wikilink]] of a strategy/question card this note fulfils — resolves+archives it and draws a "closed by" arrow.'),
+    canvas: z.string().optional().describe('Brain canvas filename/path. Defaults to the project brain ("brain").'),
+  },
+}, async ({ text, marker, area, closes, canvas }) => {
+  let via; try { via = server.server.getClientVersion()?.name; } catch { /* optional */ }
+  return toContent(await opBrainNote({ vault: VAULT, canvas, text, area, marker: marker || '', closes, via }));
 });
 
 const transport = new StdioServerTransport();

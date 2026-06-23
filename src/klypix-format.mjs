@@ -1234,6 +1234,26 @@ export function findStaleOpenCards(struct, { coverAt = 0.6, max = 5 } = {}) {
     return { gaps: out.slice(0, max), total: out.length };
 }
 
+// ── Deliberate note → capture input ──────────────────────────────────────────
+// Turn ONE structured note into captureIntoBrain's input shape — the deliberate
+// twin of the Stop hook's transcript marker parser. This is what lets an ON-DEMAND
+// write (the brain_note MCP tool, the brain-note CLI — any agent, not just the
+// Claude-Code hook) get IDENTICAL supersede / resolve / close / dedup semantics as
+// a harvested 🧠 marker. marker ∈ '' (decision) | '?' (open question) | '!'
+// (milestone) | '✓' (resolve+archive a match) | '~' (update a match in place).
+export function noteToCaptureInput({ text = '', area = '', marker = '', closes = '', evidence = null, createdVia = 'mcp' } = {}) {
+    const body = String(text).trim();
+    if (!body) return { cards: [], resolutions: [], updates: [] };
+    const a = String(area || '').trim();
+    if (marker === '✓') return { cards: [], resolutions: [{ area: a, text: body }], updates: [] };
+    if (marker === '~') return { cards: [], resolutions: [], updates: [{ area: a, text: body, createdVia, ...(evidence ? { evidence } : {}) }] };
+    const prefix = marker === '?' ? '❓ ' : marker === '!' ? '🏁 ' : '';
+    const borderColor = marker === '?' ? 'rgba(245,166,35,0.8)' : marker === '!' ? 'rgba(59,130,246,0.8)' : 'rgba(16,185,129,0.6)';
+    const tag = a ? `\n#${a.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : '';
+    const cardText = (a ? `${a}: ${prefix}${body}` : `${prefix}${body}`) + tag;
+    return { cards: [{ text: cardText, area: a, color: '#e8e8ed', borderColor, createdVia, ...(closes ? { closes } : {}), ...(evidence ? { evidence } : {}) }], resolutions: [], updates: [] };
+}
+
 /**
  * Build a RICH "map" .klypix: areas become titled containers, their cards
  * stack inside, connections draw across. Produces a real spatial board (used by

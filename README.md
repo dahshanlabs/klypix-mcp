@@ -52,8 +52,28 @@ notes into a board,"* or *"add a card with the decision we just made."*
 | `list_canvases` | List every `.klypix` in the vault |
 | `read_canvas` | Read a canvas as markdown (cards, the connection graph, `[[links]]`, `#tags`) |
 | `search_canvases` | Search across canvases by name + content |
+| `search_all_brains` | Cross-project memory search across every registered brain |
+| `brain_insights` | Hubs, orphaned decisions, stale questions, area sizes |
+| `brain_connect` | Find + draw related-but-unlinked cards (densify the graph) |
+| `brain_reconcile` | Flag committed-but-unrecorded DB migrations (the brain can't see prod) |
 | `create_canvas` | Create a new `.klypix` from cards + connections |
 | `add_to_canvas` | Append cards/connections to an existing canvas (positions preserved) |
+
+### Tools vs. the *automatic* brain
+
+This package is the **agent-neutral read/write surface** — any MCP client (Claude
+Code, Claude Desktop, Cursor, Cline, Windsurf…) gets the **tools** above and can
+read, search, and write canvases on demand (*pull*). That works in any agent, in
+any project.
+
+The **automatic** brain — auto-capturing decisions from your work, injecting the
+relevant cards into each prompt, and coordinating across concurrent sessions
+(*push*) — runs in a host **hook**, which is a Claude Code / KLYPIX-desktop
+feature, not part of this npm package. So `npx klypix-mcp` gives you the tools
+everywhere; the hands-free brain comes with the [KLYPIX desktop app](https://klypix.com)
+or the Claude Code project-brain hook. (`search_all_brains` is also hook-fed — it
+reads the cross-project registry the hook writes, so it stays empty until a hook
+has registered at least one brain.)
 
 ## Also speaks A2A (Agent-to-Agent)
 

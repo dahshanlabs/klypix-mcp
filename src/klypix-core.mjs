@@ -386,12 +386,12 @@ export async function opBrainGarden({ vault, canvas, apply = false, syntheses })
   let struct;
   try { ({ struct } = await parseKlypix(fs.readFileSync(file))); } catch (e) { return err(`Read failed: ${e.message}`); }
   const areas = selectGardenCandidates(struct);
-  if (!areas.length) return { blocks: [text('Nothing to garden — no area has 3+ cards older than 14 days beyond its newest 8. The brain is tidy.')] };
+  if (!areas.length) return { blocks: [text('Nothing to garden — no area has 3+ DORMANT cards (old, beyond its newest 8, AND peripheral/≤1 link). Anything still woven into the graph is protected. The brain is tidy.')] };
 
   if (!apply) {
     const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
-    const body = areas.map(a => `## ${a.title}  (${a.candidates.length} cards)\n` + a.candidates.map(c => `- ${flat(c.text).slice(0, 240)}`).join('\n')).join('\n\n');
-    return { blocks: [text(`# 🌿 Gardener — ${areas.length} over-grown area(s) ready to consolidate\nFor EACH area below, write ONE tight synthesis (3-6 sentences, plain prose, no headers) that preserves every still-relevant fact / decision / number and drops only repetition + play-by-play. Then call \`brain_garden\` again with \`apply:true\` and \`syntheses: [{ "title": "<area title EXACTLY as shown>", "synthesis": "<text>" }, …]\`. Originals are archived with audit arrows — nothing is deleted; one undo un-gardens.\n\n${body}`)] };
+    const body = areas.map(a => `## ${a.title}  (${a.candidates.length} dormant cards)\n` + a.candidates.map(c => `- ${flat(c.text).slice(0, 240)}`).join('\n')).join('\n\n');
+    return { blocks: [text(`# 🌿 Gardener — ${areas.length} area(s) with DORMANT cards to consolidate\nThese are old, peripheral (≤1 link) cards only — hubs and still-referenced decisions were left untouched. For EACH area below, write ONE tight synthesis (3-6 sentences, plain prose, no headers) that preserves every still-relevant fact / decision / number and drops only repetition + play-by-play. Then call \`brain_garden\` again with \`apply:true\` and \`syntheses: [{ "title": "<area title EXACTLY as shown>", "synthesis": "<text>" }, …]\`. Originals are archived with audit arrows — nothing is deleted; one undo un-gardens.\n\n${body}`)] };
   }
 
   if (!Array.isArray(syntheses) || !syntheses.length) return err('apply:true needs syntheses:[{title, synthesis}, …] — run the dry run first (apply omitted) to get the areas + their cards.');

@@ -1210,14 +1210,29 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
 const GARDEN_KEEP_NEWEST = 8;       // per area, never consolidate the newest N
 const GARDEN_MIN_AGE_DAYS = 14;     // only cards older than this are candidates
 const GARDEN_MIN_CANDIDATES = 3;    // don't bother merging fewer than this
+const GARDEN_MAX_DEGREE = 1;        // SMART guard: protect load-bearing cards —
+//   only consolidate cards with ≤ this many connections (orphans + leaves). A
+//   card the graph leans on (degree ≥ 2) is signal, not noise, and is left alone.
 // Areas the gardener must never touch: human steering + config + its own output.
 const GARDEN_PROTECTED = /^(archive|📌?\s*focus|(🤖\s*)?(agent\s+)?instructions|open questions|pending)/i;
 
 // Deterministic candidate selection — PURE, so the model never chooses WHAT to
-// merge. Returns each over-grown area with its old cards (oldest first).
-export function selectGardenCandidates(struct, { keepNewest = GARDEN_KEEP_NEWEST, minAgeDays = GARDEN_MIN_AGE_DAYS, minCandidates = GARDEN_MIN_CANDIDATES, now = Date.now() } = {}) {
+// merge. SMART + non-invasive: a card is a candidate only if it's DORMANT —
+// old (> minAgeDays), beyond the area's newest N, AND peripheral (connection
+// degree ≤ maxDegree). That protects hubs and still-referenced cards (the spine
+// of the brain), so consolidation hits forgotten noise — the same cards
+// brain_insights flags as orphaned — never load-bearing decisions. Returns each
+// over-grown area with its dormant cards (oldest first), each tagged with degree.
+export function selectGardenCandidates(struct, { keepNewest = GARDEN_KEEP_NEWEST, minAgeDays = GARDEN_MIN_AGE_DAYS, minCandidates = GARDEN_MIN_CANDIDATES, maxDegree = GARDEN_MAX_DEGREE, now = Date.now() } = {}) {
     if (!struct || !Array.isArray(struct.cards)) return [];
     const cutoff = now - minAgeDays * 86_400_000;
+    // Connection degree per card — both ends of every edge. A card that is linked
+    // to (or links out to) the rest of the graph is structurally load-bearing.
+    const degree = new Map();
+    for (const cn of (struct.connections || [])) {
+        if (cn.fromId) degree.set(cn.fromId, (degree.get(cn.fromId) || 0) + 1);
+        if (cn.toId) degree.set(cn.toId, (degree.get(cn.toId) || 0) + 1);
+    }
     const out = [];
     for (const ctn of struct.cards) {
         if (ctn.type !== 'container') continue;
@@ -1226,8 +1241,10 @@ export function selectGardenCandidates(struct, { keepNewest = GARDEN_KEEP_NEWEST
         const children = struct.cards
             .filter(c => c.type === 'text' && c.parentId === ctn.id && (c.text || '').trim() && !/⤵|↩|✅/.test(c.text))
             .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
-        const old = children.slice(0, Math.max(0, children.length - keepNewest)).filter(c => (c.createdAt || 0) < cutoff);
-        if (old.length >= minCandidates) out.push({ containerId: ctn.id, title, candidates: old.map(c => ({ id: c.id, text: c.text, createdAt: c.createdAt || 0 })) });
+        const old = children
+            .slice(0, Math.max(0, children.length - keepNewest))
+            .filter(c => (c.createdAt || 0) < cutoff && (degree.get(c.id) || 0) <= maxDegree);  // dormant: old AND peripheral
+        if (old.length >= minCandidates) out.push({ containerId: ctn.id, title, candidates: old.map(c => ({ id: c.id, text: c.text, createdAt: c.createdAt || 0, degree: degree.get(c.id) || 0 })) });
     }
     return out;
 }

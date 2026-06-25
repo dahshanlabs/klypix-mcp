@@ -1200,6 +1200,127 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
     return { buffer: work, stats };
 }
 
+// ── Brain gardener — sleep-time consolidation with a visible audit trail ─────
+// The portable engine twin of the in-app /garden (so ANY agent can run it over
+// MCP, not just the KLYPIX canvas). Two phases, like brain_connect: the engine
+// SELECTS deterministically (the model never decides WHAT merges, only writes the
+// prose), the agent writes one synthesis per area, then the engine APPLIES — each
+// area gets a 🌿 synthesis card; the originals are stamped "⤵ consolidated", moved
+// to Archive, and arrowed → the synthesis. Nothing is deleted (archived verbatim).
+const GARDEN_KEEP_NEWEST = 8;       // per area, never consolidate the newest N
+const GARDEN_MIN_AGE_DAYS = 14;     // only cards older than this are candidates
+const GARDEN_MIN_CANDIDATES = 3;    // don't bother merging fewer than this
+// Areas the gardener must never touch: human steering + config + its own output.
+const GARDEN_PROTECTED = /^(archive|📌?\s*focus|(🤖\s*)?(agent\s+)?instructions|open questions|pending)/i;
+
+// Deterministic candidate selection — PURE, so the model never chooses WHAT to
+// merge. Returns each over-grown area with its old cards (oldest first).
+export function selectGardenCandidates(struct, { keepNewest = GARDEN_KEEP_NEWEST, minAgeDays = GARDEN_MIN_AGE_DAYS, minCandidates = GARDEN_MIN_CANDIDATES, now = Date.now() } = {}) {
+    if (!struct || !Array.isArray(struct.cards)) return [];
+    const cutoff = now - minAgeDays * 86_400_000;
+    const out = [];
+    for (const ctn of struct.cards) {
+        if (ctn.type !== 'container') continue;
+        const title = (ctn.title || '').trim();
+        if (!title || GARDEN_PROTECTED.test(title)) continue;
+        const children = struct.cards
+            .filter(c => c.type === 'text' && c.parentId === ctn.id && (c.text || '').trim() && !/⤵|↩|✅/.test(c.text))
+            .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+        const old = children.slice(0, Math.max(0, children.length - keepNewest)).filter(c => (c.createdAt || 0) < cutoff);
+        if (old.length >= minCandidates) out.push({ containerId: ctn.id, title, candidates: old.map(c => ({ id: c.id, text: c.text, createdAt: c.createdAt || 0 })) });
+    }
+    return out;
+}
+
+// Apply: re-selects deterministically (robust to drift since the dry-run) and,
+// for each area the agent supplied a synthesis for, adds the 🌿 card + archives
+// the originals with audit arrows. `syntheses`: [{ title, synthesis }].
+export async function applyGarden(buffer, { syntheses = [] } = {}) {
+    const stats = { areas: 0, archived: 0, synthCards: 0 };
+    const { zip, canvas, manifest, isV4, struct } = await parseKlypix(buffer);
+    if (!isV4 || !canvas.positions) throw new Error('garden needs a v4 .klypix');
+    const areas = selectGardenCandidates(struct);
+    const synthByTitle = new Map();
+    for (const s of syntheses || []) { const t = String(s?.title || '').trim().toLowerCase(); const txt = String(s?.synthesis || '').trim(); if (t && txt) synthByTitle.set(t, txt); }
+    if (!areas.length || !synthByTitle.size) return { buffer, stats };
+
+    const now = Date.now();
+    const today = new Date(now).toISOString().slice(0, 10);
+    const rand = () => Math.random().toString(36).slice(2, 10);
+    const top = Object.values(canvas.positions).map(p => p && p.zKey).filter(k => k && isValidZKey(k)).sort().pop() || null;
+    const nextZKey = makeZKeyGen(top);
+    canvas.connections = Array.isArray(canvas.connections) ? canvas.connections : [];
+    const byTitle = new Map();
+    for (const c of struct.cards) if (c.type === 'container') { const t = (c.title || '').trim().toLowerCase(); if (t && !byTitle.has(t)) byTitle.set(t, c.id); }
+    // Archive primitives (mirror captureIntoBrain): find-or-create Archive, move a
+    // card into it un-baking any group-shrink, and rewrite a card's text in place.
+    const ensureArchive = () => {
+        let id = byTitle.get('archive');
+        if (id) return id;
+        id = `ctn_${rand()}`;
+        const G = BRAIN_GEOM;
+        zip.file(`items/${shard(id)}/${id}.json`, JSON.stringify({ type: 'container', locked: false, createdAt: now, createdBy: 'agent', title: 'Archive', collapsed: false, scopeLocked: false, borderColor: 'rgba(120,120,135,0.6)' }));
+        canvas.positions[id] = { x: nextContainerX(canvas), y: G.START, w: G.AREA_W, h: G.TITLE_BAR + G.PAD * 2, zKey: nextZKey(), zIndex: canvas.order.length, parentId: null };
+        canvas.order.push(id);
+        byTitle.set('archive', id);
+        return id;
+    };
+    const rewriteCard = async (id, mutate) => {
+        const ip = `items/${shard(id)}/${id}.json`;
+        const f = zip.file(ip); if (!f) return false;
+        const j = JSON.parse(await f.async('string'));
+        mutate(j);
+        j.content = wrapText(String(j.content || ''));
+        zip.file(ip, JSON.stringify(j));
+        const pos = canvas.positions[id];
+        if (pos) canvas.positions[id] = { ...pos, h: measureCardH(j.content) };
+        return true;
+    };
+    const archiveCard = async (id) => {
+        const arc = ensureArchive();
+        let authoredW = null;
+        const ip = `items/${shard(id)}/${id}.json`;
+        const f = zip.file(ip);
+        if (f) {
+            const j = JSON.parse(await f.async('string'));
+            const a = j.authoredInParent;
+            if (a) {
+                if (j.type === 'text' && a.fontSize) j.fontSize = a.fontSize;
+                if (a.authoredWidth != null) j.authoredWidth = a.authoredWidth;
+                authoredW = a.w || null;
+                delete j.authoredInParent;
+                zip.file(ip, JSON.stringify(j));
+            }
+        }
+        const pos = canvas.positions[id];
+        if (pos) canvas.positions[id] = { ...pos, parentId: arc, ...(authoredW ? { w: authoredW } : {}) };
+    };
+
+    for (const area of areas) {
+        const synthesis = synthByTitle.get(area.title.trim().toLowerCase());
+        if (!synthesis) continue;                          // model skipped this area — leave it untouched
+        const ctnPos = canvas.positions[area.containerId];
+        if (!ctnPos) continue;
+        const span = `${new Date(area.candidates[0].createdAt || now).toISOString().slice(0, 10)} → ${new Date(area.candidates[area.candidates.length - 1].createdAt || now).toISOString().slice(0, 10)}`;
+        const content = wrapText(`${area.title}: 🌿 Consolidated history (${span}, ${area.candidates.length} cards)\n${synthesis}`);
+        const sid = `txt_${rand()}`;
+        zip.file(`items/${shard(sid)}/${sid}.json`, JSON.stringify({ type: 'text', locked: false, createdAt: now, createdBy: 'agent', createdVia: 'gardener', content, fontSize: 12, color: '#e8e8ed', border: true, borderColor: 'rgba(59,130,246,0.6)', heading: false }));
+        canvas.positions[sid] = { x: ctnPos.x + 20, y: ctnPos.y + (ctnPos.h || 0) + 10, w: 300, h: measureCardH(content), zKey: nextZKey(), zIndex: canvas.order.length, parentId: area.containerId };
+        canvas.order.push(sid);
+        stats.synthCards++;
+        for (const cand of area.candidates) {
+            await rewriteCard(cand.id, j => { j.content = `⤵ consolidated ${today}\n${j.content}`; j.borderColor = 'rgba(120,120,135,0.5)'; });
+            await archiveCard(cand.id);
+            canvas.connections.push({ id: `con_${rand()}`, fromId: cand.id, toId: sid, relationship: 'relates_to', label: 'consolidated into', arrowHead: true, width: 1.5, color: 'rgba(120,120,135,0.7)', style: 'solid' });
+            stats.archived++;
+        }
+        stats.areas++;
+    }
+    if (!stats.synthCards) return { buffer, stats };
+    const out = await finalizeBrainZip(zip, canvas, manifest, now);
+    return { buffer: out, stats };
+}
+
 // ── Stale-open reconcile ("marked open, but a milestone says it's done") ─────
 // The READ-side twin of the closes: write path. An open ❓/🎯 card lingers as
 // "still to do" forever unless someone emits a ✓/closes: for it — so a goal that

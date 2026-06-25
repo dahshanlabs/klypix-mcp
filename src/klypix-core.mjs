@@ -25,6 +25,7 @@ import {
   parseKlypix, buildKlypix, buildKlypixMap, appendToKlypix, structToMarkdown,
   brainInsights, insightsToMarkdown, addBrainConnections, proposeStructuralConnections, atomicWrite,
   findUnrecordedMigrations, captureIntoBrain, tidyBrain, noteToCaptureInput,
+  selectGardenCandidates, applyGarden,
 } from './klypix-format.mjs';
 
 // ── Card / connection input shape (single source for every face) ─────────────
@@ -372,6 +373,37 @@ export async function opBrainReconcile({ vault, canvas, root }) {
   const lines = gaps.map(g => `- \`${g.path}\` — committed, but no brain card mentions it. If applied to prod, record it:\n    \`🧠 BRAIN [DB] !: migration ${g.file.replace(/\.sql$/i, '')} applied to prod ev: ${g.path}\``);
   const more = total > gaps.length ? `\n\n…and ${total - gaps.length} more.` : '';
   return { blocks: [text(`# ⚠️ ${total} migration(s) committed but unrecorded in the brain\n_The brain can't see prod — it flags migrations that are in git but unmentioned, so you can confirm the rollout. It never asserts a migration was applied. To dismiss one without applying, record any card that names it (e.g. "committed, not applied")._\n\n${lines.join('\n')}${more}`)] };
+}
+
+// ── Brain gardener (two-phase: select → agent synthesizes → apply) ───────────
+// The portable /garden. Dry-run returns the over-grown areas + their old cards
+// for the CALLING agent to synthesize (the engine is pure — the model writes the
+// prose); apply consolidates each area into a 🌿 card and archives the originals
+// with audit arrows. Mirrors brain_connect's dry-run/apply discipline.
+export async function opBrainGarden({ vault, canvas, apply = false, syntheses }) {
+  const file = resolveCanvas(vault, canvas || 'brain') || resolveCanvas(vault, 'brain.klypix');
+  if (!file) return err(`No brain canvas found in ${vault}. Pass canvas: "<name>".`);
+  let struct;
+  try { ({ struct } = await parseKlypix(fs.readFileSync(file))); } catch (e) { return err(`Read failed: ${e.message}`); }
+  const areas = selectGardenCandidates(struct);
+  if (!areas.length) return { blocks: [text('Nothing to garden — no area has 3+ cards older than 14 days beyond its newest 8. The brain is tidy.')] };
+
+  if (!apply) {
+    const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+    const body = areas.map(a => `## ${a.title}  (${a.candidates.length} cards)\n` + a.candidates.map(c => `- ${flat(c.text).slice(0, 240)}`).join('\n')).join('\n\n');
+    return { blocks: [text(`# 🌿 Gardener — ${areas.length} over-grown area(s) ready to consolidate\nFor EACH area below, write ONE tight synthesis (3-6 sentences, plain prose, no headers) that preserves every still-relevant fact / decision / number and drops only repetition + play-by-play. Then call \`brain_garden\` again with \`apply:true\` and \`syntheses: [{ "title": "<area title EXACTLY as shown>", "synthesis": "<text>" }, …]\`. Originals are archived with audit arrows — nothing is deleted; one undo un-gardens.\n\n${body}`)] };
+  }
+
+  if (!Array.isArray(syntheses) || !syntheses.length) return err('apply:true needs syntheses:[{title, synthesis}, …] — run the dry run first (apply omitted) to get the areas + their cards.');
+  try {
+    const { buffer, stats } = await applyGarden(fs.readFileSync(file), { syntheses });
+    if (!stats.synthCards) return { blocks: [text('No areas consolidated — each synthesis `title` must match a dry-run area title exactly.')] };
+    let out = buffer; try { out = (await tidyBrain(buffer)).buffer; } catch { /* keep apply result if tidy fails */ }
+    await atomicWrite(file, out);
+    return { blocks: [text(`🌿 Gardened ${stats.areas} area(s): ${stats.archived} old card(s) → ${stats.synthCards} synthesis card(s); originals archived with "consolidated into" arrows. Reopen the brain in KLYPIX to see it.`)] };
+  } catch (e) {
+    return err(`Garden apply failed (brain unchanged): ${e.message}`);
+  }
 }
 
 export async function opBrainConnect({ vault, canvas, apply = false, max = 24, threshold = 0.45, log = () => {} }) {

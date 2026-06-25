@@ -23,7 +23,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import {
   resolveVault, getEmbedder, buildKlypixMap, cardSchema, connSchema,
   opListCanvases, opReadCanvas, opSearchCanvases, opSearchAllBrains,
-  opBrainInsights, opBrainConnect, opBrainReconcile, opCreateCanvas, opAddToCanvas, opBrainNote,
+  opBrainInsights, opBrainConnect, opBrainReconcile, opBrainGarden, opCreateCanvas, opAddToCanvas, opBrainNote,
 } from '../src/klypix-core.mjs';
 
 // IMPORTANT: stdout is the JSON-RPC channel. Never console.log — only stderr.
@@ -120,6 +120,19 @@ server.registerTool('brain_reconcile', {
     root: z.string().optional().describe("Project root holding the migrations dir (default: the brain file's folder)."),
   },
 }, async ({ canvas, root }) => toContent(await opBrainReconcile({ vault: VAULT, canvas, root })));
+
+server.registerTool('brain_garden', {
+  title: 'Garden the brain — consolidate over-grown areas (sleep-time compute)',
+  description: 'Tidy an over-grown brain WITHOUT losing anything — SMART and non-invasive: it only consolidates DORMANT cards (old + peripheral), never load-bearing ones. Two phases: call it with no apply to get the areas that have accumulated forgotten cards (deterministic: >3 cards that are older than 14 days, beyond the area\'s newest 8, AND have ≤1 connection — so hubs and still-referenced decisions are left untouched; Focus/Instructions/Archive/Open-questions areas protected) plus their card text; YOU write one tight synthesis per area; then call again with apply:true and syntheses:[{title, synthesis}]. Each area gets a 🌿 synthesis card, the originals are stamped "⤵ consolidated", moved to Archive, and arrowed to the synthesis — nothing is deleted, and one undo un-gardens. Run it when brain_insights or the brief shows an area has grown noisy.',
+  inputSchema: {
+    canvas: z.string().optional().describe('Brain canvas filename/path. Defaults to the project brain ("brain").'),
+    apply: z.boolean().optional().describe('false (default) = list over-grown areas + cards to synthesize; true = consolidate using the supplied syntheses.'),
+    syntheses: z.array(z.object({
+      title: z.string().describe('Area title EXACTLY as returned by the dry run.'),
+      synthesis: z.string().describe('3-6 sentence prose synthesis preserving every still-relevant fact/decision/number.'),
+    })).optional().describe('Required when apply:true — one entry per area you want consolidated.'),
+  },
+}, async ({ canvas, apply, syntheses }) => toContent(await opBrainGarden({ vault: VAULT, canvas, apply, syntheses })));
 
 server.registerTool('create_canvas', {
   title: 'Create a KLYPIX canvas',

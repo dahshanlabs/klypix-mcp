@@ -1200,6 +1200,175 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
     return { buffer: work, stats };
 }
 
+// ── Brain gardener — sleep-time consolidation with a visible audit trail ─────
+// The portable engine twin of the in-app /garden (so ANY agent can run it over
+// MCP, not just the KLYPIX canvas). Two phases, like brain_connect: the engine
+// SELECTS deterministically (the model never decides WHAT merges, only writes the
+// prose), the agent writes one synthesis per area, then the engine APPLIES — each
+// area gets a 🌿 synthesis card; the originals are stamped "⤵ consolidated", moved
+// to Archive, and arrowed → the synthesis. Nothing is deleted (archived verbatim).
+const GARDEN_KEEP_NEWEST = 8;       // per area, never consolidate the newest N
+const GARDEN_MIN_AGE_DAYS = 14;     // only cards older than this are candidates
+const GARDEN_MIN_CANDIDATES = 3;    // don't bother merging fewer than this
+const GARDEN_MAX_DEGREE = 1;        // SMART guard: protect load-bearing cards —
+//   only consolidate cards with ≤ this many connections (orphans + leaves). A
+//   card the graph leans on (degree ≥ 2) is signal, not noise, and is left alone.
+// Areas the gardener must never touch: human steering + config + its own output.
+const GARDEN_PROTECTED = /^(archive|📌?\s*focus|(🤖\s*)?(agent\s+)?instructions|open questions|pending)/i;
+// Faithfulness guard: a synthesis shorter than this (after whitespace-collapse)
+// is treated as degenerate (model returned a stub) and its area is skipped.
+const MIN_SYNTHESIS_CHARS = 60;
+// Distinct "figures" worth never losing — tokens carrying ≥2 digits (versions
+// 1.3.7, dates 2026-06-24, sizes 50mb, counts 326, migration ids). Trivial single
+// digits (1, 3) are ignored. Used to append any prose-dropped figure verbatim.
+const figuresIn = (text) => {
+    const out = new Set();
+    for (const m of String(text || '').matchAll(/[0-9][0-9a-zA-Z._:-]*/g)) {
+        const tok = m[0].replace(/[._:-]+$/, '').toLowerCase();
+        if ((tok.match(/\d/g) || []).length >= 2) out.add(tok);
+    }
+    return out;
+};
+
+// Deterministic candidate selection — PURE, so the model never chooses WHAT to
+// merge. SMART + non-invasive: a card is a candidate only if it's DORMANT —
+// old (> minAgeDays), beyond the area's newest N, AND peripheral (connection
+// degree ≤ maxDegree). That protects hubs and still-referenced cards (the spine
+// of the brain), so consolidation hits forgotten noise — the same cards
+// brain_insights flags as orphaned — never load-bearing decisions. Returns each
+// over-grown area with its dormant cards (oldest first), each tagged with degree.
+export function selectGardenCandidates(struct, { keepNewest = GARDEN_KEEP_NEWEST, minAgeDays = GARDEN_MIN_AGE_DAYS, minCandidates = GARDEN_MIN_CANDIDATES, maxDegree = GARDEN_MAX_DEGREE, now = Date.now() } = {}) {
+    if (!struct || !Array.isArray(struct.cards)) return [];
+    const cutoff = now - minAgeDays * 86_400_000;
+    // Connection degree per card — both ends of every edge. A card that is linked
+    // to (or links out to) the rest of the graph is structurally load-bearing.
+    const degree = new Map();
+    for (const cn of (struct.connections || [])) {
+        if (cn.fromId) degree.set(cn.fromId, (degree.get(cn.fromId) || 0) + 1);
+        if (cn.toId) degree.set(cn.toId, (degree.get(cn.toId) || 0) + 1);
+    }
+    const out = [];
+    for (const ctn of struct.cards) {
+        if (ctn.type !== 'container') continue;
+        const title = (ctn.title || '').trim();
+        if (!title || GARDEN_PROTECTED.test(title)) continue;
+        const children = struct.cards
+            .filter(c => c.type === 'text' && c.parentId === ctn.id && (c.text || '').trim() && !/⤵|↩|✅/.test(c.text))
+            .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+        const old = children
+            .slice(0, Math.max(0, children.length - keepNewest))
+            .filter(c => (c.createdAt || 0) < cutoff && (degree.get(c.id) || 0) <= maxDegree);  // dormant: old AND peripheral
+        if (old.length >= minCandidates) out.push({ containerId: ctn.id, title, candidates: old.map(c => ({ id: c.id, text: c.text, createdAt: c.createdAt || 0, degree: degree.get(c.id) || 0 })) });
+    }
+    return out;
+}
+
+// Apply: re-selects deterministically (robust to drift since the dry-run) and,
+// for each area the agent supplied a synthesis for, adds the 🌿 card + archives
+// the originals with audit arrows. `syntheses`: [{ title, synthesis }].
+export async function applyGarden(buffer, { syntheses = [] } = {}) {
+    const stats = { areas: 0, archived: 0, synthCards: 0, skipped: [] };
+    const { zip, canvas, manifest, isV4, struct } = await parseKlypix(buffer);
+    if (!isV4 || !canvas.positions) throw new Error('garden needs a v4 .klypix');
+    const areas = selectGardenCandidates(struct);
+    const synthByTitle = new Map();
+    for (const s of syntheses || []) { const t = String(s?.title || '').trim().toLowerCase(); const txt = String(s?.synthesis || '').trim(); if (t && txt) synthByTitle.set(t, txt); }
+    if (!areas.length || !synthByTitle.size) return { buffer, stats };
+
+    const now = Date.now();
+    const today = new Date(now).toISOString().slice(0, 10);
+    const rand = () => Math.random().toString(36).slice(2, 10);
+    const top = Object.values(canvas.positions).map(p => p && p.zKey).filter(k => k && isValidZKey(k)).sort().pop() || null;
+    const nextZKey = makeZKeyGen(top);
+    canvas.connections = Array.isArray(canvas.connections) ? canvas.connections : [];
+    const byTitle = new Map();
+    for (const c of struct.cards) if (c.type === 'container') { const t = (c.title || '').trim().toLowerCase(); if (t && !byTitle.has(t)) byTitle.set(t, c.id); }
+    // Archive primitives (mirror captureIntoBrain): find-or-create Archive, move a
+    // card into it un-baking any group-shrink, and rewrite a card's text in place.
+    const ensureArchive = () => {
+        let id = byTitle.get('archive');
+        if (id) return id;
+        id = `ctn_${rand()}`;
+        const G = BRAIN_GEOM;
+        zip.file(`items/${shard(id)}/${id}.json`, JSON.stringify({ type: 'container', locked: false, createdAt: now, createdBy: 'agent', title: 'Archive', collapsed: false, scopeLocked: false, borderColor: 'rgba(120,120,135,0.6)' }));
+        canvas.positions[id] = { x: nextContainerX(canvas), y: G.START, w: G.AREA_W, h: G.TITLE_BAR + G.PAD * 2, zKey: nextZKey(), zIndex: canvas.order.length, parentId: null };
+        canvas.order.push(id);
+        byTitle.set('archive', id);
+        return id;
+    };
+    const rewriteCard = async (id, mutate) => {
+        const ip = `items/${shard(id)}/${id}.json`;
+        const f = zip.file(ip); if (!f) return false;
+        const j = JSON.parse(await f.async('string'));
+        mutate(j);
+        j.content = wrapText(String(j.content || ''));
+        zip.file(ip, JSON.stringify(j));
+        const pos = canvas.positions[id];
+        if (pos) canvas.positions[id] = { ...pos, h: measureCardH(j.content) };
+        return true;
+    };
+    const archiveCard = async (id) => {
+        const arc = ensureArchive();
+        let authoredW = null;
+        const ip = `items/${shard(id)}/${id}.json`;
+        const f = zip.file(ip);
+        if (f) {
+            const j = JSON.parse(await f.async('string'));
+            const a = j.authoredInParent;
+            if (a) {
+                if (j.type === 'text' && a.fontSize) j.fontSize = a.fontSize;
+                if (a.authoredWidth != null) j.authoredWidth = a.authoredWidth;
+                authoredW = a.w || null;
+                delete j.authoredInParent;
+                zip.file(ip, JSON.stringify(j));
+            }
+        }
+        const pos = canvas.positions[id];
+        if (pos) canvas.positions[id] = { ...pos, parentId: arc, ...(authoredW ? { w: authoredW } : {}) };
+    };
+
+    for (const area of areas) {
+        const synthesis = synthByTitle.get(area.title.trim().toLowerCase());
+        if (!synthesis) continue;                          // model skipped this area — leave it untouched
+        const ctnPos = canvas.positions[area.containerId];
+        if (!ctnPos) continue;
+        // FAITHFULNESS GUARD (1) — degeneracy: a synthesis far too thin for the
+        // cards it replaces is rejected; that area is left untouched + reported,
+        // so a one-word "done" can't bury real history. (Originals stay put.)
+        const collapsed = synthesis.replace(/\s+/g, ' ').trim();
+        if (collapsed.length < MIN_SYNTHESIS_CHARS) {
+            stats.skipped.push({ title: area.title, reason: `synthesis too thin (${collapsed.length} chars, need ${MIN_SYNTHESIS_CHARS}) — revise and re-apply` });
+            continue;
+        }
+        // FAITHFULNESS GUARD (2) — figures net: any distinct number (version /
+        // size / date / count) in the originals that the prose dropped is appended
+        // verbatim, so the crispest facts survive on the visible card even if the
+        // synthesis missed them. The originals are archived verbatim regardless.
+        const origFigs = new Set();
+        for (const c of area.candidates) for (const f of figuresIn(c.text)) origFigs.add(f);
+        const synLower = synthesis.toLowerCase();
+        const missing = [...origFigs].filter(f => !synLower.includes(f));
+        const finalSynth = missing.length ? `${synthesis}\n↳ figures: ${missing.slice(0, 10).join(', ')}${missing.length > 10 ? ' …' : ''}` : synthesis;
+        const span = `${new Date(area.candidates[0].createdAt || now).toISOString().slice(0, 10)} → ${new Date(area.candidates[area.candidates.length - 1].createdAt || now).toISOString().slice(0, 10)}`;
+        const content = wrapText(`${area.title}: 🌿 Consolidated history (${span}, ${area.candidates.length} cards)\n${finalSynth}`);
+        const sid = `txt_${rand()}`;
+        zip.file(`items/${shard(sid)}/${sid}.json`, JSON.stringify({ type: 'text', locked: false, createdAt: now, createdBy: 'agent', createdVia: 'gardener', content, fontSize: 12, color: '#e8e8ed', border: true, borderColor: 'rgba(59,130,246,0.6)', heading: false }));
+        canvas.positions[sid] = { x: ctnPos.x + 20, y: ctnPos.y + (ctnPos.h || 0) + 10, w: 300, h: measureCardH(content), zKey: nextZKey(), zIndex: canvas.order.length, parentId: area.containerId };
+        canvas.order.push(sid);
+        stats.synthCards++;
+        for (const cand of area.candidates) {
+            await rewriteCard(cand.id, j => { j.content = `⤵ consolidated ${today}\n${j.content}`; j.borderColor = 'rgba(120,120,135,0.5)'; });
+            await archiveCard(cand.id);
+            canvas.connections.push({ id: `con_${rand()}`, fromId: cand.id, toId: sid, relationship: 'relates_to', label: 'consolidated into', arrowHead: true, width: 1.5, color: 'rgba(120,120,135,0.7)', style: 'solid' });
+            stats.archived++;
+        }
+        stats.areas++;
+    }
+    if (!stats.synthCards) return { buffer, stats };
+    const out = await finalizeBrainZip(zip, canvas, manifest, now);
+    return { buffer: out, stats };
+}
+
 // ── Stale-open reconcile ("marked open, but a milestone says it's done") ─────
 // The READ-side twin of the closes: write path. An open ❓/🎯 card lingers as
 // "still to do" forever unless someone emits a ✓/closes: for it — so a goal that

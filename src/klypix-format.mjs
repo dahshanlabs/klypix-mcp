@@ -1335,8 +1335,9 @@ export async function applyGarden(buffer, { syntheses = [] } = {}) {
         // FAITHFULNESS GUARD (1) — degeneracy: a synthesis far too thin for the
         // cards it replaces is rejected; that area is left untouched + reported,
         // so a one-word "done" can't bury real history. (Originals stay put.)
-        if (synthesis.replace(/\s+/g, ' ').trim().length < MIN_SYNTHESIS_CHARS) {
-            stats.skipped.push({ title: area.title, reason: `synthesis too thin (${synthesis.trim().length} chars) — revise and re-apply` });
+        const collapsed = synthesis.replace(/\s+/g, ' ').trim();
+        if (collapsed.length < MIN_SYNTHESIS_CHARS) {
+            stats.skipped.push({ title: area.title, reason: `synthesis too thin (${collapsed.length} chars, need ${MIN_SYNTHESIS_CHARS}) — revise and re-apply` });
             continue;
         }
         // FAITHFULNESS GUARD (2) — figures net: any distinct number (version /

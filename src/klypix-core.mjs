@@ -397,10 +397,13 @@ export async function opBrainGarden({ vault, canvas, apply = false, syntheses })
   if (!Array.isArray(syntheses) || !syntheses.length) return err('apply:true needs syntheses:[{title, synthesis}, …] — run the dry run first (apply omitted) to get the areas + their cards.');
   try {
     const { buffer, stats } = await applyGarden(fs.readFileSync(file), { syntheses });
-    if (!stats.synthCards) return { blocks: [text('No areas consolidated — each synthesis `title` must match a dry-run area title exactly.')] };
+    const skippedNote = (stats.skipped && stats.skipped.length)
+      ? `\n\n⚠️ Left untouched (faithfulness guard): ${stats.skipped.map(s => `"${s.title}" — ${s.reason}`).join('; ')}.`
+      : '';
+    if (!stats.synthCards) return { blocks: [text(`No areas consolidated — each synthesis \`title\` must match a dry-run area title exactly.${skippedNote}`)] };
     let out = buffer; try { out = (await tidyBrain(buffer)).buffer; } catch { /* keep apply result if tidy fails */ }
     await atomicWrite(file, out);
-    return { blocks: [text(`🌿 Gardened ${stats.areas} area(s): ${stats.archived} old card(s) → ${stats.synthCards} synthesis card(s); originals archived with "consolidated into" arrows. Reopen the brain in KLYPIX to see it.`)] };
+    return { blocks: [text(`🌿 Gardened ${stats.areas} area(s): ${stats.archived} old card(s) → ${stats.synthCards} synthesis card(s); originals archived with "consolidated into" arrows (any prose-dropped figures appended verbatim). Reopen the brain in KLYPIX to see it.${skippedNote}`)] };
   } catch (e) {
     return err(`Garden apply failed (brain unchanged): ${e.message}`);
   }

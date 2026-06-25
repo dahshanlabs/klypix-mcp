@@ -1215,6 +1215,20 @@ const GARDEN_MAX_DEGREE = 1;        // SMART guard: protect load-bearing cards �
 //   card the graph leans on (degree ≥ 2) is signal, not noise, and is left alone.
 // Areas the gardener must never touch: human steering + config + its own output.
 const GARDEN_PROTECTED = /^(archive|📌?\s*focus|(🤖\s*)?(agent\s+)?instructions|open questions|pending)/i;
+// Faithfulness guard: a synthesis shorter than this (after whitespace-collapse)
+// is treated as degenerate (model returned a stub) and its area is skipped.
+const MIN_SYNTHESIS_CHARS = 60;
+// Distinct "figures" worth never losing — tokens carrying ≥2 digits (versions
+// 1.3.7, dates 2026-06-24, sizes 50mb, counts 326, migration ids). Trivial single
+// digits (1, 3) are ignored. Used to append any prose-dropped figure verbatim.
+const figuresIn = (text) => {
+    const out = new Set();
+    for (const m of String(text || '').matchAll(/[0-9][0-9a-zA-Z._:-]*/g)) {
+        const tok = m[0].replace(/[._:-]+$/, '').toLowerCase();
+        if ((tok.match(/\d/g) || []).length >= 2) out.add(tok);
+    }
+    return out;
+};
 
 // Deterministic candidate selection — PURE, so the model never chooses WHAT to
 // merge. SMART + non-invasive: a card is a candidate only if it's DORMANT —
@@ -1253,7 +1267,7 @@ export function selectGardenCandidates(struct, { keepNewest = GARDEN_KEEP_NEWEST
 // for each area the agent supplied a synthesis for, adds the 🌿 card + archives
 // the originals with audit arrows. `syntheses`: [{ title, synthesis }].
 export async function applyGarden(buffer, { syntheses = [] } = {}) {
-    const stats = { areas: 0, archived: 0, synthCards: 0 };
+    const stats = { areas: 0, archived: 0, synthCards: 0, skipped: [] };
     const { zip, canvas, manifest, isV4, struct } = await parseKlypix(buffer);
     if (!isV4 || !canvas.positions) throw new Error('garden needs a v4 .klypix');
     const areas = selectGardenCandidates(struct);
@@ -1318,8 +1332,24 @@ export async function applyGarden(buffer, { syntheses = [] } = {}) {
         if (!synthesis) continue;                          // model skipped this area — leave it untouched
         const ctnPos = canvas.positions[area.containerId];
         if (!ctnPos) continue;
+        // FAITHFULNESS GUARD (1) — degeneracy: a synthesis far too thin for the
+        // cards it replaces is rejected; that area is left untouched + reported,
+        // so a one-word "done" can't bury real history. (Originals stay put.)
+        if (synthesis.replace(/\s+/g, ' ').trim().length < MIN_SYNTHESIS_CHARS) {
+            stats.skipped.push({ title: area.title, reason: `synthesis too thin (${synthesis.trim().length} chars) — revise and re-apply` });
+            continue;
+        }
+        // FAITHFULNESS GUARD (2) — figures net: any distinct number (version /
+        // size / date / count) in the originals that the prose dropped is appended
+        // verbatim, so the crispest facts survive on the visible card even if the
+        // synthesis missed them. The originals are archived verbatim regardless.
+        const origFigs = new Set();
+        for (const c of area.candidates) for (const f of figuresIn(c.text)) origFigs.add(f);
+        const synLower = synthesis.toLowerCase();
+        const missing = [...origFigs].filter(f => !synLower.includes(f));
+        const finalSynth = missing.length ? `${synthesis}\n↳ figures: ${missing.slice(0, 10).join(', ')}${missing.length > 10 ? ' …' : ''}` : synthesis;
         const span = `${new Date(area.candidates[0].createdAt || now).toISOString().slice(0, 10)} → ${new Date(area.candidates[area.candidates.length - 1].createdAt || now).toISOString().slice(0, 10)}`;
-        const content = wrapText(`${area.title}: 🌿 Consolidated history (${span}, ${area.candidates.length} cards)\n${synthesis}`);
+        const content = wrapText(`${area.title}: 🌿 Consolidated history (${span}, ${area.candidates.length} cards)\n${finalSynth}`);
         const sid = `txt_${rand()}`;
         zip.file(`items/${shard(sid)}/${sid}.json`, JSON.stringify({ type: 'text', locked: false, createdAt: now, createdBy: 'agent', createdVia: 'gardener', content, fontSize: 12, color: '#e8e8ed', border: true, borderColor: 'rgba(59,130,246,0.6)', heading: false }));
         canvas.positions[sid] = { x: ctnPos.x + 20, y: ctnPos.y + (ctnPos.h || 0) + 10, w: 300, h: measureCardH(content), zKey: nextZKey(), zIndex: canvas.order.length, parentId: area.containerId };

@@ -17,6 +17,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import { createRequire } from 'module';
 import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -25,6 +26,10 @@ import {
   opListCanvases, opReadCanvas, opSearchCanvases, opSearchAllBrains,
   opBrainInsights, opBrainConnect, opBrainReconcile, opBrainGarden, opCreateCanvas, opAddToCanvas, opBrainNote,
 } from '../src/klypix-core.mjs';
+
+// Real package version for the MCP handshake (was hardcoded '1.0.0', which
+// misled every client/version diagnosis — it could never reflect the true release).
+const PKG_VERSION = (() => { try { return createRequire(import.meta.url)('../package.json').version; } catch { return '0.0.0'; } })();
 
 // IMPORTANT: stdout is the JSON-RPC channel. Never console.log — only stderr.
 const log = (...a) => console.error('[klypix-mcp]', ...a);
@@ -63,7 +68,7 @@ const toContent = (r) => {
   return r.isError ? { content, isError: true } : { content };
 };
 
-const server = new McpServer({ name: 'klypix-canvas', version: '1.0.0' });
+const server = new McpServer({ name: 'klypix-canvas', version: PKG_VERSION });
 
 server.registerTool('list_canvases', {
   title: 'List KLYPIX canvases',

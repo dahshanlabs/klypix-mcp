@@ -85,6 +85,52 @@ export function resolveCanvas(vault, ref) {
   return matches[0] || null;
 }
 
+// Resolve the DEFAULT project brain for the brain-* ops, INDEPENDENT of the
+// --vault library folder. The vault answers "where does my .klypix library live"
+// (list/read/search); the BRAIN is "THIS project's ./brain.klypix". Conflating
+// them is what made the brain ops read a stray canvas out of a global vault
+// (the "SS2" bug — a foreign brain.klypix picked by a fuzzy basename walk).
+// Precedence, project-first:
+//   1. KLYPIX_BRAIN env (explicit override)
+//   2. ./brain.klypix in the launch cwd — the project brain (coding agents launch
+//      this server with cwd = the project root)
+//   3. <vault>/brain.klypix (exact) — when the vault itself is the brain's home
+//   4. a SINGLE brain.klypix found by walking the vault; if MORE THAN ONE exists
+//      we REFUSE to guess (returns { ambiguous }) instead of silently taking one.
+export function resolveDefaultBrain(vault) {
+  const ex = (p) => { try { return p && fs.existsSync(p) ? path.resolve(p) : null; } catch { return null; } };
+  let f;
+  if ((f = ex(process.env.KLYPIX_BRAIN))) return { file: f, how: 'env (KLYPIX_BRAIN)' };
+  if ((f = ex(path.join(process.cwd(), 'brain.klypix')))) return { file: f, how: 'project cwd' };
+  if ((f = ex(path.join(vault, 'brain.klypix')))) return { file: f, how: 'vault root' };
+  const matches = walkVault(vault).filter(p => /^brain\.(klypix|any)$/i.test(path.basename(p)));
+  if (matches.length === 1) return { file: matches[0], how: 'vault search' };
+  if (matches.length > 1) return { ambiguous: matches };
+  return { file: null };
+}
+
+// Resolve the brain a brain-* op should act on. An explicit `canvas` arg → exact
+// resolve against the vault; otherwise the project-aware default above. Always
+// returns one of: { file, how } · { ambiguous: [paths] } · { file: null }.
+export function brainTarget(vault, canvas) {
+  if (canvas) { const file = resolveCanvas(vault, canvas); return file ? { file, how: `canvas:"${canvas}"` } : { file: null }; }
+  return resolveDefaultBrain(vault);
+}
+
+// One-line provenance shown atop every brain-op result so a wrong brain (the
+// "SS2" class) is OBVIOUS at a glance instead of silent. Counts non-container cards.
+export function brainStamp(file, struct, how) {
+  const title = (struct && struct.title) || path.basename(file);
+  const n = struct ? struct.cards.filter(c => c.type !== 'container').length : '?';
+  return `_brain: ${path.basename(file)} · “${title}” · ${n} cards${how ? ' · via ' + how : ''}_\n\n`;
+}
+
+// Shared error for the refuse-to-guess case — names the candidates so the caller
+// can pick one (canvas:"<path>") or fix the vault / run from the project root.
+function ambiguousBrainErr(matches) {
+  return err(`Found ${matches.length} brain.klypix files in the vault and no ./brain.klypix in the current project — refusing to guess which is "the brain". Pass canvas:"<path>", run from the project root, or set KLYPIX_BRAIN. Candidates:\n${matches.map(m => '  - ' + m).join('\n')}`);
+}
+
 function safeName(vault, title) {
   const base = String(title || 'untitled').replace(/[^\w\- ]+/g, '').trim() || 'untitled';
   let name = base, n = 1;
@@ -273,7 +319,7 @@ export async function opSearchAllBrains({ vault, query, as_of, log = () => {} })
   if (pipe) { try { [qv] = await embedTexts(pipe, [q]); } catch { /* lexical only */ } }
 
   let curKey = null;
-  try { const cb = resolveCanvas(vault, 'brain') || resolveCanvas(vault, 'brain.klypix'); if (cb) curKey = path.resolve(cb).replace(/\\/g, '/').toLowerCase(); } catch { /* no current brain */ }
+  try { const cb = resolveDefaultBrain(vault).file; if (cb) curKey = path.resolve(cb).replace(/\\/g, '/').toLowerCase(); } catch { /* no current brain */ }
   const fresh = Date.now() - 30 * 86_400_000;
   const scored = [];
   for (const b of brains) {
@@ -324,12 +370,13 @@ export async function opSearchAllBrains({ vault, query, as_of, log = () => {} })
 }
 
 export async function opBrainInsights({ vault, canvas, staleDays }) {
-  const file = resolveCanvas(vault, canvas || 'brain') || resolveCanvas(vault, 'brain.klypix');
-  if (!file) return err(`No brain canvas found in ${vault}. Pass canvas: "<name>", or run \`npx klypix-mcp init\` to create one.`);
+  const t = brainTarget(vault, canvas);
+  if (t.ambiguous) return ambiguousBrainErr(t.ambiguous);
+  if (!t.file) return err(`No brain found — looked for ./brain.klypix in the project, then ${vault}. Pass canvas: "<name>", or run \`npx klypix-mcp init\` to create one.`);
   try {
-    const { struct } = await parseKlypix(fs.readFileSync(file));
+    const { struct } = await parseKlypix(fs.readFileSync(t.file));
     const ins = brainInsights(struct, staleDays ? { staleDays } : {});
-    return { blocks: [text(insightsToMarkdown(ins, struct.title))] };
+    return { blocks: [text(brainStamp(t.file, struct, t.how) + insightsToMarkdown(ins, struct.title))] };
   } catch (e) {
     return err(`Insights failed: ${e.message}`);
   }
@@ -359,20 +406,23 @@ export function collectMigrationFiles(root) {
   return out;
 }
 export async function opBrainReconcile({ vault, canvas, root }) {
-  const file = resolveCanvas(vault, canvas || 'brain') || resolveCanvas(vault, 'brain.klypix');
-  if (!file) return err(`No brain canvas found in ${vault}. Pass canvas: "<name>".`);
+  const t = brainTarget(vault, canvas);
+  if (t.ambiguous) return ambiguousBrainErr(t.ambiguous);
+  if (!t.file) return err(`No brain found — looked for ./brain.klypix in the project, then ${vault}. Pass canvas: "<name>".`);
+  const file = t.file;
   let struct;
   try { ({ struct } = await parseKlypix(fs.readFileSync(file))); } catch (e) { return err(`Read failed: ${e.message}`); }
+  const stamp = brainStamp(file, struct, t.how);
   // Migrations live in the CODE repo (usually beside brain.klypix), not in a
   // separate canvas vault — so default the root to the brain file's folder.
   const repoRoot = root ? path.resolve(root) : path.dirname(file);
   const files = collectMigrationFiles(repoRoot);
-  if (!files.length) return { blocks: [text(`No migration files under ${repoRoot} (looked in: ${MIGRATION_DIRS.join(', ')}). Nothing to reconcile.`)] };
+  if (!files.length) return { blocks: [text(stamp + `No migration files under ${repoRoot} (looked in: ${MIGRATION_DIRS.join(', ')}). Nothing to reconcile.`)] };
   const { gaps, total } = findUnrecordedMigrations(struct, files, { max: 20 });
-  if (!gaps.length) return { blocks: [text(`✓ All ${files.length} migration(s) under ${path.basename(repoRoot)} are referenced by a brain card — no unrecorded rollouts.`)] };
+  if (!gaps.length) return { blocks: [text(stamp + `✓ All ${files.length} migration(s) under ${path.basename(repoRoot)} are referenced by a brain card — no unrecorded rollouts.`)] };
   const lines = gaps.map(g => `- \`${g.path}\` — committed, but no brain card mentions it. If applied to prod, record it:\n    \`🧠 BRAIN [DB] !: migration ${g.file.replace(/\.sql$/i, '')} applied to prod ev: ${g.path}\``);
   const more = total > gaps.length ? `\n\n…and ${total - gaps.length} more.` : '';
-  return { blocks: [text(`# ⚠️ ${total} migration(s) committed but unrecorded in the brain\n_The brain can't see prod — it flags migrations that are in git but unmentioned, so you can confirm the rollout. It never asserts a migration was applied. To dismiss one without applying, record any card that names it (e.g. "committed, not applied")._\n\n${lines.join('\n')}${more}`)] };
+  return { blocks: [text(stamp + `# ⚠️ ${total} migration(s) committed but unrecorded in the brain\n_The brain can't see prod — it flags migrations that are in git but unmentioned, so you can confirm the rollout. It never asserts a migration was applied. To dismiss one without applying, record any card that names it (e.g. "committed, not applied")._\n\n${lines.join('\n')}${more}`)] };
 }
 
 // ── Brain gardener (two-phase: select → agent synthesizes → apply) ───────────
@@ -381,17 +431,20 @@ export async function opBrainReconcile({ vault, canvas, root }) {
 // prose); apply consolidates each area into a 🌿 card and archives the originals
 // with audit arrows. Mirrors brain_connect's dry-run/apply discipline.
 export async function opBrainGarden({ vault, canvas, apply = false, syntheses }) {
-  const file = resolveCanvas(vault, canvas || 'brain') || resolveCanvas(vault, 'brain.klypix');
-  if (!file) return err(`No brain canvas found in ${vault}. Pass canvas: "<name>".`);
+  const t = brainTarget(vault, canvas);
+  if (t.ambiguous) return ambiguousBrainErr(t.ambiguous);
+  if (!t.file) return err(`No brain found — looked for ./brain.klypix in the project, then ${vault}. Pass canvas: "<name>".`);
+  const file = t.file;
   let struct;
   try { ({ struct } = await parseKlypix(fs.readFileSync(file))); } catch (e) { return err(`Read failed: ${e.message}`); }
+  const stamp = brainStamp(file, struct, t.how);
   const areas = selectGardenCandidates(struct);
-  if (!areas.length) return { blocks: [text('Nothing to garden — no area has 3+ DORMANT cards (old, beyond its newest 8, AND peripheral/≤1 link). Anything still woven into the graph is protected. The brain is tidy.')] };
+  if (!areas.length) return { blocks: [text(stamp + 'Nothing to garden — no area has 3+ DORMANT cards (old, beyond its newest 8, AND peripheral/≤1 link). Anything still woven into the graph is protected. The brain is tidy.')] };
 
   if (!apply) {
     const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
     const body = areas.map(a => `## ${a.title}  (${a.candidates.length} dormant cards)\n` + a.candidates.map(c => `- ${flat(c.text).slice(0, 240)}`).join('\n')).join('\n\n');
-    return { blocks: [text(`# 🌿 Gardener — ${areas.length} area(s) with DORMANT cards to consolidate\nThese are old, peripheral (≤1 link) cards only — hubs and still-referenced decisions were left untouched. For EACH area below, write ONE tight synthesis (3-6 sentences, plain prose, no headers) that preserves every still-relevant fact / decision / number and drops only repetition + play-by-play. Then call \`brain_garden\` again with \`apply:true\` and \`syntheses: [{ "title": "<area title EXACTLY as shown>", "synthesis": "<text>" }, …]\`. Originals are archived with audit arrows — nothing is deleted; one undo un-gardens.\n\n${body}`)] };
+    return { blocks: [text(stamp + `# 🌿 Gardener — ${areas.length} area(s) with DORMANT cards to consolidate\nThese are old, peripheral (≤1 link) cards only — hubs and still-referenced decisions were left untouched. For EACH area below, write ONE tight synthesis (3-6 sentences, plain prose, no headers) that preserves every still-relevant fact / decision / number and drops only repetition + play-by-play. Then call \`brain_garden\` again with \`apply:true\` and \`syntheses: [{ "title": "<area title EXACTLY as shown>", "synthesis": "<text>" }, …]\`. Originals are archived with audit arrows — nothing is deleted; one undo un-gardens.\n\n${body}`)] };
   }
 
   if (!Array.isArray(syntheses) || !syntheses.length) return err('apply:true needs syntheses:[{title, synthesis}, …] — run the dry run first (apply omitted) to get the areas + their cards.');
@@ -410,8 +463,10 @@ export async function opBrainGarden({ vault, canvas, apply = false, syntheses })
 }
 
 export async function opBrainConnect({ vault, canvas, apply = false, max = 24, threshold = 0.45, log = () => {} }) {
-  const file = resolveCanvas(vault, canvas || 'brain') || resolveCanvas(vault, 'brain.klypix');
-  if (!file) return err(`No brain canvas found in ${vault}.`);
+  const tgt = brainTarget(vault, canvas);
+  if (tgt.ambiguous) return ambiguousBrainErr(tgt.ambiguous);
+  if (!tgt.file) return err(`No brain found — looked for ./brain.klypix in the project, then ${vault}.`);
+  const file = tgt.file;
   let struct;
   try { ({ struct } = await parseKlypix(fs.readFileSync(file))); } catch (e) { return err(`Read failed: ${e.message}`); }
   const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim().slice(0, 70);
@@ -516,8 +571,10 @@ export async function opAddToCanvas({ vault, canvas, cards, connections, via }) 
 // can now record a decision, ask an open question, mark a milestone, resolve a card,
 // or correct one — with the full lifecycle, not just a flat append.
 export async function opBrainNote({ vault, canvas, text: noteText, area, marker = '', closes, via }) {
-  const file = resolveCanvas(vault, canvas || 'brain') || resolveCanvas(vault, 'brain.klypix');
-  if (!file) return err(`No brain canvas found in ${vault}. Pass canvas: "<name>".`);
+  const t = brainTarget(vault, canvas);
+  if (t.ambiguous) return ambiguousBrainErr(t.ambiguous);
+  if (!t.file) return err(`No brain found — looked for ./brain.klypix in the project, then ${vault}. Pass canvas: "<name>".`);
+  const file = t.file;
   if (!noteText || !String(noteText).trim()) return err('brain_note needs a non-empty text.');
   if (!['', '?', '!', '✓', '~'].includes(marker)) return err(`Invalid marker "${marker}" — use: (none)=decision · ?=open question · !=milestone · ✓=resolve a matching card · ~=update a matching card.`);
   const input = noteToCaptureInput({ text: noteText, area, marker, closes: closes || '', createdVia: via || 'mcp' });
@@ -528,7 +585,9 @@ export async function opBrainNote({ vault, canvas, text: noteText, area, marker 
     const s = res.stats || {};
     const bits = [`${s.added || 0} added`];
     for (const k of ['resolved', 'updated', 'closed', 'superseded', 'linked']) if (s[k]) bits.push(`${s[k]} ${k}`);
-    return { blocks: [text(`✓ brain_note → ${path.relative(vault, file)} (${bits.join(' · ')}). Reopen the brain in KLYPIX to see it.`)] };
+    // Name the resolved brain explicitly (basename + how) so a write never lands
+    // in a surprise file silently — the write-side twin of the read-op stamp.
+    return { blocks: [text(`✓ brain_note → ${path.basename(file)} (via ${t.how}) · ${bits.join(' · ')}. Reopen the brain in KLYPIX to see it.`)] };
   } catch (e) {
     return err(`brain_note failed (brain unchanged): ${e.message}`);
   }

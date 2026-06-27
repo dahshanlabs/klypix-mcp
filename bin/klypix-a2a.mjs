@@ -32,8 +32,9 @@ import { z } from 'zod';
 import {
   resolveVault, getEmbedder, cardSchema, connSchema,
   opListCanvases, opReadCanvas, opSearchCanvases, opSearchAllBrains,
-  opBrainInsights, opBrainConnect, opCreateCanvas, opAddToCanvas,
+  opBrainInsights, opBrainConnect, opCreateCanvas, opAddToCanvas, opBrainNote,
 } from '../src/klypix-core.mjs';
+import { looksLikeSkill } from '../src/klypix-format.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Resolve the package version across layouts: the published package (bin/ →
@@ -87,9 +88,18 @@ function agentCard(publicUrl) {
       {
         id: 'remember',
         name: 'Remember into the canvas / brain',
-        description: 'Append a decision or cards (with optional connections) to an existing .klypix, preserving every existing item and position. The durable, cross-session memory a multi-agent run keeps writing to.',
-        tags: ['memory', 'append', 'write', 'brain'],
+        description: 'Append a decision or cards (with optional connections) to an existing .klypix, preserving every existing item and position. The durable, cross-session memory a multi-agent run keeps writing to. Pass a "marker" in args for the full lifecycle: ""=decision · "?"=open question · "!"=milestone · "+"=🛠️ skill · "✓"=resolve a match · "~"=update a match.',
+        tags: ['memory', 'append', 'write', 'brain', 'lifecycle'],
         examples: ['Remember that we chose Postgres over Mongo', 'Add a card with this finding to the roadmap canvas'],
+        inputModes: ['text/plain', 'application/json'],
+        outputModes: [KLYPIX_MIME, 'text/plain'],
+      },
+      {
+        id: 'learn_skill',
+        name: 'Learn a reusable skill (how-to / gotcha)',
+        description: 'Record a 🛠️ SKILL — a reusable how-to, gotcha, or convention ("always dedup zKeys before REORDER") that should resurface every session and never age out, distinct from a one-time decision. Routes through the capture engine with the "+" marker. A delegating agent uses this to teach the shared brain how work is done here, so every future agent inherits it. Plain "remember" auto-promotes to a skill when the text reads as a general rule.',
+        tags: ['memory', 'skill', 'how-to', 'procedure', 'brain', 'learn'],
+        examples: ['Learn this gotcha: never set backgroundThrottling false — it breaks visibility detection', 'Remember the convention: Electron main imports must stay at top'],
         inputModes: ['text/plain', 'application/json'],
         outputModes: [KLYPIX_MIME, 'text/plain'],
       },
@@ -195,7 +205,21 @@ async function runSkill(skill, args, text, via) {
       return await opCreateCanvas({ vault: VAULT, title: args.title ?? 'Untitled board', cards: parsed.data, connections: conns.data, filename: args.filename });
     }
     case 'remember':
-    case 'add_to_canvas': {
+    case 'add_to_canvas':
+    case 'learn_skill': {
+      // Route through the brain's CAPTURE ENGINE (full lifecycle + markers, incl.
+      // 🛠️ skills) when: the caller passed a marker, asked for learn_skill, or the
+      // text reads as a reusable rule (auto-skill from the flow — the same
+      // classifier the Claude-Code hook uses). Otherwise: flat multi-card append.
+      let marker = String(args.marker || '').trim();
+      if (skill === 'learn_skill') marker = '+';
+      const single = (!args.cards && text.trim()) ? stripVerb(text) : null;
+      if (!marker && single && looksLikeSkill(single)) marker = '+';   // NL "remember this gotcha: always…" → skill
+      if (marker) {
+        const noteText = single ?? (Array.isArray(args.cards) && args.cards[0]?.text) ?? '';
+        if (!String(noteText).trim()) return needInput('Nothing to capture — send text or a card to remember.');
+        return await opBrainNote({ vault: VAULT, canvas: args.canvas ?? 'brain', text: noteText, area: args.area, marker, closes: args.closes, via });
+      }
       // NL convenience: a bare "remember: X" becomes a single card on the brain.
       const cards = args.cards ?? (text.trim() ? [{ text: stripVerb(text) }] : null);
       const parsed = cardsArg.safeParse(cards);
@@ -250,6 +274,7 @@ function routeIntent(text, dataArgs) {
   const t = String(text || '').toLowerCase();
   const named = extractCanvas(text);
   if (/\b(make|build|create|draw|turn .* into).{0,30}(board|canvas|mind ?map|map|diagram)\b/.test(t)) return { skill: 'make_board', args: {} };
+  if (/\b(learn (this|a) skill|teach the brain|remember the (convention|rule|gotcha)|this is a (gotcha|pitfall|footgun))\b/.test(t) || /\bskill:/i.test(text)) return { skill: 'learn_skill', args: {} };
   if (/\b(remember|note this|capture this|log that|record that|add a card)\b/.test(t)) return { skill: 'remember', args: {} };
   // An explicit read verb OR a specific named canvas → read it. Checked BEFORE
   // list so "what's on the roadmap canvas" reads that canvas, not the vault index.

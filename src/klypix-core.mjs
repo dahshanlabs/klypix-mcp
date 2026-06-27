@@ -576,7 +576,7 @@ export async function opBrainNote({ vault, canvas, text: noteText, area, marker 
   if (!t.file) return err(`No brain found — looked for ./brain.klypix in the project, then ${vault}. Pass canvas: "<name>".`);
   const file = t.file;
   if (!noteText || !String(noteText).trim()) return err('brain_note needs a non-empty text.');
-  if (!['', '?', '!', '✓', '~'].includes(marker)) return err(`Invalid marker "${marker}" — use: (none)=decision · ?=open question · !=milestone · ✓=resolve a matching card · ~=update a matching card.`);
+  if (!['', '?', '!', '✓', '~', '+'].includes(marker)) return err(`Invalid marker "${marker}" — use: (none)=decision · ?=open question · !=milestone · +=skill (reusable how-to) · ✓=resolve a matching card · ~=update a matching card.`);
   const input = noteToCaptureInput({ text: noteText, area, marker, closes: closes || '', createdVia: via || 'mcp' });
   try {
     const res = await captureIntoBrain(fs.readFileSync(file), input);

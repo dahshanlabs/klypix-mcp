@@ -561,7 +561,7 @@ export async function tidyBrain(buffer) {
 // decisions + milestones. Everything older stays in the file, reachable via the
 // klypix-canvas MCP search or `--full`. Keeps the session-start cost flat as
 // the brain grows (the full markdown scales with history; this doesn't).
-export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMilestones = 8, maxConnections = 30, freshness = null } = {}) {
+export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMilestones = 8, maxConnections = 30, maxSkills = 24, freshness = null } = {}) {
     const cutoff = Date.now() - recentDays * 86_400_000;
     const texts = struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim());
     const containers = struct.cards.filter(c => c.type === 'container');
@@ -576,9 +576,14 @@ export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMile
     // 🎯 (goal/target) reads as an OPEN item alongside ❓ — a goal card is
     // still-to-do until a ✓/closes: or a covering milestone closes it (so it
     // must NOT masquerade as a plain decision that quietly ages out of view).
-    const open = rest.filter(c => /❓|🎯/.test(c.text));
-    const miles = rest.filter(c => /🏁/.test(c.text) && !/❓|🎯/.test(c.text));
-    const plain = rest.filter(c => !open.includes(c) && !miles.includes(c));
+    // 🛠️ Skills — reusable how-tos / gotchas / procedures (the '+' marker).
+    // Standing reference, NOT a point-in-time event: always shown, never
+    // recency-decayed, and excluded from open/milestones/recent so a skill never
+    // masquerades as (or ages out like) a decision.
+    const skills = rest.filter(c => /🛠/.test(c.text));
+    const open = rest.filter(c => /❓|🎯/.test(c.text) && !/🛠/.test(c.text));
+    const miles = rest.filter(c => /🏁/.test(c.text) && !/❓|🎯|🛠/.test(c.text));
+    const plain = rest.filter(c => !open.includes(c) && !miles.includes(c) && !skills.includes(c));
     const recent = plain.filter(c => c.createdAt >= cutoff).sort((a, b) => b.createdAt - a.createdAt).slice(0, maxRecent);
     const archivedCount = texts.length - live.length;
 
@@ -611,6 +616,11 @@ export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMile
         for (const c of focus) push(`- ${fr(c)}${flat(c.text)}`);
     }
     if (open.length) { push('', '## Open questions & goals'); for (const c of open) push(`- ${fr(c)}${flat(c.text)}`); }
+    if (skills.length) {
+        push('', '## 🛠️ Skills — how we do things here (reusable; applies every session)');
+        for (const c of skills.slice(0, maxSkills)) push(`- ${fr(c)}${flat(c.text)}`);
+        if (skills.length > maxSkills) push(`- …and ${skills.length - maxSkills} more skill(s) — search the brain.`);
+    }
     // ⚠️ Conflicts — pairs flagged conflicts_with (e.g. by parallel sessions);
     // surfaced HIGH so the next session reconciles them, not buries them.
     const conflicts = (struct.connections || []).filter(c => c.relationship === 'conflicts_with');
@@ -685,6 +695,7 @@ export function scoreCardsAgainstQuery(struct, query, { topK = 6, minScore = 2, 
         }
         if (score <= 0) continue;
         if ((c.createdAt || 0) >= cutoff) score += 0.5; // gentle recency tiebreak, never dominant
+        if (/🛠/.test(c.text)) score += 1; // 🛠️ skills are standing how-tos — surface them when relevant, regardless of age
         scored.push({ card: c, score });
     }
     scored.sort((a, b) => b.score - a.score || (b.card.createdAt || 0) - (a.card.createdAt || 0));
@@ -968,6 +979,25 @@ const overlapScore = (a, b) => {
 // a real `closes: v1.2.0 staged as a github draft` — only 3 long tokens — silently
 // failed to fire.)
 const coverageOf = (target, hay) => { if (!target.size) return 0; let h = 0; for (const w of target) if (hay.has(w)) h++; return h / target.size; };
+
+// ── Auto-skill classifier (skills emerge from the flow, not just the '+' marker) ─
+// A REUSABLE skill (how-to / gotcha / convention) reads as a GENERAL RULE that
+// applies next time — distinct from a one-time decision ("we shipped X"). This is
+// the high-precision signal the capture path uses to AUTO-promote a plain decision
+// or a rationale-bearing commit into a 🛠️ skill, so the brain learns "how we work
+// here" without anyone remembering to type '+'. Deliberately conservative: STRONG
+// rule cues only, and NOT pinned to a one-time event (a version/PR#/date/ship verb
+// makes it "what happened", not "how to do it"). The explicit '+' marker always
+// wins and covers everything this misses; a false miss is cheap, a false skill is
+// noisy — so this errs toward silence.
+const STRONG_SKILL_CUES = /(\balways\b|\bnever\b|\bmust\s+(?:not|always)\b|\bdon'?t\s+(?:ever|forget)\b|\bgotcha\b|\bwatch\s+out\b|\bthe\s+trick\s+is\b|\brule\s+of\s+thumb\b|\bby\s+convention\b|\bpitfall\b|\bfootgun\b|\bremember\s+to\b|\bbe\s+sure\s+to\b)/i;
+const SKILL_EVENT_PINS = /(\bv?\d+\.\d+\.\d+\b|\bPR\s*#?\d+\b|#\d{2,}\b|\b20\d{2}-\d{2}-\d{2}\b|\bshipped\b|\breleased\b|\bpublished\b|\bmerged\b|\bdeployed\b)/i;
+export function looksLikeSkill(text) {
+    const t = String(text || '');
+    if (/🛠|❓|🎯|🏁/.test(t)) return false;      // already glyphed (skill/question/goal/milestone) — don't reclassify
+    return STRONG_SKILL_CUES.test(t) && !SKILL_EVENT_PINS.test(t);
+}
+
 export async function captureIntoBrain(buffer, { cards = [], resolutions = [], updates = [] } = {}) {
     const SUPERSEDE_AT = 0.6, RESOLVE_AT = 0.3, UPDATE_AT = 0.45, CLOSE_COVER_AT = 0.6;
     let work = buffer;
@@ -1095,12 +1125,13 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
         // to the new card is drawn in pass 2 (after the new ids exist), matched
         // back by remembering which old card each new card displaced.
         for (const card of cards) {
-            if (/❓|🎯|🏁/.test(card.text)) continue; // only plain decisions supersede (not questions/goals/milestones)
+            if (/❓|🎯|🏁|🛠/.test(card.text)) continue; // only plain decisions supersede (not questions/goals/milestones/skills)
             const nTok = tokenSet(card.text);
             const area = (card.area || '').toLowerCase();
             let best = null, bestScore = 0;
             for (const c of liveTextCards()) {
                 if (area && (c.area || '').toLowerCase() !== area) continue;
+                if (/🛠/.test(c.text)) continue; // never auto-archive a 🛠️ skill via a decision's supersede — skills are standing reference (correct with ~)
                 const s = overlapScore(nTok, tokenSet(c.text));
                 if (s > bestScore) { bestScore = s; best = c; }
             }
@@ -1253,7 +1284,7 @@ export function selectGardenCandidates(struct, { keepNewest = GARDEN_KEEP_NEWEST
         const title = (ctn.title || '').trim();
         if (!title || GARDEN_PROTECTED.test(title)) continue;
         const children = struct.cards
-            .filter(c => c.type === 'text' && c.parentId === ctn.id && (c.text || '').trim() && !/⤵|↩|✅/.test(c.text))
+            .filter(c => c.type === 'text' && c.parentId === ctn.id && (c.text || '').trim() && !/⤵|↩|✅|🛠/.test(c.text))  // 🛠️ skills are standing reference — never consolidate them away
             .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
         const old = children
             .slice(0, Math.max(0, children.length - keepNewest))
@@ -1409,15 +1440,17 @@ export function findStaleOpenCards(struct, { coverAt = 0.6, max = 5 } = {}) {
 // write (the brain_note MCP tool, the brain-note CLI — any agent, not just the
 // Claude-Code hook) get IDENTICAL supersede / resolve / close / dedup semantics as
 // a harvested 🧠 marker. marker ∈ '' (decision) | '?' (open question) | '!'
-// (milestone) | '✓' (resolve+archive a match) | '~' (update a match in place).
+// (milestone) | '✓' (resolve+archive a match) | '~' (update a match in place) |
+// '+' (skill — a REUSABLE how-to/gotcha/procedure, standing reference that always
+// surfaces and never ages out, distinct from a point-in-time decision).
 export function noteToCaptureInput({ text = '', area = '', marker = '', closes = '', evidence = null, createdVia = 'mcp' } = {}) {
     const body = String(text).trim();
     if (!body) return { cards: [], resolutions: [], updates: [] };
     const a = String(area || '').trim();
     if (marker === '✓') return { cards: [], resolutions: [{ area: a, text: body }], updates: [] };
     if (marker === '~') return { cards: [], resolutions: [], updates: [{ area: a, text: body, createdVia, ...(evidence ? { evidence } : {}) }] };
-    const prefix = marker === '?' ? '❓ ' : marker === '!' ? '🏁 ' : '';
-    const borderColor = marker === '?' ? 'rgba(245,166,35,0.8)' : marker === '!' ? 'rgba(59,130,246,0.8)' : 'rgba(16,185,129,0.6)';
+    const prefix = marker === '?' ? '❓ ' : marker === '!' ? '🏁 ' : marker === '+' ? '🛠️ ' : '';
+    const borderColor = marker === '?' ? 'rgba(245,166,35,0.8)' : marker === '!' ? 'rgba(59,130,246,0.8)' : marker === '+' ? 'rgba(139,92,246,0.85)' : 'rgba(16,185,129,0.6)';
     const tag = a ? `\n#${a.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : '';
     const cardText = (a ? `${a}: ${prefix}${body}` : `${prefix}${body}`) + tag;
     return { cards: [{ text: cardText, area: a, color: '#e8e8ed', borderColor, createdVia, ...(closes ? { closes } : {}), ...(evidence ? { evidence } : {}) }], resolutions: [], updates: [] };

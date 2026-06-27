@@ -46,6 +46,7 @@ if (process.argv[2] === 'init') {
       { title: 'Goal', cards: [{ text: '❓ What is this project for, and for whom?\nAgent: survey the repo on your first session and replace this with the real goal.' }] },
       { title: 'Architecture', cards: [{ text: '❓ Key components and how they fit.\nAgent: record the actual shape from the repo — only what a new session must know.' }] },
       { title: 'Decisions', cards: [{ text: 'Decisions land here automatically: agents emit `🧠 BRAIN [Area]: …` markers; a new decision that replaces an old one archives it (superseded). Resolve finished items with `✓`, correct in place with `~`. Drag any card into 📌 Focus to make it lead every session brief.' }] },
+      { title: '🛠️ Skills', cards: [{ text: '🛠️ Reusable how-tos, gotchas & conventions land here — emit `🧠 BRAIN [Area] +: <skill>` (or just state a rule like "always X / never Y" and it auto-promotes). Skills resurface every session and never age out, unlike one-time decisions. This is "how we work here", inherited by every future agent.' }] },
       { title: 'Pending / next', cards: [{ text: 'What is in flight and what comes next. Close finished items with the ✓ marker.' }] },
       { title: 'Open questions', cards: [{ text: 'Unresolved questions (the ❓ marker) live here — the session brief surfaces them first.' }] },
       { title: '📌 Focus', cards: [{ text: 'Drag any card into this area to make it lead every session brief — steer your agent by moving cards.' }] },
@@ -166,11 +167,11 @@ server.registerTool('add_to_canvas', {
 });
 
 server.registerTool('brain_note', {
-  title: 'Write a deliberate note to the project brain (decision / question / milestone / resolve / update)',
-  description: 'Record something in the project brain ON DEMAND — the agent-neutral twin of the Claude-Code capture hook, so any client (Cursor / Cline / Desktop) can write the brain, not just read it. Unlike add_to_canvas (a flat append), this routes through the brain\'s capture engine, so a new decision SUPERSEDES a heavily-overlapping older one, ✓ RESOLVES/archives a matching card, closes: resolves the strategy/question a milestone fulfils, and ~ UPDATES a card in place — the full decision lifecycle, with dedup. Use it to remember a decision, ask an open question, mark a milestone, resolve a finished item, or correct a card. Defaults to the project brain ("brain").',
+  title: 'Write a deliberate note to the project brain (decision / question / milestone / skill / resolve / update)',
+  description: 'Record something in the project brain ON DEMAND — the agent-neutral twin of the Claude-Code capture hook, so any client (Cursor / Cline / Desktop) can write the brain, not just read it. Unlike add_to_canvas (a flat append), this routes through the brain\'s capture engine, so a new decision SUPERSEDES a heavily-overlapping older one, ✓ RESOLVES/archives a matching card, closes: resolves the strategy/question a milestone fulfils, and ~ UPDATES a card in place — the full decision lifecycle, with dedup. Use marker "+" to record a 🛠️ SKILL — a reusable how-to/gotcha/convention ("always dedup zKeys before REORDER") that should resurface every session and never age out, distinct from a one-time decision. Use it to remember a decision, ask an open question, mark a milestone, log a skill, resolve a finished item, or correct a card. Defaults to the project brain ("brain").',
   inputSchema: {
     text: z.string().describe('The note — one concise idea; the first line becomes the card title.'),
-    marker: z.enum(['', '?', '!', '✓', '~']).optional().describe('(none)=decision · ?=open question · !=milestone · ✓=resolve+archive the best-matching card · ~=update the matching card in place. Default: decision.'),
+    marker: z.enum(['', '?', '!', '+', '✓', '~']).optional().describe('(none)=decision · ?=open question · !=milestone · +=🛠️ skill (reusable how-to/gotcha; always resurfaces, never ages out) · ✓=resolve+archive the best-matching card · ~=update the matching card in place. Default: decision.'),
     area: z.string().optional().describe('Area/topic — routes the card into that titled container and becomes a #tag (e.g. "Auth", "Release").'),
     closes: z.string().optional().describe('Title or [[wikilink]] of a strategy/question card this note fulfils — resolves+archives it and draws a "closed by" arrow.'),
     canvas: z.string().optional().describe('Brain canvas filename/path. Defaults to the project brain ("brain").'),

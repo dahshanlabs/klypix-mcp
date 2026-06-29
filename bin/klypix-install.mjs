@@ -21,7 +21,6 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PKG_ROOT = path.resolve(__dirname, '..');
 const SRC = path.join(PKG_ROOT, 'src');
 const BIN = path.join(PKG_ROOT, 'bin');
-const MODS = path.join(PKG_ROOT, 'node_modules');
 const VERSION = (() => { try { return JSON.parse(fs.readFileSync(path.join(PKG_ROOT, 'package.json'), 'utf8')).version || ''; } catch { return ''; } })();
 const FORCE = process.argv.includes('--force');
 
@@ -73,32 +72,40 @@ try {
         const s = path.join(BIN, src); if (exists(s)) { fs.writeFileSync(path.join(BRAIN_DIR, dst), flatten(fs.readFileSync(s, 'utf8'))); n++; }
     }
     // 3) runtime dependency CLOSURE (jszip+fractional-indexing for the hook/engine,
-    //    @modelcontextprotocol/sdk+zod for the local MCP server) — walk each
-    //    package.json's deps + nested node_modules so the SDK's transitive tree comes
-    //    along. @huggingface/transformers (optional, huge) is intentionally skipped —
-    //    semantic recall degrades to lexical until the host warms it.
+    //    @modelcontextprotocol/sdk+zod for the local MCP server). Resolve each via
+    //    createRequire so it's found wherever the package manager put it — CRITICAL
+    //    for `npx`, which HOISTS deps to its cache root (not PKG_ROOT/node_modules).
+    //    Walk transitive deps resolved FROM each package's own context (handles
+    //    nesting). @huggingface/transformers (optional, huge) is intentionally
+    //    skipped — semantic recall degrades to lexical until the host warms it.
+    // Resolve a package DIR by walking node_modules upward (Node-style): checks
+    // fromDir/node_modules/<name>, then each parent — so it finds hoisted deps under
+    // npx AND nested ones. fs-based on purpose: require.resolve('<name>/package.json')
+    // is blocked by restrictive "exports" (e.g. fractional-indexing v3) and would
+    // silently drop a dep the hook needs.
     const destMods = path.join(BRAIN_DIR, 'node_modules');
-    const queue = ['jszip', 'fractional-indexing', '@modelcontextprotocol/sdk', 'zod'];
-    const seen = new Set();
-    const enqueueDepsOf = (pkgDir) => {
-        try { const pj = JSON.parse(fs.readFileSync(path.join(pkgDir, 'package.json'), 'utf8')); for (const d of Object.keys(pj?.dependencies || {})) queue.push(d); } catch { /* no readable package.json */ }
-        const nested = path.join(pkgDir, 'node_modules');
-        if (!exists(nested)) return;
-        for (const e of fs.readdirSync(nested, { withFileTypes: true })) {
-            if (!e.isDirectory()) continue;
-            if (e.name.startsWith('@')) { for (const s of fs.readdirSync(path.join(nested, e.name), { withFileTypes: true })) { if (s.isDirectory()) enqueueDepsOf(path.join(nested, e.name, s.name)); } }
-            else enqueueDepsOf(path.join(nested, e.name));
+    const findPkgDir = (name, fromDir) => {
+        let dir = fromDir;
+        for (; ;) {
+            const cand = path.join(dir, 'node_modules', ...name.split('/'));
+            if (exists(path.join(cand, 'package.json'))) return cand;
+            const parent = path.dirname(dir);
+            if (parent === dir) return null;
+            dir = parent;
         }
     };
-    let deps = 0;
+    const seen = new Set();
+    const queue = ['jszip', 'fractional-indexing', '@modelcontextprotocol/sdk', 'zod'].map(name => ({ name, fromDir: PKG_ROOT }));
+    let deps = 0; const missing = [];
     while (queue.length) {
-        const pkg = queue.shift();
-        if (seen.has(pkg)) continue; seen.add(pkg);
-        const src = path.join(MODS, pkg);
-        if (!exists(src)) continue;
-        if (!exists(path.join(destMods, pkg))) { copyDir(src, path.join(destMods, pkg)); deps++; }
-        enqueueDepsOf(src);
+        const { name, fromDir } = queue.shift();
+        if (seen.has(name)) continue; seen.add(name);
+        const dir = findPkgDir(name, fromDir);
+        if (!dir) { missing.push(name); continue; }
+        if (!exists(path.join(destMods, name))) { copyDir(dir, path.join(destMods, name)); deps++; }
+        try { const pj = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')); for (const d of Object.keys(pj?.dependencies || {})) queue.push({ name: d, fromDir: dir }); } catch { /* no readable package.json */ }
     }
+    if (missing.length) { console.error(`✗ could not resolve required dep(s): ${missing.join(', ')} — aborting (the brain hook needs them).`); process.exit(1); }
     // 4) mark the dir an ESM package
     fs.writeFileSync(path.join(BRAIN_DIR, 'package.json'), JSON.stringify({ name: 'klypix-project-brain', private: true, type: 'module' }, null, 2));
 

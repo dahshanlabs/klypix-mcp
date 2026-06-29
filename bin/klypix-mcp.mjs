@@ -41,6 +41,12 @@ const log = (...a) => console.error('[klypix-mcp]', ...a);
 // server setup; delegates to the dedicated bin so `npx klypix-install` also works.
 if (process.argv[2] === 'install') { await import('./klypix-install.mjs'); process.exit(0); }
 
+// `npx klypix-mcp link` — make THIS project's brain automatic for EVERY agent tool,
+// not just Claude Code: drop each tool's native MCP config + rules file (Cursor, Cline,
+// Windsurf, Copilot/VS Code, AGENTS.md) so any agent opened here reads + captures the
+// brain on its own. Project-scoped (cwd); idempotent. Runs before any server setup.
+if (process.argv[2] === 'link') { await import('./klypix-link.mjs'); process.exit(0); }
+
 // `npx klypix-mcp init` — 60-second onboarding: seed a starter project brain in
 // the current folder so a new user's FIRST contact isn't an empty vault, then
 // print a paste-ready MCP config. Runs before any server setup.

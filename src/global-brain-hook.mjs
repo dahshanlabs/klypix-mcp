@@ -278,7 +278,8 @@ function touchSession(sid, patch = {}) {
         const now = Date.now();
         const got = acquireLock(SESSIONS_LOCK, { tries: 20, waitMs: 25 });   // ~0.5s budget then best-effort
         try {
-            const all = pruneSessions(readSessions(), now);
+            let data0 = {}; try { data0 = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8')); } catch { /* fresh */ }
+            const all = pruneSessions(Array.isArray(data0.sessions) ? data0.sessions : [], now);
             const prev = all.find(s => s.id === sid) || {};
             const list = all.filter(s => s.id !== sid);
             list.push({
@@ -292,7 +293,10 @@ function touchSession(sid, patch = {}) {
                 startedAt: prev.startedAt || now, lastSeen: now,
             });
             fs.mkdirSync(SESSIONS_DIR, { recursive: true });
-            fs.writeFileSync(SESSIONS_FILE, JSON.stringify({ sessions: list.slice(-20) }));
+            // Preserve the messages lane — touchSession runs AFTER postMessages in a
+            // capture, and dropping the field here would clobber a just-posted note.
+            const keptMsgs = (Array.isArray(data0.messages) ? data0.messages : []).filter(m => m && (now - (m.ts || 0) < MSG_FRESH_MS));
+            fs.writeFileSync(SESSIONS_FILE, JSON.stringify({ sessions: list.slice(-20), messages: keptMsgs }));
         } finally { if (got) releaseLock(SESSIONS_LOCK); }
     } catch { /* coordination is best-effort */ }
 }
@@ -333,6 +337,64 @@ function peerFooter(sid) {
     }
     lines.push('Ping the other session before touching shared files; check the brain for what they decided/shipped.');
     return lines.join('\n');
+}
+
+// ── Brain messaging — async agent↔agent notes via the shared per-project lane ─
+// The COMPLEMENT to the live-ledger: the ledger surfaces a peer's AUTOMATIC high-
+// signal events (ships, version bumps); this lets a session leave a DELIBERATE,
+// TARGETED note for another ("merged the hook refactor — rebase your PR first").
+// SEND by emitting `🧠 MSG [<to>]: <text>` in a reply (to = a peer's id-prefix or
+// branch, omitted = all); the Stop hook posts it to the lane, and the recipient's
+// next prompt/session-start surfaces it ONCE (ack'd under the lane lock). Still
+// async (delivered at the peer's next hook event), by design — not real-time.
+const MSG_RE = /🧠\s*MSG\s*(?:\[([^\]]*)\])?\s*:\s*(.+)$/i;
+const MSG_FRESH_MS = 24 * 60 * 60 * 1000;
+function postMessages(msgs) {
+    if (!msgs || !msgs.length) return;
+    const got = acquireLock(SESSIONS_LOCK, { tries: 20, waitMs: 25 });
+    try {
+        let data = {}; try { data = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8')); } catch { /* fresh */ }
+        const sessions = Array.isArray(data.sessions) ? data.sessions : [];
+        const now = Date.now();
+        const kept = (Array.isArray(data.messages) ? data.messages : []).filter(m => m && (now - (m.ts || 0) < MSG_FRESH_MS));
+        for (const m of msgs) kept.push(m);
+        fs.mkdirSync(SESSIONS_DIR, { recursive: true });
+        fs.writeFileSync(SESSIONS_FILE, JSON.stringify({ sessions, messages: kept.slice(-30) }));
+    } catch { /* best-effort */ } finally { if (got) releaseLock(SESSIONS_LOCK); }
+}
+// to==='all'/'' → everyone; else the hint must appear in my id-prefix / branch / intent.
+function msgTargetsMe(m, me, sid) {
+    const to = String(m.to || '').trim().toLowerCase();
+    if (!to || to === 'all' || to === '*') return true;
+    return [String(sid || '').slice(0, 8), me?.branch || '', me?.intent || ''].join(' ').toLowerCase().includes(to);
+}
+// Surface unseen messages addressed to me, mark them seen (delivered once) under lock.
+function messageFooter(sid) {
+    if (!sid) return '';
+    let data = {}; try { data = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8')); } catch { return ''; }
+    const all = Array.isArray(data.messages) ? data.messages : [];
+    if (!all.length) return '';
+    const now = Date.now();
+    const me = (Array.isArray(data.sessions) ? data.sessions : []).find(s => s.id === sid);
+    const unseen = all.filter(m => m && (now - (m.ts || 0) < MSG_FRESH_MS) && m.from !== sid
+        && !(Array.isArray(m.seen) && m.seen.includes(sid)) && msgTargetsMe(m, me, sid));
+    if (!unseen.length) return '';
+    const got = acquireLock(SESSIONS_LOCK, { tries: 15, waitMs: 25 });   // ack under lock so a peer read can't lose it
+    try {
+        let d2 = {}; try { d2 = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8')); } catch { /* */ }
+        const ids = new Set(unseen.map(u => u.id));
+        for (const m of (Array.isArray(d2.messages) ? d2.messages : [])) {
+            if (!ids.has(m.id)) continue;
+            if (!Array.isArray(m.seen)) m.seen = [];
+            if (!m.seen.includes(sid)) m.seen.push(sid);
+        }
+        fs.writeFileSync(SESSIONS_FILE, JSON.stringify(d2));
+    } catch { /* */ } finally { if (got) releaseLock(SESSIONS_LOCK); }
+    const ago = (ts) => { const mm = Math.max(0, Math.round((now - (ts || now)) / 60000)); return mm <= 0 ? 'just now' : `${mm}m ago`; };
+    const out = ['', '## 📨 Message(s) from another session in this project (delivered once — act on or reply to them)'];
+    for (const m of unseen.slice(0, 6)) out.push(`- from ${String(m.from || '?').slice(0, 8)} · ${ago(m.ts)}: ${String(m.text).replace(/\s+/g, ' ').trim().slice(0, 200)}`);
+    out.push('Reply with `🧠 MSG [<their-id or all>]: <text>` — it reaches them on their next prompt.');
+    return '\n' + out.join('\n');
 }
 
 // Pull assistant text out of one transcript line (Claude Code JSONL: content is
@@ -755,6 +817,8 @@ async function capture(lib) {
     const resolutions = [];
     const updates = [];
     const ledger = [];   // one entry per marker decision (observability)
+    const messages = [];                 // 🧠 MSG markers → posted to the per-project lane
+    const sid = input.session_id || '';
     // Rolling set of the most-recently-touched file/dir tags (deduped, newest
     // last). A marker emitted after some edits gets tagged with the files that
     // work touched — captured by scanning EVERY entry's tool_use, not just the
@@ -776,7 +840,15 @@ async function capture(lib) {
         const text = textOf(e);
         if (!text.includes('🧠')) continue;
         for (const raw of text.split('\n')) {
-            const m = MARKER.exec(raw.trim()); if (!m) continue;
+            const trimmed = raw.trim();
+            // 🧠 MSG [to]: text — an async note to another session (not a brain card).
+            const mg = MSG_RE.exec(trimmed);
+            if (mg) {
+                const txt = (mg[2] || '').trim();
+                if (txt) messages.push({ id: sha(sid + '|' + txt + '|' + Date.now() + '|' + Math.random()), from: sid, to: (mg[1] || '').trim() || 'all', text: txt.slice(0, 400), ts: Date.now(), seen: [] });
+                continue;
+            }
+            const m = MARKER.exec(trimmed); if (!m) continue;
             const area = (m[1] || '').trim(), type = m[2] || '';
             let body = m[3].trim(); if (!body) continue;
             // Strip optional `closes:` / `ev:` suffixes off the body so they don't
@@ -833,6 +905,7 @@ async function capture(lib) {
             ledger.push({ action: type === '?' ? 'add-question' : type === '!' ? 'add-milestone' : isSkill ? 'add-skill' : 'add-decision', area, preview, files: fileTags, ...(closes ? { closes } : {}), ...(evidence ? { ev: evidence.map(e => e.ref) } : {}) });
         }
     }
+    postMessages(messages);   // deliver any 🧠 MSG notes to peers' lanes (even if no cards this turn)
     // Ship-event auto-capture: deterministic high-signal events (PR merges, releases,
     // npm publishes, tags) from SUCCESSFUL shell calls in the transcript — no marker
     // required (the gap a concurrent session hit: 3 releases + 6 PRs → zero cards).
@@ -1015,6 +1088,7 @@ async function promptRetrieve(lib) {
     // Other live sessions in THIS repo — surfaced even when the prompt retrieves
     // nothing (a peer's presence/ship is itself the signal). Empty string when solo.
     const peers = peerFooter(sid);
+    const messages = messageFooter(sid);   // 📨 deliberate notes another session left for me (delivered once)
     let hits = [], repeats = [], struct = null;
     if (tokens.length) {
         struct = await cachedStruct(lib);
@@ -1061,7 +1135,7 @@ async function promptRetrieve(lib) {
     // Other live sessions' in-flight events (struct may be null on a token-less
     // prompt — then representedInBrain just keeps entries; they're rarely in-brain yet).
     const inflight = inflightFooter(sid, struct);
-    if (!repeats.length && !freshHits.length && !peers && !inflight) return; // nothing → zero output, zero added context
+    if (!repeats.length && !freshHits.length && !peers && !inflight && !messages) return; // nothing → zero output, zero added context
     const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
     const day = (ts) => ts ? new Date(ts).toISOString().slice(0, 10) : '';
     const head = (c, n = 120) => { const t = flat(c.text); return t.length > n ? t.slice(0, n - 1) + '…' : t; };
@@ -1086,6 +1160,7 @@ async function promptRetrieve(lib) {
     if (lines.length) parts.push(lines.join('\n'));
     if (inflight) parts.push(inflight.replace(/^\n+/, '')); // ⚡ in-flight peers' events (its own block)
     if (peers) parts.push(peers.replace(/^\n+/, '')); // live-session presence footer (its own block)
+    if (messages) parts.push(messages.replace(/^\n+/, '')); // 📨 inbound deliberate peer notes
     process.stdout.write(parts.join('\n\n') + '\n'); // UserPromptSubmit injects stdout as context
 }
 
@@ -1196,7 +1271,8 @@ function legendFooter() {
     return '\n\n---\n'
         + '🧠 **Capture markers** — write these in your reply; the Stop hook harvests them into the brain (no separate log step). Use sparingly, for real decisions / milestones / discoveries:\n'
         + '`🧠 BRAIN [Area]: decision` · `[Area] ?: open question` · `[Area] !: milestone` · `[Area] +: 🛠️ skill (reusable how-to / gotcha — resurfaces every session, never ages out)` · `[Area] ✓: resolves+archives the matching card` · `[Area] ~: updates it in place` · 🎯 in text = a goal (reads as open).\n'
-        + 'Optional suffixes: `closes: <card title / [[wikilink]]>` (resolve the strategy/question this fulfils) · `ev: <file[:line]>, PR#<n>` (anchor to code → auto drift-badge).\n';
+        + 'Optional suffixes: `closes: <card title / [[wikilink]]>` (resolve the strategy/question this fulfils) · `ev: <file[:line]>, PR#<n>` (anchor to code → auto drift-badge).\n'
+        + 'Coordinate with a concurrent session: `🧠 MSG [<their-id or all>]: <text>` — a one-time note (NOT a brain card) delivered to that session on its next prompt.\n';
 }
 
 async function read(lib) {
@@ -1213,7 +1289,7 @@ async function read(lib) {
         : lib.structToMarkdown(struct);
     // ⚡ In-flight footer goes RIGHT AFTER the brief (highest signal: what a peer
     // shipped seconds ago, before it's in the brain) — closes the 1.3.17-blindness gap.
-    process.stdout.write(outStr + inflightFooter(input.session_id, struct) + selfHealFooter(drifted) + reconcileFooter(lib, struct) + staleOpenFooter(lib, struct) + selfCheckFooter() + legendFooter() + memoryFooter());
+    process.stdout.write(outStr + inflightFooter(input.session_id, struct) + selfHealFooter(drifted) + reconcileFooter(lib, struct) + staleOpenFooter(lib, struct) + selfCheckFooter() + messageFooter(input.session_id || '') + legendFooter() + memoryFooter());
     // Heartbeat: prove the brief actually injected (and how big) so a dead or
     // stale live-copy of the hook stops being a silent no-op.
     appendJsonl(HEALTH, { ts: nowIso(), project: path.basename(CWD), mode: 'read', ok: true, briefBytes: Buffer.byteLength(outStr), cards: struct?.counts?.cards ?? null }, 500);

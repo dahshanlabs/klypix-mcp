@@ -34,6 +34,13 @@ const PKG_VERSION = (() => { try { return createRequire(import.meta.url)('../pac
 // IMPORTANT: stdout is the JSON-RPC channel. Never console.log — only stderr.
 const log = (...a) => console.error('[klypix-mcp]', ...a);
 
+// `npx klypix-mcp install` — lay the WHOLE brain (hook + engine + local servers)
+// into ~/.claude/project-brain and wire the Claude Code hooks. This is the single
+// agent-neutral installer, so a brain release reaches every machine via one npm
+// publish + this command (the global brain serves every project). Runs before any
+// server setup; delegates to the dedicated bin so `npx klypix-install` also works.
+if (process.argv[2] === 'install') { await import('./klypix-install.mjs'); process.exit(0); }
+
 // `npx klypix-mcp init` — 60-second onboarding: seed a starter project brain in
 // the current folder so a new user's FIRST contact isn't an empty vault, then
 // print a paste-ready MCP config. Runs before any server setup.

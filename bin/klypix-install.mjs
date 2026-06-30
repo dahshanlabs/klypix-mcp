@@ -58,13 +58,16 @@ const flatten = (code) => code
     .replace(/from '\.\.\/src\/klypix-core\.mjs'/g, "from './klypix-core.mjs'")
     .replace(/from '\.\.\/src\/klypix-format\.mjs'/g, "from './klypix-format.mjs'")
     .replace(/\.\.\/src\/klypix-(core|format)\.mjs/g, './klypix-$1.mjs')
+    // brain-doctor + agent-rules (the server's lazy `import('../src/brain-doctor.mjs')`
+    // for the brain_doctor tool) → flat sibling refs in the runtime layout.
+    .replace(/\.\.\/src\/(brain-doctor|agent-rules)\.mjs/g, './$1.mjs')
     .replace(/const PKG_VERSION = \(\(\) => \{[\s\S]*?\}\)\(\);/, `const PKG_VERSION = '${VERSION}'; // baked at install (flat layout has no package.json)`);
 
 try {
     fs.mkdirSync(BRAIN_DIR, { recursive: true });
     // 1) flat engine + hook scripts (their imports are already './…' → verbatim)
     let n = 0;
-    for (const f of ['global-brain-hook.mjs', 'brain-semantic.mjs', 'brain-note.mjs', 'brain-git-hook.mjs', 'klypix-format.mjs', 'klypix-core.mjs']) {
+    for (const f of ['global-brain-hook.mjs', 'brain-semantic.mjs', 'brain-note.mjs', 'brain-git-hook.mjs', 'klypix-format.mjs', 'klypix-core.mjs', 'agent-rules.mjs', 'brain-doctor.mjs']) {
         const s = path.join(SRC, f); if (exists(s)) { fs.writeFileSync(path.join(BRAIN_DIR, f), fs.readFileSync(s, 'utf8')); n++; }
     }
     // 2) the two servers, flattened to the *-server.mjs names the runtime/config expect

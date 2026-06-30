@@ -199,6 +199,30 @@ server.registerTool('brain_note', {
   return toContent(await opBrainNote({ vault: VAULT, canvas, text, area, marker: marker || '', closes, via }));
 });
 
+server.registerTool('brain_doctor', {
+  title: 'Brain doctor — is this brain current, wired, and in sync?',
+  description: 'Read-only self-check of the installed klypix brain, as ONE verdict: VERSION (the deployed brain-core version + optional npm-latest currency), HOOKS (are all 4 Claude Code hooks wired — liveness vs readiness), TOOLS (the discoverable MCP verb manifest), PEERS (other live sessions on this project\'s brain right now), and HARNESS (per-file projection drift: ok/stale/hand-edited/missing). Use to answer "is my brain current + correctly installed + in sync, and who else is live?" without file-spelunking. Never writes. The MCP-callable twin of `npx klypix-mcp doctor`.',
+  inputSchema: {
+    project: z.string().optional().describe('Project dir to audit harness + peers for. Defaults to the server\'s working directory.'),
+    check_npm: z.boolean().optional().describe('Also fetch npm latest to flag a stale brain (default false — this one does a network `npm view`).'),
+  },
+}, async ({ project, check_npm }) => {
+  try {
+    // Lazy import so a flat runtime missing brain-doctor.mjs can't crash server STARTUP —
+    // the tool degrades gracefully (errors only when called) instead of taking the server down.
+    const { inspect, render } = await import('../src/brain-doctor.mjs');
+    let npmLatest = null;
+    if (check_npm) {
+      try { const { execSync } = await import('child_process'); npmLatest = execSync('npm view klypix-mcp version', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 8000 }).trim(); }
+      catch { npmLatest = '(offline)'; }
+    }
+    const report = inspect({ projectDir: project ? path.resolve(project) : process.cwd(), npmLatest });
+    return { content: [{ type: 'text', text: render(report, { color: false }) }] };
+  } catch (e) {
+    return { content: [{ type: 'text', text: `brain_doctor unavailable: ${e?.message || e}` }], isError: true };
+  }
+});
+
 const transport = new StdioServerTransport();
 await server.connect(transport);
 log(`ready · vault=${VAULT}`);

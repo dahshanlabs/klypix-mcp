@@ -52,6 +52,9 @@
   "engines": {
     "node": ">=18"
   },
+  "scripts": {
+    "test": "node test/brain-doctor.mjs"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "jszip": "^3.10.1",

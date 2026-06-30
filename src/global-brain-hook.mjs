@@ -21,6 +21,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
+import https from 'https';
 import { execSync } from 'child_process';
 
 const CWD = process.cwd();
@@ -41,6 +42,9 @@ const STATE = path.resolve(CWD, '.claude', 'brain-capture-state.json');
 //                  flag the card when that code drifts.
 const MARKER = /🧠\s*BRAIN\s*(?:\[([^\]]+)\])?\s*([?!✓~+]?)\s*:\s*(.+)$/i;
 const sha = (s) => crypto.createHash('sha1').update(s).digest('hex').slice(0, 16);
+// Numeric semver compare (major.minor.patch; pre-release tags ignored). <0 if
+// a<b, 0 equal, >0 if a>b. Shared by the version-currency footer below.
+const cmpSemver = (a, b) => { const pa = String(a || '').split('.').map(n => parseInt(n, 10) || 0), pb = String(b || '').split('.').map(n => parseInt(n, 10) || 0); for (let i = 0; i < 3; i++) { if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) - (pb[i] || 0); } return 0; };
 
 // ── Evidence anchors + close-links (decision lifecycle) ──────────────────────
 // `git rev-parse HEAD:<path>` → the file's blob OID at HEAD (stable across
@@ -207,6 +211,11 @@ function readHookInput() {
 //           bytes — so a dead/stale/unsynced live copy stops being invisible.
 const LEDGER = path.resolve(CWD, '.claude', 'brain-capture-log.jsonl');
 const HEALTH = path.join(os.homedir(), '.claude', 'project-brain', '.hook-health.jsonl');
+// npm-currency cache — the Stop hook refreshes this at most once/day (best-effort,
+// failure-silent); the SessionStart footer reads ONLY this file (zero network) to
+// surface a stale install. {pkg, latest, checkedAt, lastError?}.
+const NPM_CURRENCY = path.join(os.homedir(), '.claude', 'project-brain', '.npm-currency.json');
+const NPM_CURRENCY_TTL = 24 * 60 * 60 * 1000;   // ≤ once/day refresh throttle
 const LOCK = path.resolve(CWD, '.claude', 'brain-capture.lock');   // serialize concurrent captures
 const DRY = process.argv.includes('--dry-run');   // inspect a capture without writing
 const nowIso = () => { try { return new Date().toISOString(); } catch { return ''; } };
@@ -1250,6 +1259,87 @@ function selfCheckFooter() {
     } catch { return ''; }
 }
 
+// ── Version-currency — the brain surfaces its OWN staleness, ambiently ───────
+// doctorFooter (below) is deliberately network-free, so a stale install never
+// announced itself until someone ran `npx klypix-mcp doctor --npm` — the human was
+// the drift detector (the desktop-lag incident). These two functions close that gap
+// WITHOUT breaking the no-network-in-session-start rule:
+//   • refreshNpmCurrency() runs on the Stop hook (post-session), ≤ once/day,
+//     best-effort + failure-silent — it fetches npm `latest` into a local cache.
+//   • versionCurrencyFooter() runs at SessionStart and reads ONLY that cache
+//     (pure fs, NO fetcher) — so it CANNOT make a network call by construction.
+// `doctor` stays the authoritative on-demand full check (unchanged).
+
+// The ONLY network path (kept separate so the footer is fetcher-less). Resolves the
+// published `latest` via the registry's lightweight per-version endpoint. Zero deps
+// (node https), tight timeout, rejects on any failure. Injectable in tests.
+function httpsFetchLatest(pkg = 'klypix-mcp', timeoutMs = 4000) {
+    return new Promise((resolve, reject) => {
+        // GET /{pkg}/latest with the DEFAULT json accept — the abbreviated
+        // `vnd.npm.install-v1+json` type is only served by the full packument
+        // endpoint and 406s here. This returns the latest version manifest (~few KB).
+        const req = https.get(`https://registry.npmjs.org/${pkg}/latest`,
+            { headers: { accept: 'application/json' } }, (res) => {
+                if (res.statusCode !== 200) { res.resume(); return reject(new Error('http ' + res.statusCode)); }
+                let body = '';
+                res.setEncoding('utf8');
+                res.on('data', (c) => { body += c; if (body.length > 1_000_000) req.destroy(new Error('too large')); });
+                res.on('end', () => { try { const v = JSON.parse(body).version; v ? resolve(String(v)) : reject(new Error('no version')); } catch (e) { reject(e); } });
+            });
+        req.on('error', reject);
+        req.setTimeout(timeoutMs, () => req.destroy(new Error('timeout')));
+    });
+}
+
+// Throttled (≤ once/day), best-effort, failure-silent refresh of the npm-latest
+// cache — runs on the Stop hook only. NEVER throws. `now`/`fetcher`/`file`/`ttl`
+// are injectable so tests stay hermetic (no real network). A failed fetch still
+// stamps `checkedAt` (so we don't hammer when offline) and keeps a prior good
+// `latest`. Returns a small status object; callers ignore it.
+async function refreshNpmCurrency({ now = Date.now(), fetcher = httpsFetchLatest, file = NPM_CURRENCY, ttl = NPM_CURRENCY_TTL, pkg = 'klypix-mcp' } = {}) {
+    try {
+        let prev = null;
+        try { prev = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { /* no cache yet */ }
+        if (prev && Number.isFinite(prev.checkedAt) && (now - prev.checkedAt) < ttl) return { skipped: 'throttled', prev };
+        let latest = (prev && prev.latest) || null, lastError = null;
+        try { latest = await fetcher(pkg); } catch (e) { lastError = String((e && e.message) || e).slice(0, 120); }
+        const next = { pkg, latest: latest || null, checkedAt: now, ...(lastError ? { lastError } : {}) };
+        try { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, JSON.stringify(next, null, 2)); } catch { /* best-effort */ }
+        return { fetched: !lastError, latest: next.latest, lastError };
+    } catch { return { skipped: 'error' }; }
+}
+
+// Read the BAKED brain-core version from the deployed klypix-mcp-server.mjs — the
+// channel-independent source of truth (the install stamp's version key varies by
+// channel). Null when not deployed (a dev source checkout w/o a server file) → the
+// footer then stays silent (nothing to compare).
+function bakedBrainVersion(brainDir = path.dirname(NPM_CURRENCY)) {
+    try {
+        const m = fs.readFileSync(path.join(brainDir, 'klypix-mcp-server.mjs'), 'utf8').match(/const PKG_VERSION = '([^']+)'/);
+        return m ? m[1] : null;
+    } catch { return null; }
+}
+
+// SessionStart footer — ambient version drift. Reads ONLY the local cache (zero
+// network, no fetcher) + the baked version, and emits ONE advisory line when the
+// installed brain is behind npm `latest`. SILENT when current/ahead, when the cache
+// is missing or unknown ("(offline)" sentinel), or when there's no baked version to
+// compare against — no nag, no noise.
+function versionCurrencyFooter({ file = NPM_CURRENCY, brainDir = path.dirname(NPM_CURRENCY) } = {}) {
+    try {
+        let cache; try { cache = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return ''; }
+        const latest = cache && cache.latest;
+        // Require a well-formed semver before comparing — rejects missing, the
+        // "(offline)" sentinel, and any hand-corrupted cache value (e.g. `123`,
+        // `v1.14.0`) that could otherwise false-nag or false-silence. Silent.
+        if (!latest || !/^\d+\.\d+\.\d+/.test(String(latest))) return '';
+        const baked = bakedBrainVersion(brainDir);
+        if (!baked) return '';                                           // nothing to compare → silent
+        if (cmpSemver(latest, baked) <= 0) return '';                    // current or ahead → silent
+        return `\n\n---\n⚠️ **Brain update available** — installed brain core \`v${baked}\` < npm latest \`v${latest}\`. Update: \`npx klypix-mcp install\`.\n`;
+    } catch { return ''; }
+}
+
 // ── Readiness footer — catch a HALF-WIRED install (liveness ≠ readiness) ─────
 // SessionStart firing proves the brain is ALIVE; but the OTHER three hooks are what
 // make it LEARN — UserPromptSubmit (recall), Stop (capture), PostToolUse (live sync).
@@ -1326,7 +1416,7 @@ async function read(lib) {
         : lib.structToMarkdown(struct);
     // ⚡ In-flight footer goes RIGHT AFTER the brief (highest signal: what a peer
     // shipped seconds ago, before it's in the brain) — closes the 1.3.17-blindness gap.
-    process.stdout.write(outStr + inflightFooter(input.session_id, struct) + selfHealFooter(drifted) + reconcileFooter(lib, struct) + staleOpenFooter(lib, struct) + selfCheckFooter() + doctorFooter() + messageFooter(input.session_id || '') + legendFooter() + memoryFooter());
+    process.stdout.write(outStr + inflightFooter(input.session_id, struct) + selfHealFooter(drifted) + reconcileFooter(lib, struct) + staleOpenFooter(lib, struct) + selfCheckFooter() + doctorFooter() + versionCurrencyFooter() + messageFooter(input.session_id || '') + legendFooter() + memoryFooter());
     // Heartbeat: prove the brief actually injected (and how big) so a dead or
     // stale live-copy of the hook stops being a silent no-op.
     appendJsonl(HEALTH, { ts: nowIso(), project: path.basename(CWD), mode: 'read', ok: true, briefBytes: Buffer.byteLength(outStr), cards: struct?.counts?.cards ?? null }, 500);
@@ -1378,15 +1468,30 @@ async function main() {
         // try/finally so the clear runs across capture()'s early returns AND a throw
         // (on throw, ship/milestone re-capture next Stop; a version is on disk — no loss).
         try { await capture(lib); } finally { clearLiveLedgerForSession(readHookInput().session_id); }
+        // Ambient version-currency: piggyback the post-session Stop hook to refresh the
+        // npm-latest cache (≤ once/day, best-effort, failure-silent) so the next
+        // SessionStart footer can surface a stale install with ZERO network. Awaited so
+        // the throttled request finishes before exit; bulletproof (never throws/blocks).
+        await refreshNpmCurrency().catch(() => {});
     } else await read(lib);
 }
-main().catch((e) => {
-    // The whole point of the observability work: a real failure (missing jszip
-    // at the live path, unreadable transcript, corrupt brain) used to vanish
-    // here. Now it leaves a breadcrumb — without breaking the never-throw,
-    // always-exit-0 contract.
-    try {
-        const mode = process.argv.includes('--prompt') ? 'prompt' : process.argv.includes('--capture') ? 'capture' : 'read';
-        appendJsonl(HEALTH, { ts: nowIso(), project: path.basename(CWD), mode, ok: false, err: String((e && e.message) || e).slice(0, 200) }, 500);
-    } catch { /* even the breadcrumb is best-effort */ }
-}).finally(() => process.exit(0));
+// Run as the hook by default. The ONLY way main() is skipped is the explicit
+// opt-out flag a hermetic test sets before importing this module for its pure
+// exports — production never sets it, so runtime behavior is byte-identical (no
+// fragile entry-point/argv path-matching in the most safety-critical hook).
+if (!process.env.KLYPIX_BRAIN_NO_MAIN) {
+    main().catch((e) => {
+        // The whole point of the observability work: a real failure (missing jszip
+        // at the live path, unreadable transcript, corrupt brain) used to vanish
+        // here. Now it leaves a breadcrumb — without breaking the never-throw,
+        // always-exit-0 contract.
+        try {
+            const mode = process.argv.includes('--prompt') ? 'prompt' : process.argv.includes('--capture') ? 'capture' : 'read';
+            appendJsonl(HEALTH, { ts: nowIso(), project: path.basename(CWD), mode, ok: false, err: String((e && e.message) || e).slice(0, 200) }, 500);
+        } catch { /* even the breadcrumb is best-effort */ }
+    }).finally(() => process.exit(0));
+}
+
+// Exported for hermetic unit tests only (gated by KLYPIX_BRAIN_NO_MAIN above so the
+// import doesn't run main()/exit the test). Not part of the runtime hook contract.
+export { refreshNpmCurrency, versionCurrencyFooter, bakedBrainVersion, httpsFetchLatest, cmpSemver };

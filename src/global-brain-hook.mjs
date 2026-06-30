@@ -844,8 +844,16 @@ async function capture(lib) {
             // 🧠 MSG [to]: text — an async note to another session (not a brain card).
             const mg = MSG_RE.exec(trimmed);
             if (mg) {
+                const to = (mg[1] || '').trim();
                 const txt = (mg[2] || '').trim();
-                if (txt) messages.push({ id: sha(sid + '|' + txt + '|' + Date.now() + '|' + Math.random()), from: sid, to: (mg[1] || '').trim() || 'all', text: txt.slice(0, 400), ts: Date.now(), seen: [] });
+                // Skip the feature's OWN documentation/examples, not a real note: a
+                // placeholder target/text (<to>, <text>, <their-id…> — real targets are
+                // id-prefixes/branches and never contain <>) or a marker quoted inside an
+                // inline-code span (`…🧠 MSG…`, i.e. a backtick precedes the marker).
+                const isExample = /[<>\s]/.test(to)   // real targets are ONE token (id/branch/all/*) — <>, spaces ⇒ a doc example
+                    || /^\s*<[^>]+>/.test(txt)
+                    || /`/.test(trimmed.slice(0, trimmed.indexOf('🧠')));
+                if (txt && !isExample) messages.push({ id: sha(sid + '|' + txt + '|' + Date.now() + '|' + Math.random()), from: sid, to: to || 'all', text: txt.slice(0, 400), ts: Date.now(), seen: [] });
                 continue;
             }
             const m = MARKER.exec(trimmed); if (!m) continue;

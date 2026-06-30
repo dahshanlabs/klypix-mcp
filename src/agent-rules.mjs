@@ -152,13 +152,22 @@ function mergeMcpJson(file, wrapKey, withType) {
   return { action: before === undefined ? 'created' : 'updated' };
 }
 
-// Check-only classifier for an MCP json: is the klypix-canvas server wired?
+// Check-only classifier for an MCP json: is the klypix-canvas server wired AND does
+// its entry still actually launch klypix-mcp? Presence alone isn't enough — a hand-edit
+// that mangles the command/args (so the server never starts) reads as "wired" but is
+// broken. We DON'T strict-hash the entry: a customized `--vault <path>` is legitimate,
+// so only the invocation (npx/node … klypix-mcp …) must survive; if it doesn't, that's
+// drift the user needs to re-`link`.
 function classifyMcp(file, wrapKey) {
   if (!exists(file)) return { status: 'missing' };
-  try {
-    const cfg = JSON.parse(fs.readFileSync(file, 'utf8') || '{}');
-    return cfg?.[wrapKey]?.['klypix-canvas'] ? { status: 'ok' } : { status: 'missing' };
-  } catch { return { status: 'hand-edited', why: 'invalid JSON' }; }
+  let cfg;
+  try { cfg = JSON.parse(fs.readFileSync(file, 'utf8') || '{}'); }
+  catch { return { status: 'hand-edited', why: 'invalid JSON' }; }
+  const entry = cfg?.[wrapKey]?.['klypix-canvas'];
+  if (!entry) return { status: 'missing' };
+  const args = Array.isArray(entry.args) ? entry.args.map(String) : [];
+  const launches = (entry.command === 'npx' || entry.command === 'node') && args.some(a => a.includes('klypix-mcp'));
+  return launches ? { status: 'ok' } : { status: 'hand-edited', why: 'entry no longer launches klypix-mcp' };
 }
 
 // The projection map — the single source of truth shared by WRITE (linkProject) and

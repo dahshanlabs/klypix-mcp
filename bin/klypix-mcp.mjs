@@ -47,6 +47,11 @@ if (process.argv[2] === 'install') { await import('./klypix-install.mjs'); proce
 // brain on its own. Project-scoped (cwd); idempotent. Runs before any server setup.
 if (process.argv[2] === 'link') { await import('./klypix-link.mjs'); process.exit(0); }
 
+// `npx klypix-mcp doctor` — the brain's READ-ONLY self-check: is this machine's brain
+// current, are the 4 hooks wired, what verbs does it expose, who's live, is the harness
+// projection in sync? One verdict, one reconcile block. Exits 1 on drift (CI gate).
+if (process.argv[2] === 'doctor') { await import('./klypix-doctor.mjs'); process.exit(0); }
+
 // `npx klypix-mcp init` — 60-second onboarding: seed a starter project brain in
 // the current folder so a new user's FIRST contact isn't an empty vault, then
 // print a paste-ready MCP config. Runs before any server setup.

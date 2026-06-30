@@ -1250,6 +1250,35 @@ function selfCheckFooter() {
     } catch { return ''; }
 }
 
+// ── Readiness footer — catch a HALF-WIRED install (liveness ≠ readiness) ─────
+// SessionStart firing proves the brain is ALIVE; but the OTHER three hooks are what
+// make it LEARN — UserPromptSubmit (recall), Stop (capture), PostToolUse (live sync).
+// A settings.json edit, a partial install, or a manual hook-prune can drop any of them,
+// leaving the brain reading-but-not-capturing — invisible until cards silently go
+// missing. This reads settings.json and says so in ONE line when drifted. Cheap +
+// namespace-safe (no version compare, no network); never throws. The full picture
+// (version currency, harness-projection drift, live peers) lives in `npx klypix-mcp
+// doctor` — the footer only carries the one signal worth interrupting every session for.
+function doctorFooter() {
+    try {
+        const SETTINGS = path.join(os.homedir(), '.claude', 'settings.json');
+        if (!fs.existsSync(SETTINGS)) return '';
+        let settings; try { settings = JSON.parse(fs.readFileSync(SETTINGS, 'utf8')); } catch { return ''; }
+        const wiredFor = (evt) => {
+            const groups = settings?.hooks?.[evt];
+            return Array.isArray(groups) && groups.some(g => Array.isArray(g?.hooks)
+                && g.hooks.some(h => typeof h?.command === 'string' && h.command.includes('global-brain-hook')));
+        };
+        const missing = [['UserPromptSubmit', 'per-prompt recall'], ['Stop', 'decision capture'], ['PostToolUse', 'live sync']]
+            .filter(([evt]) => !wiredFor(evt));
+        if (!missing.length) return '';
+        return '\n\n---\n## ⚠️ Brain half-wired — readiness\n'
+            + `SessionStart fired (the brain is alive), but ${missing.length} hook(s) that make it LEARN are not wired: `
+            + missing.map(([evt, what]) => `**${evt}** (${what})`).join(', ') + '.\n'
+            + 'The brain will read but silently stop capturing/syncing decisions. Re-wire: `npx klypix-mcp install`, then restart this session.\n';
+    } catch { return ''; }
+}
+
 // ── Self-healing brain (decision lifecycle, part 5) ──────────────────────────
 // Open ❓/🎯 cards a later shipped 🏁 milestone appears to have fulfilled —
 // surfaced so the agent CLOSES them (✓ / closes:) instead of recall surfacing
@@ -1297,7 +1326,7 @@ async function read(lib) {
         : lib.structToMarkdown(struct);
     // ⚡ In-flight footer goes RIGHT AFTER the brief (highest signal: what a peer
     // shipped seconds ago, before it's in the brain) — closes the 1.3.17-blindness gap.
-    process.stdout.write(outStr + inflightFooter(input.session_id, struct) + selfHealFooter(drifted) + reconcileFooter(lib, struct) + staleOpenFooter(lib, struct) + selfCheckFooter() + messageFooter(input.session_id || '') + legendFooter() + memoryFooter());
+    process.stdout.write(outStr + inflightFooter(input.session_id, struct) + selfHealFooter(drifted) + reconcileFooter(lib, struct) + staleOpenFooter(lib, struct) + selfCheckFooter() + doctorFooter() + messageFooter(input.session_id || '') + legendFooter() + memoryFooter());
     // Heartbeat: prove the brief actually injected (and how big) so a dead or
     // stale live-copy of the hook stops being a silent no-op.
     appendJsonl(HEALTH, { ts: nowIso(), project: path.basename(CWD), mode: 'read', ok: true, briefBytes: Buffer.byteLength(outStr), cards: struct?.counts?.cards ?? null }, 500);

@@ -141,9 +141,18 @@ try {
     // 6) stamp the install (unified brain version → never-downgrade across channels)
     fs.writeFileSync(path.join(BRAIN_DIR, '.brain-version.json'), JSON.stringify({ brainVersion: VERSION, via: 'npm', dirty: false, installedAt: new Date().toISOString() }, null, 2));
 
+    // 7) READINESS check — re-read what we just wrote and confirm all 4 hooks actually
+    //    took (a malformed pre-existing group, a partial merge, or a later hand-edit can
+    //    leave the brain LIVE but not LEARNING — liveness ≠ readiness). Warn, don't fail.
+    const verify = (() => { try { return JSON.parse(fs.readFileSync(SETTINGS, 'utf8')); } catch { return null; } })();
+    const wiredFor = (evt) => Array.isArray(verify?.hooks?.[evt]) && verify.hooks[evt].some(g => Array.isArray(g?.hooks) && g.hooks.some(h => typeof h?.command === 'string' && h.command.includes(HOOK_MARK)));
+    const notWired = ['SessionStart', 'UserPromptSubmit', 'Stop', 'PostToolUse'].filter(e => !wiredFor(e));
+
     console.log(`✓ installed klypix brain v${VERSION} → ${BRAIN_DIR}  (${n} scripts, ${deps} dep packages)`);
-    console.log('✓ wired 4 hooks: SessionStart · UserPromptSubmit (--prompt) · Stop (--capture) · PostToolUse (--live) → settings.json');
+    if (!notWired.length) console.log('✓ wired 4 hooks: SessionStart · UserPromptSubmit (--prompt) · Stop (--capture) · PostToolUse (--live) → settings.json');
+    else console.error(`⚠ readiness: ${notWired.length} hook(s) did NOT take (${notWired.join(', ')}) — the brain will read but not capture/sync. Re-run \`npx klypix-mcp install --force\` or check ${SETTINGS}.`);
     console.log('  Every project with a ./brain.klypix now auto-reads its brief + captures decisions. Restart open Claude Code sessions to load the hooks.');
+    console.log('  Verify anytime: `npx klypix-mcp doctor` (is the brain current + wired + in sync, who else is live).');
 } catch (e) {
     console.error(`✗ install failed: ${e?.message || e}`);
     process.exit(1);

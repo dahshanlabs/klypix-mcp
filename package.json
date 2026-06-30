@@ -1,6 +1,6 @@
 {
   "name": "klypix-mcp",
-  "version": "1.12.1",
+  "version": "1.13.0",
   "description": "An open, local-first, agent-neutral canvas file your AI reads and writes over MCP — works with Claude, Cursor, Cline, any model.",
   "type": "module",
   "license": "MIT",
@@ -27,6 +27,7 @@
   "bin": {
     "klypix-mcp": "bin/klypix-mcp.mjs",
     "klypix-link": "bin/klypix-link.mjs",
+    "klypix-doctor": "bin/klypix-doctor.mjs",
     "klypix-a2a": "bin/klypix-a2a.mjs",
     "klypix-read": "bin/klypix-read.mjs",
     "klypix-write": "bin/klypix-write.mjs",

@@ -50,18 +50,28 @@ const BRAIN_INSTRUCTIONS = `## KLYPIX project brain
 
 This project has a **spatial brain** at \`./brain.klypix\` — the living memory of its
 decisions, open questions, and findings (the shared human↔agent memory for this repo).
-Treat it as authoritative project context.
+Treat it as authoritative project context, and as **the place project knowledge lives** so it
+survives across sessions, agents, and context resets.
 
 **At the start of a task — read it** so you know the project's state and past decisions:
 - with the \`klypix-canvas\` MCP server: call \`search_canvases\` / \`read_canvas\` (canvas: \`"brain"\`), or \`brain_insights\` for the load-bearing cards.
 - or via CLI: \`npx klypix-read brain.klypix\`
 
-**When you make a real decision, finding, or milestone — capture it** so it persists for the next session/agent:
+**When you make a real decision, finding, or milestone — capture it HERE** so it persists for the next session/agent:
 - with MCP: call \`brain_note\` with a one-line decision, or
 - emit a marker line in your output: \`🧠 BRAIN [Area]: <one-line decision>\`, or
 - via CLI: \`echo "🧠 BRAIN [Area]: <decision>" | npx klypix-append brain.klypix\`
 
-Capture **sparingly** — real decisions/milestones, not routine steps. Link related cards with \`[[other-card]]\`.
+Capture **sparingly** — real decisions / milestones / open questions / reusable gotchas, not routine
+steps — and capture it **at the moment you decide** (a one-line marker inline), not batched or left in
+a scratch file to rot. Link related cards with \`[[other-card]]\`.
+
+**Memory routing (important).** If your host has its OWN memory/notes store, that is for *user*
+preferences and how to work with this person — keep using it for that. But **project** knowledge
+(decisions, milestones, open questions, gotchas) belongs in THIS brain: it is the shared, portable
+memory the whole team and every agent reads, not a private scratchpad only you can see. Never let a
+project decision live *only* in your host's memory or a scratch file — put it here so the next
+session/agent has it.
 
 **Don't** hand-edit \`brain.klypix\` (it's a packaged canvas — use the tools) or dump file contents into it; capture the *decision*, not the file.`;
 

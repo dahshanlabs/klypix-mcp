@@ -456,7 +456,7 @@ export async function opBrainGarden({ vault, canvas, apply = false, syntheses })
     if (!stats.synthCards) return { blocks: [text(`No areas consolidated — each synthesis \`title\` must match a dry-run area title exactly.${skippedNote}`)] };
     let out = buffer; try { out = (await tidyBrain(buffer)).buffer; } catch { /* keep apply result if tidy fails */ }
     await atomicWrite(file, out);
-    return { blocks: [text(`🌿 Gardened ${stats.areas} area(s): ${stats.archived} old card(s) → ${stats.synthCards} synthesis card(s); originals archived with "consolidated into" arrows (any prose-dropped figures appended verbatim). Reopen the brain in KLYPIX to see it.${skippedNote}`)] };
+    return { blocks: [text(`🌿 Gardened ${stats.areas} area(s): ${stats.archived} old card(s) → ${stats.synthCards} synthesis card(s); originals archived with "consolidated into" arrows (any prose-dropped figures appended verbatim). Reopen the brain in the KLYPIX app to see it.${skippedNote}`)] };
   } catch (e) {
     return err(`Garden apply failed (brain unchanged): ${e.message}`);
   }
@@ -530,7 +530,7 @@ export async function opCreateCanvas({ vault, title, cards, connections, filenam
     let detail = '', struct;
     try { ({ struct } = await parseKlypix(buf)); detail = cardDetailBlock(struct); } catch { /* detail is optional */ }
     return {
-      blocks: [text(`Created ${out} — ${cards.length} cards, ${(connections || []).length} connections. Open it in KLYPIX (Canvas → Open).${detail}`)],
+      blocks: [text(`Created ${out} — ${cards.length} cards, ${(connections || []).length} connections. Open it in the KLYPIX app (Canvas → Open).${detail}`)],
       file: { name, buffer: buf }, struct,
     };
   } catch (e) {
@@ -555,7 +555,7 @@ export async function opAddToCanvas({ vault, canvas, cards, connections, via }) 
       detail = cardDetailBlock(struct, new Set(struct.cards.map(c => c.id).filter(id => !beforeIds.has(id))));
     } catch { /* detail is optional */ }
     return {
-      blocks: [text(`Added ${cards.length} card(s) to ${path.relative(vault, file)}. Reopen the canvas in KLYPIX to see them.${detail}`)],
+      blocks: [text(`Added ${cards.length} card(s) to ${path.relative(vault, file)}. Reopen the canvas in the KLYPIX app to see them.${detail}`)],
       file: { name: path.basename(file), buffer: buf }, struct,
     };
   } catch (e) {
@@ -587,7 +587,7 @@ export async function opBrainNote({ vault, canvas, text: noteText, area, marker 
     for (const k of ['resolved', 'updated', 'closed', 'superseded', 'linked']) if (s[k]) bits.push(`${s[k]} ${k}`);
     // Name the resolved brain explicitly (basename + how) so a write never lands
     // in a surprise file silently — the write-side twin of the read-op stamp.
-    return { blocks: [text(`✓ brain_note → ${path.basename(file)} (via ${t.how}) · ${bits.join(' · ')}. Reopen the brain in KLYPIX to see it.`)] };
+    return { blocks: [text(`✓ brain_note → ${path.basename(file)} (via ${t.how}) · ${bits.join(' · ')}. Reopen the brain in the KLYPIX app to see it.`)] };
   } catch (e) {
     return err(`brain_note failed (brain unchanged): ${e.message}`);
   }

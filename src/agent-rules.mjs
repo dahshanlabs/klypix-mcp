@@ -73,6 +73,11 @@ memory the whole team and every agent reads, not a private scratchpad only you c
 project decision live *only* in your host's memory or a scratch file — put it here so the next
 session/agent has it.
 
+**Working alongside other live sessions?** Send a one-time coordination note with the
+\`brain_message\` MCP tool ("merged the hook refactor — rebase before you commit"); every live peer
+session on this project receives it at its next prompt. Notes are ephemeral (24h), NOT brain cards —
+durable decisions still go through \`brain_note\`.
+
 **Don't** hand-edit \`brain.klypix\` (it's a packaged canvas — use the tools) or dump file contents into it; capture the *decision*, not the file.`;
 
 // Content fingerprint of the canonical instructions — stamped into the fence so a
@@ -104,14 +109,19 @@ function parseFence(text) {
 // Classify a projected fenced file WITHOUT writing (the drift audit).
 //   missing      — file absent, or present but carries no managed block
 //   hand-edited  — block body no longer matches the hash it was stamped with
-//   stale        — block intact but stamped from an older brain (version < current),
-//                   or a legacy unstamped block (no version) → a re-link refreshes it
-//   ok           — block present, current version, body matches its hash
+//   ok           — block body is EXACTLY what we'd project today (content-current),
+//                   regardless of the stamped version — CONTENT is the contract, the
+//                   version stamp is provenance. A version-only bump (patch release
+//                   that didn't touch the instructions) must NOT re-drift every
+//                   adopter project into a re-link treadmill.
+//   stale        — block body differs from today's instructions AND was stamped from
+//                   an older brain (or is a legacy unstamped block) → re-link refreshes
 function classifyFenced(file, version) {
   if (!exists(file)) return { status: 'missing' };
   const fence = parseFence(fs.readFileSync(file, 'utf8'));
   if (!fence) return { status: 'missing' };
   if (fence.hash && sha8(fence.body.trim()) !== fence.hash) return { status: 'hand-edited', stampedVersion: fence.version };
+  if (sha8(fence.body.trim()) === INSTRUCTIONS_HASH) return { status: 'ok', stampedVersion: fence.version || null };
   if (!fence.version) return { status: 'stale', stampedVersion: null };
   if (cmpSemver(fence.version, version) < 0) return { status: 'stale', stampedVersion: fence.version };
   return { status: 'ok', stampedVersion: fence.version };
@@ -123,6 +133,10 @@ function fenceMerge(file, version) {
   let cur = '';
   let had = false;
   if (exists(file)) { cur = fs.readFileSync(file, 'utf8'); had = true; }
+  // Content-current block → leave the file byte-identical (no stamp-only churn in
+  // adopters' committed files; matches classifyFenced's zero-touch semantics).
+  const curFence = parseFence(cur);
+  if (curFence && sha8(curFence.body.trim()) === INSTRUCTIONS_HASH) return { action: 'unchanged' };
   const block = fencedBlock(version);
   let next;
   let action;
@@ -136,9 +150,12 @@ function fenceMerge(file, version) {
 
 // Owned dedicated rules file: rewrite wholesale (optional frontmatter for always-apply).
 function writeDedicated(file, frontmatter, version) {
-  const body = (frontmatter ? frontmatter + '\n' : '') + fencedBlock(version) + '\n';
   const had = exists(file);
-  if (had && fs.readFileSync(file, 'utf8') === body) return { action: 'unchanged' };
+  if (had) {
+    const curFence = parseFence(fs.readFileSync(file, 'utf8'));
+    if (curFence && sha8(curFence.body.trim()) === INSTRUCTIONS_HASH) return { action: 'unchanged' };
+  }
+  const body = (frontmatter ? frontmatter + '\n' : '') + fencedBlock(version) + '\n';
   ensureDir(file); fs.writeFileSync(file, body, 'utf8');
   return { action: had ? 'updated' : 'created' };
 }

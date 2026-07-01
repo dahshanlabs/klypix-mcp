@@ -12,6 +12,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -38,10 +39,26 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
   ok(a.files.length === 9, 'projects exactly 9 targets (7 rules + 2 mcp)');
   ok(statusOf(a, 'GEMINI.md') === 'ok' && statusOf(a, 'CONVENTIONS.md') === 'ok', 'GEMINI.md + CONVENTIONS.md generated (were "not generated")');
 
-  // STALE — same files, newer current version → stamped < current.
+  // ZERO-TOUCH — newer current version but IDENTICAL content → still ok (a version-
+  // only bump must not re-drift every adopter project into a re-link treadmill).
   a = auditProject(proj, { version: '2.0.0' });
-  ok(statusOf(a, 'AGENTS.md') === 'stale', 'older stamp vs current version → stale');
-  ok(statusOf(a, '.cursor/mcp.json') === 'ok', 'mcp.json is version-agnostic → still ok when rules go stale');
+  ok(statusOf(a, 'AGENTS.md') === 'ok', 'older stamp + content-identical block → ok (zero-touch patch release)');
+  ok(statusOf(a, '.cursor/mcp.json') === 'ok', 'mcp.json is version-agnostic → ok');
+
+  // STALE — a block whose CONTENT differs from today's instructions (a real older
+  // release), internally consistent (body matches its own stamp → not hand-edited).
+  {
+    const sha8 = (s) => crypto.createHash('sha1').update(String(s)).digest('hex').slice(0, 8);
+    const oldBody = '## KLYPIX project brain\n\n(older instructions from a previous release)';
+    fs.writeFileSync(path.join(proj, 'AGENTS.md'),
+      `<!-- klypix-brain:start v=1.0.0 hash=${sha8(oldBody)} (managed by klypix-mcp — re-run \`npx klypix-mcp link\`) -->\n${oldBody}\n<!-- klypix-brain:end -->\n`);
+    a = auditProject(proj, { version: '1.2.3' });
+    ok(statusOf(a, 'AGENTS.md') === 'stale', 'older CONTENT (self-consistent stamp) → stale');
+    const relink = linkProject(proj, { version: '1.2.3' });
+    ok(relink.rules.find(r => r.file === 'AGENTS.md').action === 'updated', 're-link refreshes the stale block');
+    ok(linkProject(proj, { version: '9.9.9' }).rules.every(r => r.action === 'unchanged'),
+      'link with a newer version + identical content → all unchanged (no stamp-only churn)');
+  }
 
   // HAND-EDITED — mutate inside the managed block → stamped hash no longer matches.
   const agents = path.join(proj, 'AGENTS.md');
@@ -81,7 +98,8 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
 
   const names = (await client.listTools()).tools.map(t => t.name);
   ok(names.includes('brain_doctor'), 'brain_doctor is a registered MCP tool');
-  ok(names.length === 12, `tool manifest is 12 verbs (got ${names.length})`);
+  ok(names.includes('brain_message'), 'brain_message is a registered MCP tool');
+  ok(names.length === 13, `tool manifest is 13 verbs (got ${names.length})`);
 
   const r = await client.callTool({ name: 'brain_doctor', arguments: { project: vault } });
   const text = (r.content || []).filter(c => c.type === 'text').map(c => c.text).join('\n');

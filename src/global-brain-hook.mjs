@@ -268,7 +268,11 @@ function releaseLock(lockPath) { try { fs.unlinkSync(lockPath); } catch { /* */ 
 // self-pruning (a lane unseen for FRESH_MS is gone). Sibling of the registry/health
 // sidecars; same ~/.claude/project-brain home, same acquireLock/never-throw rules.
 const SESSIONS_DIR = path.join(os.homedir(), '.claude', 'project-brain', 'sessions');
-const SESSIONS_FILE = path.join(SESSIONS_DIR, `${sha(normBrainPath(BRAIN))}.json`); // one lane-file per PROJECT (shared by its concurrent sessions)
+// Lane key: canonicalize (on-disk casing + symlinks) BEFORE hashing, so an MCP
+// server that resolved the SAME brain via a differently-cased cwd / KLYPIX_BRAIN
+// lands in the SAME lane file — klypix-core.mjs laneFileFor mirrors this exactly.
+const laneCanon = (p) => { try { return fs.realpathSync.native(p); } catch { return path.resolve(p); } };
+const SESSIONS_FILE = path.join(SESSIONS_DIR, `${sha(normBrainPath(laneCanon(BRAIN)))}.json`); // one lane-file per PROJECT (shared by its concurrent sessions)
 const SESSIONS_LOCK = SESSIONS_FILE + '.lock';
 const SESSION_FRESH_MS = 10 * 60 * 1000;   // a lane unseen for 10min is treated as ended
 const safeGit = (args, timeout = 1500) => { try { return execSync(`git ${args}`, { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout }); } catch { return ''; } };
@@ -377,8 +381,34 @@ function msgTargetsMe(m, me, sid) {
     if (!to || to === 'all' || to === '*') return true;
     return [String(sid || '').slice(0, 8), me?.branch || '', me?.intent || ''].join(' ').toLowerCase().includes(to);
 }
+// Self-echo guard for the MCP twin (brain_message): an MCP-posted note carries the
+// CLIENT name as `from` (the server has no session identity), so messageFooter's
+// `from !== sid` can't exclude the sender. The sender's own transcript DOES contain
+// the tool_use, though — scan its tail for brain_message inputs and return their
+// texts so the footer can drop (and ack) the session's own sends. Best-effort.
+function ownMcpSendTexts(tp) {
+    try {
+        if (!tp || !fs.existsSync(tp)) return new Set();
+        const buf = fs.readFileSync(tp);
+        const s = buf.length > 2_000_000 ? buf.toString('utf8', buf.length - 2_000_000) : buf.toString('utf8');
+        if (!s.includes('brain_message')) return new Set();
+        const out = new Set();
+        for (const ln of s.split('\n')) {
+            if (!ln.includes('brain_message')) continue;
+            let e; try { e = JSON.parse(ln); } catch { continue; }
+            const c = e?.message?.content;
+            if (!Array.isArray(c)) continue;
+            for (const b of c) {
+                if (b?.type === 'tool_use' && /brain_message$/.test(String(b.name || '')) && b.input?.text) {
+                    out.add(String(b.input.text).trim().slice(0, 400));
+                }
+            }
+        }
+        return out;
+    } catch { return new Set(); }
+}
 // Surface unseen messages addressed to me, mark them seen (delivered once) under lock.
-function messageFooter(sid) {
+function messageFooter(sid, tp) {
     if (!sid) return '';
     let data = {}; try { data = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8')); } catch { return ''; }
     const all = Array.isArray(data.messages) ? data.messages : [];
@@ -388,10 +418,12 @@ function messageFooter(sid) {
     const unseen = all.filter(m => m && (now - (m.ts || 0) < MSG_FRESH_MS) && m.from !== sid
         && !(Array.isArray(m.seen) && m.seen.includes(sid)) && msgTargetsMe(m, me, sid));
     if (!unseen.length) return '';
+    const own = ownMcpSendTexts(tp);
+    const show = own.size ? unseen.filter(m => !own.has(String(m.text || '').trim().slice(0, 400))) : unseen;
     const got = acquireLock(SESSIONS_LOCK, { tries: 15, waitMs: 25 });   // ack under lock so a peer read can't lose it
     try {
         let d2 = {}; try { d2 = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8')); } catch { /* */ }
-        const ids = new Set(unseen.map(u => u.id));
+        const ids = new Set(unseen.map(u => u.id));   // ack self-sent notes too — they must never resurface here
         for (const m of (Array.isArray(d2.messages) ? d2.messages : [])) {
             if (!ids.has(m.id)) continue;
             if (!Array.isArray(m.seen)) m.seen = [];
@@ -399,9 +431,10 @@ function messageFooter(sid) {
         }
         fs.writeFileSync(SESSIONS_FILE, JSON.stringify(d2));
     } catch { /* */ } finally { if (got) releaseLock(SESSIONS_LOCK); }
+    if (!show.length) return '';
     const ago = (ts) => { const mm = Math.max(0, Math.round((now - (ts || now)) / 60000)); return mm <= 0 ? 'just now' : `${mm}m ago`; };
     const out = ['', '## 📨 Message(s) from another session in this project (delivered once — act on or reply to them)'];
-    for (const m of unseen.slice(0, 6)) out.push(`- from ${String(m.from || '?').slice(0, 8)} · ${ago(m.ts)}: ${String(m.text).replace(/\s+/g, ' ').trim().slice(0, 200)}`);
+    for (const m of show.slice(0, 6)) out.push(`- from ${String(m.from || '?').slice(0, 8)} · ${ago(m.ts)}: ${String(m.text).replace(/\s+/g, ' ').trim().slice(0, 400)}`);
     out.push('Reply with `🧠 MSG [<their-id or all>]: <text>` — it reaches them on their next prompt.');
     return '\n' + out.join('\n');
 }
@@ -1032,7 +1065,10 @@ async function refreshAgentsBrief(lib, buffer) {
     const agentsPath = path.resolve(CWD, 'AGENTS.md');
     if (!fs.existsSync(agentsPath) || typeof lib.structToBrief !== 'function') return;
     const { struct } = await lib.parseKlypix(buffer);
-    const brief = lib.structToBrief(struct, { recentDays: 7, maxRecent: 10, maxMilestones: 3, maxConnections: 5 }).trim();
+    // detailRecent: 0 — this block is committed into adopters' AGENTS.md and read
+    // by every hookless agent each session; it stays headlines-only by contract
+    // (the SessionStart brief is where the detailed-newest tier lives).
+    const brief = lib.structToBrief(struct, { recentDays: 7, maxRecent: 10, maxMilestones: 3, maxConnections: 5, detailRecent: 0 }).trim();
     const START = '<!-- klypix-brain-brief:start -->', END = '<!-- klypix-brain-brief:end -->';
     const block = `${START}\n<!-- auto-refreshed by the brain hook on capture · headlines only · full cards via the klypix-canvas MCP -->\n${brief}\n${END}`;
     const txt = fs.readFileSync(agentsPath, 'utf8');
@@ -1107,7 +1143,7 @@ async function promptRetrieve(lib) {
     // Other live sessions in THIS repo — surfaced even when the prompt retrieves
     // nothing (a peer's presence/ship is itself the signal). Empty string when solo.
     const peers = peerFooter(sid);
-    const messages = messageFooter(sid);   // 📨 deliberate notes another session left for me (delivered once)
+    const messages = messageFooter(sid, input.transcript_path);   // 📨 deliberate notes another session left for me (delivered once)
     let hits = [], repeats = [], struct = null;
     if (tokens.length) {
         struct = await cachedStruct(lib);
@@ -1419,7 +1455,7 @@ async function read(lib) {
         : lib.structToMarkdown(struct);
     // ⚡ In-flight footer goes RIGHT AFTER the brief (highest signal: what a peer
     // shipped seconds ago, before it's in the brain) — closes the 1.3.17-blindness gap.
-    process.stdout.write(outStr + inflightFooter(input.session_id, struct) + selfHealFooter(drifted) + reconcileFooter(lib, struct) + staleOpenFooter(lib, struct) + selfCheckFooter() + doctorFooter() + versionCurrencyFooter() + messageFooter(input.session_id || '') + legendFooter() + memoryFooter());
+    process.stdout.write(outStr + inflightFooter(input.session_id, struct) + selfHealFooter(drifted) + reconcileFooter(lib, struct) + staleOpenFooter(lib, struct) + selfCheckFooter() + doctorFooter() + versionCurrencyFooter() + messageFooter(input.session_id || '', input.transcript_path) + legendFooter() + memoryFooter());
     // Heartbeat: prove the brief actually injected (and how big) so a dead or
     // stale live-copy of the hook stops being a silent no-op.
     appendJsonl(HEALTH, { ts: nowIso(), project: path.basename(CWD), mode: 'read', ok: true, briefBytes: Buffer.byteLength(outStr), cards: struct?.counts?.cards ?? null }, 500);

@@ -201,7 +201,7 @@ server.registerTool('brain_note', {
 
 server.registerTool('brain_message', {
   title: 'Message the other live agent sessions on this project (one-time note, not a brain card)',
-  description: 'Leave a DELIBERATE, targeted note for the OTHER live agent sessions working on this project right now ("merged the hook refactor — rebase before you commit", "don\'t touch canvasStore, mid-refactor"). Delivered ONCE to each peer at its next prompt via the project\'s coordination lane — the MCP twin of the `🧠 MSG [to]: text` marker, so hookless clients (Cursor / Cline / Windsurf / Desktop) can coordinate with concurrent sessions too. Ephemeral (expires in 24h) and NOT persisted to the brain — for a durable decision use brain_note instead.',
+  description: 'Leave a DELIBERATE, targeted note for the OTHER live agent sessions working on this project right now ("merged the hook refactor — rebase before you commit", "don\'t touch canvasStore, mid-refactor"). Any MCP client can SEND (the twin of the `🧠 MSG [to]: text` marker); delivery is to HOOK-WIRED sessions (Claude Code with the brain hooks) — each sees the note once at its next prompt. A hookless peer (plain Cursor/Cline session) will NOT receive it, so don\'t rely on this to warn one. Ephemeral (expires in 24h) and NOT persisted to the brain — for a durable decision use brain_note instead.',
   inputSchema: {
     text: z.string().describe('The note to deliver (kept to 400 chars).'),
     to: z.string().optional().describe('Target hint — a peer session id-prefix or branch name; omit or "all" for every live session.'),

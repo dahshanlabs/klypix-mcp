@@ -74,8 +74,9 @@ project decision live *only* in your host's memory or a scratch file — put it 
 session/agent has it.
 
 **Working alongside other live sessions?** Send a one-time coordination note with the
-\`brain_message\` MCP tool ("merged the hook refactor — rebase before you commit"); every live peer
-session on this project receives it at its next prompt. Notes are ephemeral (24h), NOT brain cards —
+\`brain_message\` MCP tool ("merged the hook refactor — rebase before you commit"); hook-wired peer
+sessions (Claude Code) see it at their next prompt. Any client can SEND; only hook-wired sessions
+receive, so don't rely on it to reach a hookless peer. Notes are ephemeral (24h), NOT brain cards —
 durable decisions still go through \`brain_note\`.
 
 **Don't** hand-edit \`brain.klypix\` (it's a packaged canvas — use the tools) or dump file contents into it; capture the *decision*, not the file.`;
@@ -106,22 +107,43 @@ function parseFence(text) {
   return { version: m[1] || null, hash: m[2] || null, body: m[3] || '' };
 }
 
-// Classify a projected fenced file WITHOUT writing (the drift audit).
+// Classify a projected fenced file WITHOUT writing (the drift audit). THE single
+// source of truth for both check AND write: fenceMerge/writeDedicated skip a file
+// IFF this says 'ok', so classify-ok ⇔ link-unchanged can never disagree (the 1.16
+// adversarial review found three ways they used to: an unrepairable hand-edited
+// stamp, an invisible frontmatter strip, and a check-ok-but-link-downgrades skew).
 //   missing      — file absent, or present but carries no managed block
-//   hand-edited  — block body no longer matches the hash it was stamped with
-//   ok           — block body is EXACTLY what we'd project today (content-current),
-//                   regardless of the stamped version — CONTENT is the contract, the
-//                   version stamp is provenance. A version-only bump (patch release
-//                   that didn't touch the instructions) must NOT re-drift every
-//                   adopter project into a re-link treadmill.
+//   hand-edited  — block body no longer matches the hash it was stamped with; or
+//                   (owned dedicated files) anything OUTSIDE the fence drifted —
+//                   e.g. a stripped `alwaysApply:`/`trigger:` frontmatter, which
+//                   silently disables the rule in Cursor/Windsurf
+//   ok           — block body is EXACTLY what we'd project today AND the stamp is
+//                   consistent with it — regardless of the stamped version. CONTENT
+//                   is the contract, the stamp is provenance: a version-only bump
+//                   must NOT re-drift every adopter into a re-link treadmill. A
+//                   self-consistent block stamped NEWER than the running brain is
+//                   also 'ok' (and link leaves it alone — never downgrade).
 //   stale        — block body differs from today's instructions AND was stamped from
 //                   an older brain (or is a legacy unstamped block) → re-link refreshes
-function classifyFenced(file, version) {
+const STAMP_RE = /<!--\s*klypix-brain:start[\s\S]*?-->/;
+function classifyFenced(file, version, frontmatter = null) {
   if (!exists(file)) return { status: 'missing' };
-  const fence = parseFence(fs.readFileSync(file, 'utf8'));
+  const raw = fs.readFileSync(file, 'utf8');
+  const fence = parseFence(raw);
   if (!fence) return { status: 'missing' };
   if (fence.hash && sha8(fence.body.trim()) !== fence.hash) return { status: 'hand-edited', stampedVersion: fence.version };
-  if (sha8(fence.body.trim()) === INSTRUCTIONS_HASH) return { status: 'ok', stampedVersion: fence.version || null };
+  const bodyCurrent = sha8(fence.body.trim()) === INSTRUCTIONS_HASH;
+  const stampConsistent = !fence.hash || fence.hash === INSTRUCTIONS_HASH;
+  if (bodyCurrent && stampConsistent) {
+    // Owned dedicated files are OURS wholesale — frontmatter included. Compare the
+    // whole file modulo the stamp line so a frontmatter strip/flip reads as drift.
+    if (frontmatter !== null) {
+      const norm = (s) => String(s).replace(STAMP_RE, '<STAMP>').replace(/\r\n/g, '\n').trim();
+      const expected = (frontmatter ? frontmatter + '\n' : '') + fencedBlock(version) + '\n';
+      if (norm(raw) !== norm(expected)) return { status: 'hand-edited', stampedVersion: fence.version || null, why: 'frontmatter/layout drifted' };
+    }
+    return { status: 'ok', stampedVersion: fence.version || null };
+  }
   if (!fence.version) return { status: 'stale', stampedVersion: null };
   if (cmpSemver(fence.version, version) < 0) return { status: 'stale', stampedVersion: fence.version };
   return { status: 'ok', stampedVersion: fence.version };
@@ -130,13 +152,13 @@ function classifyFenced(file, version) {
 // Shared markdown (AGENTS.md, copilot-instructions.md, GEMINI.md): merge our fenced
 // block in place, preserving the user's own prose outside the fence.
 function fenceMerge(file, version) {
+  // Zero-touch IFF the audit says 'ok' (same classifier, so check and write can
+  // never disagree): current+consistent block → byte-identical file, no stamp-only
+  // churn; a hand-edited stamp or stale body falls through and gets rebuilt.
+  if (classifyFenced(file, version).status === 'ok') return { action: 'unchanged' };
   let cur = '';
   let had = false;
   if (exists(file)) { cur = fs.readFileSync(file, 'utf8'); had = true; }
-  // Content-current block → leave the file byte-identical (no stamp-only churn in
-  // adopters' committed files; matches classifyFenced's zero-touch semantics).
-  const curFence = parseFence(cur);
-  if (curFence && sha8(curFence.body.trim()) === INSTRUCTIONS_HASH) return { action: 'unchanged' };
   const block = fencedBlock(version);
   let next;
   let action;
@@ -150,11 +172,10 @@ function fenceMerge(file, version) {
 
 // Owned dedicated rules file: rewrite wholesale (optional frontmatter for always-apply).
 function writeDedicated(file, frontmatter, version) {
+  // Zero-touch IFF the audit says 'ok' — which for owned dedicated files includes
+  // the frontmatter (a stripped alwaysApply/trigger MUST be repaired, not skipped).
+  if (classifyFenced(file, version, frontmatter || '').status === 'ok') return { action: 'unchanged' };
   const had = exists(file);
-  if (had) {
-    const curFence = parseFence(fs.readFileSync(file, 'utf8'));
-    if (curFence && sha8(curFence.body.trim()) === INSTRUCTIONS_HASH) return { action: 'unchanged' };
-  }
   const body = (frontmatter ? frontmatter + '\n' : '') + fencedBlock(version) + '\n';
   ensureDir(file); fs.writeFileSync(file, body, 'utf8');
   return { action: had ? 'updated' : 'created' };
@@ -236,7 +257,7 @@ export function linkProject(projectDir, opts = {}) {
 
   const rules = t.rules.map((r) => {
     const file = relFile(projectDir, r.file);
-    if (check) return { tool: r.tool, file, ...classifyFenced(r.file, version) };
+    if (check) return { tool: r.tool, file, ...classifyFenced(r.file, version, r.kind === 'dedicated' ? (r.frontmatter || '') : null) };
     const res = r.kind === 'merge' ? fenceMerge(r.file, version) : writeDedicated(r.file, r.frontmatter, version);
     return { tool: r.tool, file, ...res };
   });

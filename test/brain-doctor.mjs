@@ -85,6 +85,49 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
   a = auditProject(proj, { version: '1.2.3' });
   ok(statusOf(a, '.cursor/mcp.json') === 'ok', 'customized --vault path tolerated → ok');
 
+  const sha8t = (s) => crypto.createHash('sha1').update(String(s)).digest('hex').slice(0, 8);
+  const resetAgents = () => { fs.writeFileSync(path.join(proj, 'AGENTS.md'), ''); linkProject(proj, { version: '1.2.3' }); };
+
+  // FRONTMATTER is part of the owned dedicated files: stripping it silently disables
+  // the rule in Cursor/Windsurf, so it must read as drift AND be repaired by link.
+  {
+    resetAgents();
+    const mdc = path.join(proj, '.cursor', 'rules', 'klypix-brain.mdc');
+    fs.writeFileSync(mdc, fs.readFileSync(mdc, 'utf8').replace(/^---[\s\S]*?---\r?\n/, ''));
+    a = auditProject(proj, { version: '1.2.3' });
+    ok(statusOf(a, '.cursor/rules/klypix-brain.mdc') === 'hand-edited', 'stripped frontmatter → drift (not silently ok)');
+    const r = linkProject(proj, { version: '1.2.3' });
+    ok(r.rules.find(x => x.file === '.cursor/rules/klypix-brain.mdc').action === 'updated', 'link repairs the stripped frontmatter');
+    a = auditProject(proj, { version: '1.2.3' });
+    ok(statusOf(a, '.cursor/rules/klypix-brain.mdc') === 'ok', 'repaired dedicated file audits ok again');
+  }
+
+  // STAMP-MISMATCH (a merge kept an old marker line + the new body): audit says
+  // hand-edited and link MUST repair it — check and write can never disagree.
+  {
+    resetAgents();
+    const agentsFile = path.join(proj, 'AGENTS.md');
+    fs.writeFileSync(agentsFile, fs.readFileSync(agentsFile, 'utf8')
+      .replace(/<!--\s*klypix-brain:start[\s\S]*?-->/, '<!-- klypix-brain:start v=0.9.0 hash=deadbeef (managed by klypix-mcp — re-run `npx klypix-mcp link`) -->'));
+    a = auditProject(proj, { version: '1.2.3' });
+    ok(statusOf(a, 'AGENTS.md') === 'hand-edited', 'current body under a wrong stamp → hand-edited');
+    linkProject(proj, { version: '1.2.3' });
+    a = auditProject(proj, { version: '1.2.3' });
+    ok(statusOf(a, 'AGENTS.md') === 'ok', 'link repairs the wrong stamp (no permanent-drift loop)');
+  }
+
+  // NEWER self-consistent stamp (project linked by a future release): check says ok
+  // AND link leaves it alone — an older install must never silently downgrade it.
+  {
+    const futureBody = '## KLYPIX project brain\n\n(instructions from a FUTURE release)';
+    const agentsFile = path.join(proj, 'AGENTS.md');
+    fs.writeFileSync(agentsFile, `<!-- klypix-brain:start v=99.0.0 hash=${sha8t(futureBody)} (managed by klypix-mcp — re-run \`npx klypix-mcp link\`) -->\n${futureBody}\n<!-- klypix-brain:end -->\n`);
+    a = auditProject(proj, { version: '1.2.3' });
+    ok(statusOf(a, 'AGENTS.md') === 'ok', 'newer self-consistent stamp → ok');
+    const r = linkProject(proj, { version: '1.2.3' });
+    ok(r.rules.find(x => x.file === 'AGENTS.md').action === 'unchanged', 'link does NOT downgrade a newer projection');
+  }
+
   fs.rmSync(proj, { recursive: true, force: true });
 }
 

@@ -593,11 +593,14 @@ export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMile
     const fr = (c) => (freshness && freshness[c.id]) ? freshness[c.id] + ' ' : '';
     // HEADLINE = first sentence-ish, hard-capped — the brief is a scannable
     // changelog; the agent pulls any card's full text via the MCP when needed.
+    // Hard cuts must not split a UTF-16 surrogate pair (an emoji straddling the cap
+    // would serialize as U+FFFD in the brief / AGENTS.md).
+    const safeCut = (t, n) => { let s = t.slice(0, n); if (/[\uD800-\uDBFF]$/.test(s)) s = s.slice(0, -1); return s.trimEnd() + '…'; };
     const headline = (c, max = 160) => {
         const t = flat(c.text);
         const stop = t.search(/(?<=[.!?])\s/);
         const h = stop > 40 && stop < max ? t.slice(0, stop) : t;
-        return h.length > max ? h.slice(0, max - 1).trimEnd() + '…' : h;
+        return h.length > max ? safeCut(h, max - 1) : h;
     };
     // EXCERPT = the first few sentences, cut at the last sentence boundary under the
     // cap. The newest `detailRecent` decisions get this instead of a headline: the
@@ -609,7 +612,7 @@ export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMile
         let cut = -1;
         const re = /(?<=[.!?])\s/g; let m;
         while ((m = re.exec(t)) && m.index < max) cut = m.index;
-        return cut > 120 ? t.slice(0, cut) : t.slice(0, max - 1).trimEnd() + '…';
+        return cut > 120 ? t.slice(0, cut) : safeCut(t, max - 1);
     };
     const day = (ts) => ts ? new Date(ts).toISOString().slice(0, 10) : '';
 
@@ -647,16 +650,24 @@ export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMile
     }
     let shownRecent = 0;
     if (recent.length) {
-        push('', `## Recent decisions (last ${recentDays}d — newest ${Math.min(detailRecent, recent.length)} in detail, rest headlines)`);
-        // recent is newest-first: the first `detailRecent` cards render as excerpts.
-        const detailIds = new Set(recent.slice(0, detailRecent).map(c => c.id));
+        push('', `## Recent decisions (last ${recentDays}d — newest first in detail, rest headlines)`);
+        // Detail tier FIRST (recent is newest-first), so the budget can never be
+        // eaten by older headlines before the cards the header promises in detail.
+        const detail = recent.slice(0, detailRecent);
+        for (const c of detail) {
+            if (used > BUDGET_CHARS) break;
+            push(`- ${fr(c)}[${flat(c.area) || 'Notes'}] ${day(c.createdAt)} ${excerpt(c)}`);
+            shownRecent++;
+        }
+        const rest = recent.slice(detailRecent);
         const byArea = new Map();
-        for (const c of recent) { const a = flat(c.area) || 'Notes'; if (!byArea.has(a)) byArea.set(a, []); byArea.get(a).push(c); }
+        for (const c of rest) { const a = flat(c.area) || 'Notes'; if (!byArea.has(a)) byArea.set(a, []); byArea.get(a).push(c); }
         outer: for (const [a, cs] of byArea) {
+            if (used > BUDGET_CHARS) break;
             push(`### ${a}`);
             for (const c of cs) {
                 if (used > BUDGET_CHARS) break outer;
-                push(`- ${fr(c)}${day(c.createdAt)} ${detailIds.has(c.id) ? excerpt(c) : headline(c)}`);
+                push(`- ${fr(c)}${day(c.createdAt)} ${headline(c)}`);
                 shownRecent++;
             }
         }

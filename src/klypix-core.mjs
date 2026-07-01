@@ -609,7 +609,11 @@ const laneSha16 = (s) => crypto.createHash('sha1').update(String(s)).digest('hex
 const laneNormBrainPath = (p) => String(p).replace(/\\/g, '/').replace(/^[a-zA-Z]:/, (m) => m.toLowerCase());
 const LANE_MSG_FRESH_MS = 24 * 60 * 60 * 1000;   // messages expire after a day
 const LANE_SESSION_FRESH_MS = 10 * 60 * 1000;    // a lane unseen for 10min is treated as ended
-const laneFileFor = (brainAbs) => path.join(os.homedir(), '.claude', 'project-brain', 'sessions', `${laneSha16(laneNormBrainPath(path.resolve(brainAbs)))}.json`);
+// Canonicalize (on-disk casing + symlinks) before hashing — the hook does the same,
+// so a brain resolved via a differently-cased cwd/KLYPIX_BRAIN still lands in the
+// hook's lane file instead of a silently-unread sibling.
+const laneCanon = (p) => { try { return fs.realpathSync.native(p); } catch { return path.resolve(p); } };
+const laneFileFor = (brainAbs) => path.join(os.homedir(), '.claude', 'project-brain', 'sessions', `${laneSha16(laneNormBrainPath(laneCanon(brainAbs)))}.json`);
 const laneSleep = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* */ } };
 function laneLock(lockPath, tries = 20, waitMs = 25) {
   try { fs.mkdirSync(path.dirname(lockPath), { recursive: true }); } catch { /* */ }
@@ -636,7 +640,9 @@ export async function opBrainMessage({ vault, canvas, text: msgText, to, via }) 
   const msg = {
     id: laneSha16('mcp|' + txt + '|' + now + '|' + Math.random()),
     from: via ? String(via).replace(/\s+/g, '-').slice(0, 24) : 'mcp',
-    to: String(to || 'all').trim() || 'all',
+    // cap + collapse the target hint too — an oversized `to` would bloat the lane
+    // file every hook of every session re-reads for 24h (and matches no one anyway)
+    to: String(to || 'all').replace(/\s+/g, ' ').trim().slice(0, 64) || 'all',
     text: txt.slice(0, 400), ts: now, seen: [],
   };
   const got = laneLock(lock);
@@ -652,7 +658,7 @@ export async function opBrainMessage({ vault, canvas, text: msgText, to, via }) 
   } catch (e) {
     return err(`brain_message failed: ${e.message}`);
   } finally { if (got) { try { fs.unlinkSync(lock); } catch { /* */ } } }
-  return { blocks: [text(`📨 posted to this project's coordination lane (to: ${msg.to}) — ${live} live session(s) right now; each receives it once at its next prompt. Ephemeral (24h), not a brain card — use brain_note for durable decisions.`)] };
+  return { blocks: [text(`📨 posted to this project's coordination lane (to: ${msg.to}) — ${live} live hook-wired session(s) right now; each sees it once at its next prompt. Hookless clients can send but not receive. Ephemeral (24h), not a brain card — use brain_note for durable decisions.`)] };
 }
 
 // Re-export the format helpers the bins need for non-op work (init onboarding).

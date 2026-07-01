@@ -52,22 +52,43 @@ try {
 }
 
 // ── 2. Receiver: the REAL hook, --prompt, a different session id ────────────
-const runHook = () => {
+const runHook = (sid, tp) => {
   const env = { ...process.env, HOME: home, USERPROFILE: home };
   delete env.KLYPIX_BRAIN_NO_MAIN;   // the subprocess MUST run main()
   return execFileSync(process.execPath, [HOOK, '--prompt'], {
     cwd: proj, env, encoding: 'utf8',
-    input: JSON.stringify({ session_id: 'sess-recv', prompt: 'continue the refactor' }),
+    input: JSON.stringify({ session_id: sid, prompt: 'continue the refactor', ...(tp ? { transcript_path: tp } : {}) }),
   });
 };
-const first = runHook();
+const first = runHook('sess-recv');
 ok(/📨/.test(first), 'receiving hook surfaces the 📨 message block');
 ok(first.includes(NOTE), 'the note text reaches the peer session verbatim');
 ok(/from cursor/.test(first), 'the sender label (MCP client name) is shown');
 
 // ── 3. Delivered ONCE: a second prompt of the same session stays quiet ──────
-const second = runHook();
+const second = runHook('sess-recv');
 ok(!second.includes(NOTE), 'same session, next prompt → note NOT re-delivered (seen-ack)');
+
+// ── 4. Self-echo guard: the SENDER (whose transcript holds the brain_message
+//      tool_use) never gets its own note back; a third session still does ────
+const NOTE2 = 'deploying the lane fix — hold your pushes for 5 minutes';
+try {
+  process.env.HOME = home; process.env.USERPROFILE = home;
+  process.chdir(proj);
+  const { opBrainMessage } = await import('../src/klypix-core.mjs');
+  await opBrainMessage({ vault: proj, text: NOTE2, to: 'all', via: 'claude-code' });
+} finally {
+  process.chdir(prevCwd);
+  process.env.HOME = prevEnv.HOME; process.env.USERPROFILE = prevEnv.USERPROFILE;
+}
+const senderTranscript = path.join(home, 'sender-transcript.jsonl');
+fs.writeFileSync(senderTranscript, JSON.stringify({
+  message: { role: 'assistant', content: [{ type: 'tool_use', name: 'mcp__klypix-canvas__brain_message', id: 't1', input: { text: NOTE2, to: 'all' } }] },
+}) + '\n');
+const senderView = runHook('sess-sender', senderTranscript);
+ok(!senderView.includes(NOTE2), 'sender (transcript holds the tool_use) does NOT get its own note back');
+const thirdView = runHook('sess-third');
+ok(thirdView.includes(NOTE2), 'a different session still receives the note');
 
 for (const d of [home, proj]) fs.rmSync(d, { recursive: true, force: true });
 console.log(failures ? `\n✗ ${failures} assertion(s) failed` : '\n✓ lane-message: all assertions passed');

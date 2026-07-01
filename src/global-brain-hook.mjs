@@ -450,7 +450,9 @@ function filesInEntry(entry) {
 // card; dedup rides the same persistent seen-set as markers.
 const SHELL_TOOLS = new Set(['Bash', 'run_shell', 'shell']);
 const SHIP_PATTERNS = [
-    { re: /\bgh\s+pr\s+merge\b/i, kind: 'merged PR', area: 'Ship', num: /#?(\d{1,6})\b/ },
+    // PR number is read ONLY from the `pr merge <n>` argument — not "any number in the
+    // command" (which grabbed a stray digit from `-R owner/repo4`, mislabeling it #4).
+    { re: /\bgh\s+pr\s+merge\b/i, kind: 'merged PR', area: 'Ship', num: /\bpr\s+merge\s+#?(\d{1,6})\b/i },
     { re: /\bgh\s+release\s+create\s+(\S+)/i, kind: 'cut release', area: 'Release' },
     { re: /\bnpm\s+publish\b/i, kind: 'published to npm', area: 'Release' },
     // CREATE only — exclude `git tag -d/-v/-l/-n` (delete/verify/list) so a tag
@@ -633,7 +635,7 @@ function liveMilestoneFromTranscript(tp) {
 const LIVE_SHIP_PATTERNS = [
     { re: /\bgh\s+release\s+edit\s+(\S+)[\s\S]*?--draft\s*=?\s*false\b/i, fmt: (m) => `released ${m[1]} (draft → live)` },
     { re: /\bgh\s+release\s+create\s+(\S+)/i, fmt: (m) => `cut release ${m[1]}` },
-    { re: /\bgh\s+pr\s+merge\b/i, fmt: (_m, cmd) => { const n = cmd.match(/#?(\d{1,6})\b/); return `merged PR${n ? ' #' + n[1] : ''}`; } },
+    { re: /\bgh\s+pr\s+merge\b/i, fmt: (_m, cmd) => { const n = cmd.match(/\bpr\s+merge\s+#?(\d{1,6})\b/i); return `merged PR${n ? ' #' + n[1] : ''}`; } },
     { re: /\bnpm\s+publish\b/i, fmt: () => 'published to npm' },
     // CREATE only — the negative lookahead rejects `git tag -d/-v/-l/-n …` (delete /
     // verify / list), which would otherwise false-ship a tag deletion as a release.
@@ -937,7 +939,7 @@ async function capture(lib) {
             const key = sha(('ship|' + p.area + '|' + summary).toLowerCase());
             if (seen.has(key)) break;                         // already captured this ship
             seen.add(key);
-            cards.push({ text: `${p.area}: 🏁 ${summary} — auto-captured (\`${cmd.replace(/\s+/g, ' ').trim().slice(0, 70)}\`)\n#${slugify(p.area)}`, area: p.area, borderColor: 'rgba(59,130,246,0.8)', createdVia: 'ship-event' });
+            cards.push({ text: `${p.area}: 🏁 ${summary}\n#${slugify(p.area)}`, area: p.area, borderColor: 'rgba(59,130,246,0.8)', createdVia: 'ship-event' });
             shipSummaries.push(summary);
             ledger.push({ action: 'ship-event', area: p.area, preview: summary });
             break;                                            // one pattern per command
@@ -1208,7 +1210,7 @@ function memoryFooter() {
         if (!notes.length) return '';
         const hasIndex = fs.existsSync(path.join(dir, 'MEMORY.md'));
         return `\n\n---\n📎 **Sibling memory store** — ${notes.length} note(s) at \`${dir}\`${hasIndex ? ' (index: MEMORY.md)' : ''}.\n`
-            + `Holds how to work with *this user* (prefs, feedback, session logs); the brain above holds *project* decisions & open questions. Reconcile across both — don't duplicate one into the other.\n`;
+            + `Route by kind: this per-user store is for how to work with *this user* (prefs, feedback, session logs) — keep it for that. **Project** decisions, milestones & open questions belong in the brain above (shared + portable, read by the next agent), NOT here. If any project knowledge currently lives only in this store, capture it into the brain so it isn't lost on the next session. Don't duplicate the same fact into both.\n`;
     } catch { return ''; }
 }
 
@@ -1399,6 +1401,7 @@ function legendFooter() {
         + '🧠 **Capture markers** — write these in your reply; the Stop hook harvests them into the brain (no separate log step). Use sparingly, for real decisions / milestones / discoveries:\n'
         + '`🧠 BRAIN [Area]: decision` · `[Area] ?: open question` · `[Area] !: milestone` · `[Area] +: 🛠️ skill (reusable how-to / gotcha — resurfaces every session, never ages out)` · `[Area] ✓: resolves+archives the matching card` · `[Area] ~: updates it in place` · 🎯 in text = a goal (reads as open).\n'
         + 'Optional suffixes: `closes: <card title / [[wikilink]]>` (resolve the strategy/question this fulfils) · `ev: <file[:line]>, PR#<n>` (anchor to code → auto drift-badge).\n'
+        + '**Routing:** capture project decisions / milestones / open questions / gotchas HERE, *at the moment you decide* — this brain is the shared, portable memory that survives context resets and the next agent reads. A host memory store (if any) is for *user* preferences; never leave project state only in a private scratchpad.\n'
         + 'Coordinate with a concurrent session: `🧠 MSG [<their-id or all>]: <text>` — a one-time note (NOT a brain card) delivered to that session on its next prompt.\n';
 }
 

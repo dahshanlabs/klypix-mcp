@@ -593,5 +593,67 @@ export async function opBrainNote({ vault, canvas, text: noteText, area, marker 
   }
 }
 
+// ── brain_message — the MCP twin of the hook's 🧠 MSG marker ─────────────────
+// A DELIBERATE one-time note to the OTHER live agent sessions on this project
+// ("merged the hook refactor — rebase before you commit"), delivered once to each
+// peer at its next prompt via the per-project coordination lane. Hook agents send
+// these by emitting `🧠 MSG [to]: text`; this op gives HOOKLESS clients (Cursor /
+// Cline / Windsurf / Desktop) the same send path. Ephemeral (24h), NOT a brain
+// card — durable decisions go through brain_note.
+//
+// The lane primitives below MUST byte-match src/global-brain-hook.mjs (sha-16 of
+// normBrainPath(brain), sessions/<key>.json layout, MSG_FRESH_MS, the wx-lockfile) —
+// the hook is the READER of what we post. test/lane-message.mjs drives the REAL
+// hook over a message posted by this op; if the two implementations drift, it fails.
+const laneSha16 = (s) => crypto.createHash('sha1').update(String(s)).digest('hex').slice(0, 16);
+const laneNormBrainPath = (p) => String(p).replace(/\\/g, '/').replace(/^[a-zA-Z]:/, (m) => m.toLowerCase());
+const LANE_MSG_FRESH_MS = 24 * 60 * 60 * 1000;   // messages expire after a day
+const LANE_SESSION_FRESH_MS = 10 * 60 * 1000;    // a lane unseen for 10min is treated as ended
+const laneFileFor = (brainAbs) => path.join(os.homedir(), '.claude', 'project-brain', 'sessions', `${laneSha16(laneNormBrainPath(path.resolve(brainAbs)))}.json`);
+const laneSleep = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* */ } };
+function laneLock(lockPath, tries = 20, waitMs = 25) {
+  try { fs.mkdirSync(path.dirname(lockPath), { recursive: true }); } catch { /* */ }
+  for (let i = 0; i < tries; i++) {
+    try { const fd = fs.openSync(lockPath, 'wx'); fs.writeSync(fd, String(process.pid)); fs.closeSync(fd); return true; }
+    catch (e) {
+      if (e && e.code !== 'EEXIST') return false;
+      try { if (Date.now() - fs.statSync(lockPath).mtimeMs > 15000) { fs.unlinkSync(lockPath); continue; } } catch { /* lost a race — retry */ }
+      laneSleep(waitMs);
+    }
+  }
+  return false;   // contended → write best-effort (same contract as the hook)
+}
+
+export async function opBrainMessage({ vault, canvas, text: msgText, to, via }) {
+  const t = brainTarget(vault, canvas);
+  if (t.ambiguous) return ambiguousBrainErr(t.ambiguous);
+  if (!t.file) return err(`No brain found — looked for ./brain.klypix in the project, then ${vault}. Pass canvas: "<name>".`);
+  const txt = String(msgText || '').trim();
+  if (!txt) return err('brain_message needs a non-empty text.');
+  const laneFile = laneFileFor(t.file);
+  const lock = laneFile + '.lock';
+  const now = Date.now();
+  const msg = {
+    id: laneSha16('mcp|' + txt + '|' + now + '|' + Math.random()),
+    from: via ? String(via).replace(/\s+/g, '-').slice(0, 24) : 'mcp',
+    to: String(to || 'all').trim() || 'all',
+    text: txt.slice(0, 400), ts: now, seen: [],
+  };
+  const got = laneLock(lock);
+  let live = 0;
+  try {
+    let data = {}; try { data = JSON.parse(fs.readFileSync(laneFile, 'utf8')); } catch { /* fresh lane */ }
+    const sessions = Array.isArray(data.sessions) ? data.sessions : [];
+    live = sessions.filter(s => s && s.id && now - (s.lastSeen || 0) < LANE_SESSION_FRESH_MS).length;
+    const kept = (Array.isArray(data.messages) ? data.messages : []).filter(m => m && now - (m.ts || 0) < LANE_MSG_FRESH_MS);
+    kept.push(msg);
+    fs.mkdirSync(path.dirname(laneFile), { recursive: true });
+    fs.writeFileSync(laneFile, JSON.stringify({ sessions, messages: kept.slice(-30) }));
+  } catch (e) {
+    return err(`brain_message failed: ${e.message}`);
+  } finally { if (got) { try { fs.unlinkSync(lock); } catch { /* */ } } }
+  return { blocks: [text(`📨 posted to this project's coordination lane (to: ${msg.to}) — ${live} live session(s) right now; each receives it once at its next prompt. Ephemeral (24h), not a brain card — use brain_note for durable decisions.`)] };
+}
+
 // Re-export the format helpers the bins need for non-op work (init onboarding).
 export { buildKlypixMap, parseKlypix };

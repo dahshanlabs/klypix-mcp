@@ -24,7 +24,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import {
   resolveVault, getEmbedder, buildKlypixMap, cardSchema, connSchema,
   opListCanvases, opReadCanvas, opSearchCanvases, opSearchAllBrains,
-  opBrainInsights, opBrainConnect, opBrainReconcile, opBrainGarden, opCreateCanvas, opAddToCanvas, opBrainNote,
+  opBrainInsights, opBrainConnect, opBrainReconcile, opBrainGarden, opCreateCanvas, opAddToCanvas, opBrainNote, opBrainMessage,
 } from '../src/klypix-core.mjs';
 
 // Real package version for the MCP handshake (was hardcoded '1.0.0', which
@@ -197,6 +197,19 @@ server.registerTool('brain_note', {
 }, async ({ text, marker, area, closes, canvas }) => {
   let via; try { via = server.server.getClientVersion()?.name; } catch { /* optional */ }
   return toContent(await opBrainNote({ vault: VAULT, canvas, text, area, marker: marker || '', closes, via }));
+});
+
+server.registerTool('brain_message', {
+  title: 'Message the other live agent sessions on this project (one-time note, not a brain card)',
+  description: 'Leave a DELIBERATE, targeted note for the OTHER live agent sessions working on this project right now ("merged the hook refactor — rebase before you commit", "don\'t touch canvasStore, mid-refactor"). Delivered ONCE to each peer at its next prompt via the project\'s coordination lane — the MCP twin of the `🧠 MSG [to]: text` marker, so hookless clients (Cursor / Cline / Windsurf / Desktop) can coordinate with concurrent sessions too. Ephemeral (expires in 24h) and NOT persisted to the brain — for a durable decision use brain_note instead.',
+  inputSchema: {
+    text: z.string().describe('The note to deliver (kept to 400 chars).'),
+    to: z.string().optional().describe('Target hint — a peer session id-prefix or branch name; omit or "all" for every live session.'),
+    canvas: z.string().optional().describe('Brain canvas filename/path. Defaults to the project brain ("brain").'),
+  },
+}, async ({ text, to, canvas }) => {
+  let via; try { via = server.server.getClientVersion()?.name; } catch { /* optional */ }
+  return toContent(await opBrainMessage({ vault: VAULT, canvas, text, to, via }));
 });
 
 server.registerTool('brain_doctor', {

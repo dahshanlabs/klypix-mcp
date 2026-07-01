@@ -561,7 +561,7 @@ export async function tidyBrain(buffer) {
 // decisions + milestones. Everything older stays in the file, reachable via the
 // klypix-canvas MCP search or `--full`. Keeps the session-start cost flat as
 // the brain grows (the full markdown scales with history; this doesn't).
-export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMilestones = 8, maxConnections = 30, maxSkills = 24, freshness = null } = {}) {
+export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMilestones = 8, maxConnections = 30, maxSkills = 24, detailRecent = 8, freshness = null } = {}) {
     const cutoff = Date.now() - recentDays * 86_400_000;
     const texts = struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim());
     const containers = struct.cards.filter(c => c.type === 'container');
@@ -599,12 +599,24 @@ export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMile
         const h = stop > 40 && stop < max ? t.slice(0, stop) : t;
         return h.length > max ? h.slice(0, max - 1).trimEnd() + '…' : h;
     };
+    // EXCERPT = the first few sentences, cut at the last sentence boundary under the
+    // cap. The newest `detailRecent` decisions get this instead of a headline: the
+    // recall eval showed detail questions about the freshest cards are exactly what a
+    // 160-char headline loses (status, resolution, the "what exactly shipped").
+    const excerpt = (c, max = 420) => {
+        const t = flat(c.text);
+        if (t.length <= max) return t;
+        let cut = -1;
+        const re = /(?<=[.!?])\s/g; let m;
+        while ((m = re.exec(t)) && m.index < max) cut = m.index;
+        return cut > 120 ? t.slice(0, cut) : t.slice(0, max - 1).trimEnd() + '…';
+    };
     const day = (ts) => ts ? new Date(ts).toISOString().slice(0, 10) : '';
 
     // TOKEN BUDGET (≈ chars/4): sections are added in priority order — Focus,
     // Open, Areas, Milestones, Recent, Connections — and Recent stops when the
     // budget is hit. The brief stays ~flat forever no matter how active a week.
-    const BUDGET_CHARS = 11_000; // ≈ 2.7k tokens
+    const BUDGET_CHARS = 13_500; // ≈ 3.3k tokens (raised for the detailed-newest tier; still hard-capped/flat)
     let used = 0;
     const out = [];
     const push = (...lines) => { for (const l of lines) { out.push(l); used += l.length + 1; } };
@@ -635,14 +647,16 @@ export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMile
     }
     let shownRecent = 0;
     if (recent.length) {
-        push('', `## Recent decisions (last ${recentDays}d — headlines)`);
+        push('', `## Recent decisions (last ${recentDays}d — newest ${Math.min(detailRecent, recent.length)} in detail, rest headlines)`);
+        // recent is newest-first: the first `detailRecent` cards render as excerpts.
+        const detailIds = new Set(recent.slice(0, detailRecent).map(c => c.id));
         const byArea = new Map();
         for (const c of recent) { const a = flat(c.area) || 'Notes'; if (!byArea.has(a)) byArea.set(a, []); byArea.get(a).push(c); }
         outer: for (const [a, cs] of byArea) {
             push(`### ${a}`);
             for (const c of cs) {
                 if (used > BUDGET_CHARS) break outer;
-                push(`- ${fr(c)}${day(c.createdAt)} ${headline(c)}`);
+                push(`- ${fr(c)}${day(c.createdAt)} ${detailIds.has(c.id) ? excerpt(c) : headline(c)}`);
                 shownRecent++;
             }
         }

@@ -160,7 +160,7 @@ server.registerTool('brain_garden', {
 
 server.registerTool('create_canvas', {
   title: 'Create a KLYPIX canvas',
-  description: 'Create a new .klypix canvas from cards + connections and save it to the vault. The user opens it in KLYPIX (Canvas → Open). Prefer short, titled cards (one idea each) connected by meaningful arrows.',
+  description: 'Create a new .klypix canvas from cards + connections and save it to the vault. The user opens it in the KLYPIX app (Canvas → Open). Prefer short, titled cards (one idea each) connected by meaningful arrows.',
   inputSchema: {
     title: z.string().describe('Canvas title (also the filename).'),
     cards: z.array(cardSchema).min(1).describe('The cards. 5-12 atomic cards is ideal.'),

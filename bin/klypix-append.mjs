@@ -41,4 +41,4 @@ await atomicWrite(file, buf);
 const cardCount = Array.isArray(addition.cards) ? addition.cards.length : 0;
 const connCount = Array.isArray(addition.connections) ? addition.connections.length : 0;
 console.log(`Appended ${cardCount} card(s), ${connCount} connection(s) to ${file}.`);
-console.log(`Reopen it in KLYPIX, or verify: node scripts/read-klypix.mjs "${file}"`);
+console.log(`Reopen it in the KLYPIX app, or verify: node scripts/read-klypix.mjs "${file}"`);

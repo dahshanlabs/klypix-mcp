@@ -42,4 +42,4 @@ await atomicWrite(outPath, buf);
 const cardCount = spec.cards.length;
 const connCount = Array.isArray(spec.connections) ? spec.connections.length : 0;
 console.log(`Wrote ${outPath} — ${cardCount} cards, ${connCount} connections.`);
-console.log(`Open it in KLYPIX (Canvas → Open), or verify: node scripts/read-klypix.mjs "${outPath}"`);
+console.log(`Open it in the KLYPIX app (Canvas → Open), or verify: node scripts/read-klypix.mjs "${outPath}"`);

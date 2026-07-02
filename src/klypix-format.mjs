@@ -1006,6 +1006,104 @@ export function scoreCardsAgainstQuery(struct, query, { topK = 6, minScore = 2, 
     return scored.filter(s => s.score >= minScore).slice(0, topK);
 }
 
+// ── Ask-the-brain — whole-brain, correction-aware retrieval for a question ───
+// The surface a human actually uses ("what did we decide about X?", "where did
+// the auth work land?"). Distinct from the per-prompt recall hook (which injects
+// a few RELATED cards into every prompt) and search_canvases (raw substring): this
+// RANKS the whole brain against a natural-language question and assembles a
+// SYNTHESIS-READY context for the calling agent to answer from — the engine stays
+// model-free (mirrors brain_connect/garden: engine selects, model writes prose).
+// Three things make it an ANSWER path, not a card dump:
+//   1. Hybrid-ready — lexical always (the shared scorer's weights + length-norm),
+//      semantic blended when the caller (core, with the on-device embedder) passes
+//      a sim map; on a lexical miss the semantic floor still surfaces paraphrases.
+//   2. History-aware — INCLUDES archived/superseded cards (penalized + flagged), so
+//      "what did we decide" can show the arc (decided A → changed to B), and an
+//      optional as_of answers "what was true then".
+//   3. Truth-aware — every stale hit carries its live CORRECTION (the P1 machinery),
+//      so the agent answers from the correction, never the outdated card alone.
+// Pure + node-runnable. `semantic` is Map<cardId, 0..1> or null.
+const deathDateOfCard = (text) => { const m = /(?:↩︎ superseded|↩ superseded|✅) (\d{4}-\d{2}-\d{2})/.exec(String(text)); return m ? Date.parse(m[1]) : null; };
+export function rankForQuestion(struct, question, { semantic = null, k = 10, as_of = null, now = Date.now(), semFloor = 0.30, recentDays = 30 } = {}) {
+    const tokens = queryTokens(question);
+    if (!struct || !Array.isArray(struct.cards) || (!tokens.length && !semantic)) return { hits: [], total: 0, tokens };
+    const isArchived = (c) => /^archive$/i.test(c.area || '');
+    const asOfTs = as_of ? Date.parse(as_of) : null;
+    const cutoff = now - recentDays * 86_400_000;
+    const scored = [];
+    for (const c of struct.cards) {
+        if (c.type === 'container' || !(c.text || '').trim()) continue;
+        const arch = isArchived(c);
+        if (asOfTs != null) {
+            if ((c.createdAt || 0) > asOfTs) continue;                     // didn't exist yet
+            const died = arch ? deathDateOfCard(c.text) : null;
+            if (died != null && died <= asOfTs) continue;                  // already retired by then
+        }
+        const titleW = wordsOf(c.title);
+        const bodyW = wordsOf(c.text);
+        const tagStems = new Set((c.tags || []).map(t => String(t).toLowerCase().replace(/^#/, '').replace(/^(file|dir)-/, '')).filter(Boolean));
+        const lenNorm = Math.min(1, 6 / Math.max(6, Math.log2(bodyW.size || 1)));
+        let lex = 0;
+        for (const tok of tokens) {
+            if (titleW.has(tok)) lex += 3;
+            else if (tagStems.has(tok)) lex += 3;
+            else if (bodyW.has(tok)) lex += lenNorm;
+        }
+        const sem = semantic ? (semantic.get(c.id) ?? null) : null;
+        if (lex <= 0 && (sem == null || sem < semFloor)) continue;         // no lexical AND no strong semantic → skip
+        // Semantic dominates when present (scaled to lex range); lexical is the
+        // fallback. Recency is a gentle tiebreak (unless time-travelling); archived
+        // cards are demoted but never excluded (history matters for "what did we…").
+        let score = sem != null ? sem * 10 + Math.min(lex, 6) * 0.5 : lex;
+        if (asOfTs == null && (c.createdAt || 0) >= cutoff) score += 0.5;
+        if (/🛠/.test(c.text)) score += 1;                                  // standing skills
+        if (arch) score -= 1.5;
+        scored.push({ card: c, score, sem, archived: arch });
+    }
+    scored.sort((a, b) => b.score - a.score || (b.card.createdAt || 0) - (a.card.createdAt || 0));
+    const top = scored.slice(0, k);
+    // Correction overlays on the surfaced hits — a stale card gets its live
+    // corrector so the agent answers from the truth (edge or cue; P1 machinery).
+    let overlays = new Map();
+    try { overlays = correctionOverlaysFor(struct, top.map(h => h.card)); } catch { /* best-effort */ }
+    const hits = top.map(h => ({ ...h, correction: overlays.get(h.card.id) || null }));
+    return { hits, total: scored.length, tokens };
+}
+
+// Assemble the ranked hits into a SYNTHESIS-READY markdown context: a header that
+// instructs the agent to answer the question directly (cite cards, honor
+// corrections, admit gaps), then each hit full-text with provenance + lifecycle +
+// its correction. Char-budgeted so a huge brain can't blow the tool result.
+export function questionContextToMarkdown(question, result, { mode = 'lexical', as_of = null, budgetChars = 9000 } = {}) {
+    const { hits, total } = result;
+    const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+    const day = (ts) => ts ? new Date(ts).toISOString().slice(0, 10) : '';
+    if (!hits.length) {
+        return `# No brain cards answer: “${flat(question)}”\n`
+            + `Searched the whole brain (${mode}) and found nothing relevant. Tell the user the brain doesn't cover this yet — don't guess. If you learn the answer this session, capture it: \`🧠 BRAIN [Area]: <decision>\`.\n`;
+    }
+    const out = [];
+    out.push(`# Answer “${flat(question)}” from these ${hits.length} brain card(s)${as_of ? ` (as of ${as_of})` : ''} — ${total} matched, ${mode} ranking`);
+    out.push('_Synthesize a DIRECT answer from the cards below, then cite the ones you used by [Area]+date. Where a card is marked ⚠️ CORRECTED, answer from the correction, NOT the stale card. Include superseded/archived cards only to show how a decision CHANGED. If the cards don\'t actually answer the question, say so — don\'t pad._');
+    out.push('');
+    let used = out.join('\n').length;
+    let shown = 0;
+    for (const h of hits) {
+        const c = h.card;
+        const status = h.archived ? ' · ⛔ archived/superseded' : '';
+        const rel = h.sem != null ? ` · sim ${h.sem.toFixed(2)}` : '';
+        let block = `## [${flat(c.area) || 'Notes'}] ${day(c.createdAt)}${status}${rel}\n${flat(c.text)}`;
+        if (h.correction) {
+            block += `\n\n  ⚠️ CORRECTED — this card is STALE; the current truth is:\n  ${flat(h.correction.by.text).slice(0, 600)}`;
+        }
+        if (used + block.length + 2 > budgetChars && shown > 0) { out.push(`\n_…and ${hits.length - shown} more matched card(s) omitted for length — narrow the question or use search for the rest._`); break; }
+        out.push(block, '');
+        used += block.length + 2;
+        shown++;
+    }
+    return out.join('\n') + '\n';
+}
+
 // ── External-state reconcile — migration omission tripwire ───────────────────
 // The brain is a NARRATION-capture system: a fact exists only if someone wrote a
 // 🧠 marker or a rationale-bearing commit body. Applying a DB migration to prod

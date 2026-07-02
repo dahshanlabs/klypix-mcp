@@ -24,7 +24,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import {
   resolveVault, getEmbedder, buildKlypixMap, cardSchema, connSchema,
   opListCanvases, opReadCanvas, opSearchCanvases, opSearchAllBrains,
-  opBrainInsights, opBrainConnect, opBrainReconcile, opBrainGarden, opCreateCanvas, opAddToCanvas, opBrainNote, opBrainMessage,
+  opBrainInsights, opBrainConnect, opBrainReconcile, opBrainGarden, opCreateCanvas, opAddToCanvas, opBrainNote, opBrainMessage, opBrainAsk,
 } from '../src/klypix-core.mjs';
 
 // Real package version for the MCP handshake (was hardcoded '1.0.0', which
@@ -115,6 +115,17 @@ server.registerTool('search_all_brains', {
     as_of: z.string().optional().describe('Optional YYYY-MM-DD: rank what was TRUE at that date (time-travel query).'),
   },
 }, async ({ query, as_of }) => toContent(await opSearchAllBrains({ vault: VAULT, query, as_of, log })));
+
+server.registerTool('brain_ask', {
+  title: 'Ask the project brain a question (whole-brain, correction-aware answer)',
+  description: 'Answer a natural-language question from the WHOLE project brain — "what did we decide about X?", "where did the auth work land?", "why did we drop Y?". Ranks every card (semantic on-device + lexical hybrid), INCLUDES superseded/archived history (flagged, so you can see how a decision changed), and attaches each stale card\'s live CORRECTION so the answer reflects the current truth, not an outdated card. Returns a synthesis-ready context (full cards + provenance + lifecycle) for you to turn into a direct, cited answer — it does not itself write prose. Prefer this over search_canvases when the user asks a QUESTION (not a keyword lookup). Optional as_of (YYYY-MM-DD) answers "what was true then". Defaults to the project brain ("brain").',
+  inputSchema: {
+    question: z.string().describe('The natural-language question to answer from the brain.'),
+    canvas: z.string().optional().describe('Brain canvas filename/path. Defaults to the project brain ("brain").'),
+    as_of: z.string().optional().describe('Optional YYYY-MM-DD: answer as of that date (superseded cards count as live if they were current then).'),
+    k: z.number().optional().describe('Max cards to surface for synthesis (default 10, capped 20).'),
+  },
+}, async ({ question, canvas, as_of, k }) => toContent(await opBrainAsk({ vault: VAULT, canvas, question, as_of, k, log })));
 
 server.registerTool('brain_insights', {
   title: 'What matters in a brain — hubs, orphans, stale questions',

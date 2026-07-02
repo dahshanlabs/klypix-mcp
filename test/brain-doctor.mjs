@@ -142,7 +142,8 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
   const names = (await client.listTools()).tools.map(t => t.name);
   ok(names.includes('brain_doctor'), 'brain_doctor is a registered MCP tool');
   ok(names.includes('brain_message'), 'brain_message is a registered MCP tool');
-  ok(names.length === 13, `tool manifest is 13 verbs (got ${names.length})`);
+  ok(names.includes('brain_ask'), 'brain_ask is a registered MCP tool');
+  ok(names.length === 14, `tool manifest is 14 verbs (got ${names.length})`);
 
   const r = await client.callTool({ name: 'brain_doctor', arguments: { project: vault } });
   const text = (r.content || []).filter(c => c.type === 'text').map(c => c.text).join('\n');

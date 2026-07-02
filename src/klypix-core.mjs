@@ -26,6 +26,7 @@ import {
   brainInsights, insightsToMarkdown, addBrainConnections, proposeStructuralConnections, atomicWrite,
   findUnrecordedMigrations, captureIntoBrain, tidyBrain, noteToCaptureInput,
   selectGardenCandidates, applyGarden, detectContradictions,
+  rankForQuestion, questionContextToMarkdown,
 } from './klypix-format.mjs';
 
 // ── Card / connection input shape (single source for every face) ─────────────
@@ -367,6 +368,40 @@ export async function opSearchAllBrains({ vault, query, as_of, log = () => {} })
   const mode = qv ? 'semantic+lexical (on-device)' : 'lexical (semantic model warming — retry for semantic ranking)';
   const asOfNote = asOfTs != null ? ` · as of ${as_of}` : '';
   return { blocks: [text(`# Cross-project matches for "${query}" (${scored.length} hits in ${brains.length} brains, top ${top.length} · ${mode}${asOfNote})\n\n${lines.join('\n')}`)] };
+}
+
+// ── brain_ask — answer a natural-language question over the WHOLE brain ───────
+// "What did we decide about X?" / "Where did the auth work land?" The daily-use
+// surface: hybrid retrieval (semantic on-device + lexical) over every card
+// (including archived history, flagged), correction-aware (a stale hit carries its
+// live correction), assembled into a SYNTHESIS-READY context the calling agent
+// turns into a direct, cited answer. The engine never calls an LLM (pure retrieval
+// + assembly) — same "engine selects, model writes" contract as brain_connect.
+export async function opBrainAsk({ vault, canvas, question, as_of, k = 10, log = () => {} }) {
+  const q = String(question || '').trim();
+  if (!q) return err('brain_ask needs a question.');
+  const t = brainTarget(vault, canvas);
+  if (t.ambiguous) return ambiguousBrainErr(t.ambiguous);
+  if (!t.file) return err(`No brain found — looked for ./brain.klypix in the project, then ${vault}. Pass canvas: "<name>".`);
+  const asOfTs = as_of ? Date.parse(as_of) : null;
+  if (as_of && Number.isNaN(asOfTs)) return err(`Bad as_of date: "${as_of}" — use YYYY-MM-DD.`);
+  let struct;
+  try { ({ struct } = await parseKlypix(fs.readFileSync(t.file))); } catch (e) { return err(`Read failed: ${e.message}`); }
+  const stamp = brainStamp(t.file, struct, t.how);
+  // Semantic blend (best-effort, time-bounded): embed the question + the brain's
+  // cards on-device, hand rankForQuestion a Map<cardId, cosine>. A missing/warming
+  // model degrades cleanly to pure lexical.
+  let semantic = null, mode = 'lexical';
+  try {
+    const pipe = await Promise.race([getEmbedder(log), new Promise(r => setTimeout(() => r(null), 20_000))]);
+    if (pipe) {
+      const [qv] = await embedTexts(pipe, [q]);
+      const vecs = await vectorsForBrain(pipe, t.file, struct.cards);
+      if (qv && vecs && vecs.size) { semantic = new Map(); for (const [id, v] of vecs) semantic.set(id, dot(qv, v)); mode = 'semantic+lexical (on-device)'; }
+    }
+  } catch { semantic = null; mode = 'lexical (semantic warming — retry for semantic ranking)'; }
+  const result = rankForQuestion(struct, q, { semantic, k: Math.max(1, Math.min(20, k || 10)), as_of: asOfTs != null ? as_of : null });
+  return { blocks: [text(stamp + questionContextToMarkdown(q, result, { mode, as_of: asOfTs != null ? as_of : null }))] };
 }
 
 export async function opBrainInsights({ vault, canvas, staleDays }) {

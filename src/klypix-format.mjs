@@ -533,23 +533,139 @@ export async function tidyBrain(buffer) {
         assignTo(ctnId, grp.ids);
     }
 
-    // UNIFIED LAYOUT — re-flow each container's children (chronological, compact
-    // heights) AND shelf-pack ALL containers into one grid by their TRUE height, so
-    // a container that grew (new captures) never overlaps its neighbor below.
+    // ── CLUSTER LAYOUT ────────────────────────────────────────────────────────
+    // The old shelf-grid stacked every area's cards in ONE column and packed
+    // containers in creation order — at 400+ cards the brain rendered as an
+    // unreadable strip and position encoded nothing. Now:
+    //   • MASONRY inside each container: cards flow into 1-5 balanced columns
+    //     targeting a ~1.15 height/width ratio → areas are squarish tiles.
+    //   • CLUSTERS across containers: each area is placed greedily beside the
+    //     already-placed area it shares the most connections with — related
+    //     knowledge is literally near, cross-area arrows stay short.
+    //   • 📌 Focus (the human steering surface) anchors the map center; Archive
+    //     is pinned to the cold rim (its supersede/close arrows touch every
+    //     area, so edge weights would otherwise drag it central).
+    // Deterministic (no RNG, stable ordering): the same brain always maps the
+    // same way, and one new card nudges its own cluster instead of reshuffling
+    // the world. At map zoom the app's capsule/dot tiers render this as the
+    // cluster-galaxy view; membership steering (dragging a card into an area)
+    // is preserved — tidy re-flows coordinates, never parentage.
     const childrenOf = (cid) => canvas.order
         .filter(id => canvas.positions[id] && canvas.positions[id].parentId === cid)
         .sort((a, b) => (meta.get(a)?.createdAt || 0) - (meta.get(b)?.createdAt || 0));
-    const heightOf = (cid) => { const inner = childrenOf(cid).reduce((s, id) => s + (meta.get(id)?.h || 40) + G.CARD_GAP, 0); return Math.max(G.TITLE_BAR + G.PAD * 2, G.TITLE_BAR + G.PAD + inner + G.PAD); };
     const orderedCtns = canvas.order.filter(id => containerIds.has(id) && canvas.positions[id]);
-    const cols = Math.max(1, Math.min(4, Math.ceil(Math.sqrt(Math.max(1, orderedCtns.length)))));
-    let colIdx = 0, rowTopY = G.START, rowMaxH = 0, colX = G.START;
-    for (const cid of orderedCtns) {
-        const h = heightOf(cid);
-        if (colIdx >= cols) { rowTopY += rowMaxH + G.COL_GAP; rowMaxH = 0; colIdx = 0; colX = G.START; }
-        canvas.positions[cid] = { ...canvas.positions[cid], x: colX, y: rowTopY, w: G.AREA_W, h };
-        let cy = rowTopY + G.TITLE_BAR + G.PAD;
-        for (const kid of childrenOf(cid)) { const kh = meta.get(kid)?.h || 40; canvas.positions[kid] = { ...canvas.positions[kid], x: colX + G.PAD, y: cy, w: G.CARD_W, h: kh }; cy += kh + G.CARD_GAP; }
-        colX += G.AREA_W + G.COL_GAP; colIdx++; rowMaxH = Math.max(rowMaxH, h);
+    const ctnTitle = new Map();
+    for (const c of struct.cards) if (c.type === 'container') ctnTitle.set(c.id, c.title || '');
+    for (const [t, id] of byTitle) if (!ctnTitle.has(id)) ctnTitle.set(id, t);
+    const isArchiveCtn = (cid) => /^archive$/i.test(String(ctnTitle.get(cid) || '').trim());
+    const isFocusCtn = (cid) => /(^|\s)focus\b/i.test(String(ctnTitle.get(cid) || ''));
+
+    if (orderedCtns.length) {
+        // 1. Masonry plan per container: pick the column count whose resulting
+        // box is closest to the target aspect, then flow cards (chronological)
+        // into the currently-shortest column.
+        const plans = new Map(); // cid -> { w, h, kids: [{id, dx, dy, h}] }
+        for (const cid of orderedCtns) {
+            const kids = childrenOf(cid);
+            const totalH = kids.reduce((s, id) => s + (meta.get(id)?.h || 40) + G.CARD_GAP, 0);
+            let k = 1, best = Infinity;
+            for (let n = 1; n <= 5 && n <= Math.max(1, kids.length); n++) {
+                const w = G.PAD * 2 + n * G.CARD_W + (n - 1) * G.CARD_GAP;
+                const h = G.TITLE_BAR + G.PAD * 2 + Math.max(40, totalH / n);
+                const score = Math.abs((h / w) - 1.15);
+                if (score < best) { best = score; k = n; }
+            }
+            const colY = new Array(k).fill(G.TITLE_BAR + G.PAD);
+            const placedKids = [];
+            for (const id of kids) {
+                const h = meta.get(id)?.h || 40;
+                let col = 0; for (let c = 1; c < k; c++) if (colY[c] < colY[col]) col = c;
+                placedKids.push({ id, dx: G.PAD + col * (G.CARD_W + G.CARD_GAP), dy: colY[col], h });
+                colY[col] += h + G.CARD_GAP;
+            }
+            plans.set(cid, {
+                w: G.PAD * 2 + k * G.CARD_W + (k - 1) * G.CARD_GAP,
+                h: Math.max(G.TITLE_BAR + G.PAD * 2, Math.max(...colY) + G.PAD),
+                kids: placedKids,
+            });
+        }
+
+        // 2. Inter-area connection weights (Archive excluded — rim-pinned below).
+        const parentOf = (id) => canvas.positions[id]?.parentId ?? null;
+        const weights = new Map();
+        for (const cn of (canvas.connections || [])) {
+            const pa = parentOf(cn.fromId), pb = parentOf(cn.toId);
+            if (!pa || !pb || pa === pb || !plans.has(pa) || !plans.has(pb)) continue;
+            if (isArchiveCtn(pa) || isArchiveCtn(pb)) continue;
+            const key = pa < pb ? pa + '|' + pb : pb + '|' + pa;
+            weights.set(key, (weights.get(key) || 0) + 1);
+        }
+        const wOf = (a, b) => weights.get(a < b ? a + '|' + b : b + '|' + a) || 0;
+        const degree = new Map(orderedCtns.map(cid => [cid, 0]));
+        for (const [key, n] of weights) { const [a, b] = key.split('|'); degree.set(a, (degree.get(a) || 0) + n); degree.set(b, (degree.get(b) || 0) + n); }
+
+        // 3. Placement order: Focus first (map anchor), then by connectivity
+        // (hubs early so satellites can attach to them), Archive always last.
+        const focusCtns = orderedCtns.filter(isFocusCtn);
+        const archiveCtns = orderedCtns.filter(c => !isFocusCtn(c) && isArchiveCtn(c));
+        const middle = orderedCtns.filter(c => !isFocusCtn(c) && !isArchiveCtn(c))
+            .sort((a, b) => ((degree.get(b) || 0) - (degree.get(a) || 0))
+                || (plans.get(b).kids.length - plans.get(a).kids.length)
+                || String(ctnTitle.get(a) || '').localeCompare(String(ctnTitle.get(b) || '')));
+
+        // 4. Greedy placement: candidates are the sides/corners of every placed
+        // box; score = mean connection-weighted distance to the areas this one
+        // links to (or distance-to-centroid when unlinked) + a gentle
+        // compactness pull. First-best wins → deterministic.
+        const GAP = G.COL_GAP;
+        const boxes = new Map();
+        const overlapsAny = (b) => { for (const o of boxes.values()) if (b.x < o.x + o.w + GAP && o.x < b.x + b.w + GAP && b.y < o.y + o.h + GAP && o.y < b.y + b.h + GAP) return true; return false; };
+        const cxOf = (b) => b.x + b.w / 2, cyOf = (b) => b.y + b.h / 2;
+        const distC = (a, b) => Math.hypot(cxOf(a) - cxOf(b), cyOf(a) - cyOf(b));
+        for (const cid of [...focusCtns, ...middle]) {
+            const plan = plans.get(cid);
+            if (!boxes.size) { boxes.set(cid, { x: 0, y: 0, w: plan.w, h: plan.h }); continue; }
+            let mx = 0, my = 0;
+            for (const b of boxes.values()) { mx += cxOf(b); my += cyOf(b); }
+            mx /= boxes.size; my /= boxes.size;
+            let bestPos = null, bestScore = Infinity;
+            for (const o of boxes.values()) {
+                const cands = [
+                    { x: o.x + o.w + GAP, y: o.y }, { x: o.x, y: o.y + o.h + GAP },
+                    { x: o.x - GAP - plan.w, y: o.y }, { x: o.x, y: o.y - GAP - plan.h },
+                    { x: o.x + o.w + GAP, y: o.y + o.h + GAP }, { x: o.x - GAP - plan.w, y: o.y + o.h + GAP },
+                    { x: o.x + o.w + GAP, y: o.y - GAP - plan.h }, { x: o.x - GAP - plan.w, y: o.y - GAP - plan.h },
+                ];
+                for (const c of cands) {
+                    const b = { x: c.x, y: c.y, w: plan.w, h: plan.h };
+                    if (overlapsAny(b)) continue;
+                    let pull = 0, wsum = 0;
+                    for (const [pid, pb] of boxes) { const w = wOf(cid, pid); if (w) { pull += w * distC(b, pb); wsum += w; } }
+                    const toCentroid = Math.hypot(cxOf(b) - mx, cyOf(b) - my);
+                    const score = (wsum ? pull / wsum : toCentroid) + 0.05 * toCentroid;
+                    if (score < bestScore) { bestScore = score; bestPos = b; }
+                }
+            }
+            boxes.set(cid, bestPos || { x: 0, y: Math.max(...[...boxes.values()].map(b => b.y + b.h)) + GAP, w: plan.w, h: plan.h });
+        }
+        // Archive → the cold rim: to the right of the whole map, top-aligned.
+        for (const cid of archiveCtns) {
+            const plan = plans.get(cid);
+            const maxX = boxes.size ? Math.max(...[...boxes.values()].map(b => b.x + b.w)) : 0;
+            const topY = boxes.size ? Math.min(...[...boxes.values()].map(b => b.y)) : 0;
+            boxes.set(cid, { x: maxX + GAP * 3, y: topY, w: plan.w, h: plan.h });
+        }
+
+        // 5. Commit: translate the map to start at START, write containers + kids.
+        const minX = Math.min(...[...boxes.values()].map(b => b.x));
+        const minY = Math.min(...[...boxes.values()].map(b => b.y));
+        for (const [cid, b] of boxes) {
+            const x = b.x - minX + G.START, y = b.y - minY + G.START;
+            canvas.positions[cid] = { ...canvas.positions[cid], x, y, w: b.w, h: b.h };
+            for (const kid of plans.get(cid).kids) {
+                canvas.positions[kid.id] = { ...canvas.positions[kid.id], x: x + kid.dx, y: y + kid.dy, w: G.CARD_W, h: kid.h };
+            }
+        }
     }
 
     const out = await finalizeBrainZip(zip, canvas, manifest, now);

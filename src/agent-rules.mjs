@@ -55,7 +55,7 @@ survives across sessions, agents, and context resets.
 
 **At the start of a task — read it** so you know the project's state and past decisions:
 - if \`.claude/brain-brief.md\` exists, read it — it is the full session brief the brain hook regenerates at every session start (Focus, open questions, skills, recent decisions).
-- with the \`klypix-canvas\` MCP server: call \`search_canvases\` / \`read_canvas\` (canvas: \`"brain"\`), or \`brain_insights\` for the load-bearing cards.
+- with the \`klypix-canvas\` MCP server: to **answer a question** from the brain ("what did we decide about X?", "where did Y land?"), call \`brain_ask\` — it ranks the whole brain, includes superseded history, and surfaces the current truth for any corrected card. Use \`search_canvases\` for a raw keyword lookup, \`read_canvas\` (canvas: \`"brain"\`) for the whole thing, or \`brain_insights\` for the load-bearing cards.
 - or via CLI: \`npx klypix-read brain.klypix\`
 
 **When you make a real decision, finding, or milestone — capture it HERE** so it persists for the next session/agent:

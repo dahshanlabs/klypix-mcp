@@ -1029,15 +1029,23 @@ export function rankForQuestion(struct, question, { semantic = null, k = 10, as_
     if (!struct || !Array.isArray(struct.cards) || (!tokens.length && !semantic)) return { hits: [], total: 0, tokens };
     const isArchived = (c) => /^archive$/i.test(c.area || '');
     const asOfTs = as_of ? Date.parse(as_of) : null;
+    const timeTravel = asOfTs != null && Number.isFinite(asOfTs);
     const cutoff = now - recentDays * 86_400_000;
     const scored = [];
     for (const c of struct.cards) {
         if (c.type === 'container' || !(c.text || '').trim()) continue;
         const arch = isArchived(c);
-        if (asOfTs != null) {
+        if (timeTravel) {
             if ((c.createdAt || 0) > asOfTs) continue;                     // didn't exist yet
-            const died = arch ? deathDateOfCard(c.text) : null;
-            if (died != null && died <= asOfTs) continue;                  // already retired by then
+            if (arch) {
+                // A card archived NOW: keep it ONLY if it demonstrably outlived
+                // as_of (its retirement is stamped LATER) — then it was the live
+                // truth then. If it died by as_of, or carries NO dated stamp (we
+                // can't prove it was still live), exclude it — precision-first, so
+                // a "what was true then" answer never asserts a since-dead fact.
+                const died = deathDateOfCard(c.text);
+                if (died == null || died <= asOfTs) continue;
+            }
         }
         const titleW = wordsOf(c.title);
         const bodyW = wordsOf(c.text);
@@ -1051,21 +1059,27 @@ export function rankForQuestion(struct, question, { semantic = null, k = 10, as_
         }
         const sem = semantic ? (semantic.get(c.id) ?? null) : null;
         if (lex <= 0 && (sem == null || sem < semFloor)) continue;         // no lexical AND no strong semantic → skip
-        // Semantic dominates when present (scaled to lex range); lexical is the
-        // fallback. Recency is a gentle tiebreak (unless time-travelling); archived
-        // cards are demoted but never excluded (history matters for "what did we…").
+        // In time-travel a surviving card WAS live at as_of, so it is NOT stale
+        // history — don't demote or flag it as archived (that status is a present
+        // fact). Outside time-travel, archived cards are demoted but never excluded
+        // (history matters for "what did we…").
+        const effArch = timeTravel ? false : arch;
         let score = sem != null ? sem * 10 + Math.min(lex, 6) * 0.5 : lex;
-        if (asOfTs == null && (c.createdAt || 0) >= cutoff) score += 0.5;
+        if (!timeTravel && (c.createdAt || 0) >= cutoff) score += 0.5;
         if (/🛠/.test(c.text)) score += 1;                                  // standing skills
-        if (arch) score -= 1.5;
-        scored.push({ card: c, score, sem, archived: arch });
+        if (effArch) score -= 1.5;
+        scored.push({ card: c, score, sem, archived: effArch });
     }
     scored.sort((a, b) => b.score - a.score || (b.card.createdAt || 0) - (a.card.createdAt || 0));
     const top = scored.slice(0, k);
     // Correction overlays on the surfaced hits — a stale card gets its live
     // corrector so the agent answers from the truth (edge or cue; P1 machinery).
+    // NOT in time-travel: a correction is a PRESENT fact; importing a future
+    // corrector into a "what was true then" answer would contaminate it (a
+    // 2026-05 correction leaking into a 2026-02 query). Then-live cards stand
+    // as they were.
     let overlays = new Map();
-    try { overlays = correctionOverlaysFor(struct, top.map(h => h.card)); } catch { /* best-effort */ }
+    if (!timeTravel) { try { overlays = correctionOverlaysFor(struct, top.map(h => h.card)); } catch { /* best-effort */ } }
     const hits = top.map(h => ({ ...h, correction: overlays.get(h.card.id) || null }));
     return { hits, total: scored.length, tokens };
 }

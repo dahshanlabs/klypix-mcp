@@ -78,6 +78,64 @@ const brainWith = async (areas) => (await parseKlypix(await buildKlypixMap({ tit
     ok(nowR.hits.some(h => /postgres/.test(h.card.text)), 'ask: without as_of, the current postgres card is surfaced');
 }
 
+// ── review: as_of must NOT import a FUTURE correction into a past answer ─────
+{
+    const struct = {
+        cards: [
+            { id: 'ctn', type: 'container', title: 'Auth' },
+            { id: 'a', type: 'text', text: 'Auth: auth uses supabase magic-links for passwordless login.', title: 'a', tags: [], area: 'Auth', parentId: 'ctn', createdAt: Date.parse('2026-01-10') },
+            { id: 'b', type: 'text', text: 'Auth: CORRECTION — dropped magic-links, moved to OAuth for auth login.', title: 'b', tags: [], area: 'Auth', parentId: 'ctn', createdAt: Date.parse('2026-05-01') },
+        ],
+        connections: [{ fromId: 'a', toId: 'b', label: 'superseded by' }],
+    };
+    const past = rankForQuestion(struct, 'how does auth login work?', { as_of: '2026-02-01', now: Date.parse('2026-07-01') });
+    const aHit = past.hits.find(h => h.card.id === 'a');
+    ok(!!aHit && aHit.correction == null, 'review-as_of: a then-live card carries NO future correction in a time-travel answer');
+    ok(!past.hits.some(h => h.card.id === 'b'), 'review-as_of: the future correction card itself is not surfaced');
+    const md = questionContextToMarkdown('how does auth work?', past, { as_of: '2026-02-01' });
+    // (the header instruction always mentions "CORRECTED"; assert no per-card STALE banner)
+    ok(!/this card is STALE/.test(md) && /magic-links/.test(md), 'review-as_of: the markdown answers with the then-current fact, no anachronistic correction banner');
+    // sanity: WITHOUT as_of, the present correction DOES surface
+    const nowR = rankForQuestion(struct, 'how does auth login work?', { now: Date.parse('2026-07-01') });
+    const aNow = nowR.hits.find(h => h.card.id === 'a');
+    ok(aNow && aNow.correction && /OAuth/.test(aNow.correction.by.text), 'review-as_of: present-day ask still surfaces the correction (no regression)');
+}
+// ── review: a card live-then-but-archived-now is not mislabeled as history ───
+{
+    const struct = {
+        cards: [
+            { id: 'ctn', type: 'container', title: 'DB' },
+            { id: 'ctnA', type: 'container', title: 'Archive' },
+            { id: 'old', type: 'text', text: '↩︎ superseded 2026-03-01\nDB: sessions stored in redis for fast expiry lookups.', title: 'a', tags: [], area: 'Archive', parentId: 'ctnA', createdAt: Date.parse('2025-12-01') },
+        ],
+        connections: [],
+    };
+    // At 2026-01-01 the redis card was the LIVE truth (archived only on 2026-03-01).
+    const past = rankForQuestion(struct, 'where are sessions stored?', { as_of: '2026-01-01', now: Date.parse('2026-07-01') });
+    const h = past.hits.find(x => x.card.id === 'old');
+    ok(!!h && h.archived === false, 'review-as_of: a then-live (now-archived) card is NOT flagged archived at as_of');
+    const md = questionContextToMarkdown('where are sessions?', past, { as_of: '2026-01-01' });
+    ok(!/⛔ archived/.test(md), 'review-as_of: no "archived/superseded" banner on a card that was live then');
+    // after its death it must NOT surface for a later as_of
+    const later = rankForQuestion(struct, 'where are sessions stored?', { as_of: '2026-04-01', now: Date.parse('2026-07-01') });
+    ok(!later.hits.some(x => x.card.id === 'old'), 'review-as_of: past its 2026-03-01 death, the card is excluded from a 2026-04 answer');
+}
+// ── review: an UNDATED archived card can't be time-travelled → excluded ──────
+{
+    const struct = {
+        cards: [
+            { id: 'ctnA', type: 'container', title: 'Archive' },
+            { id: 'u', type: 'text', text: 'Payments: we used stripe for the billing integration.', title: 'u', tags: [], area: 'Archive', parentId: 'ctnA', createdAt: Date.parse('2025-11-01') },
+        ],
+        connections: [],
+    };
+    const r = rankForQuestion(struct, 'what payments provider did we use?', { as_of: '2026-02-01', now: Date.parse('2026-07-01') });
+    ok(r.hits.length === 0, 'review-as_of: an archived card with no dated retirement is excluded from time-travel (can\'t prove it was live then)');
+    // but present-day ask still shows it (as history)
+    const nowR = rankForQuestion(struct, 'what payments provider did we use?', { now: Date.parse('2026-07-01') });
+    ok(nowR.hits.some(h => h.card.id === 'u' && h.archived), 'review-as_of: present-day ask still surfaces it, flagged archived');
+}
+
 // ── no match: honest "not in the brain", never a guess ───────────────────────
 {
     const struct = await brainWith([{ title: 'Auth', cards: [{ text: 'Auth: refresh tokens rotate weekly.' }] }]);

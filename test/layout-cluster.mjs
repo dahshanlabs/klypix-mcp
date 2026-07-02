@@ -120,5 +120,52 @@ const byTitle = (t) => ctns.find(c => (c.title || '').toLowerCase().includes(t))
     ok(focusKids.length === 1 && /cluster layout/.test(focusKids[0].text), 'Focus membership untouched by the re-flow');
 }
 
+// ── review: one new cross-area arrow must NOT reshuffle the map ──────────────
+// (the full-pass degree ordering did exactly that: 45/45 containers teleported
+// ~4.4k px on one wikilink — incremental anchoring is the fix)
+{
+    const { struct: s1 } = await parseKlypix(tidied);
+    const g = s1.cards.find(c => c.type !== 'container' && c.area === 'Gamma');
+    const d = s1.cards.find(c => c.type !== 'container' && c.area === 'Delta');
+    const { buffer: linked } = await addBrainConnections(tidied, [{ fromId: g.id, toId: d.id }]);
+    const { buffer: retidied } = await tidyBrain(linked);
+    const { canvas: c2 } = await parseKlypix(retidied);
+    let movedCtns = 0, maxShift = 0;
+    for (const c of ctns) {
+        const p0 = pos[c.id], p1 = c2.positions[c.id];
+        const dd = Math.hypot(p0.x - p1.x, p0.y - p1.y);
+        if (dd > 1) { movedCtns++; maxShift = Math.max(maxShift, dd); }
+    }
+    ok(movedCtns === 0, `review-stability: a new cross-area arrow moves ZERO containers (moved=${movedCtns}, max=${Math.round(maxShift)}px)`);
+}
+// ── review: a human-nested container never becomes a 300×40 husk ─────────────
+{
+    const buf = await buildKlypixMap({
+        title: 'brain', areas: [
+            { title: 'Parent', cards: [card(0, ' parent')] },
+            { title: 'Nested', cards: Array.from({ length: 5 }, (_, i) => card(i, ' nested')) },
+        ],
+    });
+    const parsed = await parseKlypix(buf);
+    const pId = parsed.struct.cards.find(c => c.type === 'container' && c.title === 'Parent').id;
+    const nId = parsed.struct.cards.find(c => c.type === 'container' && c.title === 'Nested').id;
+    parsed.canvas.positions[nId] = { ...parsed.canvas.positions[nId], parentId: pId };   // the human nests an area
+    parsed.zip.file('canvas.json', JSON.stringify(parsed.canvas));
+    const nested = await parsed.zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+    const { buffer: t } = await tidyBrain(nested);
+    const { struct: s, canvas: c } = await parseKlypix(t);
+    const nBox = c.positions[nId];
+    ok(nBox.parentId == null, 'review-nested: hand-nested container is promoted to a first-class area');
+    ok(nBox.h > 100 && nBox.w >= 300, `review-nested: no 300×40 husk (got ${Math.round(nBox.w)}×${Math.round(nBox.h)})`);
+    const kids = s.cards.filter(x => x.parentId === nId).map(x => c.positions[x.id]);
+    ok(kids.length === 5 && kids.every(k => k.x >= nBox.x && k.y >= nBox.y && k.x + k.w <= nBox.x + nBox.w + 1 && k.y + k.h <= nBox.y + nBox.h + 1),
+        'review-nested: all 5 children sit inside their promoted container');
+}
+// ── review: the layout stamp survives a round-trip and gates the full pass ───
+{
+    const { canvas: c } = await parseKlypix(tidied);
+    ok(c.settings && c.settings.brainLayout === 'cluster-v1', 'review: tidied brain carries the cluster-v1 layout stamp');
+}
+
 console.log(failures ? `\n✗ ${failures} assertion(s) failed` : '\n✓ layout-cluster: all assertions passed');
 process.exit(failures ? 1 : 0);

@@ -518,6 +518,7 @@ export async function tidyBrain(buffer) {
     for (const c of rootText) { const a = areaOfCard(c); const k = a.toLowerCase(); if (!groups.has(k)) groups.set(k, { title: a, ids: [] }); groups.get(k).ids.push(c.id); }
 
     let moved = 0;
+    const createdNow = new Set();   // containers born in THIS pass have no meaningful previous position
     const assignTo = (ctnId, ids) => { for (const id of ids) { const p = canvas.positions[id]; canvas.positions[id] = { ...p, parentId: ctnId, zKey: (p && p.zKey && isValidZKey(p.zKey)) ? p.zKey : nextZKey() }; moved++; } };
     // Ensure a container exists for each area (create if missing); route root cards in.
     for (const grp of groups.values()) {
@@ -525,6 +526,7 @@ export async function tidyBrain(buffer) {
         let ctnId = byTitle.get(key);
         if (!ctnId) {
             ctnId = `ctn_${rand()}`;
+            createdNow.add(ctnId);
             zip.file(`items/${shard(ctnId)}/${ctnId}.json`, JSON.stringify({ type: 'container', locked: false, createdAt: now, createdBy: 'agent', title: grp.title, collapsed: false, scopeLocked: false, borderColor: '#10b981' }));
             canvas.order.push(ctnId);
             canvas.positions[ctnId] = { x: G.START, y: G.START, w: G.AREA_W, h: G.TITLE_BAR + G.PAD * 2, zKey: nextZKey(), zIndex: canvas.order.length, parentId: null };
@@ -550,8 +552,11 @@ export async function tidyBrain(buffer) {
     // the world. At map zoom the app's capsule/dot tiers render this as the
     // cluster-galaxy view; membership steering (dragging a card into an area)
     // is preserved — tidy re-flows coordinates, never parentage.
+    // Containers are never masonry "kids" — a nested container would otherwise
+    // be committed twice (as its parent's 300×40 pseudo-card AND as its own
+    // box), stranding its children at abandoned coordinates.
     const childrenOf = (cid) => canvas.order
-        .filter(id => canvas.positions[id] && canvas.positions[id].parentId === cid)
+        .filter(id => !containerIds.has(id) && canvas.positions[id] && canvas.positions[id].parentId === cid)
         .sort((a, b) => (meta.get(a)?.createdAt || 0) - (meta.get(b)?.createdAt || 0));
     const orderedCtns = canvas.order.filter(id => containerIds.has(id) && canvas.positions[id]);
     const ctnTitle = new Map();
@@ -561,6 +566,16 @@ export async function tidyBrain(buffer) {
     const isFocusCtn = (cid) => /(^|\s)focus\b/i.test(String(ctnTitle.get(cid) || ''));
 
     if (orderedCtns.length) {
+        // 0. Flatten human-nested containers to root. The capture toolchain
+        // never nests; a hand-nested area would be committed twice (as its
+        // parent's 300×40 pseudo-card AND as its own box), stranding its
+        // children. Promoted areas keep their absolute spot via the
+        // incremental anchor below, so visually nothing jumps.
+        for (const cid of orderedCtns) {
+            const p = canvas.positions[cid];
+            if (p && p.parentId != null && containerIds.has(p.parentId)) canvas.positions[cid] = { ...p, parentId: null };
+        }
+
         // 1. Masonry plan per container: pick the column count whose resulting
         // box is closest to the target aspect, then flow cards (chronological)
         // into the currently-shortest column.
@@ -590,7 +605,7 @@ export async function tidyBrain(buffer) {
             });
         }
 
-        // 2. Inter-area connection weights (Archive excluded — rim-pinned below).
+        // 2. Inter-area connection weights (Archive excluded — rim-pinned).
         const parentOf = (id) => canvas.positions[id]?.parentId ?? null;
         const weights = new Map();
         for (const cn of (canvas.connections || [])) {
@@ -604,30 +619,78 @@ export async function tidyBrain(buffer) {
         const degree = new Map(orderedCtns.map(cid => [cid, 0]));
         for (const [key, n] of weights) { const [a, b] = key.split('|'); degree.set(a, (degree.get(a) || 0) + n); degree.set(b, (degree.get(b) || 0) + n); }
 
-        // 3. Placement order: Focus first (map anchor), then by connectivity
-        // (hubs early so satellites can attach to them), Archive always last.
-        const focusCtns = orderedCtns.filter(isFocusCtn);
-        const archiveCtns = orderedCtns.filter(c => !isFocusCtn(c) && isArchiveCtn(c));
-        const middle = orderedCtns.filter(c => !isFocusCtn(c) && !isArchiveCtn(c))
-            .sort((a, b) => ((degree.get(b) || 0) - (degree.get(a) || 0))
-                || (plans.get(b).kids.length - plans.get(a).kids.length)
-                || String(ctnTitle.get(a) || '').localeCompare(String(ctnTitle.get(b) || '')));
+        // 3. INCREMENTAL by default, full cluster pass only on migration.
+        // The full pass orders by (mutable) connectivity — running it per
+        // capture reshuffled the entire map the moment one cross-area arrow
+        // landed (field-measured: 45/45 containers teleported ~4.4k px on one
+        // wikilink). A memory's map must be as stable as the memory: normally
+        // every container ANCHORS to its previous spot (taken verbatim when
+        // nothing grew into it), so a capture moves at most the areas whose
+        // size actually changed. The full pass runs only when the previous
+        // layout isn't this engine's (legacy strip, foreign grid, degenerate
+        // aspect) — detected via the settings stamp + geometry heuristics.
+        const cmp = (a, b) => (a < b ? -1 : a > b ? 1 : 0);   // code-unit compare — locale-independent, unlike bare localeCompare
+        const prev = new Map();
+        for (const cid of orderedCtns) {
+            if (createdNow.has(cid)) continue;
+            const p = canvas.positions[cid];
+            if (p && Number.isFinite(p.x) && Number.isFinite(p.y)) prev.set(cid, { x: p.x, y: p.y, w: p.w || 0, h: p.h || 0 });
+        }
+        let fullPass = !(canvas.settings && canvas.settings.brainLayout === 'cluster-v1');
+        if (fullPass && prev.size >= 2 && [...prev.values()].some(b => b.w > 400)) fullPass = false; // stamp lost (e.g. app re-save) but geometry is clearly cluster-made
+        if (!fullPass && prev.size >= 2) {
+            const xs = [...prev.values()];
+            const w = Math.max(...xs.map(b => b.x + b.w)) - Math.min(...xs.map(b => b.x));
+            const h = Math.max(...xs.map(b => b.y + b.h)) - Math.min(...xs.map(b => b.y));
+            const aspect = h / Math.max(1, w);
+            if (aspect > 4 || aspect < 0.1) fullPass = true;   // degenerate strip → re-map
+        }
+        if (prev.size < 2) fullPass = true;
 
-        // 4. Greedy placement: candidates are the sides/corners of every placed
-        // box; score = mean connection-weighted distance to the areas this one
-        // links to (or distance-to-centroid when unlinked) + a gentle
-        // compactness pull. First-best wins → deterministic.
+        const focusCtns = orderedCtns.filter(isFocusCtn);
+        const isRim = (c) => !isFocusCtn(c) && isArchiveCtn(c);
+        let placeOrder, rimCtns;
+        if (fullPass) {
+            // Hubs early so satellites attach to them; Focus anchors the map.
+            rimCtns = orderedCtns.filter(isRim);
+            const middle = orderedCtns.filter(c => !isFocusCtn(c) && !isRim(c))
+                .sort((a, b) => ((degree.get(b) || 0) - (degree.get(a) || 0))
+                    || (plans.get(b).kids.length - plans.get(a).kids.length)
+                    || cmp(String(ctnTitle.get(a) || ''), String(ctnTitle.get(b) || ''))
+                    || cmp(a, b));
+            placeOrder = [...focusCtns, ...middle];
+        } else {
+            // Previous spatial order (top-left claims its spot first) — an
+            // IMMUTABLE ordering, so new arrows can't reshuffle the queue.
+            const anchored = orderedCtns.filter(c => prev.has(c))
+                .sort((a, b) => (prev.get(a).y - prev.get(b).y) || (prev.get(a).x - prev.get(b).x) || cmp(a, b));
+            const fresh = orderedCtns.filter(c => !prev.has(c) && !isRim(c))
+                .sort((a, b) => ((degree.get(b) || 0) - (degree.get(a) || 0)) || cmp(a, b));
+            rimCtns = orderedCtns.filter(c => !prev.has(c) && isRim(c));
+            placeOrder = [...anchored, ...fresh];
+        }
+
+        // 4. Greedy placement. Anchored containers try their previous spot
+        // verbatim first (zero movement when nothing grew into it), else the
+        // nearest free side/corner slot. Unanchored ones score by
+        // connection-weighted distance + a gentle compactness pull.
         const GAP = G.COL_GAP;
         const boxes = new Map();
         const overlapsAny = (b) => { for (const o of boxes.values()) if (b.x < o.x + o.w + GAP && o.x < b.x + b.w + GAP && b.y < o.y + o.h + GAP && o.y < b.y + b.h + GAP) return true; return false; };
         const cxOf = (b) => b.x + b.w / 2, cyOf = (b) => b.y + b.h / 2;
         const distC = (a, b) => Math.hypot(cxOf(a) - cxOf(b), cyOf(a) - cyOf(b));
-        for (const cid of [...focusCtns, ...middle]) {
+        for (const cid of placeOrder) {
             const plan = plans.get(cid);
-            if (!boxes.size) { boxes.set(cid, { x: 0, y: 0, w: plan.w, h: plan.h }); continue; }
+            const anchor = !fullPass && prev.has(cid) ? prev.get(cid) : null;
+            if (anchor) {
+                const b0 = { x: anchor.x, y: anchor.y, w: plan.w, h: plan.h };
+                if (!overlapsAny(b0)) { boxes.set(cid, b0); continue; }
+            }
+            if (!boxes.size) { boxes.set(cid, { x: anchor ? anchor.x : 0, y: anchor ? anchor.y : 0, w: plan.w, h: plan.h }); continue; }
             let mx = 0, my = 0;
             for (const b of boxes.values()) { mx += cxOf(b); my += cyOf(b); }
             mx /= boxes.size; my /= boxes.size;
+            const anchorBox = anchor ? { x: anchor.x, y: anchor.y, w: plan.w, h: plan.h } : null;
             let bestPos = null, bestScore = Infinity;
             for (const o of boxes.values()) {
                 const cands = [
@@ -639,33 +702,44 @@ export async function tidyBrain(buffer) {
                 for (const c of cands) {
                     const b = { x: c.x, y: c.y, w: plan.w, h: plan.h };
                     if (overlapsAny(b)) continue;
-                    let pull = 0, wsum = 0;
-                    for (const [pid, pb] of boxes) { const w = wOf(cid, pid); if (w) { pull += w * distC(b, pb); wsum += w; } }
-                    const toCentroid = Math.hypot(cxOf(b) - mx, cyOf(b) - my);
-                    const score = (wsum ? pull / wsum : toCentroid) + 0.05 * toCentroid;
+                    let score;
+                    if (anchorBox) {
+                        score = distC(b, anchorBox);            // reclaim the old neighborhood
+                    } else {
+                        let pull = 0, wsum = 0;
+                        for (const [pid, pb] of boxes) { const w = wOf(cid, pid); if (w) { pull += w * distC(b, pb); wsum += w; } }
+                        const toCentroid = Math.hypot(cxOf(b) - mx, cyOf(b) - my);
+                        score = (wsum ? pull / wsum : toCentroid) + 0.05 * toCentroid;
+                    }
                     if (score < bestScore) { bestScore = score; bestPos = b; }
                 }
             }
             boxes.set(cid, bestPos || { x: 0, y: Math.max(...[...boxes.values()].map(b => b.y + b.h)) + GAP, w: plan.w, h: plan.h });
         }
-        // Archive → the cold rim: to the right of the whole map, top-aligned.
-        for (const cid of archiveCtns) {
+        // Rim containers (Archive without a previous spot / full pass): the
+        // cold right edge, each right of the last so they never stack.
+        for (const cid of rimCtns) {
             const plan = plans.get(cid);
             const maxX = boxes.size ? Math.max(...[...boxes.values()].map(b => b.x + b.w)) : 0;
             const topY = boxes.size ? Math.min(...[...boxes.values()].map(b => b.y)) : 0;
             boxes.set(cid, { x: maxX + GAP * 3, y: topY, w: plan.w, h: plan.h });
         }
 
-        // 5. Commit: translate the map to start at START, write containers + kids.
+        // 5. Commit: normalize to START only when the map would drift off-origin
+        // (incremental runs keep absolute coordinates → anchored spots stay
+        // byte-identical), write containers + kids, stamp the layout engine.
         const minX = Math.min(...[...boxes.values()].map(b => b.x));
         const minY = Math.min(...[...boxes.values()].map(b => b.y));
+        const dx = (fullPass || minX < 0) ? G.START - minX : 0;
+        const dy = (fullPass || minY < 0) ? G.START - minY : 0;
         for (const [cid, b] of boxes) {
-            const x = b.x - minX + G.START, y = b.y - minY + G.START;
+            const x = b.x + dx, y = b.y + dy;
             canvas.positions[cid] = { ...canvas.positions[cid], x, y, w: b.w, h: b.h };
             for (const kid of plans.get(cid).kids) {
                 canvas.positions[kid.id] = { ...canvas.positions[kid.id], x: x + kid.dx, y: y + kid.dy, w: G.CARD_W, h: kid.h };
             }
         }
+        canvas.settings = { ...(canvas.settings || {}), brainLayout: 'cluster-v1' };
     }
 
     const out = await finalizeBrainZip(zip, canvas, manifest, now);

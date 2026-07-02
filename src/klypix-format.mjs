@@ -498,13 +498,20 @@ export async function tidyBrain(buffer) {
 
     // Normalize every text card to the compact brain font (so the render matches
     // our height measure → no overlap) + cache each card's measured height.
+    // ALSO drop each card's `authoredInParent` anchor: the KLYPIX app freezes a
+    // child's in-container position in that field and RE-DERIVES the card's x/y
+    // from it on every render (ContainerItem group-scale) — so it would ignore
+    // the masonry x/y we write and snap cards back to their old single-column
+    // spots (the container then auto-grows to wrap them → skyscraper). Clearing
+    // the anchor makes THIS layout the card's authored baseline; the app re-seeds
+    // from our x/y. Verified against the app's render math in test/layout-cluster.
     const meta = new Map(); // id -> { h }
     for (const c of struct.cards) {
         if (c.type === 'container') continue;
         const wrapped = wrapText(String(c.text ?? ''));
         let createdAt = 0;
         const ip = `items/${shard(c.id)}/${c.id}.json`;
-        try { const f = zip.file(ip); if (f) { const j = JSON.parse(await f.async('string')); createdAt = Number(j.createdAt) || 0; j.fontSize = G.FONT; j.content = wrapped; zip.file(ip, JSON.stringify(j)); } } catch { /* leave as-is */ }
+        try { const f = zip.file(ip); if (f) { const j = JSON.parse(await f.async('string')); createdAt = Number(j.createdAt) || 0; j.fontSize = G.FONT; j.content = wrapped; delete j.authoredInParent; zip.file(ip, JSON.stringify(j)); } } catch { /* leave as-is */ }
         meta.set(c.id, { h: measureCardH(wrapped), createdAt });
     }
 
@@ -738,6 +745,12 @@ export async function tidyBrain(buffer) {
             for (const kid of plans.get(cid).kids) {
                 canvas.positions[kid.id] = { ...canvas.positions[kid.id], x: x + kid.dx, y: y + kid.dy, w: G.CARD_W, h: kid.h };
             }
+            // Drop the container's frozen group-scale baseline so the app's
+            // child-scaling pass early-returns (ContainerItem: `if
+            // (!item.authoredW) return`) and honors our masonry child x/y
+            // instead of scaling children off a stale authored size.
+            const cp = `items/${shard(cid)}/${cid}.json`;
+            try { const f = zip.file(cp); if (f) { const j = JSON.parse(await f.async('string')); if (j.authoredW != null || j.authoredH != null) { delete j.authoredW; delete j.authoredH; zip.file(cp, JSON.stringify(j)); } } } catch { /* leave as-is */ }
         }
         canvas.settings = { ...(canvas.settings || {}), brainLayout: 'cluster-v1' };
     }

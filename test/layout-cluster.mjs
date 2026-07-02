@@ -167,5 +167,32 @@ const byTitle = (t) => ctns.find(c => (c.title || '').toLowerCase().includes(t))
     ok(c.settings && c.settings.brainLayout === 'cluster-v1', 'review: tidied brain carries the cluster-v1 layout stamp');
 }
 
+// ── render contract: the app must HONOR the masonry (not re-derive from a
+// frozen anchor). ContainerItem re-derives a child's x/y from
+// `authoredInParent` and scales children off the container's `authoredW/H`,
+// EARLY-RETURNING only when authoredW is absent. So tidy must strip those
+// frozen baselines from everything it lays out — else the masonry we write is
+// ignored at render and containers auto-grow into skyscrapers (the 1.18.0
+// field bug). This reads the raw item JSONs the app actually consumes.
+{
+    const { zip: z2, struct: s2, canvas: cv2 } = await parseKlypix(tidied);
+    const rawById = new Map();
+    for (const [pth, entry] of Object.entries(z2.files)) {
+        if (entry.dir || !/^items\/.+\.json$/.test(pth)) continue;
+        const id = pth.split('/').pop().replace(/\.json$/, '');
+        try { rawById.set(id, JSON.parse(await entry.async('string'))); } catch { /* skip */ }
+    }
+    const laidCtns = s2.cards.filter(c => c.type === 'container');
+    const ctnWithAnchor = laidCtns.filter(c => { const j = rawById.get(c.id) || {}; return j.authoredW != null || j.authoredH != null; });
+    ok(ctnWithAnchor.length === 0, `render: no laid-out container keeps a frozen authoredW/H baseline (${ctnWithAnchor.length} leaked → would scale children off a stale size)`);
+    const childWithAnchor = s2.cards.filter(c => c.type !== 'container' && c.parentId && (rawById.get(c.id) || {}).authoredInParent != null);
+    ok(childWithAnchor.length === 0, `render: no in-container card keeps an authoredInParent anchor (${childWithAnchor.length} leaked → app would snap it back to its old spot)`);
+    // With anchors gone, the app early-returns and renders our file positions
+    // verbatim → the container's stored height IS the masonry height, so the
+    // skyscraper aspect (65:1 on the field brain) cannot recur.
+    const worst = Math.max(...laidCtns.map(c => { const p = cv2.positions[c.id]; return p.h / p.w; }));
+    ok(worst <= 3, `render: worst container aspect is a tile, not a strip (h/w=${worst.toFixed(1)})`);
+}
+
 console.log(failures ? `\n✗ ${failures} assertion(s) failed` : '\n✓ layout-cluster: all assertions passed');
 process.exit(failures ? 1 : 0);

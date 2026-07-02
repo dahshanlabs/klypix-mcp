@@ -229,6 +229,87 @@ const archived = (struct) => struct.cards.filter(c => c.type !== 'container' && 
     ok(pairs.length >= 1 && pairs[0] && /is now WIRED/.test(pairs[0].fresh.text), 'P8 field: the REAL pair is the first contradiction candidate');
 }
 
+// ── Adversarial-review regressions (1.17.0 review: 21 confirmed findings) ────
+// (D) casual lowercase prose must NOT fire the cross-area correction supersede
+{
+    const buf = await buildKlypixMap({ title: 'brain', areas: [{ title: 'Strategy', cards: [{ text: STALE }] }] });
+    const casual = 'Runtime: the old approach was wrong — off-cloud skill brain execution is wired now, not deferred like before\n#runtime';
+    const { stats } = await captureIntoBrain(buf, { cards: [{ text: casual, area: 'Runtime' }] });
+    ok(stats.superseded === 0, 'review-D: lowercase "was wrong" prose does NOT fire the cross-area supersede (uppercase cue only)');
+}
+// (B) closes: and ✓ must never archive a 🛠 skill
+{
+    const buf = await buildKlypixMap({
+        title: 'brain', areas: [{
+            title: 'Agent', cards: [
+                { text: '❓ Agent status is a dead field — remove or wire it?' },
+                { text: '🛠️ Gotcha: the agent status dead field must never be read before init.' },
+            ],
+        }],
+    });
+    const { buffer, stats } = await captureIntoBrain(buf, { cards: [{ text: 'Ship: 🏁 wired the agent status field\n#ship', area: 'Ship', closes: 'agent status dead field' }] });
+    const { struct } = await parseKlypix(buffer);
+    ok(stats.closed === 1, `review-B: closes: took the ❓ only (closed=${stats.closed})`);
+    ok(liveCards(struct).some(c => /🛠/.test(c.text)), 'review-B: the 🛠 skill is still LIVE (never archived by closes:)');
+    const { stats: s2, buffer: b2 } = await captureIntoBrain(buffer, { resolutions: [{ area: '', text: 'agent status dead field handled everywhere' }] });
+    const { struct: st2 } = await parseKlypix(b2);
+    ok(liveCards(st2).some(c => /🛠/.test(c.text)), `review-B: ✓ resolution also leaves the skill live (resolved=${s2.resolved})`);
+}
+// (C) #auto is provenance, not topic — no auto-edges between unrelated ship cards
+{
+    const buf = await buildKlypixMap({
+        title: 'brain', areas: [
+            { title: 'Ship', cards: [{ text: 'Ship: 🏁 merged PR #1\n#ship #auto' }] },
+            { title: 'Release', cards: [{ text: 'Release: 🏁 cut release v9.0.0\n#release #auto' }] },
+        ],
+    });
+    const { buffer } = await captureIntoBrain(buf, { cards: [{ text: 'Docs: 🏁 published the handbook\n#docs #auto', area: 'Docs' }] });
+    const { struct } = await parseKlypix(buffer);
+    ok(struct.connections.filter(c => c.label === 'auto').length === 0, 'review-C: the shared #auto tag draws NO auto-links between unrelated harvested cards');
+}
+// (G) a too-generic close target collapses to the single best match
+{
+    const areas = [{ title: 'Sandbox', cards: Array.from({ length: 6 }, (_, i) => ({ text: `sandbox concern ${i} — the runner quota and approval dialog behavior for case ${i}` })) }];
+    const buf = await buildKlypixMap({ title: 'brain', areas });
+    const { stats } = await captureIntoBrain(buf, { cards: [{ text: 'Ship: 🏁 sandbox hardening pass\n#ship', area: 'Ship', closes: 'sandbox' }] });
+    ok(stats.closed === 1, `review-G: a generic 7-char target archives exactly ONE best match, not a 4-card sweep (closed=${stats.closed})`);
+}
+// (I) polarity matching is word-level: deadline/delivery never flag dead↔live; blocked↔unblocked CAN fire
+{
+    const struct = {
+        cards: [
+            { id: 'd1', type: 'text', text: 'Ops: the export deadline for the delivery report is friday with the ops crew handling review', title: 'a', tags: [], area: 'Ops', createdAt: 1000 },
+            { id: 'd2', type: 'text', text: 'Ops: the export pipeline is live for the delivery report with the ops crew handling review', title: 'b', tags: [], area: 'Ops', createdAt: 2000 },
+            { id: 'b1', type: 'text', text: 'Auth: the signup flow is blocked on the vendor api review process for new tenants', title: 'c', tags: [], area: 'Auth', createdAt: 1000 },
+            { id: 'b2', type: 'text', text: 'Auth: the signup flow is unblocked after the vendor api review process for new tenants', title: 'd', tags: [], area: 'Auth', createdAt: 2000 },
+        ],
+        connections: [],
+    };
+    const pairs = detectContradictions(struct);
+    ok(!pairs.some(p => /deadline|delivery/.test(p.stale.text) && /dead|live/.test(p.why)), 'review-I: deadline/delivery no longer fake a dead↔live polarity pair');
+    ok(pairs.some(p => /blocked ↔ unblocked/.test(p.why)), 'review-I: blocked↔unblocked now fires (substring made it impossible before)');
+    // (E) a deliberate connection dismisses a POLARITY pair…
+    struct.connections.push({ fromId: 'b1', toId: 'b2', relationship: 'relates_to' });
+    ok(!detectContradictions(struct).some(p => /blocked/.test(p.why)), 'review-E: a deliberate relates_to edge dismisses the polarity pair (the documented dismissal now works)');
+}
+// (E') …but a cue pair is NOT dismissed by a mere link — only by retiring the stale card
+{
+    const { struct } = await brainWith([
+        { title: 'Strategy', cards: [{ text: STALE }] },
+        { title: 'Runtime', cards: [{ text: CORRECTION }] },
+    ]);
+    const stale = struct.cards.find(c => /deferred ON PURPOSE/.test(c.text || ''));
+    const corr = struct.cards.find(c => /WIRED/.test(c.text || ''));
+    struct.connections.push({ fromId: corr.id, toId: stale.id, relationship: 'relates_to' });
+    ok(detectContradictions(struct).length === 1, 'review-E: a relates_to link does NOT dismiss a correction-cue pair');
+}
+// (H) a terse deliberate correction (3 subject tokens after cue-strip) still supersedes
+{
+    const buf = await buildKlypixMap({ title: 'brain', areas: [{ title: 'Config', cards: [{ text: 'Config: the vault default resolution uses the global folder setting always for brains' }] }] });
+    const { stats } = await captureIntoBrain(buf, { cards: [{ text: 'Runtime: CORRECTION: the vault default resolution was WRONG — use cwd\n#runtime', area: 'Runtime' }] });
+    ok(stats.superseded === 1, `review-H: a terse correction (3 subject tokens) fires the supersede (superseded=${stats.superseded})`);
+}
+
 // ── P8 at the tool level: opBrainReconcile mode='contradictions' ─────────────
 {
     const fs = await import('fs');

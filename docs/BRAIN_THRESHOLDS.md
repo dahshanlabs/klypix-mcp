@@ -24,12 +24,36 @@ release). If you change one, update this table and the snapshot-parity fixtures.
 | `GARDEN_MIN_AGE_DAYS` / `GARDEN_AUTO_MIN_AGE_DAYS` | 14 / 7 | `klypix-format.mjs` | garden dormancy age; **1.17**: `#auto` ship cards age out at 7d |
 | garden `KEEP_NEWEST=8 / MIN_CANDIDATES=3 / MAX_DEGREE=1` | — | `klypix-format.mjs` | garden selection (unchanged) |
 
-## Correction cue (shared regex)
+## Correction cue (shared)
 
-`CORRECTION_RE = /\bCORRECTIONS?\b|\bOBSOLETE\b|\bstale note (?:is )?resolved\b|\bwas WRONG\b/i`
+`hasCorrectionCue(text)` = `/\bCORRECTIONS?\b|\bOBSOLETE\b|\bwas WRONG\b/` (**case-sensitive**
+— the uppercase form is the deliberate signal; casual prose like "the calc was wrong" or
+"remove obsolete helper" must never archive a card) OR `/\bstale note (?:is )?resolved\b/i`
+(the one natural-language phrase, any case).
 
 Used in three places (deliberately the same): capture-side widened supersede,
 recall-side overlay (`correctionOverlaysFor`), and `detectContradictions`.
+
+## Adversarial-review hardening (post-implementation, 21 confirmed findings)
+
+- `cueMatch` floor is **3** tokens per side (overlapScore keeps 4) — terse deliberate
+  corrections keep ~3 subject tokens after `stripCueMeta`; ≤2-token corrections land as a
+  new card (use `~` instead).
+- `closes:` guards: 🛠 skills are excluded (mirroring supersede); the title-CONTAINS
+  fast-path needs a ≥10-char target (exact/prefix stay ≥6); **>4 matches collapses to the
+  single best** (a too-generic target must not sweep).
+- ✓ resolutions also exclude 🛠 skills.
+- `proposeStructuralConnections` excludes the `auto` tag (provenance, not topic).
+- Polarity matching is **word-boundary** (`\bdead\b` — 'deadline' no longer carries the
+  pole; blocked↔unblocked can actually fire). A pair with any **deliberate** edge
+  (label ≠ 'auto') dismisses a POLARITY candidate; a CUE candidate clears only via
+  supersede/close/conflicts_with.
+- Recall render: the stale-hit demotion is unconditional (even when the corrector already
+  rendered as its own hit); corrector full-text respects the per-session injected-set;
+  repeat-nudges warn when the nudged card has a live correction.
+- Ultra brief: budgeted sections emit "…and N more" elisions (Focus's is never silent);
+  all cuts are surrogate-safe; 📨 messages print directly after the brief (delivered-once
+  semantics must sit in the visible window).
 
 ## Session brief tiers (1.17)
 

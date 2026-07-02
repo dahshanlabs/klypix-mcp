@@ -1210,12 +1210,20 @@ async function promptRetrieve(lib) {
     const head = (c, n = 120) => { const t = flat(c.text); return t.length > n ? t.slice(0, n - 1) + '…' : t; };
     const lines = [];
     if (repeats.length) {
+        // A nudged "already shipped" card may itself have been CORRECTED since —
+        // nudging the agent to reuse a stale fact would be worse than no nudge.
+        let repOverlays = new Map();
+        if (struct && typeof lib.correctionOverlaysFor === 'function') {
+            try { repOverlays = lib.correctionOverlaysFor(struct, repeats.map(r => r.card)); } catch { /* best-effort */ }
+        }
         lines.push('## ⚠️ Possible repeat — this may already be done (reuse/supersede, don’t silently redo)');
         for (const r of repeats) {
             const verb = r.kind === 'superseded'
                 ? `you moved OFF this ${day(r.card.createdAt)} — check what replaced it before redoing`
                 : `already ${r.kind} ${day(r.card.createdAt)} — reuse/build on it, or supersede it deliberately`;
-            lines.push(`- [${flat(r.card.area) || '?'}] ${head(r.card)}  · ${verb}`);
+            const ov = repOverlays.get(r.card.id);
+            const corr = ov ? `  · ⚠️ a live CORRECTION exists — read it first: “${head(ov.by, 90)}”` : '';
+            lines.push(`- [${flat(r.card.area) || '?'}] ${head(r.card)}  · ${verb}${corr}`);
         }
         lines.push('Read the matching card (klypix-canvas MCP / brain) BEFORE redoing. Other project? use search_all_brains.');
     }
@@ -1240,11 +1248,24 @@ async function promptRetrieve(lib) {
         for (const h of freshHits) {
             if (shownNow.has(h.card.id)) continue;                      // already rendered this turn (e.g. as a corrector)
             const ov = overlays.get(h.card.id);
-            if (ov && !shownNow.has(ov.by.id)) {
-                lines.push(`- ⚠️ CORRECTED — current: ${flat(ov.by.text)}`);
-                lines.push(`  ↳ recall matched a STALE card${ov.kind === 'edge' ? ' (superseded)' : ''}: “${head(h.card, 110)}” — do not act on it. Reconcile: \`brain_reconcile\` (contradictions) or a ✓/~ marker.`);
-                shownNow.add(h.card.id); shownNow.add(ov.by.id);
-                newlyInjected.push(h.card.id, ov.by.id);
+            if (ov) {
+                // The STALE demotion is UNCONDITIONAL — even when the corrector
+                // already rendered (as its own hit, or for a twin), the stale
+                // card must never fall through to the plain full-text branch.
+                // The corrector prints full-text at most once per session.
+                let correctorLine = false;
+                if (!shownNow.has(ov.by.id)) {
+                    correctorLine = true;
+                    if (injected.has(ov.by.id)) {
+                        lines.push(`- ⚠️ CORRECTED — current (already shown this session): ${head(ov.by, 110)}`);
+                    } else {
+                        lines.push(`- ⚠️ CORRECTED — current: ${flat(ov.by.text)}`);
+                        newlyInjected.push(ov.by.id);
+                    }
+                    shownNow.add(ov.by.id);
+                }
+                lines.push(`${correctorLine ? '  ↳' : '-'} ⚠️ recall matched a STALE card${ov.kind === 'edge' ? ' (superseded)' : ''}: “${head(h.card, 110)}” — do NOT act on it${correctorLine ? '' : ' (its CORRECTION is listed above)'}. Reconcile: \`brain_reconcile\` (contradictions) or a ✓/~ marker.`);
+                shownNow.add(h.card.id);
                 continue;
             }
             if (injected.has(h.card.id)) {
@@ -1484,7 +1505,7 @@ function legendFooter() {
         + '🧠 **Capture markers** — write these in your reply; the Stop hook harvests them into the brain (no separate log step). Use sparingly, for real decisions / milestones / discoveries:\n'
         + '`🧠 BRAIN [Area]: decision` · `[Area] ?: open question` · `[Area] !: milestone` · `[Area] +: 🛠️ skill (reusable how-to / gotcha — resurfaces every session, never ages out)` · `[Area] ✓: resolves+archives the matching card` · `[Area] ~: updates it in place` · 🎯 in text = a goal (reads as open).\n'
         + 'Optional suffixes: `closes: <card title / [[wikilink]]>` (resolve the strategy/question this fulfils) · `ev: <file[:line]>, PR#<n>` (anchor to code → auto drift-badge).\n'
-        + '**Correcting a stale card:** include the word `CORRECTION` (or "was WRONG" / "OBSOLETE") in the decision — the capture then hunts the stale card across ALL areas at a lower match bar and supersedes it (archived + arrowed, with a receipt; restore from Archive if it grabbed the wrong one). A rephrased duplicate `?` merges into the existing open question instead of stacking a twin.\n'
+        + '**Correcting a stale card:** include the word `CORRECTION` (or "was WRONG" / "OBSOLETE" — UPPERCASE; casing is the deliberate-signal, casual prose never fires it) in the decision — the capture then hunts the stale card across ALL areas at a lower match bar and supersedes it (archived + arrowed, with a receipt; restore from Archive if it grabbed the wrong one). A rephrased duplicate `?` merges into the existing open question instead of stacking a twin.\n'
         + '**Session brief:** the SessionStart hook prints a ≤2KB ultra brief and writes the FULL brief to `.claude/brain-brief.md` — read that file when planning non-trivial work.\n'
         + '**Routing:** capture project decisions / milestones / open questions / gotchas HERE, *at the moment you decide* — this brain is the shared, portable memory that survives context resets and the next agent reads. A host memory store (if any) is for *user* preferences; never leave project state only in a private scratchpad.\n'
         + 'Coordinate with a concurrent session: `🧠 MSG [<their-id or all>]: <text>` — a one-time note (NOT a brain card) delivered to that session on its next prompt.\n';
@@ -1534,10 +1555,13 @@ async function read(lib) {
     } catch { /* */ }
     try { if (typeof lib.findStaleOpenCards === 'function') { const { total } = lib.findStaleOpenCards(struct, { max: 5 }); if (total) heals.push(`${total} open card(s) look already done`); } } catch { /* */ }
     const healLine = heals.length ? `\n🔧 Self-heal: ${heals.join(' · ')} — detail + fix markers in ${briefRel}.` : '';
-    const out = ultra + healLine
+    // 📨 messages are delivered-ONCE (acked the moment this reads them) — they
+    // go right after the ultra brief, at the top of the visible window, never
+    // after a stack of footers that could push them past a preview cut.
+    const messages = messageFooter(input.session_id || '', input.transcript_path);
+    const out = ultra + messages + healLine
         + inflightFooter(input.session_id, struct)
-        + selfCheckFooter() + doctorFooter() + versionCurrencyFooter()
-        + messageFooter(input.session_id || '', input.transcript_path);
+        + selfCheckFooter() + doctorFooter() + versionCurrencyFooter();
     process.stdout.write(out);
     // Heartbeat: prove the brief actually injected (and how big) so a dead or
     // stale live-copy of the hook stops being a silent no-op.

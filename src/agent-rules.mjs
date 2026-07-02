@@ -66,9 +66,10 @@ survives across sessions, agents, and context resets.
 Capture **sparingly** — real decisions / milestones / open questions / reusable gotchas, not routine
 steps — and capture it **at the moment you decide** (a one-line marker inline), not batched or left in
 a scratch file to rot. Link related cards with \`[[other-card]]\`. To **correct a stale card**, include
-the word \`CORRECTION\` (or "was WRONG" / "OBSOLETE") in the decision — capture then supersedes the
-stale card across ALL areas (archived with an arrow + a receipt, restorable if wrong). Suspect stale
-facts survive somewhere? Run \`brain_reconcile\` — it surfaces contradiction candidates to confirm.
+the word \`CORRECTION\` (or "was WRONG" / "OBSOLETE" — UPPERCASE, the deliberate signal) in the
+decision — capture then supersedes the stale card across ALL areas (archived with an arrow + a
+receipt, restorable if wrong). Suspect stale facts survive somewhere? Run \`brain_reconcile\` — it
+surfaces contradiction candidates to confirm.
 
 **Memory routing (important).** If your host has its OWN memory/notes store, that is for *user*
 preferences and how to work with this person — keep using it for that. But **project** knowledge

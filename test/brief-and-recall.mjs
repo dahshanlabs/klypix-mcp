@@ -87,6 +87,28 @@ function fixture(tag) {
     f.cleanup();
 }
 
+// ── review-A/F: corrector ranked FIRST must still demote the stale hit ──────
+{
+    const f = fixture('corrfirst');
+    fs.writeFileSync(path.join(f.proj, 'brain.klypix'), await buildKlypixMap({
+        title: 'brain',
+        areas: [
+            { title: 'Strategy', cards: [{ text: STALE }] },
+            { title: 'Runtime', cards: [{ text: CORRECTION }] },
+        ],
+    }));
+    // Prompt shares more tokens with the CORRECTION card → it outranks the stale one.
+    const prompt = 'the runner executes skills off-cloud since the connectivity arc — wired or deferred? plan the executor rollout';
+    const first = f.run(['--prompt'], { session_id: 'sess-corrfirst', prompt });
+    ok(/STALE card/.test(first), 'review-A: stale hit is labeled STALE even when its corrector renders first as its own hit');
+    ok(!first.includes('executor postponed until real demand shows'), 'review-A: stale card body is never injected full-text');
+    const second = f.run(['--prompt'], { session_id: 'sess-corrfirst', prompt });
+    ok(!/CORRECTED — current: Runtime: CORRECTION/.test(second) || /already shown this session/.test(second),
+        'review-F: the corrector full text is not re-paid on the next prompt of the same session');
+    ok(/STALE card/.test(second), 'review-F: the stale labeling persists on re-hits');
+    f.cleanup();
+}
+
 // ── P6: injected-set — full text once, headline after ────────────────────────
 {
     const f = fixture('dedup');

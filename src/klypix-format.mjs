@@ -726,11 +726,18 @@ export function structToUltraBrief(struct, { freshness = null, briefPath = '.cla
     const budget = Math.max(400, budgetChars - tail.reduce((s, l) => s + l.length + 1, 0));
     push(`# ${struct.title} — brain (ultra brief)`);
     push(`*${struct.counts.cards} cards · ${struct.counts.connections} connections — this is the preview tier; the full brief is one Read away (below)*`);
+    // clip = surrogate-safe truncation for arbitrary strings (head() covers cards).
+    const clip = (s, n) => { const t = flat(s); return t.length > n ? safeCut(t, n - 1) : t; };
     if (focus.length && pushIf('') && pushIf('## 📌 Human focus (act on these first)')) {
-        for (const c of focus) if (!pushIf(`- ${fr(c)}${head(c, 400)}`)) break;
+        let shown = 0;
+        for (const c of focus) { if (!pushIf(`- ${fr(c)}${head(c, 400)}`)) break; shown++; }
+        // Never present a truncated "act on these first" list as complete.
+        if (shown < focus.length) push(`- ⚠️ …and ${focus.length - shown} MORE focus card(s) — read the full brief before acting.`);
     }
     if (conflicts.length && pushIf('') && pushIf('## ⚠️ Conflicts to reconcile')) {
-        for (const c of conflicts.slice(0, 4)) if (!pushIf(`- ${flat(c.from).slice(0, 70)} ⚔️ ${flat(c.to).slice(0, 70)}`)) break;
+        let shown = 0;
+        for (const c of conflicts.slice(0, 4)) { if (!pushIf(`- ${clip(c.from, 70)} ⚔️ ${clip(c.to, 70)}`)) break; shown++; }
+        if (shown < conflicts.length) pushIf(`- …and ${conflicts.length - shown} more conflict(s) — in the full brief.`);
     }
     if (open.length && pushIf('') && pushIf(`## Open questions & goals (${open.length})`)) {
         let shown = 0;
@@ -739,7 +746,7 @@ export function structToUltraBrief(struct, { freshness = null, briefPath = '.cla
     }
     const areas = struct.cards.filter(c => c.type === 'container' && !/^archive$/i.test(c.title || ''))
         .map(c => `${flat(c.title)} (${texts.filter(t => t.parentId === c.id).length})`);
-    if (areas.length) { pushIf(''); pushIf(('Areas: ' + areas.join(' · ')).slice(0, 240)); }
+    if (areas.length) { pushIf(''); pushIf(clip('Areas: ' + areas.join(' · '), 240)); }
     push(...tail);
     return out.join('\n') + '\n';
 }
@@ -775,10 +782,12 @@ export function scoreCardsAgainstQuery(struct, query, { topK = 6, minScore = 2, 
         // Log-length normalization: a flat 1pt/word-hit made LONG cards outrank
         // short ones purely by having more vocabulary to hit (one ~600-word card
         // was re-injected into 3 prompts on those cheap hits). Body hits are
-        // scaled by log2 of the body's distinct-word count — ≤64 words is
-        // unpenalized, a 600-word card scores ~0.7/hit. Title/tag hits (the
-        // precise signals) are untouched.
-        const lenNorm = Math.min(1, 6 / Math.max(1, Math.log2(bodyW.size + 1)));
+        // scaled by log2 of the body's distinct-word count — ≤64 words is EXACTLY
+        // unpenalized (log2(64)=6), a 600-word card scores ~0.65/hit, so a
+        // body-only match on a big card needs 5 distinct hits to clear the recall
+        // minScore of 3 — by design. Title/tag hits (the precise signals) are
+        // untouched.
+        const lenNorm = Math.min(1, 6 / Math.max(6, Math.log2(bodyW.size || 1)));
         let score = 0;
         for (const tok of tokens) {
             if (titleW.has(tok)) score += 3;
@@ -961,6 +970,10 @@ const POLARITY_PAIRS = [
     ['broken', 'fixed'], ['broken', 'working'], ['dead', 'live'], ['dead', 'alive'],
     ['disabled', 'enabled'], ['blocked', 'unblocked'], ['wrong', 'correct'], ['removed', 'restored'],
 ];
+// WORD-boundary matchers, precompiled — substring includes() made 'deadline'
+// carry the 'dead' pole and 'delivery' carry 'live', and blocked↔unblocked
+// could never fire ('unblocked' contains 'blocked').
+const POLARITY_RES = POLARITY_PAIRS.map(([x, y]) => ({ x, y, rx: new RegExp(`\\b${x}\\b`), ry: new RegExp(`\\b${y}\\b`) }));
 export function detectContradictions(struct, { minOverlap = 0.45, topK = 12 } = {}) {
     if (!struct || !Array.isArray(struct.cards)) return [];
     const isArchived = (c) => /^archive$/i.test(c.area || '');
@@ -969,11 +982,17 @@ export function detectContradictions(struct, { minOverlap = 0.45, topK = 12 } = 
     // SUBJECT, not the vocabulary of the correction act (see stripCueMeta above).
     const wset = new Map(live.map(c => [c.id, stripCueMeta(new Set(queryTokens(c.text)))]));
     const lower = new Map(live.map(c => [c.id, String(c.text).toLowerCase()]));
-    const settled = new Set();
+    // settled — fully reconciled (supersede/close/conflict arrow): excludes the
+    //   pair regardless of kind.
+    // linked — ANY deliberate edge (label !== 'auto'): dismisses a POLARITY pair
+    //   ("I looked, they relate, not a contradiction"), but never a cue pair —
+    //   a correction that [[wikilinks]] its stale card must still surface until
+    //   the stale card is actually retired. Auto-drawn edges dismiss nothing.
+    const settled = new Set(), linked = new Set();
     for (const e of struct.connections || []) {
-        if (e.label === 'superseded by' || e.label === 'closed by' || e.relationship === 'conflicts_with') {
-            settled.add(e.fromId + '|' + e.toId); settled.add(e.toId + '|' + e.fromId);
-        }
+        const k1 = e.fromId + '|' + e.toId, k2 = e.toId + '|' + e.fromId;
+        if (e.label === 'superseded by' || e.label === 'closed by' || e.relationship === 'conflicts_with') { settled.add(k1); settled.add(k2); }
+        if (e.label !== 'auto') { linked.add(k1); linked.add(k2); }
     }
     const out = [];
     for (let i = 0; i < live.length; i++) {
@@ -984,7 +1003,7 @@ export function detectContradictions(struct, { minOverlap = 0.45, topK = 12 } = 
             if (A.size < 4 || B.size < 4) continue;
             let inter = 0; for (const t of A) if (B.has(t)) inter++;
             const overlap = inter / Math.min(A.size, B.size);           // same subject?
-            const aCue = CORRECTION_RE.test(a.text), bCue = CORRECTION_RE.test(b.text);
+            const aCue = hasCorrectionCue(a.text), bCue = hasCorrectionCue(b.text);
             // Cue-asymmetric pairs may also match on absolute subject mass (long
             // cards — see cueMatch above); cue-less pairs keep the strict ratio.
             const subjectHit = overlap >= minOverlap
@@ -994,13 +1013,14 @@ export function detectContradictions(struct, { minOverlap = 0.45, topK = 12 } = 
             if (aCue !== bCue) {
                 why = 'correction-cue';                                  // one side explicitly corrects — it is the presumed truth
                 freshC = aCue ? a : b; staleC = aCue ? b : a;
-            } else if (!aCue) {
+            } else if (!aCue && !linked.has(a.id + '|' + b.id)) {
                 const la = lower.get(a.id), lb = lower.get(b.id);
-                for (const [x, y] of POLARITY_PAIRS) {
-                    // each side must carry ONE pole only — a card narrating "from
-                    // deferred to wired" holds both and contradicts neither.
-                    if ((la.includes(x) && !la.includes(y) && lb.includes(y) && !lb.includes(x))
-                        || (la.includes(y) && !la.includes(x) && lb.includes(x) && !lb.includes(y))) { why = `polarity: ${x} ↔ ${y}`; break; }
+                for (const { x, y, rx, ry } of POLARITY_RES) {
+                    // each side must carry ONE pole only (word-level) — a card
+                    // narrating "from deferred to wired" holds both and
+                    // contradicts neither.
+                    if ((rx.test(la) && !ry.test(la) && ry.test(lb) && !rx.test(lb))
+                        || (ry.test(la) && !rx.test(la) && rx.test(lb) && !ry.test(lb))) { why = `polarity: ${x} ↔ ${y}`; break; }
                 }
                 if (why) [staleC, freshC] = (a.createdAt || 0) <= (b.createdAt || 0) ? [a, b] : [b, a];  // later card = presumed truth
             }
@@ -1105,9 +1125,12 @@ export function proposeStructuralConnections(struct, { maxPerCard = 2 } = {}) {
     const live = struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim() && !/^archive$/i.test(c.area || ''));
     const linked = new Set(struct.connections.map(c => [c.fromId, c.toId].sort().join('|')));
     const titleIx = live.filter(c => (c.title || '').trim()).map(c => ({ id: c.id, t: c.title.trim().toLowerCase() }));
+    // 'auto' is PROVENANCE, not topic — as a shared tag it would link every
+    // harvested ship card to every other one (junk edges that then push their
+    // degree past the garden's dormancy guard).
     const tagsOf = (c) => (c.tags || [])
         .map(t => String(t).toLowerCase().replace(/^#/, ''))
-        .filter(t => t && t !== 'area' && t !== String(c.area || '').toLowerCase());
+        .filter(t => t && t !== 'area' && t !== 'auto' && t !== String(c.area || '').toLowerCase());
     const cand = [];
     for (const c of live) {
         for (const link of (c.links || [])) {
@@ -1169,7 +1192,14 @@ const coverageOf = (target, hay) => { if (!target.size) return 0; let h = 0; for
 // reworded) — the stale card then stays live and recall serves it alone. Shared
 // by: the capture-side widened supersede, the recall-side overlay below, and
 // detectContradictions.
-export const CORRECTION_RE = /\bCORRECTIONS?\b|\bOBSOLETE\b|\bstale note (?:is )?resolved\b|\bwas WRONG\b/i;
+// DELIBERATE cue only: the uppercase forms are the documented convention, and
+// case-sensitivity is what keeps casual prose ("the floor calc was wrong",
+// "remove obsolete helper", "color-correction") from firing a cross-area
+// supersede on an innocent card. "stale note resolved" is the one
+// natural-language phrase, accepted in any case (it is never incidental).
+export const CORRECTION_RE = /\bCORRECTIONS?\b|\bOBSOLETE\b|\bwas WRONG\b/;
+const CORRECTION_PHRASE_RE = /\bstale note (?:is )?resolved\b/i;
+export const hasCorrectionCue = (t) => CORRECTION_RE.test(String(t || '')) || CORRECTION_PHRASE_RE.test(String(t || ''));
 export const CORRECTION_SUPERSEDE_AT = 0.4;   // widened cross-area bar (vs same-area SUPERSEDE_AT 0.6)
 // Cue META words describe the act of correcting, not the subject — left in, they
 // dilute the overlap denominator and push real correction pairs just under the
@@ -1184,8 +1214,13 @@ const stripCueMeta = (set) => { const out = new Set(); for (const w of set) if (
 // meaningful tokens at ≥0.25 coefficient. Cue-gated ONLY — plain supersede and
 // polarity pairs keep their strict ratio bars (no cue prior to lean on).
 const CUE_STRONG_SHARED = 10, CUE_RELAXED_COEF = 0.25;
+// Floor 3 (not overlapScore's 4): after stripCueMeta a terse deliberate
+// correction ("CORRECTION: the vault default was WRONG — use cwd") keeps only
+// 3-ish subject tokens; at 4 it silently no-oped. ≤2-token corrections still
+// no-op (too little signal to archive on) — they land as a new card; use ~ to
+// edit a card in place instead.
 const cueMatch = (a, b, bar) => {
-    if (a.size < 4 || b.size < 4) return 0;
+    if (a.size < 3 || b.size < 3) return 0;
     let inter = 0; for (const w of a) if (b.has(w)) inter++;
     const coef = inter / Math.min(a.size, b.size);
     return (coef >= bar || (inter >= CUE_STRONG_SHARED && coef >= CUE_RELAXED_COEF)) ? coef : 0;
@@ -1209,12 +1244,12 @@ export function correctionOverlaysFor(struct, cards, { at = CORRECTION_SUPERSEDE
     for (const cn of struct.connections || []) {
         if (cn.label === 'superseded by' || cn.label === 'closed by') successorOf.set(cn.fromId, cn.toId);
     }
-    const cues = struct.cards.filter(c => c.type !== 'container' && !isArchived(c) && (c.text || '').trim() && CORRECTION_RE.test(c.text));
+    const cues = struct.cards.filter(c => c.type !== 'container' && !isArchived(c) && (c.text || '').trim() && hasCorrectionCue(c.text));
     for (const card of cards) {
         if (!card || !card.id) continue;
         const succ = successorOf.has(card.id) ? byId.get(successorOf.get(card.id)) : null;
         if (succ && (succ.text || '').trim()) { out.set(card.id, { kind: 'edge', by: succ }); continue; }
-        if (CORRECTION_RE.test(card.text || '')) continue;   // the hit IS a correction — nothing to overlay
+        if (hasCorrectionCue(card.text)) continue;   // the hit IS a correction — nothing to overlay
         const cTok = tokenSet(card.text);
         let best = null, bestS = 0;
         for (const cue of cues) {
@@ -1329,6 +1364,7 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
             const cands = [];
             for (const c of liveTextCards()) {
                 if (r.area && (c.area || '').toLowerCase() !== r.area.toLowerCase()) continue;
+                if (/🛠/.test(c.text)) continue; // skills are standing reference — a ✓ must never archive one (mirror the supersede guard)
                 const s = overlapScore(rTok, tokenSet(c.text)) + (/❓|🎯/.test(c.text) ? 0.15 : 0);
                 if (s > 0) cands.push({ c, s });
             }
@@ -1422,7 +1458,7 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
             // bar: a cross-area reworded correction could never fire the
             // same-area 0.6 path by construction, which is exactly how stale
             // cards outlived their corrections in the field.
-            const isCorrection = CORRECTION_RE.test(card.text);
+            const isCorrection = hasCorrectionCue(card.text);
             const nTokCmp = isCorrection ? stripCueMeta(nTok) : nTok;   // cue meta words dilute the denominator
             let best = null, bestScore = 0;
             for (const c of liveTextCards()) {
@@ -1469,16 +1505,23 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
             // generic to trust beyond the strongest few.
             const matches = [];
             for (const c of liveTextCards()) {
+                if (/🛠/.test(c.text)) continue; // skills are standing reference — a closes: must never archive one (mirror the supersede guard)
                 const ct = (c.title || '').trim().toLowerCase();
-                // Title fast-path: exact / prefix / or the card title CONTAINS the
-                // target (handles the common "Area: <title> (extra…)" card title).
-                if (ct && wantTitle.length >= 6 && (ct === wantTitle || ct.startsWith(wantTitle) || wantTitle.startsWith(ct) || ct.includes(wantTitle))) { matches.push({ c, cov: 1 }); continue; }
+                // Title fast-path: exact / prefix (≥6 chars), or the card title
+                // CONTAINS the target — the contains variant needs a LONGER target
+                // (≥10) because a short generic word ("sandbox") appears in many
+                // unrelated titles and the multi-close below would sweep them all.
+                if (ct && wantTitle.length >= 6 && (ct === wantTitle || ct.startsWith(wantTitle) || wantTitle.startsWith(ct))) { matches.push({ c, cov: 1 }); continue; }
+                if (ct && wantTitle.length >= 10 && ct.includes(wantTitle)) { matches.push({ c, cov: 1 }); continue; }
                 // Else target-coverage (≥2 tokens, no floor): a short deliberate
                 // close-target whose tokens are present in a card is a precise hit.
                 if (tTok.size >= 2) { const cov = coverageOf(tTok, tokenSet(c.text)); if (cov >= CLOSE_COVER_AT) matches.push({ c, cov }); }
             }
             matches.sort((a, b) => b.cov - a.cov);
-            const chosen = matches.slice(0, 4);
+            // >4 matches means the target was too GENERIC to trust a sweep —
+            // fall back to the single best match (the pre-1.17 behavior) rather
+            // than archive four semi-related cards in iteration order.
+            const chosen = matches.length > 4 ? matches.slice(0, 1) : matches;
             if (!chosen.length) continue;
             const ship = String(card.text).replace(/\s+/g, ' ').replace(/^[^:\n]{1,40}:\s*/, '').replace(/^🏁\s*/, '').trim().slice(0, 80);
             card.__closesIds = [];

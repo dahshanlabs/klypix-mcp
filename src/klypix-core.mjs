@@ -429,7 +429,7 @@ export async function opBrainReconcile({ vault, canvas, root, mode = 'all' }) {
         `${i + 1}. ${p.why} · overlap ${p.overlap}\n`
         + `   · likely STALE   [${p.stale.area || '?'}] ${flat(p.stale.text).slice(0, 180)}\n`
         + `   · likely CURRENT [${p.fresh.area || '?'}] ${flat(p.fresh.text).slice(0, 180)}`);
-      sections.push(`# ⚔️ ${pairs.length} contradiction candidate(s) — confirm, then reconcile\n_Candidates only — nothing was changed. For each REAL contradiction: retire the stale card with \`brain_note\` marker \`✓\` (text = what it resolved to), or record a correction-cue decision ("CORRECTION: …") — capture auto-supersedes it across areas. If a pair is NOT a contradiction, connect the two cards (\`brain_connect\` / relates_to) to dismiss it from future runs._\n\n${lines.join('\n')}`);
+      sections.push(`# ⚔️ ${pairs.length} contradiction candidate(s) — confirm, then reconcile\n_Candidates only — nothing was changed. For each REAL contradiction: retire the stale card with \`brain_note\` marker \`✓\` (text = what it resolved to), or record a correction-cue decision ("CORRECTION: …", uppercase) — capture auto-supersedes it across areas. Dismissing a FALSE positive: a **polarity** pair is dismissed by deliberately connecting the two cards (\`brain_connect\`); a **correction-cue** pair only clears when the stale card is retired (✓ / supersede) — a mere link does not settle a declared correction._\n\n${lines.join('\n')}`);
     } else if (mode === 'contradictions') {
       sections.push('✓ No contradiction candidates — no live card pair shows a correction cue or a polarity flip over the same subject.');
     }

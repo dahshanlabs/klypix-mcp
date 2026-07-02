@@ -209,6 +209,26 @@ const archived = (struct) => struct.cards.filter(c => c.type !== 'container' && 
     ok(areas.length === 1 && !areas[0].candidates.some(c => c.id === 'h1'), 'P9 garden: the same-age hand-written card is NOT dormant (14d bar intact)');
 }
 
+// ── P1/P8 long-card reality (verbatim from the AgentLit field brain) ─────────
+// The report's short fixtures pass at pure ratio bars, but the REAL pair
+// measures only ~0.31-0.33 overlap coefficient (long cards — the subject is a
+// fraction of each text; 16-17 shared subject tokens). The cue-gated absolute
+// subject-mass clause (≥10 shared @ ≥0.25) is what makes the real pair fire;
+// this pins it so a future threshold tweak can't silently regress the field case.
+{
+    const REAL_STALE = `❓ Off-cloud skill/brain EXECUTION deferred ON PURPOSE 2026-06-16 Making file-embedded skills/brain RUN on desktop/CLI (not just travel as data) was the audit's highest-scored play (9/10) and the deepest moat — deferred deliberately because it's a DISTRIBUTION moat and the founder said to ignore distribution for now. Revisit when distribution is back on. Root cause: quickstart.ts InMemoryPersistenceAdapter.getLatestBlueprint (+ desktop/CLI FileAgentPersistence clones) drop blueprint.skills and file.brain; use_skill dead-ends at "Unknown tool" off-cloud. Fix = widen BlueprintRecord + ship portable file-backed use_skill/brain_lookup executors. #strategy`;
+    const REAL_CORR = `Runtime: CORRECTION (stale note resolved): off-cloud self-skilling + agent-brain EXECUTION is now WIRED, not deferred. Verified in main 2026-06-24: desktop (artifacts/agentlit-desktop/src/lib/use-agent-runner.ts:197-204) and CLI (artifacts/agentlit-cli/src/index.ts) both register SaveSkillExecutor/UseSkillExecutor (+ BrainRemember/BrainLookup) against the .agent file via TauriAgentFileStore/FileAgentFileStore, with createLlmSkillVerifier(llm) running the SAME verify-before-keep judge on the user's own key. Portable executors live in artifacts/runtime/src/tools/self-skilling.ts. So a desktop/CLI agent LEARNS + REPLAYS skills locally, keys never leaving — on-thesis. The earlier "use_skill dead-ends at Unknown tool off-cloud / EXECUTION deferred" (2026-06-14/16) is OBSOLETE. #runtime`;
+    const { struct } = await brainWith([
+        { title: 'Strategy', cards: [{ text: REAL_STALE }] },
+        { title: 'Runtime', cards: [{ text: REAL_CORR }] },
+    ]);
+    const stale = struct.cards.find(c => /deferred ON PURPOSE/.test(c.text || ''));
+    const ov = correctionOverlaysFor(struct, [stale]).get(stale.id);
+    ok(!!ov && ov.kind === 'cue', `P1 field: recall overlay fires on the REAL long-card pair (overlap=${ov ? ov.overlap : 'none'})`);
+    const pairs = detectContradictions(struct);
+    ok(pairs.length >= 1 && pairs[0] && /is now WIRED/.test(pairs[0].fresh.text), 'P8 field: the REAL pair is the first contradiction candidate');
+}
+
 // ── P8 at the tool level: opBrainReconcile mode='contradictions' ─────────────
 {
     const fs = await import('fs');

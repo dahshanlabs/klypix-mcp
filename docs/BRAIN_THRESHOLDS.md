@@ -8,6 +8,7 @@ release). If you change one, update this table and the snapshot-parity fixtures.
 |---|---|---|---|
 | `SUPERSEDE_AT` | 0.6 | `klypix-format.mjs` `captureIntoBrain` | plain same-area decision supersede |
 | `CORRECTION_SUPERSEDE_AT` | 0.4 | `klypix-format.mjs` (exported) | **new 1.17** — correction-cue supersede, ALL areas; also the recall-side overlay bar (`correctionOverlaysFor`) |
+| cue absolute-mass clause | ≥10 shared @ ≥0.25 coef | `klypix-format.mjs` `cueMatch` / `detectContradictions` | **new 1.17** — cue-gated matches also fire on absolute subject mass: long real-world cards measure ~0.31-0.33 coefficient with 16-17 shared subject tokens (the field pair), under every pure-ratio bar. Cue-gated ONLY — plain supersede + polarity pairs keep strict ratios |
 | `QUESTION_MERGE_AT` | 0.6 | `klypix-format.mjs` `captureIntoBrain` | **new 1.17** — rephrased duplicate ❓ merges into the existing open question |
 | `RESOLVE_AT` | 0.3 | `klypix-format.mjs` `captureIntoBrain` | ✓ resolve floor; 1.17 resolves the best match **± 0.1 near-ties** (cap 3), not just the first |
 | `CLOSE_COVER_AT` | 0.6 | `klypix-format.mjs` `captureIntoBrain` | `closes:` coverage; 1.17 resolves **ALL** matches ≥ bar (cap 4), was first-match-and-break |

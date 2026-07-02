@@ -984,8 +984,12 @@ export function detectContradictions(struct, { minOverlap = 0.45, topK = 12 } = 
             if (A.size < 4 || B.size < 4) continue;
             let inter = 0; for (const t of A) if (B.has(t)) inter++;
             const overlap = inter / Math.min(A.size, B.size);           // same subject?
-            if (overlap < minOverlap) continue;
             const aCue = CORRECTION_RE.test(a.text), bCue = CORRECTION_RE.test(b.text);
+            // Cue-asymmetric pairs may also match on absolute subject mass (long
+            // cards — see cueMatch above); cue-less pairs keep the strict ratio.
+            const subjectHit = overlap >= minOverlap
+                || (aCue !== bCue && inter >= CUE_STRONG_SHARED && overlap >= CUE_RELAXED_COEF);
+            if (!subjectHit) continue;
             let why = null, staleC = null, freshC = null;
             if (aCue !== bCue) {
                 why = 'correction-cue';                                  // one side explicitly corrects — it is the presumed truth
@@ -1173,6 +1177,19 @@ export const CORRECTION_SUPERSEDE_AT = 0.4;   // widened cross-area bar (vs same
 // every correction-overlap comparison.
 const CORRECTION_META = new Set(['correction', 'corrections', 'obsolete', 'stale', 'note', 'notes', 'resolved', 'wrong']);
 const stripCueMeta = (set) => { const out = new Set(); for (const w of set) if (!CORRECTION_META.has(w)) out.add(w); return out; };
+// Long-card reality: a correction's SUBJECT is a fraction of each card — the
+// overlap COEFFICIENT alone punishes long↔long pairs (the real field pair
+// measures 0.33 with 17 shared subject tokens, under every per-ratio bar). A
+// cue-gated match therefore also fires on ABSOLUTE subject mass: ≥10 shared
+// meaningful tokens at ≥0.25 coefficient. Cue-gated ONLY — plain supersede and
+// polarity pairs keep their strict ratio bars (no cue prior to lean on).
+const CUE_STRONG_SHARED = 10, CUE_RELAXED_COEF = 0.25;
+const cueMatch = (a, b, bar) => {
+    if (a.size < 4 || b.size < 4) return 0;
+    let inter = 0; for (const w of a) if (b.has(w)) inter++;
+    const coef = inter / Math.min(a.size, b.size);
+    return (coef >= bar || (inter >= CUE_STRONG_SHARED && coef >= CUE_RELAXED_COEF)) ? coef : 0;
+};
 
 // Recall-side guard: given the cards recall is about to inject, return for each
 // one the card that CORRECTS it, found two ways:
@@ -1202,10 +1219,10 @@ export function correctionOverlaysFor(struct, cards, { at = CORRECTION_SUPERSEDE
         let best = null, bestS = 0;
         for (const cue of cues) {
             if (cue.id === card.id) continue;
-            const s = overlapScore(cTok, stripCueMeta(tokenSet(cue.text)));
+            const s = cueMatch(cTok, stripCueMeta(tokenSet(cue.text)), at);
             if (s > bestS) { bestS = s; best = cue; }
         }
-        if (best && bestS >= at) out.set(card.id, { kind: 'cue', by: best, overlap: Math.round(bestS * 100) / 100 });
+        if (best && bestS > 0) out.set(card.id, { kind: 'cue', by: best, overlap: Math.round(bestS * 100) / 100 });
     }
     return out;
 }
@@ -1406,16 +1423,17 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
             // same-area 0.6 path by construction, which is exactly how stale
             // cards outlived their corrections in the field.
             const isCorrection = CORRECTION_RE.test(card.text);
-            const bar = isCorrection ? CORRECTION_SUPERSEDE_AT : SUPERSEDE_AT;
             const nTokCmp = isCorrection ? stripCueMeta(nTok) : nTok;   // cue meta words dilute the denominator
             let best = null, bestScore = 0;
             for (const c of liveTextCards()) {
                 if (!isCorrection && area && (c.area || '').toLowerCase() !== area) continue;
                 if (/🛠/.test(c.text)) continue; // never auto-archive a 🛠️ skill via a decision's supersede — skills are standing reference (correct with ~)
-                const s = overlapScore(nTokCmp, tokenSet(c.text));
+                // cueMatch returns 0 unless it clears the widened bar (ratio OR
+                // absolute subject mass) — so for corrections, any non-zero fires.
+                const s = isCorrection ? cueMatch(nTokCmp, tokenSet(c.text), CORRECTION_SUPERSEDE_AT) : overlapScore(nTok, tokenSet(c.text));
                 if (s > bestScore) { bestScore = s; best = c; }
             }
-            if (best && bestScore >= bar) {
+            if (best && (isCorrection ? bestScore > 0 : bestScore >= SUPERSEDE_AT)) {
                 await rewriteCard(best.id, j => {
                     j.content = `↩︎ superseded ${today}\n${j.content}`;
                     j.borderColor = 'rgba(120,120,135,0.5)';

@@ -681,6 +681,66 @@ export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMile
     if (unshown > 0) hidden.push(`${unshown} older/over-budget decision${unshown === 1 ? '' : 's'}`);
     if (archivedCount > 0) hidden.push(`${archivedCount} archived/superseded`);
     if (hidden.length) push('', `*${hidden.join(' + ')} not shown — search the full brain via the klypix-canvas MCP (search/read tools) or \`node ~/.claude/project-brain/global-brain-hook.mjs --full\`.*`);
+    // Graph health, ambient: when a third of the live brain is unlinked, say so
+    // once (brain_insights has the detail; auto-linking at capture works the
+    // backlog down going forward).
+    const degIds = new Set();
+    for (const cn of struct.connections || []) { if (cn.fromId) degIds.add(cn.fromId); if (cn.toId) degIds.add(cn.toId); }
+    const orphanN = live.filter(c => !degIds.has(c.id)).length;
+    if (live.length >= 10 && orphanN / live.length > 0.3) push('', `*graph: ${orphanN}/${live.length} live cards have no connections — \`brain_connect\` (or capturing with [[wikilinks]]) densifies the graph.*`);
+    return out.join('\n') + '\n';
+}
+
+// ── Ultra brief (SessionStart stdout tier) ───────────────────────────────────
+// The harness persists hook stdout to a file and shows the agent only a ~2KB
+// PREVIEW — a 13.5KB brief was mostly invisible (everything after Focus/open
+// questions reached the agent only if it chose to open the file; it usually
+// didn't). This tier is sized to fit that preview WHOLE: Focus + conflicts +
+// open questions + a pointer to the FULL brief file the hook writes alongside.
+// The pointer + marker legend are reserved OUT of the budget so they always fit.
+export const ULTRA_BUDGET_CHARS = 1_800;   // sibling of BUDGET_CHARS above — sized for the harness preview, not token cost
+export function structToUltraBrief(struct, { freshness = null, briefPath = '.claude/brain-brief.md', budgetChars = ULTRA_BUDGET_CHARS } = {}) {
+    const texts = struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim());
+    const isArchived = (c) => /^archive$/i.test(c.area || '');
+    const isFocus = (c) => /(^|\s)focus\b/i.test(c.area || '');
+    const live = texts.filter(c => !isArchived(c));
+    const focus = live.filter(isFocus);
+    const open = live.filter(c => /❓|🎯/.test(c.text) && !/🛠/.test(c.text) && !isFocus(c));
+    const skills = live.filter(c => /🛠/.test(c.text) && !isFocus(c));
+    const conflicts = (struct.connections || []).filter(c => c.relationship === 'conflicts_with');
+    const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+    const fr = (c) => (freshness && freshness[c.id]) ? freshness[c.id] + ' ' : '';
+    const safeCut = (t, n) => { let s = t.slice(0, n); if (/[\uD800-\uDBFF]$/.test(s)) s = s.slice(0, -1); return s.trimEnd() + '…'; };
+    const head = (c, max = 150) => { const t = flat(c.text); return t.length > max ? safeCut(t, max - 1) : t; };
+    const out = [];
+    let used = 0;
+    const push = (...ls) => { for (const l of ls) { out.push(l); used += l.length + 1; } };
+    // Length-aware guard: a line only lands if it FITS — one long focus card
+    // must not blow the tier past the preview it exists to fit inside.
+    const pushIf = (l) => { if (used + l.length + 1 > budget) return false; out.push(l); used += l.length + 1; return true; };
+    const tail = [
+        '',
+        `📖 **Full brief: \`${briefPath}\`** — skills (${skills.length}), milestones, recent decisions, connections, self-heal detail. READ IT before planning non-trivial work.`,
+        '🧠 Capture: `🧠 BRAIN [Area]: <decision>` · `?` question · `!` milestone · `+` skill · `✓` resolve · `~` update · a "CORRECTION: …" decision supersedes its stale card across areas · suffixes `closes:` / `ev:` (full legend in the brief file).',
+    ];
+    const budget = Math.max(400, budgetChars - tail.reduce((s, l) => s + l.length + 1, 0));
+    push(`# ${struct.title} — brain (ultra brief)`);
+    push(`*${struct.counts.cards} cards · ${struct.counts.connections} connections — this is the preview tier; the full brief is one Read away (below)*`);
+    if (focus.length && pushIf('') && pushIf('## 📌 Human focus (act on these first)')) {
+        for (const c of focus) if (!pushIf(`- ${fr(c)}${head(c, 400)}`)) break;
+    }
+    if (conflicts.length && pushIf('') && pushIf('## ⚠️ Conflicts to reconcile')) {
+        for (const c of conflicts.slice(0, 4)) if (!pushIf(`- ${flat(c.from).slice(0, 70)} ⚔️ ${flat(c.to).slice(0, 70)}`)) break;
+    }
+    if (open.length && pushIf('') && pushIf(`## Open questions & goals (${open.length})`)) {
+        let shown = 0;
+        for (const c of open) { if (!pushIf(`- ${fr(c)}${head(c)}`)) break; shown++; }
+        if (shown < open.length) pushIf(`- …and ${open.length - shown} more — in the full brief.`);
+    }
+    const areas = struct.cards.filter(c => c.type === 'container' && !/^archive$/i.test(c.title || ''))
+        .map(c => `${flat(c.title)} (${texts.filter(t => t.parentId === c.id).length})`);
+    if (areas.length) { pushIf(''); pushIf(('Areas: ' + areas.join(' · ')).slice(0, 240)); }
+    push(...tail);
     return out.join('\n') + '\n';
 }
 
@@ -712,11 +772,18 @@ export function scoreCardsAgainstQuery(struct, query, { topK = 6, minScore = 2, 
         const titleW = wordsOf(c.title);
         const bodyW = wordsOf(c.text);
         const tagStems = new Set((c.tags || []).map(t => String(t).toLowerCase().replace(/^#/, '').replace(/^(file|dir)-/, '')).filter(Boolean));
+        // Log-length normalization: a flat 1pt/word-hit made LONG cards outrank
+        // short ones purely by having more vocabulary to hit (one ~600-word card
+        // was re-injected into 3 prompts on those cheap hits). Body hits are
+        // scaled by log2 of the body's distinct-word count — ≤64 words is
+        // unpenalized, a 600-word card scores ~0.7/hit. Title/tag hits (the
+        // precise signals) are untouched.
+        const lenNorm = Math.min(1, 6 / Math.max(1, Math.log2(bodyW.size + 1)));
         let score = 0;
         for (const tok of tokens) {
             if (titleW.has(tok)) score += 3;
             else if (tagStems.has(tok)) score += 3;
-            else if (bodyW.has(tok)) score += 1;
+            else if (bodyW.has(tok)) score += lenNorm;
         }
         if (score <= 0) continue;
         if ((c.createdAt || 0) >= cutoff) score += 0.5; // gentle recency tiebreak, never dominant
@@ -785,6 +852,23 @@ export function findUnrecordedMigrations(struct, files, { max = 6 } = {}) {
 // recall list still shows below). Returns each card's `kind` so the caller can
 // say "reuse it" (shipped/resolved) vs "see what replaced it" (superseded).
 // Pure + node-runnable; reuses the one shared tokenizer — no divergent scorer.
+// Generic work-verbs establish that a prompt is WORK, not WHICH work — two of
+// them shared with a 🏁 ship-card title used to clear the floor ("deploy it"
+// flagged two unrelated PR-merge cards; zero true positives all session).
+// Excluded from repeat scoring entirely; the loose recall list still sees them.
+const REPEAT_VERB_STOP = new Set([
+    'deploy', 'deployed', 'deploying', 'deploys', 'ship', 'shipped', 'shipping', 'ships',
+    'merge', 'merged', 'merges', 'merging', 'release', 'released', 'releases', 'releasing',
+    'publish', 'published', 'publishes', 'publishing', 'push', 'pushed', 'land', 'landed',
+    'build', 'builds', 'building', 'built', 'check', 'checked', 'checking', 'checks',
+    'plan', 'planned', 'planning', 'plans', 'best', 'class', 'cut', 'hand', 'handoff',
+    'report', 'reports', 'live', 'latest', 'done', 'complete', 'completed', 'finish', 'finished',
+    'work', 'task', 'feature',
+]);
+// Entity-shaped token — the kind that pins WHICH work: carries a digit (version,
+// PR#), or a kebab/snake identifier. A #file-/#dir- tag-stem match counts as an
+// entity at match time regardless of shape (tags are capture-stamped anchors).
+const isEntityToken = (t) => /\d/.test(t) || t.includes('-') || t.includes('_');
 export function detectRepeatWork(struct, query, { topK = 2, minScore = 5, minTokens = 2 } = {}) {
     const tokens = Array.isArray(query) ? query.filter(Boolean) : queryTokens(query);
     if (tokens.length < minTokens || !struct || !Array.isArray(struct.cards)) return [];
@@ -802,13 +886,19 @@ export function detectRepeatWork(struct, query, { topK = 2, minScore = 5, minTok
         const titleW = wordsOf(firstMeaningful || c.title);
         const bodyW = wordsOf(c.text);
         const tagStems = new Set((c.tags || []).map(t => String(t).toLowerCase().replace(/^#/, '').replace(/^(file|dir)-/, '')).filter(Boolean));
-        let score = 0, matched = 0;
+        // Auto-harvested ship cards (#auto, one-line merge/release events) are
+        // dense with exactly the verbs above — they additionally need ≥1 ENTITY
+        // token matched before a nudge is worth showing.
+        const isAuto = (c.tags || []).some(t => String(t).toLowerCase().replace(/^#/, '') === 'auto');
+        let score = 0, matched = 0, entities = 0;
         for (const tok of tokens) {
-            if (titleW.has(tok)) { score += 3; matched++; }
-            else if (tagStems.has(tok)) { score += 3; matched++; }
-            else if (bodyW.has(tok)) { score += 1; matched++; }
+            if (REPEAT_VERB_STOP.has(tok)) continue;  // "that it's work" ≠ "which work"
+            if (titleW.has(tok)) { score += 3; matched++; if (isEntityToken(tok)) entities++; }
+            else if (tagStems.has(tok)) { score += 3; matched++; entities++; }
+            else if (bodyW.has(tok)) { score += 1; matched++; if (isEntityToken(tok)) entities++; }
         }
         if (matched < minTokens || score < minScore) continue;   // precision-first floor
+        if (isAuto && entities < 1) continue;                    // auto cards: entity anchor required
         out.push({ card: c, score, kind });
     }
     out.sort((a, b) => b.score - a.score || (rank[b.kind] - rank[a.kind]) || (b.card.createdAt || 0) - (a.card.createdAt || 0));
@@ -852,6 +942,69 @@ export function detectConflicts(struct, { minOverlap = 0.45, topK = 12 } = {}) {
         }
     }
     out.sort((x, y) => y.overlap - x.overlap);
+    return out.slice(0, topK);
+}
+
+// ── Contradiction candidates (reconcile-proper) ──────────────────────────────
+// The retroactive cleaner for stale/correction pairs that slipped past capture
+// (cross-area + reworded → no supersede possible by construction). Unlike
+// detectConflicts (a pre-filter for an LLM verifier), this is precision-scoped
+// enough to surface DIRECTLY for human/agent confirmation: same-subject live
+// pairs where (a) exactly ONE side carries an explicit correction cue
+// (CORRECTION / OBSOLETE / was WRONG / stale note resolved) — that side is the
+// presumed truth — or (b) the two sides use OPPOSITE polarity words about the
+// same subject (deferred↔wired, broken↔fixed, dead↔live …). Pairs already
+// settled by a supersede/close/conflict arrow are excluded; a plain relates_to
+// arrow is NOT a settlement. Suggestion-only — never writes. Pure, node-runnable.
+const POLARITY_PAIRS = [
+    ['deferred', 'wired'], ['deferred', 'shipped'], ['deferred', 'live'], ['deferred', 'enabled'],
+    ['broken', 'fixed'], ['broken', 'working'], ['dead', 'live'], ['dead', 'alive'],
+    ['disabled', 'enabled'], ['blocked', 'unblocked'], ['wrong', 'correct'], ['removed', 'restored'],
+];
+export function detectContradictions(struct, { minOverlap = 0.45, topK = 12 } = {}) {
+    if (!struct || !Array.isArray(struct.cards)) return [];
+    const isArchived = (c) => /^archive$/i.test(c.area || '');
+    const live = struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim() && !isArchived(c));
+    // Cue meta words stripped up front — same-subject matching must compare the
+    // SUBJECT, not the vocabulary of the correction act (see stripCueMeta above).
+    const wset = new Map(live.map(c => [c.id, stripCueMeta(new Set(queryTokens(c.text)))]));
+    const lower = new Map(live.map(c => [c.id, String(c.text).toLowerCase()]));
+    const settled = new Set();
+    for (const e of struct.connections || []) {
+        if (e.label === 'superseded by' || e.label === 'closed by' || e.relationship === 'conflicts_with') {
+            settled.add(e.fromId + '|' + e.toId); settled.add(e.toId + '|' + e.fromId);
+        }
+    }
+    const out = [];
+    for (let i = 0; i < live.length; i++) {
+        for (let j = i + 1; j < live.length; j++) {
+            const a = live[i], b = live[j];
+            if (settled.has(a.id + '|' + b.id)) continue;
+            const A = wset.get(a.id), B = wset.get(b.id);
+            if (A.size < 4 || B.size < 4) continue;
+            let inter = 0; for (const t of A) if (B.has(t)) inter++;
+            const overlap = inter / Math.min(A.size, B.size);           // same subject?
+            if (overlap < minOverlap) continue;
+            const aCue = CORRECTION_RE.test(a.text), bCue = CORRECTION_RE.test(b.text);
+            let why = null, staleC = null, freshC = null;
+            if (aCue !== bCue) {
+                why = 'correction-cue';                                  // one side explicitly corrects — it is the presumed truth
+                freshC = aCue ? a : b; staleC = aCue ? b : a;
+            } else if (!aCue) {
+                const la = lower.get(a.id), lb = lower.get(b.id);
+                for (const [x, y] of POLARITY_PAIRS) {
+                    // each side must carry ONE pole only — a card narrating "from
+                    // deferred to wired" holds both and contradicts neither.
+                    if ((la.includes(x) && !la.includes(y) && lb.includes(y) && !lb.includes(x))
+                        || (la.includes(y) && !la.includes(x) && lb.includes(x) && !lb.includes(y))) { why = `polarity: ${x} ↔ ${y}`; break; }
+                }
+                if (why) [staleC, freshC] = (a.createdAt || 0) <= (b.createdAt || 0) ? [a, b] : [b, a];  // later card = presumed truth
+            }
+            if (!why) continue;
+            out.push({ stale: staleC, fresh: freshC, why, overlap: Math.round(overlap * 100) / 100, cue: aCue || bCue });
+        }
+    }
+    out.sort((x, y) => (Number(y.cue) - Number(x.cue)) || (y.overlap - x.overlap));
     return out.slice(0, topK);
 }
 
@@ -1005,6 +1158,58 @@ const overlapScore = (a, b) => {
 // failed to fire.)
 const coverageOf = (target, hay) => { if (!target.size) return 0; let h = 0; for (const w of target) if (hay.has(w)) h++; return h / target.size; };
 
+// ── Truth decay (P1) — corrections must never lose to the cards they correct ─
+// A correction-cue note explicitly declares an older fact stale ("CORRECTION:",
+// "was WRONG", "OBSOLETE", "stale note resolved"). The same-area ≥0.6 supersede
+// can miss it BY CONSTRUCTION (the correction often lands in a different area,
+// reworded) — the stale card then stays live and recall serves it alone. Shared
+// by: the capture-side widened supersede, the recall-side overlay below, and
+// detectContradictions.
+export const CORRECTION_RE = /\bCORRECTIONS?\b|\bOBSOLETE\b|\bstale note (?:is )?resolved\b|\bwas WRONG\b/i;
+export const CORRECTION_SUPERSEDE_AT = 0.4;   // widened cross-area bar (vs same-area SUPERSEDE_AT 0.6)
+// Cue META words describe the act of correcting, not the subject — left in, they
+// dilute the overlap denominator and push real correction pairs just under the
+// bar (the field fixture lands at 0.375 with them, 0.5 without). Stripped before
+// every correction-overlap comparison.
+const CORRECTION_META = new Set(['correction', 'corrections', 'obsolete', 'stale', 'note', 'notes', 'resolved', 'wrong']);
+const stripCueMeta = (set) => { const out = new Set(); for (const w of set) if (!CORRECTION_META.has(w)) out.add(w); return out; };
+
+// Recall-side guard: given the cards recall is about to inject, return for each
+// one the card that CORRECTS it, found two ways:
+//   • edge — an outgoing "superseded by"/"closed by" arrow (drawn by capture or
+//     a confirmed reconcile) whose successor still has text;
+//   • cue  — a LIVE correction-cue card that lexically overlaps it ≥ `at`, ANY
+//     area (the un-edged pair the capture-time supersede missed).
+// The caller injects the corrector FIRST (labeled) and reduces the stale hit to
+// a headline — the stale text never stands alone. Pure + cheap: correction-cue
+// cards are rare and the hit list is ≤topK.
+export function correctionOverlaysFor(struct, cards, { at = CORRECTION_SUPERSEDE_AT } = {}) {
+    const out = new Map();
+    if (!struct || !Array.isArray(struct.cards) || !Array.isArray(cards) || !cards.length) return out;
+    const byId = new Map(struct.cards.map(c => [c.id, c]));
+    const isArchived = (c) => /^archive$/i.test(c.area || '');
+    const successorOf = new Map();
+    for (const cn of struct.connections || []) {
+        if (cn.label === 'superseded by' || cn.label === 'closed by') successorOf.set(cn.fromId, cn.toId);
+    }
+    const cues = struct.cards.filter(c => c.type !== 'container' && !isArchived(c) && (c.text || '').trim() && CORRECTION_RE.test(c.text));
+    for (const card of cards) {
+        if (!card || !card.id) continue;
+        const succ = successorOf.has(card.id) ? byId.get(successorOf.get(card.id)) : null;
+        if (succ && (succ.text || '').trim()) { out.set(card.id, { kind: 'edge', by: succ }); continue; }
+        if (CORRECTION_RE.test(card.text || '')) continue;   // the hit IS a correction — nothing to overlay
+        const cTok = tokenSet(card.text);
+        let best = null, bestS = 0;
+        for (const cue of cues) {
+            if (cue.id === card.id) continue;
+            const s = overlapScore(cTok, stripCueMeta(tokenSet(cue.text)));
+            if (s > bestS) { bestS = s; best = cue; }
+        }
+        if (best && bestS >= at) out.set(card.id, { kind: 'cue', by: best, overlap: Math.round(bestS * 100) / 100 });
+    }
+    return out;
+}
+
 // ── Auto-skill classifier (skills emerge from the flow, not just the '+' marker) ─
 // A REUSABLE skill (how-to / gotcha / convention) reads as a GENERAL RULE that
 // applies next time — distinct from a one-time decision ("we shipped X"). This is
@@ -1024,9 +1229,12 @@ export function looksLikeSkill(text) {
 }
 
 export async function captureIntoBrain(buffer, { cards = [], resolutions = [], updates = [] } = {}) {
-    const SUPERSEDE_AT = 0.6, RESOLVE_AT = 0.3, UPDATE_AT = 0.45, CLOSE_COVER_AT = 0.6;
+    const SUPERSEDE_AT = 0.6, RESOLVE_AT = 0.3, UPDATE_AT = 0.45, CLOSE_COVER_AT = 0.6, QUESTION_MERGE_AT = 0.6;
     let work = buffer;
-    const stats = { added: 0, superseded: 0, resolved: 0, linked: 0, updated: 0, closed: 0 };
+    // corrections[] lists cross-area/low-bar supersedes driven by a correction
+    // cue, so the surface (brain_note result / capture stderr) can say WHAT was
+    // archived and how to undo — the confirmation channel for the widened match.
+    const stats = { added: 0, superseded: 0, resolved: 0, linked: 0, updated: 0, closed: 0, merged: 0, corrections: [] };
 
     // Pass 1 — resolutions + supersede marking operate on EXISTING cards.
     if (resolutions.length || cards.length || updates.length) {
@@ -1093,24 +1301,35 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
         };
         canvas.connections = Array.isArray(canvas.connections) ? canvas.connections : [];
 
-        // RESOLVE (✓ markers) — best live match in the area; ❓ cards preferred.
+        // RESOLVE (✓ markers) — best live match in the area, PLUS its near-tie
+        // twins: a rephrased duplicate ❓ scores within a hair of its sibling, and
+        // resolving only the first left the twin open forever (it kept surfacing
+        // in every brief as still-to-do). Precision-kept: the set is the best
+        // match ± 0.1, never everything above the loose 0.3 floor. ❓ preferred.
         const milestonesFallback = [];
         for (const r of resolutions) {
             const rTok = tokenSet(r.text);
-            let best = null, bestScore = 0;
+            const cands = [];
             for (const c of liveTextCards()) {
                 if (r.area && (c.area || '').toLowerCase() !== r.area.toLowerCase()) continue;
                 const s = overlapScore(rTok, tokenSet(c.text)) + (/❓|🎯/.test(c.text) ? 0.15 : 0);
-                if (s > bestScore) { bestScore = s; best = c; }
+                if (s > 0) cands.push({ c, s });
             }
-            if (best && bestScore >= RESOLVE_AT) {
-                await rewriteCard(best.id, j => {
-                    j.content = `${j.content}\n✅ ${today}: ${r.text}`;
-                    j.borderColor = 'rgba(16,185,129,0.35)';
-                });
-                await archiveCard(best.id);
-                best.text += ` ✅ ${r.text}`; // keep in-memory struct honest for later matching
-                stats.resolved++;
+            cands.sort((a, b) => b.s - a.s);
+            const bestScore = cands.length ? cands[0].s : 0;
+            const set = bestScore >= RESOLVE_AT
+                ? cands.filter(x => x.s >= Math.max(RESOLVE_AT, bestScore - 0.1)).slice(0, 3)
+                : [];
+            if (set.length) {
+                for (const { c: best } of set) {
+                    await rewriteCard(best.id, j => {
+                        j.content = `${j.content}\n✅ ${today}: ${r.text}`;
+                        j.borderColor = 'rgba(16,185,129,0.35)';
+                    });
+                    await archiveCard(best.id);
+                    best.text += ` ✅ ${r.text}`; // keep in-memory struct honest for later matching
+                    stats.resolved++;
+                }
             } else {
                 milestonesFallback.push({ text: (r.area ? `${r.area}: ` : '') + `🏁 ${r.text}`, area: r.area, borderColor: 'rgba(59,130,246,0.8)' });
             }
@@ -1146,6 +1365,34 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
             }
         }
 
+        // MERGE-ON-CAPTURE for duplicate open questions — a rephrased ❓ that
+        // heavily overlaps an EXISTING live ❓ updates that card in place (fresh
+        // wording + createdAt) instead of stacking a twin the close-pass would
+        // later miss. (Supersede deliberately skips ? cards, so without this
+        // twins could never merge at capture at all.)
+        for (let i = cards.length - 1; i >= 0; i--) {
+            const card = cards[i];
+            if (!/❓/.test(card.text) || /🏁|🛠/.test(card.text)) continue;
+            const nTok = tokenSet(card.text);
+            let best = null, bestScore = 0;
+            for (const c of liveTextCards()) {
+                if (!/❓/.test(c.text)) continue;
+                const s = overlapScore(nTok, tokenSet(c.text));
+                if (s > bestScore) { bestScore = s; best = c; }
+            }
+            if (best && bestScore >= QUESTION_MERGE_AT) {
+                await rewriteCard(best.id, j => {
+                    j.content = String(card.text);
+                    j.createdAt = now;
+                    if (card.createdVia) j.createdVia = String(card.createdVia);
+                    if (Array.isArray(card.evidence) && card.evidence.length) j.evidence = card.evidence;
+                });
+                best.text = String(card.text);
+                cards.splice(i, 1);
+                stats.merged++;
+            }
+        }
+
         // SUPERSEDE — pre-mark old cards that a NEW decision replaces. The arrow
         // to the new card is drawn in pass 2 (after the new ids exist), matched
         // back by remembering which old card each new card displaced.
@@ -1153,22 +1400,35 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
             if (/❓|🎯|🏁|🛠/.test(card.text)) continue; // only plain decisions supersede (not questions/goals/milestones/skills)
             const nTok = tokenSet(card.text);
             const area = (card.area || '').toLowerCase();
+            // A correction-cue note ("CORRECTION: … was WRONG") declares it
+            // replaces something — widen the search to ALL areas and lower the
+            // bar: a cross-area reworded correction could never fire the
+            // same-area 0.6 path by construction, which is exactly how stale
+            // cards outlived their corrections in the field.
+            const isCorrection = CORRECTION_RE.test(card.text);
+            const bar = isCorrection ? CORRECTION_SUPERSEDE_AT : SUPERSEDE_AT;
+            const nTokCmp = isCorrection ? stripCueMeta(nTok) : nTok;   // cue meta words dilute the denominator
             let best = null, bestScore = 0;
             for (const c of liveTextCards()) {
-                if (area && (c.area || '').toLowerCase() !== area) continue;
+                if (!isCorrection && area && (c.area || '').toLowerCase() !== area) continue;
                 if (/🛠/.test(c.text)) continue; // never auto-archive a 🛠️ skill via a decision's supersede — skills are standing reference (correct with ~)
-                const s = overlapScore(nTok, tokenSet(c.text));
+                const s = overlapScore(nTokCmp, tokenSet(c.text));
                 if (s > bestScore) { bestScore = s; best = c; }
             }
-            if (best && bestScore >= SUPERSEDE_AT) {
+            if (best && bestScore >= bar) {
                 await rewriteCard(best.id, j => {
                     j.content = `↩︎ superseded ${today}\n${j.content}`;
                     j.borderColor = 'rgba(120,120,135,0.5)';
                 });
                 await archiveCard(best.id);
+                const wasCross = isCorrection && (bestScore < SUPERSEDE_AT || (area && (best.area || '').toLowerCase() !== area));
                 best.text = `↩︎ ${best.text}`;
                 card.__supersedes = best.id;
                 stats.superseded++;
+                // Surface the widened match for confirmation: the caller tells the
+                // agent what was archived and how to undo (restore from Archive /
+                // re-run with ~) — the widened bar acts WITH a visible receipt.
+                if (wasCross) stats.corrections.push({ old: (best.title || String(best.text).replace(/^↩︎\s*/, '').slice(0, 80)), area: best.area || null, overlap: Math.round(bestScore * 100) / 100 });
             }
         }
 
@@ -1184,25 +1444,34 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
             if (!target) continue;
             const wantTitle = target.replace(/^\[\[/, '').replace(/\]\]$/, '').trim().toLowerCase();
             const tTok = tokenSet(target);
-            let best = null, bestScore = 0;
+            // Collect EVERY live card the close-target covers — near-duplicate ❓
+            // twins score together, and the old first-match-and-break resolved one
+            // while its twin stayed "open" in every brief forever. Capped for
+            // safety: a close-target is deliberate, so >4 matches means it was too
+            // generic to trust beyond the strongest few.
+            const matches = [];
             for (const c of liveTextCards()) {
                 const ct = (c.title || '').trim().toLowerCase();
                 // Title fast-path: exact / prefix / or the card title CONTAINS the
                 // target (handles the common "Area: <title> (extra…)" card title).
-                if (ct && wantTitle.length >= 6 && (ct === wantTitle || ct.startsWith(wantTitle) || wantTitle.startsWith(ct) || ct.includes(wantTitle))) { best = c; bestScore = 1; break; }
+                if (ct && wantTitle.length >= 6 && (ct === wantTitle || ct.startsWith(wantTitle) || wantTitle.startsWith(ct) || ct.includes(wantTitle))) { matches.push({ c, cov: 1 }); continue; }
                 // Else target-coverage (≥2 tokens, no floor): a short deliberate
                 // close-target whose tokens are present in a card is a precise hit.
-                if (tTok.size >= 2) { const cov = coverageOf(tTok, tokenSet(c.text)); if (cov > bestScore) { bestScore = cov; best = c; } }
+                if (tTok.size >= 2) { const cov = coverageOf(tTok, tokenSet(c.text)); if (cov >= CLOSE_COVER_AT) matches.push({ c, cov }); }
             }
-            if (best && bestScore >= CLOSE_COVER_AT) {
-                const ship = String(card.text).replace(/\s+/g, ' ').replace(/^[^:\n]{1,40}:\s*/, '').replace(/^🏁\s*/, '').trim().slice(0, 80);
+            matches.sort((a, b) => b.cov - a.cov);
+            const chosen = matches.slice(0, 4);
+            if (!chosen.length) continue;
+            const ship = String(card.text).replace(/\s+/g, ' ').replace(/^[^:\n]{1,40}:\s*/, '').replace(/^🏁\s*/, '').trim().slice(0, 80);
+            card.__closesIds = [];
+            for (const { c: best } of chosen) {
                 await rewriteCard(best.id, j => {
                     j.content = `${j.content}\n✅ ${today}: closed by → ${ship}`;
                     j.borderColor = 'rgba(16,185,129,0.35)';
                 });
                 await archiveCard(best.id);
                 best.text = `✅ ${best.text}`;
-                card.__closes = best.id;
+                card.__closesIds.push(best.id);
                 stats.closed++;
             }
         }
@@ -1238,17 +1507,34 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
         const titleIndex = struct.cards
             .filter(c => (c.title || '').trim())
             .map(c => ({ id: c.id, t: c.title.trim().toLowerCase() }));
+        const newIds = new Set();
         for (const card of cards) {
             const created = findNew(card.text);
             if (!created) continue;
+            newIds.add(created.id);
             if (card.__supersedes) addConn(card.__supersedes, created.id, 'superseded by', undefined);
-            if (card.__closes) addConn(card.__closes, created.id, 'closed by', undefined);
+            for (const cid of (card.__closesIds || [])) addConn(cid, created.id, 'closed by', undefined);
             for (const link of (created.links || [])) {
                 const want = String(link).trim().toLowerCase();
                 if (!want) continue;
                 const target = titleIndex.find(e => e.id !== created.id && (e.t === want || e.t.startsWith(want)));
                 if (target) addConn(created.id, target.id, undefined, 'relates_to');
             }
+        }
+        // Structural auto-link for the NEW cards — the graph used to form only
+        // when someone explicitly ran brain_connect (never, in practice: 66%
+        // orphans in the field). Run the cheap tag/[[title]] proposer over the
+        // post-append struct and keep only edges touching a just-added card
+        // (≤2 per card via the proposer's own cap), labeled 'auto' so they're
+        // distinguishable from deliberate arrows. Best-effort: an auto-link
+        // failure must never fail a capture.
+        if (newIds.size) {
+            try {
+                for (const e of proposeStructuralConnections(struct, { maxPerCard: 2 })) {
+                    if (!newIds.has(e.fromId) && !newIds.has(e.toId)) continue;
+                    addConn(e.fromId, e.toId, 'auto', 'relates_to');
+                }
+            } catch { /* auto-linking is opportunistic */ }
         }
         work = await finalizeBrainZip(zip, canvas, manifest, now);
     }
@@ -1265,6 +1551,7 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
 // to Archive, and arrowed → the synthesis. Nothing is deleted (archived verbatim).
 const GARDEN_KEEP_NEWEST = 8;       // per area, never consolidate the newest N
 const GARDEN_MIN_AGE_DAYS = 14;     // only cards older than this are candidates
+const GARDEN_AUTO_MIN_AGE_DAYS = 7; // #auto ship-event cards age out sooner — the durable fact usually also exists as a hand-written milestone
 const GARDEN_MIN_CANDIDATES = 3;    // don't bother merging fewer than this
 const GARDEN_MAX_DEGREE = 1;        // SMART guard: protect load-bearing cards —
 //   only consolidate cards with ≤ this many connections (orphans + leaves). A
@@ -1311,9 +1598,11 @@ export function selectGardenCandidates(struct, { keepNewest = GARDEN_KEEP_NEWEST
         const children = struct.cards
             .filter(c => c.type === 'text' && c.parentId === ctn.id && (c.text || '').trim() && !/⤵|↩|✅|🛠/.test(c.text))  // 🛠️ skills are standing reference — never consolidate them away
             .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+        const autoCutoff = now - GARDEN_AUTO_MIN_AGE_DAYS * 86_400_000;
+        const isAuto = (c) => (c.tags || []).some(t => String(t).toLowerCase().replace(/^#/, '') === 'auto');
         const old = children
             .slice(0, Math.max(0, children.length - keepNewest))
-            .filter(c => (c.createdAt || 0) < cutoff && (degree.get(c.id) || 0) <= maxDegree);  // dormant: old AND peripheral
+            .filter(c => (c.createdAt || 0) < (isAuto(c) ? autoCutoff : cutoff) && (degree.get(c.id) || 0) <= maxDegree);  // dormant: old AND peripheral (#auto ages faster)
         if (old.length >= minCandidates) out.push({ containerId: ctn.id, title, candidates: old.map(c => ({ id: c.id, text: c.text, createdAt: c.createdAt || 0, degree: degree.get(c.id) || 0 })) });
     }
     return out;

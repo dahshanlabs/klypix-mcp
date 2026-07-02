@@ -303,6 +303,10 @@ function touchSession(sid, patch = {}) {
                 // ships ACCUMULATE across turns (deduped, last 5) so a peer sees the
                 // session's recent ship-events, not just the latest turn's.
                 ships: patch.ships !== undefined ? [...new Set([...(prev.ships || []), ...patch.ships])].slice(-5) : (prev.ships ?? []),
+                // Card ids already injected full-text into THIS session's prompts —
+                // the per-prompt recall renders a re-hit as one headline instead of
+                // re-paying the full card (a ~600-word card was injected 3× before).
+                injected: patch.injected !== undefined ? patch.injected : (prev.injected ?? []),
                 startedAt: prev.startedAt || now, lastSeen: now,
             });
             fs.mkdirSync(SESSIONS_DIR, { recursive: true });
@@ -348,7 +352,7 @@ function peerFooter(sid) {
         else if (p.branch && myBranch && p.branch === myBranch) warn = '  · ⚠️ same branch — pull/rebase before you commit';
         lines.push(`- session ${String(p.id).slice(0, 8)} · ${bits.join(' · ')}${warn}`);
     }
-    lines.push('Ping the other session before touching shared files; check the brain for what they decided/shipped.');
+    lines.push('Coordinate BEFORE touching shared files: reply with `🧠 MSG [<their id-prefix or branch>]: <text>` (or call the `brain_message` MCP tool) — delivered once at their next prompt. Check the brain for what they decided/shipped.');
     return lines.join('\n');
 }
 
@@ -972,7 +976,10 @@ async function capture(lib) {
             const key = sha(('ship|' + p.area + '|' + summary).toLowerCase());
             if (seen.has(key)) break;                         // already captured this ship
             seen.add(key);
-            cards.push({ text: `${p.area}: 🏁 ${summary}\n#${slugify(p.area)}`, area: p.area, borderColor: 'rgba(59,130,246,0.8)', createdVia: 'ship-event' });
+            // #auto marks machine-harvested provenance: the repeat-detector demands an
+            // entity-token match on these (they're dense with generic ship verbs) and
+            // the gardener consolidates them at a shorter age.
+            cards.push({ text: `${p.area}: 🏁 ${summary}\n#${slugify(p.area)} #auto`, area: p.area, borderColor: 'rgba(59,130,246,0.8)', createdVia: 'ship-event' });
             shipSummaries.push(summary);
             ledger.push({ action: 'ship-event', area: p.area, preview: summary });
             break;                                            // one pattern per command
@@ -1047,10 +1054,17 @@ async function capture(lib) {
     const bits = [`${stats.added} added`];
     if (stats.resolved) bits.push(`${stats.resolved} resolved`);
     if (stats.updated) bits.push(`${stats.updated} updated`);
+    if (stats.merged) bits.push(`${stats.merged} merged`);
     if (stats.closed) bits.push(`${stats.closed} closed`);
     if (stats.superseded) bits.push(`${stats.superseded} superseded`);
     if (stats.linked) bits.push(`${stats.linked} linked`);
     process.stderr.write(`[brain] capture: ${bits.join(' · ')} → brain.klypix\n`);
+    // Receipt for correction-driven (cross-area / low-bar) supersedes — the
+    // confirmation channel: say WHAT was archived and how to undo a wrong grab.
+    if (Array.isArray(stats.corrections) && stats.corrections.length) {
+        process.stderr.write(`[brain] correction supersede: ${stats.corrections.map(c => `"${c.old}" (${c.overlap})`).join('; ')} — archived + arrowed; restore from Archive or ~ update if wrong\n`);
+    }
+    if (stats.added > 0 && !stats.linked) process.stderr.write(`[brain] note: ${stats.added} card(s) landed unlinked — \`brain_connect\` (or [[wikilinks]] next time) wires them into the graph\n`);
     appendJsonl(LEDGER, { ts: nowIso(), mode: 'capture', stats, decisions: ledger }, 1000);
     appendJsonl(HEALTH, { ts: nowIso(), project: path.basename(CWD), mode: 'capture', ok: true, brainBytes: brainBytes(), added: stats.added, skipped: ledger.filter(d => d.action.startsWith('skipped')).length }, 500);
 }
@@ -1206,10 +1220,43 @@ async function promptRetrieve(lib) {
         lines.push('Read the matching card (klypix-canvas MCP / brain) BEFORE redoing. Other project? use search_all_brains.');
     }
     if (freshHits.length) {
+        // Truth-decay guard: for each hit with a supersede/close edge or an
+        // overlapping live correction-cue card, inject the CORRECTOR full-text
+        // FIRST and reduce the stale hit to a labeled headline — a stale card
+        // must never stand alone (the worst failure mode a memory can have).
+        let overlays = new Map();
+        if (struct && typeof lib.correctionOverlaysFor === 'function') {
+            try { overlays = lib.correctionOverlaysFor(struct, freshHits.map(h => h.card)); } catch { /* best-effort */ }
+        }
+        // Per-session injection dedup: a card already shown full-text this
+        // session renders as one headline, not another ~600 words of context.
+        let me = null; try { me = readSessions().find(s => s.id === sid) || null; } catch { /* */ }
+        const injected = new Set((me && Array.isArray(me.injected)) ? me.injected : []);
+        const shownNow = new Set();
         lines.push(semMode === 'sem-hit'
             ? "# Related prior decisions (semantic match — no exact keyword overlap; full brain via the klypix-canvas MCP)"
             : "# Relevant prior decisions from this project's brain (task-matched; full brain via the klypix-canvas MCP)");
-        for (const h of freshHits) lines.push(`- ${flat(h.card.text)}`);
+        const newlyInjected = [];
+        for (const h of freshHits) {
+            if (shownNow.has(h.card.id)) continue;                      // already rendered this turn (e.g. as a corrector)
+            const ov = overlays.get(h.card.id);
+            if (ov && !shownNow.has(ov.by.id)) {
+                lines.push(`- ⚠️ CORRECTED — current: ${flat(ov.by.text)}`);
+                lines.push(`  ↳ recall matched a STALE card${ov.kind === 'edge' ? ' (superseded)' : ''}: “${head(h.card, 110)}” — do not act on it. Reconcile: \`brain_reconcile\` (contradictions) or a ✓/~ marker.`);
+                shownNow.add(h.card.id); shownNow.add(ov.by.id);
+                newlyInjected.push(h.card.id, ov.by.id);
+                continue;
+            }
+            if (injected.has(h.card.id)) {
+                lines.push(`- (already shown this session) ${head(h.card, 110)}`);
+                shownNow.add(h.card.id);
+                continue;
+            }
+            lines.push(`- ${flat(h.card.text)}`);
+            shownNow.add(h.card.id);
+            newlyInjected.push(h.card.id);
+        }
+        if (newlyInjected.length) touchSession(sid, { injected: [...new Set([...injected, ...newlyInjected])].slice(-100) });
     }
     const parts = [];
     if (lines.length) parts.push(lines.join('\n'));
@@ -1437,6 +1484,8 @@ function legendFooter() {
         + '🧠 **Capture markers** — write these in your reply; the Stop hook harvests them into the brain (no separate log step). Use sparingly, for real decisions / milestones / discoveries:\n'
         + '`🧠 BRAIN [Area]: decision` · `[Area] ?: open question` · `[Area] !: milestone` · `[Area] +: 🛠️ skill (reusable how-to / gotcha — resurfaces every session, never ages out)` · `[Area] ✓: resolves+archives the matching card` · `[Area] ~: updates it in place` · 🎯 in text = a goal (reads as open).\n'
         + 'Optional suffixes: `closes: <card title / [[wikilink]]>` (resolve the strategy/question this fulfils) · `ev: <file[:line]>, PR#<n>` (anchor to code → auto drift-badge).\n'
+        + '**Correcting a stale card:** include the word `CORRECTION` (or "was WRONG" / "OBSOLETE") in the decision — the capture then hunts the stale card across ALL areas at a lower match bar and supersedes it (archived + arrowed, with a receipt; restore from Archive if it grabbed the wrong one). A rephrased duplicate `?` merges into the existing open question instead of stacking a twin.\n'
+        + '**Session brief:** the SessionStart hook prints a ≤2KB ultra brief and writes the FULL brief to `.claude/brain-brief.md` — read that file when planning non-trivial work.\n'
         + '**Routing:** capture project decisions / milestones / open questions / gotchas HERE, *at the moment you decide* — this brain is the shared, portable memory that survives context resets and the next agent reads. A host memory store (if any) is for *user* preferences; never leave project state only in a private scratchpad.\n'
         + 'Coordinate with a concurrent session: `🧠 MSG [<their-id or all>]: <text>` — a one-time note (NOT a brain card) delivered to that session on its next prompt.\n';
 }
@@ -1447,18 +1496,52 @@ async function read(lib) {
     // immediately. Files/ships come from Stop (what this session actually edits).
     touchSession(input.session_id, { branch: gitBranch() });
     const { struct } = await lib.parseKlypix(fs.readFileSync(BRAIN));
-    // Default = TIERED brief (open questions + recent + area map) so the
-    // session-start cost stays flat as the brain grows. --full = everything.
     const { freshness, drifted } = computeFreshness(struct);
-    const outStr = (!process.argv.includes('--full') && typeof lib.structToBrief === 'function')
-        ? lib.structToBrief(struct, { freshness })
-        : lib.structToMarkdown(struct);
-    // ⚡ In-flight footer goes RIGHT AFTER the brief (highest signal: what a peer
-    // shipped seconds ago, before it's in the brain) — closes the 1.3.17-blindness gap.
-    process.stdout.write(outStr + inflightFooter(input.session_id, struct) + selfHealFooter(drifted) + reconcileFooter(lib, struct) + staleOpenFooter(lib, struct) + selfCheckFooter() + doctorFooter() + versionCurrencyFooter() + messageFooter(input.session_id || '', input.transcript_path) + legendFooter() + memoryFooter());
+    // The FULL brief: tiered brief + every self-heal/health footer. Messages are
+    // deliberately NOT part of it (messageFooter ACKS on read — it must only ever
+    // go to stdout, where the agent actually sees it, exactly once).
+    const full = ((typeof lib.structToBrief === 'function') ? lib.structToBrief(struct, { freshness }) : lib.structToMarkdown(struct))
+        + inflightFooter(input.session_id, struct) + selfHealFooter(drifted) + reconcileFooter(lib, struct) + staleOpenFooter(lib, struct)
+        + selfCheckFooter() + doctorFooter() + versionCurrencyFooter() + legendFooter() + memoryFooter();
+    const emitFull = () => {
+        process.stdout.write(full + messageFooter(input.session_id || '', input.transcript_path));
+        appendJsonl(HEALTH, { ts: nowIso(), project: path.basename(CWD), mode: 'read', ok: true, briefBytes: Buffer.byteLength(full), cards: struct?.counts?.cards ?? null }, 500);
+    };
+    // --full = everything to stdout (manual runs); also the fallback when the
+    // live klypix-format predates the ultra tier (version skew) or the brief
+    // file can't be written (stdout is then the only channel).
+    if (process.argv.includes('--full') || typeof lib.structToUltraBrief !== 'function') return emitFull();
+    // Default = ULTRA tier. The harness persists hook stdout and shows only a
+    // ~2KB preview, so a 13KB brief was mostly invisible — write the FULL brief
+    // to a stable project-local file and print a tier that fits the preview
+    // whole: Focus + conflicts + open questions + alerts + the file's path.
+    const briefRel = '.claude/brain-brief.md';
+    try {
+        fs.mkdirSync(path.resolve(CWD, '.claude'), { recursive: true });
+        fs.writeFileSync(path.resolve(CWD, briefRel),
+            '<!-- auto-generated by the brain hook at session start — read it, don\'t edit it; regenerated next session -->\n' + full, 'utf8');
+    } catch { return emitFull(); }
+    const ultra = lib.structToUltraBrief(struct, { freshness, briefPath: briefRel });
+    // Self-heal tiers compress to ONE line up here; the actionable detail (which
+    // cards, which markers to emit) lives in the brief file.
+    const heals = [];
+    if (drifted && drifted.length) heals.push(`${drifted.length} code-anchored fact(s) DRIFTED`);
+    try {
+        if (typeof lib.findUnrecordedMigrations === 'function') {
+            const files = collectMigrationFiles(CWD);
+            if (files.length) { const { total } = lib.findUnrecordedMigrations(struct, files, { max: 6 }); if (total) heals.push(`${total} unrecorded migration(s)`); }
+        }
+    } catch { /* */ }
+    try { if (typeof lib.findStaleOpenCards === 'function') { const { total } = lib.findStaleOpenCards(struct, { max: 5 }); if (total) heals.push(`${total} open card(s) look already done`); } } catch { /* */ }
+    const healLine = heals.length ? `\n🔧 Self-heal: ${heals.join(' · ')} — detail + fix markers in ${briefRel}.` : '';
+    const out = ultra + healLine
+        + inflightFooter(input.session_id, struct)
+        + selfCheckFooter() + doctorFooter() + versionCurrencyFooter()
+        + messageFooter(input.session_id || '', input.transcript_path);
+    process.stdout.write(out);
     // Heartbeat: prove the brief actually injected (and how big) so a dead or
     // stale live-copy of the hook stops being a silent no-op.
-    appendJsonl(HEALTH, { ts: nowIso(), project: path.basename(CWD), mode: 'read', ok: true, briefBytes: Buffer.byteLength(outStr), cards: struct?.counts?.cards ?? null }, 500);
+    appendJsonl(HEALTH, { ts: nowIso(), project: path.basename(CWD), mode: 'read', ok: true, briefBytes: Buffer.byteLength(out), fullBriefBytes: Buffer.byteLength(full), cards: struct?.counts?.cards ?? null }, 500);
 }
 
 // Registry of every brain this machine has touched — written on each hook run,

@@ -137,13 +137,14 @@ server.registerTool('brain_connect', {
 }, async ({ canvas, apply, max, threshold }) => toContent(await opBrainConnect({ vault: VAULT, canvas, apply, max, threshold, log })));
 
 server.registerTool('brain_reconcile', {
-  title: 'Reconcile the brain against committed migrations (find unrecorded rollouts)',
-  description: 'External-state check the brain otherwise CANNOT do: a brain only knows facts someone narrated (a marker, a commit body), so a DB migration APPLIED to prod — which narrates nothing — silently never lands. This lists committed migration files (Supabase / Rails / Prisma / Knex / generic) under the project and flags any that NO brain card references, so you can confirm the rollout with one marker. It reads ONLY the filesystem — never the database, never the network — and never claims a migration was applied, only that it is unrecorded. Defaults to the migrations dir beside the project brain; pass root to point elsewhere. Run it when you want to be sure the brain reflects what actually shipped.',
+  title: 'Reconcile the brain — contradictions between cards + unrecorded migrations',
+  description: 'Truth maintenance in two passes. (1) CONTRADICTIONS: finds same-subject live card pairs where one carries an explicit correction cue ("CORRECTION", "was WRONG", "OBSOLETE" — that side is the presumed truth) or the two use opposite polarity words (deferred↔wired, broken↔fixed, dead↔live), i.e. stale facts whose correction never got linked — candidates only, YOU confirm each (retire the stale card via brain_note ✓, or dismiss by connecting the pair). (2) MIGRATIONS: lists committed migration files (Supabase / Rails / Prisma / Knex / generic) that NO brain card references, so an applied-but-unnarrated rollout can be recorded. Reads ONLY the filesystem — never the database, never the network — and changes nothing. Run it periodically, or when recall surfaces something you believe is stale.',
   inputSchema: {
     canvas: z.string().optional().describe('Brain canvas filename/path. Defaults to the project brain ("brain").'),
     root: z.string().optional().describe("Project root holding the migrations dir (default: the brain file's folder)."),
+    mode: z.enum(['all', 'contradictions', 'migrations']).optional().describe('Which pass to run (default "all").'),
   },
-}, async ({ canvas, root }) => toContent(await opBrainReconcile({ vault: VAULT, canvas, root })));
+}, async ({ canvas, root, mode }) => toContent(await opBrainReconcile({ vault: VAULT, canvas, root, mode })));
 
 server.registerTool('brain_garden', {
   title: 'Garden the brain — consolidate over-grown areas (sleep-time compute)',

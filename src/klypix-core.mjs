@@ -25,7 +25,7 @@ import {
   parseKlypix, buildKlypix, buildKlypixMap, appendToKlypix, structToMarkdown,
   brainInsights, insightsToMarkdown, addBrainConnections, proposeStructuralConnections, atomicWrite,
   findUnrecordedMigrations, captureIntoBrain, tidyBrain, noteToCaptureInput,
-  selectGardenCandidates, applyGarden,
+  selectGardenCandidates, applyGarden, detectContradictions,
 } from './klypix-format.mjs';
 
 // ── Card / connection input shape (single source for every face) ─────────────
@@ -405,7 +405,7 @@ export function collectMigrationFiles(root) {
   }
   return out;
 }
-export async function opBrainReconcile({ vault, canvas, root }) {
+export async function opBrainReconcile({ vault, canvas, root, mode = 'all' }) {
   const t = brainTarget(vault, canvas);
   if (t.ambiguous) return ambiguousBrainErr(t.ambiguous);
   if (!t.file) return err(`No brain found — looked for ./brain.klypix in the project, then ${vault}. Pass canvas: "<name>".`);
@@ -413,16 +413,49 @@ export async function opBrainReconcile({ vault, canvas, root }) {
   let struct;
   try { ({ struct } = await parseKlypix(fs.readFileSync(file))); } catch (e) { return err(`Read failed: ${e.message}`); }
   const stamp = brainStamp(file, struct, t.how);
+  const sections = [];
+
+  // (1) CONTRADICTIONS — the brain reconciled against ITSELF. Same-subject live
+  // pairs where one side carries an explicit correction cue (that side is the
+  // presumed truth) or the two use opposite polarity words (deferred↔wired,
+  // broken↔fixed …). Candidates only — nothing is changed here; the agent/human
+  // confirms each. This is the retroactive cleaner for stale/correction pairs
+  // that slipped past capture (cross-area + reworded → no supersede possible).
+  if (mode === 'all' || mode === 'contradictions') {
+    const pairs = detectContradictions(struct);
+    if (pairs.length) {
+      const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+      const lines = pairs.map((p, i) =>
+        `${i + 1}. ${p.why} · overlap ${p.overlap}\n`
+        + `   · likely STALE   [${p.stale.area || '?'}] ${flat(p.stale.text).slice(0, 180)}\n`
+        + `   · likely CURRENT [${p.fresh.area || '?'}] ${flat(p.fresh.text).slice(0, 180)}`);
+      sections.push(`# ⚔️ ${pairs.length} contradiction candidate(s) — confirm, then reconcile\n_Candidates only — nothing was changed. For each REAL contradiction: retire the stale card with \`brain_note\` marker \`✓\` (text = what it resolved to), or record a correction-cue decision ("CORRECTION: …") — capture auto-supersedes it across areas. If a pair is NOT a contradiction, connect the two cards (\`brain_connect\` / relates_to) to dismiss it from future runs._\n\n${lines.join('\n')}`);
+    } else if (mode === 'contradictions') {
+      sections.push('✓ No contradiction candidates — no live card pair shows a correction cue or a polarity flip over the same subject.');
+    }
+  }
+
+  // (2) MIGRATIONS — the brain reconciled against committed external state.
   // Migrations live in the CODE repo (usually beside brain.klypix), not in a
   // separate canvas vault — so default the root to the brain file's folder.
-  const repoRoot = root ? path.resolve(root) : path.dirname(file);
-  const files = collectMigrationFiles(repoRoot);
-  if (!files.length) return { blocks: [text(stamp + `No migration files under ${repoRoot} (looked in: ${MIGRATION_DIRS.join(', ')}). Nothing to reconcile.`)] };
-  const { gaps, total } = findUnrecordedMigrations(struct, files, { max: 20 });
-  if (!gaps.length) return { blocks: [text(stamp + `✓ All ${files.length} migration(s) under ${path.basename(repoRoot)} are referenced by a brain card — no unrecorded rollouts.`)] };
-  const lines = gaps.map(g => `- \`${g.path}\` — committed, but no brain card mentions it. If applied to prod, record it:\n    \`🧠 BRAIN [DB] !: migration ${g.file.replace(/\.sql$/i, '')} applied to prod ev: ${g.path}\``);
-  const more = total > gaps.length ? `\n\n…and ${total - gaps.length} more.` : '';
-  return { blocks: [text(stamp + `# ⚠️ ${total} migration(s) committed but unrecorded in the brain\n_The brain can't see prod — it flags migrations that are in git but unmentioned, so you can confirm the rollout. It never asserts a migration was applied. To dismiss one without applying, record any card that names it (e.g. "committed, not applied")._\n\n${lines.join('\n')}${more}`)] };
+  if (mode === 'all' || mode === 'migrations') {
+    const repoRoot = root ? path.resolve(root) : path.dirname(file);
+    const files = collectMigrationFiles(repoRoot);
+    if (!files.length) {
+      if (mode === 'migrations') sections.push(`No migration files under ${repoRoot} (looked in: ${MIGRATION_DIRS.join(', ')}). Nothing to reconcile.`);
+    } else {
+      const { gaps, total } = findUnrecordedMigrations(struct, files, { max: 20 });
+      if (!gaps.length) sections.push(`✓ All ${files.length} migration(s) under ${path.basename(repoRoot)} are referenced by a brain card — no unrecorded rollouts.`);
+      else {
+        const lines = gaps.map(g => `- \`${g.path}\` — committed, but no brain card mentions it. If applied to prod, record it:\n    \`🧠 BRAIN [DB] !: migration ${g.file.replace(/\.sql$/i, '')} applied to prod ev: ${g.path}\``);
+        const more = total > gaps.length ? `\n\n…and ${total - gaps.length} more.` : '';
+        sections.push(`# ⚠️ ${total} migration(s) committed but unrecorded in the brain\n_The brain can't see prod — it flags migrations that are in git but unmentioned, so you can confirm the rollout. It never asserts a migration was applied. To dismiss one without applying, record any card that names it (e.g. "committed, not applied")._\n\n${lines.join('\n')}${more}`);
+      }
+    }
+  }
+
+  if (!sections.length) sections.push('✓ Nothing to reconcile — no contradiction candidates, and no unrecorded migrations.');
+  return { blocks: [text(stamp + sections.join('\n\n---\n\n'))] };
 }
 
 // ── Brain gardener (two-phase: select → agent synthesizes → apply) ───────────
@@ -584,10 +617,16 @@ export async function opBrainNote({ vault, canvas, text: noteText, area, marker 
     await atomicWrite(file, out);
     const s = res.stats || {};
     const bits = [`${s.added || 0} added`];
-    for (const k of ['resolved', 'updated', 'closed', 'superseded', 'linked']) if (s[k]) bits.push(`${s[k]} ${k}`);
+    for (const k of ['resolved', 'updated', 'merged', 'closed', 'superseded', 'linked']) if (s[k]) bits.push(`${s[k]} ${k}`);
+    // Correction receipt — a correction-cue note superseded a card cross-area /
+    // below the plain 0.6 bar; say WHAT was archived and how to undo, so the
+    // widened match is always confirmable rather than silent.
+    const corr = (Array.isArray(s.corrections) && s.corrections.length)
+      ? `\n↩︎ correction supersede: ${s.corrections.map(c => `"${c.old}"${c.area ? ` [${c.area}]` : ''} (overlap ${c.overlap})`).join('; ')} — archived + arrowed to your note. If it grabbed the wrong card, restore it from Archive or re-run with marker "~".`
+      : '';
     // Name the resolved brain explicitly (basename + how) so a write never lands
     // in a surprise file silently — the write-side twin of the read-op stamp.
-    return { blocks: [text(`✓ brain_note → ${path.basename(file)} (via ${t.how}) · ${bits.join(' · ')}. Reopen the brain in the KLYPIX app to see it.`)] };
+    return { blocks: [text(`✓ brain_note → ${path.basename(file)} (via ${t.how}) · ${bits.join(' · ')}. Reopen the brain in the KLYPIX app to see it.${corr}`)] };
   } catch (e) {
     return err(`brain_note failed (brain unchanged): ${e.message}`);
   }

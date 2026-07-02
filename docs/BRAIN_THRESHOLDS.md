@@ -1,4 +1,15 @@
-# Brain thresholds & constants — single reference (v1.17.0)
+# Brain thresholds & constants — single reference (v1.18.0)
+
+## Cluster layout (v1.18, `tidyBrain`)
+
+| Constant | Value | What it does |
+|---|---|---|
+| masonry columns | 1–5, target aspect ~1.15 | cards flow chronologically into the shortest column; areas become squarish tiles |
+| placement | incremental, anchored | containers reclaim their previous spot verbatim when nothing grew into it — a capture moves only areas whose size changed (field: a wikilink capture moves ZERO containers) |
+| full cluster pass | migration only | triggers: no `settings.brainLayout === 'cluster-v1'` stamp AND no >400px-wide container, or a degenerate >4:1 map; orders hubs first by connectivity, Focus at the anchor, Archive on the rim |
+| nested containers | flattened to root | a hand-nested area is promoted (keeps its absolute spot); containers are never masonry kids |
+| tiebreaks | code-unit compare | bare `localeCompare` collated per machine locale → cross-machine layout divergence |
+
 
 The scoring/matching constants live across two files; this table is the coherence
 contract (from the 2026-07-02 field report, updated for the v1.17.0 knowledge-quality

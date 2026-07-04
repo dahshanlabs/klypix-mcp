@@ -26,6 +26,7 @@ import {
     detectContradictions, addBrainConnections,
     isLegacyRawShipCard, findLegacyShipCards, detectRepeatWork,
 } from '../src/klypix-format.mjs';
+// (detectContradictions + mergeOverlaysFor reused across the F2/F4 precision cases below)
 
 const HOOK = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src', 'global-brain-hook.mjs');
 let failures = 0;
@@ -88,6 +89,28 @@ const DAY = 86_400_000;
     ok(!ov.has(awaiting9.id), 'F2: "PR #9 awaits merge" (no ship event) gets NO overlay');
     ok(!ov.has(mergeCard.id), 'F2: the merge ship card itself is not overlaid');
 }
+// F2 precision (2026-07-04 field): the cue must be ADJACENT to the PR ref, so a card
+// that only cites #N as an example (with an unrelated "awaits merge" elsewhere) does
+// NOT over-trigger.
+{
+    const buf = await buildKlypixMap({ title: 'brain', areas: [
+        { title: 'Notes', cards: [{ text: 'Notes: we copied the retry pattern from PR #7 (a good example). Unrelatedly, the whole epic still awaits a merge window next sprint.' }] },
+        { title: 'Ship', cards: [{ text: 'Ship: 🏁 merged PR #7\n#ship #auto' }] },
+    ] });
+    const { struct } = await parseKlypix(buf);
+    const cards = liveCards(struct);
+    const exampleCard = cards.find(c => /example/.test(c.text));
+    ok(!mergeOverlaysFor(struct, cards).has(exampleCard.id), 'F2 precision: a card citing #7 only as an EXAMPLE (awaits-cue far from the ref) is NOT overlaid');
+
+    const buf2 = await buildKlypixMap({ title: 'brain', areas: [
+        { title: 'Roadmap', cards: [{ text: 'Roadmap: the folder-lens work is code-complete; PR #7 awaits founder merge.' }] },
+        { title: 'Ship', cards: [{ text: 'Ship: 🏁 merged PR #7\n#ship #auto' }] },
+    ] });
+    const { struct: s2 } = await parseKlypix(buf2);
+    const c2 = liveCards(s2);
+    const adj = c2.find(c => /folder-lens/.test(c.text));
+    ok(mergeOverlaysFor(s2, c2).has(adj.id), 'F2 precision: "PR #7 awaits founder merge" (cue adjacent to the ref) STILL fires');
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // F3 — correction-cue false positive is dismissible (persisted) via not_contradiction
@@ -141,6 +164,17 @@ const DAY = 86_400_000;
     const both = await parseKlypix(await buildKlypixMap({ title: 'brain', areas: [{ title: 'Deploy', cards: [{ text: legacy }, { text: clean }] }] }));
     const { total } = findLegacyShipCards(both.struct);
     ok(total === 1, 'F4 cleanup: findLegacyShipCards surfaces the legacy card (and only it) for one-time tidy');
+
+    // F4 completeness (2026-07-04 field): legacy cards poison RECONCILE too — a legacy
+    // raw-bash card sharing heavy vocab with a CORRECTION card must not become a
+    // contradiction candidate.
+    const corr = 'CORRECTION: the installer-pipeline rollout for agentmug now uses the signed artifact, not the auto-captured merge path scattered across the deploy scripts.';
+    const legacyDupe = 'Deploy: 🏁 merged PR #238886 — auto-captured (`cd /c/Users/x/agentmug`) installer-pipeline rollout deploy path scattered across scripts\n#deploy';
+    const recon = await parseKlypix(await buildKlypixMap({ title: 'brain', areas: [
+        { title: 'Ops', cards: [{ text: corr }] },
+        { title: 'Deploy', cards: [{ text: legacyDupe }] },
+    ] }));
+    ok(detectContradictions(recon.struct).length === 0, 'F4 reconcile: a legacy raw-bash ship card is excluded from contradiction candidates (no reconcile poison)');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

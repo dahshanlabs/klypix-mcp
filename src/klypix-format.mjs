@@ -1334,7 +1334,11 @@ const POLARITY_RES = POLARITY_PAIRS.map(([x, y]) => ({ x, y, rx: new RegExp(`\\b
 export function detectContradictions(struct, { minOverlap = 0.45, topK = 12 } = {}) {
     if (!struct || !Array.isArray(struct.cards)) return [];
     const isArchived = (c) => /^archive$/i.test(c.area || '');
-    const live = struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim() && !isArchived(c));
+    // Legacy pre-v1.15 raw-bash ship cards are noise (path-scraped junk); they poison
+    // reconcile with vocabulary-overlap false positives just as they did repeat-
+    // matching, so exclude them here too (they're surfaced for cleanup by
+    // findLegacyShipCards / brain_reconcile mode:legacy instead).
+    const live = struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim() && !isArchived(c) && !isLegacyRawShipCard(c.text));
     // Cue meta words stripped up front — same-subject matching must compare the
     // SUBJECT, not the vocabulary of the correction act (see stripCueMeta above).
     const wset = new Map(live.map(c => [c.id, stripCueMeta(new Set(queryTokens(c.text)))]));
@@ -1635,14 +1639,26 @@ export function correctionOverlaysFor(struct, cards, { at = CORRECTION_SUPERSEDE
 // caller annotates the card (never retires it — the fact is right, only its
 // status decayed). Pure + cheap. PR numbers are capped at 5 digits — a 6+ digit
 // "#N" is a path-scraped junk number (see isLegacyRawShipCard), never a real PR.
-const PR_MERGE_AWAIT_RE = /\b(?:await(?:s|ing)?|pending|not\s+yet|yet\s+to\s+be|to\s+be|unmerged|needs?)\b[^.\n]{0,24}?\bmerg/i;
 const PR_MERGED_RE = /\bmerged\b[^.\n]{0,16}?(?:PR|pull\s+request|#)\s*#?(\d{1,5})\b/i;
 const PR_REFS_RE = /\b(?:PR|pull\s+request|#)\s*#?(\d{1,5})\b/ig;
+// The awaits/pending-merge cue fragment, reused both directions below.
+const AWAIT_CUE = String.raw`(?:await(?:s|ing)?|pending|not\s+yet|yet\s+to\s+be|unmerged|needs?)\b[^.\n]{0,20}?merg`;
 function prNumbersIn(text) {
     const out = new Set(); const s = String(text || '');
     PR_REFS_RE.lastIndex = 0; let m;
     while ((m = PR_REFS_RE.exec(s))) out.add(m[1]);
     return out;
+}
+// PRECISION (field 2026-07-04): the awaits/pending cue must sit ADJACENT to THIS PR
+// ref — otherwise a long card that names "#850" only as an EXAMPLE and separately
+// says "awaits merge" (about something else) over-triggered the overlay. Require the
+// cue within ~30 chars of the specific "PR #N", in either order, same sentence.
+function awaitNearRef(text, num) {
+    const n = String(num).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const ref = String.raw`(?:PR|pull\s+request|#)\s*#?${n}\b`;
+    const before = new RegExp(`${ref}[^.\\n]{0,30}?${AWAIT_CUE}`, 'i');   // "PR #7 awaits merge"
+    const after = new RegExp(`${AWAIT_CUE}[^.\\n]{0,30}?${ref}`, 'i');    // "awaiting merge of PR #7"
+    return before.test(text) || after.test(text);
 }
 export function mergeOverlaysFor(struct, cards) {
     const out = new Map();
@@ -1660,10 +1676,12 @@ export function mergeOverlaysFor(struct, cards) {
     for (const card of cards) {
         if (!card || !card.id || !(card.text || '').trim()) continue;
         if (PR_MERGED_RE.test(card.text)) continue;       // the hit IS a merge note — nothing to overlay
-        if (!PR_MERGE_AWAIT_RE.test(card.text)) continue; // must actually claim it's awaiting a merge
         for (const num of prNumbersIn(card.text)) {
             const by = mergedBy.get(num);
-            if (by && by.id !== card.id) { out.set(card.id, { kind: 'merged', num, by, date: by.createdAt ? new Date(by.createdAt).toISOString().slice(0, 10) : null }); break; }
+            if (!by || by.id === card.id) continue;
+            if (!awaitNearRef(card.text, num)) continue;  // the awaits cue must be ADJACENT to THIS ref (no example-#N over-trigger)
+            out.set(card.id, { kind: 'merged', num, by, date: by.createdAt ? new Date(by.createdAt).toISOString().slice(0, 10) : null });
+            break;
         }
     }
     return out;

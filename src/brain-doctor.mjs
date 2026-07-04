@@ -94,6 +94,27 @@ function inspectTools(brainDir, pkgRoot) {
   return { names: [], count: 0, source: null, hash: null };
 }
 
+// ── RUNNING layer (behavioral truth, not a baked stamp) ──────────────────────
+// The baked-file VERSION layer certifies whatever install last wrote — NOT the
+// process actually answering MCP tool calls (an npx-spawned server serves its warm
+// cache, which can lag the install). The MCP server writes .running-version.json on
+// boot; comparing it to the baked version surfaces the "stamp says current, live
+// server is stale" incident as DRIFT. Absent → the server hasn't booted since the
+// heartbeat shipped (reconnect to populate it) — reported as unknown, not drift.
+function inspectRunning(brainDir, baked, now) {
+  const rv = readJson(path.join(brainDir, '.running-version.json'), null);
+  if (!rv || !rv.version) return { known: false, version: null, matchesInstalled: null, bootedAt: null, ageMin: null };
+  const ageMin = rv.bootedAt ? Math.round((now - Date.parse(rv.bootedAt)) / 60000) : null;
+  return {
+    known: true,
+    version: rv.version,
+    pid: rv.pid || null,
+    bootedAt: rv.bootedAt || null,
+    ageMin: Number.isFinite(ageMin) ? ageMin : null,
+    matchesInstalled: baked ? cmpSemver(rv.version, baked) === 0 : null,
+  };
+}
+
 // ── PEERS (alignment) layer ──────────────────────────────────────────────────
 function inspectPeers(brainDir, brainPath, now) {
   const file = path.join(brainDir, 'sessions', `${sha(normBrainPath(brainPath))}.json`);
@@ -117,6 +138,7 @@ export function inspect(opts = {}) {
   const hasBrain = fs.existsSync(brainPath) || fs.existsSync(path.join(projectDir, 'brain.any'));
 
   const version = inspectVersion(brainDir);
+  const running = inspectRunning(brainDir, version.baked, now);
   const hooks = inspectHooks(home);
   const tools = inspectTools(brainDir, PKG_ROOT);
   const peers = inspectPeers(brainDir, brainPath, now);
@@ -134,6 +156,10 @@ export function inspect(opts = {}) {
   // ── verdict ──────────────────────────────────────────────────────────────
   const layers = {
     version: version.installed ? ((version.dirty || (npm && npm.matches === false)) ? 'drift' : 'ok') : 'absent',
+    // RUNNING drifts when the live server's version ≠ the installed bundle — the
+    // stale-server incident. Unknown (server not booted since the heartbeat shipped)
+    // is NOT drift; it's a reconnect prompt.
+    running: !running.known ? 'unknown' : (running.matchesInstalled === false ? 'drift' : 'ok'),
     hooks: !hooks.settingsPresent ? 'absent' : (hooks.missing.length ? 'drift' : 'ok'),
     harness: hasBrain ? (harness.ok ? 'ok' : 'drift') : 'n/a',
   };
@@ -146,11 +172,12 @@ export function inspect(opts = {}) {
   else {
     if (version.dirty) actions.push('node scripts/deploy-brain.mjs   # running uncommitted (dirty) hook code — commit + re-deploy');
     if (npm && npm.matches === false) actions.push(`npx klypix-mcp install   # installed brain v${version.baked} < npm latest v${npm.latest}`);
+    if (running.matchesInstalled === false) actions.push(`/mcp reconnect (or restart the session)   # LIVE server v${running.version} ≠ installed v${version.baked} — the running MCP server is stale`);
     if (hooks.missing.length) actions.push(`npx klypix-mcp install   # half-wired: hooks not active — ${hooks.missing.join(', ')}`);
     if (hasBrain && !harness.ok) actions.push('npx klypix-mcp link      # harness configs drifted — re-project managed blocks');
   }
 
-  return { verdict, layers, drifted, version, hooks, tools, peers, harness, npm, project: { dir: projectDir, brainPath, hasBrain }, brainDir, actions };
+  return { verdict, layers, drifted, version, running, hooks, tools, peers, harness, npm, project: { dir: projectDir, brainPath, hasBrain }, brainDir, actions };
 }
 
 // One-line drift summary (empty when clean) — for a footer / status line.
@@ -160,6 +187,7 @@ export function driftLine(r) {
   if (!r.version.installed) return 'brain NOT installed — run `npx klypix-mcp install`';
   if (r.version.dirty) bits.push('dirty deploy');
   if (r.npm && r.npm.matches === false) bits.push(`v${r.version.baked}<${r.npm.latest}`);
+  if (r.running && r.running.matchesInstalled === false) bits.push(`live server v${r.running.version}≠installed v${r.version.baked} (/mcp reconnect)`);
   if (r.hooks.missing.length) bits.push(`${r.hooks.missing.length} hook(s) unwired`);
   if (r.project.hasBrain && !r.harness.ok) bits.push(`${r.harness.drift.length} harness file(s) drifted`);
   return bits.length ? `⚠️ brain DRIFTED: ${bits.join(' · ')}` : '';
@@ -181,6 +209,14 @@ export function render(r, opts = {}) {
   L.push(`${vmark} ${c.bold}VERSION${c.rst}  brain core ${c.bold}v${r.version.baked || '(not deployed)'}${c.rst}${r.version.channel ? ` ${c.dim}via ${r.version.channel}${c.rst}` : ''}${r.version.dev ? `  ${c.yel}dev${c.rst}` : ''}`);
   if (r.version.dirty) L.push(`        ${c.red}DIRTY — running uncommitted hook code (source ${String(r.version.sourceSha || '?').slice(0, 12)})${c.rst}`);
   if (r.npm) L.push(`        npm latest v${r.npm.latest}  ${r.npm.matches === false ? c.yel + '⚠ installed brain is behind' + c.rst : r.npm.matches === true ? c.grn + '✓ current' + c.rst : c.dim + '(no baked version to compare)' + c.rst}`);
+
+  // RUNNING (behavioral truth — the live MCP server, not the baked file)
+  if (r.running) {
+    const rm = r.running.matchesInstalled === false ? warn : ok;
+    if (!r.running.known) L.push(`${ok} ${c.bold}RUNNING${c.rst}  ${c.dim}live server version unknown — it hasn't booted since the heartbeat shipped; /mcp reconnect to populate${c.rst}`);
+    else if (r.running.matchesInstalled === false) L.push(`${rm} ${c.bold}RUNNING${c.rst}  ${c.red}live MCP server v${r.running.version} ≠ installed v${r.version.baked} — the running server is STALE; /mcp reconnect${c.rst}${r.running.ageMin != null ? c.dim + `  (booted ${r.running.ageMin}m ago)` + c.rst : ''}`);
+    else L.push(`${rm} ${c.bold}RUNNING${c.rst}  live MCP server v${r.running.version} ✓ matches installed${r.running.ageMin != null ? c.dim + `  (booted ${r.running.ageMin}m ago)` + c.rst : ''}`);
+  }
 
   // HOOKS
   const hmark = r.layers.hooks === 'ok' ? ok : warn;

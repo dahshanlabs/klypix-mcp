@@ -103,6 +103,7 @@ ok(!!after.lastError, 'failed fetch records lastError + advances checkedAt (no o
 
     const env = { ...process.env, HOME: home, USERPROFILE: home };
     delete env.KLYPIX_BRAIN_NO_MAIN;   // the subprocess MUST run main() (real SessionStart)
+    env.KLYPIX_AUTO_UPDATE = '0';      // this fixture (cached latest > baked) would otherwise fire the SessionStart self-update — off so the test stays hermetic (self-update is covered by test/autoprop.mjs)
     const before = fs.readFileSync(cachePath, 'utf8');
     const out = execFileSync(process.execPath, [HOOK], { cwd: proj, env, encoding: 'utf8' });  // SessionStart = no arg
     const afterCache = fs.readFileSync(cachePath, 'utf8');

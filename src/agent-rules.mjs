@@ -21,11 +21,34 @@
 // `npx klypix-mcp link --check` and `brain_doctor`'s harness layer read. Closes the
 // audited "harness projection is write-once, drift is undetectable" gap.
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
+
+// ── The MCP launch entry (auto-propagation, part A) ──────────────────────────
+// Reliability root-cause fix: an emitted `npx -y klypix-mcp` config runs whatever
+// npx has WARM-CACHED — a publish never reaches it, so the running server silently
+// lags the installed bundle (the 1.20.0 incident: doctor said current, the live
+// server ran pre-1.20.0). Prefer the INSTALLED local bundle
+// (~/.claude/project-brain/klypix-mcp-server.mjs): it is the SAME artifact the
+// hooks + doctor use (one version, no npx cache, works offline) and the self-update
+// hook keeps it current. Fall back to npx ONLY when the bundle isn't installed yet —
+// first-run bootstrap; the very next link/install flips it to local.
+export function localBundleServer(home = os.homedir()) {
+  return path.join(home, '.claude', 'project-brain', 'klypix-mcp-server.mjs');
+}
+export function mcpServerEntry({ vault = '.', withType = false, home } = {}) {
+  let base;
+  try {
+    const local = localBundleServer(home);
+    if (fs.statSync(local).isFile()) base = { command: 'node', args: [local.replace(/\\/g, '/'), '--vault', vault] };
+  } catch { /* no local bundle yet → bootstrap via npx below */ }
+  if (!base) base = { command: 'npx', args: ['-y', 'klypix-mcp', '--vault', vault] };
+  return withType ? { type: 'stdio', ...base } : base;
+}
 const sha8 = (s) => crypto.createHash('sha1').update(String(s)).digest('hex').slice(0, 8);
 const cmpSemver = (a, b) => { const pa = String(a || '').split('.').map(n => parseInt(n, 10) || 0), pb = String(b || '').split('.').map(n => parseInt(n, 10) || 0); for (let i = 0; i < 3; i++) { if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) - (pb[i] || 0); } return 0; };
 
@@ -189,9 +212,10 @@ function writeDedicated(file, frontmatter, version) {
 // Project-level MCP config: add the klypix-canvas server, preserving any sibling servers.
 // wrapKey differs by tool: Cursor/Claude use "mcpServers"; VS Code uses "servers".
 function mergeMcpJson(file, wrapKey, withType) {
-  const entry = withType
-    ? { type: 'stdio', command: 'npx', args: ['-y', 'klypix-mcp', '--vault', '.'] }
-    : { command: 'npx', args: ['-y', 'klypix-mcp', '--vault', '.'] };
+  // Prefer the installed local bundle (no npx warm-cache staleness); npx only as a
+  // first-run bootstrap. Migrating an existing npx entry → local is exactly the
+  // desync fix, so a re-link (or the self-update install) heals stale configs.
+  const entry = mcpServerEntry({ vault: '.', withType });
   let cfg = {};
   if (exists(file)) {
     const raw = fs.readFileSync(file, 'utf8');

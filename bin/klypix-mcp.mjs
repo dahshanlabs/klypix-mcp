@@ -16,8 +16,10 @@
 // FACE over that engine (the A2A face, bin/klypix-a2a.mjs, shares the same core).
 
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { createRequire } from 'module';
+import { fileURLToPath } from 'url';
 import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -26,6 +28,7 @@ import {
   opListCanvases, opReadCanvas, opSearchCanvases, opSearchAllBrains,
   opBrainInsights, opBrainConnect, opBrainReconcile, opBrainGarden, opCreateCanvas, opAddToCanvas, opBrainNote, opBrainMessage, opBrainAsk,
 } from '../src/klypix-core.mjs';
+import { mcpServerEntry } from '../src/agent-rules.mjs';
 
 // Real package version for the MCP handshake (was hardcoded '1.0.0', which
 // misled every client/version diagnosis — it could never reflect the true release).
@@ -71,7 +74,7 @@ if (process.argv[2] === 'init') {
     ],
   });
   fs.writeFileSync(target, buf);
-  const cfg = JSON.stringify({ mcpServers: { 'klypix-canvas': { command: 'npx', args: ['-y', 'klypix-mcp', '--vault', process.cwd().replace(/\\/g, '/')] } } }, null, 2);
+  const cfg = JSON.stringify({ mcpServers: { 'klypix-canvas': mcpServerEntry({ vault: process.cwd().replace(/\\/g, '/') }) } }, null, 2);
   console.error(`✓ Created ${target}\n\nAdd this to your MCP client config (.mcp.json / claude_desktop_config.json):\n\n${cfg}\n\nThen ask your agent to read the canvas "brain" — it now has a project memory.`);
   process.exit(0);
 }
@@ -252,6 +255,18 @@ server.registerTool('brain_doctor', {
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
+// ── Boot heartbeat (auto-propagation, part E) ────────────────────────────────
+// Write the version this PROCESS is actually running to ~/.claude/project-brain so
+// brain_doctor can compare RUNNING vs installed(baked) vs npm — catching the exact
+// "doctor says current, the live server is stale" incident. brain_doctor reads only
+// the baked file otherwise, which certifies whatever install last wrote, not the
+// npx-spawned process answering tool calls. Best-effort: never break server startup.
+try {
+  const brainDir = path.join(os.homedir(), '.claude', 'project-brain');
+  fs.mkdirSync(brainDir, { recursive: true });
+  fs.writeFileSync(path.join(brainDir, '.running-version.json'),
+    JSON.stringify({ version: PKG_VERSION, pid: process.pid, bootedAt: new Date().toISOString(), server: fileURLToPath(import.meta.url).replace(/\\/g, '/') }, null, 2));
+} catch { /* heartbeat is best-effort */ }
 log(`ready · vault=${VAULT}`);
 // Pre-warm the on-device embedder in the BACKGROUND so the first cross-project
 // search of a session is already semantic, not a lexical fallback.

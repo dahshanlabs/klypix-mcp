@@ -22,7 +22,7 @@ import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
 import https from 'https';
-import { execSync } from 'child_process';
+import { execSync, spawn } from 'child_process';
 
 const CWD = process.cwd();
 const BRAIN = path.resolve(CWD, 'brain.klypix');
@@ -1543,8 +1543,66 @@ function legendFooter() {
         + 'Coordinate with a concurrent session: `🧠 MSG [<their-id or all>]: <text>` — a one-time note (NOT a brain card) delivered to that session on its next prompt.\n';
 }
 
+// ── Self-update on SessionStart (auto-propagation, part B — the lever) ────────
+// The one trigger that fires for EVERY user EVERY session. Turn the passive advisory
+// ("Update: npx klypix-mcp install", which nobody runs) into an ACTION: if a newer
+// version is on npm, spawn a DETACHED, fail-open updater so the NEXT session runs it —
+// "publish ⇒ everywhere, automatically." Non-negotiables, all enforced here:
+//   • fail-open — any error/offline/missing-npx degrades silently to the current version;
+//   • throttled — a global once/24h stamp (not per-project, not per-session);
+//   • dev-safe — a dev deploy (dev:true) owns its brain and is NEVER auto-updated;
+//   • zero session-path cost — spawn detached+unref, never awaited;
+//   • honest — install respects never-downgrade + dev gates, so a mis-fire can't harm.
+// It reads the npm-latest CACHE the Stop hook already maintains (zero network here).
+const AUTOUPDATE_STAMP = path.join(os.homedir(), '.claude', 'project-brain', '.autoupdate-check.json');
+const AUTOUPDATE_TTL = 24 * 60 * 60 * 1000;
+function autoUpdateEnabled() {
+    const v = String(process.env.KLYPIX_AUTO_UPDATE ?? '').trim().toLowerCase();
+    return !(v === '0' || v === 'off' || v === 'false' || v === 'no');   // default ON
+}
+function writeAutoUpdateStamp(now) { try { fs.mkdirSync(path.dirname(AUTOUPDATE_STAMP), { recursive: true }); fs.writeFileSync(AUTOUPDATE_STAMP, JSON.stringify({ lastCheck: now })); } catch { /* */ } }
+// Cross-platform detached spawn: npx is npx.cmd on Windows (needs shell); detach +
+// unref so it outlives this hook; swallow the 'error' event so a missing npx / offline
+// resolve can never surface. Returns null on any throw.
+function spawnDetached(cmd, args) {
+    try {
+        const child = spawn(cmd, args, { cwd: CWD, detached: true, stdio: 'ignore', shell: process.platform === 'win32', windowsHide: true });
+        child.on('error', () => { /* fail-open: npx missing / offline */ });
+        child.unref();
+        return child;
+    } catch { return null; }
+}
+// PURE decision (exported for the acceptance gauntlet): given the inputs, should we
+// self-update, and why? Order matters — throttle is checked first so the caller knows
+// NOT to reset the window; every other negative reason is post-throttle (caller stamps).
+export function shouldSelfUpdate({ enabled, now, lastCheck, ttl = AUTOUPDATE_TTL, dev, latest, installed } = {}) {
+    if (!enabled) return { act: false, reason: 'disabled' };
+    if (Number.isFinite(lastCheck) && (now - lastCheck) < ttl) return { act: false, reason: 'throttled' };
+    if (dev) return { act: false, reason: 'dev-owned' };                                      // a dev deploy owns its brain
+    if (!latest || !/^\d+\.\d+\.\d+/.test(String(latest)) || !installed) return { act: false, reason: 'unknown' };  // offline / no baked version
+    if (cmpSemver(latest, installed) <= 0) return { act: false, reason: 'current' };          // current or ahead
+    return { act: true, reason: 'update', latest };
+}
+function maybeSelfUpdate() {
+    try {
+        const now = Date.now();
+        let lastCheck = null; try { lastCheck = JSON.parse(fs.readFileSync(AUTOUPDATE_STAMP, 'utf8')).lastCheck; } catch { /* first run */ }
+        let dev = false; try { dev = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.claude', 'project-brain', '.brain-version.json'), 'utf8')).dev === true; } catch { /* */ }
+        let latest = null; try { latest = JSON.parse(fs.readFileSync(NPM_CURRENCY, 'utf8')).latest; } catch { /* */ }
+        const d = shouldSelfUpdate({ enabled: autoUpdateEnabled(), now, lastCheck, dev, latest, installed: bakedBrainVersion() });
+        if (d.reason === 'throttled') return;   // keep the window — don't re-stamp
+        writeAutoUpdateStamp(now);              // passed throttle → reset the 24h window regardless of outcome
+        // Apply: detached, fail-open. cwd=CWD so install also migrates THIS project's
+        // .mcp.json off npx. install self-enforces never-downgrade + dev gates.
+        if (d.act) spawnDetached('npx', ['-y', `klypix-mcp@${d.latest}`, 'install']);
+    } catch { /* self-update is best-effort — never break a session */ }
+}
+
 async function read(lib) {
     const input = readHookInput();
+    // Auto-propagation lever: fire-and-forget a self-update check (detached, throttled,
+    // fail-open) so a newer published brain installs itself for the next session.
+    maybeSelfUpdate();
     // Register presence at session start so a peer already running sees this session
     // immediately. Files/ships come from Stop (what this session actually edits).
     touchSession(input.session_id, { branch: gitBranch() });
@@ -1673,3 +1731,4 @@ if (!process.env.KLYPIX_BRAIN_NO_MAIN) {
 // Exported for hermetic unit tests only (gated by KLYPIX_BRAIN_NO_MAIN above so the
 // import doesn't run main()/exit the test). Not part of the runtime hook contract.
 export { refreshNpmCurrency, versionCurrencyFooter, bakedBrainVersion, httpsFetchLatest, cmpSemver };
+// (shouldSelfUpdate is exported at its declaration above — the auto-propagation decision seam for tests)

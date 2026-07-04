@@ -307,6 +307,12 @@ function touchSession(sid, patch = {}) {
                 // the per-prompt recall renders a re-hit as one headline instead of
                 // re-paying the full card (a ~600-word card was injected 3× before).
                 injected: patch.injected !== undefined ? patch.injected : (prev.injected ?? []),
+                // Sibling ledger for LARGE cards (>1KB) with a much deeper cap: the
+                // 100-entry `injected` set evicts old ids in a long session, so a big
+                // card injected early could re-inflate full-text after ~100 other
+                // cards scrolled it out. Big cards are rare, so this cap effectively
+                // never evicts one — enforcing "no >1KB card full-text twice".
+                injectedBig: patch.injectedBig !== undefined ? patch.injectedBig : (prev.injectedBig ?? []),
                 startedAt: prev.startedAt || now, lastSeen: now,
             });
             fs.mkdirSync(SESSIONS_DIR, { recursive: true });
@@ -436,9 +442,16 @@ function messageFooter(sid, tp) {
         fs.writeFileSync(SESSIONS_FILE, JSON.stringify(d2));
     } catch { /* */ } finally { if (got) releaseLock(SESSIONS_LOCK); }
     if (!show.length) return '';
+    // De-dupe identical message TEXT within one delivery: the same note can reach
+    // the lane twice (posted via both the 🧠 MSG marker and the brain_message MCP
+    // twin, or re-sent) as two distinct ids — all are already acked above, so
+    // dropping the repeats here shows each note once without ever re-surfacing it.
+    const seenTxt = new Set();
+    const showUniq = show.filter(m => { const k = String(m.text || '').replace(/\s+/g, ' ').trim().toLowerCase(); if (!k || seenTxt.has(k)) return false; seenTxt.add(k); return true; });
+    if (!showUniq.length) return '';
     const ago = (ts) => { const mm = Math.max(0, Math.round((now - (ts || now)) / 60000)); return mm <= 0 ? 'just now' : `${mm}m ago`; };
     const out = ['', '## 📨 Message(s) from another session in this project (delivered once — act on or reply to them)'];
-    for (const m of show.slice(0, 6)) out.push(`- from ${String(m.from || '?').slice(0, 8)} · ${ago(m.ts)}: ${String(m.text).replace(/\s+/g, ' ').trim().slice(0, 400)}`);
+    for (const m of showUniq.slice(0, 6)) out.push(`- from ${String(m.from || '?').slice(0, 8)} · ${ago(m.ts)}: ${String(m.text).replace(/\s+/g, ' ').trim().slice(0, 400)}`);
     out.push('Reply with `🧠 MSG [<their-id or all>]: <text>` — it reaches them on their next prompt.');
     return '\n' + out.join('\n');
 }
@@ -1236,15 +1249,30 @@ async function promptRetrieve(lib) {
         if (struct && typeof lib.correctionOverlaysFor === 'function') {
             try { overlays = lib.correctionOverlaysFor(struct, freshHits.map(h => h.card)); } catch { /* best-effort */ }
         }
-        // Per-session injection dedup: a card already shown full-text this
-        // session renders as one headline, not another ~600 words of context.
+        // Awaits-merge decay: a hit saying "PR #N awaits merge" gets a merged-overlay
+        // when a harvested ship event already recorded #N MERGED (deterministic, no
+        // retirement — the fact is right, only its status decayed).
+        let mergeOv = new Map();
+        if (struct && typeof lib.mergeOverlaysFor === 'function') {
+            try { mergeOv = lib.mergeOverlaysFor(struct, freshHits.map(h => h.card)); } catch { /* best-effort */ }
+        }
+        const mergeTag = (id) => { const m = mergeOv.get(id); return m ? `\n  ↳ ⚠️ PR #${m.num} is since MERGED${m.date ? ` (ship event ${m.date})` : ''} — this "awaits merge" note is stale; nothing to do.` : ''; };
+        // Per-session injection dedup: a card already shown full-text this session
+        // renders as one headline, not another ~600 words of context. LARGE cards
+        // (>1KB) are tracked in a separate, deep-capped ledger so the 100-entry
+        // `injected` set's eviction can never re-inflate one (the observed 3× bug).
+        const BIG_CHARS = 1000;
         let me = null; try { me = readSessions().find(s => s.id === sid) || null; } catch { /* */ }
         const injected = new Set((me && Array.isArray(me.injected)) ? me.injected : []);
+        const injectedBig = new Set((me && Array.isArray(me.injectedBig)) ? me.injectedBig : []);
+        const isBig = (c) => flat(c.text).length > BIG_CHARS;
+        const wasInjected = (c) => injected.has(c.id) || (isBig(c) && injectedBig.has(c.id));
         const shownNow = new Set();
         lines.push(semMode === 'sem-hit'
             ? "# Related prior decisions (semantic match — no exact keyword overlap; full brain via the klypix-canvas MCP)"
             : "# Relevant prior decisions from this project's brain (task-matched; full brain via the klypix-canvas MCP)");
-        const newlyInjected = [];
+        const newlyInjected = [], newlyBig = [];
+        const noteInjected = (c) => { newlyInjected.push(c.id); if (isBig(c)) newlyBig.push(c.id); };
         for (const h of freshHits) {
             if (shownNow.has(h.card.id)) continue;                      // already rendered this turn (e.g. as a corrector)
             const ov = overlays.get(h.card.id);
@@ -1256,11 +1284,11 @@ async function promptRetrieve(lib) {
                 let correctorLine = false;
                 if (!shownNow.has(ov.by.id)) {
                     correctorLine = true;
-                    if (injected.has(ov.by.id)) {
+                    if (wasInjected(ov.by)) {
                         lines.push(`- ⚠️ CORRECTED — current (already shown this session): ${head(ov.by, 110)}`);
                     } else {
                         lines.push(`- ⚠️ CORRECTED — current: ${flat(ov.by.text)}`);
-                        newlyInjected.push(ov.by.id);
+                        noteInjected(ov.by);
                     }
                     shownNow.add(ov.by.id);
                 }
@@ -1268,16 +1296,20 @@ async function promptRetrieve(lib) {
                 shownNow.add(h.card.id);
                 continue;
             }
-            if (injected.has(h.card.id)) {
-                lines.push(`- (already shown this session) ${head(h.card, 110)}`);
+            if (wasInjected(h.card)) {
+                lines.push(`- (already shown this session) ${head(h.card, 110)}${mergeTag(h.card.id)}`);
                 shownNow.add(h.card.id);
                 continue;
             }
-            lines.push(`- ${flat(h.card.text)}`);
+            lines.push(`- ${flat(h.card.text)}${mergeTag(h.card.id)}`);
             shownNow.add(h.card.id);
-            newlyInjected.push(h.card.id);
+            noteInjected(h.card);
         }
-        if (newlyInjected.length) touchSession(sid, { injected: [...new Set([...injected, ...newlyInjected])].slice(-100) });
+        if (newlyInjected.length) {
+            const patch = { injected: [...new Set([...injected, ...newlyInjected])].slice(-100) };
+            if (newlyBig.length) patch.injectedBig = [...new Set([...injectedBig, ...newlyBig])].slice(-400);
+            touchSession(sid, patch);
+        }
     }
     const parts = [];
     if (lines.length) parts.push(lines.join('\n'));

@@ -127,7 +127,11 @@ export async function parseKlypix(buffer) {
     return { struct, zip, assetPaths, isV4, canvas, manifest };
 }
 
-const REL = new Set(['leads_to', 'depends_on', 'relates_to', 'conflicts_with', 'supports', 'questions', 'costs', 'blocks']);
+// 'not_contradiction' is a DISMISSAL edge, not a topical relation: an agent draws
+// it between two cards a reconcile pass flagged as a FALSE contradiction, and
+// detectContradictions then treats the pair as settled forever (the persisted
+// dismiss path the correction-cue false-positive previously lacked).
+const REL = new Set(['leads_to', 'depends_on', 'relates_to', 'conflicts_with', 'supports', 'questions', 'costs', 'blocks', 'not_contradiction']);
 
 /**
  * Build a real .klypix v4 file (nodebuffer) from a simple spec:
@@ -827,13 +831,17 @@ export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMile
     const out = [];
     const push = (...lines) => { for (const l of lines) { out.push(l); used += l.length + 1; } };
 
+    // Overdue open cards (self-declared deadline passed) — badged inline so a
+    // stale-dated reminder is flagged the next session instead of decaying silently.
+    const overdueById = findOverdueOpenCards(struct).byId;
+    const odBadge = (c) => { const o = overdueById.get(c.id); return o ? `  ·  ⏰ OVERDUE — deadline ${o.date} passed ${o.daysOverdue}d ago; verify or close (✓)` : ''; };
     push(`# ${struct.title} — brain brief`);
     push(`*${struct.format} · ${struct.counts.cards} cards · ${struct.counts.connections} connections · tiered brief (focus + open + last ${recentDays}d headlines); full cards via klypix-canvas MCP search*`);
     if (focus.length) {
         push('', '## 📌 Human focus (cards the human placed here — act on these first)');
-        for (const c of focus) push(`- ${fr(c)}${flat(c.text)}`);
+        for (const c of focus) push(`- ${fr(c)}${flat(c.text)}${odBadge(c)}`);
     }
-    if (open.length) { push('', '## Open questions & goals'); for (const c of open) push(`- ${fr(c)}${flat(c.text)}`); }
+    if (open.length) { push('', '## Open questions & goals'); for (const c of open) push(`- ${fr(c)}${flat(c.text)}${odBadge(c)}`); }
     if (skills.length) {
         push('', '## 🛠️ Skills — how we do things here (reusable; applies every session)');
         for (const c of skills.slice(0, maxSkills)) push(`- ${fr(c)}${flat(c.text)}`);
@@ -942,9 +950,13 @@ export function structToUltraBrief(struct, { freshness = null, briefPath = '.cla
         for (const c of conflicts.slice(0, 4)) { if (!pushIf(`- ${clip(c.from, 70)} ⚔️ ${clip(c.to, 70)}`)) break; shown++; }
         if (shown < conflicts.length) pushIf(`- …and ${conflicts.length - shown} more conflict(s) — in the full brief.`);
     }
-    if (open.length && pushIf('') && pushIf(`## Open questions & goals (${open.length})`)) {
+    // Overdue opens lead (and get a ⏰ prefix) so a passed deadline is never the
+    // line that falls off the bottom of the preview-sized budget.
+    const overdueById = findOverdueOpenCards(struct).byId;
+    const openSorted = open.slice().sort((a, b) => (overdueById.has(b.id) ? 1 : 0) - (overdueById.has(a.id) ? 1 : 0));
+    if (open.length && pushIf('') && pushIf(`## Open questions & goals (${open.length}${overdueById.size ? `, ${overdueById.size} ⏰ overdue` : ''})`)) {
         let shown = 0;
-        for (const c of open) { if (!pushIf(`- ${fr(c)}${head(c)}`)) break; shown++; }
+        for (const c of openSorted) { if (!pushIf(`- ${overdueById.has(c.id) ? '⏰ OVERDUE ' : ''}${fr(c)}${head(c)}`)) break; shown++; }
         if (shown < open.length) pushIf(`- …and ${open.length - shown} more — in the full brief.`);
     }
     const areas = struct.cards.filter(c => c.type === 'container' && !/^archive$/i.test(c.title || ''))
@@ -1193,6 +1205,35 @@ const REPEAT_VERB_STOP = new Set([
 // PR#), or a kebab/snake identifier. A #file-/#dir- tag-stem match counts as an
 // entity at match time regardless of shape (tags are capture-stamped anchors).
 const isEntityToken = (t) => /\d/.test(t) || t.includes('-') || t.includes('_');
+// ── Legacy raw-bash ship cards (pre-v1.15 auto-capture residue) ──────────────
+// Before the v1.15 ship-capture rewrite, auto-harvest dumped the RAW shell command
+// into the card ("🏁 merged PR #850 — auto-captured (`cd /c/Users/…/8db42`)") and
+// scraped stray path digits as PR numbers ("merged PR #238886"). These are dense
+// with generic ship verbs + junk numbers, so the possible-repeat warner kept
+// matching them and crying wolf — training agents to ignore repeat warnings. They
+// are (a) excluded from detectRepeatWork below and (b) surfaced by findLegacyShip-
+// Cards for a one-time cleanup. Detection is SIGNATURE-based (not just "old"), so a
+// CLEAN ship card ("Ship: 🏁 merged PR #286") is never touched.
+export const isLegacyRawShipCard = (text) => {
+    const t = String(text || '');
+    if (!/🏁|\bmerged\b|\brelease|\bpublish|\bshipped\b|\btagged\b/i.test(t)) return false;   // ship-shaped only
+    return /auto-captured/i.test(t)                              // the explicit pre-v1.15 stamp
+        || /`[^`]*\b(?:cd|gh|git|npm|node|npx)\b[^`]*`/i.test(t) // a raw shell command left inside the card
+        || /(?:\/c\/users\/|[a-z]:[\\/]+users[\\/]|\/(?:home|users|mnt|tmp)\/)/i.test(t)   // a filesystem-path fragment
+        || /\b(?:PR|pull request|#)\s*#?\d{6,}\b/i.test(t);      // a 6+ digit "PR number" = scraped path digits, not a real PR
+};
+// One-time cleanup surface: the legacy raw-bash ship cards still live in a brain.
+// Suggestion-only (retire each with a ✓ marker) — they're already excluded from
+// repeat-matching, so this is cosmetic hygiene, not a correctness fix.
+export function findLegacyShipCards(struct, { max = 20 } = {}) {
+    const empty = { cards: [], total: 0 };
+    if (!struct || !Array.isArray(struct.cards)) return empty;
+    const isArchived = (c) => /^archive$/i.test(c.area || '');
+    const hits = struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim()
+        && !isArchived(c) && !/↩|✅/.test(c.text) && isLegacyRawShipCard(c.text));
+    return { cards: hits.slice(0, max), total: hits.length };
+}
+
 export function detectRepeatWork(struct, query, { topK = 2, minScore = 5, minTokens = 2 } = {}) {
     const tokens = Array.isArray(query) ? query.filter(Boolean) : queryTokens(query);
     if (tokens.length < minTokens || !struct || !Array.isArray(struct.cards)) return [];
@@ -1203,6 +1244,7 @@ export function detectRepeatWork(struct, query, { topK = 2, minScore = 5, minTok
         if (c.type === 'container' || !(c.text || '').trim()) continue;
         const kind = kindOf(c.text);
         if (!kind) continue;                          // only COMPLETED-work cards qualify
+        if (isLegacyRawShipCard(c.text)) continue;    // pre-v1.15 raw-bash residue — never a repeat candidate (nonsense scraped PR numbers)
         // Score the first MEANINGFUL line, not a marker stamp: supersede/resolve
         // prepend "↩︎ superseded <date>" / lead with "✅ …", which would otherwise
         // become the title and hide the real content from title-weighted matching.
@@ -1307,6 +1349,12 @@ export function detectContradictions(struct, { minOverlap = 0.45, topK = 12 } = 
     for (const e of struct.connections || []) {
         const k1 = e.fromId + '|' + e.toId, k2 = e.toId + '|' + e.fromId;
         if (e.label === 'superseded by' || e.label === 'closed by' || e.relationship === 'conflicts_with') { settled.add(k1); settled.add(k2); }
+        // Explicit "not a contradiction" dismissal — settles BOTH a cue pair and a
+        // polarity pair. This is the persisted escape hatch for a correction-cue
+        // FALSE positive: it had no stale card to retire, so a plain link never
+        // cleared it and it re-reported on every run forever. A deliberate
+        // not_contradiction edge (brain_connect pairs:…) now permanently dismisses it.
+        if (e.relationship === 'not_contradiction' || e.label === 'not a contradiction') { settled.add(k1); settled.add(k2); }
         if (e.label !== 'auto') { linked.add(k1); linked.add(k2); }
     }
     const out = [];
@@ -1573,6 +1621,50 @@ export function correctionOverlaysFor(struct, cards, { at = CORRECTION_SUPERSEDE
             if (s > bestS) { bestS = s; best = cue; }
         }
         if (best && bestS > 0) out.set(card.id, { kind: 'cue', by: best, overlap: Math.round(bestS * 100) / 100 });
+    }
+    return out;
+}
+
+// ── Awaits-merge decay — the deterministic twin of the correction overlay ────
+// A milestone written minutes before the human merges ("PR #332 awaits founder
+// merge") stays stale forever, even though ship-event auto-capture DOES record
+// "merged PR #332" — nothing linked the two. Matching a "PR #N" + awaits-cue card
+// against a harvested "merged PR #N" is EXACT-STRING, zero-inference work. Given
+// the cards recall is about to inject, return for each one carrying an unmet
+// merge that the ship event contradicts a merged-overlay {num, by, date}. The
+// caller annotates the card (never retires it — the fact is right, only its
+// status decayed). Pure + cheap. PR numbers are capped at 5 digits — a 6+ digit
+// "#N" is a path-scraped junk number (see isLegacyRawShipCard), never a real PR.
+const PR_MERGE_AWAIT_RE = /\b(?:await(?:s|ing)?|pending|not\s+yet|yet\s+to\s+be|to\s+be|unmerged|needs?)\b[^.\n]{0,24}?\bmerg/i;
+const PR_MERGED_RE = /\bmerged\b[^.\n]{0,16}?(?:PR|pull\s+request|#)\s*#?(\d{1,5})\b/i;
+const PR_REFS_RE = /\b(?:PR|pull\s+request|#)\s*#?(\d{1,5})\b/ig;
+function prNumbersIn(text) {
+    const out = new Set(); const s = String(text || '');
+    PR_REFS_RE.lastIndex = 0; let m;
+    while ((m = PR_REFS_RE.exec(s))) out.add(m[1]);
+    return out;
+}
+export function mergeOverlaysFor(struct, cards) {
+    const out = new Map();
+    if (!struct || !Array.isArray(struct.cards) || !Array.isArray(cards) || !cards.length) return out;
+    const isArchived = (c) => /^archive$/i.test(c.area || '');
+    // Index PR number → the NEWEST live card that says it merged (ship event or hand marker).
+    const mergedBy = new Map();
+    for (const c of struct.cards) {
+        if (c.type === 'container' || isArchived(c) || !(c.text || '').trim()) continue;
+        const mm = PR_MERGED_RE.exec(c.text); if (!mm) continue;
+        const prev = mergedBy.get(mm[1]);
+        if (!prev || (c.createdAt || 0) >= (prev.createdAt || 0)) mergedBy.set(mm[1], c);
+    }
+    if (!mergedBy.size) return out;
+    for (const card of cards) {
+        if (!card || !card.id || !(card.text || '').trim()) continue;
+        if (PR_MERGED_RE.test(card.text)) continue;       // the hit IS a merge note — nothing to overlay
+        if (!PR_MERGE_AWAIT_RE.test(card.text)) continue; // must actually claim it's awaiting a merge
+        for (const num of prNumbersIn(card.text)) {
+            const by = mergedBy.get(num);
+            if (by && by.id !== card.id) { out.set(card.id, { kind: 'merged', num, by, date: by.createdAt ? new Date(by.createdAt).toISOString().slice(0, 10) : null }); break; }
+        }
     }
     return out;
 }
@@ -2122,6 +2214,45 @@ export function findStaleOpenCards(struct, { coverAt = 0.6, max = 5 } = {}) {
     }
     out.sort((a, b) => b.cov - a.cov);
     return { gaps: out.slice(0, max), total: out.length };
+}
+
+// ── Open-question deadline awareness ─────────────────────────────────────────
+// An open card can carry a self-declared deadline ("Rotate NPM_TOKEN before
+// ~2026-07-03"). Once that day passes the card is OVERDUE — but nothing surfaced
+// it, so it decayed silently and served the same stale reminder a day late. This
+// parses an EXPLICIT, cue-anchored ISO date only (a bare date elsewhere in the
+// card — "shipped 2026-06-30" — is NOT a deadline), so a false overdue flag can't
+// fire. Deadline = end of the named UTC day. Used to badge overdue opens in both
+// brief tiers (the "flag it in the next session's brief" acceptance criterion).
+const DEADLINE_RE = /\b(?:before|by|due(?:\s+(?:date|by|on))?|deadline|until|no\s+later\s+than|not\s+later\s+than|eod|end\s+of(?:\s+day)?)\b[^\n.]{0,32}?~?\s*(\d{4}-\d{2}-\d{2})\b/i;
+export function parseDeadline(text) {
+    const m = DEADLINE_RE.exec(String(text || ''));
+    if (!m) return null;
+    const ts = Date.parse(m[1] + 'T23:59:59Z');   // due at the END of the named day (UTC)
+    return Number.isFinite(ts) ? { date: m[1], ts } : null;
+}
+// Live open (❓/🎯) cards whose parsed deadline has passed, newest-overdue-last so
+// the most-overdue lead. Injectable `now` for hermetic tests. Skips already
+// resolved/superseded cards (they carry ✅/↩︎) and skills (standing reference).
+export function findOverdueOpenCards(struct, { now = Date.now() } = {}) {
+    const empty = { overdue: [], total: 0, byId: new Map() };
+    if (!struct || !Array.isArray(struct.cards)) return empty;
+    const isArchived = (c) => /^archive$/i.test(c.area || '');
+    const dayMs = (iso) => Date.parse(iso + 'T00:00:00Z');
+    const nowDay = dayMs(new Date(now).toISOString().slice(0, 10));
+    const out = [];
+    for (const c of struct.cards) {
+        if (c.type === 'container' || !(c.text || '').trim() || isArchived(c)) continue;
+        if (/↩|✅/.test(c.text)) continue;                       // already superseded/resolved
+        if (!/❓|🎯/.test(c.text) || /🛠/.test(c.text)) continue; // open questions & goals only
+        const d = parseDeadline(c.text);
+        // Overdue gate is LENIENT (end of the named day, d.ts) — a card isn't overdue
+        // at 00:01 on its deadline day. The DISPLAY count is a whole-calendar-day
+        // difference, so "before 2026-07-03" seen on 2026-07-04 reads "passed 1d ago".
+        if (d && d.ts < now) out.push({ card: c, date: d.date, daysOverdue: Math.max(0, Math.round((nowDay - dayMs(d.date)) / 86_400_000)) });
+    }
+    out.sort((a, b) => b.daysOverdue - a.daysOverdue);
+    return { overdue: out, total: out.length, byId: new Map(out.map(o => [o.card.id, o])) };
 }
 
 // ── Deliberate note → capture input ──────────────────────────────────────────

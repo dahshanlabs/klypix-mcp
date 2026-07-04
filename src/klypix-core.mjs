@@ -26,7 +26,7 @@ import {
   brainInsights, insightsToMarkdown, addBrainConnections, proposeStructuralConnections, atomicWrite,
   findUnrecordedMigrations, captureIntoBrain, tidyBrain, noteToCaptureInput,
   selectGardenCandidates, applyGarden, detectContradictions,
-  rankForQuestion, questionContextToMarkdown,
+  rankForQuestion, questionContextToMarkdown, findLegacyShipCards,
 } from './klypix-format.mjs';
 
 // ── Card / connection input shape (single source for every face) ─────────────
@@ -462,11 +462,27 @@ export async function opBrainReconcile({ vault, canvas, root, mode = 'all' }) {
       const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
       const lines = pairs.map((p, i) =>
         `${i + 1}. ${p.why} · overlap ${p.overlap}\n`
-        + `   · likely STALE   [${p.stale.area || '?'}] ${flat(p.stale.text).slice(0, 180)}\n`
-        + `   · likely CURRENT [${p.fresh.area || '?'}] ${flat(p.fresh.text).slice(0, 180)}`);
-      sections.push(`# ⚔️ ${pairs.length} contradiction candidate(s) — confirm, then reconcile\n_Candidates only — nothing was changed. For each REAL contradiction: retire the stale card with \`brain_note\` marker \`✓\` (text = what it resolved to), or record a correction-cue decision ("CORRECTION: …", uppercase) — capture auto-supersedes it across areas. Dismissing a FALSE positive: a **polarity** pair is dismissed by deliberately connecting the two cards (\`brain_connect\`); a **correction-cue** pair only clears when the stale card is retired (✓ / supersede) — a mere link does not settle a declared correction._\n\n${lines.join('\n')}`);
+        + `   · likely STALE   [${p.stale.area || '?'}] (id ${p.stale.id}) ${flat(p.stale.text).slice(0, 180)}\n`
+        + `   · likely CURRENT [${p.fresh.area || '?'}] (id ${p.fresh.id}) ${flat(p.fresh.text).slice(0, 180)}`);
+      sections.push(`# ⚔️ ${pairs.length} contradiction candidate(s) — confirm, then reconcile\n_Candidates only — nothing was changed. For each REAL contradiction: retire the stale card with \`brain_note\` marker \`✓\` (text = what it resolved to), or record a correction-cue decision ("CORRECTION: …", uppercase) — capture auto-supersedes it across areas. Dismissing a FALSE positive (either kind — polarity OR correction-cue): \`brain_connect\` with \`pairs:[{fromId, toId}]\` and \`relationship:"not_contradiction"\` using the ids above — the dismissal is persisted, so that pair never resurfaces here again._\n\n${lines.join('\n')}`);
     } else if (mode === 'contradictions') {
       sections.push('✓ No contradiction candidates — no live card pair shows a correction cue or a polarity flip over the same subject.');
+    }
+  }
+
+  // (1b) LEGACY SHIP CARDS — pre-v1.15 auto-captured "merged PR — auto-captured
+  // (`gh …`)" cards with raw shell text / path-scraped junk PR numbers. Already
+  // excluded from repeat-matching (so they no longer cry wolf); this surfaces them
+  // for optional one-time cleanup. Suggestion-only — retire each with a ✓ marker.
+  if (mode === 'all' || mode === 'legacy') {
+    const { cards: legacy, total } = findLegacyShipCards(struct);
+    if (legacy.length) {
+      const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+      const lines = legacy.map(c => `- (id ${c.id}) [${c.area || '?'}] ${flat(c.text).slice(0, 140)}`);
+      const more = total > legacy.length ? `\n\n…and ${total - legacy.length} more.` : '';
+      sections.push(`# 🧹 ${total} legacy raw-bash ship card(s) — optional cleanup\n_Pre-v1.15 auto-capture residue (raw shell command / path-scraped PR numbers). They are ALREADY excluded from repeat-detection, so this is cosmetic hygiene, not a correctness fix. To tidy: retire each with \`brain_note\` marker \`✓\`, or leave them — they no longer trigger false repeat warnings._\n\n${lines.join('\n')}${more}`);
+    } else if (mode === 'legacy') {
+      sections.push('✓ No legacy raw-bash ship cards — every ship card is a clean fact.');
     }
   }
 
@@ -530,7 +546,7 @@ export async function opBrainGarden({ vault, canvas, apply = false, syntheses })
   }
 }
 
-export async function opBrainConnect({ vault, canvas, apply = false, max = 24, threshold = 0.45, log = () => {} }) {
+export async function opBrainConnect({ vault, canvas, apply = false, max = 24, threshold = 0.45, pairs = null, relationship = null, label = null, log = () => {} }) {
   const tgt = brainTarget(vault, canvas);
   if (tgt.ambiguous) return ambiguousBrainErr(tgt.ambiguous);
   if (!tgt.file) return err(`No brain found — looked for ./brain.klypix in the project, then ${vault}.`);
@@ -541,6 +557,28 @@ export async function opBrainConnect({ vault, canvas, apply = false, max = 24, t
   const byId = new Map(struct.cards.map(c => [c.id, c]));
   const live = struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim() && !/^archive$/i.test(c.area || ''));
   const linked = new Set(struct.connections.map(c => [c.fromId, c.toId].sort().join('|')));
+
+  // ── Explicit-pairs mode ─────────────────────────────────────────────────────
+  // Draw EXACTLY the given card-id pairs with a chosen relationship, bypassing the
+  // auto-proposer. This is the persisted DISMISS path for a reconcile false
+  // positive: pass relationship:"not_contradiction" and detectContradictions will
+  // treat the pair as settled forever (the escape hatch a correction-cue false
+  // positive — which has no stale card to retire — previously lacked).
+  if (Array.isArray(pairs) && pairs.length) {
+    const rel = typeof relationship === 'string' && relationship ? relationship : 'relates_to';
+    const lbl = (typeof label === 'string' && label) ? label : (rel === 'not_contradiction' ? 'not a contradiction' : undefined);
+    const explicit = pairs
+      .filter(p => p && p.fromId && p.toId && byId.has(p.fromId) && byId.has(p.toId) && p.fromId !== p.toId)
+      .map(p => ({ fromId: p.fromId, toId: p.toId, relationship: rel, ...(lbl ? { label: lbl } : {}) }));
+    if (!explicit.length) return err('pairs needs [{fromId, toId}, …] where both ids are real cards in this brain (see the ids in brain_reconcile output).');
+    const render2 = (e) => `- ${flat(byId.get(e.fromId)?.text)} ↔ ${flat(byId.get(e.toId)?.text)}  (${e.relationship}${e.label ? `: ${e.label}` : ''})`;
+    if (!apply) return { blocks: [text(`# ${explicit.length} explicit connection(s) to draw\n_Re-run with apply:true to draw them.${rel === 'not_contradiction' ? ' These pairs will then be permanently dismissed as contradiction candidates.' : ''}_\n\n${explicit.map(render2).join('\n')}`)] };
+    try {
+      const { buffer, added } = await addBrainConnections(fs.readFileSync(file), explicit);
+      await atomicWrite(file, buffer);
+      return { blocks: [text(`✓ Drew ${added} connection(s)${rel === 'not_contradiction' ? ' — these pair(s) are now dismissed and will NOT resurface as brain_reconcile contradiction candidates' : ''}.\n\n${explicit.slice(0, added).map(render2).join('\n')}`)] };
+    } catch (e) { return err(`Apply failed (brain unchanged): ${e.message}`); }
+  }
 
   let edges = [];
   let mode = 'structural (shared tags + [[mentions]])';

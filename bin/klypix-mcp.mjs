@@ -138,22 +138,24 @@ server.registerTool('brain_insights', {
 
 server.registerTool('brain_connect', {
   title: 'Connect related-but-unlinked brain cards (densify the graph)',
-  description: 'Finds genuinely related cards that AREN\'T linked yet and proposes connections — semantic similarity when the on-device model is installed, else shared tags + [[mentions]]. Dry-run by default (review the suggestions); pass apply:true to draw them (ADDITIVE — never deletes; the human can remove any arrow). Use after brain_insights flags many orphans, to turn a flat list into a real knowledge graph.',
+  description: 'Finds genuinely related cards that AREN\'T linked yet and proposes connections — semantic similarity when the on-device model is installed, else shared tags + [[mentions]]. Dry-run by default (review the suggestions); pass apply:true to draw them (ADDITIVE — never deletes; the human can remove any arrow). Use after brain_insights flags many orphans, to turn a flat list into a real knowledge graph. To DISMISS a brain_reconcile false-positive contradiction, pass pairs:[{fromId,toId}] (the ids are in the reconcile output) with relationship:"not_contradiction" — a persisted dismissal that stops that pair ever resurfacing as a candidate.',
   inputSchema: {
     canvas: z.string().optional().describe('Canvas filename/path. Defaults to the project brain ("brain").'),
     apply: z.boolean().optional().describe('false (default) = suggest only; true = draw the connections.'),
     max: z.number().optional().describe('Max connections to propose/draw (default 24).'),
     threshold: z.number().optional().describe('Min semantic similarity 0–1 to link (default 0.45). Higher = fewer, tighter links.'),
+    pairs: z.array(z.object({ fromId: z.string(), toId: z.string() })).optional().describe('Explicit card-id pairs to connect (bypasses auto-proposal). Use to dismiss a reconcile false-positive: pass the two card ids with relationship:"not_contradiction".'),
+    relationship: z.string().optional().describe('Relationship for explicit `pairs` (e.g. "not_contradiction" to permanently dismiss a contradiction candidate, or "relates_to", "depends_on", "supports").'),
   },
-}, async ({ canvas, apply, max, threshold }) => toContent(await opBrainConnect({ vault: VAULT, canvas, apply, max, threshold, log })));
+}, async ({ canvas, apply, max, threshold, pairs, relationship }) => toContent(await opBrainConnect({ vault: VAULT, canvas, apply, max, threshold, pairs, relationship, log })));
 
 server.registerTool('brain_reconcile', {
   title: 'Reconcile the brain — contradictions between cards + unrecorded migrations',
-  description: 'Truth maintenance in two passes. (1) CONTRADICTIONS: finds same-subject live card pairs where one carries an explicit correction cue (uppercase "CORRECTION", "was WRONG", "OBSOLETE" — that side is the presumed truth) or the two use opposite polarity words (deferred↔wired, broken↔fixed, dead↔live), i.e. stale facts whose correction never got linked — candidates only, YOU confirm each: retire the stale card via brain_note ✓; a false POLARITY pair is dismissed by deliberately connecting the pair (brain_connect), while a correction-cue pair clears only when the stale card is retired. (2) MIGRATIONS: lists committed migration files (Supabase / Rails / Prisma / Knex / generic) that NO brain card references, so an applied-but-unnarrated rollout can be recorded. Reads ONLY the filesystem — never the database, never the network — and changes nothing. Run it periodically, or when recall surfaces something you believe is stale.',
+  description: 'Truth maintenance. (1) CONTRADICTIONS: finds same-subject live card pairs where one carries an explicit correction cue (uppercase "CORRECTION", "was WRONG", "OBSOLETE" — that side is the presumed truth) or the two use opposite polarity words (deferred↔wired, broken↔fixed, dead↔live), i.e. stale facts whose correction never got linked — candidates only, YOU confirm each: retire the stale card via brain_note ✓. Dismiss a FALSE positive (either kind) by connecting the two ids with brain_connect pairs + relationship:"not_contradiction" — persisted, so it never resurfaces. (2) MIGRATIONS: lists committed migration files (Supabase / Rails / Prisma / Knex / generic) that NO brain card references, so an applied-but-unnarrated rollout can be recorded. (3) LEGACY: pre-v1.15 raw-bash ship cards to tidy. Reads ONLY the filesystem — never the database, never the network — and changes nothing. Run it periodically, or when recall surfaces something you believe is stale.',
   inputSchema: {
     canvas: z.string().optional().describe('Brain canvas filename/path. Defaults to the project brain ("brain").'),
     root: z.string().optional().describe("Project root holding the migrations dir (default: the brain file's folder)."),
-    mode: z.enum(['all', 'contradictions', 'migrations']).optional().describe('Which pass to run (default "all").'),
+    mode: z.enum(['all', 'contradictions', 'migrations', 'legacy']).optional().describe('Which pass to run (default "all"): contradictions · migrations · legacy (pre-v1.15 raw-bash ship cards to tidy).'),
   },
 }, async ({ canvas, root, mode }) => toContent(await opBrainReconcile({ vault: VAULT, canvas, root, mode })));
 

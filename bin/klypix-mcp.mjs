@@ -246,27 +246,65 @@ server.registerTool('brain_doctor', {
       try { const { execSync } = await import('child_process'); npmLatest = execSync('npm view klypix-mcp version', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 8000 }).trim(); }
       catch { npmLatest = '(offline)'; }
     }
-    const report = inspect({ projectDir: project ? path.resolve(project) : process.cwd(), npmLatest });
+    // self = THIS running server (the process answering this very call). Passing it
+    // makes the RUNNING check report the caller's actual server version, never a
+    // phantom another session's heartbeat wrote to the shared registry.
+    const report = inspect({ projectDir: project ? path.resolve(project) : process.cwd(), npmLatest, self: { pid: process.pid, version: PKG_VERSION } });
     return { content: [{ type: 'text', text: render(report, { color: false }) }] };
   } catch (e) {
     return { content: [{ type: 'text', text: `brain_doctor unavailable: ${e?.message || e}` }], isError: true };
   }
 });
 
+// ── Boot heartbeat (auto-propagation, part E) ────────────────────────────────
+// Record the version THIS process actually runs into a per-pid REGISTRY at
+// ~/.claude/project-brain/.running-servers.json, so brain_doctor can compare RUNNING
+// vs installed(baked) vs npm — catching the "doctor says current, live server is
+// stale" incident. A per-pid registry (not a single-value file) is REQUIRED because
+// MCP servers are per-session: a shared single file is last-writer-wins, so it could
+// report a DIFFERENT session's server version (a phantom). Each server upserts its
+// own {pid, version, vault} and prunes dead pids; doctor-as-tool matches its own pid.
+// Best-effort, tiny lock so concurrent boots (2–4 sessions) don't tear the file.
+const RUNNING_MAX_AGE_MS = 24 * 60 * 60 * 1000;   // bound a reused-PID phantom entry (see isAlive note)
+function recordRunningServer() {
+  const brainDir = path.join(os.homedir(), '.claude', 'project-brain');
+  const REG = path.join(brainDir, '.running-servers.json');
+  const LOCK = REG + '.lock';
+  const LOCK_STALE_MS = 5000;   // a heartbeat critical section is ms; steal a lock older than this
+  // Alive ONLY if we can actually signal it: ESRCH (dead) and EPERM (another user's
+  // process — never our MCP server) both prune. This narrows the reused-PID phantom
+  // window; the age ceiling below bounds the remaining same-user-reuse case.
+  const isAlive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  const fresh = (b) => { const t = Date.parse(b); return !Number.isFinite(t) || (Date.now() - t) < RUNNING_MAX_AGE_MS; };
+  const sleep = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* */ } };
+  let got = false;
+  try {
+    fs.mkdirSync(brainDir, { recursive: true });
+    for (let i = 0; i < 40 && !got; i++) {
+      try { const fd = fs.openSync(LOCK, 'wx'); fs.writeSync(fd, String(process.pid)); fs.closeSync(fd); got = true; }
+      catch (e) { if (e && e.code !== 'EEXIST') break; try { if (Date.now() - fs.statSync(LOCK).mtimeMs > LOCK_STALE_MS) { fs.unlinkSync(LOCK); continue; } } catch { /* raced on the stale file — retry */ } sleep(25); }
+    }
+    // NEVER write the shared registry without the lock — a lock-free read-modify-write
+    // is the last-writer-wins/torn-file corruption this per-pid registry exists to
+    // avoid. A contended boot simply skips recording itself this once (self-heals on
+    // the next uncontended boot; doctor's self-mode never depends on the registry).
+    if (got) {
+      let data = {}; try { data = JSON.parse(fs.readFileSync(REG, 'utf8')); } catch { /* fresh/corrupt → rebuild */ }
+      const servers = (Array.isArray(data.servers) ? data.servers : [])
+        .filter(s => s && s.pid && s.pid !== process.pid && s.version && isAlive(s.pid) && fresh(s.bootedAt));   // drop mine + dead + aged-out
+      servers.push({ pid: process.pid, version: PKG_VERSION, vault: String(VAULT).replace(/\\/g, '/'), server: fileURLToPath(import.meta.url).replace(/\\/g, '/'), bootedAt: new Date().toISOString() });
+      // Atomic swap (temp + rename) so a concurrent reader never observes a truncated file.
+      const tmp = REG + '.' + process.pid + '.tmp';
+      fs.writeFileSync(tmp, JSON.stringify({ servers: servers.slice(-32) }, null, 2));
+      fs.renameSync(tmp, REG);
+    }
+  } catch { /* heartbeat is best-effort — never break startup */ }
+  finally { if (got) { try { fs.unlinkSync(LOCK); } catch { /* */ } } }
+}
+
 const transport = new StdioServerTransport();
 await server.connect(transport);
-// ── Boot heartbeat (auto-propagation, part E) ────────────────────────────────
-// Write the version this PROCESS is actually running to ~/.claude/project-brain so
-// brain_doctor can compare RUNNING vs installed(baked) vs npm — catching the exact
-// "doctor says current, the live server is stale" incident. brain_doctor reads only
-// the baked file otherwise, which certifies whatever install last wrote, not the
-// npx-spawned process answering tool calls. Best-effort: never break server startup.
-try {
-  const brainDir = path.join(os.homedir(), '.claude', 'project-brain');
-  fs.mkdirSync(brainDir, { recursive: true });
-  fs.writeFileSync(path.join(brainDir, '.running-version.json'),
-    JSON.stringify({ version: PKG_VERSION, pid: process.pid, bootedAt: new Date().toISOString(), server: fileURLToPath(import.meta.url).replace(/\\/g, '/') }, null, 2));
-} catch { /* heartbeat is best-effort */ }
+recordRunningServer();
 log(`ready · vault=${VAULT}`);
 // Pre-warm the on-device embedder in the BACKGROUND so the first cross-project
 // search of a session is already semantic, not a lexical fallback.

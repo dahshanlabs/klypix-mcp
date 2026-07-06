@@ -97,21 +97,51 @@ function inspectTools(brainDir, pkgRoot) {
 // ── RUNNING layer (behavioral truth, not a baked stamp) ──────────────────────
 // The baked-file VERSION layer certifies whatever install last wrote — NOT the
 // process actually answering MCP tool calls (an npx-spawned server serves its warm
-// cache, which can lag the install). The MCP server writes .running-version.json on
-// boot; comparing it to the baked version surfaces the "stamp says current, live
-// server is stale" incident as DRIFT. Absent → the server hasn't booted since the
-// heartbeat shipped (reconnect to populate it) — reported as unknown, not drift.
-function inspectRunning(brainDir, baked, now) {
-  const rv = readJson(path.join(brainDir, '.running-version.json'), null);
-  if (!rv || !rv.version) return { known: false, version: null, matchesInstalled: null, bootedAt: null, ageMin: null };
-  const ageMin = rv.bootedAt ? Math.round((now - Date.parse(rv.bootedAt)) / 60000) : null;
+// cache, which can lag the install). Servers record {pid, version, vault} into a
+// per-pid REGISTRY (.running-servers.json) on boot; comparing to the baked version
+// surfaces the "stamp says current, live server is stale" incident as DRIFT.
+//
+// Per-pid matters: MCP servers are per-session, so a single shared value is last-
+// writer-wins and could report a DIFFERENT session's server (a phantom). Two modes:
+//   • self (brain_doctor called AS the MCP tool, inside a server): report THAT
+//     process's version — authoritative for the caller, never a phantom.
+//   • CLI (separate process): enumerate every LIVE server (dead pids pruned); drift
+//     if ANY live server ≠ installed, so a multi-version machine is visible, not hidden.
+const RUNNING_MAX_AGE_MS = 24 * 60 * 60 * 1000;   // bound a reused-PID phantom (see isAlivePid)
+// Alive ONLY if we can signal it: ESRCH (dead) and EPERM (another user's process,
+// never our MCP server) both count as NOT a live server of ours — narrows the
+// reused-PID phantom; the age ceiling bounds the same-user-reuse remainder.
+const isAlivePid = (pid) => { if (!pid) return false; try { process.kill(pid, 0); return true; } catch { return false; } };
+function inspectRunning(brainDir, baked, now, self) {
+  const ageMin = (b) => { const m = b ? Math.round((now - Date.parse(b)) / 60000) : null; return Number.isFinite(m) ? m : null; };
+  const freshAge = (b) => { const t = Date.parse(b); return !Number.isFinite(t) || (now - t) < RUNNING_MAX_AGE_MS; };
+  const fmt = (s) => ({ pid: s.pid || null, version: s.version, vault: s.vault || null, ageMin: ageMin(s.bootedAt) });
+  // Live servers from the registry (prune dead pids + aged-out phantoms); fall back
+  // to the legacy single-file heartbeat only if the registry is absent/empty.
+  let live = [];
+  const reg = readJson(path.join(brainDir, '.running-servers.json'), null);
+  if (reg && Array.isArray(reg.servers)) live = reg.servers.filter(s => s && s.version && isAlivePid(s.pid) && freshAge(s.bootedAt));
+  if (!live.length) {
+    const legacy = readJson(path.join(brainDir, '.running-version.json'), null);
+    if (legacy && legacy.version) live = [{ pid: legacy.pid || null, version: legacy.version, bootedAt: legacy.bootedAt || null }];
+  }
+  // self mode — report the CALLER's own process (definitive, phantom-proof).
+  if (self && self.version) {
+    return {
+      known: true, self: true, version: self.version, pid: self.pid || null,
+      matchesInstalled: baked ? cmpSemver(self.version, baked) === 0 : null,
+      others: live.filter(s => s.pid !== self.pid).map(fmt),   // other live servers, for visibility
+    };
+  }
+  // CLI mode — no single "mine"; report the live set.
+  if (!live.length) return { known: false, self: false, version: null, matchesInstalled: null, servers: [] };
+  const servers = live.map(fmt);
+  const versions = [...new Set(servers.map(s => s.version))];
   return {
-    known: true,
-    version: rv.version,
-    pid: rv.pid || null,
-    bootedAt: rv.bootedAt || null,
-    ageMin: Number.isFinite(ageMin) ? ageMin : null,
-    matchesInstalled: baked ? cmpSemver(rv.version, baked) === 0 : null,
+    known: true, self: false,
+    version: versions.length === 1 ? versions[0] : versions.join(', '),
+    matchesInstalled: baked ? servers.every(s => cmpSemver(s.version, baked) === 0) : null,
+    servers,
   };
 }
 
@@ -138,7 +168,7 @@ export function inspect(opts = {}) {
   const hasBrain = fs.existsSync(brainPath) || fs.existsSync(path.join(projectDir, 'brain.any'));
 
   const version = inspectVersion(brainDir);
-  const running = inspectRunning(brainDir, version.baked, now);
+  const running = inspectRunning(brainDir, version.baked, now, opts.self);
   const hooks = inspectHooks(home);
   const tools = inspectTools(brainDir, PKG_ROOT);
   const peers = inspectPeers(brainDir, brainPath, now);
@@ -210,12 +240,18 @@ export function render(r, opts = {}) {
   if (r.version.dirty) L.push(`        ${c.red}DIRTY — running uncommitted hook code (source ${String(r.version.sourceSha || '?').slice(0, 12)})${c.rst}`);
   if (r.npm) L.push(`        npm latest v${r.npm.latest}  ${r.npm.matches === false ? c.yel + '⚠ installed brain is behind' + c.rst : r.npm.matches === true ? c.grn + '✓ current' + c.rst : c.dim + '(no baked version to compare)' + c.rst}`);
 
-  // RUNNING (behavioral truth — the live MCP server, not the baked file)
+  // RUNNING (behavioral truth — the live MCP server(s), not the baked file)
   if (r.running) {
-    const rm = r.running.matchesInstalled === false ? warn : ok;
-    if (!r.running.known) L.push(`${ok} ${c.bold}RUNNING${c.rst}  ${c.dim}live server version unknown — it hasn't booted since the heartbeat shipped; /mcp reconnect to populate${c.rst}`);
-    else if (r.running.matchesInstalled === false) L.push(`${rm} ${c.bold}RUNNING${c.rst}  ${c.red}live MCP server v${r.running.version} ≠ installed v${r.version.baked} — the running server is STALE; /mcp reconnect${c.rst}${r.running.ageMin != null ? c.dim + `  (booted ${r.running.ageMin}m ago)` + c.rst : ''}`);
-    else L.push(`${rm} ${c.bold}RUNNING${c.rst}  live MCP server v${r.running.version} ✓ matches installed${r.running.ageMin != null ? c.dim + `  (booted ${r.running.ageMin}m ago)` + c.rst : ''}`);
+    const run = r.running;
+    const who = run.self ? "this session's " : (run.servers && run.servers.length > 1 ? `${run.servers.length} ` : '');
+    const rm = run.matchesInstalled === false ? warn : ok;
+    if (!run.known) L.push(`${ok} ${c.bold}RUNNING${c.rst}  ${c.dim}live server version unknown — no server has booted since the heartbeat shipped; /mcp reconnect to populate${c.rst}`);
+    else if (run.matchesInstalled === false) L.push(`${rm} ${c.bold}RUNNING${c.rst}  ${c.red}${who}live MCP server v${run.version} ≠ installed v${r.version.baked} — STALE; /mcp reconnect${c.rst}`);
+    else L.push(`${rm} ${c.bold}RUNNING${c.rst}  ${who}live MCP server v${run.version} ✓ matches installed`);
+    // Multi-session visibility: list other live servers (self mode) or the full set
+    // (CLI mode when >1) so a phantom / a stale peer server is never hidden.
+    const extra = run.self ? (run.others || []) : (run.servers && run.servers.length > 1 ? run.servers : []);
+    for (const s of extra) L.push(`        ${c.dim}· ${run.self ? 'other' : 'server'} pid ${s.pid ?? '?'} · v${s.version}${s.vault ? ' · ' + s.vault : ''}${s.ageMin != null ? ` (booted ${s.ageMin}m ago)` : ''}${c.rst}`);
   }
 
   // HOOKS

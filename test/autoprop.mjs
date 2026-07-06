@@ -69,26 +69,60 @@ function seedInstalledBrain(home, bakedVersion) {
   fs.writeFileSync(path.join(bd, '.brain-version.json'), JSON.stringify({ brainVersion: bakedVersion, via: 'npm', dirty: false }));
   return bd;
 }
+const ALIVE = process.pid;          // a genuinely-alive pid for registry entries
+const DEAD = 2147483646;            // a pid that does not exist → pruned by liveness
+const reg = (bd, servers) => fs.writeFileSync(path.join(bd, '.running-servers.json'), JSON.stringify({ servers }));
+const NOW_ISO = new Date().toISOString();
+const OLD_ISO = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();   // >24h → aged out
 {
+  // CLI mode: a live server whose version < installed → RUNNING drift (the incident).
   const home = tmp('e-stale'); const bd = seedInstalledBrain(home, '1.20.1');
-  fs.writeFileSync(path.join(bd, '.running-version.json'), JSON.stringify({ version: '1.19.0', pid: 1, bootedAt: new Date(0).toISOString() }));
+  reg(bd, [{ pid: ALIVE, version: '1.19.0', vault: '/x', bootedAt: NOW_ISO }]);
   const r = inspect({ home, projectDir: home });
-  ok(r.layers.running === 'drift' && r.running.matchesInstalled === false, 'E: running v1.19 ≠ installed v1.20.1 → RUNNING drift (the exact stale-server incident)');
-  ok(r.verdict === 'DRIFTED', 'E: a stale live server makes the verdict DRIFTED, not a false ALIGNED');
-  ok(r.actions.some(a => /reconnect/i.test(a)), 'E: the reconcile action tells the agent to /mcp reconnect');
+  ok(r.layers.running === 'drift' && r.running.matchesInstalled === false, 'E: a LIVE server v1.19 ≠ installed v1.20.1 → RUNNING drift (the stale-server incident)');
+  ok(r.verdict === 'DRIFTED' && r.actions.some(a => /reconnect/i.test(a)), 'E: stale live server → verdict DRIFTED + /mcp reconnect action');
   rmrf(home);
 }
 {
-  const home = tmp('e-match'); const bd = seedInstalledBrain(home, '1.20.1');
-  fs.writeFileSync(path.join(bd, '.running-version.json'), JSON.stringify({ version: '1.20.1', pid: 1, bootedAt: new Date().toISOString() }));
+  // review fix (medium): an ALIVE-pid but AGED-OUT stale entry (reused-PID phantom) is
+  // pruned, so it can't produce a false DRIFT in CLI doctor.
+  const home = tmp('e-aged'); const bd = seedInstalledBrain(home, '1.21.0');
+  reg(bd, [{ pid: ALIVE, version: '1.10.0', vault: '/reused', bootedAt: OLD_ISO }]);
   const r = inspect({ home, projectDir: home });
-  ok(r.layers.running === 'ok' && r.running.matchesInstalled === true, 'E: running == installed → RUNNING ok');
+  ok(r.layers.running === 'unknown', 'E: an alive-pid but >24h-old entry (reused-PID phantom) is aged out → not a false DRIFT');
   rmrf(home);
 }
 {
-  const home = tmp('e-unknown'); seedInstalledBrain(home, '1.20.1');   // no .running-version.json
+  // self mode is PHANTOM-PROOF: a stale peer server is registered, but the caller
+  // (brain_doctor AS the MCP tool) reports ITS OWN version — not the phantom.
+  const home = tmp('e-phantom'); const bd = seedInstalledBrain(home, '1.21.0');
+  reg(bd, [{ pid: ALIVE, version: '1.19.0', vault: '/peer', bootedAt: new Date().toISOString() }]);   // a live PHANTOM peer
+  const r = inspect({ home, projectDir: home, self: { pid: 424242, version: '1.21.0' } });
+  ok(r.running.self === true && r.running.version === '1.21.0' && r.running.matchesInstalled === true, 'E: self mode reports the CALLER’s own server (1.21.0), never the phantom peer (1.19.0)');
+  ok(r.layers.running === 'ok', 'E: the caller’s server matches installed → RUNNING ok despite a stale peer in the registry');
+  ok((r.running.others || []).some(s => s.version === '1.19.0'), 'E: the stale peer is still surfaced as an "other" live server (visible, not hidden)');
+  rmrf(home);
+}
+{
+  // dead pids are pruned; a matching live server → ok.
+  const home = tmp('e-prune'); const bd = seedInstalledBrain(home, '1.21.0');
+  reg(bd, [{ pid: DEAD, version: '1.10.0', bootedAt: new Date(0).toISOString() }, { pid: ALIVE, version: '1.21.0', bootedAt: new Date().toISOString() }]);
   const r = inspect({ home, projectDir: home });
-  ok(r.layers.running === 'unknown', 'E: no heartbeat yet → RUNNING unknown (reconnect prompt), NOT drift');
+  ok(r.layers.running === 'ok' && r.running.matchesInstalled === true, 'E: a DEAD-pid stale entry is pruned; the live matching server → RUNNING ok');
+  rmrf(home);
+}
+{
+  // registry absent → falls back to the legacy single-file heartbeat (transition compat).
+  const home = tmp('e-legacy'); const bd = seedInstalledBrain(home, '1.21.0');
+  fs.writeFileSync(path.join(bd, '.running-version.json'), JSON.stringify({ version: '1.21.0', pid: ALIVE, bootedAt: new Date().toISOString() }));
+  const r = inspect({ home, projectDir: home });
+  ok(r.running.known === true && r.running.version === '1.21.0', 'E: no registry → legacy .running-version.json still read (transition compat)');
+  rmrf(home);
+}
+{
+  const home = tmp('e-unknown'); seedInstalledBrain(home, '1.21.0');   // no registry, no legacy file
+  const r = inspect({ home, projectDir: home });
+  ok(r.layers.running === 'unknown', 'E: no heartbeat at all → RUNNING unknown (reconnect prompt), NOT drift');
   ok(!(r.drifted && r.layers.running === 'drift'), 'E: unknown running does not by itself force DRIFTED');
   rmrf(home);
 }

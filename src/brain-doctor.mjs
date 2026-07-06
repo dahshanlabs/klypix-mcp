@@ -122,8 +122,11 @@ function inspectRunning(brainDir, baked, now, self) {
   const reg = readJson(path.join(brainDir, '.running-servers.json'), null);
   if (reg && Array.isArray(reg.servers)) live = reg.servers.filter(s => s && s.version && isAlivePid(s.pid) && freshAge(s.bootedAt));
   if (!live.length) {
+    // Legacy single-file heartbeat (a still-running pre-registry server). Trust it
+    // ONLY if its pid is alive + fresh — a dead server's leftover file must never
+    // read as a live stale server (that would be the very phantom this fix prevents).
     const legacy = readJson(path.join(brainDir, '.running-version.json'), null);
-    if (legacy && legacy.version) live = [{ pid: legacy.pid || null, version: legacy.version, bootedAt: legacy.bootedAt || null }];
+    if (legacy && legacy.version && isAlivePid(legacy.pid) && freshAge(legacy.bootedAt)) live = [{ pid: legacy.pid || null, version: legacy.version, bootedAt: legacy.bootedAt || null }];
   }
   // self mode — report the CALLER's own process (definitive, phantom-proof).
   if (self && self.version) {

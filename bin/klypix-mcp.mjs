@@ -297,6 +297,9 @@ function recordRunningServer() {
       const tmp = REG + '.' + process.pid + '.tmp';
       fs.writeFileSync(tmp, JSON.stringify({ servers: servers.slice(-32) }, null, 2));
       fs.renameSync(tmp, REG);
+      // The per-pid registry supersedes the old single-file heartbeat — remove any
+      // leftover so a dead server's stale .running-version.json can't be trusted later.
+      try { fs.unlinkSync(path.join(brainDir, '.running-version.json')); } catch { /* none / raced */ }
     }
   } catch { /* heartbeat is best-effort — never break startup */ }
   finally { if (got) { try { fs.unlinkSync(LOCK); } catch { /* */ } } }

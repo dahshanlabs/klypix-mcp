@@ -116,7 +116,16 @@ const OLD_ISO = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();   // >
   const home = tmp('e-legacy'); const bd = seedInstalledBrain(home, '1.21.0');
   fs.writeFileSync(path.join(bd, '.running-version.json'), JSON.stringify({ version: '1.21.0', pid: ALIVE, bootedAt: new Date().toISOString() }));
   const r = inspect({ home, projectDir: home });
-  ok(r.running.known === true && r.running.version === '1.21.0', 'E: no registry → legacy .running-version.json still read (transition compat)');
+  ok(r.running.known === true && r.running.version === '1.21.0', 'E: no registry → a LIVE-pid legacy .running-version.json is still read (transition compat)');
+  rmrf(home);
+}
+{
+  // 1.21.2 fix: a legacy single-file heartbeat from a DEAD server must NOT be trusted —
+  // else its leftover file reads as a live stale server forever (a phantom).
+  const home = tmp('e-legacy-dead'); const bd = seedInstalledBrain(home, '1.21.1');
+  fs.writeFileSync(path.join(bd, '.running-version.json'), JSON.stringify({ version: '1.21.0', pid: DEAD, bootedAt: new Date().toISOString() }));
+  const r = inspect({ home, projectDir: home });
+  ok(r.layers.running === 'unknown', 'E: a DEAD-pid legacy heartbeat is NOT trusted → no phantom stale-server DRIFT');
   rmrf(home);
 }
 {

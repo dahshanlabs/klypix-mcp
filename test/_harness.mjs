@@ -63,7 +63,12 @@ export async function seedRoadmap(vault) {
 // so the SAME drive sequence verifies any layout against the same baseline.
 export async function driveServer(vault, binPath = BIN) {
   const client = new Client({ name: 'klypix-test', version: '1.0.0' }, { capabilities: {} });
-  const transport = new StdioClientTransport({ command: process.execPath, args: [binPath, '--vault', vault] });
+  // Sandbox HOME so the spawned server's boot heartbeat writes into a THROWAWAY
+  // ~/.claude/project-brain, not the developer's real one (which polluted the running-
+  // server registry + left orphaned entries that showed up as phantom stale servers).
+  const home = path.join(os.tmpdir(), 'klypix-test-home');
+  try { fs.mkdirSync(home, { recursive: true }); } catch { /* */ }
+  const transport = new StdioClientTransport({ command: process.execPath, args: [binPath, '--vault', vault], env: { ...process.env, HOME: home, USERPROFILE: home } });
   await client.connect(transport);
 
   const out = {};

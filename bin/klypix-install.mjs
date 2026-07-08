@@ -224,7 +224,8 @@ try {
     else console.error(`⚠ readiness: ${notWired.length} hook(s) did NOT take (${notWired.join(', ')}) — the brain will read but not capture/sync. Re-run \`npx klypix-mcp install --force\` or check ${SETTINGS}.`);
     console.log(`✓ MCP server runs from the local bundle (node ${fwd(path.join(BRAIN_DIR, 'klypix-mcp-server.mjs'))}) — no npx cache, works offline, always the installed version.`);
     if (migrated) console.log(`✓ migrated ${migrated.file} klypix-canvas server: ${migrated.from} → ${migrated.to} (backup: .mcp.json.klypix-bak). Reconnect (/mcp) or restart to pick it up.`);
-    console.log('  Every project with a ./brain.klypix now auto-reads its brief + captures decisions. Restart open Claude Code sessions to load the hooks.');
+    console.log('  Every project with a ./brain.klypix now auto-reads its brief + captures decisions.');
+    console.log('  ⚠ Open sessions keep their OLD server until relaunched: fully quit & reopen the app (a session resume / new chat does NOT respawn the MCP server). `brain_doctor`\'s RUNNING line confirms when you\'re current.');
     console.log('  Verify anytime: `npx klypix-mcp doctor` (is the brain current + wired + in sync, who else is live).');
 } catch (e) {
     if (gotLock) releaseLock();

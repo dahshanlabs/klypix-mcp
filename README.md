@@ -75,6 +75,23 @@ or the Claude Code project-brain hook. (`search_all_brains` is also hook-fed —
 reads the cross-project registry the hook writes, so it stays empty until a hook
 has registered at least one brain.)
 
+### Updates — the propagation contract
+
+`npx klypix-mcp install` lays the whole brain (hooks + engine + local MCP server)
+into `~/.claude/project-brain`, and the emitted MCP config runs the server **from
+that installed bundle** (no npx cache to go stale). From then on updates are
+automatic: at session start the hook checks npm (≤ once/24h, fail-open, disable
+with `KLYPIX_AUTO_UPDATE=0`) and self-installs a newer release, so a publish
+reaches every machine by its **next session**.
+
+One honest caveat: a running stdio MCP server can't hot-swap, and **resuming a
+session (or opening a new chat in the same app) does not respawn it** — only a
+full app quit + reopen (or `/mcp` reconnect after the old process exits) starts
+the new binary. `brain_doctor` tells you when that's needed: its RUNNING line
+compares the *live server's* self-reported version against the installed bundle
+and npm, and reads `DRIFTED → /mcp reconnect` instead of pretending a stale
+server is current.
+
 ## Also speaks A2A (Agent-to-Agent)
 
 The same engine is exposed as an **A2A agent** so other agents and orchestrators

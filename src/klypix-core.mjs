@@ -452,10 +452,13 @@ export async function opBrainReconcile({ vault, canvas, root, mode = 'all' }) {
 
   // (1) CONTRADICTIONS — the brain reconciled against ITSELF. Same-subject live
   // pairs where one side carries an explicit correction cue (that side is the
-  // presumed truth) or the two use opposite polarity words (deferred↔wired,
-  // broken↔fixed …). Candidates only — nothing is changed here; the agent/human
-  // confirms each. This is the retroactive cleaner for stale/correction pairs
-  // that slipped past capture (cross-area + reworded → no supersede possible).
+  // presumed truth — UNLESS the cue predates its counterpart, then the newer
+  // card is presumed to have superseded the correction and the pair is marked
+  // "presumed superseded") or the two use opposite polarity words
+  // (deferred↔wired, broken↔fixed …). Candidates only — nothing is changed
+  // here; the agent/human confirms each. This is the retroactive cleaner for
+  // stale/correction pairs that slipped past capture (cross-area + reworded →
+  // no supersede possible).
   if (mode === 'all' || mode === 'contradictions') {
     const pairs = detectContradictions(struct);
     if (pairs.length) {
@@ -464,7 +467,7 @@ export async function opBrainReconcile({ vault, canvas, root, mode = 'all' }) {
         `${i + 1}. ${p.why} · overlap ${p.overlap}\n`
         + `   · likely STALE   [${p.stale.area || '?'}] (id ${p.stale.id}) ${flat(p.stale.text).slice(0, 180)}\n`
         + `   · likely CURRENT [${p.fresh.area || '?'}] (id ${p.fresh.id}) ${flat(p.fresh.text).slice(0, 180)}`);
-      sections.push(`# ⚔️ ${pairs.length} contradiction candidate(s) — confirm, then reconcile\n_Candidates only — nothing was changed. For each REAL contradiction: retire the stale card with \`brain_note\` marker \`✓\` (text = what it resolved to), or record a correction-cue decision ("CORRECTION: …", uppercase) — capture auto-supersedes it across areas. Dismissing a FALSE positive (either kind — polarity OR correction-cue): \`brain_connect\` with \`pairs:[{fromId, toId}]\` and \`relationship:"not_contradiction"\` using the ids above — the dismissal is persisted, so that pair never resurfaces here again._\n\n${lines.join('\n')}`);
+      sections.push(`# ⚔️ ${pairs.length} contradiction candidate(s) — confirm, then reconcile\n_Candidates only — nothing was changed. For each REAL contradiction: retire the stale card with \`brain_note\` marker \`✓\` (text = what it resolved to), or record a correction-cue decision ("CORRECTION: …", uppercase) — capture auto-supersedes it across areas. A pair marked "presumed superseded" is INVERTED — its correction card PREDATES its counterpart (e.g. the old fact was re-captured after the correction): verify which side is real before retiring anything; if the correction still holds, re-assert it (a \`~\` update or a fresh CORRECTION card) instead of retiring it. Dismissing a FALSE positive (either kind — polarity OR correction-cue): \`brain_connect\` with \`pairs:[{fromId, toId}]\` and \`relationship:"not_contradiction"\` using the ids above — the dismissal is persisted, so that pair never resurfaces here (and its cue never re-attaches as a recall/ask overlay)._\n\n${lines.join('\n')}`);
     } else if (mode === 'contradictions') {
       sections.push('✓ No contradiction candidates — no live card pair shows a correction cue or a polarity flip over the same subject.');
     }

@@ -1378,8 +1378,22 @@ export function detectContradictions(struct, { minOverlap = 0.45, topK = 12 } = 
             if (!subjectHit) continue;
             let why = null, staleC = null, freshC = null;
             if (aCue !== bCue) {
-                why = 'correction-cue';                                  // one side explicitly corrects — it is the presumed truth
-                freshC = aCue ? a : b; staleC = aCue ? b : a;
+                const cueC = aCue ? a : b, otherC = aCue ? b : a;
+                // Recency: the cue side is the presumed truth ONLY for cards that
+                // existed when it was written. Against a STRICTLY NEWER card the
+                // presumption inverts — the newer card superseded the correction
+                // (field 2026-07-12: a 07-11 audit correction was flagged CURRENT
+                // over the 07-12 R1 cards that post-dated it).
+                const inverted = (cueC.createdAt || 0) && (otherC.createdAt || 0) && cueC.createdAt < otherC.createdAt;
+                why = inverted ? 'correction-cue (cue predates its counterpart — presumed superseded)' : 'correction-cue';
+                freshC = inverted ? otherC : cueC; staleC = inverted ? cueC : otherC;
+                // Skills are standing reference (corrected in place with ~, never
+                // retirable by ✓/supersede) — presenting one as "likely STALE"
+                // invites a retire the engine would refuse; skip the pair. Checked
+                // on the RESOLVED stale side, so it covers both directions — incl.
+                // an inverted pair whose cue card is itself a 🛠 skill (a skill
+                // documenting the CORRECTION convention carries the cue token).
+                if (/🛠/.test(staleC.text || '')) continue;
             } else if (!aCue && !linked.has(a.id + '|' + b.id)) {
                 const la = lower.get(a.id), lb = lower.get(b.id);
                 for (const { x, y, rx, ry } of POLARITY_RES) {
@@ -1598,7 +1612,13 @@ const cueMatch = (a, b, bar) => {
 //   • edge — an outgoing "superseded by"/"closed by" arrow (drawn by capture or
 //     a confirmed reconcile) whose successor still has text;
 //   • cue  — a LIVE correction-cue card that lexically overlaps it ≥ `at`, ANY
-//     area (the un-edged pair the capture-time supersede missed).
+//     area (the un-edged pair the capture-time supersede missed) — EXCEPT:
+//       - a cue STRICTLY OLDER than the card (recency guard — an old correction
+//         must never be served as the current truth for a card that post-dated
+//         it; field 2026-07-12: 17 of 32 live overlays pointed backward),
+//       - a 🛠 skill card as the overlay TARGET (standing reference, corrected
+//         in place with ~ — never labeled stale by a lexical match),
+//       - a pair dismissed with a not_contradiction edge (same human verdict).
 // The caller injects the corrector FIRST (labeled) and reduces the stale hit to
 // a headline — the stale text never stands alone. Pure + cheap: correction-cue
 // cards are rare and the hit list is ≤topK.
@@ -1608,8 +1628,14 @@ export function correctionOverlaysFor(struct, cards, { at = CORRECTION_SUPERSEDE
     const byId = new Map(struct.cards.map(c => [c.id, c]));
     const isArchived = (c) => /^archive$/i.test(c.area || '');
     const successorOf = new Map();
+    // A confirmed not_contradiction dismissal is the same human verdict for the
+    // overlay: that cue does not correct that card — the CUE path never
+    // re-attaches the pair (an explicit superseded-by edge still wins: both are
+    // deliberate verdicts and the edge is the stronger one).
+    const dismissed = new Set();
     for (const cn of struct.connections || []) {
         if (cn.label === 'superseded by' || cn.label === 'closed by') successorOf.set(cn.fromId, cn.toId);
+        if (cn.relationship === 'not_contradiction' || cn.label === 'not a contradiction') { dismissed.add(cn.fromId + '|' + cn.toId); dismissed.add(cn.toId + '|' + cn.fromId); }
     }
     const cues = struct.cards.filter(c => c.type !== 'container' && !isArchived(c) && (c.text || '').trim() && hasCorrectionCue(c.text));
     for (const card of cards) {
@@ -1617,10 +1643,20 @@ export function correctionOverlaysFor(struct, cards, { at = CORRECTION_SUPERSEDE
         const succ = successorOf.has(card.id) ? byId.get(successorOf.get(card.id)) : null;
         if (succ && (succ.text || '').trim()) { out.set(card.id, { kind: 'edge', by: succ }); continue; }
         if (hasCorrectionCue(card.text)) continue;   // the hit IS a correction — nothing to overlay
+        if (/🛠/.test(card.text || '')) continue;    // skills are standing reference, corrected in place with ~ — never labeled STALE by a lexical cue (mirror the supersede/resolve guards)
         const cTok = tokenSet(card.text);
         let best = null, bestS = 0;
         for (const cue of cues) {
             if (cue.id === card.id) continue;
+            if (dismissed.has(cue.id + '|' + card.id)) continue;
+            // Recency guard: a correction can only correct facts that existed when
+            // it was written — a cue STRICTLY older than the card must never be
+            // served as its "current truth" (field 2026-07-12: a 07-11 audit
+            // correction overlaid the 07-12 cards that superseded it, and a June
+            // "deploy did not stick" correction poisoned July version answers,
+            // steering synthesis BACKWARD). Equal/unknown stamps keep the overlay
+            // (same-batch captures share a timestamp; missing dates can't be judged).
+            if ((cue.createdAt || 0) && (card.createdAt || 0) && cue.createdAt < card.createdAt) continue;
             const s = cueMatch(cTok, stripCueMeta(tokenSet(cue.text)), at);
             if (s > bestS) { bestS = s; best = cue; }
         }

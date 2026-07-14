@@ -203,6 +203,43 @@ async function vectorsForBrain(pipe, brainPath, cards) {
 }
 const deathDateOf = (text) => { const m = /(?:↩︎ superseded|✅) (\d{4}-\d{2}-\d{2})/.exec(String(text)); return m ? Date.parse(m[1]) : null; };
 
+// ── On-device cross-encoder reranker (brain_ask precision) ───────────────────
+// Eval-proven on the frozen human-paraphrase set (2026-07-15): recall@5 15%→40%,
+// MRR 0.087→0.28, top-1 0%→20%. Scores (question, cardText) PAIRS jointly (full
+// token interaction, unlike the bi-encoder cosine) and reorders a wide candidate
+// net. Same lazy/self-healing contract as getEmbedder: ~23MB q8 model cached in
+// hf-cache; any failure → null → ranking is byte-identical to the un-reranked
+// order. Disable outright with KLYPIX_RERANK=0.
+let rerankerPromise = null;
+export function getReranker(log = () => {}) {
+  if (!rerankerPromise) {
+    rerankerPromise = (async () => {
+      let t;
+      try { t = await import('@huggingface/transformers'); }
+      catch {
+        const base = path.join(PB_DIR, 'semantic', 'node_modules', '@huggingface', 'transformers', 'dist');
+        let lastErr;
+        for (const f of ['transformers.node.mjs', 'transformers.mjs']) {
+          try { t = await import(new URL('file:///' + path.join(base, f).replace(/\\/g, '/')).href); lastErr = null; break; }
+          catch (e) { lastErr = e; }
+        }
+        if (!t) throw lastErr;
+      }
+      t.env.cacheDir = path.join(PB_DIR, 'hf-cache');
+      const tokenizer = await t.AutoTokenizer.from_pretrained('Xenova/ms-marco-MiniLM-L-6-v2');
+      const model = await t.AutoModelForSequenceClassification.from_pretrained('Xenova/ms-marco-MiniLM-L-6-v2', { dtype: 'q8' });
+      return { tokenizer, model };
+    })().catch(e => { log('reranker unavailable (no rerank):', e?.message || e); return null; });
+  }
+  return rerankerPromise;
+}
+async function rerankHits(rr, question, hits) {
+  const texts = hits.map(h => String(h.card?.text || '').slice(0, 1500));
+  const inputs = rr.tokenizer(new Array(texts.length).fill(String(question)), { text_pair: texts, padding: true, truncation: true });
+  const { logits } = await rr.model(inputs);
+  return hits.map((h, i) => ({ h, s: Number(logits.data[i]) })).sort((a, b) => b.s - a.s).map(x => x.h);
+}
+
 // ── small block helpers ──────────────────────────────────────────────────────
 const text = (t) => ({ kind: 'text', text: t });
 const err = (t) => ({ blocks: [text(t)], isError: true });
@@ -400,8 +437,25 @@ export async function opBrainAsk({ vault, canvas, question, as_of, k = 10, log =
       if (qv && vecs && vecs.size) { semantic = new Map(); for (const [id, v] of vecs) semantic.set(id, dot(qv, v)); mode = 'semantic+lexical (on-device)'; }
     }
   } catch { semantic = null; mode = 'lexical (semantic warming — retry for semantic ranking)'; }
-  const result = rankForQuestion(struct, q, { semantic, k: Math.max(1, Math.min(20, k || 10)), as_of: asOfTs != null ? as_of : null });
-  return { blocks: [text(stamp + questionContextToMarkdown(q, result, { mode, as_of: asOfTs != null ? as_of : null }))] };
+  const kk = Math.max(1, Math.min(20, k || 10));
+  const timeTravel = asOfTs != null;
+  // Cross-encoder rerank (eval-proven: recall@5 15%→40% on human paraphrase
+  // questions): cast a WIDER candidate net (50), rescore (question, card) pairs
+  // jointly on-device, keep the top-k. Precision rules: SUPPRESSED under as_of
+  // (time-travel stays deterministic); own 8s budget; any failure/warm-up →
+  // the un-reranked candidate order, whose top-k slice is byte-identical to
+  // today's ranking (same sort, longer slice). Overlays are safe: rankForQuestion
+  // attaches corrections to ALL candidates before we reorder. KLYPIX_RERANK=0 kills.
+  const wantRerank = !timeTravel && process.env.KLYPIX_RERANK !== '0';
+  const result = rankForQuestion(struct, q, { semantic, k: wantRerank ? Math.max(kk, 50) : kk, as_of: timeTravel ? as_of : null });
+  if (wantRerank && result.hits.length > 1) {
+    try {
+      const rr = await Promise.race([getReranker(log), new Promise(r => setTimeout(() => r(null), 8_000))]);
+      if (rr) { result.hits = await rerankHits(rr, q, result.hits); mode += ' + rerank'; }
+    } catch { /* keep the pre-rerank order */ }
+    result.hits = result.hits.slice(0, kk);
+  }
+  return { blocks: [text(stamp + questionContextToMarkdown(q, result, { mode, as_of: timeTravel ? as_of : null }))] };
 }
 
 export async function opBrainInsights({ vault, canvas, staleDays }) {

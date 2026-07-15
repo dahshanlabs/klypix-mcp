@@ -137,13 +137,17 @@ try {
         }
     };
     const seen = new Set();
-    const queue = ['jszip', 'fractional-indexing', '@modelcontextprotocol/sdk', 'zod'].map(name => ({ name, fromDir: PKG_ROOT }));
+    // @modelcontextprotocol/ext-apps powers the canvas_view MCP App; the server
+    // treats it as OPTIONAL (lazy import, degrades to a text-only tool), so a
+    // resolve failure here must NOT abort — it's queued but tolerated if missing.
+    const OPTIONAL_DEPS = new Set(['@modelcontextprotocol/ext-apps']);
+    const queue = ['jszip', 'fractional-indexing', '@modelcontextprotocol/sdk', 'zod', '@modelcontextprotocol/ext-apps'].map(name => ({ name, fromDir: PKG_ROOT }));
     let deps = 0; const missing = [];
     while (queue.length) {
         const { name, fromDir } = queue.shift();
         if (seen.has(name)) continue; seen.add(name);
         const dir = findPkgDir(name, fromDir);
-        if (!dir) { missing.push(name); continue; }
+        if (!dir) { if (!OPTIONAL_DEPS.has(name)) missing.push(name); continue; }
         if (!exists(path.join(destMods, name))) { copyDir(dir, path.join(destMods, name)); deps++; }
         try { const pj = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')); for (const d of Object.keys(pj?.dependencies || {})) queue.push({ name: d, fromDir: dir }); } catch { /* no readable package.json */ }
     }
@@ -157,7 +161,10 @@ try {
     //    version-skew-safe brain (the hook guards on missing engine exports), never
     //    a truncated hook. Deps (step 1) are additive and already in place.
     const staged = [];
-    for (const f of ['global-brain-hook.mjs', 'brain-semantic.mjs', 'brain-note.mjs', 'brain-git-hook.mjs', 'klypix-format.mjs', 'klypix-core.mjs', 'agent-rules.mjs', 'brain-doctor.mjs']) {
+    // canvas-view-app.html is the canvas_view MCP App UI — staged raw (an HTML
+    // file must never get a JS-comment banner) beside the flat server, which
+    // resolves it via its ./canvas-view-app.html candidate path.
+    for (const f of ['global-brain-hook.mjs', 'brain-semantic.mjs', 'brain-note.mjs', 'brain-git-hook.mjs', 'klypix-format.mjs', 'klypix-core.mjs', 'agent-rules.mjs', 'brain-doctor.mjs', 'canvas-view-app.html']) {
         const s = path.join(SRC, f); if (exists(s)) staged.push({ dst: f, content: fs.readFileSync(s, 'utf8') });
     }
     for (const [src, dst] of [['klypix-mcp.mjs', 'klypix-mcp-server.mjs'], ['klypix-a2a.mjs', 'klypix-a2a-server.mjs']]) {

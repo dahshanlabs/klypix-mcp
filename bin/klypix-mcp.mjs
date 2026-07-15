@@ -26,7 +26,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import {
   resolveVault, getEmbedder, buildKlypixMap, cardSchema, connSchema,
   opListCanvases, opReadCanvas, opSearchCanvases, opSearchAllBrains,
-  opBrainInsights, opBrainConnect, opBrainReconcile, opBrainGarden, opCreateCanvas, opAddToCanvas, opBrainNote, opBrainMessage, opBrainAsk, opBrainChallenge,
+  opBrainInsights, opBrainConnect, opBrainReconcile, opBrainGarden, opCreateCanvas, opAddToCanvas, opBrainNote, opBrainMessage, opBrainAsk, opBrainChallenge, opCanvasView,
 } from '../src/klypix-core.mjs';
 import { mcpServerEntry } from '../src/agent-rules.mjs';
 
@@ -316,6 +316,47 @@ function recordRunningServer() {
     }
   } catch { /* heartbeat is best-effort — never break startup */ }
   finally { if (got) { try { fs.unlinkSync(LOCK); } catch { /* */ } } }
+}
+
+// ── canvas_view — the whiteboard-in-chat MCP App (SEP-1865 / ext-apps) ────────
+// The ext-apps dep is OPTIONAL BY DESIGN: the flat local-bundle deploy resolves
+// deps from a hardcoded queue (bin/klypix-install.mjs), so a missing module must
+// cost exactly this one tool's UI, never the server. The whole App registration
+// is try/caught (import, HTML load, register) and degrades to a plain text tool.
+const CANVAS_VIEW_DESC = 'Render a KLYPIX canvas/brain as a SPATIAL BOARD. In an MCP Apps host (Claude, VS Code, Goose) this opens an interactive read-only whiteboard — cards, containers, connection arrows, pan/zoom — of any .klypix canvas (defaults to the project brain). In hosts without the apps extension it returns a text summary of the board. Use when the user asks to SEE the canvas/brain/board, not just query it.';
+const canvasViewHandler = async ({ canvas }) => {
+  const r = await opCanvasView({ vault: VAULT, canvas });
+  const c = toContent(r);
+  return r.structured ? { ...c, structuredContent: r.structured } : c;
+};
+const CANVAS_VIEW_SCHEMA = { canvas: z.string().optional().describe('Canvas filename/path. Defaults to the project brain ("brain").') };
+let canvasViewAsApp = false;
+try {
+  const apps = await import('@modelcontextprotocol/ext-apps/server');
+  // The HTML sits next to src/ siblings in the flat bundle deploy, ../src in the repo.
+  let html = null;
+  for (const u of [new URL('../src/canvas-view-app.html', import.meta.url), new URL('./canvas-view-app.html', import.meta.url)]) {
+    try { html = fs.readFileSync(u, 'utf8'); break; } catch { /* next candidate */ }
+  }
+  if (html && typeof apps.registerAppTool === 'function' && typeof apps.registerAppResource === 'function') {
+    const URI = 'ui://klypix/canvas-view.html';
+    apps.registerAppResource(server, 'KLYPIX canvas view', URI, { mimeType: apps.RESOURCE_MIME_TYPE },
+      async () => ({ contents: [{ uri: URI, mimeType: apps.RESOURCE_MIME_TYPE, text: html }] }));
+    apps.registerAppTool(server, 'canvas_view', {
+      title: 'View a canvas as a spatial board (whiteboard-in-chat)',
+      description: CANVAS_VIEW_DESC,
+      inputSchema: CANVAS_VIEW_SCHEMA,
+      _meta: { ui: { resourceUri: URI } },
+    }, canvasViewHandler);
+    canvasViewAsApp = true;
+  }
+} catch { /* ext-apps absent or drifted — fall through to the plain tool */ }
+if (!canvasViewAsApp) {
+  server.registerTool('canvas_view', {
+    title: 'View a canvas as a spatial board (summary)',
+    description: CANVAS_VIEW_DESC,
+    inputSchema: CANVAS_VIEW_SCHEMA,
+  }, canvasViewHandler);
 }
 
 const transport = new StdioServerTransport();

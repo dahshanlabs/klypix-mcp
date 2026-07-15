@@ -27,7 +27,7 @@ import {
   findUnrecordedMigrations, captureIntoBrain, tidyBrain, noteToCaptureInput,
   selectGardenCandidates, applyGarden, detectContradictions,
   rankForQuestion, questionContextToMarkdown, findLegacyShipCards,
-  challengeBrain, challengeContextToMarkdown,
+  challengeBrain, challengeContextToMarkdown, buildRenderSpec, structToBrief,
 } from './klypix-format.mjs';
 
 // ── Card / connection input shape (single source for every face) ─────────────
@@ -484,6 +484,28 @@ export async function opBrainChallenge({ vault, canvas, claim, k = 8, via, log =
   } catch { semantic = null; }
   const result = challengeBrain(struct, q, { semantic, k: Math.max(1, Math.min(20, k || 8)) });
   return { blocks: [text(stamp + challengeContextToMarkdown(q, result, { mode, via }))] };
+}
+
+// ── canvas_view — the whiteboard-in-chat MCP App ──────────────────────────────
+// surface: parse a canvas (default: the project brain) into a budgeted render
+// spec. In an MCP Apps host the spec drives the self-contained canvas-view
+// iframe (declared in bin); in any other host the text summary alone is a
+// useful answer. READ-ONLY. The `structured` field is lifted to the tool
+// result's structuredContent by the bin handler.
+export async function opCanvasView({ vault, canvas }) {
+  const t = brainTarget(vault, canvas);
+  if (t.ambiguous) return ambiguousBrainErr(t.ambiguous);
+  if (!t.file) return err(`No canvas found — looked for ./brain.klypix in the project, then ${vault}. Pass canvas: "<name>".`);
+  let parsed;
+  try { parsed = await parseKlypix(fs.readFileSync(t.file)); } catch (e) { return err(`Read failed: ${e.message}`); }
+  const { struct, canvas: canvasJson, zip } = parsed;
+  const renderSpec = await buildRenderSpec({ struct, canvas: canvasJson, zip });
+  const stamp = brainStamp(t.file, struct, t.how);
+  const summary = `${stamp}Rendered “${struct.title}” — ${renderSpec.items.length} items · ${renderSpec.connections.length} connections`
+    + `${renderSpec.counts.truncated ? ` · ${renderSpec.counts.truncated} truncated for budget` : ''}`
+    + `${renderSpec.counts.strokes ? ` · ${renderSpec.counts.strokes} ink strokes not shown` : ''}\n\n`
+    + structToBrief(struct, { maxRecent: 10, maxMilestones: 4, maxConnections: 0, maxSkills: 6 });
+  return { blocks: [text(summary)], structured: { renderSpec } };
 }
 
 export async function opBrainInsights({ vault, canvas, staleDays }) {

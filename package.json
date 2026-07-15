@@ -1,6 +1,6 @@
 {
   "name": "klypix-mcp",
-  "version": "1.24.0",
+  "version": "1.25.0",
   "description": "An open, local-first, agent-neutral canvas file your AI reads and writes over MCP — works with Claude, Cursor, Cline, any model.",
   "type": "module",
   "license": "MIT",
@@ -53,13 +53,14 @@
     "node": ">=18"
   },
   "scripts": {
-    "test": "node test/brain-doctor.mjs && node test/version-currency.mjs && node test/ship-capture.mjs && node test/lane-message.mjs && node test/brain-quality.mjs && node test/brief-and-recall.mjs && node test/layout-cluster.mjs && node test/brain-ask.mjs && node test/field-report-2026-07-04.mjs && node test/autoprop.mjs && node test/overlay-recency-2026-07-12.mjs && node test/brain-challenge.mjs"
+    "test": "node test/brain-doctor.mjs && node test/version-currency.mjs && node test/ship-capture.mjs && node test/lane-message.mjs && node test/brain-quality.mjs && node test/brief-and-recall.mjs && node test/layout-cluster.mjs && node test/brain-ask.mjs && node test/field-report-2026-07-04.mjs && node test/autoprop.mjs && node test/overlay-recency-2026-07-12.mjs && node test/brain-challenge.mjs && node test/canvas-view.mjs"
   },
   "dependencies": {
+    "@modelcontextprotocol/ext-apps": "^1.7.4",
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "fractional-indexing": "^3.2.0",
     "jszip": "^3.10.1",
-    "zod": "^4.3.6",
-    "fractional-indexing": "^3.2.0"
+    "zod": "^4.3.6"
   },
   "optionalDependencies": {
     "@huggingface/transformers": "^4.2.0"

@@ -87,7 +87,9 @@ function inspectTools(brainDir, pkgRoot) {
     const src = readText(f);
     if (!src) continue;
     const names = [];
-    const re = /server\.registerTool\(\s*['"]([^'"]+)['"]/g;
+    // Also match ext-apps' registerAppTool(server, 'name', …) — the canvas_view
+    // MCP App registers through it; the manifest must count it or doctor drifts.
+    const re = /(?:server\.registerTool|registerAppTool)\(\s*(?:server\s*,\s*)?['"]([^'"]+)['"]/g;
     let mm; while ((mm = re.exec(src))) names.push(mm[1]);
     if (names.length) return { names, count: names.length, source: f === candidates[0] ? 'deployed' : 'package', hash: sha(names.slice().sort().join(',')).slice(0, 8) };
   }

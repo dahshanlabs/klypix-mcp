@@ -1,0 +1,207 @@
+<!doctype html>
+<!-- KLYPIX canvas-view — self-contained MCP App (SEP-1865 / ext-apps).
+     Renders a read-only spatial view of a .klypix canvas/brain inside an MCP
+     Apps host (Claude / VS Code / Goose). ZERO external requests (Apps CSP is
+     deny-by-default): everything inline; data arrives per-call via the host's
+     ui/notifications/tool-result bridge as structuredContent.renderSpec.
+     Geometry + relationship styling ported from the KLYPIX web viewer
+     (admin/lib/viewerGeometry.ts) so arrows and frames render app-faithful. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>KLYPIX canvas</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#0a0a0f;color:#e8e8ed;
+    font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;}
+  #stage{position:absolute;inset:0;cursor:grab;overflow:hidden;}
+  #stage.panning{cursor:grabbing;}
+  #world{position:absolute;left:0;top:0;transform-origin:0 0;}
+  .card{position:absolute;border-radius:8px;padding:8px 10px;box-sizing:border-box;
+    white-space:pre-wrap;word-break:break-word;line-height:1.35;
+    background:rgba(18,18,26,.85);border:1px solid rgba(16,185,129,.45);}
+  .card.agent{background:rgba(139,92,246,.05);border-color:rgba(139,92,246,.22);
+    box-shadow:inset 3px 0 0 rgba(139,92,246,.9);}
+  .card .via{position:absolute;right:6px;top:4px;font-size:9px;opacity:.55;color:#c4b5fd;}
+  .chip-link{color:#8b9cff;} .chip-tag{color:#fbbf24;}
+  .frame{position:absolute;border:1.5px dashed;border-radius:12px;box-sizing:border-box;}
+  .frame .bar{position:absolute;left:0;right:0;top:0;height:28px;display:flex;align-items:center;
+    gap:8px;padding:0 12px;font-size:13px;font-weight:600;letter-spacing:.02em;
+    border-radius:10px 10px 0 0;box-sizing:border-box;}
+  .frame .cnt{font-size:10px;opacity:.6;font-weight:400;}
+  svg#edges{position:absolute;left:0;top:0;overflow:visible;z-index:2147483646;pointer-events:none;}
+  #hud{position:absolute;left:10px;bottom:10px;font-size:11px;opacity:.65;background:rgba(10,10,15,.75);
+    padding:4px 10px;border-radius:8px;border:1px solid rgba(255,255,255,.08);pointer-events:none;}
+  #wait{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+    font-size:13px;opacity:.6;letter-spacing:.03em;}
+</style>
+</head>
+<body>
+<div id="stage"><div id="world"></div></div>
+<div id="hud" hidden></div>
+<div id="wait">waiting for canvas data…</div>
+<script>
+'use strict';
+/* ── Bridge: hand-rolled postMessage JSON-RPC per the 2026-01-26 MCP Apps spec.
+   ui/initialize → ui/notifications/initialized → listen for tool results.
+   Idempotent re-render on repeated results; malformed messages ignored. ── */
+let rpcId = 1;
+function post(msg){ try{ parent.postMessage(msg, '*'); }catch(e){} }
+post({ jsonrpc:'2.0', id:rpcId++, method:'ui/initialize',
+  params:{ protocolVersion:'2026-01-26', capabilities:{}, clientInfo:{ name:'klypix-canvas-view', version:'1.0.0' } } });
+window.addEventListener('message', (ev)=>{
+  const m = ev && ev.data;
+  if(!m || m.jsonrpc !== '2.0') return;
+  if(m.id !== undefined && m.result !== undefined && !m.method){         // ui/initialize response
+    post({ jsonrpc:'2.0', method:'ui/notifications/initialized' });
+    return;
+  }
+  if(m.method === 'ui/notifications/tool-result'){
+    const spec = m.params && m.params.result && m.params.result.structuredContent
+      && m.params.result.structuredContent.renderSpec;
+    if(spec && Array.isArray(spec.items)) render(spec);
+  }
+});
+
+/* ── Geometry (ported from viewerGeometry.ts) ── */
+const REL = {
+  default:{color:'#10b981',dashed:false,icon:''}, leads_to:{color:'#3b82f6',dashed:false,icon:'→'},
+  depends_on:{color:'#a855f7',dashed:false,icon:'⇠'}, relates_to:{color:'#9ca3af',dashed:false,icon:'∼'},
+  conflicts_with:{color:'#ef4444',dashed:true,icon:'⚡'}, supports:{color:'#10b981',dashed:false,icon:'✓'},
+  questions:{color:'#f59e0b',dashed:true,icon:'?'}, costs:{color:'#f97316',dashed:false,icon:'$'},
+  blocks:{color:'#ef4444',dashed:false,icon:'✕'}, not_contradiction:{color:'#6b7280',dashed:true,icon:'≠'},
+};
+const DEPTH_RGB = [[16,185,129],[56,189,248],[251,113,133],[192,132,252]];
+function center(r){ return {x:r.x+r.w/2, y:r.y+r.h/2}; }
+function sideAnchor(r,tx,ty){
+  const cx=r.x+r.w/2, cy=r.y+r.h/2, dx=tx-cx, dy=ty-cy;
+  if(dx===0&&dy===0) return {x:r.x+r.w,y:cy,side:'right'};
+  if(Math.abs(dx)*(r.h/2) > Math.abs(dy)*(r.w/2))
+    return dx>0 ? {x:r.x+r.w,y:cy,side:'right'} : {x:r.x,y:cy,side:'left'};
+  return dy>0 ? {x:cx,y:r.y+r.h,side:'bottom'} : {x:cx,y:r.y,side:'top'};
+}
+function handle(p,side,mag){
+  return side==='right'?{cx:p.x+mag,cy:p.y}:side==='left'?{cx:p.x-mag,cy:p.y}
+    :side==='bottom'?{cx:p.x,cy:p.y+mag}:{cx:p.x,cy:p.y-mag};
+}
+function pushOut(a,off){
+  return a.side==='top'?{x:a.x,y:a.y-off,side:a.side}:a.side==='bottom'?{x:a.x,y:a.y+off,side:a.side}
+    :a.side==='left'?{x:a.x-off,y:a.y,side:a.side}:{x:a.x+off,y:a.y,side:a.side};
+}
+function bezier(a,b,hasArrow,width){
+  const ca=center(a), cb=center(b);
+  const s1=sideAnchor(a,cb.x,cb.y); let s2=sideAnchor(b,ca.x,ca.y);
+  if(hasArrow) s2=pushOut(s2, 3*Math.max(1,width));
+  const mag=Math.max(40, Math.abs(s2.x-s1.x)*0.5);
+  const h1=handle(s1,s1.side,mag), h2=handle(s2,s2.side,mag);
+  return { d:`M ${s1.x} ${s1.y} C ${h1.cx} ${h1.cy}, ${h2.cx} ${h2.cy}, ${s2.x} ${s2.y}`,
+    mid:{ x:(s1.x+3*h1.cx+3*h2.cx+s2.x)/8, y:(s1.y+3*h1.cy+3*h2.cy+s2.y)/8 } };
+}
+function estTextRect(it){
+  const fs = it.fontSize || 14;
+  const lines = (it.text||'').split('\n'); let maxLen=1;
+  for(const l of lines) if(l.length>maxLen) maxLen=l.length;
+  return { x:it.x, y:it.y, w:Math.max(24,Math.min(640,maxLen*fs*0.62+6)),
+    h:Math.max(fs*1.35+6, lines.length*fs*1.35+6) };
+}
+function renderRect(it){
+  if(it.type!=='container' && it.type==='text' && (it.w<12||it.h<12)) return estTextRect(it);
+  return { x:it.x, y:it.y, w:it.w, h:it.h };
+}
+function depthOf(it, byId){
+  let d=0, cur=it; const seen=new Set();
+  while(cur && cur.parentId && !seen.has(cur.parentId)){
+    seen.add(cur.parentId); const p=byId[cur.parentId]; if(!p) break;
+    if(p.type==='container') d++; cur=p;
+  }
+  return d;
+}
+const esc = (s)=>String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+function richText(s){
+  return esc(s)
+    .replace(/\[\[([^\[\]]{1,80})\]\]/g,'<span class="chip-link">[[$1]]</span>')
+    .replace(/(^|\s)(#[a-zA-Z][\w-]{0,40})/g,'$1<span class="chip-tag">$2</span>');
+}
+
+/* ── Renderer: absolutely-positioned divs in painter's order + one SVG on top ── */
+const stage=document.getElementById('stage'), world=document.getElementById('world'),
+      hud=document.getElementById('hud'), wait=document.getElementById('wait');
+let view={ tx:60, ty:60, z:0.5 }, fitted=false;
+function applyView(){ world.style.transform=`translate(${view.tx}px,${view.ty}px) scale(${view.z})`; }
+function fit(items){
+  if(!items.length) return;
+  let x1=Infinity,y1=Infinity,x2=-Infinity,y2=-Infinity;
+  for(const it of items){ const r=renderRect(it);
+    x1=Math.min(x1,r.x); y1=Math.min(y1,r.y); x2=Math.max(x2,r.x+r.w); y2=Math.max(y2,r.y+r.h); }
+  const pad=80, vw=stage.clientWidth||800, vh=stage.clientHeight||600;
+  const z=Math.max(0.02, Math.min(2, Math.min(vw/(x2-x1+pad*2), vh/(y2-y1+pad*2))));
+  view={ z, tx:(vw-(x2-x1)*z)/2 - x1*z, ty:(vh-(y2-y1)*z)/2 - y1*z };
+  applyView();
+}
+function render(spec){
+  wait.hidden = true;
+  const byId={}; for(const it of spec.items) byId[it.id]=it;
+  const sorted=[...spec.items].sort((a,b)=>(a.zIndex||0)-(b.zIndex||0));
+  const frag=[];
+  for(const it of sorted){
+    if(it.type==='container'){
+      const rgb=DEPTH_RGB[depthOf(it,byId)%DEPTH_RGB.length].join(',');
+      const kids=spec.items.filter(k=>k.parentId===it.id).length;
+      frag.push(`<div class="frame" style="left:${it.x}px;top:${it.y}px;width:${it.w}px;height:${it.h}px;`
+        +`border-color:rgba(${rgb},.55);background:rgba(${rgb},.04);">`
+        +`<div class="bar" style="background:rgba(${rgb},.12);color:rgba(${rgb},1);">`
+        +`<span>${esc(it.title||'Group')}</span><span class="cnt">${kids} ITEMS</span></div></div>`);
+    } else {
+      const r=renderRect(it);
+      const agent=it.createdBy==='agent';
+      const style=`left:${r.x}px;top:${r.y}px;width:${r.w}px;min-height:${r.h}px;`
+        +`font-size:${it.fontSize||14}px;`
+        +(it.heading?'font-weight:700;':'')
+        +(it.color?`color:${esc(it.color)};`:'')
+        +(it.fillColor?`background:${esc(it.fillColor)};`:'')
+        +(it.borderColor?`border-color:${esc(it.borderColor)};`:'')
+        +(it.border===false?'border:none;':'');
+      const via=agent&&it.createdVia?`<span class="via">via ${esc(it.createdVia)}</span>`:'';
+      frag.push(`<div class="card${agent?' agent':''}" style="${style}">${via}${richText(it.text||'')}</div>`);
+    }
+  }
+  // Edges — one overflow:visible SVG painted on top, per-color arrow markers.
+  const colors=new Set(); const paths=[];
+  for(const cn of spec.connections||[]){
+    const a=byId[cn.fromId], b=byId[cn.toId]; if(!a||!b) continue;
+    const st=REL[cn.relationship]||REL.default;
+    const color=cn.color||st.color; colors.add(color);
+    const w=cn.width||2;
+    const {d,mid}=bezier(renderRect(a),renderRect(b),cn.arrowHead,w);
+    paths.push(`<path d="${d}" fill="none" stroke="${esc(color)}" stroke-width="${w}"`
+      +(st.dashed?' stroke-dasharray="7 5"':'')
+      +(cn.arrowHead?` marker-end="url(#m-${color.replace(/[^a-z0-9]/gi,'')})"`:'')+'/>');
+    const lbl=cn.label||st.icon;
+    if(lbl) paths.push(`<text x="${mid.x}" y="${mid.y}" fill="${esc(color)}" font-size="11" text-anchor="middle"`
+      +` style="paint-order:stroke;stroke:#0a0a0f;stroke-width:3px;">${esc(String(lbl).slice(0,24))}</text>`);
+  }
+  const markers=[...colors].map(c=>`<marker id="m-${c.replace(/[^a-z0-9]/gi,'')}" viewBox="0 0 10 10" refX="8" refY="5"`
+    +` markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="${esc(c)}"/></marker>`).join('');
+  world.innerHTML = frag.join('') + `<svg id="edges" width="1" height="1"><defs>${markers}</defs>${paths.join('')}</svg>`;
+  const c=spec.counts||{};
+  hud.hidden=false;
+  hud.textContent=`${esc(spec.title||'canvas')} · ${spec.items.length} items · ${(spec.connections||[]).length} connections`
+    +(c.truncated?` · ${c.truncated} truncated`:'')+(c.strokes?` · ${c.strokes} ink strokes not shown`:'');
+  if(!fitted){ fit(spec.items); fitted=true; }
+}
+
+/* ── Pan + wheel zoom ── */
+let panning=null;
+stage.addEventListener('pointerdown',(e)=>{ panning={x:e.clientX,y:e.clientY,tx:view.tx,ty:view.ty}; stage.classList.add('panning'); stage.setPointerCapture(e.pointerId); });
+stage.addEventListener('pointermove',(e)=>{ if(!panning) return; view.tx=panning.tx+(e.clientX-panning.x); view.ty=panning.ty+(e.clientY-panning.y); applyView(); });
+stage.addEventListener('pointerup',()=>{ panning=null; stage.classList.remove('panning'); });
+stage.addEventListener('wheel',(e)=>{
+  e.preventDefault();
+  const f=e.deltaY<0?1.12:1/1.12, nz=Math.max(0.02,Math.min(2,view.z*f));
+  view.tx=e.clientX-(e.clientX-view.tx)*(nz/view.z);
+  view.ty=e.clientY-(e.clientY-view.ty)*(nz/view.z);
+  view.z=nz; applyView();
+},{passive:false});
+applyView();
+</script>
+</body>
+</html>

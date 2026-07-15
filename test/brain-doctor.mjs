@@ -144,7 +144,8 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
   ok(names.includes('brain_message'), 'brain_message is a registered MCP tool');
   ok(names.includes('brain_ask'), 'brain_ask is a registered MCP tool');
   ok(names.includes('brain_challenge'), 'brain_challenge is a registered MCP tool');
-  ok(names.length === 15, `tool manifest is 15 verbs (got ${names.length})`);
+  ok(names.includes('canvas_view'), 'canvas_view is a registered MCP tool');
+  ok(names.length === 16, `tool manifest is 16 verbs (got ${names.length})`);
 
   const r = await client.callTool({ name: 'brain_doctor', arguments: { project: vault } });
   const text = (r.content || []).filter(c => c.type === 'text').map(c => c.text).join('\n');

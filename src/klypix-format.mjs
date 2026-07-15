@@ -1861,6 +1861,66 @@ export function challengeContextToMarkdown(claim, result, { mode = 'lexical', vi
     return out.join('\n') + '\n';
 }
 
+// ── canvas_view render spec (MCP App) ─────────────────────────────────────────
+// Flatten a parsed canvas into the minimal spec the self-contained canvas-view
+// MCP App renders: merged geometry (canvas.positions has the full x/y/w/h/zIndex/
+// parentId; struct.cards.pos is x/y only) + per-item visual fields from the zip
+// item JSON. BUDGETED: structuredContent rides the tool result INTO MODEL CONTEXT
+// on most hosts, so the spec is capped (per-card text trim + total char budget,
+// with an explicit truncated count the iframe displays) — never the whole brain
+// verbatim. Pure + additive; nothing existing changes.
+export async function buildRenderSpec({ struct, canvas, zip }, { perCardChars = 800, budgetChars = 150_000 } = {}) {
+    const positions = (canvas && canvas.positions) || {};
+    const order = Array.isArray(canvas && canvas.order) ? canvas.order : struct.cards.map(c => c.id);
+    const rawItem = async (id) => {
+        try { const f = zip && zip.file(`items/${shard(id)}/${id}.json`); return f ? JSON.parse(await f.async('string')) : null; }
+        catch { return null; }
+    };
+    const items = [];
+    let truncated = 0, used = 0;
+    for (const id of order) {
+        const p = positions[id] || {};
+        const raw = (await rawItem(id)) || {};
+        const card = struct.cards.find(c => c.id === id) || {};
+        const type = raw.type || card.type || 'text';
+        let text = type === 'text' ? String(raw.content ?? card.text ?? '') : '';
+        if (text.length > perCardChars) { text = text.slice(0, perCardChars) + '…'; truncated++; }
+        const item = {
+            id, type,
+            x: Number(p.x) || 0, y: Number(p.y) || 0,
+            w: Number(p.w) || 0, h: Number(p.h) || 0,
+            zIndex: Number(p.zIndex) || 0, parentId: p.parentId ?? null,
+            ...(type === 'text' ? { text, heading: !!raw.heading, fontSize: Number(raw.fontSize) || 14 } : {}),
+            ...(type === 'container' ? { title: String(raw.title || 'Group'), collapsed: !!raw.collapsed } : {}),
+            ...(raw.color ? { color: raw.color } : {}), ...(raw.fillColor ? { fillColor: raw.fillColor } : {}),
+            ...(raw.borderColor ? { borderColor: raw.borderColor } : {}), ...(raw.border != null ? { border: !!raw.border } : {}),
+            ...(raw.createdBy ? { createdBy: raw.createdBy } : {}), ...(raw.createdVia ? { createdVia: raw.createdVia } : {}),
+        };
+        used += JSON.stringify(item).length;
+        if (used > budgetChars) { truncated += order.length - items.length; break; }
+        items.push(item);
+    }
+    const live = new Set(items.map(i => i.id));
+    const connections = (canvas && Array.isArray(canvas.connections) ? canvas.connections : [])
+        .filter(c => c && live.has(c.fromId) && live.has(c.toId))
+        .map(c => ({
+            fromId: c.fromId, toId: c.toId,
+            relationship: c.relationship || null, label: c.label || null,
+            color: c.color || null,
+            arrowHead: c.arrowHead !== false,           // default true — the "dropped every desktop connection" lesson
+            width: Number(c.width) || 2,
+        }));
+    return {
+        title: struct.title, items, connections,
+        counts: {
+            cards: struct.counts.cards, truncated,
+            strokes: (canvas && canvas.strokes || []).length,
+            lines: (canvas && canvas.lines || []).length,
+            assets: struct.counts.assets,
+        },
+    };
+}
+
 // ── Awaits-merge decay — the deterministic twin of the correction overlay ────
 // A milestone written minutes before the human merges ("PR #332 awaits founder
 // merge") stays stale forever, even though ship-event auto-capture DOES record

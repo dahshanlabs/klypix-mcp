@@ -1,35 +1,52 @@
-# klypix-mcp
+# Every project gets a brain.
 
-**An open, local-first, agent-neutral canvas file your AI reads and writes over MCP — works with Claude, Cursor, Cline, any model.**
+### Not a *second* brain. A **shared** one.
 
-Your AI forgets everything between sessions, and you can't hand it your *whole*
-messy project at once. `klypix-mcp` fixes that with a single portable file:
+You've seen the setup: point an AI at a folder of notes, watch the graph fill up, call it a brain. Look closer — **the human never touches anything.** Even the pattern's inventor says it: *"you never write the wiki yourself… I browse the results in real time."* The human is a reader. The AI is the sole writer. That's not a brain — that's an aquarium.
 
-- **`.klypix`** is one file that holds your whole project spatially — text, PDFs,
-  screenshots, audio, code, links — arranged and connected on an infinite canvas.
-- This package is an **MCP server**: any MCP-capable agent (Claude Desktop,
-  Cursor, Cline, …) can **list, read, search, create, and append** to your
-  `.klypix` canvases — so your agent gets durable, multimodal, *spatial* memory.
-- **Local-first + agent-neutral.** The file lives on *your* disk. No lab is in
-  the loop — read it with Claude today, GPT tomorrow, a local model next week.
-  No vendor can take it away.
+**`klypix-mcp` gives your project a brain you're allowed inside while it works.** One file — `brain.klypix` — in your repo, versioned with git, that your AI agents read, write, and argue from. And in the [KLYPIX app](https://klypix.com), you work *in* it while they do: your cursor typing in one card while agent decisions land beside your hands, each in its area, with an arrow explaining why — and the save refuses to write a file that lost a card.
 
-> **The shared memory layer for your multi-agent stack.** A2A moves the messages
-> between agents; MCP connects an agent to its tools; **`.klypix` is the owned,
-> multimodal context both layers read and write.** KLYPIX ships *two* faces over
-> one engine — an **MCP server** (`klypix-mcp`) and an **A2A agent**
-> (`klypix-a2a`) — so whichever protocol your stack speaks, the memory node is
-> the same portable file you own. See **[A2A.md](A2A.md)**.
+> *Their AI keeps a diary about your project. Ours works in the same room as you — and the room remembers.*
 
-## Quick start (60 seconds)
+## Quick start
+
+**Claude Code (native — live hooks, zero effort):**
 
 ```bash
-# point it at any folder of .klypix files (a "vault")
-npx klypix-mcp --vault ./canvases
+npx klypix-mcp install
 ```
 
-Then add it to your MCP client. For **Claude Desktop**, in
-`claude_desktop_config.json`:
+Every repo on your machine with a `brain.klypix` now auto-briefs each session with the project's state and auto-captures decisions as you work. Give a project a brain by dropping a `brain.klypix` in it — the [KLYPIX app](https://klypix.com) does it in one click (*Save canvas as project brain*), or `create_canvas` makes one from any agent.
+
+**Every other agent tool (one command per project):**
+
+```bash
+npx klypix-mcp link
+```
+
+Extends the brain to Cursor & VS Code/Copilot (MCP config + rules) and to Cline, Windsurf, Gemini CLI, Aider, and any AGENTS.md-reading agent — always-on rules that teach the tool to read and capture the brain.
+
+## What a project brain does
+
+The difference from a folder of notes is not the shape — it's that this memory is a **mechanism, not a filing convention**:
+
+- **It briefs every session.** Each agent session starts already knowing the project's decisions, open questions, and standing rules — a compact brief (≈3–5k tokens even at 600+ cards, growing sublinearly). Measured on our own brain: **73% of past decisions recovered with one search round (55% brief-only) vs 0% cold** (n=20).
+- **It argues back.** `brain_challenge`: propose a decision and the brain answers with receipts — *"you reversed this on June 12; here's the correction — captured by a different agent, coordinate before overriding."* Deterministic evidence only (correction-cues, opposite-polarity), never mere topical similarity. A memory that can't disagree with you is flattery.
+- **It knows when it's stale.** Decision cards can anchor to the exact code they were decided against (git blob OID). When that code moves on, the card raises its hand in the next brief. Their notes rot silently; ours confess.
+- **It answers from the past.** `brain_ask` with `as_of: 2026-03-01` answers what the project believed *then* — corrections from the future never leak backwards.
+- **Position means something.** Drag a card into the 📌 Focus area and it leads every future session's brief. Layout is instruction, not decoration.
+- **Many agents, no chaos.** Concurrent sessions take a capture lock (zero captures lost, tested at four simultaneous writers), tag *who* wrote each card, message each other through the brain (`brain_message`), and genuine contradictions surface as red arrows for a human to arbitrate — never auto-resolved.
+- **Retrieval that's measured, failures included.** Hybrid on-device search (semantic + lexical + cross-encoder rerank, no cloud): recall@5 of the true source card went **5% → 15% → 40%** across our upgrades (n=20 frozen human-paraphrase questions) — and the experiment that *regressed* (contextual prefixes on short cards) is recorded next to the wins.
+
+## One file you can hold
+
+The whole brain — layout, decisions, arrows, **and the actual bytes** (images, PDFs, audio, code) — is a single `.klypix` file. Email it. Git it. Hand it to an agent. A folder of markdown points at its attachments; this file *carries* them.
+
+And it's not a cage: everything **exports to Markdown and JSON Canvas** in one command, and **Obsidian `.canvas` files open directly** in KLYPIX. Plain markdown is the most portable text on earth — that's exactly why we export to it. Full spec: [FORMAT.md](FORMAT.md).
+
+## Setup for plain MCP clients
+
+Any MCP client gets the tools without the hooks. For **Claude Desktop**, in `claude_desktop_config.json`:
 
 ```json
 {
@@ -42,71 +59,45 @@ Then add it to your MCP client. For **Claude Desktop**, in
 }
 ```
 
-Now ask your agent things like *"summarize the canvas `roadmap`,"* *"turn these
-notes into a board,"* or *"add a card with the decision we just made."*
+Then ask your agent things like *"what did we decide about auth?"*, *"challenge this: let's switch to polling"*, or *"turn these notes into a board."*
 
-## Tools the server exposes
+## The 16 verbs
 
 | Tool | What it does |
 |---|---|
-| `list_canvases` | List every `.klypix` in the vault |
-| `read_canvas` | Read a canvas as markdown (cards, the connection graph, `[[links]]`, `#tags`) |
+| `brain_ask` | Whole-brain question answering — correction-aware, `as_of` time-travel |
+| `brain_challenge` | The brain argues back: contradictions with receipts, tried-and-reversed chains, standing rules, other-agent provenance flags |
+| `brain_note` | Capture with the full lifecycle — supersede / ✓ resolve / ~ update / 🛠 skill / closes: |
+| `brain_reconcile` | Find stale-vs-correction pairs + unrecorded migrations |
+| `brain_insights` | Hubs, orphaned decisions, stale questions, area sizes |
+| `brain_garden` | Maintenance pass over the brain |
+| `brain_doctor` | Self-diagnosis: version alignment, hooks wired, projection drift |
+| `brain_message` | Session-to-session coordination notes |
+| `brain_connect` | Find + draw related-but-unlinked cards |
+| `canvas_view` | The board as an MCP App — Apps-capable chats get an interactive spatial view; everyone else gets clean text |
+| `read_canvas` | A canvas as markdown (cards, connection graph, `[[links]]`, `#tags`) |
 | `search_canvases` | Search across canvases by name + content |
 | `search_all_brains` | Cross-project memory search across every registered brain |
-| `brain_insights` | Hubs, orphaned decisions, stale questions, area sizes |
-| `brain_connect` | Find + draw related-but-unlinked cards (densify the graph) |
-| `brain_reconcile` | Flag committed-but-unrecorded DB migrations (the brain can't see prod) |
-| `create_canvas` | Create a new `.klypix` from cards + connections |
-| `add_to_canvas` | Append cards/connections to an existing canvas (positions preserved) |
+| `create_canvas` | New `.klypix` from cards + connections |
+| `add_to_canvas` | Append cards/connections (positions preserved) |
+| `list_canvases` | List every `.klypix` in the vault |
 
 ### Tools vs. the *automatic* brain
 
-This package is the **agent-neutral read/write surface** — any MCP client (Claude
-Code, Claude Desktop, Cursor, Cline, Windsurf…) gets the **tools** above and can
-read, search, and write canvases on demand (*pull*). That works in any agent, in
-any project.
-
-The **automatic** brain — auto-capturing decisions from your work, injecting the
-relevant cards into each prompt, and coordinating across concurrent sessions
-(*push*) — runs in a host **hook**, which is a Claude Code / KLYPIX-desktop
-feature, not part of this npm package. So `npx klypix-mcp` gives you the tools
-everywhere; the hands-free brain comes with the [KLYPIX desktop app](https://klypix.com)
-or the Claude Code project-brain hook. (`search_all_brains` is also hook-fed — it
-reads the cross-project registry the hook writes, so it stays empty until a hook
-has registered at least one brain.)
+This package is the **agent-neutral read/write surface** — any MCP client gets the tools above on demand (*pull*), in any project. The **automatic** brain — auto-capturing decisions from your work, injecting the brief into each session, coordinating concurrent sessions (*push*) — runs in a host **hook**, which `npx klypix-mcp install` wires for Claude Code (and the [KLYPIX desktop app](https://klypix.com) ships built-in). Other tools get the always-on rules via `link`.
 
 ### Updates — the propagation contract
 
-`npx klypix-mcp install` lays the whole brain (hooks + engine + local MCP server)
-into `~/.claude/project-brain`, and the emitted MCP config runs the server **from
-that installed bundle** (no npx cache to go stale). From then on updates are
-automatic: at session start the hook checks npm (≤ once/24h, fail-open, disable
-with `KLYPIX_AUTO_UPDATE=0`) and self-installs a newer release, so a publish
-reaches every machine by its **next session**.
-
-One honest caveat: a running stdio MCP server can't hot-swap, and **resuming a
-session (or opening a new chat in the same app) does not respawn it** — only a
-full app quit + reopen (or `/mcp` reconnect after the old process exits) starts
-the new binary. `brain_doctor` tells you when that's needed: its RUNNING line
-compares the *live server's* self-reported version against the installed bundle
-and npm, and reads `DRIFTED → /mcp reconnect` instead of pretending a stale
-server is current.
+`install` lays the whole brain (hooks + engine + local MCP server) into `~/.claude/project-brain`, and the emitted config runs the server **from that installed bundle** (no npx cache to go stale). Updates are then automatic: at session start the hook checks npm (≤ once/24h, fail-open, disable with `KLYPIX_AUTO_UPDATE=0`) and self-installs newer releases. One honest caveat: a running stdio server can't hot-swap — a new binary loads on the next full app launch (or `/mcp` reconnect); `brain_doctor`'s RUNNING line tells you when that's needed.
 
 ## Also speaks A2A (Agent-to-Agent)
-
-The same engine is exposed as an **A2A agent** so other agents and orchestrators
-can delegate memory tasks to KLYPIX as a discoverable peer:
 
 ```bash
 npx -p klypix-mcp klypix-a2a --vault ./canvases     # 127.0.0.1:41241
 # Agent Card: http://127.0.0.1:41241/.well-known/agent-card.json
 ```
 
-Skills: `make_board`, `remember`, `recall`, `read_canvas`, `list_canvases`,
-`brain_insights`, `search_all_brains`. Unlike a typical A2A agent that returns
-text, KLYPIX returns the **`.klypix` board itself** as a multimodal artifact.
-Full protocol details (JSON-RPC methods, message shapes, streaming) in
-**[A2A.md](A2A.md)**.
+Skills: `make_board`, `remember`, `recall`, `read_canvas`, `list_canvases`, `brain_insights`, `search_all_brains`. Unlike a typical A2A agent that returns text, KLYPIX returns the **`.klypix` board itself** as a multimodal artifact. Details: [A2A.md](A2A.md).
 
 ## Use it as a library
 
@@ -114,27 +105,24 @@ Full protocol details (JSON-RPC methods, message shapes, streaming) in
 import { parseKlypix, buildKlypix, appendToKlypix, structToMarkdown } from 'klypix-mcp';
 ```
 
-…or read/write from the shell:
-
 ```bash
 npx -p klypix-mcp klypix-read   path/to/board.klypix      # → markdown brief
 echo '{ "title": "Plan", "cards": [{ "text": "kickoff" }] }' \
   | npx -p klypix-mcp klypix-write --out plan.klypix
 ```
 
-## The `.klypix` format
+## The workspace it opens in
 
-A `.klypix` is just a **ZIP** of JSON + assets — open, inspectable, versioned.
-Full spec in [FORMAT.md](FORMAT.md). The point: *you own the file, and any agent
-can drive it.*
+The brain is open and free — this package, the hooks, the format. **[KLYPIX](https://klypix.com)** is the Windows app built around it: see the brain as a living spatial map, work inside it while your agents write, capture anything from anywhere, act with agents, share encrypted. Bilingual English/Arabic.
+
+## Honesty notes
+
+- Dogfooded hard: **KLYPIX itself is built with its own brain** — 600+ cards, multiple concurrent agent sessions, receipts in the file.
+- All engine intelligence is deterministic and local — the only LLM anywhere is *your* agent. No telemetry, no cloud calls, works offline.
+- Every number above is measured on our own project brain; the eval harness ships in the repo.
 
 ## Why this exists
 
-Frontier labs are racing to put your context inside *their* canvas — a roach
-motel your work checks into and never leaves for a competitor. `klypix-mcp` is
-the opposite: **your project, your file, any model, offline.** That's the one
-thing a lab is structurally disincentivized to build.
+Frontier labs are racing to put your context inside *their* memory — a roach motel your work checks into and never leaves for a competitor. `klypix-mcp` is the opposite: **your project, your file, any model, offline.** A brain that any agent reads and writes is the one thing a lab is structurally disincentivized to build.
 
-MIT licensed. Built by [Dahshan Labs](https://klypix.com). The KLYPIX desktop
-app is the spatial editor for these files — but the file and this server are
-fully open and work without it.
+MIT © [Dahshan Labs](https://klypix.com). The KLYPIX desktop app is a separate, proprietary product — the file and this server are fully open and work without it.

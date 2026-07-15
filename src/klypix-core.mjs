@@ -27,6 +27,7 @@ import {
   findUnrecordedMigrations, captureIntoBrain, tidyBrain, noteToCaptureInput,
   selectGardenCandidates, applyGarden, detectContradictions,
   rankForQuestion, questionContextToMarkdown, findLegacyShipCards,
+  challengeBrain, challengeContextToMarkdown,
 } from './klypix-format.mjs';
 
 // ── Card / connection input shape (single source for every face) ─────────────
@@ -456,6 +457,33 @@ export async function opBrainAsk({ vault, canvas, question, as_of, k = 10, log =
     result.hits = result.hits.slice(0, kk);
   }
   return { blocks: [text(stamp + questionContextToMarkdown(q, result, { mode, as_of: timeTravel ? as_of : null }))] };
+}
+
+// ── brain_challenge — the adversarial brain ───────────────────────────────────
+// surface: given a PROPOSED decision, argue back with receipts (deterministic
+// contradictions, 🛠 standing rules, tried-and-reversed chains, open-question
+// collisions). READ-ONLY — parse → analyze → render; never writes. Semantic
+// ranking is best-effort exactly like opBrainAsk (degrades to lexical).
+export async function opBrainChallenge({ vault, canvas, claim, k = 8, via, log = () => {} }) {
+  const q = String(claim || '').trim();
+  if (!q) return err('brain_challenge needs a claim — the proposed decision to argue against.');
+  const t = brainTarget(vault, canvas);
+  if (t.ambiguous) return ambiguousBrainErr(t.ambiguous);
+  if (!t.file) return err(`No brain found — looked for ./brain.klypix in the project, then ${vault}. Pass canvas: "<name>".`);
+  let struct;
+  try { ({ struct } = await parseKlypix(fs.readFileSync(t.file))); } catch (e) { return err(`Read failed: ${e.message}`); }
+  const stamp = brainStamp(t.file, struct, t.how);
+  let semantic = null, mode = 'lexical';
+  try {
+    const pipe = await Promise.race([getEmbedder(log), new Promise(r => setTimeout(() => r(null), 20_000))]);
+    if (pipe) {
+      const [qv] = await embedTexts(pipe, [q]);
+      const vecs = await vectorsForBrain(pipe, t.file, struct.cards);
+      if (qv && vecs && vecs.size) { semantic = new Map(); for (const [id, v] of vecs) semantic.set(id, dot(qv, v)); mode = 'semantic+lexical (on-device)'; }
+    }
+  } catch { semantic = null; }
+  const result = challengeBrain(struct, q, { semantic, k: Math.max(1, Math.min(20, k || 8)) });
+  return { blocks: [text(stamp + challengeContextToMarkdown(q, result, { mode, via }))] };
 }
 
 export async function opBrainInsights({ vault, canvas, staleDays }) {

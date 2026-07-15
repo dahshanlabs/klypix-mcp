@@ -26,7 +26,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import {
   resolveVault, getEmbedder, buildKlypixMap, cardSchema, connSchema,
   opListCanvases, opReadCanvas, opSearchCanvases, opSearchAllBrains,
-  opBrainInsights, opBrainConnect, opBrainReconcile, opBrainGarden, opCreateCanvas, opAddToCanvas, opBrainNote, opBrainMessage, opBrainAsk,
+  opBrainInsights, opBrainConnect, opBrainReconcile, opBrainGarden, opCreateCanvas, opAddToCanvas, opBrainNote, opBrainMessage, opBrainAsk, opBrainChallenge,
 } from '../src/klypix-core.mjs';
 import { mcpServerEntry } from '../src/agent-rules.mjs';
 
@@ -129,6 +129,19 @@ server.registerTool('brain_ask', {
     k: z.number().optional().describe('Max cards to surface for synthesis (default 10, capped 20).'),
   },
 }, async ({ question, canvas, as_of, k }) => toContent(await opBrainAsk({ vault: VAULT, canvas, question, as_of, k, log })));
+
+server.registerTool('brain_challenge', {
+  title: 'Challenge a decision against the brain (argue back with receipts)',
+  description: 'BEFORE committing to a significant decision, ask the brain to ARGUE BACK: prior decisions that deterministically contradict the claim (correction-cue / opposite-polarity evidence — never mere topical similarity), 🛠 standing rules that dispute it, approaches tried before and REVERSED (with the correction/successor as the receipt), and open questions it collides with. Candidates, not verdicts — silence means "no deterministic contradiction signal", not verified consistency. Cards captured by a DIFFERENT agent are flagged so you coordinate instead of overriding. Dismiss a confirmed-false pair (after capturing the claim) with brain_connect pairs + relationship:"not_contradiction". Defaults to the project brain ("brain").',
+  inputSchema: {
+    claim: z.string().describe('The proposed decision/claim to argue against — one concise statement.'),
+    canvas: z.string().optional().describe('Brain canvas filename/path. Defaults to the project brain ("brain").'),
+    k: z.number().optional().describe('Max contradiction candidates to surface (default 8, capped 20).'),
+  },
+}, async ({ claim, canvas, k }) => {
+  let via; try { via = server.server.getClientVersion()?.name; } catch { /* optional */ }
+  return toContent(await opBrainChallenge({ vault: VAULT, canvas, claim, k, via, log }));
+});
 
 server.registerTool('brain_insights', {
   title: 'What matters in a brain — hubs, orphans, stale questions',

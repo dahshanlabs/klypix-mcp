@@ -202,30 +202,47 @@ export async function buildKlypix(spec) {
         const lines = String(card.text ?? '').split('\n');
         const longest = lines.reduce((m, l) => Math.max(m, l.length), 0);
         const w = Math.max(160, Math.min(360, Math.round(longest * (FONT * 0.55)) + PAD));
-        const h = Math.max(40, Math.round(lines.length * LINE_H) + 14);
+        // Wrap-aware height (76eea3f contract): the app renders at width w and
+        // wraps at ~0.5em/char; its observer only GROWS an under-estimate, so a
+        // long single-line card used to measure 40px and render 150+ → overlap.
+        const cpl = Math.max(8, Math.floor(((w - PAD) / (FONT * 0.5)) * 0.9));
+        const estLines = lines.reduce((n, l) => n + Math.max(1, Math.ceil(l.length / cpl)), 0);
+        const h = Math.max(40, Math.round(estLines * LINE_H) + 14);
         return { w, h };
     };
     const cols = Math.max(1, Math.ceil(Math.sqrt(order.length)));
     const COL_W = 380, GAP_Y = 70, START = 80;
+    // Row pitch from each row's tallest card (a fixed pitch let tall cards
+    // grow through the row below).
+    const sizes = order.map(id => sizeFor(cards[idByIndex.indexOf(id)]));
+    const rows = Math.ceil(order.length / cols);
+    const rowHs = new Array(rows).fill(0);
+    sizes.forEach((sz, idx) => { const r = Math.floor(idx / cols); rowHs[r] = Math.max(rowHs[r], sz.h); });
+    const rowYs = new Array(rows).fill(0);
+    for (let r = 1; r < rows; r++) rowYs[r] = rowYs[r - 1] + rowHs[r - 1] + GAP_Y;
     const positions = {};
     let zi = 0;
     const nextZKey = makeZKeyGen();
     order.forEach((id, idx) => {
         const card = cards[idByIndex.indexOf(id)];
-        const { w, h } = sizeFor(card);
+        const { w, h } = sizes[idx];
         const col = idx % cols, row = Math.floor(idx / cols);
         positions[id] = {
             x: card.x ?? (START + col * COL_W),
-            y: card.y ?? (START + row * (180 + GAP_Y) + (col % 2) * 12),
+            y: card.y ?? (START + rowYs[row] + (col % 2) * 12),
             w, h, zKey: nextZKey(), zIndex: zi++, parentId: null,
         };
     });
 
-    const itemJson = (card) => {
+    const itemJson = (card, w) => {
         if (card.type === 'text') {
             return {
                 type: 'text', locked: false, createdAt: now, createdBy: 'agent',
                 content: String(card.text ?? ''), fontSize: FONT,
+                // PLAIN text (no border) renders at max-content width unless
+                // authoredWidth pins the wrap — without it a long single line
+                // runs horizontally into the next grid column.
+                ...(w && !card.border ? { authoredWidth: w } : {}),
                 color: card.color || '#1a1a1f', border: !!card.border, borderColor: '#1e1e2e',
                 heading: !!card.heading, fontFamily: 'Thmanyah Sans',
                 fontWeight: card.heading ? 'bold' : 'normal', fontStyle: 'normal',
@@ -255,7 +272,7 @@ export async function buildKlypix(spec) {
     zip.file('canvas.json', JSON.stringify(canvasJson));
     for (const id of order) {
         const card = cards[idByIndex.indexOf(id)];
-        zip.file(`items/${shard(id)}/${id}.json`, JSON.stringify(itemJson(card)));
+        zip.file(`items/${shard(id)}/${id}.json`, JSON.stringify(itemJson(card, positions[id]?.w)));
     }
     return zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
 }
@@ -2715,13 +2732,16 @@ export async function applyGarden(buffer, { syntheses = [] } = {}) {
     const nextZKey = makeZKeyGen(top);
     canvas.connections = Array.isArray(canvas.connections) ? canvas.connections : [];
     const byTitle = new Map();
-    for (const c of struct.cards) if (c.type === 'container') { const t = (c.title || '').trim().toLowerCase(); if (t && !byTitle.has(t)) byTitle.set(t, c.id); }
+    for (const c of struct.cards) if (c.type === 'container') { const t = normTitleKey(c.title); if (t && !byTitle.has(t)) byTitle.set(t, c.id); }
     // Archive primitives (mirror captureIntoBrain): find-or-create Archive, move a
     // card into it un-baking any group-shrink, and rewrite a card's text in place.
+    const createdCtns = new Set();
+    const newCards = [];
     const ensureArchive = () => {
         let id = byTitle.get('archive');
         if (id) return id;
         id = `ctn_${rand()}`;
+        createdCtns.add(id);
         const G = BRAIN_GEOM;
         zip.file(`items/${shard(id)}/${id}.json`, JSON.stringify({ type: 'container', locked: false, createdAt: now, createdBy: 'agent', title: 'Archive', collapsed: false, scopeLocked: false, borderColor: 'rgba(120,120,135,0.6)' }));
         canvas.positions[id] = { x: nextContainerX(canvas), y: G.START, w: G.AREA_W, h: G.TITLE_BAR + G.PAD * 2, zKey: nextZKey(), zIndex: canvas.order.length, parentId: null };
@@ -2788,6 +2808,7 @@ export async function applyGarden(buffer, { syntheses = [] } = {}) {
         zip.file(`items/${shard(sid)}/${sid}.json`, JSON.stringify({ type: 'text', locked: false, createdAt: now, createdBy: 'agent', createdVia: 'gardener', content, fontSize: 12, color: '#e8e8ed', border: true, borderColor: 'rgba(59,130,246,0.6)', heading: false }));
         canvas.positions[sid] = { x: ctnPos.x + 20, y: ctnPos.y + (ctnPos.h || 0) + 10, w: 300, h: measureCardH(content), zKey: nextZKey(), zIndex: canvas.order.length, parentId: area.containerId };
         canvas.order.push(sid);
+        newCards.push(sid);
         stats.synthCards++;
         for (const cand of area.candidates) {
             await rewriteCard(cand.id, j => { j.content = `⤵ consolidated ${today}\n${j.content}`; j.borderColor = 'rgba(120,120,135,0.5)'; });
@@ -2798,6 +2819,25 @@ export async function applyGarden(buffer, { syntheses = [] } = {}) {
         stats.areas++;
     }
     if (!stats.synthCards) return { buffer, stats };
+    // Broadcast-time overlap guarantee (same as appendIntoContainers): the
+    // synthesis card lands BELOW the container frame (auto-grow collision) and
+    // archived cards re-parent while keeping their old world spot (Archive
+    // balloon) — the incremental re-flow re-stacks both before finalizing.
+    if (canvas.settings && canvas.settings.brainLayout === 'cluster-v1') {
+        const containerIds = new Set(struct.cards.filter(c => c.type === 'container').map(c => c.id));
+        for (const id of byTitle.values()) containerIds.add(id);
+        const meta = new Map();
+        for (const c of struct.cards) {
+            if (c.type === 'container') continue;
+            const p = canvas.positions[c.id] || {};
+            meta.set(c.id, { h: Math.max(40, Number(p.h) || 40), w: Math.max(40, Number(p.w) || BRAIN_GEOM.CARD_W), keepSize: true, createdAt: Number(c.createdAt) || 0 });
+        }
+        for (const id of newCards) {
+            const p = canvas.positions[id];
+            meta.set(id, { h: Math.max(40, Number(p.h) || 40), w: Math.max(40, Number(p.w) || BRAIN_GEOM.CARD_W), keepSize: true, createdAt: now });
+        }
+        await reflowBrainGeometry({ zip, canvas, struct, meta, containerIds, extraTitles: byTitle, forceFull: false, createdNow: createdCtns, clearKidAnchors: true });
+    }
     const out = await finalizeBrainZip(zip, canvas, manifest, now);
     return { buffer: out, stats };
 }

@@ -26,7 +26,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import {
   resolveVault, getEmbedder, buildKlypixMap, cardSchema, connSchema,
   opListCanvases, opReadCanvas, opSearchCanvases, opSearchAllBrains,
-  opBrainInsights, opBrainConnect, opBrainReconcile, opBrainGarden, opCreateCanvas, opAddToCanvas, opBrainNote, opBrainMessage, opBrainAsk, opBrainChallenge, opCanvasView,
+  opBrainInsights, opBrainConnect, opBrainReconcile, opBrainGarden, opCreateCanvas, opAddToCanvas, opBrainNote, opBrainMessage, opBrainAsk, opBrainChallenge, opCanvasView, opBrainLens,
 } from '../src/klypix-core.mjs';
 import { mcpServerEntry } from '../src/agent-rules.mjs';
 
@@ -151,6 +151,18 @@ server.registerTool('brain_insights', {
     staleDays: z.number().optional().describe('Open questions older than this many days count as stale (default 21).'),
   },
 }, async ({ canvas, staleDays }) => toContent(await opBrainInsights({ vault: VAULT, canvas, staleDays })));
+
+server.registerTool('brain_lens', {
+  title: 'Brain lens — machine-readable views of a brain (freshness · provenance · activity · timeline · orrery · unresolved)',
+  description: 'The data twin of the desktop app\'s Brain Lenses: ONE structured payload any surface (agent, web viewer, iOS) can render. Views: freshness (age buckets + stale open ❓), provenance (who wrote the brain, by channel: you/claude/cursor/git/gardener/…), activity (last 7 days), timeline (birth-order events — the Replay spine; events included only for view:"timeline"), orrery (focus+context neighborhood of one card: 1/2/3-hop ring-capped nodes + typed edges — pass root as a card title prefix or id, defaults to the most-connected hub), unresolved (open-❓ triage, oldest first, with typed evidence). Read-only by construction — it never writes. Use it to answer "what\'s rotting / who wrote this / what happened this week / what\'s around X / what\'s undecided" with receipts, or to feed a UI.',
+  inputSchema: {
+    canvas: z.string().optional().describe('Canvas filename/path. Defaults to the project brain ("brain").'),
+    view: z.enum(['all', 'freshness', 'provenance', 'activity', 'timeline', 'orrery', 'unresolved']).optional().describe('Which lens to compute (default "all" — every section, timeline events omitted from structured output unless view is "timeline").'),
+    root: z.string().optional().describe('Orrery center: a card title prefix or id. Default: the most-connected hub card.'),
+    staleDays: z.number().optional().describe('Open questions older than this count as stale (default 21).'),
+    limit: z.number().optional().describe('Cap for recent-activity entries (default 30).'),
+  },
+}, async ({ canvas, view, root, staleDays, limit }) => toContent(await opBrainLens({ vault: VAULT, canvas, view, root, staleDays, limit })));
 
 server.registerTool('brain_connect', {
   title: 'Connect related-but-unlinked brain cards (densify the graph)',

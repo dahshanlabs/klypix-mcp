@@ -28,6 +28,7 @@ import {
   selectGardenCandidates, applyGarden, detectContradictions,
   rankForQuestion, questionContextToMarkdown, findLegacyShipCards,
   challengeBrain, challengeContextToMarkdown, buildRenderSpec, structToBrief,
+  brainLensData, lensToMarkdown,
 } from './klypix-format.mjs';
 
 // ── Card / connection input shape (single source for every face) ─────────────
@@ -506,6 +507,35 @@ export async function opCanvasView({ vault, canvas }) {
     + `${renderSpec.counts.strokes ? ` · ${renderSpec.counts.strokes} ink strokes not shown` : ''}\n\n`
     + structToBrief(struct, { maxRecent: 10, maxMilestones: 4, maxConnections: 0, maxSkills: 6 });
   return { blocks: [text(summary)], structured: { renderSpec } };
+}
+
+// ── Brain lens (machine-readable views: the desktop Lenses' data twin) ───────
+// One structured payload per view so agents AND product surfaces (web viewer,
+// iOS) render the same picture from the same source: freshness buckets,
+// provenance channels, 7-day activity, birth-order timeline (the Replay
+// spine), orrery neighborhood, and open-❓ triage. Read-only by construction.
+export async function opBrainLens({ vault, canvas, view = 'all', root, staleDays, limit }) {
+  const t = brainTarget(vault, canvas);
+  if (t.ambiguous) return ambiguousBrainErr(t.ambiguous);
+  if (!t.file) return err(`No brain found — looked for ./brain.klypix in the project, then ${vault}. Pass canvas: "<name>".`);
+  const VIEWS = new Set(['all', 'freshness', 'provenance', 'activity', 'timeline', 'orrery', 'unresolved']);
+  const v = VIEWS.has(String(view)) ? String(view) : 'all';
+  try {
+    const { struct } = await parseKlypix(fs.readFileSync(t.file));
+    const lens = brainLensData(struct, {
+      ...(root ? { root } : {}),
+      ...(Number(staleDays) > 0 ? { staleDays: Number(staleDays) } : {}),
+      ...(Number(limit) > 0 ? { limit: Number(limit) } : {}),
+    });
+    // Timeline events are the one unbounded field — included only when the
+    // caller explicitly asks for the timeline view (products replaying).
+    const structured = v === 'timeline'
+      ? lens
+      : { ...lens, timeline: { ...lens.timeline, events: [] } };
+    return { blocks: [text(brainStamp(t.file, struct, t.how) + lensToMarkdown(lens, v))], structured: { lens: structured, view: v } };
+  } catch (e) {
+    return err(`Lens failed: ${e.message}`);
+  }
 }
 
 export async function opBrainInsights({ vault, canvas, staleDays }) {

@@ -114,6 +114,8 @@ export async function parseKlypix(buffer) {
             // git / gardener / …) — persisted by the capture paths, surfaced for
             // brain_challenge's "captured by another agent" twist + view badges.
             createdVia: it.createdVia ?? null,
+            // 'user' | 'agent' — the coarse authorship bit (brain_lens provenance).
+            createdBy: it.createdBy ?? null,
             parentId: it.parentId ?? null,
             // Parent container's title — the card's "area" in brain terms.
             area: it.parentId ? (cardTitle(items[it.parentId]) || null) : null,
@@ -3076,6 +3078,214 @@ export async function buildKlypixMap(spec) {
     zip.file('canvas.json', JSON.stringify(canvasJson));
     for (const id of order) zip.file(`items/${shard(id)}/${id}.json`, JSON.stringify(items[id]));
     return zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+}
+
+// ── Brain Lens data (the machine-readable twin of the app's Brain Lenses) ────
+// One source of truth for every product surface (desktop lenses, web viewer,
+// iOS, agents): freshness buckets, provenance channels, 7-day activity,
+// birth-order timeline, orrery (focus+context neighborhood), and the open-❓
+// triage. Pure over a parsed struct — read-only by construction.
+
+const LENS_DAY = 86_400_000;
+const lensIsArchived = (c) => /^archive$/i.test(String(c.area || '').trim());
+const lensTitle = (c) => String(c.title || c.text || c.id).split('\n').map(s => s.trim()).find(Boolean)?.slice(0, 80) || c.id;
+const LENS_VIA = [
+    [/claude/i, 'claude'], [/cursor/i, 'cursor'], [/cline|windsurf|copilot/i, 'other-agent'],
+    [/git|commit/i, 'git'], [/gardener/i, 'gardener'], [/ship|release/i, 'ship-event'],
+    [/mcp|hook|agent/i, 'agent'],
+];
+const lensChannel = (c) => {
+    const via = String(c.createdVia || '');
+    if (via) { for (const [re, k] of LENS_VIA) if (re.test(via)) return k; return via.slice(0, 16).toLowerCase(); }
+    if (c.createdBy === 'user') return 'you';
+    if (c.createdBy === 'agent') return 'agent';
+    return 'unknown';
+};
+
+export function brainLensData(struct, opts = {}) {
+    const { staleDays = 21, root = null, limit = 30, now = Date.now() } = opts;
+    const cards = struct.cards.filter(c => c.type !== 'container');
+    const textCards = cards.filter(c => c.type === 'text' && String(c.text || '').trim());
+
+    // Freshness — age buckets + resolution glyphs; stale open ❓ called out.
+    const freshness = { fresh7d: 0, days30: 0, days90: 0, stale: 0, archived: 0, staleQuestions: [] };
+    for (const c of textCards) {
+        if (lensIsArchived(c)) { freshness.archived++; continue; }
+        const age = now - (c.createdAt || 0);
+        const isOpenQ = /❓/.test(c.text || '') && !/✅|↩|⤵/.test(c.text || '');
+        if (isOpenQ && age > staleDays * LENS_DAY)
+            freshness.staleQuestions.push({ id: c.id, title: lensTitle(c), area: c.area || null, ageDays: Math.round(age / LENS_DAY) });
+        if (!c.createdAt || age > 90 * LENS_DAY) freshness.stale++;
+        else if (age <= 7 * LENS_DAY) freshness.fresh7d++;
+        else if (age <= 30 * LENS_DAY) freshness.days30++;
+        else freshness.days90++;
+    }
+    freshness.staleQuestions.sort((a, b) => b.ageDays - a.ageDays);
+
+    // Provenance — who wrote the brain, by channel.
+    const channels = {};
+    for (const c of textCards) { const k = lensChannel(c); channels[k] = (channels[k] || 0) + 1; }
+
+    // Activity — the last 7 days, day by day, newest additions listed.
+    const days = [];
+    for (let d = 6; d >= 0; d--) {
+        const start = now - (d + 1) * LENS_DAY, end = now - d * LENS_DAY;
+        days.push({ daysAgo: d, added: cards.filter(c => (c.createdAt || 0) > start && (c.createdAt || 0) <= end).length });
+    }
+    const recent = cards
+        .filter(c => (c.createdAt || 0) > now - 7 * LENS_DAY)
+        .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
+        .slice(0, limit)
+        .map(c => ({ id: c.id, title: lensTitle(c), area: c.area || null, hoursAgo: Math.round((now - c.createdAt) / 3_600_000) }));
+
+    // Timeline — birth order (the Replay spine). Events stay compact: id + t.
+    const events = cards
+        .filter(c => Number(c.createdAt) > 0)
+        .map(c => ({ id: c.id, t: c.createdAt }))
+        .sort((a, b) => a.t - b.t);
+    const weeks = new Map();
+    for (const e of events) {
+        const wk = new Date(e.t); wk.setUTCHours(0, 0, 0, 0); wk.setUTCDate(wk.getUTCDate() - wk.getUTCDay());
+        const key = wk.toISOString().slice(0, 10);
+        weeks.set(key, (weeks.get(key) || 0) + 1);
+    }
+    const timeline = {
+        total: events.length,
+        tMin: events[0]?.t ?? null,
+        tMax: events[events.length - 1]?.t ?? null,
+        weeks: [...weeks.entries()].map(([weekStart, added]) => ({ weekStart, added })),
+        events,
+    };
+
+    // Orrery — focus+context neighborhood, ring-capped so it can never hairball.
+    const degree = new Map();
+    for (const cn of struct.connections) { degree.set(cn.fromId, (degree.get(cn.fromId) || 0) + 1); degree.set(cn.toId, (degree.get(cn.toId) || 0) + 1); }
+    const byId = new Map(struct.cards.map(c => [c.id, c]));
+    let rootId = null;
+    if (root) {
+        const want = String(root).trim().toLowerCase();
+        rootId = struct.cards.find(c => c.id === root)?.id
+            ?? struct.cards.find(c => lensTitle(c).toLowerCase().startsWith(want))?.id
+            ?? null;
+    }
+    if (!rootId) { let best = 0; for (const [id, n] of degree) if (byId.has(id) && n > best) { best = n; rootId = id; } }
+    let orrery = null;
+    if (rootId) {
+        const RING_CAP = { 1: 14, 2: 22, 3: 30 };
+        const adj = new Map();
+        for (const cn of struct.connections) {
+            if (!byId.has(cn.fromId) || !byId.has(cn.toId)) continue;
+            if (!adj.has(cn.fromId)) adj.set(cn.fromId, []);
+            if (!adj.has(cn.toId)) adj.set(cn.toId, []);
+            adj.get(cn.fromId).push(cn.toId);
+            adj.get(cn.toId).push(cn.fromId);
+        }
+        const known = new Set([rootId]);
+        const nodes = [];
+        let frontier = [rootId], overflow = 0;
+        for (const hop of [1, 2, 3]) {
+            const candidates = [];
+            for (const cur of frontier) for (const other of adj.get(cur) || []) {
+                if (!known.has(other) && !candidates.includes(other)) candidates.push(other);
+            }
+            candidates.sort((a, b) => (degree.get(b) || 0) - (degree.get(a) || 0) || (a < b ? -1 : 1));
+            const kept = candidates.slice(0, RING_CAP[hop]);
+            overflow += candidates.length - kept.length;
+            for (const id of kept) {
+                known.add(id);
+                const c = byId.get(id);
+                nodes.push({ id, hop, title: lensTitle(c), area: c.area || null, degree: degree.get(id) || 0 });
+            }
+            frontier = kept;
+            if (!frontier.length) break;
+        }
+        const seen = new Set();
+        const edges = [];
+        for (const cn of struct.connections) {
+            if (!known.has(cn.fromId) || !known.has(cn.toId)) continue;
+            const k = `${cn.fromId}|${cn.toId}|${cn.relationship || ''}|${cn.label || ''}`;
+            if (seen.has(k)) continue;
+            seen.add(k);
+            edges.push({ fromId: cn.fromId, toId: cn.toId, rel: cn.relationship || null, label: cn.label || null });
+        }
+        const rc = byId.get(rootId);
+        orrery = { rootId, rootTitle: lensTitle(rc), rootArea: rc.area || null, nodes, edges, overflow };
+    }
+
+    // Unresolved — open-❓ triage, oldest debt first, with typed evidence.
+    const unresolved = [];
+    for (const c of textCards) {
+        if (!/❓/.test(c.text || '') || /✅|↩|⤵/.test(c.text || '') || lensIsArchived(c)) continue;
+        const evidence = [];
+        for (const cn of struct.connections) {
+            const other = cn.fromId === c.id ? cn.toId : cn.toId === c.id ? cn.fromId : null;
+            if (!other || !byId.has(other) || evidence.length >= 4) continue;
+            evidence.push({ id: other, title: lensTitle(byId.get(other)), rel: cn.relationship || null, label: cn.label || null });
+        }
+        unresolved.push({
+            id: c.id, title: lensTitle(c), area: c.area || null,
+            ageDays: c.createdAt ? Math.max(0, Math.round((now - c.createdAt) / LENS_DAY)) : 0,
+            evidence,
+        });
+    }
+    unresolved.sort((a, b) => b.ageDays - a.ageDays || (a.id < b.id ? -1 : 1));
+
+    return {
+        title: struct.title,
+        counts: { cards: cards.length, textCards: textCards.length, connections: struct.connections.length },
+        staleDays,
+        freshness,
+        provenance: { channels },
+        activity: { days, recent },
+        timeline,
+        orrery,
+        unresolved,
+    };
+}
+
+/** Agent-readable rendering of brainLensData (a view, or 'all'). */
+export function lensToMarkdown(d, view = 'all') {
+    const L = [];
+    const date = (t) => (t ? new Date(t).toISOString().slice(0, 10) : '—');
+    const want = (v) => view === 'all' || view === v;
+    L.push(`# Brain lens — ${d.title} (${d.counts.textCards} cards · ${d.counts.connections} connections)`);
+    if (want('freshness')) {
+        const f = d.freshness;
+        L.push(`\n## Freshness\n≤7d **${f.fresh7d}** · ≤30d **${f.days30}** · ≤90d **${f.days90}** · stale **${f.stale}** · archived **${f.archived}**`);
+        if (f.staleQuestions.length) {
+            L.push(`Stale open ❓ (> ${d.staleDays}d):`);
+            for (const q of f.staleQuestions.slice(0, 8)) L.push(`- ${q.ageDays}d · ${q.title}${q.area ? ` _(${q.area})_` : ''}`);
+        }
+    }
+    if (want('provenance')) {
+        const ch = Object.entries(d.provenance.channels).sort((a, b) => b[1] - a[1]);
+        L.push(`\n## Who wrote it\n${ch.map(([k, n]) => `${k} **${n}**`).join(' · ') || '—'}`);
+    }
+    if (want('activity')) {
+        L.push(`\n## This week\n${d.activity.days.map(x => `${x.daysAgo}d:${x.added}`).join(' · ')} (added per day, 6d→today)`);
+        for (const r of d.activity.recent.slice(0, 10)) L.push(`- ${r.hoursAgo}h ago · ${r.title}${r.area ? ` _(${r.area})_` : ''}`);
+    }
+    if (want('timeline')) {
+        L.push(`\n## Timeline\n${d.timeline.total} timed cards, ${date(d.timeline.tMin)} → ${date(d.timeline.tMax)}`);
+        L.push(d.timeline.weeks.map(w => `${w.weekStart}:${w.added}`).join(' · '));
+    }
+    if (want('orrery') && d.orrery) {
+        L.push(`\n## Orrery — “${d.orrery.rootTitle}”${d.orrery.rootArea ? ` _(${d.orrery.rootArea})_` : ''}`);
+        for (const hop of [1, 2, 3]) {
+            const ring = d.orrery.nodes.filter(n => n.hop === hop);
+            if (ring.length) L.push(`hop ${hop}: ${ring.map(n => n.title.slice(0, 42)).join(' · ')}`);
+        }
+        if (d.orrery.overflow) L.push(`(+${d.orrery.overflow} more beyond ring caps)`);
+    }
+    if (want('unresolved')) {
+        L.push(`\n## Unresolved (oldest first)`);
+        if (!d.unresolved.length) L.push('No open questions — everything is decided. 🎉');
+        for (const q of d.unresolved.slice(0, 12)) {
+            L.push(`- **${q.ageDays}d** · ${q.title}${q.area ? ` _(${q.area})_` : ''}`);
+            for (const ev of q.evidence.slice(0, 3)) L.push(`  ↳ ${ev.label || ev.rel || 'linked'}: ${ev.title.slice(0, 60)}`);
+        }
+    }
+    return L.join('\n');
 }
 
 /** Render a parsed struct to the markdown brief (shared by read-klypix + MCP). */

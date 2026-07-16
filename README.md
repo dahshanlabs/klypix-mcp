@@ -44,6 +44,8 @@ The whole brain — layout, decisions, arrows, **and the actual bytes** (images,
 
 And it's not a cage: everything **exports to Markdown and JSON Canvas** in one command, and **Obsidian `.canvas` files open directly** in KLYPIX. Plain markdown is the most portable text on earth — that's exactly why we export to it. Full spec: [FORMAT.md](FORMAT.md).
 
+**"Project" means any project.** Two showcase brains ship in [`examples/`](examples/), identical in engine, different in life: [`showcase-brain.klypix`](examples/showcase-brain.klypix) is *Aurora*, a fictional weather app mid-build (radar tiles, API caps, a correction with its receipt) — and [`showcase-wedding.klypix`](examples/showcase-wedding.klypix) is *Our Wedding* (venue, vendors, guest list, the same correction machinery pointed at a caterer). Same 📌 Focus, same arrows, same brief. If it has decisions worth keeping, it gets a brain.
+
 ## Setup for plain MCP clients
 
 Any MCP client gets the tools without the hooks. For **Claude Desktop**, in `claude_desktop_config.json`:

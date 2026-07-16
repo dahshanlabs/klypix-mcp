@@ -2605,6 +2605,24 @@ export async function buildKlypixMap(spec) {
     const TITLE_BAR = 44, PAD = 16, CARD_GAP = 12, CARD_W = 280, FONT = 15, LINE_H = FONT * 1.4;
     const AREA_W = CARD_W + PAD * 2;
     const COL_GAP = 48, ROW_GAP = 48, START = 80;
+    // Wrapped-height contract for the bordered cards this builder emits. They
+    // render at width CARD_W with the app's bordered-text box model
+    // (src/canvas/items/TextItem.tsx:733-734 — padding '8px 10px' + 1px border,
+    // box-sizing:border-box, lineHeight 1.35, wordBreak:break-word) and the app's
+    // ResizeObserver (TextItem.tsx:672-692) GROWS item.h to the rendered content
+    // height on open. Estimating height from explicit '\n' count alone ignores
+    // wrapping: a long single line reserves ~1 line (~40px) but renders as several
+    // wrapped lines, so the app grows the card and it overlaps the next one. So
+    // estimate the WRAPPED line count using the app's own text metrics
+    // (src/canvas/items/types.ts sizePastedText: avgCharPx = fontSize*0.5,
+    // charsPerLine = floor(usableWidth/avgCharPx)) and deliberately OVER-reserve a
+    // hair (0.9 wrap-efficiency for word-boundary raggedness + a margin). The app
+    // only ever SHRINKS an over-estimate, so over-reserving widens gaps but never
+    // overlaps; under-reserving overlaps.
+    const TEXT_PAD_H = 10, TEXT_BORDER = 1, WRAP_MARGIN = 8;
+    const CONTENT_W = CARD_W - TEXT_PAD_H * 2 - TEXT_BORDER * 2;   // usable text px (258)
+    const AVG_CHAR_PX = FONT * 0.5;                                // app's ~0.5em/char metric
+    const CHARS_PER_LINE = Math.max(8, Math.floor((CONTENT_W / AVG_CHAR_PX) * 0.9));
     const cols = Math.max(1, Math.min(4, Math.ceil(Math.sqrt(spec.areas.length))));
 
     const positions = {};
@@ -2619,10 +2637,12 @@ export async function buildKlypixMap(spec) {
     let rowTopY = START, rowMaxH = 0, colX = START, colIdx = 0;
     spec.areas.forEach((area, ai) => {
         const cards = (area.cards || []).filter(c => c && typeof c.text === 'string' && c.text.trim());
-        // measure card heights
+        // measure card heights — WRAPPED lines, not just explicit '\n' count.
         const measured = cards.map(c => {
-            const lines = String(c.text).split('\n').length;
-            return Math.max(40, Math.round(lines * LINE_H) + 18);
+            const wrappedLines = String(c.text).split('\n').reduce(
+                (n, line) => n + Math.max(1, Math.ceil(line.length / CHARS_PER_LINE)), 0);
+            // + 18 = 8px×2 vertical padding + 1px×2 border (box-sizing:border-box).
+            return Math.max(40, Math.round(wrappedLines * LINE_H) + 18 + WRAP_MARGIN);
         });
         const innerH = measured.reduce((s, h) => s + h + CARD_GAP, 0);
         const areaH = TITLE_BAR + PAD + innerH + PAD;

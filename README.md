@@ -127,4 +127,4 @@ The brain is open and free — this package, the hooks, the format. **[KLYPIX](h
 
 Frontier labs are racing to put your context inside *their* memory — a roach motel your work checks into and never leaves for a competitor. `klypix-mcp` is the opposite: **your project, your file, any model, offline.** A brain that any agent reads and writes is the one thing a lab is structurally disincentivized to build.
 
-MIT © [Dahshan Labs](https://klypix.com). The KLYPIX desktop app is a separate, proprietary product — the file and this server are fully open and work without it.
+Apache-2.0 © [Dahshan Labs](https://klypix.com). The KLYPIX desktop app is a separate, proprietary product — the file and this server are fully open and work without it.

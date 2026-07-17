@@ -2,7 +2,7 @@
 
 `.klypix` is an **open, local-first, agent-neutral** canvas file. It's a plain
 **ZIP** of JSON + assets — no proprietary binary, fully inspectable (`unzip
-your.klypix`), and parseable with the MIT library in this package. You own it;
+your.klypix`), and parseable with the Apache-2.0 library in this package. You own it;
 any agent or app can read and write it.
 
 ## Container layout

@@ -1,9 +1,9 @@
 {
   "name": "klypix-mcp",
-  "version": "1.28.0",
+  "version": "1.29.0",
   "description": "Every project gets a brain — one open .klypix file your AI agents read, write, and argue from, over MCP. Works with Claude, Cursor, Cline, any model.",
   "type": "module",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "keywords": [
     "mcp",
     "model-context-protocol",

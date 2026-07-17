@@ -259,6 +259,10 @@ export async function buildKlypix(spec) {
         format: 'klypix', version: 4, schemaVersion: 4,
         createdAt: nowIso, updatedAt: nowIso,
         title: spec.title || 'Untitled',
+        // Explicit brain marker (additive; older readers ignore it): a brain is
+        // detected by manifest.kind OR the brain.* filename — the flag survives
+        // renames, so co-owned merge semantics can't be dropped silently.
+        ...(spec.kind === 'brain' ? { kind: 'brain' } : {}),
         stats: { itemCount: order.length, assetCount: 0, totalBytes: 0 },
         sync: { enabled: false, lastSyncRev: null, lastSyncAt: null, deviceId: `dev_${rand()}${rand()}` },
     };
@@ -432,6 +436,14 @@ function areaOfCard(card) {
     if (Array.isArray(card.tags) && card.tags[0]) return String(card.tags[0]);
     return 'Notes';
 }
+// Retro-stamp: write paths that BY CONTRACT only ever run on project brains
+// (tidy / arrange / capture / garden / brain_connect) mark the manifest kind,
+// so an existing brain gains the explicit flag on its next touch and co-owned
+// merge semantics survive a file rename. Detection everywhere is
+// `manifest.kind === 'brain' OR basename brain.*` — the filename convention
+// keeps working forever; the flag closes its silent-rename hole.
+const stampBrainKind = (manifest) => { if (manifest && manifest.kind !== 'brain') manifest.kind = 'brain'; };
+
 async function finalizeBrainZip(zip, canvas, manifest, now) {
     if (manifest) {
         manifest.updatedAt = new Date(now).toISOString();
@@ -845,6 +857,7 @@ export async function tidyBrain(buffer, opts = {}) {
     // clearKidAnchors stays false — no redundant zip reads).
     await reflowBrainGeometry({ zip, canvas, struct, meta, containerIds, extraTitles: byTitle, forceFull: opts.forceFull === true, createdNow });
 
+    stampBrainKind(manifest);
     const out = await finalizeBrainZip(zip, canvas, manifest, now);
     return { buffer: out, moved, containers: byTitle.size };
 }
@@ -1051,6 +1064,7 @@ export async function arrangeBrain(buffer, opts = {}) {
         }
         canvas.order = (canvas.order || []).filter(id => !removed.has(id));
 
+        stampBrainKind(manifest);
         return finalizeBrainZip(zip, canvas, manifest, Date.now());
     };
 
@@ -1824,6 +1838,7 @@ export async function addBrainConnections(buffer, edges) {
         added++;
     }
     if (!added) return { buffer, added: 0 };
+    stampBrainKind(manifest);
     const out = await finalizeBrainZip(zip, canvas, manifest, Date.now());
     return { buffer: out, added };
 }
@@ -2584,6 +2599,7 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
         }
 
         cards.push(...milestonesFallback);
+        stampBrainKind(manifest);
         work = await finalizeBrainZip(zip, canvas, manifest, now);
     }
 
@@ -2643,6 +2659,7 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                 }
             } catch { /* auto-linking is opportunistic */ }
         }
+        stampBrainKind(manifest);
         work = await finalizeBrainZip(zip, canvas, manifest, now);
     }
 
@@ -2840,6 +2857,7 @@ export async function applyGarden(buffer, { syntheses = [] } = {}) {
         }
         await reflowBrainGeometry({ zip, canvas, struct, meta, containerIds, extraTitles: byTitle, forceFull: false, createdNow: createdCtns, clearKidAnchors: true });
     }
+    stampBrainKind(manifest);
     const out = await finalizeBrainZip(zip, canvas, manifest, now);
     return { buffer: out, stats };
 }
@@ -3062,6 +3080,9 @@ export async function buildKlypixMap(spec) {
     const manifest = {
         format: 'klypix', version: 4, schemaVersion: 4, createdAt: nowIso, updatedAt: nowIso,
         title: spec.title || 'Brain', stats: { itemCount: order.length, assetCount: 0, totalBytes: 0 },
+        // Map builds default to spec.kind; brains pass kind:'brain' so the flag
+        // survives renames (detection = manifest.kind OR brain.* filename).
+        ...(spec.kind === 'brain' ? { kind: 'brain' } : {}),
         sync: { enabled: false, lastSyncRev: null, lastSyncAt: null, deviceId: `dev_${rand()}${rand()}` },
     };
     const xs = Object.values(positions);

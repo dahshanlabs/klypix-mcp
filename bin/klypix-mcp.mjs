@@ -63,6 +63,7 @@ if (process.argv[2] === 'init') {
   if (fs.existsSync(target)) { console.error(`brain.klypix already exists in ${process.cwd()} — not overwriting.`); process.exit(0); }
   const buf = await buildKlypixMap({
     title: 'project brain',
+    kind: 'brain',   // explicit flag — co-owned merge semantics survive a rename
     areas: [
       { title: 'Goal', cards: [{ text: '❓ What is this project for, and for whom?\nAgent: survey the repo on your first session and replace this with the real goal.' }] },
       { title: 'Architecture', cards: [{ text: '❓ Key components and how they fit.\nAgent: record the actual shape from the repo — only what a new session must know.' }] },

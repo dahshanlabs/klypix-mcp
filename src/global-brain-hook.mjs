@@ -865,6 +865,184 @@ function inflightFooter(sid, struct) {
     } catch { return ''; }
 }
 
+// ── Post-verified-fix rule DRAFTS (capture-coverage closer, 2026-07-17) ──────
+// The founder-surfaced gap: the brain RECALLS solved problems well (rerank /
+// brain_ask / challenge are strong), but a fix is only recallable if an agent
+// remembered to emit a marker — and a trap-shaped fix that lands as a PLAIN note
+// only resurfaces on a lexical phrasing match, not every session like a 🛠️ rule.
+// This closes that WITHOUT blind auto-capture (noise kills recall): when a session
+// MAKES and VERIFIES a fix that reads like a recurring trap, the Stop hook DRAFTS a
+// candidate 🛠️ rule for human/agent approval — a draft in a per-project sidecar,
+// NEVER a brain card. The read paths surface it once/session with a ready-to-emit
+// `+` marker (promotion is one line); approve the real traps, ignore the rest and
+// they age out. Same ~/.claude never-throw / best-effort / zero-cost-when-empty
+// contract as the other sidecars. Two hard gates keep it from spamming: a VERIFY
+// signal must be present (real fix work, not idle prose) and ≤2 NEW drafts per Stop.
+const RULE_DRAFTS = path.resolve(CWD, '.claude', 'brain-rule-drafts.json');
+const RULE_DRAFTS_LOCK = RULE_DRAFTS + '.lock';
+const RULE_DRAFT_TTL_MS = 21 * 24 * 60 * 60 * 1000;   // a never-approved draft ages out in 3 weeks
+const RULE_DRAFTS_MAX = 40;                            // hard cap on the per-project store
+const RULE_DRAFTS_PER_SESSION = 2;                    // anti-spam: ≤ 2 NEW drafts per Stop
+const RULE_DRAFT_MAX_SURFACINGS = 5;                  // ignored across this many distinct sessions → stop nagging (decay < TTL)
+// A successful test / build / typecheck / lint / e2e command — the "AND verifies"
+// half of the gate. Deterministic + scraped from the transcript's SUCCESSFUL shell
+// calls (a fix/perf commit is also a verify — you commit verified work).
+const VERIFY_CMD = /\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|build|lint|typecheck|check|verify|e2e)\b|\bnpm\s+ci\b|\bvitest\b|\bjest\b|\bplaywright\b|\bpytest\b|\bgo\s+test\b|\bcargo\s+(?:test|build|check|clippy)\b|\btsc\b|\bmocha\b|\beslint\b|\bphpunit\b|\brspec\b|\bgradle\s+(?:test|build|check)\b|\bmvn\s+(?:test|verify)\b/i;
+const readRuleDrafts = () => { try { const d = JSON.parse(fs.readFileSync(RULE_DRAFTS, 'utf8')); return Array.isArray(d.drafts) ? d.drafts : []; } catch { return []; } };
+const writeRuleDrafts = (drafts) => { try { fs.mkdirSync(path.dirname(RULE_DRAFTS), { recursive: true }); fs.writeFileSync(RULE_DRAFTS, JSON.stringify({ drafts: (drafts || []).slice(-RULE_DRAFTS_MAX) }, null, 2)); } catch { /* best-effort */ } };
+const draftKey = (area, text) => sha(((area || '') + '|' + String(text)).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim());
+// Token overlap: is a draft seed substantially covered by a (skill) card's text?
+// Used to (a) retire a draft a captured 🛠️ skill fulfils and (b) NOT surface a draft
+// a live skill already covers — the approval detection, via any promotion path.
+function draftMatches(draft, text) {
+    const a = new Set(String(draft?.text || '').toLowerCase().match(/[a-z0-9]{4,}/g) || []);
+    if (a.size < 3) return false;
+    const b = new Set(String(text || '').toLowerCase().match(/[a-z0-9]{4,}/g) || []);
+    let hit = 0; for (const tok of a) if (b.has(tok)) hit++;
+    return hit / a.size >= 0.6;
+}
+// A short, promotable rule seed from a trap card: first non-tag line, with a leading
+// "Area: " prefix + glyphs stripped, capped. The human/agent refines it when emitting +.
+function ruleSeedFrom(card) {
+    const raw = String(card?.text || '').split('\n').map(s => s.trim()).filter(Boolean);
+    let line = raw.find(l => !/^#/.test(l)) || raw[0] || '';
+    line = line.replace(/^([^:]{1,30}):\s+/, '').replace(/^[🏁🛠️❓🎯✅↩︎·\s]+/u, '').trim();
+    return line.slice(0, 200);
+}
+// Did this session actually VERIFY something? (the "AND verifies" gate)
+function sessionVerified(shellCmds, errorIds, hadFixCommit) {
+    if (hadFixCommit) return true;
+    for (const { id, cmd } of shellCmds) { if (errorIds.has(id)) continue; if (VERIFY_CMD.test(cmd)) return true; }
+    return false;
+}
+// Locked read-modify-write of the drafts sidecar (TTL-pruned on every touch). Skips
+// the write entirely when the result equals what's already on disk — so a Stop that
+// captures only skills (no draft to add/retire) never creates an empty {drafts:[]}
+// sidecar in an adopter project, and identical rewrites cause no churn.
+function persistDrafts(mutate) {
+    const got = acquireLock(RULE_DRAFTS_LOCK, { tries: 20, waitMs: 25 });
+    try {
+        const now = Date.now();
+        const raw = readRuleDrafts();
+        const rawJson = JSON.stringify(raw);   // SNAPSHOT before mutate: filter() shares object refs, so an in-place
+        const before = raw.filter(d => d && d.id && d.text && (now - (d.lastSeen || d.firstSeen || 0)) < RULE_DRAFT_TTL_MS);
+        const next = (mutate(before, now) || before).slice(-RULE_DRAFTS_MAX);   // mutation (seenCount bump / shownSessions) would else also mutate `raw` → false no-op
+        if (JSON.stringify(next) === rawJson) return;   // disk already matches → no write/mkdir/churn
+        writeRuleDrafts(next);
+    } catch { /* best-effort */ } finally { if (got) releaseLock(RULE_DRAFTS_LOCK); }
+}
+// Draft trap-shaped fixes this session VERIFIED, deduped + recurrence-bumped. cards[]
+// is the fully-built capture batch (markers + fix/perf commits). A candidate is a
+// PLAIN decision (not already ❓/🏁/🛠️/🎯 — those are already surfaced or standing)
+// that reads as a TRAP (lib.looksLikeTrap) — a finding that WILL recur but landed as
+// a one-off note. NEVER writes a brain card; only the pending-draft sidecar. A 🛠️
+// skill captured this same batch RETIRES a matching draft (approval). Never throws.
+function draftRulesFromFixes(lib, cards, verified, sid) {
+    try {
+        if (typeof lib.looksLikeTrap !== 'function' || !Array.isArray(cards) || !cards.length) return { drafted: 0, approved: 0 };
+        const skillCards = cards.filter(c => /🛠/.test(String(c.text || '')));
+        const candidates = [];
+        if (verified) {
+            for (const c of cards) {
+                const t = String(c.text || '');
+                if (/🛠|❓|🏁|🎯/.test(t)) continue;              // only PLAIN decisions
+                if (c.createdVia === 'ship-event') continue;      // a ship is not a fix
+                if (!lib.looksLikeTrap(t)) continue;
+                const seed = ruleSeedFrom(c);
+                if (seed.length < 12) continue;                   // too thin to be a useful rule
+                // Must have ≥3 distinct significant tokens — the SAME bar draftMatches uses to
+                // retire a draft. A seed below it is both un-retireable (promoting it could never
+                // clear the nag) and too generic to be a useful standing rule, so drop it now.
+                if ((seed.toLowerCase().match(/[a-z0-9]{4,}/g) || []).filter((v, i, a) => a.indexOf(v) === i).length < 3) continue;
+                candidates.push({ area: c.area || '', text: seed, source: c.createdVia || 'marker' });
+            }
+        }
+        if (!candidates.length && !skillCards.length) return { drafted: 0, approved: 0 };
+        let added = 0, approved = 0;
+        persistDrafts((drafts, now) => {
+            if (skillCards.length) {   // approval: a captured 🛠️ skill retires the draft it fulfils
+                const before = drafts.length;
+                drafts = drafts.filter(d => !skillCards.some(sc => draftMatches(d, String(sc.text || ''))));
+                approved = before - drafts.length;
+            }
+            const handled = new Set();
+            for (const cand of candidates) {
+                if (skillCards.some(sc => draftMatches({ text: cand.text }, String(sc.text || '')))) continue;   // already promoted to a skill THIS batch — don't also draft it
+                const key = draftKey(cand.area, cand.text);
+                if (handled.has(key)) continue; handled.add(key);   // collapse in-batch duplicate keys → no same-session seenCount inflation
+                const existing = drafts.find(d => d.id === key);
+                if (existing) { existing.seenCount = (existing.seenCount || 1) + 1; existing.lastSeen = now; continue; }   // cross-session recurrence — bump, don't stack
+                if (added >= RULE_DRAFTS_PER_SESSION) continue;   // cap NEW drafts only
+                drafts.push({ id: key, area: cand.area, text: cand.text, source: cand.source, firstSeen: now, lastSeen: now, seenCount: 1, shownSessions: [] });
+                added++;
+            }
+            return drafts;
+        });
+        return { drafted: added, approved };
+    } catch { return { drafted: 0, approved: 0 }; }
+}
+// Pending drafts: TTL-fresh, not already covered by a live 🛠️ skill, and NOT decayed
+// (a draft surfaced-and-ignored across ≥ RULE_DRAFT_MAX_SURFACINGS distinct sessions
+// stops nagging well before the TTL — that's the "no infinite nag" dismiss path).
+// Read-only.
+function livePendingDrafts(struct) {
+    const now = Date.now();
+    let drafts = readRuleDrafts().filter(d => d && d.id && d.text
+        && (now - (d.lastSeen || d.firstSeen || 0)) < RULE_DRAFT_TTL_MS
+        && (Array.isArray(d.shownSessions) ? d.shownSessions.length : 0) < RULE_DRAFT_MAX_SURFACINGS);
+    if (!drafts.length) return [];
+    let liveSkills = [];
+    try { liveSkills = (struct?.cards || []).filter(c => c && c.type !== 'container' && /🛠/.test(String(c.text || '')) && !/^archive$/i.test(c.area || '')); } catch { /* */ }
+    if (liveSkills.length) drafts = drafts.filter(d => !liveSkills.some(sc => draftMatches(d, sc.text)));
+    return drafts;
+}
+// The nudge: surface pending drafts, HOTTEST first (recurring traps take the top slots
+// so their escalation actually shows), each with a ready-to-emit `+` marker (promotion
+// is one line). markShown=true (per-prompt path) records that THIS session surfaced the
+// displayed drafts — durably, ON the draft (shownSessions) — so a NEW session re-surfaces
+// (until promoted / covered / decayed) but this session won't re-nag, and the count
+// doubles as the decay signal. The SessionStart file tier passes markShown=false (lists
+// all, writes nothing). Empty string when nothing → zero-cost contract holds. Never throws.
+function ruleDraftsFooter(sid, struct, { markShown = true } = {}) {
+    try {
+        if (!sid) return '';
+        const all = livePendingDrafts(struct);
+        if (!all.length) return '';
+        all.sort((a, b) => (b.seenCount || 1) - (a.seenCount || 1) || (b.lastSeen || 0) - (a.lastSeen || 0));   // hottest / most-recent first
+        const seenBy = (d) => Array.isArray(d.shownSessions) && d.shownSessions.includes(sid);
+        const pending = markShown ? all.filter(d => !seenBy(d)) : all;
+        if (!pending.length) return '';
+        const display = pending.slice(0, 3);
+        const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+        const lines = ['', '---',
+            '## 🛠️ Draft rule(s) from a verified fix — approve to make them fire EVERY session',
+            'A change you verified this session reads like a recurring trap, but it landed as a one-off note (recallable only on a phrasing match). Promote a REAL trap to a standing 🛠️ rule card — surfaces every session, like the release-naming rule — by emitting its marker; ignore the rest and they age out. This is a DRAFT: nothing was written to the brain.'];
+        for (const d of display) {
+            const seed = flat(d.text).slice(0, 160);
+            const rec = (d.seenCount || 1) >= 2 ? `  ⭐ recurred ${d.seenCount}× — this trap keeps coming back; make it a standing rule` : '';
+            lines.push(`- seed: “${seed}”${rec}`);
+            lines.push(`  promote → \`🧠 BRAIN [${d.area || 'Fixes'}] +: ${seed}\``);
+        }
+        if (pending.length > display.length) lines.push(`- …and ${pending.length - display.length} more draft(s) in \`.claude/brain-rule-drafts.json\`.`);
+        // Mark ONLY the displayed drafts surfaced-to-this-session (durable, on the draft).
+        // So the next 3 can surface on a later prompt this session, and a genuinely-ignored
+        // draft decays after RULE_DRAFT_MAX_SURFACINGS distinct sessions. Rare write (only
+        // when a draft actually surfaces); persistDrafts no-ops if nothing changed.
+        if (markShown) {
+            const shownIds = new Set(display.map(d => d.id));
+            persistDrafts((drafts) => {
+                for (const d of drafts) {
+                    if (!shownIds.has(d.id)) continue;
+                    if (!Array.isArray(d.shownSessions)) d.shownSessions = [];
+                    if (!d.shownSessions.includes(sid)) d.shownSessions = [...d.shownSessions, sid].slice(-RULE_DRAFT_MAX_SURFACINGS);
+                }
+                return drafts;
+            });
+        }
+        return '\n' + lines.join('\n') + '\n';
+    } catch { return ''; }
+}
+
 async function capture(lib) {
     const input = readHookInput();
     // Keep this session's coordination lane warm at every Stop (a turn ended; the
@@ -1029,6 +1207,14 @@ async function capture(lib) {
         process.stderr.write(`[brain] DRY-RUN — would capture ${cards.length} card(s), ${resolutions.length} resolution(s), ${updates.length} update(s):\n`);
         for (const d of ledger) process.stderr.write(`  ${d.action}: ${d.area ? '[' + d.area + '] ' : ''}${d.preview}\n`);
         return;
+    }
+    // Post-verified-fix rule DRAFTS (see the block above). Independent of the brain
+    // write — it only touches the pending-drafts sidecar, never a brain card. DRY-RUN
+    // has already returned above, so this never persists during an inspection. A fix/
+    // perf commit this session counts as a verify (you commit verified work).
+    {
+        const hadFixCommit = commitCards.some(cc => cc.createdVia === 'commit' && !/🏁/.test(String(cc.text || '')));
+        draftRulesFromFixes(lib, cards, sessionVerified(shellCmds, errorIds, hadFixCommit), sid);
     }
     if (!cards.length && !resolutions.length && !updates.length) {
         // Record the commit baseline / advance even with nothing to capture, so
@@ -1217,7 +1403,12 @@ async function promptRetrieve(lib) {
     // Other live sessions' in-flight events (struct may be null on a token-less
     // prompt — then representedInBrain just keeps entries; they're rarely in-brain yet).
     const inflight = inflightFooter(sid, struct);
-    if (!repeats.length && !freshHits.length && !peers && !inflight && !messages) return; // nothing → zero output, zero added context
+    // Rule-draft nudge — the same-session promote-me push. Gated on struct so the
+    // "already covered by a live 🛠️ skill" filter always runs (a token-less prompt
+    // leaves struct null; SessionStart's own draft surface + count line cover that
+    // case) and so a terse prompt pays zero extra parse cost.
+    const drafts = struct ? ruleDraftsFooter(sid, struct, { markShown: true }) : '';
+    if (!repeats.length && !freshHits.length && !peers && !inflight && !messages && !drafts) return; // nothing → zero output, zero added context
     const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
     const day = (ts) => ts ? new Date(ts).toISOString().slice(0, 10) : '';
     const head = (c, n = 120) => { const t = flat(c.text); return t.length > n ? t.slice(0, n - 1) + '…' : t; };
@@ -1313,6 +1504,7 @@ async function promptRetrieve(lib) {
     }
     const parts = [];
     if (lines.length) parts.push(lines.join('\n'));
+    if (drafts) parts.push(drafts.replace(/^\n+/, '')); // 🛠️ pending rule drafts awaiting approval (its own block)
     if (inflight) parts.push(inflight.replace(/^\n+/, '')); // ⚡ in-flight peers' events (its own block)
     if (peers) parts.push(peers.replace(/^\n+/, '')); // live-session presence footer (its own block)
     if (messages) parts.push(messages.replace(/^\n+/, '')); // 📨 inbound deliberate peer notes
@@ -1538,6 +1730,7 @@ function legendFooter() {
         + '`🧠 BRAIN [Area]: decision` · `[Area] ?: open question` · `[Area] !: milestone` · `[Area] +: 🛠️ skill (reusable how-to / gotcha — resurfaces every session, never ages out)` · `[Area] ✓: resolves+archives the matching card` · `[Area] ~: updates it in place` · 🎯 in text = a goal (reads as open).\n'
         + 'Optional suffixes: `closes: <card title / [[wikilink]]>` (resolve the strategy/question this fulfils) · `ev: <file[:line]>, PR#<n>` (anchor to code → auto drift-badge).\n'
         + '**Correcting a stale card:** include the word `CORRECTION` (or "was WRONG" / "OBSOLETE" — UPPERCASE; casing is the deliberate-signal, casual prose never fires it) in the decision — the capture then hunts the stale card across ALL areas at a lower match bar and supersedes it (archived + arrowed, with a receipt; restore from Archive if it grabbed the wrong one). A rephrased duplicate `?` merges into the existing open question instead of stacking a twin.\n'
+        + '**Verified-fix rule drafts:** when a session FIXES + VERIFIES something trap-shaped that landed as a one-off note, the Stop hook auto-DRAFTS a candidate 🛠️ rule (a per-project sidecar — never a brain card). Approve a real recurring trap with the `+` marker the nudge shows you and it becomes a standing rule that fires EVERY session (like the release-naming rule); ignore the rest and they age out. Draft-only, no blind auto-capture.\n'
         + '**Session brief:** the SessionStart hook prints a ≤2KB ultra brief and writes the FULL brief to `.claude/brain-brief.md` — read that file when planning non-trivial work.\n'
         + '**Routing:** capture project decisions / milestones / open questions / gotchas HERE, *at the moment you decide* — this brain is the shared, portable memory that survives context resets and the next agent reads. A host memory store (if any) is for *user* preferences; never leave project state only in a private scratchpad.\n'
         + 'Coordinate with a concurrent session: `🧠 MSG [<their-id or all>]: <text>` — a one-time note (NOT a brain card) delivered to that session on its next prompt.\n';
@@ -1613,6 +1806,7 @@ async function read(lib) {
     // go to stdout, where the agent actually sees it, exactly once).
     const full = ((typeof lib.structToBrief === 'function') ? lib.structToBrief(struct, { freshness }) : lib.structToMarkdown(struct))
         + inflightFooter(input.session_id, struct) + selfHealFooter(drifted) + reconcileFooter(lib, struct) + staleOpenFooter(lib, struct)
+        + ruleDraftsFooter(input.session_id, struct, { markShown: false })
         + selfCheckFooter() + doctorFooter() + versionCurrencyFooter() + legendFooter() + memoryFooter();
     const emitFull = () => {
         process.stdout.write(full + messageFooter(input.session_id || '', input.transcript_path));
@@ -1645,11 +1839,15 @@ async function read(lib) {
     } catch { /* */ }
     try { if (typeof lib.findStaleOpenCards === 'function') { const { total } = lib.findStaleOpenCards(struct, { max: 5 }); if (total) heals.push(`${total} open card(s) look already done`); } } catch { /* */ }
     const healLine = heals.length ? `\n🔧 Self-heal: ${heals.join(' · ')} — detail + fix markers in ${briefRel}.` : '';
+    // Rule-draft nudge (capture-coverage): a one-line count in the preview; the full
+    // promote-markers live in the brief file (read-only here — no shown-mark).
+    const pendingDrafts = livePendingDrafts(struct);
+    const draftLine = pendingDrafts.length ? `\n🛠️ ${pendingDrafts.length} draft rule(s) from verified fixes await approval — promote-markers in ${briefRel} (turn a recurring trap into a rule that fires every session).` : '';
     // 📨 messages are delivered-ONCE (acked the moment this reads them) — they
     // go right after the ultra brief, at the top of the visible window, never
     // after a stack of footers that could push them past a preview cut.
     const messages = messageFooter(input.session_id || '', input.transcript_path);
-    const out = ultra + messages + healLine
+    const out = ultra + messages + healLine + draftLine
         + inflightFooter(input.session_id, struct)
         + selfCheckFooter() + doctorFooter() + versionCurrencyFooter();
     process.stdout.write(out);

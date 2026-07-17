@@ -2341,6 +2341,40 @@ export function looksLikeSkill(text) {
     return STRONG_SKILL_CUES.test(t) && !SKILL_EVENT_PINS.test(t);
 }
 
+// ── Trap classifier — the draft-a-rule signal (capture-coverage, 2026-07-17) ──
+// A "trap" is a finding that WILL RECUR: a failure mode or a corrective "do X, not
+// Y" rule — as opposed to a one-time event ("we shipped X"). looksLikeSkill above
+// only fires on STRONG imperative cues (always / never / must not / gotcha) and
+// AUTO-promotes those to 🛠️ skills at capture. But most hard-won fixes read as
+// FAILURE shapes WITHOUT an imperative verb — "root cause was a race in the lock",
+// "the fix was to project the diagonal instead of max(scaleX,scaleY)", "it silently
+// threw on an empty list" — so they land as PLAIN decision cards that only resurface
+// on a lexical phrasing match. That's the founder-surfaced capture-coverage gap: the
+// fix is effectively un-recallable unless someone remembered the exact words. This
+// classifier detects that broader trap surface. It is DELIBERATELY never used to
+// auto-write a card (that is the blind-auto-capture noise the brain refuses) — it
+// only gates a DRAFT the human/agent must approve, so it can afford to be broader
+// than looksLikeSkill while the draft's verify-gate + per-session cap keep the
+// surfaced volume tight. Precision-first all the same: a false miss is cheap (emit
+// a `+` marker by hand), a false draft is mild noise in one footer line.
+const TRAP_CONTRAST = /(\bnever\b|\bmust(?:\s+not)?\b|\bdon'?t\b|\binstead\s+of\b|\brather\s+than\b|,\s*not\b|\bnot\s+\w+\s+but\b|\bavoid\b|\bbeware\b|\bwatch\s+out\b)/i;
+// NOTE: no bare `\bstale\b` — it's domain vocabulary in a memory tool (stale card /
+// stale install), a systematic false-positive with near-zero true-trap value (a real
+// staleness trap always carries another cue). Fixtures wouldn't catch that; the real
+// 790-card brain did (29 plain cards matched it, ~all noise). Precision > recall here.
+// broke/breaks/broken carry a negative lookahead for the DECOMPOSITION idiom ("broke
+// App.tsx into 13 hooks", "broke out the retry logic") — that's a refactor milestone,
+// not a failure trap. A real breakage ("broke Alt+Space", "the exporter breaks on
+// rotated strokes") has no into/apart/up/out/down after it, so it still fires.
+const TRAP_FAILURE = /(\bgotcha\b|\bpitfall\b|\bfootgun\b|\broot\s+cause\b|\bregress\w*|\bsilently\b|\brace\s+condition\b|\bdead\s?locks?\b|\bmemory\s+leaks?\b|\bleaks?\b|\boff[-\s]?by[-\s]?one\b|\bTDZ\b|\bzombies?\b|\bhangs?\b|\bwedges?\b|\bthe\s+(?:real\s+)?(?:fix|bug|culprit|cause|problem|issue)\s+(?:was|is|turned)\b|\bturns?\s+out\b|\bculprit\b|\b(?:broke|breaks?|broken)\b(?!\s+(?:\w[\w.]*\s+)?(?:into|apart|up|out|down)\b)|\bcrash\w*|\bthrows?\b|\bthrew\b|\bcorrupt\w*|\bflak\w*|\bnull\s+(?:pointer|deref|ref)\b)/i;
+export function looksLikeTrap(text) {
+    const t = String(text || '');
+    if (/🛠|❓|🎯/.test(t)) return false;                                 // already a skill / question / goal
+    if (/🏁/.test(t) && !TRAP_FAILURE.test(t)) return false;             // a pure milestone is not a trap
+    if (SKILL_EVENT_PINS.test(t) && !TRAP_FAILURE.test(t)) return false; // "released v1.2.3" alone is an event, not a trap
+    return TRAP_CONTRAST.test(t) || TRAP_FAILURE.test(t);
+}
+
 export async function captureIntoBrain(buffer, { cards = [], resolutions = [], updates = [] } = {}) {
     const SUPERSEDE_AT = 0.6, RESOLVE_AT = 0.3, UPDATE_AT = 0.45, CLOSE_COVER_AT = 0.6, QUESTION_MERGE_AT = 0.6;
     let work = buffer;

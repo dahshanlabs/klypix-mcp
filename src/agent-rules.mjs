@@ -261,6 +261,10 @@ function targets(projectDir) {
       // Added 1.13.0 — close the "not generated at all" coverage gap the audit flagged.
       { tool: 'Gemini CLI', file: j('GEMINI.md'), kind: 'merge' },
       { tool: 'Aider', file: j('CONVENTIONS.md'), kind: 'dedicated', frontmatter: '' },
+      // Added 1.29.1 — Antigravity (Gemini IDE) reads .agents/AGENTS.md; the desktop
+      // app already writes it (projectBrainConnect.ts), this adds CLI audit coverage.
+      // kind:'merge' so the fenced block coexists with any existing content.
+      { tool: 'Antigravity', file: j('.agents', 'AGENTS.md'), kind: 'merge' },
     ],
     mcp: [
       { tool: 'Cursor', file: j('.cursor', 'mcp.json'), wrapKey: 'mcpServers', withType: false },

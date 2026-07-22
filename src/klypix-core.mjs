@@ -28,7 +28,7 @@ import {
   selectGardenCandidates, applyGarden, detectContradictions,
   rankForQuestion, questionContextToMarkdown, findLegacyShipCards,
   challengeBrain, challengeContextToMarkdown, buildRenderSpec, structToBrief,
-  brainLensData, lensToMarkdown,
+  brainLensData, lensToMarkdown, deathDateOfCard,
 } from './klypix-format.mjs';
 
 // ── Card / connection input shape (single source for every face) ─────────────
@@ -203,7 +203,10 @@ async function vectorsForBrain(pipe, brainPath, cards) {
   for (const c of want) { const e = cache.cards[c.id]; if (e?.v) map.set(c.id, e.v); }
   return map;
 }
-const deathDateOf = (text) => { const m = /(?:↩︎ superseded|✅) (\d{4}-\d{2}-\d{2})/.exec(String(text)); return m ? Date.parse(m[1]) : null; };
+// Death-date reads go through the ONE shared reader in klypix-format —
+// this file used to carry a divergent local regex (missing the bare
+// "↩ superseded" variant AND the gardener's "⤵ consolidated" stamp), so
+// cross-brain as_of was silently stricter than brain_ask as_of (2026-07-23).
 
 // ── On-device cross-encoder reranker (brain_ask precision) ───────────────────
 // Eval-proven on the frozen human-paraphrase set (2026-07-15): recall@5 15%→40%,
@@ -375,7 +378,7 @@ export async function opSearchAllBrains({ vault, query, as_of, log = () => {} })
       const isArchived = /^archive$/i.test(c.area || '');
       if (asOfTs != null) {
         if ((c.createdAt || 0) > asOfTs) continue;                  // didn't exist yet
-        const died = isArchived ? deathDateOf(c.text) : null;
+        const died = isArchived ? deathDateOfCard(c) : null;
         if (died != null && died <= asOfTs) continue;               // already superseded then
       }
       let lex = 0;
@@ -651,7 +654,19 @@ export async function opBrainReconcile({ vault, canvas, root, mode = 'all' }) {
 // for the CALLING agent to synthesize (the engine is pure — the model writes the
 // prose); apply consolidates each area into a 🌿 card and archives the originals
 // with audit arrows. Mirrors brain_connect's dry-run/apply discipline.
-export async function opBrainGarden({ vault, canvas, apply = false, syntheses }) {
+// HUMAN GATE (2026-07-23, hardened same day after adversarial review): apply
+// used to be a bare flag the dry-run TEXT invited the agent to set — a
+// model-proposes-model-approves loop with zero human in it. Apply now requires
+// `approve: "<code>"` derived from the exact candidate set + day, and the code
+// is deliberately NOT printed in the dry-run response — the HUMAN obtains it
+// out-of-band by running `npx klypix-mcp garden-code` in the project (or via
+// the app's Brain Health pill) and pastes it into chat after reviewing the
+// plan. An agent that never showed the human the plan never gets the code.
+// Stale approvals die when the selection or the day changes.
+export const gardenApprovalCode = (areas) =>
+  sha1(areas.map(a => a.candidates.map(c => c.id).sort().join(',')).sort().join('|') + '|' + new Date().toISOString().slice(0, 10)).slice(0, 8);
+
+export async function opBrainGarden({ vault, canvas, apply = false, syntheses, approve = '' }) {
   const t = brainTarget(vault, canvas);
   if (t.ambiguous) return ambiguousBrainErr(t.ambiguous);
   if (!t.file) return err(`No brain found — looked for ./brain.klypix in the project, then ${vault}. Pass canvas: "<name>".`);
@@ -665,10 +680,13 @@ export async function opBrainGarden({ vault, canvas, apply = false, syntheses })
   if (!apply) {
     const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
     const body = areas.map(a => `## ${a.title}  (${a.candidates.length} dormant cards)\n` + a.candidates.map(c => `- ${flat(c.text).slice(0, 240)}`).join('\n')).join('\n\n');
-    return { blocks: [text(stamp + `# 🌿 Gardener — ${areas.length} area(s) with DORMANT cards to consolidate\nThese are old, peripheral (≤1 link) cards only — hubs and still-referenced decisions were left untouched. For EACH area below, write ONE tight synthesis (3-6 sentences, plain prose, no headers) that preserves every still-relevant fact / decision / number and drops only repetition + play-by-play. Then call \`brain_garden\` again with \`apply:true\` and \`syntheses: [{ "title": "<area title EXACTLY as shown>", "synthesis": "<text>" }, …]\`. Originals are archived with audit arrows — nothing is deleted; one undo un-gardens.\n\n${body}`)] };
+    return { blocks: [text(stamp + `# 🌿 Gardener — ${areas.length} area(s) with DORMANT cards to consolidate\nThese are old, peripheral (≤1 link) cards only — hubs and still-referenced decisions were left untouched. For EACH area below, write ONE tight synthesis (3-6 sentences, plain prose, no headers) that preserves every still-relevant fact / decision / number and drops only repetition + play-by-play.\n\n⚠️ HUMAN APPROVAL REQUIRED — this pass ARCHIVES cards, and the approval code is NOT given to you. Show the human this plan (areas + card list + your syntheses) and ask them to run \`npx klypix-mcp garden-code\` in this project; they will paste an 8-character code into chat if — and only if — they approve. Then call \`brain_garden\` again with \`apply:true\`, \`syntheses: [{ "title": "<area title EXACTLY as shown>", "synthesis": "<text>" }, …]\` and \`approve: "<their code>"\`. Never guess or fabricate the code. Originals are archived with audit arrows — nothing is deleted; one undo un-gardens.\n\n${body}`)] };
   }
 
   if (!Array.isArray(syntheses) || !syntheses.length) return err('apply:true needs syntheses:[{title, synthesis}, …] — run the dry run first (apply omitted) to get the areas + their cards.');
+  if (String(approve || '').trim() !== gardenApprovalCode(areas)) {
+    return err('Garden apply requires HUMAN approval: show the human the dry-run plan + your syntheses, then ask them to run `npx klypix-mcp garden-code` in this project and paste the 8-character code — pass it as approve:"<code>". The code is never shown to you directly. (It changes when the candidate set or the day changes — if it expired, re-run the dry run and re-confirm.)');
+  }
   try {
     const { buffer, stats } = await applyGarden(fs.readFileSync(file), { syntheses });
     const skippedNote = (stats.skipped && stats.skipped.length)

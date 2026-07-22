@@ -36,7 +36,7 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
   linkProject(proj, { version: '1.2.3' });
   let a = auditProject(proj, { version: '1.2.3' });
   ok(a.ok && a.drift.length === 0, `fresh link → all ${a.files.length} files ok`);
-  ok(a.files.length === 9, 'projects exactly 9 targets (7 rules + 2 mcp)');
+  ok(a.files.length === 10, 'projects exactly 10 targets (8 rules + 2 mcp — Antigravity added 1.29.1)');
   ok(statusOf(a, 'GEMINI.md') === 'ok' && statusOf(a, 'CONVENTIONS.md') === 'ok', 'GEMINI.md + CONVENTIONS.md generated (were "not generated")');
 
   // ZERO-TOUCH — newer current version but IDENTICAL content → still ok (a version-

@@ -122,6 +122,10 @@ export async function parseKlypix(buffer) {
             // Evidence anchors (file:line / PR#) with the git blob OID stamped at
             // capture-time — lets the hook flag a card whose cited code drifted.
             evidence: Array.isArray(it.evidence) && it.evidence.length ? it.evidence : null,
+            // Machine death-date (epoch ms) written by the gardener at
+            // consolidation — the prose "⤵ consolidated" stamp's reliable twin,
+            // so as_of time-travel never depends on parsing prose.
+            ...(Number.isFinite(it.consolidatedAt) ? { consolidatedAt: it.consolidatedAt } : {}),
         })),
         connections: connections.map(c => ({
             from: titleOf(c.fromId), to: titleOf(c.toId),
@@ -1110,6 +1114,42 @@ export async function arrangeBrain(buffer, opts = {}) {
     return { buffer: work, stats };
 }
 
+// ── Per-area status digest (2026-07-23 field incident) ───────────────────────
+// ONE computed current-state line per ACTIVE area: newest 🏁 headline + open
+// count. This is the fact whose tier-eviction let a stale "remaining:" claim
+// win a "what is remaining?" answer — the freshest milestone had fallen out of
+// the brief while the corpse stayed in the Open tier. O(areas), bounded, pure;
+// also the seed of the future brain_ask status mode (one digest assembler).
+export function areaStatusDigest(struct, { activeDays = 30, maxAreas = 20, now = Date.now() } = {}) {
+    if (!struct || !Array.isArray(struct.cards)) return [];
+    const cutoff = now - activeDays * 86_400_000;
+    const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+    const day = (ts) => ts ? new Date(ts).toISOString().slice(0, 10) : '';
+    const cut = (t, n) => { let s = String(t).slice(0, n); if (/[\uD800-\uDBFF]$/.test(s)) s = s.slice(0, -1); return s.trimEnd() + (String(t).length > n ? '…' : ''); };
+    const byArea = new Map();
+    for (const c of struct.cards) {
+        if (c.type === 'container' || !(c.text || '').trim()) continue;
+        const area = flat(c.area);
+        if (!area || /^archive$/i.test(area)) continue;
+        if (!byArea.has(area)) byArea.set(area, []);
+        byArea.get(area).push(c);
+    }
+    const rows = [];
+    for (const [area, cs] of byArea) {
+        const newest = Math.max(...cs.map(c => c.createdAt || 0));
+        if (newest < cutoff) continue;                                  // dormant area — not "current state"
+        const miles = cs.filter(c => /🏁/.test(c.text) && !/❓|🎯|🛠/.test(c.text)).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+        const opens = cs.filter(c => /❓|🎯/.test(c.text) && !/🛠/.test(c.text));
+        const m = miles[0];
+        const mileTxt = m ? `last 🏁 ${day(m.createdAt)} “${cut(flat(m.text).replace(/^[^:\n]{1,40}:\s*/, '').replace(/^🏁\s*/, ''), 70)}”` : 'no 🏁 yet';
+        rows.push({ newest, line: `- ${area} — ${mileTxt} · ${opens.length} open · latest ${day(newest)}` });
+    }
+    rows.sort((a, b) => b.newest - a.newest);
+    const out = rows.slice(0, maxAreas).map(r => r.line);
+    if (rows.length > maxAreas) out.push(`- …and ${rows.length - maxAreas} more active area(s) — search the brain.`);
+    return out;
+}
+
 // ── Tiered brain brief ───────────────────────────────────────────────────────
 // A compact, token-bounded session brief: area map + open questions + recent
 // decisions + milestones. Everything older stays in the file, reachable via the
@@ -1184,15 +1224,39 @@ export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMile
     const odBadge = (c) => { const o = overdueById.get(c.id); return o ? `  ·  ⏰ OVERDUE — deadline ${o.date} passed ${o.daysOverdue}d ago; verify or close (✓)` : ''; };
     push(`# ${struct.title} — brain brief`);
     push(`*${struct.format} · ${struct.counts.cards} cards · ${struct.counts.connections} connections · tiered brief (focus + open + last ${recentDays}d headlines); full cards via klypix-canvas MCP search*`);
+    // TIER CAPS (2026-07-23): Focus/Open/Skills used to render UNBOUNDED full
+    // text — the "flat forever" budget only ever gated Recent/Connections, so
+    // the brief was already 2× over budget at ~950 cards and heading for ~31k
+    // tokens at 9000. Every tier now has a count cap + a budget guard + an
+    // HONEST overflow line (never a silently-truncated "complete" list).
     if (focus.length) {
         push('', '## 📌 Human focus (cards the human placed here — act on these first)');
-        for (const c of focus) push(`- ${fr(c)}${flat(c.text)}${odBadge(c)}`);
+        let shown = 0;
+        for (const c of focus.slice(0, 20)) { push(`- ${fr(c)}${flat(c.text)}${odBadge(c)}`); shown++; }
+        if (shown < focus.length) push(`- ⚠️ …and ${focus.length - shown} MORE focus card(s) — read them (MCP search) before acting; this list is NOT complete.`);
     }
-    if (open.length) { push('', '## Open questions & goals'); for (const c of open) push(`- ${fr(c)}${flat(c.text)}${odBadge(c)}`); }
+    if (open.length) {
+        push('', `## Open questions & goals (${open.length}${overdueById.size ? `, ${overdueById.size} ⏰ overdue` : ''})`);
+        // Overdue first, then newest — the card that falls off the bottom must
+        // never be a passed deadline.
+        const sorted = open.slice().sort((a, b) => (overdueById.has(b.id) ? 1 : 0) - (overdueById.has(a.id) ? 1 : 0) || (b.createdAt || 0) - (a.createdAt || 0));
+        let shown = 0;
+        for (const c of sorted) {
+            if (shown >= 40 || used > BUDGET_CHARS * 0.55) break;
+            push(`- ${fr(c)}${flat(c.text)}${odBadge(c)}`);
+            shown++;
+        }
+        if (shown < open.length) push(`- …and ${open.length - shown} more open item(s) — ask the brain (brain_ask) rather than assuming this list is complete.`);
+    }
     if (skills.length) {
         push('', '## 🛠️ Skills — how we do things here (reusable; applies every session)');
-        for (const c of skills.slice(0, maxSkills)) push(`- ${fr(c)}${flat(c.text)}`);
-        if (skills.length > maxSkills) push(`- …and ${skills.length - maxSkills} more skill(s) — search the brain.`);
+        let shown = 0;
+        for (const c of skills.slice(0, maxSkills)) {
+            if (used > BUDGET_CHARS * 0.85) break;
+            push(`- ${fr(c)}${flat(c.text)}`);
+            shown++;
+        }
+        if (shown < skills.length) push(`- …and ${skills.length - shown} more skill(s) — search the brain.`);
     }
     // ⚠️ Conflicts — pairs flagged conflicts_with (e.g. by parallel sessions);
     // surfaced HIGH so the next session reconciles them, not buries them.
@@ -1202,6 +1266,13 @@ export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMile
         .filter(c => !/^archive$/i.test(c.title || ''))
         .map(c => `${flat(c.title)} (${texts.filter(t => t.parentId === c.id).length})`);
     if (areaCounts.length) { push('', '## Areas', areaCounts.join(' · ')); }
+    // Computed current-state row — one line per ACTIVE area (newest 🏁 + open
+    // count). Sits ABOVE Milestones so tier pressure squeezes history, never
+    // the "where does each area stand today" answer (the 2026-07-23 incident:
+    // the portal-shipped 🏁 fell out of the milestone tier and a week-old
+    // "remaining:" claim answered a status question).
+    const digest = areaStatusDigest(struct);
+    if (digest.length) { push('', '## Area status (computed — newest 🏁 + open count per active area)'); for (const l of digest) push(l); }
     if (miles.length) {
         push('', '## Milestones');
         for (const c of miles.sort((a, b) => b.createdAt - a.createdAt).slice(0, maxMilestones)) push(`- ${fr(c)}${headline(c)}`);
@@ -1324,6 +1395,27 @@ const STOPWORDS = new Set(['the', 'and', 'for', 'that', 'this', 'with', 'from', 
 export function queryTokens(s) {
     return [...new Set(String(s || '').toLowerCase().match(/[a-z0-9][a-z0-9_-]{2,}/g) || [])].filter(t => !STOPWORDS.has(t));
 }
+// ── Status-vocab quarantine (2026-07-23 field incident) ──────────────────────
+// Words that describe the SHAPE of a status question ("what is remaining?"),
+// not its subject. As content tokens they are adversarially ANTI-correlated
+// with truth: cards *saying* "remaining/pending" are exactly the stale claims,
+// while the milestones that fulfilled them ("shipped the web portal") share
+// zero tokens with the question — so lexical scoring structurally prefers the
+// corpse. Quarantined out of QUERY scoring only (card tokenSets untouched —
+// claim-matching thresholds were calibrated on them). Deliberately narrow:
+// polysemous words (open, left, next, done, state) stay content tokens and are
+// caught by the phrase-level shape regex instead.
+// 'status'/'progress' are NOT here — "sync status indicator" / "progress bar"
+// are real subjects (adversarial review 2026-07-23); the phrase regex below
+// still catches "current status"-style question shapes.
+export const STATUS_VOCAB = new Set(['remaining', 'remains', 'pending', 'outstanding', 'todo', 'todos', 'unfinished', 'awaits', 'awaiting']);
+const STATUS_QUERY_RE = /\bwhat(?:'?s| is| are)\s+(?:still\s+)?(?:left|remaining|next|open|pending|outstanding|the status)\b|\bstill\s+(?:open|left|pending|remaining|to\s*do)\b|\bto[- ]?do\b|\bwhere (?:are we|do we stand)\b|\bcurrent (?:state|status)\b/i;
+export function splitQueryTokens(s) {
+    const all = queryTokens(s);
+    const content = all.filter(t => !STATUS_VOCAB.has(t));
+    const statusShaped = content.length < all.length || STATUS_QUERY_RE.test(String(s || ''));
+    return { content, status: all.filter(t => STATUS_VOCAB.has(t)), statusShaped };
+}
 const wordsOf = (s) => new Set(String(s || '').toLowerCase().match(/[a-z0-9][a-z0-9_-]{1,}/g) || []);
 export function scoreCardsAgainstQuery(struct, query, { topK = 6, minScore = 2, recentDays = 30 } = {}) {
     const tokens = Array.isArray(query) ? query.filter(Boolean) : queryTokens(query);
@@ -1382,10 +1474,22 @@ export function scoreCardsAgainstQuery(struct, query, { topK = 6, minScore = 2, 
 //   3. Truth-aware — every stale hit carries its live CORRECTION (the P1 machinery),
 //      so the agent answers from the correction, never the outdated card alone.
 // Pure + node-runnable. `semantic` is Map<cardId, 0..1> or null.
-const deathDateOfCard = (text) => { const m = /(?:↩︎ superseded|↩ superseded|✅) (\d{4}-\d{2}-\d{2})/.exec(String(text)); return m ? Date.parse(m[1]) : null; };
+// THE one death-date reader (2026-07-23: three divergent regex copies had
+// shipped — core's as_of missed "↩ superseded", and BOTH copies missed the
+// gardener's "⤵ consolidated" stamp, so every gardened card silently vanished
+// from time-travel). Accepts a struct card (machine `consolidatedAt` wins) or
+// a raw text string; core imports this instead of keeping a local twin.
+export const deathDateOfCard = (card) => {
+    const c = card && typeof card === 'object' ? card : { text: card };
+    if (Number.isFinite(c.consolidatedAt) && c.consolidatedAt > 0) return c.consolidatedAt;
+    const m = /(?:↩︎ superseded|↩ superseded|✅|⤵ consolidated) (\d{4}-\d{2}-\d{2})/.exec(String(c.text || ''));
+    return m ? Date.parse(m[1]) : null;
+};
 export function rankForQuestion(struct, question, { semantic = null, k = 10, as_of = null, now = Date.now(), semFloor = 0.30, recentDays = 30 } = {}) {
-    const tokens = queryTokens(question);
-    if (!struct || !Array.isArray(struct.cards) || (!tokens.length && !semantic)) return { hits: [], total: 0, tokens };
+    // Status-shaped questions score by their CONTENT tokens only — "remaining"
+    // must never lexically select the stale cards that say "remaining:".
+    const { content: tokens, statusShaped } = splitQueryTokens(question);
+    if (!struct || !Array.isArray(struct.cards) || (!tokens.length && !semantic)) return { hits: [], total: 0, tokens, statusShaped };
     const isArchived = (c) => /^archive$/i.test(c.area || '');
     const asOfTs = as_of ? Date.parse(as_of) : null;
     const timeTravel = asOfTs != null && Number.isFinite(asOfTs);
@@ -1402,7 +1506,7 @@ export function rankForQuestion(struct, question, { semantic = null, k = 10, as_
                 // truth then. If it died by as_of, or carries NO dated stamp (we
                 // can't prove it was still live), exclude it — precision-first, so
                 // a "what was true then" answer never asserts a since-dead fact.
-                const died = deathDateOfCard(c.text);
+                const died = deathDateOfCard(c);
                 if (died == null || died <= asOfTs) continue;
             }
         }
@@ -1440,7 +1544,7 @@ export function rankForQuestion(struct, question, { semantic = null, k = 10, as_
     let overlays = new Map();
     if (!timeTravel) { try { overlays = correctionOverlaysFor(struct, top.map(h => h.card)); } catch { /* best-effort */ } }
     const hits = top.map(h => ({ ...h, correction: overlays.get(h.card.id) || null }));
-    return { hits, total: scored.length, tokens };
+    return { hits, total: scored.length, tokens, statusShaped };
 }
 
 // Assemble the ranked hits into a SYNTHESIS-READY markdown context: a header that
@@ -2497,8 +2601,30 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
             }
             if (best && bestScore >= UPDATE_AT) {
                 const tag = u.area ? `\n#${u.area.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : '';
+                // NON-DESTRUCTIVE CONFIRM GUARD (2026-07-23): content replacement
+                // is wholesale, so a terse "~ still true" against a rich card used
+                // to truncate it to the confirmation text — the system had no
+                // non-destructive verify verb at all. The guard is OPT-IN by
+                // shape: only an update that READS as a confirmation ("still
+                // true", "confirmed", "verified", "unchanged", "holds") is
+                // appended as a re-affirmed line; anything else — including
+                // same-vocabulary inversions, terse lowercase corrections, and
+                // negations, none of which token-set/length heuristics can see
+                // (adversarial review live-traced all three) — REPLACES, the
+                // documented ~ semantics where the new text wins. Digits or
+                // contrast/negation words disqualify ("still true but port now
+                // 9223" is a correction). No ✅/↩/⤵ glyphs in the stamp — those
+                // would drop the card out of liveTextCards matching forever.
+                const bestLen = String(best.text || '').length;
+                const CONFIRM_CUE_RE = /^\s*(?:\(|")?\s*(?:still\b|confirmed?\b|verified\b|unchanged\b|re-?affirmed?\b|holds\b|remains true\b)/i;
+                const CONFIRM_DISQUALIFIER_RE = /\d|\b(?:not|no|never|but|instead|now|except|however|wrong|longer|actually)\b/i;
+                const isTerseConfirm = CONFIRM_CUE_RE.test(String(u.text || ''))
+                    && !CONFIRM_DISQUALIFIER_RE.test(String(u.text || ''))
+                    && String(u.text || '').length < bestLen * 0.6
+                    && !hasCorrectionCue(u.text);
                 await rewriteCard(best.id, j => {
-                    j.content = (u.area ? `${u.area}: ` : '') + u.text + tag;
+                    if (isTerseConfirm) j.content = `${j.content}\n(re-affirmed ${today}: ${u.text})`;
+                    else j.content = (u.area ? `${u.area}: ` : '') + u.text + tag;
                     j.createdAt = now;
                     j.borderColor = 'rgba(16,185,129,0.6)';
                     if (u.createdVia) j.createdVia = String(u.createdVia);
@@ -2506,7 +2632,7 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                     // verifiedAt), so confirming/correcting a drifted fact marks it ✅.
                     if (Array.isArray(u.evidence) && u.evidence.length) j.evidence = u.evidence;
                 });
-                best.text = u.text;
+                best.text = isTerseConfirm ? `${best.text}\n(re-affirmed ${today}: ${u.text})` : u.text;
                 stats.updated++;
             } else {
                 cards.push({ text: (u.area ? `${u.area}: ` : '') + u.text + (u.area ? `\n#${u.area.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : ''), area: u.area, createdVia: u.createdVia, ...(Array.isArray(u.evidence) && u.evidence.length ? { evidence: u.evidence } : {}) });
@@ -2754,7 +2880,7 @@ export function selectGardenCandidates(struct, { keepNewest = GARDEN_KEEP_NEWEST
         const title = (ctn.title || '').trim();
         if (!title || GARDEN_PROTECTED.test(title)) continue;
         const children = struct.cards
-            .filter(c => c.type === 'text' && c.parentId === ctn.id && (c.text || '').trim() && !/⤵|↩|✅|🛠/.test(c.text))  // 🛠️ skills are standing reference — never consolidate them away
+            .filter(c => c.type === 'text' && c.parentId === ctn.id && (c.text || '').trim() && !/⤵|↩|✅|🛠|❓|🎯/.test(c.text))  // 🛠️ skills are standing reference — never consolidate them away; ❓/🎯 are OPEN items — dormancy is not resolution, and consolidating one is silent false-retirement (2026-07-23 audit; GARDEN_PROTECTED only shields containers *titled* "open questions")
             .sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
         const autoCutoff = now - GARDEN_AUTO_MIN_AGE_DAYS * 86_400_000;
         const isAuto = (c) => (c.tags || []).some(t => String(t).toLowerCase().replace(/^#/, '') === 'auto');
@@ -2858,13 +2984,18 @@ export async function applyGarden(buffer, { syntheses = [] } = {}) {
         const span = `${new Date(area.candidates[0].createdAt || now).toISOString().slice(0, 10)} → ${new Date(area.candidates[area.candidates.length - 1].createdAt || now).toISOString().slice(0, 10)}`;
         const content = wrapText(`${area.title}: 🌿 Consolidated history (${span}, ${area.candidates.length} cards)\n${finalSynth}`);
         const sid = `txt_${rand()}`;
-        zip.file(`items/${shard(sid)}/${sid}.json`, JSON.stringify({ type: 'text', locked: false, createdAt: now, createdBy: 'agent', createdVia: 'gardener', content, fontSize: 12, color: '#e8e8ed', border: true, borderColor: 'rgba(59,130,246,0.6)', heading: false }));
+        // `sources` = machine lineage (which originals fed this synthesis, with
+        // their birth dates) — as_of and future provenance passes read the
+        // field, never the prose.
+        zip.file(`items/${shard(sid)}/${sid}.json`, JSON.stringify({ type: 'text', locked: false, createdAt: now, createdBy: 'agent', createdVia: 'gardener', content, fontSize: 12, color: '#e8e8ed', border: true, borderColor: 'rgba(59,130,246,0.6)', heading: false, sources: area.candidates.map(c => ({ id: c.id, createdAt: c.createdAt || 0 })) }));
         canvas.positions[sid] = { x: ctnPos.x + 20, y: ctnPos.y + (ctnPos.h || 0) + 10, w: 300, h: measureCardH(content), zKey: nextZKey(), zIndex: canvas.order.length, parentId: area.containerId };
         canvas.order.push(sid);
         newCards.push(sid);
         stats.synthCards++;
         for (const cand of area.candidates) {
-            await rewriteCard(cand.id, j => { j.content = `⤵ consolidated ${today}\n${j.content}`; j.borderColor = 'rgba(120,120,135,0.5)'; });
+            // consolidatedAt = the machine death-date deathDateOfCard prefers —
+            // as_of must never depend on the prose stamp parsing correctly.
+            await rewriteCard(cand.id, j => { j.content = `⤵ consolidated ${today}\n${j.content}`; j.borderColor = 'rgba(120,120,135,0.5)'; j.consolidatedAt = now; });
             await archiveCard(cand.id);
             canvas.connections.push({ id: `con_${rand()}`, fromId: cand.id, toId: sid, relationship: 'relates_to', label: 'consolidated into', arrowHead: true, width: 1.5, color: 'rgba(120,120,135,0.7)', style: 'solid' });
             stats.archived++;

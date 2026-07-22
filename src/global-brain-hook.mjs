@@ -559,6 +559,22 @@ function parseCommitLog(raw) {
 function commitToCard(c) {
     const m = CC_RE.exec(c.subject);
     if (!m) return null;                                                        // only feat / fix / perf
+    // Closes:/Resolves:/Fulfils: trailer in the commit BODY → card.closes — the
+    // engine's close-link pass then archives the strategy/❓ card this ship
+    // fulfilled. This gives the highest-volume capture channel (and EVERY agent
+    // that commits — Cursor, Cline, a human — not just hook-wired ones) real
+    // resolution semantics. Before this, commit-derived 🏁 cards were
+    // lifecycle-INERT: shipping produced new truth without ever touching the
+    // stale "remaining:" claim it fulfilled (2026-07-23 field incident).
+    // Parsed from the RAW body (trailers are line-anchored) before flattening.
+    const tm = /^(?:closes|resolves|fulfils|fulfills)\s*:\s*(.+)$/im.exec(c.body);
+    let closes = tm ? tm[1].trim().replace(/\.$/, '') : '';
+    // URL / bare-issue-ref trailers ("Closes: https://github.com/...",
+    // "Closes: #123") tokenize to pure boilerplate (https/github/<org>/issues)
+    // that coverage-matches UNRELATED live cards mentioning the same host —
+    // false retirement, the worst case (adversarial review reproduced it).
+    // Only a prose target (a card title / claim) is a usable close-target.
+    if (/^https?:\/\//i.test(closes) || /^#?\d+$/.test(closes)) closes = '';
     const body = c.body.replace(/\s+/g, ' ').trim();
     if (body.length < 12) return null;                                          // RATIONALE-bearing only — keeps it high-signal, not a dump
     const type = m[1].toLowerCase(), scope = (m[2] || '').trim(), desc = m[3].trim();
@@ -567,6 +583,7 @@ function commitToCard(c) {
     return {
         text: `${area}: ${prefix}${desc}\n\n${body.slice(0, 400)}\n#${slugify(area)} #commit-${c.hash.slice(0, 7)}`,
         area, borderColor: type === 'feat' ? 'rgba(59,130,246,0.8)' : 'rgba(16,185,129,0.6)', createdVia: 'commit',
+        ...(closes ? { closes } : {}),
     };
 }
 async function gatherCommitCards(prevCommit) {
@@ -579,7 +596,37 @@ async function gatherCommitCards(prevCommit) {
     catch { return { cards: [], newLastCommit: head }; }                        // history rewritten → re-baseline, don't dump
     let raw = '';
     try { raw = git(`log ${prevCommit}..HEAD --no-merges --format=%x1e%H%x1f%s%x1f%b`); } catch { return { cards: [], newLastCommit: head }; }
-    return { cards: parseCommitLog(raw).slice(0, 15).map(commitToCard).filter(Boolean), newLastCommit: head };
+    const entries = parseCommitLog(raw);
+    // Revert retraction (same batch): a "feat: X" shipped-and-reverted before
+    // this hook ran must not close the open card X claimed to fulfil. Reverts
+    // themselves never become cards (CC_RE skips them), so scan the raw batch
+    // for Revert subjects and strip `closes` from any card whose subject was
+    // reverted. Cross-batch reverts (feat captured in an earlier run) need the
+    // P1 retraction machinery — consciously deferred, recorded in the plan.
+    const reverted = new Set();
+    for (const e of entries) { const rm = /^Revert\s+"(.+)"/.exec(e.subject); if (rm) reverted.add(rm[1].trim()); }
+    const cards = entries.slice(0, 15)
+        .map(e => { const card = commitToCard(e); if (card && reverted.has(e.subject)) delete card.closes; return card; })
+        .filter(Boolean);
+    // Ship-evidence guard: a Closes: trailer only CLOSES a live claim when the
+    // commit is on the repo's DEFAULT branch — a feature-branch ship that never
+    // merges must not retire an open card. Default branch is detected from
+    // origin/HEAD (so trunk/develop repos work), falling back to master|main;
+    // a strip leaves a HEALTH breadcrumb so the inert channel is diagnosable.
+    if (cards.some(c => c.closes)) {
+        let onDefault = false, branch = '';
+        try {
+            branch = git('rev-parse --abbrev-ref HEAD');
+            let def = '';
+            try { def = (git('symbolic-ref refs/remotes/origin/HEAD') || '').replace(/^refs\/remotes\/origin\//, ''); } catch { /* no origin/HEAD ref */ }
+            onDefault = def ? branch === def : /^(master|main)$/.test(branch);
+        } catch { onDefault = false; }
+        if (!onDefault) {
+            for (const c of cards) delete c.closes;
+            try { appendJsonl(HEALTH, { ts: nowIso(), project: path.basename(CWD), mode: 'commit-closes', ok: true, err: `closes stripped (branch ${branch || '?'} is not default)` }, 500); } catch { /* best-effort */ }
+        }
+    }
+    return { cards, newLastCommit: head };
 }
 
 // ── Live cross-session ledger (in-flight ship/version/milestone, 2026-06-28) ─────
@@ -1343,7 +1390,26 @@ async function promptRetrieve(lib) {
     const input = readHookInput();
     const sid = input.session_id;
     const prompt = input.prompt || input.user_prompt || input.userPrompt || '';
-    const ptoks = lib.queryTokens(prompt);
+    // Status-vocab quarantine (2026-07-23): "what is remaining?" must not
+    // lexically retrieve the stale cards that SAY "remaining:" — status words
+    // describe the question's shape, not its subject, and are anti-correlated
+    // with truth. Content tokens only. A status-shaped prompt ALSO suppresses
+    // the git-diff file-token fallback below: a stale "remaining:" card is
+    // usually about the files being edited right now, so the fallback's
+    // #file- tag hits re-serve the exact corpse the quarantine removed
+    // (adversarial review traced the side door). The brief's computed "Area
+    // status" section carries the current-state answer instead.
+    let ptoks = lib.queryTokens(prompt);
+    let statusShaped = false;
+    if (typeof lib.splitQueryTokens === 'function') {
+        const sp = lib.splitQueryTokens(prompt);
+        ptoks = sp.content;
+        statusShaped = sp.statusShaped;
+    } else if (lib.STATUS_VOCAB instanceof Set) {
+        const filtered = ptoks.filter(t => !lib.STATUS_VOCAB.has(t));
+        statusShaped = filtered.length < ptoks.length;
+        ptoks = filtered;
+    }
     // Git diff is the retrieval FALLBACK for a prompt too terse to rank on. It is
     // NOT used for the lane's files: two sessions in one repo share a working tree,
     // so the diff is identical for both — the lane's files come from each session's
@@ -1351,7 +1417,7 @@ async function promptRetrieve(lib) {
     const changedPaths = gitChangedPaths();
     const branch = gitBranch();
     touchSession(sid, { intent: String(prompt).replace(/\s+/g, ' ').trim().slice(0, 80), branch });
-    const fileToks = ptoks.length < 2 ? changedPaths.flatMap(fileQueryTokens) : [];
+    const fileToks = (ptoks.length < 2 && !statusShaped) ? changedPaths.flatMap(fileQueryTokens) : [];
     const tokens = [...new Set(ptoks.concat(fileToks))];
     // Other live sessions in THIS repo — surfaced even when the prompt retrieves
     // nothing (a peer's presence/ship is itself the signal). Empty string when solo.

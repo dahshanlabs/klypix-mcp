@@ -55,6 +55,26 @@ if (process.argv[2] === 'link') { await import('./klypix-link.mjs'); process.exi
 // projection in sync? One verdict, one reconcile block. Exits 1 on drift (CI gate).
 if (process.argv[2] === 'doctor') { await import('./klypix-doctor.mjs'); process.exit(0); }
 
+// `npx klypix-mcp garden-code` — the HUMAN half of the garden approval gate.
+// brain_garden's apply requires an 8-char code derived from the exact dormant
+// candidate set + day; the agent is deliberately never shown it. The human runs
+// this after reviewing the agent's plan and pastes the code into chat — that
+// paste IS the out-of-band approval. Optional arg: a brain path (default
+// ./brain.klypix in the cwd).
+if (process.argv[2] === 'garden-code') {
+  const target = path.resolve(process.cwd(), process.argv[3] || 'brain.klypix');
+  if (!fs.existsSync(target)) { console.error(`No brain at ${target} — run from the project folder (or pass a path).`); process.exit(1); }
+  const { parseKlypix, selectGardenCandidates } = await import('../src/klypix-format.mjs');
+  const { gardenApprovalCode } = await import('../src/klypix-core.mjs');
+  const { struct } = await parseKlypix(fs.readFileSync(target));
+  const areas = selectGardenCandidates(struct);
+  if (!areas.length) { console.error('Nothing to garden right now — no approval needed.'); process.exit(0); }
+  console.error(`Garden plan: ${areas.length} area(s) — ${areas.map(a => `${a.title} (${a.candidates.length})`).join(' · ')}`);
+  console.error(`If you approve what the agent showed you, paste this code into chat (valid today, for exactly this set):`);
+  console.log(gardenApprovalCode(areas));
+  process.exit(0);
+}
+
 // `npx klypix-mcp init` — 60-second onboarding: seed a starter project brain in
 // the current folder so a new user's FIRST contact isn't an empty vault, then
 // print a paste-ready MCP config. Runs before any server setup.
@@ -198,8 +218,9 @@ server.registerTool('brain_garden', {
       title: z.string().describe('Area title EXACTLY as returned by the dry run.'),
       synthesis: z.string().describe('3-6 sentence prose synthesis preserving every still-relevant fact/decision/number.'),
     })).optional().describe('Required when apply:true — one entry per area you want consolidated.'),
+    approve: z.string().optional().describe('Required when apply:true — the 8-char human-approval code. You are never shown it: the human runs `npx klypix-mcp garden-code` and pastes the code into chat after reviewing your plan. Never guess or fabricate it.'),
   },
-}, async ({ canvas, apply, syntheses }) => toContent(await opBrainGarden({ vault: VAULT, canvas, apply, syntheses })));
+}, async ({ canvas, apply, syntheses, approve }) => toContent(await opBrainGarden({ vault: VAULT, canvas, apply, syntheses, approve })));
 
 server.registerTool('create_canvas', {
   title: 'Create a KLYPIX canvas',

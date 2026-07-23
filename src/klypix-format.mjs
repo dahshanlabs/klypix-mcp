@@ -2645,6 +2645,26 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
         };
         canvas.connections = Array.isArray(canvas.connections) ? canvas.connections : [];
 
+        // Fallback-add near-dup guard (live incident 2026-07-23): ✓/~ markers
+        // BYPASS the hook's seen-dedup by design (self-heal re-stamps a drifted
+        // fact), so a marker that stops matching — e.g. a ✓ whose target was
+        // archived by its own FIRST run — re-fires on every Stop while it sits
+        // in the transcript tail. Its no-match FALLBACK path must therefore
+        // never re-add: 4 duplicate 🏁 fallback cards landed from one ✓ before
+        // this guard. Checks live cards AND this batch's queued adds.
+        const nearDupExists = (text) => {
+            const t = tokenSet(text);
+            if (t.size < 3) return false;
+            for (const c of liveTextCards()) if (overlapScore(t, tokenSet(c.text)) >= 0.9) return true;
+            for (const c of cards) if (c && c.text && overlapScore(t, tokenSet(c.text)) >= 0.9) return true;
+            return false;
+        };
+        // Engine-authored text inserted into LIVE cards (fallback 🏁 cards, ✔
+        // partial stamps) must never carry lifecycle glyphs from the marker's
+        // prose — a ✓ whose text MENTIONED "❓/🎯" made its fallback card
+        // classify as an open question in every brief (glyph-in-prose trap).
+        const stripLifecycleGlyphs = (s) => String(s || '').replace(/[❓🎯🏁🛠✅✔↩⤵️]/gu, '').replace(/\s+/g, ' ').trim();
+
         // RESOLVE (✓ markers) — best live match in the area, PLUS its near-tie
         // twins: a rephrased duplicate ❓ scores within a hair of its sibling, and
         // resolving only the first left the twin open forever (it kept surfacing
@@ -2685,12 +2705,13 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                     const uncoveredItems = items.filter(it => coverageOf(it.tokens, rTok) < 0.5);
                     const partial = (coveredItems.length && uncoveredItems.length) || (/🏁/.test(best.text) && items.length > 0);
                     if (partial) {
+                        const cleanR = stripLifecycleGlyphs(r.text);
                         const still = uncoveredItems.length ? ` — still open: ${uncoveredItems.map(x => x.text.slice(0, 50)).join(' + ').slice(0, 160)}` : '';
                         await rewriteCard(best.id, j => {
-                            j.content = `${j.content}\n✔ partial ${today}: ${r.text.slice(0, 100)}${still}`;
+                            j.content = `${j.content}\n✔ partial ${today}: ${cleanR.slice(0, 100)}${still}`;
                             j.borderColor = 'rgba(16,185,129,0.45)';
                         });
-                        best.text += `\n✔ partial ${today}: ${r.text}`;
+                        best.text += `\n✔ partial ${today}: ${cleanR}`;
                         stats.partialResolved = (stats.partialResolved || 0) + 1;
                         continue;
                     }
@@ -2706,7 +2727,11 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                 // __fromResolve: an unmatched-✓ fallback card must not seed the
                 // fulfillment cross-check (it would cover its own source item at
                 // cov 1.0 and self-feed a suggestion loop — review-traced).
-                milestonesFallback.push({ text: (r.area ? `${r.area}: ` : '') + `🏁 ${r.text}`, area: r.area, borderColor: 'rgba(59,130,246,0.8)', __fromResolve: true });
+                // Glyph-stripped + near-dup-guarded (see helpers above).
+                const cleanR = stripLifecycleGlyphs(r.text);
+                if (cleanR && !nearDupExists(cleanR)) {
+                    milestonesFallback.push({ text: (r.area ? `${r.area}: ` : '') + `🏁 ${cleanR}`, area: r.area, borderColor: 'rgba(59,130,246,0.8)', __fromResolve: true });
+                }
             }
         }
 
@@ -2757,7 +2782,9 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                 });
                 best.text = isTerseConfirm ? `${best.text}\n(re-affirmed ${today}: ${u.text})` : u.text;
                 stats.updated++;
-            } else {
+            } else if (!nearDupExists(u.text)) {
+                // ~ fallback add is guarded like ✓'s: an unmatched ~ re-harvested
+                // from the transcript tail must not stack a copy every turn.
                 cards.push({ text: (u.area ? `${u.area}: ` : '') + u.text + (u.area ? `\n#${u.area.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : ''), area: u.area, createdVia: u.createdVia, ...(Array.isArray(u.evidence) && u.evidence.length ? { evidence: u.evidence } : {}) });
             }
         }

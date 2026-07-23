@@ -29,6 +29,7 @@ import {
   rankForQuestion, questionContextToMarkdown, findLegacyShipCards,
   challengeBrain, challengeContextToMarkdown, buildRenderSpec, structToBrief,
   brainLensData, lensToMarkdown, deathDateOfCard,
+  statusContextToMarkdown, findFulfillmentCandidates,
 } from './klypix-format.mjs';
 
 // ── Card / connection input shape (single source for every face) ─────────────
@@ -460,7 +461,19 @@ export async function opBrainAsk({ vault, canvas, question, as_of, k = 10, log =
     } catch { /* keep the pre-rerank order */ }
     result.hits = result.hits.slice(0, kk);
   }
-  return { blocks: [text(stamp + questionContextToMarkdown(q, result, { mode, as_of: timeTravel ? as_of : null }))] };
+  // STATUS MODE (T7, 2026-07-23): a status-shaped question ("what is
+  // remaining?") gets the COMPUTED current-state section prepended — per-area
+  // digest, opens with overdue/corrected/likely-fulfilled flags, newest 🏁s.
+  // The lexical hits stay below as supporting context. Suppressed under as_of
+  // (time-travel answers stay deterministic ranked-card answers).
+  // STRONG shape only: a work request that merely mentions 'pending'/'TODO'
+  // must keep its ranked answer (review fix); the phrase-shaped "what is
+  // remaining?" gets the computed section.
+  let statusMd = '';
+  if (result.statusStrong && !timeTravel) {
+    try { statusMd = statusContextToMarkdown(struct); mode += ' + status-mode'; } catch { statusMd = ''; }
+  }
+  return { blocks: [text(stamp + statusMd + questionContextToMarkdown(q, result, { mode, as_of: timeTravel ? as_of : null }))] };
 }
 
 // ── brain_challenge — the adversarial brain ───────────────────────────────────
@@ -623,6 +636,32 @@ export async function opBrainReconcile({ vault, canvas, root, mode = 'all' }) {
       sections.push(`# 🧹 ${total} legacy raw-bash ship card(s) — optional cleanup\n_Pre-v1.15 auto-capture residue (raw shell command / path-scraped PR numbers). They are ALREADY excluded from repeat-detection, so this is cosmetic hygiene, not a correctness fix. To tidy: retire each with \`brain_note\` marker \`✓\`, or leave them — they no longer trigger false repeat warnings._\n\n${lines.join('\n')}${more}`);
     } else if (mode === 'legacy') {
       sections.push('✓ No legacy raw-bash ship cards — every ship card is a clean fact.');
+    }
+  }
+
+  // (1c) CLAIMS (T9, 2026-07-23) — the retroactive fulfillment sweep: live
+  // "remaining:/next:/pending:" prose clauses AND ❓/🎯 cards reconciled
+  // against LATER live 🏁 milestones via the ONE shared claim extractor. This
+  // is how corpses that predate the capture-time cross-check get found (the
+  // incident card sat fulfilled-but-open for a week). Receipts show the
+  // covered item AND the uncovered remainder so partial fulfillment can never
+  // be approved whole. Suggestion-only — every retirement is a human ✓.
+  if (mode === 'all' || mode === 'claims') {
+    const isArchived = (c) => /^archive$/i.test(c.area || '');
+    const miles = struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim() && !isArchived(c) && /🏁/.test(c.text) && !/❓|🎯/.test(c.text));
+    const cands = findFulfillmentCandidates(struct, miles, { maxPerMilestone: 2 }).slice(0, 12);
+    if (cands.length) {
+      const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+      const lines = cands.map((c, i) =>
+        `${i + 1}. [${c.open.area || '?'}] (id ${c.open.id}) claim: “${flat(c.item).slice(0, 100)}” · coverage ${c.cov}\n`
+        + `   · likely fulfilled by [${c.milestone.area || '?'}] ${flat(c.milestone.text).slice(0, 140)}\n`
+        + (c.uncovered.length ? `   · ⚠️ PARTIAL — does NOT cover: ${c.uncovered.map(u => `“${flat(u).slice(0, 60)}”`).join(' · ')}\n` : '')
+        + ((!c.uncovered.length && c.resolvable)
+            ? `   · confirm: \`🧠 BRAIN [${c.open.area || 'Notes'}] ✓: ${flat(c.item).slice(0, 80)}\``
+            : `   · no ✓ suggested (${c.uncovered.length ? 'partial — the card stays open; a ✓ would engage the partial-resolve path only after full coverage' : 'item too short to resolve safely'}) — verify by hand`));
+      sections.push(`# ⏳ ${cands.length} open claim(s) a later milestone likely fulfilled\n_Candidates with receipts — nothing was changed, nothing auto-archives. A ✓ is only suggested for FULLY covered claims. Dismiss a wrong hint permanently: \`brain_connect\` with \`pairs:[{fromId:<open id>, toId:<milestone id>}]\` and \`relationship:"not_fulfilled"\` — it will never be re-suggested._\n\n${lines.join('\n')}`);
+    } else if (mode === 'claims') {
+      sections.push('✓ No fulfilled-claim candidates — no live open clause is covered by a later milestone.');
     }
   }
 

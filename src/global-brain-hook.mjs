@@ -313,6 +313,10 @@ function touchSession(sid, patch = {}) {
                 // cards scrolled it out. Big cards are rare, so this cap effectively
                 // never evicts one — enforcing "no >1KB card full-text twice".
                 injectedBig: patch.injectedBig !== undefined ? patch.injectedBig : (prev.injectedBig ?? []),
+                // Per-session status-digest dedup hash (T8) — the fixed field
+                // list silently dropped unknown patch keys, which made the
+                // dedup dead code (review-caught).
+                statusDigestHash: patch.statusDigestHash !== undefined ? patch.statusDigestHash : (prev.statusDigestHash ?? null),
                 startedAt: prev.startedAt || now, lastSeen: now,
             });
             fs.mkdirSync(SESSIONS_DIR, { recursive: true });
@@ -1311,6 +1315,19 @@ async function capture(lib) {
         process.stderr.write(`[brain] correction supersede: ${stats.corrections.map(c => `"${c.old}" (${c.overlap})`).join('; ')} — archived + arrowed; restore from Archive or ~ update if wrong\n`);
     }
     if (stats.added > 0 && !stats.linked) process.stderr.write(`[brain] note: ${stats.added} card(s) landed unlinked — \`brain_connect\` (or [[wikilinks]] next time) wires them into the graph\n`);
+    // Fulfillment receipts (claim engine): a captured 🏁 that appears to cover a
+    // live open claim raised a dashed hint — print the receipt with its
+    // ready-to-emit ✓ marker AND the uncovered remainder (approving the covered
+    // half must never silently retire the rest). Suggestion-only.
+    if (Array.isArray(stats.fulfillCandidates) && stats.fulfillCandidates.length) {
+        for (const f of stats.fulfillCandidates.slice(0, 4)) {
+            const rest = f.uncovered && f.uncovered.length ? ` · does NOT cover: ${f.uncovered.map(u => `"${u.slice(0, 50)}"`).join(', ')}` : '';
+            const act = f.marker
+                ? `— if truly done, emit: ${f.marker}`
+                : '— PARTIAL/short: the card stays open; no ✓ suggested (verify by hand; dismiss via brain_connect relationship:"not_fulfilled")';
+            process.stderr.write(`[brain] ⏳ likely fulfilled (${f.cov}): "${f.item.slice(0, 70)}"${rest} ${act}\n`);
+        }
+    }
     appendJsonl(LEDGER, { ts: nowIso(), mode: 'capture', stats, decisions: ledger }, 1000);
     appendJsonl(HEALTH, { ts: nowIso(), project: path.basename(CWD), mode: 'capture', ok: true, brainBytes: brainBytes(), added: stats.added, skipped: ledger.filter(d => d.action.startsWith('skipped')).length }, 500);
 }
@@ -1400,14 +1417,21 @@ async function promptRetrieve(lib) {
     // (adversarial review traced the side door). The brief's computed "Area
     // status" section carries the current-state answer instead.
     let ptoks = lib.queryTokens(prompt);
-    let statusShaped = false;
+    let statusShaped = false, statusStrong = false;
     if (typeof lib.splitQueryTokens === 'function') {
         const sp = lib.splitQueryTokens(prompt);
         ptoks = sp.content;
         statusShaped = sp.statusShaped;
+        // strong = the prompt IS a status question (phrase shape / nothing but
+        // status words); loose statusShaped only quarantines tokens. Only
+        // STRONG may replace retrieval with the digest — "remove the TODO:
+        // refactor X" is a work request (review fix). Older engine without
+        // `strong` degrades to content-empty as the strong signal.
+        statusStrong = sp.strong !== undefined ? sp.strong : (statusShaped && sp.content.length === 0);
     } else if (lib.STATUS_VOCAB instanceof Set) {
         const filtered = ptoks.filter(t => !lib.STATUS_VOCAB.has(t));
         statusShaped = filtered.length < ptoks.length;
+        statusStrong = statusShaped && filtered.length === 0;
         ptoks = filtered;
     }
     // Git diff is the retrieval FALLBACK for a prompt too terse to rank on. It is
@@ -1466,6 +1490,32 @@ async function promptRetrieve(lib) {
         } catch { semMode = 'sem-error'; }
         if (semMode !== 'lexical') { try { appendJsonl(HEALTH, { ts: nowIso(), project: path.basename(CWD), mode: 'prompt', sem: semMode, hits: freshHits.length }, 500); } catch { /* */ } }
     }
+    // T8 STATUS-DIGEST INJECTION (2026-07-23): a status-shaped prompt gets the
+    // COMPUTED current-state digest INSTEAD of card hits — so an agent that
+    // never queried the brain still answers "what is remaining?" from state,
+    // not from whichever stale claim happened to rank. REPLACES freshHits
+    // (never additive) and is hash-deduped per session: turn 2+ of the same
+    // status conversation gets a one-line pointer, not another 2KB.
+    let statusMd = '';
+    if (statusStrong && typeof lib.areaStatusDigest === 'function') {
+        if (!struct) { try { struct = await cachedStruct(lib); } catch { struct = null; } }
+        if (struct) {
+            try {
+                const digest = lib.areaStatusDigest(struct, { maxAreas: 12 });
+                if (digest.length) {
+                    const h = crypto.createHash('sha1').update(digest.join('\n')).digest('hex').slice(0, 12);
+                    let lane = null; try { lane = readSessions().find(s => s.id === sid) || null; } catch { /* */ }
+                    if (lane && lane.statusDigestHash === h) {
+                        statusMd = '## 📊 Current state — unchanged since the digest shown earlier this session (`brain_ask` gives the full computed status view).';
+                    } else {
+                        statusMd = ['## 📊 Computed current state (status-shaped question detected — answer from THIS + `brain_ask`, never from memory of past sessions)', ...digest].join('\n');
+                        try { touchSession(sid, { statusDigestHash: h }); } catch { /* best-effort */ }
+                    }
+                    freshHits = [];
+                }
+            } catch { /* best-effort */ }
+        }
+    }
     // Other live sessions' in-flight events (struct may be null on a token-less
     // prompt — then representedInBrain just keeps entries; they're rarely in-brain yet).
     const inflight = inflightFooter(sid, struct);
@@ -1474,11 +1524,12 @@ async function promptRetrieve(lib) {
     // leaves struct null; SessionStart's own draft surface + count line cover that
     // case) and so a terse prompt pays zero extra parse cost.
     const drafts = struct ? ruleDraftsFooter(sid, struct, { markShown: true }) : '';
-    if (!repeats.length && !freshHits.length && !peers && !inflight && !messages && !drafts) return; // nothing → zero output, zero added context
+    if (!repeats.length && !freshHits.length && !peers && !inflight && !messages && !drafts && !statusMd) return; // nothing → zero output, zero added context
     const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
     const day = (ts) => ts ? new Date(ts).toISOString().slice(0, 10) : '';
     const head = (c, n = 120) => { const t = flat(c.text); return t.length > n ? t.slice(0, n - 1) + '…' : t; };
     const lines = [];
+    if (statusMd) lines.push(statusMd);
     if (repeats.length) {
         // A nudged "already shipped" card may itself have been CORRECTED since —
         // nudging the agent to reuse a stale fact would be worse than no nudge.

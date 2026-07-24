@@ -1114,6 +1114,47 @@ export async function arrangeBrain(buffer, opts = {}) {
     return { buffer: work, stats };
 }
 
+// ── Lifecycle classification — ONE definition, every surface ────────────────
+// A capture marker writes the lifecycle glyph into LINE 1 ("Area: ❓ text").
+// PRECEDENCE: when line 1 already carries a state glyph, line 1 DECIDES — so a
+// 🏁 milestone whose BODY quotes "❓/🎯" stays a milestone instead of ranking as
+// an open question forever (the glyph-in-prose trap; 6 live false-positives on
+// the KLYPIX brain, four of them the same shipped 1.30.0 card re-read as "still
+// to do"). v1.31.1 stripped glyphs at CAPTURE time for engine-authored text —
+// that could not help cards already written, nor a human card that legitimately
+// quotes a glyph. This is the read-side half, and it needs no rewrite of stored
+// text (a rewrite's failure mode is silent: an over-matching strip turns a real
+// open card invisible with nothing to notice).
+//
+// Two deliberate constraints, both measured before shipping:
+//   1. FALLBACK — if line 1 carries no state glyph at all we scan the whole
+//      text exactly as before, so a brain that writes its marker under a title
+//      line is classified identically. Zero regression by construction.
+//   2. 🛠 IS EXEMPT — a skill is ADDITIVE (a milestone can also carry a standing
+//      rule) and skills never age out, so 🛠 keeps whole-text matching. Applying
+//      precedence to it demoted 7 live skill cards to milestones, silently
+//      retiring 7 standing rules. Precedence governs the ❓/🎯-vs-🏁 STATE
+//      distinction only.
+// Measured on the KLYPIX brain: open 26→20 (6 false-positives, 0 lost),
+// skills 97→97, milestones 303→309, 0 cards left with no lifecycle at all.
+const STATE_GLYPH = /❓|🎯|🏁/;
+const OPEN_GLYPH = /❓|🎯/;
+const SKILL_GLYPH = /🛠/;
+const MILE_GLYPH = /🏁/;
+const RESOLVED_GLYPH = /↩|✅|⤵/;
+// The span line 1 governs when it carries a state glyph; else the whole card.
+const lifecycleScope = (text) => {
+    const t = String(text || '');
+    const l1 = t.split('\n', 1)[0];
+    return STATE_GLYPH.test(l1) ? l1 : t;
+};
+export const isSkillCard = (c) => SKILL_GLYPH.test(String(c?.text || ''));
+export const isOpenCard = (c) => !isSkillCard(c) && OPEN_GLYPH.test(lifecycleScope(c?.text));
+export const isMilestoneCard = (c) => !isSkillCard(c) && !isOpenCard(c) && MILE_GLYPH.test(lifecycleScope(c?.text));
+// "Open AND not already resolved in prose" — the status surfaces carry this
+// extra guard so a ✅/↩/⤵-stamped card is never reported as plainly still-open.
+export const isUnresolvedOpenCard = (c) => isOpenCard(c) && !RESOLVED_GLYPH.test(String(c?.text || ''));
+
 // ── Per-area status digest (2026-07-23 field incident) ───────────────────────
 // ONE computed current-state line per ACTIVE area: newest 🏁 headline + open
 // count. This is the fact whose tier-eviction let a stale "remaining:" claim
@@ -1138,8 +1179,8 @@ export function areaStatusDigest(struct, { activeDays = 30, maxAreas = 20, now =
     for (const [area, cs] of byArea) {
         const newest = Math.max(...cs.map(c => c.createdAt || 0));
         if (newest < cutoff) continue;                                  // dormant area — not "current state"
-        const miles = cs.filter(c => /🏁/.test(c.text) && !/❓|🎯|🛠/.test(c.text)).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-        const opens = cs.filter(c => /❓|🎯/.test(c.text) && !/🛠/.test(c.text));
+        const miles = cs.filter(isMilestoneCard).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+        const opens = cs.filter(isOpenCard);
         const m = miles[0];
         const mileTxt = m ? `last 🏁 ${day(m.createdAt)} “${cut(flat(m.text).replace(/^[^:\n]{1,40}:\s*/, '').replace(/^🏁\s*/, ''), 70)}”` : 'no 🏁 yet';
         rows.push({ newest, line: `- ${area} — ${mileTxt} · ${opens.length} open · latest ${day(newest)}` });
@@ -1174,9 +1215,9 @@ export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMile
     // Standing reference, NOT a point-in-time event: always shown, never
     // recency-decayed, and excluded from open/milestones/recent so a skill never
     // masquerades as (or ages out like) a decision.
-    const skills = rest.filter(c => /🛠/.test(c.text));
-    const open = rest.filter(c => /❓|🎯/.test(c.text) && !/🛠/.test(c.text));
-    const miles = rest.filter(c => /🏁/.test(c.text) && !/❓|🎯|🛠/.test(c.text));
+    const skills = rest.filter(isSkillCard);
+    const open = rest.filter(isOpenCard);
+    const miles = rest.filter(isMilestoneCard);
     const plain = rest.filter(c => !open.includes(c) && !miles.includes(c) && !skills.includes(c));
     const recent = plain.filter(c => c.createdAt >= cutoff).sort((a, b) => b.createdAt - a.createdAt).slice(0, maxRecent);
     const archivedCount = texts.length - live.length;
@@ -1237,16 +1278,29 @@ export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMile
     }
     if (open.length) {
         push('', `## Open questions & goals (${open.length}${overdueById.size ? `, ${overdueById.size} ⏰ overdue` : ''})`);
-        // Overdue first, then newest — the card that falls off the bottom must
-        // never be a passed deadline.
-        const sorted = open.slice().sort((a, b) => (overdueById.has(b.id) ? 1 : 0) - (overdueById.has(a.id) ? 1 : 0) || (b.createdAt || 0) - (a.createdAt || 0));
+        // Overdue first, then OLDEST first. This tier used to render every open
+        // in FULL TEXT while every other tier rendered 160-char headlines, so a
+        // handful of verbose cards spent the whole allowance: 14,401 chars of
+        // opens against a 7,425-char tier meant 15 of 27 were dropped — and
+        // sorted newest-first, the dropped 15 were ALWAYS the oldest, i.e. the
+        // long-deferred items a "what is still open?" question is mostly about.
+        // Now: the newest few keep their detail, the rest get a headline, and
+        // the whole list fits. Age-ascending makes eviction safe permanently —
+        // if the brain triples and something must go, it is the newest (already
+        // shown in Recent decisions), never the item nobody has looked at.
+        const sorted = open.slice().sort((a, b) => (overdueById.has(b.id) ? 1 : 0) - (overdueById.has(a.id) ? 1 : 0) || (a.createdAt || 0) - (b.createdAt || 0));
+        // Detail tier mirrors the Recent-decisions idiom: a few in depth, the
+        // rest as scannable headlines. Completeness beats depth for a list whose
+        // job is to say what EXISTS — full text is one MCP read away.
+        const detailOpen = new Set(sorted.slice(-detailRecent).map(c => c.id));   // newest few keep full detail
         let shown = 0;
         for (const c of sorted) {
             if (shown >= 40 || used > BUDGET_CHARS * 0.55) break;
-            push(`- ${fr(c)}${flat(c.text)}${odBadge(c)}`);
+            const body = (overdueById.has(c.id) || detailOpen.has(c.id)) ? excerpt(c) : headline(c, 200);
+            push(`- ${fr(c)}${body}${odBadge(c)}`);
             shown++;
         }
-        if (shown < open.length) push(`- …and ${open.length - shown} more open item(s) — ask the brain (brain_ask) rather than assuming this list is complete.`);
+        if (shown < open.length) push(`- ⚠️ …and ${open.length - shown} more open item(s) — ask the brain (brain_ask) rather than assuming this list is complete.`);
     }
     if (skills.length) {
         push('', '## 🛠️ Skills — how we do things here (reusable; applies every session)');
@@ -1299,6 +1353,9 @@ export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMile
     if (miles.length) {
         push('', '## Milestones');
         for (const c of miles.sort((a, b) => b.createdAt - a.createdAt).slice(0, maxMilestones)) push(`- ${fr(c)}${headline(c)}`);
+        // Same honesty rule as every other tier: this printed 8 of 302 with no
+        // notice at all, so the newest-8 read as "the milestones".
+        if (miles.length > maxMilestones) push(`- …and ${miles.length - maxMilestones} older milestone(s) — search the brain.`);
     }
     let shownRecent = 0;
     if (recent.length) {
@@ -1327,6 +1384,7 @@ export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMile
     if (struct.connections.length && used <= BUDGET_CHARS) {
         push('', '## Connections');
         for (const cn of struct.connections.slice(0, maxConnections)) push(`- ${cn.from} → ${cn.to}${cn.label || cn.relationship ? ` (${cn.label || cn.relationship})` : ''}`);
+        if (struct.connections.length > maxConnections) push(`- …and ${struct.connections.length - maxConnections} more connection(s) — search the brain.`);
     }
     const hidden = [];
     const unshown = plain.length - shownRecent;
@@ -1357,8 +1415,8 @@ export function structToUltraBrief(struct, { freshness = null, briefPath = '.cla
     const isFocus = (c) => /(^|\s)focus\b/i.test(c.area || '');
     const live = texts.filter(c => !isArchived(c));
     const focus = live.filter(isFocus);
-    const open = live.filter(c => /❓|🎯/.test(c.text) && !/🛠/.test(c.text) && !isFocus(c));
-    const skills = live.filter(c => /🛠/.test(c.text) && !isFocus(c));
+    const open = live.filter(c => isOpenCard(c) && !isFocus(c));
+    const skills = live.filter(c => isSkillCard(c) && !isFocus(c));
     const conflicts = (struct.connections || []).filter(c => c.relationship === 'conflicts_with');
     const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
     const fr = (c) => (freshness && freshness[c.id]) ? freshness[c.id] + ' ' : '';
@@ -1627,7 +1685,10 @@ export function questionContextToMarkdown(question, result, { mode = 'lexical', 
 // the question). Deterministic O(cards) assembly, no embeddings: per-area
 // digest + open items (overdue first, with correction/fulfillment flags) +
 // likely-fulfilled hints + newest milestones. Rendered ABOVE the ranked hits.
-export function statusContextToMarkdown(struct, { maxOpen = 12, budgetChars = 3200 } = {}) {
+// maxOpen defaults to NO cap: the open list is the answer to a status question,
+// so it is sized to fit (per-card width adapts) rather than sliced. Callers can
+// still pass a cap explicitly.
+export function statusContextToMarkdown(struct, { maxOpen = Infinity, budgetChars = 4200 } = {}) {
     if (!struct || !Array.isArray(struct.cards)) return '';
     const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
     const day = (ts) => ts ? new Date(ts).toISOString().slice(0, 10) : '';
@@ -1635,17 +1696,38 @@ export function statusContextToMarkdown(struct, { maxOpen = 12, budgetChars = 32
     const live = struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim() && !isArchived(c));
     const out = [];
     let used = 0;
-    const push = (l) => { if (used < budgetChars) { out.push(l); used += l.length + 1; } };
-    push('# Computed current state (status mode)');
-    push('_A status-shaped question answers from THIS computed section first — the ranked cards below are supporting context only. A card marked ⏳ or ⚠️ must not be reported as plainly still-open._');
-    push('');
-    for (const l of areaStatusDigest(struct, { maxAreas: 14 })) push(l);
+    // A truncation notice must NEVER be subject to the budget it is warning
+    // about. It used to be: the "…and N more" line was emitted through the same
+    // guarded push as the content, so once the budget was spent the notice was
+    // dropped too — and a one-third-complete list rendered as a complete one,
+    // under a header that tells the agent to answer from this section first.
+    // (2026-07-25 field incident: 9 of 27 opens shown, no notice, answer wrong.)
+    // Structural lines — headers, counts, overflow notices — bypass the budget.
+    const pushAlways = (l) => { out.push(l); used += l.length + 1; };
+    const cut = (t, n) => { let s = String(t).slice(0, n); if (/[\uD800-\uDBFF]$/.test(s)) s = s.slice(0, -1); return String(t).length > n ? s.trimEnd() + '…' : s; };
+    pushAlways('# Computed current state (status mode)');
+    pushAlways('_A status-shaped question answers from THIS computed section first — the ranked cards below are supporting context only. A card marked ⏳ or ⚠️ must not be reported as plainly still-open._');
+    pushAlways('');
     // Resolved-but-not-archived cards (✅/↩/⤵ in text) are NOT open — every
     // sibling lifecycle matcher carries this guard (review parity fix).
-    const opens = live.filter(c => /❓|🎯/.test(c.text) && !/🛠/.test(c.text) && !/↩|✅|⤵/.test(c.text));
+    const opens = live.filter(isUnresolvedOpenCard);
+    // OPENS ARE THE PRIORITY TIER — reserve their share BEFORE the area digest
+    // spends it. The digest used to run first and unbounded at 14 areas, eating
+    // 1,886 of 3,200 chars (59%) before a single open card printed, so `maxOpen`
+    // never even bound: the budget cut the list at 9 first. Derive the area cap
+    // from what's actually left instead of a fixed number — areaStatusDigest
+    // prints its own honest "…and N more active area(s)" line when it trims.
+    const openReserve = opens.length ? Math.floor(budgetChars * 0.6) : 0;
+    const maxAreas = Math.max(4, Math.min(14, Math.floor((budgetChars - openReserve - used) / 100)));
+    for (const l of areaStatusDigest(struct, { maxAreas })) pushAlways(l);
     if (opens.length) {
         const overdueById = findOverdueOpenCards(struct).byId;
-        const sorted = opens.slice().sort((a, b) => (overdueById.has(b.id) ? 1 : 0) - (overdueById.has(a.id) ? 1 : 0) || (b.createdAt || 0) - (a.createdAt || 0));
+        // Overdue first, then OLDEST first. Age IS an open item's urgency signal,
+        // and the newest opens already appear in the brief's Recent tier — so if
+        // anything must be cut it should be the newest, never the long-deferred.
+        // (The brief evicted oldest-first: every dropped card was older than
+        // every printed one, hiding a founder-ranked #1 bug for two weeks.)
+        const sorted = opens.slice().sort((a, b) => (overdueById.has(b.id) ? 1 : 0) - (overdueById.has(a.id) ? 1 : 0) || (a.createdAt || 0) - (b.createdAt || 0));
         // Slice FIRST, overlay the slice — running correction/fulfillment
         // overlays across ALL opens was a cards×cards-shaped pass per status
         // question (review scale finding).
@@ -1653,24 +1735,33 @@ export function statusContextToMarkdown(struct, { maxOpen = 12, budgetChars = 32
         const fulfills = fulfillmentOverlaysFor(struct, top);
         let overlays = new Map();
         try { overlays = correctionOverlaysFor(struct, top); } catch { /* best-effort */ }
-        push('');
-        push(`## Open (${opens.length})`);
+        pushAlways('');
+        pushAlways(`## Open (${opens.length})`);
+        // COMPLETENESS OVER DEPTH: scale each line to fit rather than dropping
+        // items. A 60-char headline still proves an item EXISTS and can be
+        // pulled in full; a missing line asserts it doesn't. Only if every open
+        // at the floor width still overflows do we cut — and then we say so.
+        const room = Math.max(0, budgetChars - used - 200);   // 200 ≈ milestones tail
+        // Budget the PREFIX too ("- [Area] ⏰OVERDUE ⏳likely-fulfilled "), or the
+        // section overruns by prefix×cards — measured 17% over before this term.
+        const PREFIX = 30;
+        const perCard = Math.max(60, Math.min(140, Math.floor(room / Math.max(1, top.length)) - PREFIX));
         let shown = 0;
         for (const c of top) {
             if (used > budgetChars) break;
             const flags = `${overdueById.has(c.id) ? ' ⏰OVERDUE' : ''}${overlays.has(c.id) ? ' ⚠️CORRECTED' : ''}${fulfills.has(c.id) ? ' ⏳likely-fulfilled' : ''}`;
-            push(`- [${flat(c.area) || 'Notes'}]${flags} ${flat(c.text).slice(0, 140)}`);
+            pushAlways(`- [${flat(c.area) || 'Notes'}]${flags} ${cut(flat(c.text), perCard)}`);
             shown++;
         }
-        if (shown < opens.length) push(`- …and ${opens.length - shown} more open item(s).`);
+        if (shown < opens.length) pushAlways(`- ⚠️ …and ${opens.length - shown} more open item(s) — this list is NOT complete; call brain_ask before reporting what remains.`);
     }
-    const miles = live.filter(c => /🏁/.test(c.text) && !/❓|🎯|🛠/.test(c.text)).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+    const miles = live.filter(isMilestoneCard).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
     if (miles.length) {
-        push('');
-        push('## Newest milestones');
-        for (const m of miles.slice(0, 3)) push(`- [${flat(m.area) || '?'}] ${day(m.createdAt)} ${flat(m.text).slice(0, 130)}`);
+        pushAlways('');
+        pushAlways('## Newest milestones');
+        for (const m of miles.slice(0, 3)) pushAlways(`- [${flat(m.area) || '?'}] ${day(m.createdAt)} ${cut(flat(m.text), 130)}`);
     }
-    push('');
+    pushAlways('');
     return out.join('\n') + '\n';
 }
 
@@ -1978,7 +2069,7 @@ export function brainInsights(struct, { staleDays = 21, topHubs = 6 } = {}) {
         if (cn.toId) deg.set(cn.toId, (deg.get(cn.toId) || 0) + 1);
     }
     const headline = (c) => String(c.text || '').replace(/\s+/g, ' ').trim().replace(/^(.*?)([.!?](\s|$)|$)/, '$1').slice(0, 120);
-    const isQuestion = (c) => /❓|🎯/.test(c.text); // ❓ open question + 🎯 goal both read as "open"
+    const isQuestion = isOpenCard; // ❓ open question + 🎯 goal both read as "open" (line-1 precedence)
     const hubs = live
         .map(c => ({ id: c.id, area: c.area, degree: deg.get(c.id) || 0, headline: headline(c) }))
         .filter(x => x.degree > 0)
@@ -2233,7 +2324,7 @@ export function challengeBrain(struct, claim, { semantic = null, k = 8, now = Da
     const liveCards = struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim() && !isArchived(c));
     res.checked.liveCards = liveCards.length;
     res.checked.cueCards = liveCards.filter(c => hasCorrectionCue(c.text)).length;
-    res.checked.openQuestions = liveCards.filter(c => /❓|🎯/.test(c.text)).length;
+    res.checked.openQuestions = liveCards.filter(isOpenCard).length;
     if (!text) { res.shortClaim = true; return res; }
 
     const claimQTok = stripCueMeta(new Set(queryTokens(text)));
@@ -3392,10 +3483,9 @@ export function findStaleOpenCards(struct, { coverAt = 0.6, max = 5 } = {}) {
     const empty = { gaps: [], total: 0 };
     if (!struct || !Array.isArray(struct.cards)) return empty;
     const isArchived = (c) => /^archive$/i.test(c.area || '');
-    const isOpen = (c) => /❓|🎯/.test(c.text);
     const live = struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim() && !isArchived(c) && !/↩|✅/.test(c.text));
-    const opens = live.filter(isOpen);
-    const miles = live.filter(c => /🏁/.test(c.text) && !isOpen(c));
+    const opens = live.filter(isOpenCard);
+    const miles = live.filter(isMilestoneCard);
     if (!opens.length || !miles.length) return empty;
     const out = [];
     for (const o of opens) {
@@ -3451,7 +3541,7 @@ export function findOverdueOpenCards(struct, { now = Date.now() } = {}) {
     for (const c of struct.cards) {
         if (c.type === 'container' || !(c.text || '').trim() || isArchived(c)) continue;
         if (/↩|✅/.test(c.text)) continue;                       // already superseded/resolved
-        if (!/❓|🎯/.test(c.text) || /🛠/.test(c.text)) continue; // open questions & goals only
+        if (!isOpenCard(c)) continue;                            // open questions & goals only
         const d = parseDeadline(c.text);
         // Overdue gate is LENIENT (end of the named day, d.ts) — a card isn't overdue
         // at 00:01 on its deadline day. The DISPLAY count is a whole-calendar-day

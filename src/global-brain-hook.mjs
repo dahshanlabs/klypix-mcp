@@ -1502,13 +1502,38 @@ async function promptRetrieve(lib) {
         if (struct) {
             try {
                 const digest = lib.areaStatusDigest(struct, { maxAreas: 12 });
+                // The digest alone is per-area COUNTS ("· 8 open ·") — it never
+                // names a single open card, yet this block also clears freshHits,
+                // so a status prompt used to arrive with the instruction "answer
+                // from THIS" and nothing to answer FROM. An agent then reports
+                // whatever the session brief happened to show, which is itself a
+                // truncated tier — the 2026-07-25 field incident, where 8 live
+                // opens (including a founder-ranked #1 bug) were invisible on
+                // both surfaces at once. Prefer the full computed view — digest
+                // AND every open card, honestly overflow-marked — and keep the
+                // bare digest only as the fallback for an older engine.
+                let body = null;
+                if (typeof lib.statusContextToMarkdown === 'function') {
+                    try {
+                        // Sized so a real brain fits BOTH a full area digest and
+                        // every open at readable width (~140 chars) — this block
+                        // IS the answer to the question that triggered it, it is
+                        // hash-deduped per session, and it replaces freshHits
+                        // rather than adding to them. Paying ~1.2k tokens once
+                        // per status conversation beats answering it wrong.
+                        const md = lib.statusContextToMarkdown(struct, { budgetChars: 5200 });
+                        // Drop its own H1; the hook's stronger header replaces it.
+                        if (md && md.trim()) body = md.split('\n').slice(1).join('\n').trimEnd();
+                    } catch { body = null; }
+                }
+                const content = body || digest.join('\n');
                 if (digest.length) {
-                    const h = crypto.createHash('sha1').update(digest.join('\n')).digest('hex').slice(0, 12);
+                    const h = crypto.createHash('sha1').update(content).digest('hex').slice(0, 12);
                     let lane = null; try { lane = readSessions().find(s => s.id === sid) || null; } catch { /* */ }
                     if (lane && lane.statusDigestHash === h) {
                         statusMd = '## 📊 Current state — unchanged since the digest shown earlier this session (`brain_ask` gives the full computed status view).';
                     } else {
-                        statusMd = ['## 📊 Computed current state (status-shaped question detected — answer from THIS + `brain_ask`, never from memory of past sessions)', ...digest].join('\n');
+                        statusMd = ['## 📊 Computed current state (status-shaped question detected — answer from THIS + `brain_ask`, never from memory of past sessions)', content].join('\n');
                         try { touchSession(sid, { statusDigestHash: h }); } catch { /* best-effort */ }
                     }
                     freshHits = [];

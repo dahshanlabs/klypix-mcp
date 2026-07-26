@@ -10,13 +10,21 @@ You've seen the setup: point an AI at a folder of notes, watch the graph fill up
 
 ## Quick start
 
-**Claude Code (native — live hooks, zero effort):**
+**Claude Code + Codex (native, machine-wide):**
 
 ```bash
 npx klypix-mcp install
 ```
 
-Every repo on your machine with a `brain.klypix` now auto-briefs each session with the project's state and auto-captures decisions as you work. Give a project a brain by dropping a `brain.klypix` in it — the [KLYPIX app](https://klypix.com) does it in one click (*Save canvas as project brain*), or `create_canvas` makes one from any agent.
+Claude Code gets live hooks for auto-brief + auto-capture. Codex gets a native
+`~/.codex/config.toml` MCP registration and conditional global guidance that activates
+only when a project contains `./brain.klypix`. Existing MCP servers, Codex settings, and
+personal instructions are preserved and backed up before KLYPIX-owned blocks change.
+Restart Codex after installation so it loads the new server.
+
+Give a project a brain by dropping a `brain.klypix` in it — the
+[KLYPIX app](https://klypix.com) does it in one click (*Save canvas as project brain*),
+or `create_canvas` makes one from any agent.
 
 **Every other agent tool (one command per project):**
 
@@ -24,7 +32,9 @@ Every repo on your machine with a `brain.klypix` now auto-briefs each session wi
 npx klypix-mcp link
 ```
 
-Extends the brain to Cursor & VS Code/Copilot (MCP config + rules) and to Cline, Windsurf, Gemini CLI, Aider, and any AGENTS.md-reading agent — always-on rules that teach the tool to read and capture the brain.
+Adds project-native config for Codex, Cursor, and VS Code/Copilot, plus rules for
+Cline, Windsurf, Gemini CLI, Aider, and any AGENTS.md-reading agent. Verify all
+managed files without changing them with `npx klypix-mcp link --check`.
 
 ## What a project brain does
 
@@ -86,11 +96,11 @@ Then ask your agent things like *"what did we decide about auth?"*, *"challenge 
 
 ### Tools vs. the *automatic* brain
 
-This package is the **agent-neutral read/write surface** — any MCP client gets the tools above on demand (*pull*), in any project. The **automatic** brain — auto-capturing decisions from your work, injecting the brief into each session, coordinating concurrent sessions (*push*) — runs in a host **hook**, which `npx klypix-mcp install` wires for Claude Code (and the [KLYPIX desktop app](https://klypix.com) ships built-in). Other tools get the always-on rules via `link`.
+This package is the **agent-neutral read/write surface** — any MCP client gets the tools above on demand (*pull*), in any project. `install` wires Claude Code's live hooks and Codex's native MCP + conditional global guidance; `link` projects the repository-level MCP and instruction files used by Codex and the other coding agents. Full transcript-driven auto-capture remains a Claude Code hook capability; Codex and other hookless clients capture durable decisions through the MCP instructions and `brain_note`.
 
 ### Updates — the propagation contract
 
-`install` lays the whole brain (hooks + engine + local MCP server) into `~/.claude/project-brain`, and the emitted config runs the server **from that installed bundle** (no npx cache to go stale). Updates are then automatic: at session start the hook checks npm (≤ once/24h, fail-open, disable with `KLYPIX_AUTO_UPDATE=0`) and self-installs newer releases. One honest caveat: a running stdio server can't hot-swap — a new binary loads on the next full app launch (or `/mcp` reconnect); `brain_doctor`'s RUNNING line tells you when that's needed.
+`install` lays the whole brain (hooks + engine + local MCP server) into `~/.claude/project-brain`, then points both Claude and Codex at that installed bundle so there is no npx cache to go stale. Updates are automatic through the Claude session-start hook: it checks npm (≤ once/24h, fail-open, disable with `KLYPIX_AUTO_UPDATE=0`) and self-installs newer releases, including healing the Codex registration. One honest caveat: a running stdio server can't hot-swap — a new binary loads on the next full app launch (or `/mcp` reconnect); `brain_doctor`'s RUNNING line tells you when that's needed.
 
 ## Also speaks A2A (Agent-to-Agent)
 

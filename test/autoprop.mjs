@@ -145,6 +145,10 @@ function runInstall(home, projectCwd) {
 {
   const home = tmp('d-home');
   const proj = tmp('d-proj');
+  fs.mkdirSync(path.join(home, '.codex'), { recursive: true });
+  fs.writeFileSync(path.join(home, '.codex', 'config.toml'),
+    'model = "gpt-test"\n\n# keep this server\n[mcp_servers.docs]\nurl = "https://example.test/mcp"\n');
+  fs.writeFileSync(path.join(home, '.codex', 'AGENTS.md'), '# Personal Codex instructions\n');
   // an EXISTING stale config (the migration subject)
   fs.writeFileSync(path.join(proj, '.mcp.json'), JSON.stringify({ mcpServers: { 'klypix-canvas': { command: 'npx', args: ['-y', 'klypix-mcp', '--vault', '.'] } } }, null, 2));
   runInstall(home, proj);
@@ -165,10 +169,18 @@ function runInstall(home, projectCwd) {
   // settings.json wired 4 hooks
   const settings = JSON.parse(fs.readFileSync(path.join(home, '.claude', 'settings.json'), 'utf8'));
   ok(['SessionStart', 'UserPromptSubmit', 'Stop', 'PostToolUse'].every(e => Array.isArray(settings.hooks?.[e])), 'D: all 4 Claude Code hooks wired');
+  const codexConfig = fs.readFileSync(path.join(home, '.codex', 'config.toml'), 'utf8');
+  ok(codexConfig.includes('[mcp_servers.klypix-canvas]') && codexConfig.includes('klypix-mcp-server.mjs'), 'D: Codex native MCP server wired to the installed local bundle');
+  ok(codexConfig.includes('model = "gpt-test"') && codexConfig.includes('[mcp_servers.docs]'), 'D: Codex config preserves user settings + sibling servers');
+  const codexAgents = fs.readFileSync(path.join(home, '.codex', 'AGENTS.md'), 'utf8');
+  ok(codexAgents.includes('# Personal Codex instructions') && codexAgents.includes('klypix-codex:start'), 'D: Codex global guidance is fence-merged with personal instructions');
+  ok(fs.existsSync(path.join(home, '.codex', 'config.toml.klypix-bak')), 'D: Codex config gets a rollback backup');
 
   // re-install → .prev backup of the prior scripts is created
   runInstall(home, proj);
   ok(fs.existsSync(path.join(bd, '.prev', 'global-brain-hook.mjs')), 'D: re-install snapshots the prior scripts to .prev/ (rollback)');
+  ok((fs.readFileSync(path.join(home, '.codex', 'config.toml'), 'utf8').match(/\[mcp_servers\.klypix-canvas\]/g) || []).length === 1, 'D: Codex MCP registration stays idempotent on re-install');
+  ok((fs.readFileSync(path.join(home, '.codex', 'AGENTS.md'), 'utf8').match(/klypix-codex:start/g) || []).length === 1, 'D: Codex global guidance stays idempotent on re-install');
   ok(!fs.existsSync(path.join(bd, '.install.lock')), 'D: the install lock is released after completion');
 
   // concurrency: two installs at once are idempotent (lock serializes; no torn state)

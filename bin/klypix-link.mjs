@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // klypix-link — make THIS project's brain automatic for EVERY agent tool.
-// `npx klypix-mcp install` gives Claude Code the brain via hooks; `link` extends the
-// same automatic read+capture to Cursor, Cline, Windsurf, Copilot/VS Code, Gemini CLI,
-// Aider, and any AGENTS.md-reading agent, by dropping each tool's native MCP config +
+// `npx klypix-mcp install` gives Claude Code hooks and wires Codex globally; `link`
+// extends the same automatic read+capture per project to Codex, Cursor, Cline,
+// Windsurf, Copilot/VS Code, Gemini CLI, Aider, and any AGENTS.md-reading agent,
+// by dropping each tool's native MCP config +
 // rules file in the current project. Idempotent — re-run anytime to refresh. The managed
 // block carries the brain version + a content hash, so:
 //
@@ -48,7 +49,7 @@ try {
 
   const changed = [...rules, ...mcp].filter(r => r.action && !['unchanged', 'skipped'].includes(r.action)).length;
   console.log(`\n✓ ${changed} file(s) written/updated — every agent opened in this project now reads + captures ./brain.klypix.`);
-  console.log('  Cline & Windsurf MCP servers live in their global config; the rules file points them at the brain regardless.');
+  console.log('  Codex gets .codex/config.toml + AGENTS.md; Cline & Windsurf use their global MCP config plus project rules.');
   console.log('  Verify anytime with `npx klypix-mcp link --check` (or `npx klypix-mcp doctor`).');
   if (!hasBrain) {
     console.log('\n⚠ No ./brain.klypix here yet — the rules reference it for when you create one.');

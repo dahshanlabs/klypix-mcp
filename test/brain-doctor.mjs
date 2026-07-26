@@ -16,7 +16,13 @@ import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { linkProject, auditProject } from '../src/agent-rules.mjs';
+import {
+  auditProject,
+  connectCodexMcpServer,
+  disconnectCodexMcpServer,
+  linkProject,
+  safeReadCodexConfig,
+} from '../src/agent-rules.mjs';
 import { makeVault, seedBrain } from './_harness.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -31,12 +37,18 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
   const proj = path.join(os.tmpdir(), 'klypix-doctor-test-proj');
   fs.rmSync(proj, { recursive: true, force: true });
   fs.mkdirSync(proj, { recursive: true });
+  fs.mkdirSync(path.join(proj, '.codex'), { recursive: true });
+  fs.writeFileSync(path.join(proj, '.codex', 'config.toml'),
+    'model = "gpt-test"\n\n# user-owned docs server\n[mcp_servers.docs]\nurl = "https://example.test/mcp"\n');
   fs.writeFileSync(path.join(proj, 'brain.klypix'), 'stub');   // hasBrain → projection makes sense
 
   linkProject(proj, { version: '1.2.3' });
   let a = auditProject(proj, { version: '1.2.3' });
   ok(a.ok && a.drift.length === 0, `fresh link → all ${a.files.length} files ok`);
-  ok(a.files.length === 10, 'projects exactly 10 targets (8 rules + 2 mcp — Antigravity added 1.29.1)');
+  ok(a.files.length === 11, 'projects exactly 11 targets (8 rules + 3 mcp, including Codex)');
+  ok(statusOf(a, '.codex/config.toml') === 'ok', 'Codex project MCP config generated + audited');
+  const codexRaw = fs.readFileSync(path.join(proj, '.codex', 'config.toml'), 'utf8');
+  ok(codexRaw.includes('model = "gpt-test"') && codexRaw.includes('[mcp_servers.docs]'), 'Codex merge preserves unrelated settings, comments, and MCP servers');
   ok(statusOf(a, 'GEMINI.md') === 'ok' && statusOf(a, 'CONVENTIONS.md') === 'ok', 'GEMINI.md + CONVENTIONS.md generated (were "not generated")');
 
   // ZERO-TOUCH — newer current version but IDENTICAL content → still ok (a version-
@@ -44,6 +56,7 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
   a = auditProject(proj, { version: '2.0.0' });
   ok(statusOf(a, 'AGENTS.md') === 'ok', 'older stamp + content-identical block → ok (zero-touch patch release)');
   ok(statusOf(a, '.cursor/mcp.json') === 'ok', 'mcp.json is version-agnostic → ok');
+  ok(statusOf(a, '.codex/config.toml') === 'ok', 'Codex TOML is version-agnostic → ok');
 
   // STALE — a block whose CONTENT differs from today's instructions (a real older
   // release), internally consistent (body matches its own stamp → not hand-edited).
@@ -84,6 +97,28 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
   fs.writeFileSync(cur, JSON.stringify(cfg, null, 2));
   a = auditProject(proj, { version: '1.2.3' });
   ok(statusOf(a, '.cursor/mcp.json') === 'ok', 'customized --vault path tolerated → ok');
+
+  // Codex TOML is section-edited, never wholesale serialized. A broken KLYPIX
+  // launch is drift, while connect/disconnect preserve user-owned tables.
+  {
+    const codexFile = path.join(proj, '.codex', 'config.toml');
+    fs.writeFileSync(codexFile, fs.readFileSync(codexFile, 'utf8')
+      .replace(/command = "[^"]+"/, 'command = "echo"'));
+    a = auditProject(proj, { version: '1.2.3' });
+    ok(statusOf(a, '.codex/config.toml') === 'hand-edited', 'Codex entry that no longer launches klypix-mcp → hand-edited');
+    const repaired = connectCodexMcpServer({
+      configPath: codexFile,
+      entry: { command: 'node', args: ['/runtime/klypix-mcp-server.mjs', '--vault', '.'] },
+      cwd: '..',
+    });
+    ok(repaired.ok && safeReadCodexConfig(codexFile).servers['klypix-canvas'].launchesKlypix, 'Codex reconnect repairs only the KLYPIX table');
+    const removed = disconnectCodexMcpServer({ configPath: codexFile });
+    const afterRemove = fs.readFileSync(codexFile, 'utf8');
+    ok(removed.ok && !/mcp_servers\.klypix-canvas/.test(afterRemove), 'Codex disconnect removes the KLYPIX table');
+    ok(afterRemove.includes('model = "gpt-test"') && afterRemove.includes('[mcp_servers.docs]'), 'Codex disconnect preserves every unrelated setting/server');
+    ok(fs.existsSync(codexFile + '.klypix-bak'), 'Codex config changes create a rollback backup');
+    linkProject(proj, { version: '1.2.3' });
+  }
 
   const sha8t = (s) => crypto.createHash('sha1').update(String(s)).digest('hex').slice(0, 8);
   const resetAgents = () => { fs.writeFileSync(path.join(proj, 'AGENTS.md'), ''); linkProject(proj, { version: '1.2.3' }); };

@@ -16,7 +16,11 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { mcpServerEntry } from '../src/agent-rules.mjs';
+import {
+    connectCodexMcpServer,
+    mcpServerEntry,
+    mergeCodexGlobalInstructions,
+} from '../src/agent-rules.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PKG_ROOT = path.resolve(__dirname, '..');
@@ -29,6 +33,7 @@ const HOME = os.homedir();
 const CLAUDE_DIR = path.join(HOME, '.claude');
 const BRAIN_DIR = path.join(CLAUDE_DIR, 'project-brain');
 const SETTINGS = path.join(CLAUDE_DIR, 'settings.json');
+const CODEX_CONFIG = path.join(HOME, '.codex', 'config.toml');
 const HOOK_MARK = 'global-brain-hook';
 const exists = (p) => { try { fs.statSync(p); return true; } catch { return false; } };
 const fwd = (p) => p.replace(/\\/g, '/');
@@ -40,6 +45,28 @@ function copyDir(src, dest) {
     }
 }
 
+// Codex has two independent integration layers: MCP gives it the brain tools,
+// while a conditional managed block in ~/.codex/AGENTS.md tells every session
+// to use those tools when ./brain.klypix exists.
+function wireCodex() {
+    const mcp = connectCodexMcpServer({
+        configPath: CODEX_CONFIG,
+        entry: mcpServerEntry({ vault: '.', home: HOME }),
+    });
+    const instructions = mergeCodexGlobalInstructions(HOME);
+    return { mcp, instructions, ok: mcp.ok && instructions.ok };
+}
+
+function reportCodex(result) {
+    if (result.ok) {
+        console.log(`✓ wired Codex: MCP tools (${result.mcp.action}) + conditional project-brain guidance (${result.instructions.action})`);
+        return;
+    }
+    if (!result.mcp.ok) console.error(`⚠ Codex MCP was not changed: ${result.mcp.error}`);
+    if (!result.instructions.ok) console.error(`⚠ Codex guidance was not changed: ${result.instructions.error}`);
+    console.error('  Claude Code installation is intact. Fix the Codex warning, then re-run this command.');
+}
+
 // ── Never-downgrade gate ─────────────────────────────────────────────────────
 // The brain version is a UNIFIED namespace = the klypix-mcp version, stamped by BOTH
 // the npm install (here) and the desktop bundle, so the two channels compare cleanly.
@@ -48,8 +75,16 @@ function copyDir(src, dest) {
 const cmpSemver = (a, b) => { const pa = String(a || '').split('.').map(n => parseInt(n, 10) || 0), pb = String(b || '').split('.').map(n => parseInt(n, 10) || 0); for (let i = 0; i < 3; i++) { if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) - (pb[i] || 0); } return 0; };
 const cur = (() => { try { return JSON.parse(fs.readFileSync(path.join(BRAIN_DIR, '.brain-version.json'), 'utf8')); } catch { return null; } })();
 if (!FORCE && cur) {
-    if (cur.dev === true) { console.log(`• A dev deploy owns ${BRAIN_DIR} (dev:true) — leaving it untouched. Re-run with --force to override.`); process.exit(0); }
-    if (cur.brainVersion && cmpSemver(cur.brainVersion, VERSION) > 0) { console.log(`• Installed brain v${cur.brainVersion} is newer than this package v${VERSION} — not downgrading. Re-run with --force to override.`); process.exit(0); }
+    if (cur.dev === true) {
+        console.log(`• A dev deploy owns ${BRAIN_DIR} (dev:true) — leaving it untouched. Re-run with --force to override.`);
+        reportCodex(wireCodex());
+        process.exit(0);
+    }
+    if (cur.brainVersion && cmpSemver(cur.brainVersion, VERSION) > 0) {
+        console.log(`• Installed brain v${cur.brainVersion} is newer than this package v${VERSION} — not downgrading. Re-run with --force to override.`);
+        reportCodex(wireCodex());
+        process.exit(0);
+    }
 }
 
 // ── Install lock (auto-propagation, part D — concurrency) ─────────────────────
@@ -218,6 +253,9 @@ try {
     //    (heals an existing stale config so the next MCP server spawn runs current).
     const migrated = migrateProjectMcpConfig();
 
+    // Codex needs both native MCP tools and conditional global guidance.
+    const codex = wireCodex();
+
     // 8) READINESS check — re-read what we just wrote and confirm all 4 hooks actually
     //    took (a malformed pre-existing group, a partial merge, or a later hand-edit can
     //    leave the brain LIVE but not LEARNING — liveness ≠ readiness). Warn, don't fail.
@@ -226,12 +264,13 @@ try {
     const notWired = ['SessionStart', 'UserPromptSubmit', 'Stop', 'PostToolUse'].filter(e => !wiredFor(e));
 
     if (gotLock) releaseLock();
+    reportCodex(codex);
     console.log(`✓ installed klypix brain v${VERSION} → ${BRAIN_DIR}  (${n} scripts, ${deps} dep packages)`);
     if (!notWired.length) console.log('✓ wired 4 hooks: SessionStart · UserPromptSubmit (--prompt) · Stop (--capture) · PostToolUse (--live) → settings.json');
     else console.error(`⚠ readiness: ${notWired.length} hook(s) did NOT take (${notWired.join(', ')}) — the brain will read but not capture/sync. Re-run \`npx klypix-mcp install --force\` or check ${SETTINGS}.`);
     console.log(`✓ MCP server runs from the local bundle (node ${fwd(path.join(BRAIN_DIR, 'klypix-mcp-server.mjs'))}) — no npx cache, works offline, always the installed version.`);
     if (migrated) console.log(`✓ migrated ${migrated.file} klypix-canvas server: ${migrated.from} → ${migrated.to} (backup: .mcp.json.klypix-bak). Reconnect (/mcp) or restart to pick it up.`);
-    console.log('  Every project with a ./brain.klypix now auto-reads its brief + captures decisions.');
+    console.log('  Claude Code auto-briefs + captures through hooks; Codex reads + writes through native MCP and managed guidance.');
     console.log('  ⚠ Open sessions keep their OLD server until relaunched: fully quit & reopen the app (a session resume / new chat does NOT respawn the MCP server). `brain_doctor`\'s RUNNING line confirms when you\'re current.');
     console.log('  Verify anytime: `npx klypix-mcp doctor` (is the brain current + wired + in sync, who else is live).');
 } catch (e) {

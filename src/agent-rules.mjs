@@ -49,6 +49,304 @@ export function mcpServerEntry({ vault = '.', withType = false, home } = {}) {
   if (!base) base = { command: 'npx', args: ['-y', 'klypix-mcp', '--vault', vault] };
   return withType ? { type: 'stdio', ...base } : base;
 }
+
+// Codex uses TOML rather than the JSON MCP shape used by the other clients.
+// These helpers replace only KLYPIX-owned table sections, preserving comments,
+// formatting, and every unrelated setting byte-for-byte. They intentionally do
+// not serialize the whole document.
+const CODEX_GLOBAL_START = '<!-- klypix-codex:start (managed by klypix-mcp) -->';
+const CODEX_GLOBAL_END = '<!-- klypix-codex:end -->';
+const CODEX_GLOBAL_RE = /<!-- klypix-codex:start \(managed by klypix-mcp\) -->[\s\S]*?<!-- klypix-codex:end -->\r?\n?/;
+const CODEX_GLOBAL_BODY = [
+  CODEX_GLOBAL_START,
+  '## KLYPIX project brains',
+  '',
+  'When the current project contains `./brain.klypix`, treat it as the authoritative shared project memory.',
+  'At task start, read `.claude/brain-brief.md` when present; otherwise use the `klypix-canvas`',
+  'MCP tools (`brain_ask`, `read_canvas` with canvas `"brain"`, or `brain_insights`).',
+  'Capture durable decisions and milestones with `brain_note`. Never hand-edit `brain.klypix`.',
+  'If the project has no `brain.klypix`, ignore this section.',
+  CODEX_GLOBAL_END,
+].join('\n');
+
+const tomlKey = (value) => /^[A-Za-z0-9_-]+$/.test(String(value)) ? String(value) : JSON.stringify(String(value));
+const tomlString = (value) => JSON.stringify(String(value));
+const eolOf = (raw) => raw.includes('\r\n') ? '\r\n' : '\n';
+
+function parseTomlDottedKey(source) {
+  const out = [];
+  let token = '';
+  let quote = null;
+  let escaped = false;
+  const push = () => {
+    const s = token.trim();
+    token = '';
+    if (!s) return false;
+    if (s.startsWith('"')) {
+      try { out.push(JSON.parse(s)); } catch { return false; }
+    } else if (s.startsWith("'")) {
+      if (s.length < 2 || !s.endsWith("'")) return false;
+      out.push(s.slice(1, -1));
+    } else {
+      if (!/^[A-Za-z0-9_-]+$/.test(s)) return false;
+      out.push(s);
+    }
+    return true;
+  };
+  for (let i = 0; i < source.length; i++) {
+    const ch = source[i];
+    if (quote === '"') {
+      token += ch;
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') quote = null;
+      continue;
+    }
+    if (quote === "'") {
+      token += ch;
+      if (ch === "'") quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") { quote = ch; token += ch; continue; }
+    if (ch === '.') { if (!push()) return null; continue; }
+    token += ch;
+  }
+  if (quote || !push()) return null;
+  return out;
+}
+
+function scanTomlMultiline(line, initial) {
+  let state = initial;
+  let i = 0;
+  while (i < line.length) {
+    if (state) {
+      let at = line.indexOf(state, i);
+      while (state === '"""' && at >= 0) {
+        let slashes = 0;
+        for (let j = at - 1; j >= 0 && line[j] === '\\'; j--) slashes++;
+        if (slashes % 2 === 0) break;
+        at = line.indexOf(state, at + 3);
+      }
+      if (at < 0) return state;
+      state = null;
+      i = at + 3;
+      continue;
+    }
+    const ch = line[i];
+    if (ch === '#') break;
+    const tri = line.slice(i, i + 3);
+    if (tri === '"""' || tri === "'''") { state = tri; i += 3; continue; }
+    if (ch === '"') {
+      i++;
+      let escaped = false;
+      while (i < line.length) {
+        const c = line[i++];
+        if (escaped) escaped = false;
+        else if (c === '\\') escaped = true;
+        else if (c === '"') break;
+      }
+      continue;
+    }
+    if (ch === "'") {
+      const close = line.indexOf("'", i + 1);
+      i = close < 0 ? line.length : close + 1;
+      continue;
+    }
+    i++;
+  }
+  return state;
+}
+
+function scanTomlTables(raw) {
+  const tables = [];
+  const lines = raw.match(/[^\r\n]*(?:\r\n|\n|\r|$)/g) || [];
+  let offset = 0;
+  let multiline = null;
+  for (const fullLine of lines) {
+    if (!fullLine) continue;
+    const line = fullLine.replace(/(?:\r\n|\n|\r)$/, '').replace(/^\uFEFF/, '');
+    if (!multiline) {
+      const array = line.match(/^[ \t]*\[\[(.+)\]\][ \t]*(?:#.*)?$/);
+      const table = array ? null : line.match(/^[ \t]*\[([^\[\]].*)\][ \t]*(?:#.*)?$/);
+      const match = array || table;
+      if (match) {
+        const parts = parseTomlDottedKey(match[1].trim());
+        if (!parts) return { ok: false, error: 'contains a table header KLYPIX cannot safely parse', tables: [] };
+        tables.push({ start: offset, end: raw.length, parts, array: !!array });
+      }
+    }
+    multiline = scanTomlMultiline(line, multiline);
+    offset += fullLine.length;
+  }
+  if (multiline) return { ok: false, error: 'contains an unterminated multiline TOML string', tables: [] };
+  for (let i = 0; i < tables.length - 1; i++) tables[i].end = tables[i + 1].start;
+  return { ok: true, tables };
+}
+
+function parseTomlStringValue(rawValue) {
+  const value = rawValue.trim();
+  if (value.startsWith('"')) {
+    const m = value.match(/^"((?:\\.|[^"])*)"/);
+    if (!m) return null;
+    try { return JSON.parse(`"${m[1]}"`); } catch { return null; }
+  }
+  const m = value.match(/^'([^']*)'/);
+  return m ? m[1] : null;
+}
+
+export function safeReadCodexConfig(configPath) {
+  if (!exists(configPath)) return { ok: true, raw: '', servers: {} };
+  let raw;
+  try { raw = fs.readFileSync(configPath, 'utf8'); }
+  catch (e) { return { ok: false, raw: '', servers: {}, error: `Can't read ${configPath}: ${e?.message || e}` }; }
+  const scanned = scanTomlTables(raw);
+  if (!scanned.ok) {
+    return { ok: false, raw, servers: {}, error: `${path.basename(configPath)} ${scanned.error}. Fix it first - KLYPIX left it untouched.` };
+  }
+  const servers = {};
+  for (const table of scanned.tables) {
+    if (table.array || table.parts[0] !== 'mcp_servers' || table.parts.length < 2) continue;
+    const name = String(table.parts[1]);
+    if (servers[name]) continue; // nested .env/.tools table for an existing server
+    const block = raw.slice(table.start, table.end);
+    const commandLine = block.match(/^[ \t]*command[ \t]*=[ \t]*(.+)$/m);
+    const command = commandLine ? parseTomlStringValue(commandLine[1]) : null;
+    const launchesKlypix = /(?:klypix-mcp-server\.mjs|(?:^|["'\s,])klypix-mcp(?:["'\s,]|$))/i.test(block)
+      && !!command && /(?:^|[\\/])(node|node\.exe|npx|npx\.cmd|cmd|cmd\.exe)$/i.test(command);
+    servers[name] = { command, launchesKlypix, raw: block };
+  }
+  return { ok: true, raw, servers, tables: scanned.tables };
+}
+
+function renderCodexMcpTable(name, entry, cwd) {
+  const args = Array.isArray(entry?.args) ? entry.args.map(tomlString).join(', ') : '';
+  const lines = [
+    `[mcp_servers.${tomlKey(name)}]`,
+    `command = ${tomlString(entry?.command || 'npx')}`,
+    `args = [${args}]`,
+  ];
+  if (cwd) lines.push(`cwd = ${tomlString(cwd)}`);
+  // A cold npx bootstrap can exceed Codex's 10 second default; local installs
+  // start immediately, but the larger timeout is harmless and makes first use reliable.
+  lines.push('startup_timeout_sec = 120');
+  return lines.join('\n');
+}
+
+function writeCodexConfig(configPath, raw, next) {
+  try {
+    ensureDir(configPath);
+    let backup;
+    if (raw) {
+      backup = configPath + '.klypix-bak';
+      try { fs.writeFileSync(backup, raw, 'utf8'); } catch { backup = undefined; }
+    }
+    const tmp = configPath + '.klypix-tmp';
+    fs.writeFileSync(tmp, next, 'utf8');
+    const verify = safeReadCodexConfig(tmp);
+    if (!verify.ok) { try { fs.unlinkSync(tmp); } catch { /* best effort */ } return { ok: false, error: verify.error }; }
+    fs.renameSync(tmp, configPath);
+    return { ok: true, backup };
+  } catch (e) {
+    return { ok: false, error: `Couldn't write ${configPath}: ${e?.message || e}` };
+  }
+}
+
+export function connectCodexMcpServer({ configPath, name = 'klypix-canvas', entry, cwd } = {}) {
+  const parsed = safeReadCodexConfig(configPath);
+  if (!parsed.ok) return { ok: false, error: parsed.error };
+  const existingNames = Object.keys(parsed.servers).filter(k => /klypix/i.test(k));
+  const chosen = existingNames[0] || name;
+  const owned = (parsed.tables || []).filter(t => t.parts[0] === 'mcp_servers' && t.parts.length >= 2 && /klypix/i.test(String(t.parts[1])));
+  const eol = eolOf(parsed.raw);
+  const block = renderCodexMcpTable(chosen, entry, cwd).replace(/\n/g, eol);
+  let next = parsed.raw;
+  if (owned.length) {
+    const firstStart = owned[0].start;
+    for (const table of [...owned].sort((a, b) => b.start - a.start)) {
+      next = next.slice(0, table.start) + (table.start === firstStart ? block + eol + eol : '') + next.slice(table.end);
+    }
+  } else {
+    const needsEol = next.length > 0 && !/[\r\n]$/.test(next);
+    const spacer = next.trim() ? eol : '';
+    next += (needsEol ? eol : '') + spacer + block + eol + eol;
+  }
+  if (next === parsed.raw) {
+    return { ok: true, action: 'unchanged', name: chosen, path: configPath, otherServers: Object.keys(parsed.servers).filter(k => !/klypix/i.test(k)) };
+  }
+  const written = writeCodexConfig(configPath, parsed.raw, next);
+  if (!written.ok) return written;
+  return {
+    ok: true,
+    action: existingNames.length ? 'updated' : 'connected',
+    name: chosen,
+    path: configPath,
+    backup: written.backup,
+    otherServers: Object.keys(parsed.servers).filter(k => !/klypix/i.test(k)),
+  };
+}
+
+export function disconnectCodexMcpServer({ configPath } = {}) {
+  const parsed = safeReadCodexConfig(configPath);
+  if (!parsed.ok) return { ok: false, error: parsed.error };
+  const owned = (parsed.tables || []).filter(t => t.parts[0] === 'mcp_servers' && t.parts.length >= 2 && /klypix/i.test(String(t.parts[1])));
+  if (!owned.length) return { ok: true, action: 'unchanged', path: configPath };
+  let next = parsed.raw;
+  for (const table of [...owned].sort((a, b) => b.start - a.start)) {
+    next = next.slice(0, table.start) + next.slice(table.end);
+  }
+  const written = writeCodexConfig(configPath, parsed.raw, next);
+  if (!written.ok) return written;
+  return {
+    ok: true,
+    action: 'disconnected',
+    path: configPath,
+    backup: written.backup,
+    otherServers: Object.keys(parsed.servers).filter(k => !/klypix/i.test(k)),
+  };
+}
+
+export function mergeCodexGlobalInstructions(home = os.homedir()) {
+  const file = path.join(home, '.codex', 'AGENTS.md');
+  let raw = '';
+  try { raw = fs.readFileSync(file, 'utf8'); } catch { /* fresh file */ }
+  const eol = eolOf(raw);
+  const block = CODEX_GLOBAL_BODY.replace(/\n/g, eol);
+  const next = CODEX_GLOBAL_RE.test(raw)
+    ? raw.replace(CODEX_GLOBAL_RE, block + eol)
+    : (raw.trim() ? raw.replace(/\s*$/, '') + eol + eol + block + eol : block + eol);
+  if (next === raw) return { ok: true, action: 'unchanged', path: file };
+  try {
+    ensureDir(file);
+    let backup;
+    if (raw) { backup = file + '.klypix-bak'; try { fs.writeFileSync(backup, raw, 'utf8'); } catch { backup = undefined; } }
+    const tmp = file + '.klypix-tmp';
+    fs.writeFileSync(tmp, next, 'utf8');
+    fs.renameSync(tmp, file);
+    return { ok: true, action: CODEX_GLOBAL_RE.test(raw) ? 'updated' : 'connected', path: file, backup };
+  } catch (e) { return { ok: false, error: `Couldn't write ${file}: ${e?.message || e}` }; }
+}
+
+export function removeCodexGlobalInstructions(home = os.homedir()) {
+  const file = path.join(home, '.codex', 'AGENTS.md');
+  let raw = '';
+  try { raw = fs.readFileSync(file, 'utf8'); } catch { return { ok: true, action: 'unchanged', path: file }; }
+  if (!CODEX_GLOBAL_RE.test(raw)) return { ok: true, action: 'unchanged', path: file };
+  const next = raw.replace(CODEX_GLOBAL_RE, '').replace(/^\s+|\s+$/g, (m, offset) => offset === 0 ? '' : '\n');
+  try {
+    const backup = file + '.klypix-bak';
+    try { fs.writeFileSync(backup, raw, 'utf8'); } catch { /* best effort */ }
+    const tmp = file + '.klypix-tmp';
+    fs.writeFileSync(tmp, next, 'utf8');
+    fs.renameSync(tmp, file);
+    return { ok: true, action: 'disconnected', path: file, backup };
+  } catch (e) { return { ok: false, error: `Couldn't write ${file}: ${e?.message || e}` }; }
+}
+
+export function codexGlobalInstructionsInstalled(home = os.homedir()) {
+  try { return CODEX_GLOBAL_RE.test(fs.readFileSync(path.join(home, '.codex', 'AGENTS.md'), 'utf8')); }
+  catch { return false; }
+}
+
 const sha8 = (s) => crypto.createHash('sha1').update(String(s)).digest('hex').slice(0, 8);
 const cmpSemver = (a, b) => { const pa = String(a || '').split('.').map(n => parseInt(n, 10) || 0), pb = String(b || '').split('.').map(n => parseInt(n, 10) || 0); for (let i = 0; i < 3; i++) { if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) - (pb[i] || 0); } return 0; };
 
@@ -253,7 +551,7 @@ function targets(projectDir) {
   const j = (...p) => path.join(projectDir, ...p);
   return {
     rules: [
-      { tool: 'AGENTS.md (cross-tool standard)', file: j('AGENTS.md'), kind: 'merge' },
+      { tool: 'Codex / AGENTS.md standard', file: j('AGENTS.md'), kind: 'merge' },
       { tool: 'Cursor', file: j('.cursor', 'rules', 'klypix-brain.mdc'), kind: 'dedicated', frontmatter: '---\ndescription: KLYPIX project brain — read at task start, capture decisions\nalwaysApply: true\n---' },
       { tool: 'Windsurf', file: j('.windsurf', 'rules', 'klypix-brain.md'), kind: 'dedicated', frontmatter: '---\ntrigger: always_on\n---' },
       { tool: 'Cline', file: j('.clinerules', 'klypix-brain.md'), kind: 'dedicated', frontmatter: '' },
@@ -267,6 +565,7 @@ function targets(projectDir) {
       { tool: 'Antigravity', file: j('.agents', 'AGENTS.md'), kind: 'merge' },
     ],
     mcp: [
+      { tool: 'Codex', file: j('.codex', 'config.toml'), format: 'toml' },
       { tool: 'Cursor', file: j('.cursor', 'mcp.json'), wrapKey: 'mcpServers', withType: false },
       { tool: 'VS Code (Copilot/Continue)', file: j('.vscode', 'mcp.json'), wrapKey: 'servers', withType: true },
     ],
@@ -299,6 +598,20 @@ export function linkProject(projectDir, opts = {}) {
   // MCP), so we skip .mcp.json to avoid double-registering its server.
   const mcp = t.mcp.map((m) => {
     const file = relFile(projectDir, m.file);
+    if (m.format === 'toml') {
+      if (check) {
+        const parsed = safeReadCodexConfig(m.file);
+        if (!parsed.ok) return { tool: m.tool, file, status: 'hand-edited', why: parsed.error };
+        const name = Object.keys(parsed.servers).find(k => /klypix/i.test(k));
+        const entry = name ? parsed.servers[name] : null;
+        return { tool: m.tool, file, status: entry ? (entry.launchesKlypix ? 'ok' : 'hand-edited') : 'missing', why: entry && !entry.launchesKlypix ? 'entry no longer launches klypix-mcp' : undefined };
+      }
+      // Project config is commonly committed. Keep it machine-portable; the
+      // 120s Codex startup timeout covers the one-time npx bootstrap.
+      const portableEntry = { command: 'npx', args: ['-y', 'klypix-mcp', '--vault', '.'] };
+      const res = connectCodexMcpServer({ configPath: m.file, entry: portableEntry, cwd: '..' });
+      return res.ok ? { tool: m.tool, file, ...res } : { tool: m.tool, file, action: 'skipped', why: res.error };
+    }
     if (check) return { tool: m.tool, file, ...classifyMcp(m.file, m.wrapKey) };
     return { tool: m.tool, file, ...mergeMcpJson(m.file, m.wrapKey, m.withType) };
   });

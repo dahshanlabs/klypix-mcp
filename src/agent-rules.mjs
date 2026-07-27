@@ -40,11 +40,24 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 export function localBundleServer(home = os.homedir()) {
   return path.join(home, '.claude', 'project-brain', 'klypix-mcp-server.mjs');
 }
+
+// Keep checked-in project MCP configs portable while still launching the
+// installed, offline-safe bundle. `node -e` has no script pathname in argv, so
+// insert a harmless placeholder before importing the server; the server can
+// then keep reading its normal arguments from process.argv.slice(2).
+export const LOCAL_BUNDLE_EVAL = [
+  "process.argv.splice(1,0,'klypix-mcp-server.mjs');",
+  "import(require('url').pathToFileURL(require('path').join(",
+  "require('os').homedir(),'.claude','project-brain','klypix-mcp-server.mjs')).href)",
+].join('');
+
 export function mcpServerEntry({ vault = '.', withType = false, home } = {}) {
   let base;
   try {
     const local = localBundleServer(home);
-    if (fs.statSync(local).isFile()) base = { command: 'node', args: [local.replace(/\\/g, '/'), '--vault', vault] };
+    if (fs.statSync(local).isFile()) {
+      base = { command: 'node', args: ['-e', LOCAL_BUNDLE_EVAL, '--', '--vault', vault] };
+    }
   } catch { /* no local bundle yet → bootstrap via npx below */ }
   if (!base) base = { command: 'npx', args: ['-y', 'klypix-mcp', '--vault', vault] };
   return withType ? { type: 'stdio', ...base } : base;

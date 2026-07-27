@@ -57,7 +57,7 @@ try {
 
   const changed = [...rules, ...mcp, compactBrief].filter(r => r.action && !['unchanged', 'skipped'].includes(r.action)).length;
   console.log(`\n✓ ${changed} file(s) written/updated — every agent opened in this project now reads + captures ./brain.klypix.`);
-  console.log('  Codex gets .codex/config.toml + AGENTS.md; Cline & Windsurf use their global MCP config plus project rules.');
+  console.log('  Codex, Cline, Gemini/Antigravity, Cursor, and VS Code get project MCP configs; Windsurf uses its global MCP plus project rules.');
   console.log('  Verify anytime with `npx klypix-mcp link --check` (or `npx klypix-mcp doctor`).');
   if (!hasBrain) {
     console.log('\n⚠ No ./brain.klypix here yet — the rules reference it for when you create one.');

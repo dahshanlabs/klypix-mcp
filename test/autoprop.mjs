@@ -40,7 +40,8 @@ const tmp = (tag) => { const p = path.join(os.tmpdir(), 'klypix-autoprop-' + tag
   // Lay the server file → prefer local node launch.
   fs.writeFileSync(path.join(bd, 'klypix-mcp-server.mjs'), '// server');
   const localEntry = mcpServerEntry({ vault: '/proj', home });
-  ok(localEntry.command === 'node' && localEntry.args[0].endsWith('klypix-mcp-server.mjs'), 'A: local bundle present → node local-bundle entry (no npx cache)');
+  ok(localEntry.command === 'node' && localEntry.args[0] === '-e' && localEntry.args[1].includes('klypix-mcp-server.mjs'), 'A: local bundle present → portable node local-bundle entry (no npx cache)');
+  ok(!JSON.stringify(localEntry).includes(home.replace(/\\/g, '/')), 'A: local-bundle entry does not leak a machine-specific home path');
   ok(localEntry.args.includes('/proj'), 'A: the --vault value is preserved');
   ok(mcpServerEntry({ vault: '.', withType: true, home }).type === 'stdio', 'A: withType adds the stdio type for VS Code-style configs');
   rmrf(home);
@@ -201,7 +202,10 @@ function runInstall(home, projectCwd, args = []) {
   ok(new RegExp(`const PKG_VERSION = '${PKG_VERSION.replace(/\./g, '\\.')}'`).test(baked), 'D: server has the baked version (flat layout has no package.json)');
   // migration: the project .mcp.json flipped npx → local node, with a backup.
   const mcp = JSON.parse(fs.readFileSync(path.join(proj, '.mcp.json'), 'utf8'));
-  ok(mcp.mcpServers['klypix-canvas'].command === 'node' && mcp.mcpServers['klypix-canvas'].args[0].endsWith('klypix-mcp-server.mjs'), 'D: existing .mcp.json migrated npx → local bundle');
+  ok(mcp.mcpServers['klypix-canvas'].command === 'node'
+    && mcp.mcpServers['klypix-canvas'].args[0] === '-e'
+    && mcp.mcpServers['klypix-canvas'].args[1].includes('klypix-mcp-server.mjs'),
+  'D: existing .mcp.json migrated npx → portable local bundle');
   ok(fs.existsSync(path.join(proj, '.mcp.json.klypix-bak')), 'D: the original .mcp.json was backed up before migration');
   // settings.json wired 4 hooks
   const settings = JSON.parse(fs.readFileSync(path.join(home, '.claude', 'settings.json'), 'utf8'));

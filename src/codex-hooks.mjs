@@ -10,6 +10,7 @@ import crypto from 'crypto';
 export const CODEX_PRESENCE_EVENTS = [
   'SessionStart',
   'UserPromptSubmit',
+  'PreToolUse',
   'Stop',
   'PostToolUse',
   'SessionEnd',
@@ -29,10 +30,19 @@ export function resolveCodexHooksPath(home = os.homedir()) {
 }
 
 export function codexPresenceGroups(command) {
-  const handler = (timeout = 5) => ({ type: 'command', command, timeout });
+  const handler = (timeout = 5, statusMessage) => ({
+    type: 'command',
+    command,
+    timeout,
+    ...(statusMessage ? { statusMessage } : {}),
+  });
   return {
-    SessionStart: [{ hooks: [handler()] }],
-    UserPromptSubmit: [{ hooks: [handler()] }],
+    SessionStart: [{ hooks: [handler(5, 'Loading KLYPIX project awareness')] }],
+    UserPromptSubmit: [{ hooks: [handler(5, 'Syncing KLYPIX task context')] }],
+    PreToolUse: [{
+      matcher: 'apply_patch|Edit|Write',
+      hooks: [handler(5, 'Checking KLYPIX file ownership')],
+    }],
     Stop: [{ hooks: [handler()] }],
     PostToolUse: [{ hooks: [handler()] }],
     SessionEnd: [{ hooks: [handler(3)] }],

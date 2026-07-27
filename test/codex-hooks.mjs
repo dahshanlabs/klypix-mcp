@@ -52,11 +52,17 @@ ok(CODEX_PRESENCE_EVENTS.every((event) =>
   afterConnect.hooks[event].some((group) =>
     group.hooks?.some((hook) => hook.command === command))),
 'connect owns one handler in every required lifecycle event');
-ok(CODEX_PRESENCE_EVENTS.every((event) =>
-  afterConnect.hooks[event].flatMap((group) => group.hooks || [])
-    .filter((hook) => hook.command === command)
-    .every((hook) => !('statusMessage' in hook))),
-'presence hooks stay visually quiet');
+ok(CODEX_PRESENCE_EVENTS.includes('PreToolUse')
+  && afterConnect.hooks.PreToolUse.some((group) =>
+    group.matcher === 'apply_patch|Edit|Write'
+    && group.hooks?.some((hook) =>
+      hook.command === command && /file ownership/i.test(hook.statusMessage))),
+'enhanced hooks check exact file ownership before Codex edits');
+ok(afterConnect.hooks.SessionStart.some((group) =>
+  group.hooks?.some((hook) => /project awareness/i.test(hook.statusMessage)))
+  && afterConnect.hooks.UserPromptSubmit.some((group) =>
+    group.hooks?.some((hook) => /task context/i.test(hook.statusMessage))),
+'automatic memory and presence hooks expose concise progress messages');
 
 const firstBytes = fs.readFileSync(hooksFile, 'utf8');
 const second = mergeCodexPresenceHooks({ home, command });

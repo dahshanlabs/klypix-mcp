@@ -8,11 +8,14 @@ import {
   findProjectBrain,
   formatPresenceMessage,
   formatReceivedMessages,
+  postPresenceMessage,
   receiveMessages,
   removeSession,
   upsertSession,
 } from './agent-presence.mjs';
 import { recordCodexHookExecution } from './codex-hooks.mjs';
+import { opBrainTaskContext } from './klypix-core.mjs';
+import { findPresenceConflicts } from './mcp-presence.mjs';
 
 function readInput() {
   try {
@@ -84,6 +87,53 @@ function emitSystemMessage(parts) {
   process.stdout.write(JSON.stringify({ continue: true, systemMessage }));
 }
 
+function formatConflictWarning(conflicts, event) {
+  if (!conflicts.length) return '';
+  const moment = event === 'PreToolUse' ? 'before this edit runs' : 'after this file operation';
+  return [
+    `KLYPIX BLOCKING exact-file overlap detected ${moment}:`,
+    ...conflicts.map((peer) =>
+      `- ${String(peer.id).slice(0, 12)}${peer.intent ? ` "${String(peer.intent).slice(0, 90)}"` : ''}: ${peer.files.join(', ')}`),
+    'Coordinate file ownership now. Do not continue overlapping edits until one session yields or the scopes are separated.',
+  ].join('\n');
+}
+
+function queueConflictAlerts({ brainPath, sessionId, intent, conflicts, turnId }) {
+  const queued = [];
+  for (const peer of conflicts) {
+    const filesKey = peer.files.map((file) => String(file).toLowerCase()).sort().join('|');
+    const result = postPresenceMessage({
+      brainPath,
+      from: sessionId,
+      to: peer.id,
+      text: `Automatic KLYPIX pre-edit overlap alert: ${String(sessionId).slice(0, 12)}`
+        + `${intent ? ` is working on "${String(intent).slice(0, 110)}"` : ' is editing'}`
+        + ` and reports the same file(s): ${peer.files.join(', ')}. Coordinate ownership now.`,
+      dedupeKey: `hook-overlap|${sessionId}|${peer.id}|${turnId || 'turn'}|${filesKey}`,
+    });
+    if (result.posted) queued.push(peer.id);
+  }
+  return queued;
+}
+
+async function compactTaskContext(projectDir, prompt, files) {
+  if (!prompt) return '';
+  try {
+    const result = await opBrainTaskContext({
+      vault: projectDir,
+      intent: String(prompt).slice(0, 2000),
+      files,
+      k: 4,
+      budgetChars: 1800,
+    });
+    return result?.context
+      ? result.blocks?.filter((block) => block.kind === 'text').map((block) => block.text).filter(Boolean).join('\n\n') || ''
+      : '';
+  } catch {
+    return '';
+  }
+}
+
 async function main() {
   const input = readInput();
   const event = String(input.hook_event_name || input.hookEventName || '');
@@ -100,7 +150,9 @@ async function main() {
 
   const projectDir = path.dirname(brainPath);
   const prompt = input.prompt || input.user_prompt || input.userPrompt;
-  const files = event === 'PostToolUse' ? touchedFiles(input, projectDir) : undefined;
+  const files = event === 'PreToolUse' || event === 'PostToolUse'
+    ? touchedFiles(input, projectDir)
+    : (event === 'UserPromptSubmit' ? [] : undefined);
   const sessions = upsertSession({
     brainPath,
     id: sessionId,
@@ -111,6 +163,7 @@ async function main() {
     branch: gitBranch(cwd),
     intent: prompt === undefined ? undefined : prompt,
     files,
+    replaceFiles: event === 'UserPromptSubmit',
     event,
     channel: 'lifecycle',
     cwd,
@@ -118,6 +171,19 @@ async function main() {
 
   const ignored = event === 'PostToolUse' ? ownBrainMessageText(input) : [];
   const messages = receiveMessages({ brainPath, sessionId, ignoreTexts: ignored });
+  const conflicts = (event === 'PreToolUse' || event === 'PostToolUse')
+    ? findPresenceConflicts(sessions, sessionId)
+    : [];
+  if (conflicts.length) {
+    const me = sessions.find((session) => session.id === sessionId);
+    queueConflictAlerts({
+      brainPath,
+      sessionId,
+      intent: me?.intent || '',
+      conflicts,
+      turnId: input.turn_id || input.turnId || '',
+    });
+  }
   if (event === 'SessionStart') {
     emitSystemMessage([
       formatPresenceMessage(sessions, sessionId, { includeSolo: true }),
@@ -126,8 +192,18 @@ async function main() {
     return;
   }
   if (event === 'UserPromptSubmit') {
+    const me = sessions.find((session) => session.id === sessionId);
+    const context = await compactTaskContext(projectDir, prompt, me?.files || []);
     emitSystemMessage([
+      context,
       formatPresenceMessage(sessions, sessionId),
+      formatReceivedMessages(messages),
+    ]);
+    return;
+  }
+  if (event === 'PreToolUse' || event === 'PostToolUse') {
+    emitSystemMessage([
+      formatConflictWarning(conflicts, event),
       formatReceivedMessages(messages),
     ]);
     return;

@@ -290,7 +290,7 @@ export function render(r, opts = {}) {
   else L.push(`${hmark} ${c.bold}CLAUDE${c.rst}   existing 4-hook capture path intact: ${r.hooks.wired.join(', ')}`);
   const chmark = r.layers.codexHooks === 'warning' ? warn : ok;
   const smart = r.codexSmart?.globalInstructions
-    ? 'approval-free Context Gateway active (task memory + clean peers + auto-alerts)'
+    ? 'approval-free Context Gateway active (task memory + clean peers + proactive/guaranteed alerts)'
     : 'approval-free brain_sync Context Gateway available through MCP';
   if (r.codexHooks.error) {
     L.push(`${chmark} ${c.bold}CODEX${c.rst}    automatic MCP presence + ${smart}; optional native-hook config unreadable: ${c.yel}${r.codexHooks.error}${c.rst}`);
@@ -298,9 +298,9 @@ export function render(r, opts = {}) {
     L.push(`${chmark} ${c.bold}CODEX${c.rst}    automatic MCP presence + ${smart} · native hooks off ${c.dim}(optional)${c.rst}`);
   } else if (r.codexHooks.executionStatus !== 'observed') {
     L.push(`${chmark} ${c.bold}CODEX${c.rst}    automatic MCP presence + ${smart} · ${c.yel}native hooks configured but execution not verified${c.rst}`);
-    L.push(`        ${c.dim}Context Gateway memory/coordination already works. Native hooks add mechanical lifecycle capture on Codex surfaces that support trust review.${c.rst}`);
+    L.push(`        ${c.dim}Context Gateway memory/coordination already works. Once trusted, native hooks auto-inject task memory and warn before exact overlapping edits.${c.rst}`);
   } else {
-    L.push(`${chmark} ${c.bold}CODEX${c.rst}    automatic MCP presence + ${smart} · native hooks active ${c.dim}(last observed ${r.codexHooks.lastExecutedAt})${c.rst}`);
+    L.push(`${chmark} ${c.bold}CODEX${c.rst}    automatic MCP presence + ${smart} · native auto-context + pre-edit guard active ${c.dim}(last observed ${r.codexHooks.lastExecutedAt})${c.rst}`);
   }
 
   // TOOLS

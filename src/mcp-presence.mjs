@@ -12,6 +12,7 @@ import {
   findProjectBrain,
   formatPresenceMessage,
   formatReceivedMessages,
+  peekMessages,
   postPresenceMessage,
   receiveMessages,
   removeSession,
@@ -19,6 +20,7 @@ import {
 } from './agent-presence.mjs';
 
 export const MCP_HEARTBEAT_MS = 60_000;
+export const MCP_INBOX_POLL_MS = 3_000;
 
 // Standard MCP server instructions are the approval-free awareness path. Hosts
 // that surface InitializeResult.instructions to the model learn the same
@@ -185,19 +187,25 @@ export function createMcpPresence({
   env = process.env,
   home,
   heartbeatMs = MCP_HEARTBEAT_MS,
+  inboxPollMs = MCP_INBOX_POLL_MS,
   now = () => Date.now(),
   setIntervalFn = setInterval,
   clearIntervalFn = clearInterval,
 } = {}) {
   const sessionId = resolveMcpSessionId({ env });
+  const effectiveInboxPollMs = Number(env?.KLYPIX_MCP_INBOX_POLL_MS)
+    || Number(inboxPollMs)
+    || MCP_INBOX_POLL_MS;
   let vault = path.resolve(initialVault || process.cwd());
   let brainPath = null;
   let timer = null;
+  let inboxTimer = null;
   let started = false;
   let lastPeers = '';
   let taskStartedAt = 0;
   const sentTexts = new Set();
   const notifiedConflicts = new Set();
+  const announcedMessageIds = new Set();
 
   const clientInfo = () => {
     let version = {};
@@ -209,12 +217,37 @@ export function createMcpPresence({
   };
 
   const sendNotice = (message) => {
-    if (!message || typeof server?.sendLoggingMessage !== 'function') return;
+    if (!message || typeof server?.sendLoggingMessage !== 'function') return false;
     Promise.resolve(server.sendLoggingMessage({
       level: 'info',
       logger: 'klypix-presence',
       data: message,
     })).catch(() => {});
+    return true;
+  };
+
+  // Best-effort proactive path: MCP logging notifications can surface an
+  // overlap while the older session is still working. This deliberately PEEKS
+  // instead of acknowledging. Hosts are allowed to hide logging notifications,
+  // so the same warning remains unread and is guaranteed to arrive in-band on
+  // the next KLYPIX tool result / brain_sync call.
+  const pollInbox = () => {
+    if (!brainPath) return [];
+    const pending = peekMessages({
+      brainPath,
+      sessionId,
+      ignoreTexts: [...sentTexts],
+      home,
+      now: now(),
+    }).filter((message) => !announcedMessageIds.has(message.id));
+    if (!pending.length) return [];
+    if (sendNotice(formatReceivedMessages(pending, now()))) {
+      for (const message of pending) announcedMessageIds.add(message.id);
+      while (announcedMessageIds.size > 100) {
+        announcedMessageIds.delete(announcedMessageIds.values().next().value);
+      }
+    }
+    return pending;
   };
 
   const touch = ({
@@ -271,7 +304,9 @@ export function createMcpPresence({
 
   const stop = () => {
     if (timer) clearIntervalFn(timer);
+    if (inboxTimer) clearIntervalFn(inboxTimer);
     timer = null;
+    inboxTimer = null;
     if (brainPath) removeSession({
       brainPath,
       id: sessionId,
@@ -282,6 +317,7 @@ export function createMcpPresence({
     brainPath = null;
     started = false;
     lastPeers = '';
+    announcedMessageIds.clear();
   };
 
   const start = (nextVault = vault, details = {}) => {
@@ -302,7 +338,12 @@ export function createMcpPresence({
       replaceFiles: details.replaceFiles === true,
     });
     timer = setIntervalFn(() => touch(), Math.max(5_000, Number(heartbeatMs) || MCP_HEARTBEAT_MS));
+    inboxTimer = setIntervalFn(
+      () => pollInbox(),
+      Math.max(250, effectiveInboxPollMs),
+    );
     timer?.unref?.();
+    inboxTimer?.unref?.();
     return first;
   };
 
@@ -398,6 +439,10 @@ export function createMcpPresence({
         ts: message.ts,
       })),
       alertsQueued,
+      delivery: {
+        proactive: 'mcp-logging-best-effort',
+        guaranteed: 'next-klypix-action',
+      },
       timingMs: { coordination: durationMs },
     };
     const text = [
@@ -429,6 +474,7 @@ export function createMcpPresence({
     start,
     stop,
     touch,
+    pollInbox,
     sync,
     noteSent,
     decorateToolResult,

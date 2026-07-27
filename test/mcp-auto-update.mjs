@@ -9,6 +9,7 @@ import { EventEmitter } from 'events';
 import { fileURLToPath } from 'url';
 import {
   autoUpdatePaths,
+  installExactRuntime,
   inspectAutoUpdate,
   runAutoUpdateCheck,
   spawnAutoUpdateHelper,
@@ -194,6 +195,32 @@ try {
       env: { KLYPIX_AUTO_UPDATE: '0' },
       spawnProcess: () => { throw new Error('must not launch'); },
     }) === null, 'worker and supervisor triggers both honor the opt-out');
+  }
+
+  {
+    const dir = scenario('safe-installer-spawn');
+    let launch = null;
+    await installExactRuntime('1.5.2', {
+      brainDir: dir,
+      spawnProcess: (command, args, options) => {
+        launch = { command, args, options };
+        const child = new EventEmitter();
+        child.kill = () => {};
+        setTimeout(() => child.emit('exit', 0, null), 0);
+        return child;
+      },
+    });
+    ok(launch.options.shell === false
+      && launch.args.some((arg) => arg === 'klypix-mcp@1.5.2'),
+    'exact-version installer never concatenates package input through a shell');
+    let rejected = false;
+    try {
+      await installExactRuntime('1.5.2 & whoami', {
+        brainDir: dir,
+        spawnProcess: () => { throw new Error('must not spawn'); },
+      });
+    } catch { rejected = true; }
+    ok(rejected, 'non-semver package input is rejected before process creation');
   }
 
   {

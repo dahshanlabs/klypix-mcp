@@ -229,7 +229,25 @@ export function installExactRuntime(version, {
     };
     let child;
     try {
-      child = spawnProcess('npx', ['-y', `klypix-mcp@${version}`, 'install', '--runtime-only'], {
+      let command = 'npx';
+      let args = ['-y', `klypix-mcp@${version}`, 'install', '--runtime-only'];
+      if (process.platform === 'win32') {
+        // .cmd files require a shell on Windows, but Node 24 correctly warns
+        // that shell:true concatenates arguments. Invoke npm's JS entry with
+        // this exact Node binary instead: no quoting ambiguity, no shell, and
+        // the strict-semver gate above leaves no command-injection surface.
+        const npxCli = path.join(path.dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npx-cli.js');
+        if (fs.existsSync(npxCli)) {
+          command = process.execPath;
+          args = [npxCli, ...args];
+        } else {
+          // Portable fallback for unusual Windows Node layouts. The only
+          // interpolated value is strict x.y.z semver.
+          command = process.env.ComSpec || 'cmd.exe';
+          args = ['/d', '/s', '/c', `npx -y klypix-mcp@${version} install --runtime-only`];
+        }
+      }
+      child = spawnProcess(command, args, {
         cwd: brainDir,
         env: {
           ...process.env,
@@ -237,7 +255,7 @@ export function installExactRuntime(version, {
           KLYPIX_MCP_AUTO_UPDATE_CHILD: '1',
         },
         stdio: 'ignore',
-        shell: process.platform === 'win32',
+        shell: false,
         windowsHide: true,
       });
     } catch (error) {

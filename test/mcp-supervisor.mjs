@@ -152,6 +152,7 @@ const transport = new StdioClientTransport({
     KLYPIX_MCP_STATE_DIR: stateDir,
     KLYPIX_MCP_SUPERVISOR_POLL_MS: '50',
     KLYPIX_MCP_ROLLBACK_GRACE_MS: '500',
+    KLYPIX_AUTO_UPDATE: '0',
   },
   stderr: 'pipe',
 });

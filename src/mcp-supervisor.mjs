@@ -21,11 +21,19 @@ import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
 import { spawn } from 'child_process';
+import { fileURLToPath } from 'url';
+import {
+  AUTO_UPDATE_WORKER_ARG,
+  autoUpdateEnabled,
+  inspectAutoUpdate,
+} from './mcp-auto-update.mjs';
 
 const INTERNAL_PREFIX = '__klypix_supervisor__';
 const DEFAULT_POLL_MS = 1000;
 const DEFAULT_TIMEOUT_MS = 15000;
 const DEFAULT_ROLLBACK_GRACE_MS = 3000;
+const DEFAULT_AUTO_UPDATE_POLL_MS = 60 * 60 * 1000;
+const DEFAULT_AUTO_UPDATE_START_DELAY_MS = 2000;
 
 const log = (...args) => console.error('[klypix-supervisor]', ...args);
 const sha256 = (value) => crypto.createHash('sha256').update(value).digest('hex');
@@ -217,6 +225,17 @@ class Supervisor {
     this.pollMs = Number(options.pollMs || process.env.KLYPIX_MCP_SUPERVISOR_POLL_MS || DEFAULT_POLL_MS);
     this.timeoutMs = Number(options.timeoutMs || process.env.KLYPIX_MCP_SUPERVISOR_TIMEOUT_MS || DEFAULT_TIMEOUT_MS);
     this.rollbackGraceMs = Number(options.rollbackGraceMs || process.env.KLYPIX_MCP_ROLLBACK_GRACE_MS || DEFAULT_ROLLBACK_GRACE_MS);
+    this.autoUpdate = options.autoUpdate !== false && autoUpdateEnabled();
+    this.autoUpdatePollMs = Number(
+      options.autoUpdatePollMs
+      || process.env.KLYPIX_MCP_AUTO_UPDATE_POLL_MS
+      || DEFAULT_AUTO_UPDATE_POLL_MS,
+    );
+    this.autoUpdateStartDelayMs = Number(
+      options.autoUpdateStartDelayMs
+      || process.env.KLYPIX_MCP_AUTO_UPDATE_START_DELAY_MS
+      || DEFAULT_AUTO_UPDATE_START_DELAY_MS,
+    );
     this.stateDir = path.resolve(
       options.stateDir
       || process.env.KLYPIX_MCP_STATE_DIR
@@ -255,6 +274,10 @@ class Supervisor {
         hotReloads: this.hotReloads,
         lastSwapAt: this.lastSwapAt,
         lastError: this.lastError,
+        autoUpdate: {
+          enabled: this.autoUpdate,
+          ...inspectAutoUpdate(path.dirname(this.runtimeManifest)),
+        },
         runtimeManifest: this.runtimeManifest.replace(/\\/g, '/'),
         active: this.active ? {
           pid: this.active.child.pid,
@@ -680,6 +703,33 @@ class Supervisor {
     }
   }
 
+  scheduleAutoUpdate() {
+    if (this.closed || !this.autoUpdate || process.env.KLYPIX_MCP_AUTO_UPDATE_CHILD === '1') return;
+    const brainDir = path.dirname(this.runtimeManifest);
+    const status = inspectAutoUpdate(brainDir);
+    if (!status.due) return;
+    try {
+      const helper = fileURLToPath(new URL('./mcp-auto-update.mjs', import.meta.url));
+      const child = spawn(process.execPath, [helper, AUTO_UPDATE_WORKER_ARG], {
+        // Do not hold the managed directory as this detached process's cwd.
+        // This matters for ephemeral/test homes on Windows and is cleaner for
+        // uninstallers; the installer receives its exact target through env.
+        cwd: os.tmpdir(),
+        env: {
+          ...process.env,
+          KLYPIX_MCP_AUTO_UPDATE_DIR: brainDir,
+          KLYPIX_MCP_AUTO_UPDATE_CURRENT: String(this.active?.version || this.fallbackTarget.version || ''),
+          KLYPIX_MCP_AUTO_UPDATE_CHILD: '1',
+        },
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true,
+      });
+      child.on('error', () => { /* fail-open: the MCP transport remains healthy */ });
+      child.unref();
+    } catch { /* update discovery must never affect MCP */ }
+  }
+
   flushHostQueue() {
     const queued = this.hostQueue.splice(0);
     for (const message of queued) this.onHostMessage(message);
@@ -716,6 +766,16 @@ class Supervisor {
 
     this.poller = setInterval(() => this.checkForUpdate(), Math.max(50, this.pollMs));
     this.poller.unref?.();
+    this.autoUpdateStarter = setTimeout(
+      () => this.scheduleAutoUpdate(),
+      Math.max(0, this.autoUpdateStartDelayMs),
+    );
+    this.autoUpdateStarter.unref?.();
+    this.autoUpdatePoller = setInterval(
+      () => this.scheduleAutoUpdate(),
+      Math.max(60000, this.autoUpdatePollMs),
+    );
+    this.autoUpdatePoller.unref?.();
 
     await new Promise(resolve => {
       this.resolveRun = resolve;
@@ -730,6 +790,8 @@ class Supervisor {
     if (this.closed) return;
     this.closed = true;
     clearInterval(this.poller);
+    clearTimeout(this.autoUpdateStarter);
+    clearInterval(this.autoUpdatePoller);
     for (const worker of [this.active, this.candidate, this.standby]) this.retireWorker(worker, 0);
     try { fs.unlinkSync(this.stateFile); } catch { /* */ }
     this.resolveRun?.();

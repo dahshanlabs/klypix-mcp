@@ -27,6 +27,7 @@ import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { auditProject, codexGlobalInstructionsInstalled, resolveVersion } from './agent-rules.mjs';
 import { codexPresenceHookStatus } from './codex-hooks.mjs';
+import { inspectAutoUpdate } from './mcp-auto-update.mjs';
 
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -236,6 +237,7 @@ export function inspect(opts = {}) {
   const version = inspectVersion(brainDir);
   const running = inspectRunning(brainDir, version.baked, now, opts.self);
   const supervisors = inspectSupervisors(brainDir, version.baked);
+  const autoUpdate = inspectAutoUpdate(brainDir, { now, env: opts.env || process.env });
   const hooks = inspectHooks(home);
   const codexHooks = codexPresenceHookStatus(home);
   const codexSmart = {
@@ -263,6 +265,7 @@ export function inspect(opts = {}) {
     // is NOT drift; it's a reconnect prompt.
     running: !running.known ? 'unknown' : (running.matchesInstalled === false ? 'drift' : 'ok'),
     supervisor: supervisors.active ? 'ok' : (version.supervisorCapable ? 'pending-reconnect' : 'legacy'),
+    autoUpdate: !autoUpdate.enabled ? 'off' : (autoUpdate.result === 'failed' ? 'warning' : 'ok'),
     hooks: !hooks.settingsPresent ? 'absent' : (hooks.missing.length ? 'drift' : 'ok'),
     // Codex MCP presence is the automatic baseline. Hooks are an OPTIONAL
     // enrichment layer, so off/unverified must never make the brain "drifted".
@@ -288,7 +291,7 @@ export function inspect(opts = {}) {
     if (hasBrain && !harness.ok) actions.push('npx klypix-mcp link      # harness configs drifted — re-project managed blocks');
   }
 
-  return { verdict, layers, drifted, version, running, supervisors, hooks, codexSmart, codexHooks, tools, peers, sessions: peers, harness, npm, project: { dir: projectDir, brainPath, hasBrain }, brainDir, actions };
+  return { verdict, layers, drifted, version, running, supervisors, autoUpdate, hooks, codexSmart, codexHooks, tools, peers, sessions: peers, harness, npm, project: { dir: projectDir, brainPath, hasBrain }, brainDir, actions };
 }
 
 // One-line drift summary (empty when clean) — for a footer / status line.
@@ -346,6 +349,20 @@ export function render(r, opts = {}) {
     L.push(`${warn} ${c.bold}SUPERVISOR${c.rst}  installed but this is a legacy direct-worker session · reconnect once to activate`);
   } else {
     L.push(`${warn} ${c.bold}SUPERVISOR${c.rst}  not installed · core updates require reconnect`);
+  }
+
+  // AUTO-UPDATE (host-neutral supervisor policy; never part of the drift verdict).
+  if (!r.autoUpdate?.enabled) {
+    L.push(`${c.dim}· ${c.bold}AUTO-UPDATE${c.rst}  off by KLYPIX_AUTO_UPDATE${c.rst}`);
+  } else if (r.autoUpdate.result === 'failed') {
+    L.push(`${warn} ${c.bold}AUTO-UPDATE${c.rst}  enabled · last check failed safely${r.autoUpdate.error ? `: ${c.yel}${r.autoUpdate.error}${c.rst}` : ''}`);
+  } else if (r.autoUpdate.result === 'major-blocked') {
+    L.push(`${warn} ${c.bold}AUTO-UPDATE${c.rst}  compatible releases automatic · ${c.yel}${r.autoUpdate.error}${c.rst}`);
+  } else if (r.autoUpdate.result) {
+    const versionText = r.autoUpdate.installedVersion || r.autoUpdate.latestVersion || r.autoUpdate.currentVersion;
+    L.push(`${ok} ${c.bold}AUTO-UPDATE${c.rst}  enabled · machine-wide 24h check · last result ${r.autoUpdate.result}${versionText ? ` v${versionText}` : ''}`);
+  } else {
+    L.push(`${ok} ${c.bold}AUTO-UPDATE${c.rst}  enabled · machine-wide 24h check starts with the MCP supervisor`);
   }
 
   // Host adapters

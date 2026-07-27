@@ -70,6 +70,7 @@ async function connect(name, sessionId) {
       KLYPIX_SESSION_ID: sessionId,
       KLYPIX_MCP_INBOX_POLL_MS: '250',
       KLYPIX_RERANK: '0',
+      KLYPIX_AUTO_UPDATE: '0',
     },
     stderr: 'pipe',
   });

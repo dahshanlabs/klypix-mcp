@@ -151,11 +151,13 @@ host-specific transcript parsing stays outside the protocol.
 
 ### Updates — the propagation contract
 
-`install` lays the whole brain (hooks + engine + local MCP runtime) into `~/.claude/project-brain` and binds the current brain project's Codex config to that exact project on the current machine. `brain_sync` also accepts the current project root, providing a host-independent fallback when an IDE starts MCP from its own install directory. Updates are automatic through the Claude session-start hook: it checks npm (≤ once/24h, fail-open, disable with `KLYPIX_AUTO_UPDATE=0`) and self-installs newer releases.
+`install` lays the whole brain (hooks + engine + local MCP runtime) into `~/.claude/project-brain` and binds the current brain project's Codex config to that exact project on the current machine. `brain_sync` also accepts the current project root, providing a host-independent fallback when an IDE starts MCP from its own install directory.
+
+Updates are host-neutral. The MCP supervisor performs one machine-wide npm check per 24 hours, no matter how many Codex, Claude, Cursor, Cline, Antigravity, or generic MCP sessions are open. It installs an exact stable same-major release in `--runtime-only` mode, preserving host settings and project files. The check is detached and fail-open, developer-owned installs are protected, concurrent sessions collapse behind one lock, new major versions require a deliberate manual install, and `KLYPIX_AUTO_UPDATE=0` opts out. The Claude session-start updater remains as a compatible bootstrap path for older installations.
 
 The MCP entry point is a stable stdio supervisor. It keeps the host-owned connection open while a replaceable worker runs the brain core. A staged update is hash-verified, initialized in parallel, checked for backward-compatible tool schemas, and given the current `brain_sync` task scope before the supervisor switches between requests. Added tools use the standard `notifications/tools/list_changed` signal. A failed or breaking candidate is rejected while the old worker continues serving.
 
-There is one unavoidable migration reconnect for sessions that started before the supervisor was installed. After that, compatible core updates activate without restarting Codex, Antigravity, Claude, Cursor, Cline, or another stdio MCP host. A supervisor-code change, MCP major/tool removal, or host that ignores standard tool-list notifications can still require a deliberate reconnect; `brain_doctor` reports that boundary explicitly.
+There is one unavoidable migration reconnect for sessions that started before the supervisor was installed. After that, compatible worker/core updates activate without restarting Codex, Antigravity, Claude, Cursor, Cline, or another stdio MCP host. A supervisor-code change, MCP major/tool removal, or host that ignores standard tool-list notifications can still require a deliberate reconnect; `brain_doctor` reports the live supervisor and automatic-update receipt explicitly.
 
 ## Also speaks A2A (Agent-to-Agent)
 

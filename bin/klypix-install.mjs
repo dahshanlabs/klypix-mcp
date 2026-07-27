@@ -36,10 +36,13 @@ const BIN = path.join(PKG_ROOT, 'bin');
 const VERSION = (() => { try { return JSON.parse(fs.readFileSync(path.join(PKG_ROOT, 'package.json'), 'utf8')).version || ''; } catch { return ''; } })();
 const FORCE = process.argv.includes('--force');
 const CODEX_HOOKS = process.argv.includes('--codex-hooks');
+const RUNTIME_ONLY = process.argv.includes('--runtime-only');
 
 const HOME = os.homedir();
 const CLAUDE_DIR = path.join(HOME, '.claude');
-const BRAIN_DIR = path.join(CLAUDE_DIR, 'project-brain');
+const BRAIN_DIR = process.env.KLYPIX_MCP_INSTALL_DIR
+    ? path.resolve(process.env.KLYPIX_MCP_INSTALL_DIR)
+    : path.join(CLAUDE_DIR, 'project-brain');
 const SETTINGS = path.join(CLAUDE_DIR, 'settings.json');
 const CODEX_CONFIG = path.join(HOME, '.codex', 'config.toml');
 const HOOK_MARK = 'global-brain-hook';
@@ -148,12 +151,12 @@ const cur = (() => { try { return JSON.parse(fs.readFileSync(path.join(BRAIN_DIR
 if (!FORCE && cur) {
     if (cur.dev === true) {
         console.log(`• A dev deploy owns ${BRAIN_DIR} (dev:true) — leaving it untouched. Re-run with --force to override.`);
-        reportCodex(wireCodex());
+        if (!RUNTIME_ONLY) reportCodex(wireCodex());
         process.exit(0);
     }
     if (cur.brainVersion && cmpSemver(cur.brainVersion, VERSION) > 0) {
         console.log(`• Installed brain v${cur.brainVersion} is newer than this package v${VERSION} — not downgrading. Re-run with --force to override.`);
-        reportCodex(wireCodex());
+        if (!RUNTIME_ONLY) reportCodex(wireCodex());
         process.exit(0);
     }
 }
@@ -222,6 +225,10 @@ const flatten = (code) => code
     .replace(/const PKG_VERSION = \(\(\) => \{[\s\S]*?\}\)\(\);/, `const PKG_VERSION = '${VERSION}'; // baked at install (flat layout has no package.json)`);
 
 const gotLock = acquireLock();
+if (!gotLock) {
+    console.error(`✗ another KLYPIX install still owns ${LOCK}; no files were changed`);
+    process.exit(1);
+}
 try {
     fs.mkdirSync(BRAIN_DIR, { recursive: true });
     // 1) runtime dependency CLOSURE (jszip+fractional-indexing for the hook/engine,
@@ -280,7 +287,7 @@ try {
     // canvas-view-app.html is the canvas_view MCP App UI — staged raw (an HTML
     // file must never get a JS-comment banner) beside the flat server, which
     // resolves it via its ./canvas-view-app.html candidate path.
-    for (const f of ['global-brain-hook.mjs', 'brain-semantic.mjs', 'brain-note.mjs', 'brain-git-hook.mjs', 'klypix-format.mjs', 'klypix-core.mjs', 'agent-rules.mjs', 'brain-doctor.mjs', 'agent-presence.mjs', 'mcp-presence.mjs', 'mcp-supervisor.mjs', 'codex-brain-hook.mjs', 'codex-hooks.mjs', 'canvas-view-app.html']) {
+    for (const f of ['global-brain-hook.mjs', 'brain-semantic.mjs', 'brain-note.mjs', 'brain-git-hook.mjs', 'klypix-format.mjs', 'klypix-core.mjs', 'agent-rules.mjs', 'brain-doctor.mjs', 'agent-presence.mjs', 'mcp-presence.mjs', 'mcp-supervisor.mjs', 'mcp-auto-update.mjs', 'codex-brain-hook.mjs', 'codex-hooks.mjs', 'canvas-view-app.html']) {
         const s = path.join(SRC, f); if (exists(s)) staged.push({ dst: f, content: fs.readFileSync(s, 'utf8') });
     }
     for (const [src, dst] of [
@@ -303,7 +310,9 @@ try {
     // 3) mark the dir an ESM package
     fs.writeFileSync(path.join(BRAIN_DIR, 'package.json'), JSON.stringify({ name: 'klypix-project-brain', private: true, type: 'module' }, null, 2));
 
-    // 5) wire the 4 hooks into settings.json (refuse on invalid JSON; back up; atomic)
+    // 5) wire the 4 hooks into settings.json (refuse on invalid JSON; back up;
+    // atomic). A background runtime-only update refreshes the scripts while
+    // deliberately preserving every host/project config byte.
     const brainCmd = (arg) => `node "${fwd(path.join(BRAIN_DIR, 'global-brain-hook.mjs'))}"${arg ? ' ' + arg : ''}`;
     const GROUPS = [
         ['SessionStart', { matcher: 'startup|resume', hooks: [{ type: 'command', command: brainCmd('') }] }],
@@ -316,21 +325,23 @@ try {
         .filter(g => !g || !Array.isArray(g.hooks) || g.hooks.length > 0);
     let settings = {};
     let rawSettings = '';
-    if (exists(SETTINGS)) {
+    if (!RUNTIME_ONLY && exists(SETTINGS)) {
         rawSettings = fs.readFileSync(SETTINGS, 'utf8');
         if (rawSettings.trim()) {
             try { settings = JSON.parse(rawSettings); }
             catch (e) { if (gotLock) releaseLock(); console.error(`✗ ${SETTINGS} is invalid JSON (${e.message}). Fix it and re-run — refusing to overwrite a broken config.`); process.exit(1); }
         }
     }
-    if (!settings.hooks || typeof settings.hooks !== 'object' || Array.isArray(settings.hooks)) settings.hooks = {};
-    for (const [evt, entry] of GROUPS) { const cleaned = stripOurs(settings.hooks[evt]); cleaned.push(JSON.parse(JSON.stringify(entry))); settings.hooks[evt] = cleaned; }
-    fs.mkdirSync(CLAUDE_DIR, { recursive: true });
-    if (rawSettings) { try { fs.writeFileSync(SETTINGS + '.klypix-bak', rawSettings, 'utf8'); } catch { /* best-effort backup */ } }
-    const tmp = SETTINGS + '.klypix-tmp';
-    fs.writeFileSync(tmp, JSON.stringify(settings, null, 2), 'utf8');
-    JSON.parse(fs.readFileSync(tmp, 'utf8'));   // verify before swap
-    fs.renameSync(tmp, SETTINGS);
+    if (!RUNTIME_ONLY) {
+        if (!settings.hooks || typeof settings.hooks !== 'object' || Array.isArray(settings.hooks)) settings.hooks = {};
+        for (const [evt, entry] of GROUPS) { const cleaned = stripOurs(settings.hooks[evt]); cleaned.push(JSON.parse(JSON.stringify(entry))); settings.hooks[evt] = cleaned; }
+        fs.mkdirSync(CLAUDE_DIR, { recursive: true });
+        if (rawSettings) { try { fs.writeFileSync(SETTINGS + '.klypix-bak', rawSettings, 'utf8'); } catch { /* best-effort backup */ } }
+        const tmp = SETTINGS + '.klypix-tmp';
+        fs.writeFileSync(tmp, JSON.stringify(settings, null, 2), 'utf8');
+        JSON.parse(fs.readFileSync(tmp, 'utf8'));   // verify before swap
+        fs.renameSync(tmp, SETTINGS);
+    }
 
     // 6) stamp the install (unified brain version → never-downgrade across channels)
     const installedAt = new Date().toISOString();
@@ -352,27 +363,30 @@ try {
 
     // 7) migrate THIS project's .mcp.json off npx onto the now-installed local bundle
     //    (heals an existing stale config so the next MCP server spawn runs current).
-    const migrated = migrateProjectMcpConfig();
+    const migrated = RUNTIME_ONLY ? null : migrateProjectMcpConfig();
 
     // Codex needs native MCP tools, conditional guidance, and lifecycle presence.
-    const codex = wireCodex();
+    const codex = RUNTIME_ONLY ? null : wireCodex();
 
     // 8) READINESS check — re-read what we just wrote and confirm all 4 hooks actually
     //    took (a malformed pre-existing group, a partial merge, or a later hand-edit can
     //    leave the brain LIVE but not LEARNING — liveness ≠ readiness). Warn, don't fail.
-    const verify = (() => { try { return JSON.parse(fs.readFileSync(SETTINGS, 'utf8')); } catch { return null; } })();
+    const verify = RUNTIME_ONLY ? null : (() => { try { return JSON.parse(fs.readFileSync(SETTINGS, 'utf8')); } catch { return null; } })();
     const wiredFor = (evt) => Array.isArray(verify?.hooks?.[evt]) && verify.hooks[evt].some(g => Array.isArray(g?.hooks) && g.hooks.some(h => typeof h?.command === 'string' && h.command.includes(HOOK_MARK)));
     const notWired = ['SessionStart', 'UserPromptSubmit', 'Stop', 'PostToolUse'].filter(e => !wiredFor(e));
 
     if (gotLock) releaseLock();
-    reportCodex(codex);
+    if (!RUNTIME_ONLY) reportCodex(codex);
     console.log(`✓ installed klypix brain v${VERSION} → ${BRAIN_DIR}  (${n} scripts, ${deps} dep packages)`);
-    if (!notWired.length) console.log('✓ wired 4 hooks: SessionStart · UserPromptSubmit (--prompt) · Stop (--capture) · PostToolUse (--live) → settings.json');
+    if (RUNTIME_ONLY) console.log('✓ runtime-only update: host settings and project files were preserved');
+    else if (!notWired.length) console.log('✓ wired 4 hooks: SessionStart · UserPromptSubmit (--prompt) · Stop (--capture) · PostToolUse (--live) → settings.json');
     else console.error(`⚠ readiness: ${notWired.length} hook(s) did NOT take (${notWired.join(', ')}) — the brain will read but not capture/sync. Re-run \`npx klypix-mcp install --force\` or check ${SETTINGS}.`);
     console.log(`✓ MCP supervisor runs from the local bundle (node ${fwd(path.join(BRAIN_DIR, 'klypix-mcp-server.mjs'))}) — compatible core updates activate without restarting the host.`);
     if (migrated) console.log(`✓ migrated ${migrated.file} klypix-canvas server: ${migrated.from} → ${migrated.to} (backup: .mcp.json.klypix-bak). Reconnect (/mcp) or restart to pick it up.`);
-    console.log('  Claude Code keeps its existing auto-brief/capture hooks; Codex gets the brain_sync Context Gateway (compact task memory + clean peers + proactive/guaranteed conflict alerts) with no hook trust prompt.');
-    console.log('  Enhanced Codex auto-context + pre-edit overlap guard: re-run with `--codex-hooks`, then approve/review KLYPIX once in a Codex surface that supports hook trust.');
+    if (!RUNTIME_ONLY) {
+        console.log('  Claude Code keeps its existing auto-brief/capture hooks; Codex gets the brain_sync Context Gateway (compact task memory + clean peers + proactive/guaranteed conflict alerts) with no hook trust prompt.');
+        console.log('  Enhanced Codex auto-context + pre-edit overlap guard: re-run with `--codex-hooks`, then approve/review KLYPIX once in a Codex surface that supports hook trust.');
+    }
     console.log('  Compatible brain-core updates hot-swap behind the same MCP connection. Only the one-time legacy→supervisor migration, a supervisor change, or an intentionally breaking tool/protocol change needs reconnect.');
     console.log('  Verify anytime: `npx klypix-mcp doctor`; prove two-client behavior with `npx klypix-mcp conformance`.');
 } catch (e) {

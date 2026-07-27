@@ -1902,9 +1902,16 @@ function writeAutoUpdateStamp(now) { try { fs.mkdirSync(path.dirname(AUTOUPDATE_
 // Cross-platform detached spawn: npx is npx.cmd on Windows (needs shell); detach +
 // unref so it outlives this hook; swallow the 'error' event so a missing npx / offline
 // resolve can never surface. Returns null on any throw.
-function spawnDetached(cmd, args) {
+function spawnDetached(cmd, args, options = {}) {
     try {
-        const child = spawn(cmd, args, { cwd: CWD, detached: true, stdio: 'ignore', shell: process.platform === 'win32', windowsHide: true });
+        const child = spawn(cmd, args, {
+            cwd: options.cwd || CWD,
+            env: options.env || process.env,
+            detached: true,
+            stdio: 'ignore',
+            shell: options.shell ?? (process.platform === 'win32'),
+            windowsHide: true,
+        });
         child.on('error', () => { /* fail-open: npx missing / offline */ });
         child.unref();
         return child;
@@ -1923,6 +1930,29 @@ export function shouldSelfUpdate({ enabled, now, lastCheck, ttl = AUTOUPDATE_TTL
 }
 function maybeSelfUpdate() {
     try {
+        // New installations share the exact same host-neutral updater used by
+        // Codex/Cursor/Cline/generic MCP supervisors. Starting it here preserves
+        // Claude's bootstrap path even when no MCP connection is open, while the
+        // helper's machine lock + 24h stamp prevent duplicate work.
+        const brainDir = path.join(os.homedir(), '.claude', 'project-brain');
+        const helper = path.join(brainDir, 'mcp-auto-update.mjs');
+        if (fs.existsSync(helper)) {
+            spawnDetached(process.execPath, [helper, '--klypix-auto-update-worker'], {
+                cwd: os.tmpdir(),
+                env: {
+                    ...process.env,
+                    KLYPIX_MCP_AUTO_UPDATE_DIR: brainDir,
+                    KLYPIX_MCP_AUTO_UPDATE_CURRENT: bakedBrainVersion() || '',
+                    KLYPIX_MCP_AUTO_UPDATE_CHILD: '1',
+                },
+                shell: false,
+            });
+            return;
+        }
+
+        // Pre-host-neutral installations retain their original cache-driven
+        // updater. Its only job now is to bootstrap the release that contains
+        // mcp-auto-update.mjs; subsequent checks use the shared helper above.
         const now = Date.now();
         let lastCheck = null; try { lastCheck = JSON.parse(fs.readFileSync(AUTOUPDATE_STAMP, 'utf8')).lastCheck; } catch { /* first run */ }
         let dev = false; try { dev = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.claude', 'project-brain', '.brain-version.json'), 'utf8')).dev === true; } catch { /* */ }

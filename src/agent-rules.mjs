@@ -655,7 +655,11 @@ export function linkProject(projectDir, opts = {}) {
       // Project config is commonly committed. Keep it machine-portable; the
       // 120s Codex startup timeout covers the one-time npx bootstrap.
       const portableEntry = { command: 'npx', args: ['-y', 'klypix-mcp', '--vault', '.'] };
-      const res = connectCodexMcpServer({ configPath: m.file, entry: portableEntry, cwd: '..' });
+      // Codex resolves an MCP server's `cwd` from the active session working
+      // directory, not from the `.codex/` folder containing this config. Keep
+      // it at the session cwd; klypix-core walks upward when Codex starts from
+      // a project subdirectory.
+      const res = connectCodexMcpServer({ configPath: m.file, entry: portableEntry, cwd: '.' });
       return res.ok ? { tool: m.tool, file, ...res } : { tool: m.tool, file, action: 'skipped', why: res.error };
     }
     if (check) return { tool: m.tool, file, ...classifyMcp(m.file, m.wrapKey) };

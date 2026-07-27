@@ -72,6 +72,23 @@ ok(contextText.length <= 2800,
 ok(contextElapsed < 1000,
   `task context stays on the fast path (${contextElapsed.toFixed(1)}ms < 1000ms)`);
 
+const nested = path.join(project, 'src', 'nested');
+fs.mkdirSync(nested, { recursive: true });
+const originalCwd = process.cwd();
+let nestedContext;
+try {
+  process.chdir(nested);
+  nestedContext = await opBrainTaskContext({
+    vault: nested,
+    intent: 'Resolve the project brain from a nested Codex working directory',
+    files: ['src/nested/example.ts'],
+  });
+} finally {
+  process.chdir(originalCwd);
+}
+ok(nestedContext?.context?.hits?.some((hit) => /Context Gateway/.test(hit.text)),
+  'brain_sync walks upward from a nested Codex cwd to the project brain');
+
 const fakeServer = {
   server: { getClientVersion: () => ({ name: 'codex-context-perf', version: 'test' }) },
   sendLoggingMessage: () => {},

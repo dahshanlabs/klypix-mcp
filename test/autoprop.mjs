@@ -178,7 +178,7 @@ function runInstall(home, projectCwd, args = []) {
   ok(globalCodexConfig.includes('model = "gpt-test"') && globalCodexConfig.includes('[mcp_servers.docs]'), 'D: global Codex cleanup preserves user settings + sibling servers');
   const codexConfig = fs.readFileSync(path.join(proj, '.codex', 'config.toml'), 'utf8');
   ok(codexConfig.includes('[mcp_servers.klypix-canvas]') && codexConfig.includes('command = "npx"')
-    && codexConfig.includes('cwd = ".."'), 'D: Codex project MCP + automatic presence are wired with a portable config');
+    && codexConfig.includes('cwd = "."'), 'D: Codex project MCP stays at the active project cwd with a portable config');
   ok(codexConfig.includes('model = "gpt-project"') && codexConfig.includes('[mcp_servers.project-docs]'), 'D: project Codex config preserves user settings + sibling servers');
   const codexAgents = fs.readFileSync(path.join(home, '.codex', 'AGENTS.md'), 'utf8');
   ok(codexAgents.includes('# Personal Codex instructions') && codexAgents.includes('klypix-codex:start'), 'D: Codex global guidance is fence-merged with personal instructions');

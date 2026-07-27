@@ -80,12 +80,12 @@ function wireCodex() {
     const mcp = hasProjectBrain
         ? connectCodexMcpServer({
             configPath: projectConfig,
-            // Project config is commonly committed. Keep it portable: the
-            // package invocation that is running this installer is exactly the
-            // version the project asked for, while an absolute home path would
-            // dirty the repo and break it on every other machine.
+            // Project config is commonly committed. Keep it portable and keep
+            // the MCP process at Codex's active session cwd. Codex resolves
+            // this field from the session working directory, not from the
+            // `.codex/` config folder; using ".." incorrectly escaped the repo.
             entry: { command: 'npx', args: ['-y', 'klypix-mcp', '--vault', '.'] },
-            cwd: '..',
+            cwd: '.',
         })
         : { ok: true, action: 'skipped-no-project-brain', path: projectConfig };
     // Pre-1.35 installed a global `--vault "."` entry. A global Codex process

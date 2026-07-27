@@ -32,6 +32,7 @@ import {
   statusContextToMarkdown, findFulfillmentCandidates,
   splitQueryTokens, scoreCardsAgainstQuery, correctionOverlaysFor,
 } from './klypix-format.mjs';
+import { findProjectBrain } from './agent-presence.mjs';
 
 // ── Card / connection input shape (single source for every face) ─────────────
 export const cardSchema = z.object({
@@ -97,8 +98,8 @@ export function resolveCanvas(vault, ref) {
 // (the "SS2" bug — a foreign brain.klypix picked by a fuzzy basename walk).
 // Precedence, project-first:
 //   1. KLYPIX_BRAIN env (explicit override)
-//   2. ./brain.klypix in the launch cwd — the project brain (coding agents launch
-//      this server with cwd = the project root)
+//   2. nearest brain.klypix / brain.any at-or-above the launch cwd — the
+//      project brain (coding agents may launch from a project subdirectory)
 //   3. <vault>/brain.klypix (exact) — when the vault itself is the brain's home
 //   4. a SINGLE brain.klypix found by walking the vault; if MORE THAN ONE exists
 //      we REFUSE to guess (returns { ambiguous }) instead of silently taking one.
@@ -106,7 +107,10 @@ export function resolveDefaultBrain(vault) {
   const ex = (p) => { try { return p && fs.existsSync(p) ? path.resolve(p) : null; } catch { return null; } };
   let f;
   if ((f = ex(process.env.KLYPIX_BRAIN))) return { file: f, how: 'env (KLYPIX_BRAIN)' };
-  if ((f = ex(path.join(process.cwd(), 'brain.klypix')))) return { file: f, how: 'project cwd' };
+  if ((f = findProjectBrain(process.cwd()))) {
+    const how = path.dirname(f) === path.resolve(process.cwd()) ? 'project cwd' : 'project ancestor';
+    return { file: f, how };
+  }
   if ((f = ex(path.join(vault, 'brain.klypix')))) return { file: f, how: 'vault root' };
   const matches = walkVault(vault).filter(p => /^brain\.(klypix|any)$/i.test(path.basename(p)));
   if (matches.length === 1) return { file: matches[0], how: 'vault search' };

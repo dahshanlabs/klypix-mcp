@@ -236,7 +236,12 @@ try {
     // silently drop a dep the hook needs.
     const destMods = path.join(BRAIN_DIR, 'node_modules');
     const findPkgDir = (name, fromDir) => {
-        let dir = fromDir;
+        // Follow linked/isolated package roots before walking upward. A host
+        // can have AJV 6 at its app root while the linked MCP SDK resolves AJV
+        // 8 beside its real package location; starting from the symlink path
+        // would silently select the wrong major for the flat runtime.
+        let dir;
+        try { dir = fs.realpathSync(fromDir); } catch { dir = path.resolve(fromDir); }
         for (; ;) {
             const cand = path.join(dir, 'node_modules', ...name.split('/'));
             if (exists(path.join(cand, 'package.json'))) return cand;

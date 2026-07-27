@@ -30,6 +30,7 @@ import {
   challengeBrain, challengeContextToMarkdown, buildRenderSpec, structToBrief,
   brainLensData, lensToMarkdown, deathDateOfCard,
   statusContextToMarkdown, findFulfillmentCandidates,
+  splitQueryTokens, scoreCardsAgainstQuery, correctionOverlaysFor,
 } from './klypix-format.mjs';
 
 // ── Card / connection input shape (single source for every face) ─────────────
@@ -420,6 +421,100 @@ export async function opSearchAllBrains({ vault, query, as_of, log = () => {} })
 // live correction), assembled into a SYNTHESIS-READY context the calling agent
 // turns into a direct, cited answer. The engine never calls an LLM (pure retrieval
 // + assembly) — same "engine selects, model writes" contract as brain_connect.
+// Fast, bounded task context for brain_sync. Unlike brain_ask, this path never
+// loads an embedding model or reranker: one MCP call should coordinate peers
+// AND provide enough current project memory to begin work without making every
+// Codex session read the full generated brief.
+export async function opBrainTaskContext({
+  vault,
+  canvas,
+  intent,
+  files = [],
+  k = 5,
+  budgetChars = 2800,
+}) {
+  const startedAt = Date.now();
+  const task = String(intent || '').replace(/\s+/g, ' ').trim();
+  const scopedFiles = (Array.isArray(files) ? files : [])
+    .map((file) => String(file || '').replace(/\\/g, '/').trim())
+    .filter(Boolean)
+    .slice(0, 20);
+  if (!task && !scopedFiles.length) {
+    return {
+      blocks: [text('Task context: no intent or files were supplied, so no brain cards were retrieved.')],
+      context: { mode: 'lexical-fast', hits: [], sufficient: false, durationMs: Date.now() - startedAt },
+    };
+  }
+  const t = brainTarget(vault, canvas);
+  if (t.ambiguous) return ambiguousBrainErr(t.ambiguous);
+  if (!t.file) {
+    return {
+      blocks: [text('Task context unavailable: no project brain was found.')],
+      context: { mode: 'lexical-fast', hits: [], sufficient: false, durationMs: Date.now() - startedAt },
+    };
+  }
+  let struct;
+  try { ({ struct } = await parseKlypix(fs.readFileSync(t.file))); }
+  catch (e) { return err(`Task context read failed: ${e.message}`); }
+
+  const generic = new Set(['src', 'app', 'lib', 'components', 'component', 'scripts', 'public', 'test', 'tests', 'electron']);
+  const fileTerms = scopedFiles.flatMap((file) => {
+    const parts = file.toLowerCase().split('/').filter(Boolean);
+    const base = (parts.pop() || '').replace(/\.[a-z0-9]+$/i, '');
+    return [base, ...parts.filter((part) => part.length >= 3 && !generic.has(part))];
+  });
+  const split = splitQueryTokens(`${task} ${fileTerms.join(' ')}`);
+  const tokens = [...new Set(split.content)];
+  const hits = scoreCardsAgainstQuery(struct, tokens, {
+    topK: Math.max(1, Math.min(8, Number(k) || 5)),
+    minScore: 2,
+  });
+  let overlays = new Map();
+  try { overlays = correctionOverlaysFor(struct, hits.map((hit) => hit.card)); }
+  catch { /* context remains useful without overlays */ }
+
+  const flat = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+  const clip = (value, limit) => {
+    const clean = flat(value);
+    return clean.length > limit ? `${clean.slice(0, limit - 1)}…` : clean;
+  };
+  const entries = hits.map((hit) => {
+    const correction = overlays.get(hit.card.id)?.by || null;
+    return {
+      id: hit.card.id,
+      area: flat(hit.card.area) || 'Notes',
+      text: clip(hit.card.text, 420),
+      score: Number(hit.score.toFixed(2)),
+      correctedBy: correction ? clip(correction.text, 420) : null,
+    };
+  });
+  const maxChars = Math.max(800, Math.min(5000, Number(budgetChars) || 2800));
+  const lines = [
+    `## Compact task context (${entries.length} relevant brain card${entries.length === 1 ? '' : 's'} · lexical-fast)`,
+  ];
+  if (!entries.length) {
+    lines.push('No high-confidence task-specific card matched. Continue from repository evidence; use brain_ask only if deeper project history is needed.');
+  } else {
+    for (const entry of entries) {
+      if (entry.correctedBy) lines.push(`- [${entry.area}] CURRENT CORRECTION: ${entry.correctedBy}`);
+      lines.push(`- [${entry.area}]${entry.correctedBy ? ' superseded context:' : ''} ${entry.text}`);
+      if (lines.join('\n').length >= maxChars) break;
+    }
+    lines.push('This is a bounded start-of-task capsule, not the whole brain; use brain_ask for broad status/history questions.');
+  }
+  const durationMs = Math.max(0, Date.now() - startedAt);
+  return {
+    blocks: [text(lines.join('\n').slice(0, maxChars))],
+    context: {
+      mode: 'lexical-fast',
+      hits: entries,
+      sufficient: entries.length > 0,
+      durationMs,
+      brain: path.basename(t.file),
+    },
+  };
+}
+
 export async function opBrainAsk({ vault, canvas, question, as_of, k = 10, log = () => {} }) {
   const q = String(question || '').trim();
   if (!q) return err('brain_ask needs a question.');
@@ -964,7 +1059,7 @@ export async function opBrainMessage({ vault, canvas, text: msgText, to, via }) 
   } catch (e) {
     return err(`brain_message failed: ${e.message}`);
   } finally { if (got) { try { fs.unlinkSync(lock); } catch { /* */ } } }
-  return { blocks: [text(`📨 posted to this project's coordination lane (to: ${msg.to}) — ${live} active presence-wired session(s) right now; each receives it once through its host lifecycle hook. Hookless clients can send but not receive. Ephemeral (24h), not a brain card — use brain_note for durable decisions.`)] };
+  return { blocks: [text(`📨 posted to this project's coordination lane (to: ${msg.to}) — ${live} active presence-wired session(s) right now; each receives it once through its lifecycle adapter or next brain_sync / KLYPIX tool call. Ephemeral (24h), not a brain card — use brain_note for durable decisions.`)] };
 }
 
 // Re-export the format helpers the bins need for non-op work (init onboarding).

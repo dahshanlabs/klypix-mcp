@@ -5,6 +5,7 @@ import {
   CODEX_PRESENCE_EVENTS,
   codexPresenceHookStatus,
   mergeCodexPresenceHooks,
+  recordCodexHookExecution,
   removeCodexPresenceHooks,
   resolveCodexHooksPath,
 } from '../src/codex-hooks.mjs';
@@ -63,6 +64,13 @@ ok(second.ok && second.action === 'unchanged', 'connect is idempotent');
 ok(fs.readFileSync(hooksFile, 'utf8') === firstBytes, 'idempotent connect preserves file bytes');
 const status = codexPresenceHookStatus(home);
 ok(status.installed && status.missing.length === 0, 'status reports all Codex presence hooks installed');
+ok(status.executionStatus === 'unverified',
+  'configured hook files are not falsely reported as trusted before execution');
+ok(recordCodexHookExecution({ home, event: 'SessionStart', sessionId: 'test-session' }).ok,
+  'a real hook invocation records a behavioral execution receipt');
+const observed = codexPresenceHookStatus(home);
+ok(observed.executionStatus === 'observed' && observed.lastExecutedAt,
+  'status reports enhanced hooks active only after matching config actually executes');
 
 const removed = removeCodexPresenceHooks(home);
 ok(removed.ok && removed.action === 'disconnected', 'disconnect removes KLYPIX-owned handlers');

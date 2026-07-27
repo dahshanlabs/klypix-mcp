@@ -1340,14 +1340,17 @@ async function capture(lib) {
 // 🧠 plug's job).
 async function refreshAgentsBrief(lib, buffer) {
     const agentsPath = path.resolve(CWD, 'AGENTS.md');
-    if (!fs.existsSync(agentsPath) || typeof lib.structToBrief !== 'function') return;
+    if (!fs.existsSync(agentsPath)
+        || (typeof lib.structToUltraBrief !== 'function' && typeof lib.structToBrief !== 'function')) return;
     const { struct } = await lib.parseKlypix(buffer);
     // detailRecent: 0 — this block is committed into adopters' AGENTS.md and read
     // by every hookless agent each session; it stays headlines-only by contract
     // (the SessionStart brief is where the detailed-newest tier lives).
-    const brief = lib.structToBrief(struct, { recentDays: 7, maxRecent: 10, maxMilestones: 3, maxConnections: 5, detailRecent: 0 }).trim();
+    const brief = (typeof lib.structToUltraBrief === 'function'
+        ? lib.structToUltraBrief(struct, { briefPath: '.claude/brain-brief.md', budgetChars: 3200 })
+        : lib.structToBrief(struct, { recentDays: 7, maxRecent: 4, maxMilestones: 2, maxConnections: 3, detailRecent: 0 }).slice(0, 3200)).trim();
     const START = '<!-- klypix-brain-brief:start -->', END = '<!-- klypix-brain-brief:end -->';
-    const block = `${START}\n<!-- auto-refreshed by the brain hook on capture · headlines only · full cards via the klypix-canvas MCP -->\n${brief}\n${END}`;
+    const block = `${START}\n<!-- auto-refreshed by the brain hook on capture · compact fallback only; brain_sync supplies task-ranked context -->\n${brief}\n${END}`;
     const txt = fs.readFileSync(agentsPath, 'utf8');
     const re = new RegExp(`${START}[\\s\\S]*?${END}`);
     const next = re.test(txt) ? txt.replace(re, block) : (txt.trimEnd() + '\n\n' + block + '\n');

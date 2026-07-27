@@ -27,8 +27,10 @@ import {
   resolveVault, getEmbedder, buildKlypixMap, cardSchema, connSchema,
   opListCanvases, opReadCanvas, opSearchCanvases, opSearchAllBrains,
   opBrainInsights, opBrainConnect, opBrainReconcile, opBrainGarden, opCreateCanvas, opAddToCanvas, opBrainNote, opBrainMessage, opBrainAsk, opBrainChallenge, opCanvasView, opBrainLens,
+  opBrainTaskContext,
 } from '../src/klypix-core.mjs';
 import { mcpServerEntry } from '../src/agent-rules.mjs';
+import { createMcpPresence, KLYPIX_MCP_INSTRUCTIONS } from '../src/mcp-presence.mjs';
 
 // Real package version for the MCP handshake (was hardcoded '1.0.0', which
 // misled every client/version diagnosis — it could never reflect the true release).
@@ -102,16 +104,20 @@ if (process.argv[2] === 'init') {
 
 const vaultArgIdx = process.argv.indexOf('--vault');
 const VAULT = resolveVault(vaultArgIdx >= 0 ? process.argv[vaultArgIdx + 1] : undefined);
+const server = new McpServer(
+  { name: 'klypix-canvas', version: PKG_VERSION },
+  { instructions: KLYPIX_MCP_INSTRUCTIONS },
+);
+const mcpPresence = createMcpPresence({ server, initialVault: VAULT });
 
 // Map a protocol-neutral core result → an MCP tool result.
 const toContent = (r) => {
   const content = r.blocks.map(b => b.kind === 'image'
     ? { type: 'image', data: b.data, mimeType: b.mime }
     : { type: 'text', text: b.text });
-  return r.isError ? { content, isError: true } : { content };
+  const result = r.isError ? { content, isError: true } : { content };
+  return mcpPresence.decorateToolResult(result);
 };
-
-const server = new McpServer({ name: 'klypix-canvas', version: PKG_VERSION });
 
 server.registerTool('list_canvases', {
   title: 'List KLYPIX canvases',
@@ -265,7 +271,7 @@ server.registerTool('brain_note', {
 
 server.registerTool('brain_message', {
   title: 'Message the other live agent sessions on this project (one-time note, not a brain card)',
-  description: 'Leave a DELIBERATE, targeted note for the OTHER active agent sessions working on this project right now ("merged the hook refactor — rebase before you commit", "don\'t touch canvasStore, mid-refactor"). Any MCP client can SEND (the twin of the `🧠 MSG [to]: text` marker); delivery is to presence-wired sessions (Claude Code and Codex, with more host adapters supported by the shared protocol). Each receives it once through its lifecycle hook. A hookless peer can send but will NOT receive. Ephemeral (expires in 24h) and NOT persisted to the brain — for a durable decision use brain_note instead.',
+  description: 'Leave a DELIBERATE, targeted note for the OTHER active agent sessions working on this project right now ("merged the hook refactor — rebase before you commit", "don\'t touch canvasStore, mid-refactor"). Any MCP client can send and receive through the shared presence lane. Hookless MCP peers receive each note once on their next KLYPIX tool call (and may also see a host logging notification); lifecycle hooks provide more proactive delivery. Ephemeral (expires in 24h) and NOT persisted to the brain — for a durable decision use brain_note instead.',
   inputSchema: {
     text: z.string().describe('The note to deliver (kept to 400 chars).'),
     to: z.string().optional().describe('Target hint — a peer session id-prefix or branch name; omit or "all" for every live session.'),
@@ -273,12 +279,75 @@ server.registerTool('brain_message', {
   },
 }, async ({ text, to, canvas }) => {
   let via; try { via = server.server.getClientVersion()?.name; } catch { /* optional */ }
+  mcpPresence.noteSent(text);
   return toContent(await opBrainMessage({ vault: VAULT, canvas, text, to, via }));
+});
+
+server.registerTool('brain_sync', {
+  title: 'KLYPIX Context Gateway — synchronize task, peers, conflicts, and relevant memory',
+  description: 'APPROVAL-FREE task gateway over the authorized MCP connection. Call FIRST with a concise intent and expected files, again when scope changes, and with phase:"complete" before the final response. One bounded response returns compact task-relevant brain context, active TASK peers (idle connections hidden), one-time messages, structured exact-file conflicts, and automatic late-arrival overlap alerts. Portable across Codex/Antigravity and every MCP host; native hooks are optional.',
+  annotations: {
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+  inputSchema: {
+    intent: z.string().max(160).optional().describe('One sentence describing the current task. Supply for start/checkpoint; completion clears it.'),
+    files: z.array(z.string()).max(20).optional().describe('Project-relative files you expect to touch or have touched. Exact overlaps with peers are flagged.'),
+    phase: z.enum(['start', 'checkpoint', 'complete']).optional().describe('start replaces prior task scope; checkpoint merges changed scope; complete clears task intent/files. Default: checkpoint.'),
+    include_context: z.boolean().optional().describe('Include fast task-relevant brain cards in the same response. Defaults true; ignored for phase complete.'),
+  },
+}, async ({ intent, files, phase, include_context }) => {
+  const totalStartedAt = Date.now();
+  const report = mcpPresence.sync({ intent, files, phase });
+  let taskContext = null;
+  if (phase !== 'complete' && include_context !== false && (intent || files?.length)) {
+    taskContext = await opBrainTaskContext({
+      vault: VAULT,
+      intent,
+      files,
+      k: 5,
+      budgetChars: 2800,
+    });
+  }
+  const contextText = taskContext?.blocks
+    ?.filter((block) => block.kind === 'text')
+    .map((block) => block.text)
+    .filter(Boolean)
+    .join('\n\n') || '';
+  const totalMs = Math.max(0, Date.now() - totalStartedAt);
+  const structuredContent = {
+    ...(report.structured || {
+      schemaVersion: 1,
+      status: 'idle',
+      phase: phase || 'checkpoint',
+    }),
+    context: taskContext?.context || {
+      mode: 'not-requested',
+      hits: [],
+      sufficient: false,
+      durationMs: 0,
+    },
+    timingMs: {
+      ...(report.structured?.timingMs || {}),
+      context: taskContext?.context?.durationMs || 0,
+      total: totalMs,
+    },
+  };
+  const timingText = `Context Gateway total: ${totalMs}ms`
+    + (taskContext?.context ? ` (memory ${taskContext.context.durationMs}ms)` : '') + '.';
+  return {
+    content: [{
+      type: 'text',
+      text: [report.text, contextText, timingText].filter(Boolean).join('\n\n'),
+    }],
+    structuredContent,
+  };
 });
 
 server.registerTool('brain_doctor', {
   title: 'Brain doctor — is this brain current, wired, and in sync?',
-  description: 'Read-only self-check of the installed klypix brain, as ONE verdict: VERSION (deployed brain-core + optional npm currency), CLAUDE (existing 4-hook capture readiness), CODEX (5-hook live-presence readiness), TOOLS (discoverable MCP verbs), SESSIONS (all active lifecycle sessions across hosts, never recent-chat history), and HARNESS (projection drift). Use to answer "is my brain current, correctly installed, in sync, and who is actually live?" without file-spelunking. Never writes. The MCP-callable twin of `npx klypix-mcp doctor`.',
+  description: 'Read-only self-check of the installed klypix brain, as ONE verdict: VERSION (deployed brain-core + optional npm currency), CLAUDE (existing 4-hook capture readiness), CODEX (automatic MCP presence plus optional enhanced-hook status), TOOLS (discoverable MCP verbs), SESSIONS (all active presence-adapter sessions across hosts, never recent-chat history), and HARNESS (projection drift). Use to answer "is my brain current, correctly installed, in sync, and who is actually live?" without file-spelunking. Never writes. The MCP-callable twin of `npx klypix-mcp doctor`.',
   inputSchema: {
     project: z.string().optional().describe('Project dir to audit harness + peers for. Defaults to the server\'s working directory.'),
     check_npm: z.boolean().optional().describe('Also fetch npm latest to flag a stale brain (default false — this one does a network `npm view`).'),
@@ -297,7 +366,7 @@ server.registerTool('brain_doctor', {
     // makes the RUNNING check report the caller's actual server version, never a
     // phantom another session's heartbeat wrote to the shared registry.
     const report = inspect({ projectDir: project ? path.resolve(project) : process.cwd(), npmLatest, self: { pid: process.pid, version: PKG_VERSION } });
-    return { content: [{ type: 'text', text: render(report, { color: false }) }] };
+    return mcpPresence.decorateToolResult({ content: [{ type: 'text', text: render(report, { color: false }) }] });
   } catch (e) {
     return { content: [{ type: 'text', text: `brain_doctor unavailable: ${e?.message || e}` }], isError: true };
   }
@@ -394,9 +463,14 @@ if (!canvasViewAsApp) {
 }
 
 const transport = new StdioServerTransport();
+server.server.oninitialized = () => {
+  mcpPresence.start(VAULT);
+  recordRunningServer();
+  log(`ready · vault=${VAULT} · presence=mcp`);
+};
+server.server.onclose = () => mcpPresence.stop();
+process.once('exit', () => mcpPresence.stop());
 await server.connect(transport);
-recordRunningServer();
-log(`ready · vault=${VAULT}`);
 // Pre-warm the on-device embedder in the BACKGROUND so the first cross-project
 // search of a session is already semantic, not a lexical fallback.
 getEmbedder(log).then(p => log(p ? 'semantic ready (pre-warmed)' : 'semantic unavailable — lexical only')).catch(() => {});

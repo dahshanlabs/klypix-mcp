@@ -75,7 +75,8 @@ const ALIVE = process.pid;          // a genuinely-alive pid for registry entrie
 const DEAD = 2147483646;            // a pid that does not exist → pruned by liveness
 const reg = (bd, servers) => fs.writeFileSync(path.join(bd, '.running-servers.json'), JSON.stringify({ servers }));
 const NOW_ISO = new Date().toISOString();
-const OLD_ISO = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();   // >24h → aged out
+const OLD_ISO = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
+const REUSED_ISO = new Date(Date.now() - 10 * 60 * 1000).toISOString();
 {
   // CLI mode: a live server whose version < installed → RUNNING drift (the incident).
   const home = tmp('e-stale'); const bd = seedInstalledBrain(home, '1.20.1');
@@ -86,12 +87,21 @@ const OLD_ISO = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();   // >
   rmrf(home);
 }
 {
-  // review fix (medium): an ALIVE-pid but AGED-OUT stale entry (reused-PID phantom) is
-  // pruned, so it can't produce a false DRIFT in CLI doctor.
+  // An ALIVE reused PID without a renewable MCP heartbeat is pruned within
+  // minutes, so an unrelated same-day process cannot create false CLI drift.
   const home = tmp('e-aged'); const bd = seedInstalledBrain(home, '1.21.0');
-  reg(bd, [{ pid: ALIVE, version: '1.10.0', vault: '/reused', bootedAt: OLD_ISO }]);
+  reg(bd, [{ pid: ALIVE, version: '1.10.0', vault: '/reused', bootedAt: REUSED_ISO }]);
   const r = inspect({ home, projectDir: home });
-  ok(r.layers.running === 'unknown', 'E: an alive-pid but >24h-old entry (reused-PID phantom) is aged out → not a false DRIFT');
+  ok(r.layers.running === 'unknown', 'E: an alive reused PID without a fresh heartbeat is rejected → not a false DRIFT');
+  rmrf(home);
+}
+{
+  // A genuinely long-running MCP worker remains current through lastSeenAt,
+  // independent of its old boot timestamp.
+  const home = tmp('e-heartbeat'); const bd = seedInstalledBrain(home, '1.21.0');
+  reg(bd, [{ pid: ALIVE, version: '1.21.0', vault: '/live', bootedAt: OLD_ISO, lastSeenAt: NOW_ISO }]);
+  const r = inspect({ home, projectDir: home });
+  ok(r.layers.running === 'ok', 'E: a renewable heartbeat preserves a genuinely long-running MCP server');
   rmrf(home);
 }
 {

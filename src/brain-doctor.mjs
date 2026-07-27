@@ -107,36 +107,49 @@ function inspectTools(brainDir, pkgRoot) {
 // ── RUNNING layer (behavioral truth, not a baked stamp) ──────────────────────
 // The baked-file VERSION layer certifies whatever install last wrote — NOT the
 // process actually answering MCP tool calls (an npx-spawned server serves its warm
-// cache, which can lag the install). Servers record {pid, version, vault} into a
-// per-pid REGISTRY (.running-servers.json) on boot; comparing to the baked version
+// cache, which can lag the install). Servers record {pid, version, vault,
+// lastSeenAt} into a per-pid REGISTRY (.running-servers.json); comparing to the baked version
 // surfaces the "stamp says current, live server is stale" incident as DRIFT.
 //
 // Per-pid matters: MCP servers are per-session, so a single shared value is last-
 // writer-wins and could report a DIFFERENT session's server (a phantom). Two modes:
 //   • self (brain_doctor called AS the MCP tool, inside a server): report THAT
 //     process's version — authoritative for the caller, never a phantom.
-//   • CLI (separate process): enumerate every LIVE server (dead pids pruned); drift
+//   • CLI (separate process): enumerate every LIVE server (dead pids and stale
+//     renewable heartbeats pruned); drift
 //     if ANY live server ≠ installed, so a multi-version machine is visible, not hidden.
-const RUNNING_MAX_AGE_MS = 24 * 60 * 60 * 1000;   // bound a reused-PID phantom (see isAlivePid)
+const RUNNING_HEARTBEAT_FRESH_MS = 2 * 60 * 1000;
+const RUNNING_LEGACY_GRACE_MS = 5 * 60 * 1000;
 // Alive ONLY if we can signal it: ESRCH (dead) and EPERM (another user's process,
 // never our MCP server) both count as NOT a live server of ours — narrows the
 // reused-PID phantom; the age ceiling bounds the same-user-reuse remainder.
 const isAlivePid = (pid) => { if (!pid) return false; try { process.kill(pid, 0); return true; } catch { return false; } };
 function inspectRunning(brainDir, baked, now, self) {
   const ageMin = (b) => { const m = b ? Math.round((now - Date.parse(b)) / 60000) : null; return Number.isFinite(m) ? m : null; };
-  const freshAge = (b) => { const t = Date.parse(b); return !Number.isFinite(t) || (now - t) < RUNNING_MAX_AGE_MS; };
-  const fmt = (s) => ({ pid: s.pid || null, version: s.version, vault: s.vault || null, ageMin: ageMin(s.bootedAt) });
+  const freshEntry = (server) => {
+    const heartbeat = Date.parse(server?.lastSeenAt);
+    if (Number.isFinite(heartbeat)) return (now - heartbeat) < RUNNING_HEARTBEAT_FRESH_MS;
+    const booted = Date.parse(server?.bootedAt);
+    return Number.isFinite(booted) && (now - booted) < RUNNING_LEGACY_GRACE_MS;
+  };
+  const fmt = (s) => ({
+    pid: s.pid || null,
+    version: s.version,
+    vault: s.vault || null,
+    ageMin: ageMin(s.bootedAt),
+    heartbeatAgeMin: ageMin(s.lastSeenAt),
+  });
   // Live servers from the registry (prune dead pids + aged-out phantoms); fall back
   // to the legacy single-file heartbeat only if the registry is absent/empty.
   let live = [];
   const reg = readJson(path.join(brainDir, '.running-servers.json'), null);
-  if (reg && Array.isArray(reg.servers)) live = reg.servers.filter(s => s && s.version && isAlivePid(s.pid) && freshAge(s.bootedAt));
+  if (reg && Array.isArray(reg.servers)) live = reg.servers.filter(s => s && s.version && isAlivePid(s.pid) && freshEntry(s));
   if (!live.length) {
     // Legacy single-file heartbeat (a still-running pre-registry server). Trust it
     // ONLY if its pid is alive + fresh — a dead server's leftover file must never
     // read as a live stale server (that would be the very phantom this fix prevents).
     const legacy = readJson(path.join(brainDir, '.running-version.json'), null);
-    if (legacy && legacy.version && isAlivePid(legacy.pid) && freshAge(legacy.bootedAt)) live = [{ pid: legacy.pid || null, version: legacy.version, bootedAt: legacy.bootedAt || null }];
+    if (legacy && legacy.version && isAlivePid(legacy.pid) && freshEntry(legacy)) live = [{ pid: legacy.pid || null, version: legacy.version, bootedAt: legacy.bootedAt || null }];
   }
   // self mode — report the CALLER's own process (definitive, phantom-proof).
   if (self && self.version) {

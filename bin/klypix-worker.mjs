@@ -389,10 +389,13 @@ server.registerTool('brain_doctor', {
 // stale" incident. A per-pid registry (not a single-value file) is REQUIRED because
 // MCP servers are per-session: a shared single file is last-writer-wins, so it could
 // report a DIFFERENT session's server version (a phantom). Each server upserts its
-// own {pid, version, vault} and prunes dead pids; doctor-as-tool matches its own pid.
-// Best-effort, tiny lock so concurrent boots (2–4 sessions) don't tear the file.
-const RUNNING_MAX_AGE_MS = 24 * 60 * 60 * 1000;   // bound a reused-PID phantom entry (see isAlive note)
-function recordRunningServer() {
+// own {pid, version, vault, lastSeenAt} and prunes dead/stale-heartbeat pids;
+// doctor-as-tool matches its own pid. Renewable heartbeats prevent Windows PID
+// reuse from making an unrelated live process look like a stale MCP server.
+// Best-effort, tiny lock so concurrent sessions don't tear the file.
+const RUNNING_HEARTBEAT_FRESH_MS = 2 * 60 * 1000;
+const RUNNING_LEGACY_GRACE_MS = 5 * 60 * 1000;
+function recordRunningServer({ remove = false } = {}) {
   const brainDir = path.join(os.homedir(), '.claude', 'project-brain');
   const REG = path.join(brainDir, '.running-servers.json');
   const LOCK = REG + '.lock';
@@ -401,7 +404,12 @@ function recordRunningServer() {
   // process — never our MCP server) both prune. This narrows the reused-PID phantom
   // window; the age ceiling below bounds the remaining same-user-reuse case.
   const isAlive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
-  const fresh = (b) => { const t = Date.parse(b); return !Number.isFinite(t) || (Date.now() - t) < RUNNING_MAX_AGE_MS; };
+  const fresh = (server) => {
+    const heartbeat = Date.parse(server?.lastSeenAt);
+    if (Number.isFinite(heartbeat)) return (Date.now() - heartbeat) < RUNNING_HEARTBEAT_FRESH_MS;
+    const booted = Date.parse(server?.bootedAt);
+    return Number.isFinite(booted) && (Date.now() - booted) < RUNNING_LEGACY_GRACE_MS;
+  };
   const sleep = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* */ } };
   let got = false;
   try {
@@ -416,9 +424,21 @@ function recordRunningServer() {
     // the next uncontended boot; doctor's self-mode never depends on the registry).
     if (got) {
       let data = {}; try { data = JSON.parse(fs.readFileSync(REG, 'utf8')); } catch { /* fresh/corrupt → rebuild */ }
-      const servers = (Array.isArray(data.servers) ? data.servers : [])
-        .filter(s => s && s.pid && s.pid !== process.pid && s.version && isAlive(s.pid) && fresh(s.bootedAt));   // drop mine + dead + aged-out
-      servers.push({ pid: process.pid, version: PKG_VERSION, vault: String(VAULT).replace(/\\/g, '/'), server: fileURLToPath(import.meta.url).replace(/\\/g, '/'), bootedAt: new Date().toISOString() });
+      const existing = Array.isArray(data.servers) ? data.servers : [];
+      const mine = existing.find(s => s && s.pid === process.pid);
+      const servers = existing
+        .filter(s => s && s.pid && s.pid !== process.pid && s.version && isAlive(s.pid) && fresh(s));   // drop mine + dead + stale-heartbeat
+      const stamp = new Date().toISOString();
+      if (!remove) {
+        servers.push({
+          pid: process.pid,
+          version: PKG_VERSION,
+          vault: String(VAULT).replace(/\\/g, '/'),
+          server: fileURLToPath(import.meta.url).replace(/\\/g, '/'),
+          bootedAt: mine?.bootedAt || stamp,
+          lastSeenAt: stamp,
+        });
+      }
       // Atomic swap (temp + rename) so a concurrent reader never observes a truncated file.
       const tmp = REG + '.' + process.pid + '.tmp';
       fs.writeFileSync(tmp, JSON.stringify({ servers: servers.slice(-32) }, null, 2));
@@ -473,13 +493,25 @@ if (!canvasViewAsApp) {
 }
 
 const transport = new StdioServerTransport();
+let runningHeartbeat = null;
+let runtimeStopped = false;
+const stopRuntimePresence = () => {
+  if (runtimeStopped) return;
+  runtimeStopped = true;
+  if (runningHeartbeat) clearInterval(runningHeartbeat);
+  runningHeartbeat = null;
+  recordRunningServer({ remove: true });
+  mcpPresence.stop();
+};
 server.server.oninitialized = () => {
   mcpPresence.start(VAULT);
   recordRunningServer();
+  runningHeartbeat = setInterval(() => recordRunningServer(), 30_000);
+  runningHeartbeat.unref?.();
   log(`ready · vault=${VAULT} · presence=mcp`);
 };
-server.server.onclose = () => mcpPresence.stop();
-process.once('exit', () => mcpPresence.stop());
+server.server.onclose = stopRuntimePresence;
+process.once('exit', stopRuntimePresence);
 await server.connect(transport);
 // Pre-warm the on-device embedder in the BACKGROUND so the first cross-project
 // search of a session is already semantic, not a lexical fallback.

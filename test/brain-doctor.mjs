@@ -23,6 +23,7 @@ import {
   linkProject,
   safeReadCodexConfig,
 } from '../src/agent-rules.mjs';
+import { inspect } from '../src/brain-doctor.mjs';
 import { makeVault, seedBrain } from './_harness.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -225,7 +226,20 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
     && Number.isFinite(synced.structuredContent?.timingMs?.total),
   'brain_sync returns structured coordination + bounded task memory end-to-end over plain MCP');
 
+  const runningRegistry = path.join(isolatedHome, '.claude', 'project-brain', '.running-servers.json');
+  const during = JSON.parse(fs.readFileSync(runningRegistry, 'utf8'));
+  ok(during.servers?.some(server => server.lastSeenAt),
+    'the live MCP worker publishes a renewable registry heartbeat');
+
   await client.close();
+  let stoppedReport = null;
+  for (let i = 0; i < 20; i++) {
+    stoppedReport = inspect({ home: isolatedHome, projectDir: vault });
+    if (!stoppedReport.running?.servers?.length) break;
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  ok(!stoppedReport?.running?.servers?.length,
+    'doctor ignores a stopped MCP worker even if forced host shutdown interrupts registry cleanup');
   fs.rmSync(vault, { recursive: true, force: true });
 }
 

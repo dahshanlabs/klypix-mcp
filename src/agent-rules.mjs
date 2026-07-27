@@ -62,7 +62,8 @@ const CODEX_GLOBAL_BODY = [
   '## KLYPIX project brains',
   '',
   'When the current project contains `./brain.klypix`, treat it as the authoritative shared project memory.',
-  'At task start, call `brain_sync` with a one-sentence intent and expected files before editing.',
+  'At task start, call `brain_sync` with the current project root in `project`, a one-sentence intent,',
+  'and expected files before editing. This explicit root prevents cross-project routing in IDE hosts.',
   'It returns compact task-relevant memory plus active-task/message/file-overlap coordination.',
   'Update it when scope changes and call `brain_sync` with phase `"complete"` before the final response.',
   'Read `.claude/brain-brief.md` only when `brain_sync` says context is insufficient or the task asks',
@@ -417,7 +418,9 @@ Treat it as authoritative project context, and as **the place project knowledge 
 survives across sessions, agents, and context resets.
 
 **At the start of a task — read it** so you know the project's state and past decisions:
-- first call \`brain_sync\` with a one-sentence task intent and the files you expect to touch.
+- first call \`brain_sync\` with this project's absolute root path in \`project\`, a one-sentence task
+  intent, and the files you expect to touch. The explicit root keeps each repository on its own brain
+  even when an IDE launches MCP servers from the IDE installation directory.
   It returns a compact task-relevant memory capsule, meaningful active-task peers, one-time messages,
   exact file-overlap warnings, and automatic late-arrival alerts without host hooks.
   Call it again when your file scope materially changes, and with phase \`"complete"\` before your final response.
@@ -557,10 +560,13 @@ function writeDedicated(file, frontmatter, version) {
 
 // Project-level MCP config: add the klypix-canvas server, preserving any sibling servers.
 // wrapKey differs by tool: Cursor/Claude use "mcpServers"; VS Code uses "servers".
-function mergeMcpJson(file, wrapKey, withType) {
+function mergeMcpJson(file, wrapKey, withType, projectDir) {
   // Prefer the installed local bundle (no npx warm-cache staleness); npx only as a
   // first-run bootstrap. Migrating an existing npx entry → local is exactly the
   // desync fix, so a re-link (or the self-update install) heals stale configs.
+  // These files are natively project-scoped and commonly committed. Keep their
+  // vault portable; brain_sync's explicit `project` field is the second routing
+  // guard if a host nevertheless launches from an unexpected directory.
   const entry = mcpServerEntry({ vault: '.', withType });
   let cfg = {};
   if (exists(file)) {
@@ -581,7 +587,7 @@ function mergeMcpJson(file, wrapKey, withType) {
 // broken. We DON'T strict-hash the entry: a customized `--vault <path>` is legitimate,
 // so only the invocation (npx/node … klypix-mcp …) must survive; if it doesn't, that's
 // drift the user needs to re-`link`.
-function classifyMcp(file, wrapKey) {
+function classifyMcp(file, wrapKey, projectDir) {
   if (!exists(file)) return { status: 'missing' };
   let cfg;
   try { cfg = JSON.parse(fs.readFileSync(file, 'utf8') || '{}'); }
@@ -590,7 +596,14 @@ function classifyMcp(file, wrapKey) {
   if (!entry) return { status: 'missing' };
   const args = Array.isArray(entry.args) ? entry.args.map(String) : [];
   const launches = (entry.command === 'npx' || entry.command === 'node') && args.some(a => a.includes('klypix-mcp'));
-  return launches ? { status: 'ok' } : { status: 'hand-edited', why: 'entry no longer launches klypix-mcp' };
+  const vaultIndex = args.indexOf('--vault');
+  const vaultArg = vaultIndex >= 0 ? args[vaultIndex + 1] : null;
+  const expected = path.resolve(projectDir);
+  const bound = vaultArg === '.'
+    || (!!vaultArg && path.isAbsolute(vaultArg) && path.resolve(vaultArg) === expected);
+  if (!launches) return { status: 'hand-edited', why: 'entry no longer launches klypix-mcp' };
+  if (!bound) return { status: 'hand-edited', why: `entry points outside this project (${expected})` };
+  return { status: 'ok' };
 }
 
 // The projection map — the single source of truth shared by WRITE (linkProject) and
@@ -614,7 +627,10 @@ function targets(projectDir) {
     ],
     mcp: [
       { tool: 'Codex', file: j('.codex', 'config.toml'), format: 'toml' },
+      { tool: 'Claude Code', file: j('.mcp.json'), wrapKey: 'mcpServers', withType: false },
       { tool: 'Cursor', file: j('.cursor', 'mcp.json'), wrapKey: 'mcpServers', withType: false },
+      { tool: 'Cline', file: j('.cline', 'mcp.json'), wrapKey: 'mcpServers', withType: false },
+      { tool: 'Gemini CLI / Antigravity', file: j('.gemini', 'settings.json'), wrapKey: 'mcpServers', withType: false },
       { tool: 'VS Code (Copilot/Continue)', file: j('.vscode', 'mcp.json'), wrapKey: 'servers', withType: true },
     ],
   };
@@ -642,8 +658,10 @@ export function linkProject(projectDir, opts = {}) {
     return { tool: r.tool, file, ...res };
   });
 
-  // Project-level MCP files only; Claude Code is covered by `install` (hooks + bundled
-  // MCP), so we skip .mcp.json to avoid double-registering its server.
+  const boundProject = path.resolve(projectDir).replace(/\\/g, '/');
+  // Codex needs an exact machine-local path because its app/extension currently
+  // ignores relative project cwd for MCP. Other hosts use their native
+  // project-scoped configs plus brain_sync's explicit project fallback.
   const mcp = t.mcp.map((m) => {
     const file = relFile(projectDir, m.file);
     if (m.format === 'toml') {
@@ -652,30 +670,31 @@ export function linkProject(projectDir, opts = {}) {
         if (!parsed.ok) return { tool: m.tool, file, status: 'hand-edited', why: parsed.error };
         const name = Object.keys(parsed.servers).find(k => /klypix/i.test(k));
         const entry = name ? parsed.servers[name] : null;
-        const escapesProject = entry?.cwd === '..';
+        const vaultMatch = entry?.raw?.match(/^[ \t]*args[ \t]*=[ \t]*\[[\s\S]*?["']--vault["'][ \t]*,[ \t]*["']([^"']+)["']/m);
+        const configuredVault = vaultMatch?.[1] || null;
+        const bound = !!configuredVault
+          && path.isAbsolute(configuredVault)
+          && path.resolve(configuredVault) === path.resolve(projectDir)
+          && !!entry?.cwd
+          && path.isAbsolute(entry.cwd)
+          && path.resolve(entry.cwd) === path.resolve(projectDir);
         return {
           tool: m.tool,
           file,
-          status: entry ? (entry.launchesKlypix && !escapesProject ? 'ok' : 'hand-edited') : 'missing',
+          status: entry ? (entry.launchesKlypix && bound ? 'ok' : 'hand-edited') : 'missing',
           why: entry && !entry.launchesKlypix
             ? 'entry no longer launches klypix-mcp'
-            : escapesProject
-              ? 'legacy cwd = ".." starts Codex MCP outside the project'
+            : entry && !bound
+              ? `Codex MCP is not explicitly bound to this project (${boundProject})`
               : undefined,
         };
       }
-      // Project config is commonly committed. Keep it machine-portable; the
-      // 120s Codex startup timeout covers the one-time npx bootstrap.
-      const portableEntry = { command: 'npx', args: ['-y', 'klypix-mcp', '--vault', '.'] };
-      // Codex resolves an MCP server's `cwd` from the active session working
-      // directory, not from the `.codex/` folder containing this config. Keep
-      // it at the session cwd; klypix-core walks upward when Codex starts from
-      // a project subdirectory.
-      const res = connectCodexMcpServer({ configPath: m.file, entry: portableEntry, cwd: '.' });
+      const boundEntry = mcpServerEntry({ vault: boundProject });
+      const res = connectCodexMcpServer({ configPath: m.file, entry: boundEntry, cwd: boundProject });
       return res.ok ? { tool: m.tool, file, ...res } : { tool: m.tool, file, action: 'skipped', why: res.error };
     }
-    if (check) return { tool: m.tool, file, ...classifyMcp(m.file, m.wrapKey) };
-    return { tool: m.tool, file, ...mergeMcpJson(m.file, m.wrapKey, m.withType) };
+    if (check) return { tool: m.tool, file, ...classifyMcp(m.file, m.wrapKey, projectDir) };
+    return { tool: m.tool, file, ...mergeMcpJson(m.file, m.wrapKey, m.withType, projectDir) };
   });
 
   return { rules, mcp, hasBrain, version, check };

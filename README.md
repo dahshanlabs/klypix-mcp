@@ -151,7 +151,7 @@ host-specific transcript parsing stays outside the protocol.
 
 ### Updates — the propagation contract
 
-`install` lays the whole brain (hooks + engine + local MCP runtime) into `~/.claude/project-brain` and keeps the current brain project's Codex config machine-portable. Updates are automatic through the Claude session-start hook: it checks npm (≤ once/24h, fail-open, disable with `KLYPIX_AUTO_UPDATE=0`) and self-installs newer releases.
+`install` lays the whole brain (hooks + engine + local MCP runtime) into `~/.claude/project-brain` and binds the current brain project's Codex config to that exact project on the current machine. `brain_sync` also accepts the current project root, providing a host-independent fallback when an IDE starts MCP from its own install directory. Updates are automatic through the Claude session-start hook: it checks npm (≤ once/24h, fail-open, disable with `KLYPIX_AUTO_UPDATE=0`) and self-installs newer releases.
 
 The MCP entry point is a stable stdio supervisor. It keeps the host-owned connection open while a replaceable worker runs the brain core. A staged update is hash-verified, initialized in parallel, checked for backward-compatible tool schemas, and given the current `brain_sync` task scope before the supervisor switches between requests. Added tools use the standard `notifications/tools/list_changed` signal. A failed or breaking candidate is rejected while the old worker continues serving.
 

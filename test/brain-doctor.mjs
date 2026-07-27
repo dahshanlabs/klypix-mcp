@@ -45,18 +45,22 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
   linkProject(proj, { version: '1.2.3' });
   let a = auditProject(proj, { version: '1.2.3' });
   ok(a.ok && a.drift.length === 0, `fresh link → all ${a.files.length} files ok`);
-  ok(a.files.length === 11, 'projects exactly 11 targets (8 rules + 3 mcp, including Codex)');
+  ok(a.files.length === 14, 'projects exactly 14 targets (8 rules + 6 project-bound MCP configs)');
   ok(statusOf(a, '.codex/config.toml') === 'ok', 'Codex project MCP config generated + audited');
+  for (const file of ['.mcp.json', '.cursor/mcp.json', '.cline/mcp.json', '.gemini/settings.json', '.vscode/mcp.json']) {
+    ok(statusOf(a, file) === 'ok', `${file} has a safe project-local binding`);
+  }
   const codexRaw = fs.readFileSync(path.join(proj, '.codex', 'config.toml'), 'utf8');
   ok(codexRaw.includes('model = "gpt-test"') && codexRaw.includes('[mcp_servers.docs]'), 'Codex merge preserves unrelated settings, comments, and MCP servers');
-  fs.writeFileSync(path.join(proj, '.codex', 'config.toml'), codexRaw.replace('cwd = "."', 'cwd = ".."'));
+  ok(codexRaw.includes(proj.replace(/\\/g, '/')), 'Codex binds both cwd/vault to the exact project root');
+  fs.writeFileSync(path.join(proj, '.codex', 'config.toml'), codexRaw.replace(/^cwd = .*$/m, 'cwd = ".."'));
   a = auditProject(proj, { version: '1.2.3' });
   const legacyCodex = a.files.find(f => f.file === '.codex/config.toml');
-  ok(legacyCodex?.status === 'hand-edited' && /outside the project/.test(legacyCodex?.why || ''),
-    'doctor flags the legacy Codex cwd that escapes the project');
+  ok(legacyCodex?.status === 'hand-edited' && /not explicitly bound/.test(legacyCodex?.why || ''),
+    'doctor flags a Codex cwd that is not bound to this project');
   linkProject(proj, { version: '1.2.3' });
-  ok(fs.readFileSync(path.join(proj, '.codex', 'config.toml'), 'utf8').includes('cwd = "."'),
-    're-link repairs the legacy Codex project cwd');
+  ok(fs.readFileSync(path.join(proj, '.codex', 'config.toml'), 'utf8').includes(`cwd = ${JSON.stringify(proj.replace(/\\/g, '/'))}`),
+    're-link repairs Codex to the exact project root');
   a = auditProject(proj, { version: '1.2.3' });
   ok(statusOf(a, 'GEMINI.md') === 'ok' && statusOf(a, 'CONVENTIONS.md') === 'ok', 'GEMINI.md + CONVENTIONS.md generated (were "not generated")');
 
@@ -101,11 +105,11 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
   a = auditProject(proj, { version: '1.2.3' });
   ok(statusOf(a, '.cursor/mcp.json') === 'hand-edited', 'mcp.json that no longer launches klypix-mcp → hand-edited (not presence-only)');
 
-  // a customized --vault path stays OK (we only require the invocation to survive).
+  // A foreign/custom vault is unsafe for a managed project config.
   cfg.mcpServers['klypix-canvas'] = { command: 'npx', args: ['-y', 'klypix-mcp', '--vault', '/some/custom/path'] };
   fs.writeFileSync(cur, JSON.stringify(cfg, null, 2));
   a = auditProject(proj, { version: '1.2.3' });
-  ok(statusOf(a, '.cursor/mcp.json') === 'ok', 'customized --vault path tolerated → ok');
+  ok(statusOf(a, '.cursor/mcp.json') === 'hand-edited', 'foreign --vault path is flagged instead of cross-project routing');
 
   // Codex TOML is section-edited, never wholesale serialized. A broken KLYPIX
   // launch is drift, while connect/disconnect preserve user-owned tables.
@@ -117,8 +121,8 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
     ok(statusOf(a, '.codex/config.toml') === 'hand-edited', 'Codex entry that no longer launches klypix-mcp → hand-edited');
     const repaired = connectCodexMcpServer({
       configPath: codexFile,
-      entry: { command: 'node', args: ['/runtime/klypix-mcp-server.mjs', '--vault', '.'] },
-      cwd: '..',
+      entry: { command: 'node', args: ['/runtime/klypix-mcp-server.mjs', '--vault', proj.replace(/\\/g, '/')] },
+      cwd: proj.replace(/\\/g, '/'),
     });
     ok(repaired.ok && safeReadCodexConfig(codexFile).servers['klypix-canvas'].launchesKlypix, 'Codex reconnect repairs only the KLYPIX table');
     const removed = disconnectCodexMcpServer({ configPath: codexFile });

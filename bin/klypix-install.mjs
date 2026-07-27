@@ -78,15 +78,15 @@ function wireCodex() {
     const hasProjectBrain = exists(path.join(projectDir, 'brain.klypix'))
         || exists(path.join(projectDir, 'brain.any'));
     const projectConfig = path.join(projectDir, '.codex', 'config.toml');
+    const boundProject = projectDir.replace(/\\/g, '/');
     const mcp = hasProjectBrain
         ? connectCodexMcpServer({
             configPath: projectConfig,
-            // Project config is commonly committed. Keep it portable and keep
-            // the MCP process at Codex's active session cwd. Codex resolves
-            // this field from the session working directory, not from the
-            // `.codex/` config folder; using ".." incorrectly escaped the repo.
-            entry: { command: 'npx', args: ['-y', 'klypix-mcp', '--vault', '.'] },
-            cwd: '.',
+            // Codex app/extension hosts do not consistently resolve a relative
+            // project `cwd` from the active chat workspace. Bind both the
+            // process and KLYPIX vault to this exact project on this machine.
+            entry: mcpServerEntry({ vault: boundProject }),
+            cwd: boundProject,
         })
         : { ok: true, action: 'skipped-no-project-brain', path: projectConfig };
     // Pre-1.35 installed a global `--vault "."` entry. A global Codex process

@@ -210,13 +210,16 @@ function runInstall(home, projectCwd, args = []) {
   ok(!globalCodexConfig.includes('[mcp_servers.klypix-canvas]'), 'D: obsolete wrong-vault global Codex KLYPIX entry is removed');
   ok(globalCodexConfig.includes('model = "gpt-test"') && globalCodexConfig.includes('[mcp_servers.docs]'), 'D: global Codex cleanup preserves user settings + sibling servers');
   const codexConfig = fs.readFileSync(path.join(proj, '.codex', 'config.toml'), 'utf8');
-  ok(codexConfig.includes('[mcp_servers.klypix-canvas]') && codexConfig.includes('command = "npx"')
-    && codexConfig.includes('cwd = "."'), 'D: Codex project MCP stays at the active project cwd with a portable config');
+  const boundProject = proj.replace(/\\/g, '/');
+  ok(codexConfig.includes('[mcp_servers.klypix-canvas]')
+    && codexConfig.includes(`"--vault", ${JSON.stringify(boundProject)}`)
+    && codexConfig.includes(`cwd = ${JSON.stringify(boundProject)}`),
+  'D: Codex project MCP is mechanically bound to the exact project root');
   ok(codexConfig.includes('model = "gpt-project"') && codexConfig.includes('[mcp_servers.project-docs]'), 'D: project Codex config preserves user settings + sibling servers');
   const codexAgents = fs.readFileSync(path.join(home, '.codex', 'AGENTS.md'), 'utf8');
   ok(codexAgents.includes('# Personal Codex instructions') && codexAgents.includes('klypix-codex:start'), 'D: Codex global guidance is fence-merged with personal instructions');
-  ok(codexAgents.includes('brain_sync') && codexAgents.includes('expected files'),
-    'D: Codex global guidance activates approval-free smart task/file synchronization');
+  ok(codexAgents.includes('brain_sync') && codexAgents.includes('expected files') && codexAgents.includes('current project root'),
+    'D: Codex guidance supplies host-independent project/task/file synchronization');
   ok(fs.existsSync(path.join(home, '.codex', 'config.toml.klypix-bak'))
     && fs.existsSync(path.join(proj, '.codex', 'config.toml.klypix-bak')), 'D: Codex config changes get rollback backups');
   ok(!fs.existsSync(path.join(home, '.codex', 'hooks.json')),

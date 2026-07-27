@@ -147,7 +147,9 @@ ok(mcpBStart.sessions.length === 2 && mcpBStart.notice.includes('2 active sessio
   'a second authorized MCP connection automatically sees the first');
 ok(!mcpBStart.notice.includes('queued before MCP initialization'),
   'MCP initialization does not consume a peer message through best-effort logging');
-ok(KLYPIX_MCP_INSTRUCTIONS.includes('call brain_sync') && KLYPIX_MCP_INSTRUCTIONS.includes('before editing'),
+ok(KLYPIX_MCP_INSTRUCTIONS.includes('call brain_sync')
+  && KLYPIX_MCP_INSTRUCTIONS.includes('current project root')
+  && KLYPIX_MCP_INSTRUCTIONS.includes('before editing'),
   'standard MCP server instructions teach approval-free smart synchronization');
 const syncA = mcpA.sync({
   phase: 'start',
@@ -200,6 +202,53 @@ ok(listActiveSessions({ brainPath, home, now: now + 2 }).length === 1,
 mcpA.stop();
 ok(listActiveSessions({ brainPath, home, now: now + 2 }).length === 0,
   'closing the final MCP connection leaves no phantom sessions');
+
+// Host-independent routing: reproduce an IDE launching MCP from its install
+// folder, then bind two connections to two different project brains explicitly.
+const hostInstall = path.join(os.tmpdir(), 'klypix-presence-host-install');
+const otherProject = path.join(os.tmpdir(), 'klypix-presence-other-project');
+for (const dir of [hostInstall, otherProject]) fs.rmSync(dir, { recursive: true, force: true });
+fs.mkdirSync(hostInstall, { recursive: true });
+fs.mkdirSync(otherProject, { recursive: true });
+const otherBrain = path.join(otherProject, 'brain.klypix');
+fs.writeFileSync(otherBrain, await buildKlypixMap({
+  title: 'other project',
+  kind: 'brain',
+  areas: [{ title: 'Brain', cards: [{ text: 'This belongs only to the other project.' }] }],
+}));
+const routedA = createMcpPresence({
+  server: fakeServer('codex'),
+  initialVault: hostInstall,
+  env: { KLYPIX_SESSION_ID: 'routed-project-a' },
+  home,
+  now: () => now + 3,
+  setIntervalFn: timer,
+  clearIntervalFn: () => {},
+});
+const routedB = createMcpPresence({
+  server: fakeServer('codex'),
+  initialVault: hostInstall,
+  env: { KLYPIX_SESSION_ID: 'routed-project-b' },
+  home,
+  now: () => now + 4,
+  setIntervalFn: timer,
+  clearIntervalFn: () => {},
+});
+const routeA = routedA.sync({ project, phase: 'start', intent: 'work in project A', files: ['src/a.ts'] });
+const routeB = routedB.sync({ project: otherProject, phase: 'start', intent: 'work in project B', files: ['src/a.ts'] });
+ok(routeA.structured.status === 'active'
+  && path.resolve(routeA.structured.project) === path.resolve(project)
+  && path.resolve(routedA.brainPath) === path.resolve(brainPath),
+  'brain_sync project root recovers from an IDE install-directory launch');
+ok(routeA.structured.counts.connections === 1
+  && routeB.structured.counts.connections === 1
+  && routeA.conflicts.length === 0
+  && routeB.conflicts.length === 0
+  && laneFileFor(brainPath, home) !== laneFileFor(otherBrain, home),
+  'two projects keep separate presence, messages, and file-overlap lanes');
+routedA.stop();
+routedB.stop();
+for (const dir of [hostInstall, otherProject]) fs.rmSync(dir, { recursive: true, force: true });
 
 fs.rmSync(path.dirname(laneFileFor(brainPath, home)), { recursive: true, force: true });
 const env = { ...process.env, HOME: home, USERPROFILE: home };

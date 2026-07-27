@@ -132,19 +132,19 @@ server.registerTool('list_canvases', {
   title: 'List KLYPIX canvases',
   description: 'List all .klypix / .any canvas files in the vault, with card and connection counts.',
   inputSchema: {},
-}, async () => toContent(await opListCanvases({ vault: VAULT })));
+}, async () => toContent(await opListCanvases({ vault: mcpPresence.vault })));
 
 server.registerTool('read_canvas', {
   title: 'Read a KLYPIX canvas',
   description: 'Read a canvas as structured markdown (every card, the connection graph, [[wikilinks]], #tags) AND return its images so you can SEE them, not just their filenames. Pass the canvas TITLE directly (e.g. "SS2") — a filename, vault-relative path, or absolute path also work; you do NOT need to list or search first.',
   inputSchema: { canvas: z.string().describe('Canvas title or filename (e.g. "SS2"), vault-relative path, or absolute path.') },
-}, async ({ canvas }) => toContent(await opReadCanvas({ vault: VAULT, canvas })));
+}, async ({ canvas }) => toContent(await opReadCanvas({ vault: mcpPresence.vault, canvas })));
 
 server.registerTool('search_canvases', {
   title: 'Search inside all canvases',
   description: 'Search card text, titles, and #tags across every canvas in the vault. Returns the canvases and the matching cards.',
   inputSchema: { query: z.string().describe('Text or #tag to find inside canvases.') },
-}, async ({ query }) => toContent(await opSearchCanvases({ vault: VAULT, query })));
+}, async ({ query }) => toContent(await opSearchCanvases({ vault: mcpPresence.vault, query })));
 
 server.registerTool('search_all_brains', {
   title: 'Search every project brain on this machine',
@@ -153,7 +153,7 @@ server.registerTool('search_all_brains', {
     query: z.string().describe('What to find across all project brains.'),
     as_of: z.string().optional().describe('Optional YYYY-MM-DD: rank what was TRUE at that date (time-travel query).'),
   },
-}, async ({ query, as_of }) => toContent(await opSearchAllBrains({ vault: VAULT, query, as_of, log })));
+}, async ({ query, as_of }) => toContent(await opSearchAllBrains({ vault: mcpPresence.vault, query, as_of, log })));
 
 server.registerTool('brain_ask', {
   title: 'Ask the project brain a question (whole-brain, correction-aware answer)',
@@ -164,7 +164,7 @@ server.registerTool('brain_ask', {
     as_of: z.string().optional().describe('Optional YYYY-MM-DD: answer as of that date (superseded cards count as live if they were current then).'),
     k: z.number().optional().describe('Max cards to surface for synthesis (default 10, capped 20).'),
   },
-}, async ({ question, canvas, as_of, k }) => toContent(await opBrainAsk({ vault: VAULT, canvas, question, as_of, k, log })));
+}, async ({ question, canvas, as_of, k }) => toContent(await opBrainAsk({ vault: mcpPresence.vault, canvas, question, as_of, k, log })));
 
 server.registerTool('brain_challenge', {
   title: 'Challenge a decision against the brain (argue back with receipts)',
@@ -176,7 +176,7 @@ server.registerTool('brain_challenge', {
   },
 }, async ({ claim, canvas, k }) => {
   let via; try { via = server.server.getClientVersion()?.name; } catch { /* optional */ }
-  return toContent(await opBrainChallenge({ vault: VAULT, canvas, claim, k, via, log }));
+  return toContent(await opBrainChallenge({ vault: mcpPresence.vault, canvas, claim, k, via, log }));
 });
 
 server.registerTool('brain_insights', {
@@ -186,7 +186,7 @@ server.registerTool('brain_insights', {
     canvas: z.string().optional().describe('Canvas filename/path. Defaults to the project brain ("brain").'),
     staleDays: z.number().optional().describe('Open questions older than this many days count as stale (default 21).'),
   },
-}, async ({ canvas, staleDays }) => toContent(await opBrainInsights({ vault: VAULT, canvas, staleDays })));
+}, async ({ canvas, staleDays }) => toContent(await opBrainInsights({ vault: mcpPresence.vault, canvas, staleDays })));
 
 server.registerTool('brain_lens', {
   title: 'Brain lens — machine-readable views of a brain (freshness · provenance · activity · timeline · orrery · unresolved)',
@@ -198,7 +198,7 @@ server.registerTool('brain_lens', {
     staleDays: z.number().optional().describe('Open questions older than this count as stale (default 21).'),
     limit: z.number().optional().describe('Cap for recent-activity entries (default 30).'),
   },
-}, async ({ canvas, view, root, staleDays, limit }) => toContent(await opBrainLens({ vault: VAULT, canvas, view, root, staleDays, limit })));
+}, async ({ canvas, view, root, staleDays, limit }) => toContent(await opBrainLens({ vault: mcpPresence.vault, canvas, view, root, staleDays, limit })));
 
 server.registerTool('brain_connect', {
   title: 'Connect related-but-unlinked brain cards (densify the graph)',
@@ -211,7 +211,7 @@ server.registerTool('brain_connect', {
     pairs: z.array(z.object({ fromId: z.string(), toId: z.string() })).optional().describe('Explicit card-id pairs to connect (bypasses auto-proposal). Use to dismiss a reconcile false-positive: pass the two card ids with relationship:"not_contradiction".'),
     relationship: z.string().optional().describe('Relationship for explicit `pairs` (e.g. "not_contradiction" to permanently dismiss a contradiction candidate, or "relates_to", "depends_on", "supports").'),
   },
-}, async ({ canvas, apply, max, threshold, pairs, relationship }) => toContent(await opBrainConnect({ vault: VAULT, canvas, apply, max, threshold, pairs, relationship, log })));
+}, async ({ canvas, apply, max, threshold, pairs, relationship }) => toContent(await opBrainConnect({ vault: mcpPresence.vault, canvas, apply, max, threshold, pairs, relationship, log })));
 
 server.registerTool('brain_reconcile', {
   title: 'Reconcile the brain — contradictions between cards + unrecorded migrations',
@@ -221,7 +221,7 @@ server.registerTool('brain_reconcile', {
     root: z.string().optional().describe("Project root holding the migrations dir (default: the brain file's folder)."),
     mode: z.enum(['all', 'contradictions', 'migrations', 'legacy', 'claims']).optional().describe('Which pass to run (default "all"): contradictions · migrations · legacy (pre-v1.15 raw-bash ship cards to tidy) · claims (open "remaining:/next:" clauses a later milestone likely fulfilled — receipts + ✓ markers, never auto-archived).'),
   },
-}, async ({ canvas, root, mode }) => toContent(await opBrainReconcile({ vault: VAULT, canvas, root, mode })));
+}, async ({ canvas, root, mode }) => toContent(await opBrainReconcile({ vault: mcpPresence.vault, canvas, root, mode })));
 
 server.registerTool('brain_garden', {
   title: 'Garden the brain — consolidate over-grown areas (sleep-time compute)',
@@ -235,7 +235,7 @@ server.registerTool('brain_garden', {
     })).optional().describe('Required when apply:true — one entry per area you want consolidated.'),
     approve: z.string().optional().describe('Required when apply:true — the 8-char human-approval code. You are never shown it: the human runs `npx klypix-mcp garden-code` and pastes the code into chat after reviewing your plan. Never guess or fabricate it.'),
   },
-}, async ({ canvas, apply, syntheses, approve }) => toContent(await opBrainGarden({ vault: VAULT, canvas, apply, syntheses, approve })));
+}, async ({ canvas, apply, syntheses, approve }) => toContent(await opBrainGarden({ vault: mcpPresence.vault, canvas, apply, syntheses, approve })));
 
 server.registerTool('create_canvas', {
   title: 'Create a KLYPIX canvas',
@@ -246,7 +246,7 @@ server.registerTool('create_canvas', {
     connections: z.array(connSchema).optional().describe('Arrows between cards.'),
     filename: z.string().optional().describe('Override the output filename (without extension).'),
   },
-}, async ({ title, cards, connections, filename }) => toContent(await opCreateCanvas({ vault: VAULT, title, cards, connections, filename })));
+}, async ({ title, cards, connections, filename }) => toContent(await opCreateCanvas({ vault: mcpPresence.vault, title, cards, connections, filename })));
 
 server.registerTool('add_to_canvas', {
   title: 'Add cards to an existing canvas',
@@ -260,7 +260,7 @@ server.registerTool('add_to_canvas', {
   // Provenance: stamp WHICH agent wrote these cards (from the MCP client's
   // initialize handshake — cursor / claude / cline).
   let via; try { via = server.server.getClientVersion()?.name; } catch { /* optional */ }
-  return toContent(await opAddToCanvas({ vault: VAULT, canvas, cards, connections, via }));
+  return toContent(await opAddToCanvas({ vault: mcpPresence.vault, canvas, cards, connections, via }));
 });
 
 server.registerTool('brain_note', {
@@ -275,7 +275,7 @@ server.registerTool('brain_note', {
   },
 }, async ({ text, marker, area, closes, canvas }) => {
   let via; try { via = server.server.getClientVersion()?.name; } catch { /* optional */ }
-  return toContent(await opBrainNote({ vault: VAULT, canvas, text, area, marker: marker || '', closes, via }));
+  return toContent(await opBrainNote({ vault: mcpPresence.vault, canvas, text, area, marker: marker || '', closes, via }));
 });
 
 server.registerTool('brain_message', {
@@ -289,7 +289,7 @@ server.registerTool('brain_message', {
 }, async ({ text, to, canvas }) => {
   let via; try { via = server.server.getClientVersion()?.name; } catch { /* optional */ }
   mcpPresence.noteSent(text);
-  return toContent(await opBrainMessage({ vault: VAULT, canvas, text, to, via }));
+  return toContent(await opBrainMessage({ vault: mcpPresence.vault, canvas, text, to, via }));
 });
 
 server.registerTool('brain_sync', {
@@ -301,18 +301,19 @@ server.registerTool('brain_sync', {
     openWorldHint: false,
   },
   inputSchema: {
+    project: z.string().optional().describe('Absolute current project root containing brain.klypix. Supply it on phase "start" so routing stays correct even when the MCP host launches from its own install directory.'),
     intent: z.string().max(160).optional().describe('One sentence describing the current task. Supply for start/checkpoint; completion clears it.'),
     files: z.array(z.string()).max(20).optional().describe('Project-relative files you expect to touch or have touched. Exact overlaps with peers are flagged.'),
     phase: z.enum(['start', 'checkpoint', 'complete']).optional().describe('start replaces prior task scope; checkpoint merges changed scope; complete clears task intent/files. Default: checkpoint.'),
     include_context: z.boolean().optional().describe('Include fast task-relevant brain cards in the same response. Defaults true; ignored for phase complete.'),
   },
-}, async ({ intent, files, phase, include_context }) => {
+}, async ({ project, intent, files, phase, include_context }) => {
   const totalStartedAt = Date.now();
-  const report = mcpPresence.sync({ intent, files, phase });
+  const report = mcpPresence.sync({ project, intent, files, phase });
   let taskContext = null;
   if (phase !== 'complete' && include_context !== false && (intent || files?.length)) {
     taskContext = await opBrainTaskContext({
-      vault: VAULT,
+      vault: mcpPresence.vault,
       intent,
       files,
       k: 5,
@@ -374,7 +375,7 @@ server.registerTool('brain_doctor', {
     // self = THIS running server (the process answering this very call). Passing it
     // makes the RUNNING check report the caller's actual server version, never a
     // phantom another session's heartbeat wrote to the shared registry.
-    const report = inspect({ projectDir: project ? path.resolve(project) : process.cwd(), npmLatest, self: { pid: process.pid, version: PKG_VERSION } });
+    const report = inspect({ projectDir: project ? path.resolve(project) : mcpPresence.vault, npmLatest, self: { pid: process.pid, version: PKG_VERSION } });
     return mcpPresence.decorateToolResult({ content: [{ type: 'text', text: render(report, { color: false }) }] });
   } catch (e) {
     return { content: [{ type: 'text', text: `brain_doctor unavailable: ${e?.message || e}` }], isError: true };
@@ -437,7 +438,7 @@ function recordRunningServer() {
 // is try/caught (import, HTML load, register) and degrades to a plain text tool.
 const CANVAS_VIEW_DESC = 'Render a KLYPIX canvas/brain as a SPATIAL BOARD. In an MCP Apps host (Claude, VS Code, Goose) this opens an interactive read-only whiteboard — cards, containers, connection arrows, pan/zoom — of any .klypix canvas (defaults to the project brain). In hosts without the apps extension it returns a text summary of the board. Use when the user asks to SEE the canvas/brain/board, not just query it.';
 const canvasViewHandler = async ({ canvas }) => {
-  const r = await opCanvasView({ vault: VAULT, canvas });
+  const r = await opCanvasView({ vault: mcpPresence.vault, canvas });
   const c = toContent(r);
   return r.structured ? { ...c, structuredContent: r.structured } : c;
 };

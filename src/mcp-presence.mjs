@@ -28,7 +28,7 @@ export const MCP_INBOX_POLL_MS = 3_000;
 // commands or crosses Codex's hook-trust boundary.
 export const KLYPIX_MCP_INSTRUCTIONS = [
   'KLYPIX is the shared project brain for repositories containing ./brain.klypix.',
-  'At the start of each task, call brain_sync with a one-sentence intent and any expected files before editing; it returns compact task-relevant brain context plus live coordination.',
+  'At the start of each task, call brain_sync with the current project root, a one-sentence intent, and any expected files before editing; the explicit project root keeps separate repositories on separate brains even when an MCP host launches servers from its own install directory.',
   'Use its active-task, message, and file-overlap report to coordinate concurrent work.',
   'Call brain_sync again when your file scope materially changes, and with phase "complete" before your final response.',
   'Do not read the full brain brief unless brain_sync says its compact context is insufficient or the task asks for broad history/status; use brain_ask for deeper retrieval.',
@@ -347,7 +347,7 @@ export function createMcpPresence({
     return first;
   };
 
-  const sync = ({ intent, files, phase = 'checkpoint' } = {}) => {
+  const sync = ({ project, intent, files, phase = 'checkpoint' } = {}) => {
     const syncStartedAt = Date.now();
     const nextPhase = ['start', 'checkpoint', 'complete'].includes(phase) ? phase : 'checkpoint';
     const completing = nextPhase === 'complete';
@@ -368,7 +368,15 @@ export function createMcpPresence({
       files: completing ? [] : files,
       replaceFiles: completing || nextPhase === 'start',
     };
-    const report = started ? touch(details) : start(vault, details);
+    // Some IDE extension hosts launch a project-scoped MCP server from the
+    // IDE's own installation directory. `project` is the host-independent
+    // Context Gateway binding: one explicit workspace root selects exactly one
+    // brain/presence lane for this connection. Omitting it preserves the
+    // configured launch vault for backwards compatibility.
+    const requestedVault = compact(project) ? path.resolve(project) : vault;
+    const report = started && requestedVault === vault
+      ? touch(details)
+      : start(requestedVault, details);
     if (!brainPath) {
       return {
         ...report,
@@ -378,8 +386,9 @@ export function createMcpPresence({
           status: 'idle',
           phase: nextPhase,
           reason: 'no-project-brain',
+          requestedProject: requestedVault,
         },
-        text: 'KLYPIX Context Gateway is idle: no brain.klypix was found for this MCP server vault.',
+        text: `KLYPIX Context Gateway is idle: no brain.klypix was found at or above ${requestedVault}.`,
       };
     }
 
@@ -424,6 +433,8 @@ export function createMcpPresence({
       schemaVersion: 1,
       status: completing ? 'complete' : 'active',
       phase: nextPhase,
+      project: path.dirname(brainPath),
+      brain: brainPath,
       self: snapshot.self,
       counts: {
         connections: snapshot.connectionCount,

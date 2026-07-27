@@ -12,6 +12,7 @@ import {
   removeSession,
   upsertSession,
 } from './agent-presence.mjs';
+import { recordCodexHookExecution } from './codex-hooks.mjs';
 
 function readInput() {
   try {
@@ -89,10 +90,11 @@ async function main() {
   const sessionId = String(input.session_id || input.sessionId || '');
   const cwd = path.resolve(input.cwd || process.cwd());
   const brainPath = findProjectBrain(cwd);
+  if (event && sessionId) recordCodexHookExecution({ event, sessionId });
   if (!event || !sessionId || !brainPath) return;
 
   if (event === 'SessionEnd') {
-    removeSession({ brainPath, id: sessionId });
+    removeSession({ brainPath, id: sessionId, channel: 'lifecycle' });
     return;
   }
 
@@ -110,6 +112,7 @@ async function main() {
     intent: prompt === undefined ? undefined : prompt,
     files,
     event,
+    channel: 'lifecycle',
     cwd,
   });
 

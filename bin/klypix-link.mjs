@@ -17,7 +17,7 @@
 // Synchronous top-level by design: the dispatcher does `await import(this); process.exit(0)`,
 // so all work (and its logs) must complete during module evaluation, before exit.
 import path from 'path';
-import { linkProject } from '../src/agent-rules.mjs';
+import { compactAgentsBrief, linkProject } from '../src/agent-rules.mjs';
 
 try {
   const args = process.argv.slice(3);
@@ -25,6 +25,7 @@ try {
   const dirArg = args.find(a => !a.startsWith('-'));
   const projectDir = path.resolve(dirArg || process.cwd());
   const { rules, mcp, hasBrain, version } = linkProject(projectDir, { check });
+  const compactBrief = await compactAgentsBrief(projectDir, { check });
 
   if (check) {
     // Audit-only: classify, report, exit 1 on any drift.
@@ -34,7 +35,11 @@ try {
     for (const r of mcp) console.log(`    ${mark(r.status)} ${r.tool.padEnd(26)} ${r.file} — ${r.status.toUpperCase()}${r.why ? ' (' + r.why + ')' : ''}`);
     console.log('\n  Rules / instructions:');
     for (const r of rules) console.log(`    ${mark(r.status)} ${r.tool.padEnd(26)} ${r.file} — ${r.status.toUpperCase()}${r.stampedVersion ? ' (stamped v' + r.stampedVersion + ')' : ''}`);
-    const drift = [...rules, ...mcp].filter(r => r.status !== 'ok');
+    if (compactBrief.status !== 'skipped') {
+      console.log(`    ${mark(compactBrief.status)} ${'AGENTS.md compact fallback'.padEnd(26)} AGENTS.md — ${compactBrief.status.toUpperCase()}${compactBrief.bytes ? ` (${compactBrief.bytes} bytes)` : ''}`);
+    }
+    const briefDrift = ['stale', 'error'].includes(compactBrief.status) ? [compactBrief] : [];
+    const drift = [...rules, ...mcp, ...briefDrift].filter(r => r.status !== 'ok' && r.status !== 'skipped');
     if (!drift.length) { console.log(`\n✓ in sync — all ${rules.length + mcp.length} managed file(s) match brain v${version}.`); process.exit(0); }
     console.log(`\n✗ ${drift.length} file(s) drifted (stale / hand-edited / missing) — run \`npx klypix-mcp link\` to re-project.`);
     process.exit(1);
@@ -46,8 +51,11 @@ try {
   for (const r of mcp) console.log(`    ${mark(r.action)} ${r.tool.padEnd(26)} ${r.file}${r.why ? '  (' + r.why + ')' : ''}`);
   console.log('\n  Rules (so each tool auto-reads + captures the brain):');
   for (const r of rules) console.log(`    ${mark(r.action)} ${r.tool.padEnd(26)} ${r.file}${r.why ? '  (' + r.why + ')' : ''}`);
+  if (compactBrief.status !== 'skipped') {
+    console.log(`    ${mark(compactBrief.action)} ${'AGENTS.md compact fallback'.padEnd(26)} AGENTS.md${compactBrief.bytes ? `  (${compactBrief.bytes} bytes)` : ''}`);
+  }
 
-  const changed = [...rules, ...mcp].filter(r => r.action && !['unchanged', 'skipped'].includes(r.action)).length;
+  const changed = [...rules, ...mcp, compactBrief].filter(r => r.action && !['unchanged', 'skipped'].includes(r.action)).length;
   console.log(`\n✓ ${changed} file(s) written/updated — every agent opened in this project now reads + captures ./brain.klypix.`);
   console.log('  Codex gets .codex/config.toml + AGENTS.md; Cline & Windsurf use their global MCP config plus project rules.');
   console.log('  Verify anytime with `npx klypix-mcp link --check` (or `npx klypix-mcp doctor`).');

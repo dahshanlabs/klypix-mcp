@@ -5,6 +5,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import crypto from 'crypto';
 
 export const CODEX_PRESENCE_EVENTS = [
   'SessionStart',
@@ -15,6 +16,13 @@ export const CODEX_PRESENCE_EVENTS = [
 ];
 
 const HOOK_MARK = 'codex-brain-hook.mjs';
+const EXECUTION_FRESH_MS = 24 * 60 * 60 * 1000;
+const RECEIPT_FILE = 'codex-hook-execution.json';
+
+const fingerprint = (value) => crypto.createHash('sha256')
+  .update(JSON.stringify(value))
+  .digest('hex')
+  .slice(0, 24);
 
 export function resolveCodexHooksPath(home = os.homedir()) {
   return path.join(home, '.codex', 'hooks.json');
@@ -80,7 +88,15 @@ function writeHooks(file, raw, data) {
 export function codexPresenceHookStatus(home = os.homedir()) {
   const file = resolveCodexHooksPath(home);
   const parsed = readHooks(file);
-  if (!parsed.ok) return { installed: false, file, error: parsed.error, wired: [], missing: CODEX_PRESENCE_EVENTS.slice() };
+  if (!parsed.ok) return {
+    installed: false,
+    file,
+    error: parsed.error,
+    wired: [],
+    missing: CODEX_PRESENCE_EVENTS.slice(),
+    executionStatus: 'unknown',
+    lastExecutedAt: null,
+  };
   const hooks = parsed.data?.hooks && typeof parsed.data.hooks === 'object' && !Array.isArray(parsed.data.hooks)
     ? parsed.data.hooks
     : {};
@@ -88,13 +104,63 @@ export function codexPresenceHookStatus(home = os.homedir()) {
     Array.isArray(hooks[event])
     && hooks[event].some((group) => Array.isArray(group?.hooks)
       && group.hooks.some((hook) => typeof hook?.command === 'string' && hook.command.includes(HOOK_MARK))));
+  const owned = Object.fromEntries(CODEX_PRESENCE_EVENTS.map((event) => [
+    event,
+    (Array.isArray(hooks[event]) ? hooks[event] : [])
+      .flatMap((group) => Array.isArray(group?.hooks) ? group.hooks : [])
+      .filter((hook) => typeof hook?.command === 'string' && hook.command.includes(HOOK_MARK)),
+  ]));
+  const hookFingerprint = fingerprint(owned);
+  const receiptPath = path.join(home, '.claude', 'project-brain', RECEIPT_FILE);
+  const receipt = (() => {
+    try { return JSON.parse(fs.readFileSync(receiptPath, 'utf8')); }
+    catch { return null; }
+  })();
+  const executedAt = Date.parse(receipt?.executedAt || '');
+  const executionObserved = wired.length === CODEX_PRESENCE_EVENTS.length
+    && parsed.data?.disableAllHooks !== true
+    && receipt?.fingerprint === hookFingerprint
+    && Number.isFinite(executedAt)
+    && Date.now() - executedAt < EXECUTION_FRESH_MS;
   return {
     installed: wired.length === CODEX_PRESENCE_EVENTS.length,
     file,
     error: null,
     wired,
     missing: CODEX_PRESENCE_EVENTS.filter((event) => !wired.includes(event)),
+    executionStatus: wired.length !== CODEX_PRESENCE_EVENTS.length
+      ? 'off'
+      : (parsed.data?.disableAllHooks === true
+        ? 'disabled'
+        : (executionObserved ? 'observed' : 'unverified')),
+    lastExecutedAt: receipt?.fingerprint === hookFingerprint ? receipt?.executedAt || null : null,
+    fingerprint: hookFingerprint,
+    receiptPath,
   };
+}
+
+export function recordCodexHookExecution({
+  home = os.homedir(),
+  event = null,
+  sessionId = null,
+} = {}) {
+  try {
+    const status = codexPresenceHookStatus(home);
+    if (!status.installed || !status.fingerprint) return { ok: false, reason: 'not-configured' };
+    const receipt = {
+      fingerprint: status.fingerprint,
+      executedAt: new Date().toISOString(),
+      event: event || null,
+      sessionId: sessionId ? String(sessionId).slice(0, 32) : null,
+    };
+    fs.mkdirSync(path.dirname(status.receiptPath), { recursive: true });
+    const temp = status.receiptPath + `.${process.pid}.tmp`;
+    fs.writeFileSync(temp, JSON.stringify(receipt, null, 2), 'utf8');
+    fs.renameSync(temp, status.receiptPath);
+    return { ok: true, path: status.receiptPath };
+  } catch {
+    return { ok: false, reason: 'write-failed' };
+  }
 }
 
 export function mergeCodexPresenceHooks({ home = os.homedir(), command } = {}) {

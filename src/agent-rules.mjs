@@ -62,9 +62,11 @@ const CODEX_GLOBAL_BODY = [
   '## KLYPIX project brains',
   '',
   'When the current project contains `./brain.klypix`, treat it as the authoritative shared project memory.',
-  'At task start, read `.claude/brain-brief.md` when present; otherwise use the `klypix-canvas`',
-  'MCP tools (`brain_ask`, `read_canvas` with canvas `"brain"`, or `brain_insights`).',
-  'Use `brain_doctor` when live-session awareness matters; recent chat rows are history, not presence.',
+  'At task start, call `brain_sync` with a one-sentence intent and expected files before editing.',
+  'It returns compact task-relevant memory plus active-task/message/file-overlap coordination.',
+  'Update it when scope changes and call `brain_sync` with phase `"complete"` before the final response.',
+  'Read `.claude/brain-brief.md` only when `brain_sync` says context is insufficient or the task asks',
+  'for broad history/status; otherwise use `brain_ask` for deeper targeted retrieval.',
   'Capture durable decisions and milestones with `brain_note`. Never hand-edit `brain.klypix`.',
   'If the project has no `brain.klypix`, ignore this section.',
   CODEX_GLOBAL_END,
@@ -366,6 +368,43 @@ export function resolveVersion() {
   }
 }
 
+// Keep the hook-generated fallback block in AGENTS.md bounded. MCP-aware agents
+// get task-ranked context from brain_sync; this block exists only for agents
+// that have neither MCP context nor lifecycle hooks. `link` calls this after it
+// updates the managed instruction fence so existing adopters shed oversized
+// query-blind briefs immediately instead of waiting for a later capture hook.
+export async function compactAgentsBrief(projectDir, { check = false, budgetChars = 3200 } = {}) {
+  const dir = path.resolve(projectDir || process.cwd());
+  const agentsFile = path.join(dir, 'AGENTS.md');
+  const brainFile = ['brain.klypix', 'brain.any']
+    .map((name) => path.join(dir, name))
+    .find((file) => {
+      try { return fs.statSync(file).isFile(); } catch { return false; }
+    });
+  if (!brainFile || !fs.existsSync(agentsFile)) return { status: 'skipped', action: 'skipped', reason: 'no brain/AGENTS.md' };
+  const raw = fs.readFileSync(agentsFile, 'utf8');
+  const start = '<!-- klypix-brain-brief:start -->';
+  const end = '<!-- klypix-brain-brief:end -->';
+  const re = /<!-- klypix-brain-brief:start -->[\s\S]*?<!-- klypix-brain-brief:end -->/;
+  if (!re.test(raw)) return { status: 'skipped', action: 'skipped', reason: 'no generated brief block' };
+  try {
+    const { parseKlypix, structToUltraBrief } = await import('./klypix-format.mjs');
+    const { struct } = await parseKlypix(fs.readFileSync(brainFile));
+    const brief = structToUltraBrief(struct, {
+      briefPath: '.claude/brain-brief.md',
+      budgetChars: Math.max(1200, Math.min(5000, Number(budgetChars) || 3200)),
+    }).trim();
+    const block = `${start}\n<!-- compact fallback only; brain_sync supplies task-ranked context -->\n${brief}\n${end}`;
+    const next = raw.replace(re, block);
+    if (next === raw) return { status: 'ok', action: 'unchanged', bytes: Buffer.byteLength(block) };
+    if (check) return { status: 'stale', action: 'check', bytes: Buffer.byteLength(block) };
+    fs.writeFileSync(agentsFile, next, 'utf8');
+    return { status: 'ok', action: 'updated', bytes: Buffer.byteLength(block) };
+  } catch (error) {
+    return { status: 'error', action: 'error', reason: error?.message || String(error) };
+  }
+}
+
 // The one canonical instruction every agent gets. Tool-and-CLI dual so it works whether
 // or not the agent has the klypix-canvas MCP wired.
 const BRAIN_INSTRUCTIONS = `## KLYPIX project brain
@@ -376,7 +415,12 @@ Treat it as authoritative project context, and as **the place project knowledge 
 survives across sessions, agents, and context resets.
 
 **At the start of a task — read it** so you know the project's state and past decisions:
-- if \`.claude/brain-brief.md\` exists, read it — it is the full session brief the brain hook regenerates at every session start (Focus, open questions, skills, recent decisions).
+- first call \`brain_sync\` with a one-sentence task intent and the files you expect to touch.
+  It returns a compact task-relevant memory capsule, meaningful active-task peers, one-time messages,
+  exact file-overlap warnings, and automatic late-arrival alerts without host hooks.
+  Call it again when your file scope materially changes, and with phase \`"complete"\` before your final response.
+- do NOT automatically read the full \`.claude/brain-brief.md\`; open it only when \`brain_sync\`
+  says its compact context is insufficient or the task asks for broad project history/status.
 - with the \`klypix-canvas\` MCP server: to **answer a question** from the brain ("what did we decide about X?", "where did Y land?"), call \`brain_ask\` — it ranks the whole brain, includes superseded history, and surfaces the current truth for any corrected card. Use \`search_canvases\` for a raw keyword lookup, \`read_canvas\` (canvas: \`"brain"\`) for the whole thing, or \`brain_insights\` for the load-bearing cards.
 - or via CLI: \`npx klypix-read brain.klypix\`
 
@@ -402,8 +446,8 @@ session/agent has it.
 
 **Working alongside other live sessions?** Send a one-time coordination note with the
 \`brain_message\` MCP tool ("merged the hook refactor — rebase before you commit"). Sessions with
-a KLYPIX presence adapter (Claude Code and Codex; more hosts can implement the same protocol) see it
-once through their lifecycle hooks. Hookless clients can send but cannot receive. Use
+a KLYPIX presence adapter (Claude Code, Codex, and any MCP client) see it once through their
+lifecycle adapter or on the next \`brain_sync\` / KLYPIX tool call. Use
 \`brain_doctor\` for the all-host active-session count; saved/recent chats are history, not presence.
 Notes are ephemeral (24h), NOT brain cards — durable decisions still go through \`brain_note\`.
 

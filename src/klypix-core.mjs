@@ -902,10 +902,10 @@ export async function opBrainNote({ vault, canvas, text: noteText, area, marker 
 // ── brain_message — the MCP twin of the hook's 🧠 MSG marker ─────────────────
 // A DELIBERATE one-time note to the OTHER live agent sessions on this project
 // ("merged the hook refactor — rebase before you commit"), delivered once to each
-// peer at its next prompt via the per-project coordination lane. Hook agents send
-// these by emitting `🧠 MSG [to]: text`; this op gives HOOKLESS clients (Cursor /
-// Cline / Windsurf / Desktop) the same send path. Ephemeral (24h), NOT a brain
-// card — durable decisions go through brain_note.
+// peer through its host lifecycle adapter and the per-project coordination lane.
+// Claude hook agents can also send by emitting `🧠 MSG [to]: text`; this op gives
+// every MCP client the same send path. Ephemeral (24h), NOT a brain card — durable
+// decisions go through brain_note.
 //
 // The lane primitives below MUST byte-match src/global-brain-hook.mjs (sha-16 of
 // normBrainPath(brain), sessions/<key>.json layout, MSG_FRESH_MS, the wx-lockfile) —
@@ -964,7 +964,7 @@ export async function opBrainMessage({ vault, canvas, text: msgText, to, via }) 
   } catch (e) {
     return err(`brain_message failed: ${e.message}`);
   } finally { if (got) { try { fs.unlinkSync(lock); } catch { /* */ } } }
-  return { blocks: [text(`📨 posted to this project's coordination lane (to: ${msg.to}) — ${live} live hook-wired session(s) right now; each sees it once at its next prompt. Hookless clients can send but not receive. Ephemeral (24h), not a brain card — use brain_note for durable decisions.`)] };
+  return { blocks: [text(`📨 posted to this project's coordination lane (to: ${msg.to}) — ${live} active presence-wired session(s) right now; each receives it once through its host lifecycle hook. Hookless clients can send but not receive. Ephemeral (24h), not a brain card — use brain_note for durable decisions.`)] };
 }
 
 // Re-export the format helpers the bins need for non-op work (init onboarding).

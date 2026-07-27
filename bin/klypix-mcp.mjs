@@ -265,7 +265,7 @@ server.registerTool('brain_note', {
 
 server.registerTool('brain_message', {
   title: 'Message the other live agent sessions on this project (one-time note, not a brain card)',
-  description: 'Leave a DELIBERATE, targeted note for the OTHER live agent sessions working on this project right now ("merged the hook refactor — rebase before you commit", "don\'t touch canvasStore, mid-refactor"). Any MCP client can SEND (the twin of the `🧠 MSG [to]: text` marker); delivery is to HOOK-WIRED sessions (Claude Code with the brain hooks) — each sees the note once at its next prompt. A hookless peer (plain Cursor/Cline session) will NOT receive it, so don\'t rely on this to warn one. Ephemeral (expires in 24h) and NOT persisted to the brain — for a durable decision use brain_note instead.',
+  description: 'Leave a DELIBERATE, targeted note for the OTHER active agent sessions working on this project right now ("merged the hook refactor — rebase before you commit", "don\'t touch canvasStore, mid-refactor"). Any MCP client can SEND (the twin of the `🧠 MSG [to]: text` marker); delivery is to presence-wired sessions (Claude Code and Codex, with more host adapters supported by the shared protocol). Each receives it once through its lifecycle hook. A hookless peer can send but will NOT receive. Ephemeral (expires in 24h) and NOT persisted to the brain — for a durable decision use brain_note instead.',
   inputSchema: {
     text: z.string().describe('The note to deliver (kept to 400 chars).'),
     to: z.string().optional().describe('Target hint — a peer session id-prefix or branch name; omit or "all" for every live session.'),
@@ -278,7 +278,7 @@ server.registerTool('brain_message', {
 
 server.registerTool('brain_doctor', {
   title: 'Brain doctor — is this brain current, wired, and in sync?',
-  description: 'Read-only self-check of the installed klypix brain, as ONE verdict: VERSION (the deployed brain-core version + optional npm-latest currency), HOOKS (are all 4 Claude Code hooks wired — liveness vs readiness), TOOLS (the discoverable MCP verb manifest), PEERS (other live sessions on this project\'s brain right now), and HARNESS (per-file projection drift: ok/stale/hand-edited/missing). Use to answer "is my brain current + correctly installed + in sync, and who else is live?" without file-spelunking. Never writes. The MCP-callable twin of `npx klypix-mcp doctor`.',
+  description: 'Read-only self-check of the installed klypix brain, as ONE verdict: VERSION (deployed brain-core + optional npm currency), CLAUDE (existing 4-hook capture readiness), CODEX (5-hook live-presence readiness), TOOLS (discoverable MCP verbs), SESSIONS (all active lifecycle sessions across hosts, never recent-chat history), and HARNESS (projection drift). Use to answer "is my brain current, correctly installed, in sync, and who is actually live?" without file-spelunking. Never writes. The MCP-callable twin of `npx klypix-mcp doctor`.',
   inputSchema: {
     project: z.string().optional().describe('Project dir to audit harness + peers for. Defaults to the server\'s working directory.'),
     check_npm: z.boolean().optional().describe('Also fetch npm latest to flag a stale brain (default false — this one does a network `npm view`).'),

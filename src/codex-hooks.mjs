@@ -1,0 +1,142 @@
+// Safe ownership-scoped merger for ~/.codex/hooks.json.
+//
+// KLYPIX owns only command handlers that launch codex-brain-hook.mjs. Existing
+// hooks, top-level settings, ordering, and unrelated event groups are preserved.
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+
+export const CODEX_PRESENCE_EVENTS = [
+  'SessionStart',
+  'UserPromptSubmit',
+  'Stop',
+  'PostToolUse',
+  'SessionEnd',
+];
+
+const HOOK_MARK = 'codex-brain-hook.mjs';
+
+export function resolveCodexHooksPath(home = os.homedir()) {
+  return path.join(home, '.codex', 'hooks.json');
+}
+
+export function codexPresenceGroups(command) {
+  const handler = (timeout = 5) => ({ type: 'command', command, timeout });
+  return {
+    SessionStart: [{ hooks: [handler()] }],
+    UserPromptSubmit: [{ hooks: [handler()] }],
+    Stop: [{ hooks: [handler()] }],
+    PostToolUse: [{ hooks: [handler()] }],
+    SessionEnd: [{ hooks: [handler(3)] }],
+  };
+}
+
+function readHooks(file) {
+  if (!fs.existsSync(file)) return { ok: true, raw: '', data: {} };
+  let raw = '';
+  try { raw = fs.readFileSync(file, 'utf8'); }
+  catch (error) { return { ok: false, raw: '', data: null, error: `Can't read ${file}: ${error?.message || error}` }; }
+  if (!raw.trim()) return { ok: true, raw, data: {} };
+  try {
+    const data = JSON.parse(raw);
+    if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('root must be an object');
+    return { ok: true, raw, data };
+  } catch (error) {
+    return { ok: false, raw, data: null, error: `${path.basename(file)} is invalid JSON (${error?.message || error}). KLYPIX left it untouched.` };
+  }
+}
+
+function stripOwned(groups) {
+  return (Array.isArray(groups) ? groups : [])
+    .map((group) => {
+      if (!group || !Array.isArray(group.hooks)) return group;
+      return {
+        ...group,
+        hooks: group.hooks.filter((hook) => !(typeof hook?.command === 'string' && hook.command.includes(HOOK_MARK))),
+      };
+    })
+    .filter((group) => !group || !Array.isArray(group.hooks) || group.hooks.length > 0);
+}
+
+function writeHooks(file, raw, data) {
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    let backup;
+    if (raw) {
+      backup = file + '.klypix-bak';
+      try { fs.writeFileSync(backup, raw, 'utf8'); }
+      catch { backup = undefined; }
+    }
+    const temp = file + '.klypix-tmp';
+    fs.writeFileSync(temp, JSON.stringify(data, null, 2) + '\n', 'utf8');
+    JSON.parse(fs.readFileSync(temp, 'utf8'));
+    fs.renameSync(temp, file);
+    return { ok: true, backup };
+  } catch (error) {
+    return { ok: false, error: `Couldn't write ${file}: ${error?.message || error}` };
+  }
+}
+
+export function codexPresenceHookStatus(home = os.homedir()) {
+  const file = resolveCodexHooksPath(home);
+  const parsed = readHooks(file);
+  if (!parsed.ok) return { installed: false, file, error: parsed.error, wired: [], missing: CODEX_PRESENCE_EVENTS.slice() };
+  const hooks = parsed.data?.hooks && typeof parsed.data.hooks === 'object' && !Array.isArray(parsed.data.hooks)
+    ? parsed.data.hooks
+    : {};
+  const wired = CODEX_PRESENCE_EVENTS.filter((event) =>
+    Array.isArray(hooks[event])
+    && hooks[event].some((group) => Array.isArray(group?.hooks)
+      && group.hooks.some((hook) => typeof hook?.command === 'string' && hook.command.includes(HOOK_MARK))));
+  return {
+    installed: wired.length === CODEX_PRESENCE_EVENTS.length,
+    file,
+    error: null,
+    wired,
+    missing: CODEX_PRESENCE_EVENTS.filter((event) => !wired.includes(event)),
+  };
+}
+
+export function mergeCodexPresenceHooks({ home = os.homedir(), command } = {}) {
+  if (!command || !String(command).includes(HOOK_MARK)) {
+    return { ok: false, error: `Codex presence hook command must launch ${HOOK_MARK}.` };
+  }
+  const file = resolveCodexHooksPath(home);
+  const parsed = readHooks(file);
+  if (!parsed.ok) return { ok: false, error: parsed.error, path: file };
+  const data = structuredClone(parsed.data || {});
+  if (!data.hooks || typeof data.hooks !== 'object' || Array.isArray(data.hooks)) data.hooks = {};
+  const groups = codexPresenceGroups(String(command));
+  for (const event of CODEX_PRESENCE_EVENTS) {
+    data.hooks[event] = [...stripOwned(data.hooks[event]), ...groups[event]];
+  }
+  const next = JSON.stringify(data, null, 2) + '\n';
+  if (next === parsed.raw) return { ok: true, action: 'unchanged', path: file };
+  const written = writeHooks(file, parsed.raw, data);
+  if (!written.ok) return { ...written, path: file };
+  return { ok: true, action: parsed.raw ? 'updated' : 'connected', path: file, backup: written.backup };
+}
+
+export function removeCodexPresenceHooks(home = os.homedir()) {
+  const file = resolveCodexHooksPath(home);
+  const parsed = readHooks(file);
+  if (!parsed.ok) return { ok: false, error: parsed.error, path: file };
+  if (!parsed.raw) return { ok: true, action: 'unchanged', path: file };
+  const data = structuredClone(parsed.data || {});
+  if (!data.hooks || typeof data.hooks !== 'object' || Array.isArray(data.hooks)) {
+    return { ok: true, action: 'unchanged', path: file };
+  }
+  let changed = false;
+  for (const event of CODEX_PRESENCE_EVENTS) {
+    const before = Array.isArray(data.hooks[event]) ? data.hooks[event] : [];
+    const after = stripOwned(before);
+    if (JSON.stringify(after) !== JSON.stringify(before)) changed = true;
+    if (after.length) data.hooks[event] = after;
+    else delete data.hooks[event];
+  }
+  if (!Object.keys(data.hooks).length) delete data.hooks;
+  if (!changed) return { ok: true, action: 'unchanged', path: file };
+  const written = writeHooks(file, parsed.raw, data);
+  if (!written.ok) return { ...written, path: file };
+  return { ok: true, action: 'disconnected', path: file, backup: written.backup };
+}

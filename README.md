@@ -16,11 +16,12 @@ You've seen the setup: point an AI at a folder of notes, watch the graph fill up
 npx klypix-mcp install
 ```
 
-Claude Code gets live hooks for auto-brief + auto-capture. Codex gets a native
-`~/.codex/config.toml` MCP registration and conditional global guidance that activates
-only when a project contains `./brain.klypix`. Existing MCP servers, Codex settings, and
-personal instructions are preserved and backed up before KLYPIX-owned blocks change.
-Restart Codex after installation so it loads the new server.
+Claude Code keeps its live hooks for auto-brief + auto-capture. Codex gets a native
+`~/.codex/config.toml` MCP registration, conditional global guidance, and lifecycle
+hooks for truthful cross-agent presence and one-time messages. Existing MCP servers,
+hooks, settings, and personal instructions are preserved; KLYPIX owns only its fenced
+blocks and `codex-brain-hook.mjs` handlers, with backups before changes. Restart Codex
+after installation and approve the KLYPIX hooks when Codex presents its trust review.
 
 Give a project a brain by dropping a `brain.klypix` in it — the
 [KLYPIX app](https://klypix.com) does it in one click (*Save canvas as project brain*),
@@ -73,7 +74,7 @@ Any MCP client gets the tools without the hooks. For **Claude Desktop**, in `cla
 
 Then ask your agent things like *"what did we decide about auth?"*, *"challenge this: let's switch to polling"*, or *"turn these notes into a board."*
 
-## The 16 verbs
+## The 17 verbs
 
 | Tool | What it does |
 |---|---|
@@ -83,7 +84,7 @@ Then ask your agent things like *"what did we decide about auth?"*, *"challenge 
 | `brain_reconcile` | Find stale-vs-correction pairs + unrecorded migrations |
 | `brain_insights` | Hubs, orphaned decisions, stale questions, area sizes |
 | `brain_garden` | Maintenance pass over the brain |
-| `brain_doctor` | Self-diagnosis: version alignment, hooks wired, projection drift |
+| `brain_doctor` | Self-diagnosis: version, host adapters, active lifecycle sessions, projection drift |
 | `brain_message` | Session-to-session coordination notes |
 | `brain_connect` | Find + draw related-but-unlinked cards |
 | `canvas_view` | The board as an MCP App — Apps-capable chats get an interactive spatial view; everyone else gets clean text |
@@ -96,7 +97,19 @@ Then ask your agent things like *"what did we decide about auth?"*, *"challenge 
 
 ### Tools vs. the *automatic* brain
 
-This package is the **agent-neutral read/write surface** — any MCP client gets the tools above on demand (*pull*), in any project. `install` wires Claude Code's live hooks and Codex's native MCP + conditional global guidance; `link` projects the repository-level MCP and instruction files used by Codex and the other coding agents. Full transcript-driven auto-capture remains a Claude Code hook capability; Codex and other hookless clients capture durable decisions through the MCP instructions and `brain_note`.
+This package is the **agent-neutral read/write surface** — any MCP client gets the tools above on demand (*pull*), in any project. `install` wires Claude Code's existing capture path plus Codex's native MCP, conditional guidance, and separate presence adapter; `link` projects the repository-level MCP and instruction files used by other coding agents. Full transcript-driven auto-capture remains a Claude Code capability. Codex reports lifecycle presence and captures durable decisions explicitly through `brain_note`; hookless clients can use the MCP surface but are not reported as active.
+
+### Agent-neutral live presence
+
+An active session means a host lifecycle hook heartbeated within 10 minutes; a row in a
+recent-chat list is history, not presence. Claude Code and Codex publish into the same
+per-brain lane, while each host keeps its own adapter and capture behavior. `SessionEnd`
+removes clean exits immediately, and the TTL covers crashes.
+
+Future hosts can import `klypix-mcp/presence` and map their lifecycle events to
+`upsertSession`, `removeSession`, and `receiveMessages`. The shared contract accepts
+`id`, `client`, `surface`, `model`, `branch`, `intent`, and touched `files`; host-specific
+transcript parsing stays outside the protocol.
 
 ### Updates — the propagation contract
 

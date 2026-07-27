@@ -21,6 +21,7 @@ import {
     mcpServerEntry,
     mergeCodexGlobalInstructions,
 } from '../src/agent-rules.mjs';
+import { mergeCodexPresenceHooks } from '../src/codex-hooks.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PKG_ROOT = path.resolve(__dirname, '..');
@@ -45,25 +46,36 @@ function copyDir(src, dest) {
     }
 }
 
-// Codex has two independent integration layers: MCP gives it the brain tools,
-// while a conditional managed block in ~/.codex/AGENTS.md tells every session
-// to use those tools when ./brain.klypix exists.
+// Codex has three independent integration layers: MCP gives it the brain tools,
+// a conditional managed block in ~/.codex/AGENTS.md tells every brain project to
+// use them, and lifecycle hooks publish live presence to the shared session lane.
 function wireCodex() {
     const mcp = connectCodexMcpServer({
         configPath: CODEX_CONFIG,
         entry: mcpServerEntry({ vault: '.', home: HOME }),
     });
     const instructions = mergeCodexGlobalInstructions(HOME);
-    return { mcp, instructions, ok: mcp.ok && instructions.ok };
+    const hookScript = path.join(BRAIN_DIR, 'codex-brain-hook.mjs');
+    const presence = exists(hookScript)
+        ? mergeCodexPresenceHooks({
+            home: HOME,
+            command: `node "${fwd(hookScript)}"`,
+        })
+        : { ok: true, action: 'not-available' };
+    return { mcp, instructions, presence, ok: mcp.ok && instructions.ok && presence.ok };
 }
 
 function reportCodex(result) {
     if (result.ok) {
-        console.log(`✓ wired Codex: MCP tools (${result.mcp.action}) + conditional project-brain guidance (${result.instructions.action})`);
+        const live = result.presence.action === 'not-available'
+            ? 'live presence pending a current brain bundle'
+            : `live presence (${result.presence.action})`;
+        console.log(`✓ wired Codex: MCP tools (${result.mcp.action}) + conditional project-brain guidance (${result.instructions.action}) + ${live}`);
         return;
     }
     if (!result.mcp.ok) console.error(`⚠ Codex MCP was not changed: ${result.mcp.error}`);
     if (!result.instructions.ok) console.error(`⚠ Codex guidance was not changed: ${result.instructions.error}`);
+    if (!result.presence.ok) console.error(`⚠ Codex live presence was not changed: ${result.presence.error}`);
     console.error('  Claude Code installation is intact. Fix the Codex warning, then re-run this command.');
 }
 
@@ -199,7 +211,7 @@ try {
     // canvas-view-app.html is the canvas_view MCP App UI — staged raw (an HTML
     // file must never get a JS-comment banner) beside the flat server, which
     // resolves it via its ./canvas-view-app.html candidate path.
-    for (const f of ['global-brain-hook.mjs', 'brain-semantic.mjs', 'brain-note.mjs', 'brain-git-hook.mjs', 'klypix-format.mjs', 'klypix-core.mjs', 'agent-rules.mjs', 'brain-doctor.mjs', 'canvas-view-app.html']) {
+    for (const f of ['global-brain-hook.mjs', 'brain-semantic.mjs', 'brain-note.mjs', 'brain-git-hook.mjs', 'klypix-format.mjs', 'klypix-core.mjs', 'agent-rules.mjs', 'brain-doctor.mjs', 'agent-presence.mjs', 'codex-brain-hook.mjs', 'codex-hooks.mjs', 'canvas-view-app.html']) {
         const s = path.join(SRC, f); if (exists(s)) staged.push({ dst: f, content: fs.readFileSync(s, 'utf8') });
     }
     for (const [src, dst] of [['klypix-mcp.mjs', 'klypix-mcp-server.mjs'], ['klypix-a2a.mjs', 'klypix-a2a-server.mjs']]) {
@@ -253,7 +265,7 @@ try {
     //    (heals an existing stale config so the next MCP server spawn runs current).
     const migrated = migrateProjectMcpConfig();
 
-    // Codex needs both native MCP tools and conditional global guidance.
+    // Codex needs native MCP tools, conditional guidance, and lifecycle presence.
     const codex = wireCodex();
 
     // 8) READINESS check — re-read what we just wrote and confirm all 4 hooks actually
@@ -270,7 +282,7 @@ try {
     else console.error(`⚠ readiness: ${notWired.length} hook(s) did NOT take (${notWired.join(', ')}) — the brain will read but not capture/sync. Re-run \`npx klypix-mcp install --force\` or check ${SETTINGS}.`);
     console.log(`✓ MCP server runs from the local bundle (node ${fwd(path.join(BRAIN_DIR, 'klypix-mcp-server.mjs'))}) — no npx cache, works offline, always the installed version.`);
     if (migrated) console.log(`✓ migrated ${migrated.file} klypix-canvas server: ${migrated.from} → ${migrated.to} (backup: .mcp.json.klypix-bak). Reconnect (/mcp) or restart to pick it up.`);
-    console.log('  Claude Code auto-briefs + captures through hooks; Codex reads + writes through native MCP and managed guidance.');
+    console.log('  Claude Code keeps its existing auto-brief/capture hooks; Codex uses separate lifecycle hooks for live presence and native MCP for durable memory.');
     console.log('  ⚠ Open sessions keep their OLD server until relaunched: fully quit & reopen the app (a session resume / new chat does NOT respawn the MCP server). `brain_doctor`\'s RUNNING line confirms when you\'re current.');
     console.log('  Verify anytime: `npx klypix-mcp doctor` (is the brain current + wired + in sync, who else is live).');
 } catch (e) {

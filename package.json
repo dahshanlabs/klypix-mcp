@@ -1,6 +1,6 @@
 {
   "name": "klypix-mcp",
-  "version": "1.33.0",
+  "version": "1.34.0",
   "description": "Every project gets a brain — one open .klypix file your AI agents read, write, and argue from, over MCP. Works with Claude, Codex, Cursor, Cline, any model.",
   "type": "module",
   "license": "Apache-2.0",
@@ -38,7 +38,8 @@
   "exports": {
     ".": "./index.mjs",
     "./format": "./src/klypix-format.mjs",
-    "./core": "./src/klypix-core.mjs"
+    "./core": "./src/klypix-core.mjs",
+    "./presence": "./src/agent-presence.mjs"
   },
   "files": [
     "src",
@@ -53,7 +54,7 @@
     "node": ">=18"
   },
   "scripts": {
-    "test": "node test/brain-doctor.mjs && node test/version-currency.mjs && node test/ship-capture.mjs && node test/lane-message.mjs && node test/brain-quality.mjs && node test/brief-and-recall.mjs && node test/layout-cluster.mjs && node test/brain-ask.mjs && node test/field-report-2026-07-04.mjs && node test/autoprop.mjs && node test/overlay-recency-2026-07-12.mjs && node test/brain-challenge.mjs && node test/brain-lens.mjs && node test/brain-kind.mjs && node test/rule-drafts.mjs && node test/claim-engine.mjs && node test/canvas-view.mjs && node test/status-completeness.mjs"
+    "test": "node test/codex-hooks.mjs && node test/agent-presence.mjs && node test/brain-doctor.mjs && node test/version-currency.mjs && node test/ship-capture.mjs && node test/lane-message.mjs && node test/brain-quality.mjs && node test/brief-and-recall.mjs && node test/layout-cluster.mjs && node test/brain-ask.mjs && node test/field-report-2026-07-04.mjs && node test/autoprop.mjs && node test/overlay-recency-2026-07-12.mjs && node test/brain-challenge.mjs && node test/brain-lens.mjs && node test/brain-kind.mjs && node test/rule-drafts.mjs && node test/claim-engine.mjs && node test/canvas-view.mjs && node test/status-completeness.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/ext-apps": "^1.7.4",

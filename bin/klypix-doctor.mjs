@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // klypix-doctor — `npx klypix-mcp doctor`. The brain's self-check: is THIS machine's
-// brain current, are the 4 Claude Code hooks wired, what verbs does it expose, who else
-// is live on this project's brain, and is the harness projection in sync? ONE fact, ONE
-// reconcile block. Read-only (never writes). Exits 0 = ALIGNED, 1 = DRIFTED — so it
+// brain current, are the Claude capture and Codex presence adapters wired, what verbs
+// does it expose, which lifecycle sessions are live, and is the harness projection in
+// sync? ONE fact, ONE reconcile block. Read-only (never writes). Exits 0 = ALIGNED,
+// 1 = DRIFTED — so it
 // doubles as a pre-commit / CI readiness gate.
 //
 //   npx klypix-mcp doctor              # this project + this machine's brain

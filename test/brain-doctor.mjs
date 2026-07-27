@@ -186,7 +186,9 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
   const r = await client.callTool({ name: 'brain_doctor', arguments: { project: vault } });
   const text = (r.content || []).filter(c => c.type === 'text').map(c => c.text).join('\n');
   ok(r.isError !== true, 'brain_doctor call is not an error');
-  ok(/brain_doctor/.test(text) && /VERSION/.test(text) && /HOOKS/.test(text), 'brain_doctor returns the layered verdict');
+  ok(/brain_doctor/.test(text) && /VERSION/.test(text) && /CLAUDE/.test(text)
+    && /CODEX/.test(text) && /SESSIONS/.test(text),
+  'brain_doctor returns the host-neutral layered verdict');
 
   await client.close();
   fs.rmSync(vault, { recursive: true, force: true });

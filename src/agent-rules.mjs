@@ -64,6 +64,7 @@ const CODEX_GLOBAL_BODY = [
   'When the current project contains `./brain.klypix`, treat it as the authoritative shared project memory.',
   'At task start, read `.claude/brain-brief.md` when present; otherwise use the `klypix-canvas`',
   'MCP tools (`brain_ask`, `read_canvas` with canvas `"brain"`, or `brain_insights`).',
+  'Use `brain_doctor` when live-session awareness matters; recent chat rows are history, not presence.',
   'Capture durable decisions and milestones with `brain_note`. Never hand-edit `brain.klypix`.',
   'If the project has no `brain.klypix`, ignore this section.',
   CODEX_GLOBAL_END,
@@ -400,10 +401,11 @@ project decision live *only* in your host's memory or a scratch file — put it 
 session/agent has it.
 
 **Working alongside other live sessions?** Send a one-time coordination note with the
-\`brain_message\` MCP tool ("merged the hook refactor — rebase before you commit"); hook-wired peer
-sessions (Claude Code) see it at their next prompt. Any client can SEND; only hook-wired sessions
-receive, so don't rely on it to reach a hookless peer. Notes are ephemeral (24h), NOT brain cards —
-durable decisions still go through \`brain_note\`.
+\`brain_message\` MCP tool ("merged the hook refactor — rebase before you commit"). Sessions with
+a KLYPIX presence adapter (Claude Code and Codex; more hosts can implement the same protocol) see it
+once through their lifecycle hooks. Hookless clients can send but cannot receive. Use
+\`brain_doctor\` for the all-host active-session count; saved/recent chats are history, not presence.
+Notes are ephemeral (24h), NOT brain cards — durable decisions still go through \`brain_note\`.
 
 **Don't** hand-edit \`brain.klypix\` (it's a packaged canvas — use the tools) or dump file contents into it; capture the *decision*, not the file.`;
 

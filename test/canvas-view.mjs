@@ -86,7 +86,7 @@ const ok = (cond, label) => { console.log(`${cond ? '✓' : '✗'} ${label}`); i
 
 // ── V7: bin degrades without ext-apps (structural check) ─────────────────────
 {
-    const bin = fs.readFileSync(path.join(__dirname, '..', 'bin', 'klypix-mcp.mjs'), 'utf8');
+    const bin = fs.readFileSync(path.join(__dirname, '..', 'bin', 'klypix-worker.mjs'), 'utf8');
     const block = bin.slice(bin.indexOf('canvas_view'));
     ok(/try\s*\{[\s\S]*?await import\('@modelcontextprotocol\/ext-apps\/server'\)/.test(bin), 'V7: ext-apps import is lazy + inside try');
     ok(/if\s*\(!canvasViewAsApp\)\s*\{[\s\S]*?server\.registerTool\('canvas_view'/.test(bin), 'V7: plain-tool fallback registers when the App path fails');

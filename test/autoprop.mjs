@@ -15,6 +15,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import crypto from 'crypto';
 import { execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { mcpServerEntry } from '../src/agent-rules.mjs';
@@ -137,6 +138,28 @@ const OLD_ISO = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();   // >
 }
 
 // ── D — real atomic install: complete bundle, migration, no leftovers, .prev, lock ──
+{
+  const home = tmp('e-supervisor'); const bd = seedInstalledBrain(home, '1.39.0');
+  fs.appendFileSync(path.join(bd, 'klypix-mcp-server.mjs'), 'runMcpSupervisor();\n');
+  fs.writeFileSync(path.join(bd, 'mcp-supervisor.mjs'), '// supervisor');
+  reg(bd, [{ pid: ALIVE, version: '1.39.0', bootedAt: NOW_ISO }]);
+  let r = inspect({ home, projectDir: home });
+  ok(r.layers.supervisor === 'pending-reconnect' && r.actions.some(a => /reconnect once/.test(a)),
+    'E: a legacy live session gets one explicit reconnect-to-supervisor action');
+  const states = path.join(bd, '.supervisors');
+  fs.mkdirSync(states, { recursive: true });
+  fs.writeFileSync(path.join(states, `${ALIVE}.json`), JSON.stringify({
+    pid: ALIVE,
+    status: 'ready',
+    active: { pid: ALIVE, version: '1.39.0' },
+    hotReloads: 2,
+  }));
+  r = inspect({ home, projectDir: home });
+  ok(r.layers.supervisor === 'ok' && r.supervisors.active && r.supervisors.live[0].hotReloads === 2,
+    'E: doctor reports a live zero-restart supervisor and its hot-swap count');
+  rmrf(home);
+}
+
 function runInstall(home, projectCwd, args = []) {
   const env = { ...process.env, HOME: home, USERPROFILE: home };
   delete env.KLYPIX_BRAIN_NO_MAIN;
@@ -157,13 +180,20 @@ function runInstall(home, projectCwd, args = []) {
   fs.writeFileSync(path.join(proj, '.mcp.json'), JSON.stringify({ mcpServers: { 'klypix-canvas': { command: 'npx', args: ['-y', 'klypix-mcp', '--vault', '.'] } } }, null, 2));
   runInstall(home, proj);
   const bd = path.join(home, '.claude', 'project-brain');
-  for (const f of ['global-brain-hook.mjs', 'klypix-format.mjs', 'klypix-core.mjs', 'klypix-mcp-server.mjs', 'klypix-conformance.mjs', 'agent-rules.mjs', 'brain-doctor.mjs', 'agent-presence.mjs', 'mcp-presence.mjs', 'codex-brain-hook.mjs', 'codex-hooks.mjs']) {
+  for (const f of ['global-brain-hook.mjs', 'klypix-format.mjs', 'klypix-core.mjs', 'klypix-mcp-server.mjs', 'klypix-mcp-worker.mjs', 'mcp-supervisor.mjs', 'klypix-conformance.mjs', 'agent-rules.mjs', 'brain-doctor.mjs', 'agent-presence.mjs', 'mcp-presence.mjs', 'codex-brain-hook.mjs', 'codex-hooks.mjs']) {
     ok(fs.existsSync(path.join(bd, f)), `D: installed ${f}`);
   }
   ok(fs.existsSync(path.join(bd, 'node_modules', 'jszip')), 'D: runtime deps (jszip) copied');
   ok(fs.readdirSync(bd).every(f => !f.endsWith('.klypix-new')), 'D: no half-written .klypix-new leftovers (atomic rename completed)');
   const stamp = JSON.parse(fs.readFileSync(path.join(bd, '.brain-version.json'), 'utf8'));
   ok(stamp.brainVersion === PKG_VERSION, `D: stamp brainVersion == package v${PKG_VERSION}`);
+  const runtime = JSON.parse(fs.readFileSync(path.join(bd, '.mcp-runtime.json'), 'utf8'));
+  ok(runtime.protocol === 1 && runtime.version === PKG_VERSION && runtime.worker === 'klypix-mcp-worker.mjs',
+    'D: atomic runtime pointer targets the replaceable worker');
+  ok(Object.entries(runtime.files).every(([name, expected]) =>
+    fs.existsSync(path.join(bd, name))
+    && crypto.createHash('sha256').update(fs.readFileSync(path.join(bd, name))).digest('hex') === expected),
+  'D: runtime pointer hashes verify every staged file');
   const baked = fs.readFileSync(path.join(bd, 'klypix-mcp-server.mjs'), 'utf8');
   ok(new RegExp(`const PKG_VERSION = '${PKG_VERSION.replace(/\./g, '\\.')}'`).test(baked), 'D: server has the baked version (flat layout has no package.json)');
   // migration: the project .mcp.json flipped npx → local node, with a backup.

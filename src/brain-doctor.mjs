@@ -54,6 +54,8 @@ function inspectVersion(brainDir) {
   return {
     installed: !!serverSrc || !!stamp,
     baked,                                     // real brain-core version (or null if not deployed)
+    supervisorCapable: !!(serverSrc && serverSrc.includes('runMcpSupervisor'))
+      && fs.existsSync(path.join(brainDir, 'mcp-supervisor.mjs')),
     channel: stamp?.via || null,               // 'npm' | 'app' | 'dev' | null
     stampVersion,                              // provenance only (namespace varies by channel)
     dirty: !!(stamp && stamp.dirty),
@@ -82,7 +84,12 @@ function inspectTools(brainDir, pkgRoot) {
   // Prefer the DEPLOYED server (what this machine's brain actually exposes); fall back
   // to the running package's server file. Regex the registration list — no import, no
   // spawning the stdio server.
-  const candidates = [path.join(brainDir, 'klypix-mcp-server.mjs'), path.join(pkgRoot, 'bin', 'klypix-mcp.mjs')];
+  const candidates = [
+    path.join(brainDir, 'klypix-mcp-worker.mjs'),
+    path.join(brainDir, 'klypix-mcp-server.mjs'),
+    path.join(pkgRoot, 'bin', 'klypix-worker.mjs'),
+    path.join(pkgRoot, 'bin', 'klypix-mcp.mjs'),
+  ];
   for (const f of candidates) {
     const src = readText(f);
     if (!src) continue;
@@ -91,7 +98,7 @@ function inspectTools(brainDir, pkgRoot) {
     // MCP App registers through it; the manifest must count it or doctor drifts.
     const re = /(?:server\.registerTool|registerAppTool)\(\s*(?:server\s*,\s*)?['"]([^'"]+)['"]/g;
     let mm; while ((mm = re.exec(src))) names.push(mm[1]);
-    if (names.length) return { names, count: names.length, source: f === candidates[0] ? 'deployed' : 'package', hash: sha(names.slice().sort().join(',')).slice(0, 8) };
+    if (names.length) return { names, count: names.length, source: f.startsWith(brainDir) ? 'deployed' : 'package', hash: sha(names.slice().sort().join(',')).slice(0, 8) };
   }
   return { names: [], count: 0, source: null, hash: null };
 }
@@ -151,6 +158,34 @@ function inspectRunning(brainDir, baked, now, self) {
 }
 
 // ── PEERS (alignment) layer ──────────────────────────────────────────────────
+function inspectSupervisors(brainDir, baked) {
+  const dir = path.join(brainDir, '.supervisors');
+  let names = [];
+  try { names = fs.readdirSync(dir).filter(name => name.endsWith('.json')); } catch { /* absent */ }
+  const live = [];
+  for (const name of names) {
+    const state = readJson(path.join(dir, name), null);
+    if (!state?.pid || !isAlivePid(state.pid)) continue;
+    live.push({
+      pid: state.pid,
+      status: state.status || 'unknown',
+      activePid: state.active?.pid || null,
+      activeVersion: state.active?.version || null,
+      hotReloads: Number(state.hotReloads || 0),
+      lastSwapAt: state.lastSwapAt || null,
+      lastError: state.lastError || null,
+    });
+  }
+  return {
+    active: live.length > 0,
+    count: live.length,
+    live,
+    matchesInstalled: live.length && baked
+      ? live.every(state => state.activeVersion && cmpSemver(state.activeVersion, baked) === 0)
+      : null,
+  };
+}
+
 function inspectPeers(brainDir, brainPath, now) {
   const file = path.join(brainDir, 'sessions', `${sha(normBrainPath(brainPath))}.json`);
   const data = readJson(file, null);
@@ -186,6 +221,7 @@ export function inspect(opts = {}) {
 
   const version = inspectVersion(brainDir);
   const running = inspectRunning(brainDir, version.baked, now, opts.self);
+  const supervisors = inspectSupervisors(brainDir, version.baked);
   const hooks = inspectHooks(home);
   const codexHooks = codexPresenceHookStatus(home);
   const codexSmart = {
@@ -212,6 +248,7 @@ export function inspect(opts = {}) {
     // stale-server incident. Unknown (server not booted since the heartbeat shipped)
     // is NOT drift; it's a reconnect prompt.
     running: !running.known ? 'unknown' : (running.matchesInstalled === false ? 'drift' : 'ok'),
+    supervisor: supervisors.active ? 'ok' : (version.supervisorCapable ? 'pending-reconnect' : 'legacy'),
     hooks: !hooks.settingsPresent ? 'absent' : (hooks.missing.length ? 'drift' : 'ok'),
     // Codex MCP presence is the automatic baseline. Hooks are an OPTIONAL
     // enrichment layer, so off/unverified must never make the brain "drifted".
@@ -232,11 +269,12 @@ export function inspect(opts = {}) {
     if (version.dirty) actions.push('node scripts/deploy-brain.mjs   # running uncommitted (dirty) hook code — commit + re-deploy');
     if (npm && npm.matches === false) actions.push(`npx klypix-mcp install   # installed brain v${version.baked} < npm latest v${npm.latest}`);
     if (running.matchesInstalled === false) actions.push(`/mcp reconnect (or restart the session)   # LIVE server v${running.version} ≠ installed v${version.baked} — the running MCP server is stale`);
+    if (version.supervisorCapable && running.known && !supervisors.active) actions.push('/mcp reconnect once   # activate the zero-restart supervisor; compatible future core updates hot-swap automatically');
     if (hooks.missing.length) actions.push(`npx klypix-mcp install   # half-wired: hooks not active — ${hooks.missing.join(', ')}`);
     if (hasBrain && !harness.ok) actions.push('npx klypix-mcp link      # harness configs drifted — re-project managed blocks');
   }
 
-  return { verdict, layers, drifted, version, running, hooks, codexSmart, codexHooks, tools, peers, sessions: peers, harness, npm, project: { dir: projectDir, brainPath, hasBrain }, brainDir, actions };
+  return { verdict, layers, drifted, version, running, supervisors, hooks, codexSmart, codexHooks, tools, peers, sessions: peers, harness, npm, project: { dir: projectDir, brainPath, hasBrain }, brainDir, actions };
 }
 
 // One-line drift summary (empty when clean) — for a footer / status line.
@@ -281,6 +319,19 @@ export function render(r, opts = {}) {
     // (CLI mode when >1) so a phantom / a stale peer server is never hidden.
     const extra = run.self ? (run.others || []) : (run.servers && run.servers.length > 1 ? run.servers : []);
     for (const s of extra) L.push(`        ${c.dim}· ${run.self ? 'other' : 'server'} pid ${s.pid ?? '?'} · v${s.version}${s.vault ? ' · ' + s.vault : ''}${s.ageMin != null ? ` (booted ${s.ageMin}m ago)` : ''}${c.rst}`);
+  }
+
+  // SUPERVISOR (stable host connection + replaceable worker)
+  if (r.supervisors?.active) {
+    const totalReloads = r.supervisors.live.reduce((sum, state) => sum + state.hotReloads, 0);
+    L.push(`${ok} ${c.bold}SUPERVISOR${c.rst}  ${r.supervisors.count} live · zero-restart core activation ready${totalReloads ? ` · ${totalReloads} hot-swap${totalReloads === 1 ? '' : 's'}` : ''}`);
+    for (const state of r.supervisors.live) {
+      if (state.lastError) L.push(`        ${c.yel}· pid ${state.pid} ${state.status}: ${state.lastError}${c.rst}`);
+    }
+  } else if (r.version.supervisorCapable) {
+    L.push(`${warn} ${c.bold}SUPERVISOR${c.rst}  installed but this is a legacy direct-worker session · reconnect once to activate`);
+  } else {
+    L.push(`${warn} ${c.bold}SUPERVISOR${c.rst}  not installed · core updates require reconnect`);
   }
 
   // Host adapters

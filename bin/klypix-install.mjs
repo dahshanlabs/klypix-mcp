@@ -16,6 +16,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import {
     connectCodexMcpServer,
@@ -216,7 +217,8 @@ const flatten = (code) => code
     .replace(/\.\.\/src\/klypix-(core|format)\.mjs/g, './klypix-$1.mjs')
     // brain-doctor + agent-rules (the server's lazy `import('../src/brain-doctor.mjs')`
     // for the brain_doctor tool) → flat sibling refs in the runtime layout.
-    .replace(/\.\.\/src\/(brain-doctor|agent-rules|mcp-presence)\.mjs/g, './$1.mjs')
+    .replace(/\.\.\/src\/(brain-doctor|agent-rules|mcp-presence|mcp-supervisor)\.mjs/g, './$1.mjs')
+    .replace(/klypix-worker\.mjs/g, 'klypix-mcp-worker.mjs')
     .replace(/const PKG_VERSION = \(\(\) => \{[\s\S]*?\}\)\(\);/, `const PKG_VERSION = '${VERSION}'; // baked at install (flat layout has no package.json)`);
 
 const gotLock = acquireLock();
@@ -278,11 +280,12 @@ try {
     // canvas-view-app.html is the canvas_view MCP App UI — staged raw (an HTML
     // file must never get a JS-comment banner) beside the flat server, which
     // resolves it via its ./canvas-view-app.html candidate path.
-    for (const f of ['global-brain-hook.mjs', 'brain-semantic.mjs', 'brain-note.mjs', 'brain-git-hook.mjs', 'klypix-format.mjs', 'klypix-core.mjs', 'agent-rules.mjs', 'brain-doctor.mjs', 'agent-presence.mjs', 'mcp-presence.mjs', 'codex-brain-hook.mjs', 'codex-hooks.mjs', 'canvas-view-app.html']) {
+    for (const f of ['global-brain-hook.mjs', 'brain-semantic.mjs', 'brain-note.mjs', 'brain-git-hook.mjs', 'klypix-format.mjs', 'klypix-core.mjs', 'agent-rules.mjs', 'brain-doctor.mjs', 'agent-presence.mjs', 'mcp-presence.mjs', 'mcp-supervisor.mjs', 'codex-brain-hook.mjs', 'codex-hooks.mjs', 'canvas-view-app.html']) {
         const s = path.join(SRC, f); if (exists(s)) staged.push({ dst: f, content: fs.readFileSync(s, 'utf8') });
     }
     for (const [src, dst] of [
         ['klypix-mcp.mjs', 'klypix-mcp-server.mjs'],
+        ['klypix-worker.mjs', 'klypix-mcp-worker.mjs'],
         ['klypix-a2a.mjs', 'klypix-a2a-server.mjs'],
         ['klypix-conformance.mjs', 'klypix-conformance.mjs'],
     ]) {
@@ -330,7 +333,22 @@ try {
     fs.renameSync(tmp, SETTINGS);
 
     // 6) stamp the install (unified brain version → never-downgrade across channels)
-    fs.writeFileSync(path.join(BRAIN_DIR, '.brain-version.json'), JSON.stringify({ brainVersion: VERSION, via: 'npm', dirty: false, installedAt: new Date().toISOString() }, null, 2));
+    const installedAt = new Date().toISOString();
+    fs.writeFileSync(path.join(BRAIN_DIR, '.brain-version.json'), JSON.stringify({ brainVersion: VERSION, via: 'npm', dirty: false, installedAt }, null, 2));
+    // Commit the runtime pointer LAST. A running supervisor watches only this
+    // atomic file, validates every staged hash, and keeps the old worker if the
+    // candidate is incomplete or incompatible.
+    const runtime = {
+        protocol: 1,
+        version: VERSION,
+        worker: 'klypix-mcp-worker.mjs',
+        channel: 'npm',
+        installedAt,
+        files: Object.fromEntries(staged.map(st => [st.dst, crypto.createHash('sha256').update(st.content).digest('hex')])),
+    };
+    const runtimePath = path.join(BRAIN_DIR, '.mcp-runtime.json');
+    fs.writeFileSync(runtimePath + '.klypix-new', JSON.stringify(runtime, null, 2) + '\n', 'utf8');
+    fs.renameSync(runtimePath + '.klypix-new', runtimePath);
 
     // 7) migrate THIS project's .mcp.json off npx onto the now-installed local bundle
     //    (heals an existing stale config so the next MCP server spawn runs current).
@@ -351,11 +369,11 @@ try {
     console.log(`✓ installed klypix brain v${VERSION} → ${BRAIN_DIR}  (${n} scripts, ${deps} dep packages)`);
     if (!notWired.length) console.log('✓ wired 4 hooks: SessionStart · UserPromptSubmit (--prompt) · Stop (--capture) · PostToolUse (--live) → settings.json');
     else console.error(`⚠ readiness: ${notWired.length} hook(s) did NOT take (${notWired.join(', ')}) — the brain will read but not capture/sync. Re-run \`npx klypix-mcp install --force\` or check ${SETTINGS}.`);
-    console.log(`✓ MCP server runs from the local bundle (node ${fwd(path.join(BRAIN_DIR, 'klypix-mcp-server.mjs'))}) — no npx cache, works offline, always the installed version.`);
+    console.log(`✓ MCP supervisor runs from the local bundle (node ${fwd(path.join(BRAIN_DIR, 'klypix-mcp-server.mjs'))}) — compatible core updates activate without restarting the host.`);
     if (migrated) console.log(`✓ migrated ${migrated.file} klypix-canvas server: ${migrated.from} → ${migrated.to} (backup: .mcp.json.klypix-bak). Reconnect (/mcp) or restart to pick it up.`);
     console.log('  Claude Code keeps its existing auto-brief/capture hooks; Codex gets the brain_sync Context Gateway (compact task memory + clean peers + proactive/guaranteed conflict alerts) with no hook trust prompt.');
     console.log('  Enhanced Codex auto-context + pre-edit overlap guard: re-run with `--codex-hooks`, then approve/review KLYPIX once in a Codex surface that supports hook trust.');
-    console.log('  ⚠ Open sessions keep their OLD server until relaunched: fully quit & reopen the app (a session resume / new chat does NOT respawn the MCP server). `brain_doctor`\'s RUNNING line confirms when you\'re current.');
+    console.log('  Compatible brain-core updates hot-swap behind the same MCP connection. Only the one-time legacy→supervisor migration, a supervisor change, or an intentionally breaking tool/protocol change needs reconnect.');
     console.log('  Verify anytime: `npx klypix-mcp doctor`; prove two-client behavior with `npx klypix-mcp conformance`.');
 } catch (e) {
     if (gotLock) releaseLock();

@@ -179,8 +179,14 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
 {
   const vault = makeVault();
   await seedBrain(vault);
+  const isolatedHome = path.join(vault, '.test-home');
+  fs.mkdirSync(isolatedHome, { recursive: true });
   const client = new Client({ name: 'doctor-test', version: '1.0.0' }, { capabilities: {} });
-  const transport = new StdioClientTransport({ command: process.execPath, args: [BIN, '--vault', vault] });
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [BIN, '--vault', vault],
+    env: { ...process.env, HOME: isolatedHome, USERPROFILE: isolatedHome },
+  });
   await client.connect(transport);
 
   const names = (await client.listTools()).tools.map(t => t.name);

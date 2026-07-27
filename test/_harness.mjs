@@ -68,7 +68,7 @@ export async function driveServer(vault, binPath = BIN) {
   // server registry + left orphaned entries that showed up as phantom stale servers).
   const home = path.join(os.tmpdir(), 'klypix-test-home');
   try { fs.mkdirSync(home, { recursive: true }); } catch { /* */ }
-  const transport = new StdioClientTransport({ command: process.execPath, args: [binPath, '--vault', vault], env: { ...process.env, HOME: home, USERPROFILE: home } });
+  const transport = new StdioClientTransport({ command: process.execPath, args: [binPath, '--vault', vault], env: { ...process.env, HOME: home, USERPROFILE: home, KLYPIX_AUTO_UPDATE: '0' } });
   await client.connect(transport);
 
   const out = {};

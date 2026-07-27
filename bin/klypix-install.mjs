@@ -220,7 +220,7 @@ const flatten = (code) => code
     .replace(/\.\.\/src\/klypix-(core|format)\.mjs/g, './klypix-$1.mjs')
     // brain-doctor + agent-rules (the server's lazy `import('../src/brain-doctor.mjs')`
     // for the brain_doctor tool) → flat sibling refs in the runtime layout.
-    .replace(/\.\.\/src\/(brain-doctor|agent-rules|mcp-presence|mcp-supervisor)\.mjs/g, './$1.mjs')
+    .replace(/\.\.\/src\/(brain-doctor|agent-rules|mcp-presence|mcp-supervisor|mcp-auto-update)\.mjs/g, './$1.mjs')
     .replace(/klypix-worker\.mjs/g, 'klypix-mcp-worker.mjs')
     .replace(/const PKG_VERSION = \(\(\) => \{[\s\S]*?\}\)\(\);/, `const PKG_VERSION = '${VERSION}'; // baked at install (flat layout has no package.json)`);
 

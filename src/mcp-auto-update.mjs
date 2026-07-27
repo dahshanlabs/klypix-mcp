@@ -21,6 +21,7 @@ import path from 'path';
 import crypto from 'crypto';
 import https from 'https';
 import { spawn } from 'child_process';
+import { fileURLToPath } from 'url';
 
 export const AUTO_UPDATE_TTL_MS = 24 * 60 * 60 * 1000;
 export const AUTO_UPDATE_LOCK_STALE_MS = 30 * 60 * 1000;
@@ -104,6 +105,44 @@ export function inspectAutoUpdate(brainDir, { now = Date.now(), env = process.en
     lastUpdatedAt: status?.lastUpdatedAt || null,
     error: status?.error || null,
   };
+}
+
+/**
+ * Start the detached updater when this machine is due.
+ *
+ * Safe to call from both the stable supervisor and the replaceable worker:
+ * the shared stamp prevents unnecessary children and the helper lock collapses
+ * the remaining cross-process race.
+ */
+export function spawnAutoUpdateHelper({
+  brainDir = path.join(os.homedir(), '.claude', 'project-brain'),
+  currentVersion = null,
+  env = process.env,
+  spawnProcess = spawn,
+} = {}) {
+  if (!autoUpdateEnabled(env) || env.KLYPIX_MCP_AUTO_UPDATE_CHILD === '1') return null;
+  if (!inspectAutoUpdate(brainDir, { env }).due) return null;
+  try {
+    const helper = fileURLToPath(import.meta.url);
+    const child = spawnProcess(process.execPath, [helper, AUTO_UPDATE_WORKER_ARG], {
+      // Do not hold the managed directory as this detached process's cwd.
+      // This matters for ephemeral/test homes on Windows and is cleaner for
+      // uninstallers; the installer receives its exact target through env.
+      cwd: os.tmpdir(),
+      env: {
+        ...env,
+        KLYPIX_MCP_AUTO_UPDATE_DIR: path.resolve(brainDir),
+        KLYPIX_MCP_AUTO_UPDATE_CURRENT: String(currentVersion || ''),
+        KLYPIX_MCP_AUTO_UPDATE_CHILD: '1',
+      },
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    child.on('error', () => { /* fail-open: the MCP transport remains healthy */ });
+    child.unref();
+    return child;
+  } catch { return null; }
 }
 
 function acquireLock(lockFile, now, staleMs = AUTO_UPDATE_LOCK_STALE_MS) {

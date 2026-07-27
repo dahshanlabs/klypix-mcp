@@ -190,7 +190,7 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [BIN, '--vault', vault],
-    env: { ...process.env, HOME: isolatedHome, USERPROFILE: isolatedHome },
+    env: { ...process.env, HOME: isolatedHome, USERPROFILE: isolatedHome, KLYPIX_AUTO_UPDATE: '0' },
   });
   await client.connect(transport);
 

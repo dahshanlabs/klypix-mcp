@@ -21,11 +21,10 @@ import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
 import { spawn } from 'child_process';
-import { fileURLToPath } from 'url';
 import {
-  AUTO_UPDATE_WORKER_ARG,
   autoUpdateEnabled,
   inspectAutoUpdate,
+  spawnAutoUpdateHelper,
 } from './mcp-auto-update.mjs';
 
 const INTERNAL_PREFIX = '__klypix_supervisor__';
@@ -705,29 +704,10 @@ class Supervisor {
 
   scheduleAutoUpdate() {
     if (this.closed || !this.autoUpdate || process.env.KLYPIX_MCP_AUTO_UPDATE_CHILD === '1') return;
-    const brainDir = path.dirname(this.runtimeManifest);
-    const status = inspectAutoUpdate(brainDir);
-    if (!status.due) return;
-    try {
-      const helper = fileURLToPath(new URL('./mcp-auto-update.mjs', import.meta.url));
-      const child = spawn(process.execPath, [helper, AUTO_UPDATE_WORKER_ARG], {
-        // Do not hold the managed directory as this detached process's cwd.
-        // This matters for ephemeral/test homes on Windows and is cleaner for
-        // uninstallers; the installer receives its exact target through env.
-        cwd: os.tmpdir(),
-        env: {
-          ...process.env,
-          KLYPIX_MCP_AUTO_UPDATE_DIR: brainDir,
-          KLYPIX_MCP_AUTO_UPDATE_CURRENT: String(this.active?.version || this.fallbackTarget.version || ''),
-          KLYPIX_MCP_AUTO_UPDATE_CHILD: '1',
-        },
-        detached: true,
-        stdio: 'ignore',
-        windowsHide: true,
-      });
-      child.on('error', () => { /* fail-open: the MCP transport remains healthy */ });
-      child.unref();
-    } catch { /* update discovery must never affect MCP */ }
+    spawnAutoUpdateHelper({
+      brainDir: path.dirname(this.runtimeManifest),
+      currentVersion: this.active?.version || this.fallbackTarget.version,
+    });
   }
 
   flushHostQueue() {

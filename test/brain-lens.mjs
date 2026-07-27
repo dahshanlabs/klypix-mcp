@@ -97,7 +97,7 @@ console.log('\nL3 end-to-end via MCP client (brain_lens registered + returns):')
     const vault = makeVault();
     fs.writeFileSync(path.join(vault, 'brain.klypix'), buf);
     const client = new Client({ name: 'lens-test', version: '0.0.0' });
-    await client.connect(new StdioClientTransport({ command: process.execPath, args: [BIN], env: { ...process.env, KLYPIX_VAULT: vault } }));
+    await client.connect(new StdioClientTransport({ command: process.execPath, args: [BIN], env: { ...process.env, KLYPIX_VAULT: vault, KLYPIX_AUTO_UPDATE: '0' } }));
     try {
         const tools = await client.listTools();
         ok(tools.tools.some(t => t.name === 'brain_lens'), 'brain_lens listed');

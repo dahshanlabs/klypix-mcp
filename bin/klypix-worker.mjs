@@ -32,6 +32,7 @@ import {
 } from '../src/klypix-core.mjs';
 import { mcpServerEntry } from '../src/agent-rules.mjs';
 import { createMcpPresence, KLYPIX_MCP_INSTRUCTIONS } from '../src/mcp-presence.mjs';
+import { spawnAutoUpdateHelper } from '../src/mcp-auto-update.mjs';
 
 // Real package version for the MCP handshake (was hardcoded '1.0.0', which
 // misled every client/version diagnosis — it could never reflect the true release).
@@ -494,12 +495,18 @@ if (!canvasViewAsApp) {
 
 const transport = new StdioServerTransport();
 let runningHeartbeat = null;
+let autoUpdateStarter = null;
+let autoUpdatePoller = null;
 let runtimeStopped = false;
 const stopRuntimePresence = () => {
   if (runtimeStopped) return;
   runtimeStopped = true;
   if (runningHeartbeat) clearInterval(runningHeartbeat);
   runningHeartbeat = null;
+  if (autoUpdateStarter) clearTimeout(autoUpdateStarter);
+  if (autoUpdatePoller) clearInterval(autoUpdatePoller);
+  autoUpdateStarter = null;
+  autoUpdatePoller = null;
   recordRunningServer({ remove: true });
   mcpPresence.stop();
 };
@@ -508,6 +515,22 @@ server.server.oninitialized = () => {
   recordRunningServer();
   runningHeartbeat = setInterval(() => recordRunningServer(), 30_000);
   runningHeartbeat.unref?.();
+  // The worker mirrors the supervisor's host-neutral scheduler. This lets an
+  // older stable supervisor acquire the updater immediately after hot-swapping
+  // to a compatible new worker; no extra host reconnect is needed for the
+  // scheduler itself. Stamp + lock make the duplicate trigger effectively free.
+  const autoUpdateDir = path.dirname(
+    process.env.KLYPIX_MCP_RUNTIME_MANIFEST
+    || path.join(os.homedir(), '.claude', 'project-brain', '.mcp-runtime.json'),
+  );
+  const checkForCoreUpdate = () => spawnAutoUpdateHelper({
+    brainDir: autoUpdateDir,
+    currentVersion: PKG_VERSION,
+  });
+  autoUpdateStarter = setTimeout(checkForCoreUpdate, 2000);
+  autoUpdateStarter.unref?.();
+  autoUpdatePoller = setInterval(checkForCoreUpdate, 60 * 60 * 1000);
+  autoUpdatePoller.unref?.();
   log(`ready · vault=${VAULT} · presence=mcp`);
 };
 server.server.onclose = stopRuntimePresence;

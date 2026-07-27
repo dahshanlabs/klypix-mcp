@@ -5,11 +5,13 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { spawnSync } from 'child_process';
+import { EventEmitter } from 'events';
 import { fileURLToPath } from 'url';
 import {
   autoUpdatePaths,
   inspectAutoUpdate,
   runAutoUpdateCheck,
+  spawnAutoUpdateHelper,
 } from '../src/mcp-auto-update.mjs';
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-auto-update-'));
@@ -169,6 +171,32 @@ try {
   }
 
   {
+    const dir = scenario('worker-trigger');
+    let launch = null;
+    const fakeSpawn = (command, args, options) => {
+      launch = { command, args, options };
+      const child = new EventEmitter();
+      child.unref = () => {};
+      return child;
+    };
+    const child = spawnAutoUpdateHelper({
+      brainDir: dir,
+      currentVersion: '1.5.2',
+      env: {},
+      spawnProcess: fakeSpawn,
+    });
+    ok(!!child && launch?.command === process.execPath
+      && launch.options.env.KLYPIX_MCP_AUTO_UPDATE_CURRENT === '1.5.2',
+    'replaceable workers can activate the detached updater behind an older supervisor');
+    ok(launch.options.cwd === os.tmpdir(), 'detached checks do not hold the managed directory as their cwd');
+    ok(spawnAutoUpdateHelper({
+      brainDir: dir,
+      env: { KLYPIX_AUTO_UPDATE: '0' },
+      spawnProcess: () => { throw new Error('must not launch'); },
+    }) === null, 'worker and supervisor triggers both honor the opt-out');
+  }
+
+  {
     const dir = scenario('runtime-only-installer');
     const home = path.join(dir, 'home');
     const brainDir = path.join(home, '.claude', 'project-brain');
@@ -191,11 +219,13 @@ try {
       timeout: 120_000,
     });
     const runtime = JSON.parse(fs.readFileSync(path.join(brainDir, '.mcp-runtime.json'), 'utf8'));
+    const flatWorker = fs.readFileSync(path.join(brainDir, 'klypix-mcp-worker.mjs'), 'utf8');
     ok(result.status === 0 && fs.existsSync(path.join(brainDir, 'mcp-auto-update.mjs')), 'real runtime-only installer stages the updater and managed runtime atomically');
     ok(fs.readFileSync(projectConfig, 'utf8') === '{"sentinel":"unchanged"}\n'
       && !fs.existsSync(path.join(home, '.claude', 'settings.json')),
     'automatic runtime install preserves project config and host settings');
     ok(Object.prototype.hasOwnProperty.call(runtime.files, 'mcp-auto-update.mjs'), 'runtime integrity manifest covers the updater helper');
+    ok(flatWorker.includes("from './mcp-auto-update.mjs'"), 'flattened worker keeps a valid local updater import');
   }
 } finally {
   fs.rmSync(root, { recursive: true, force: true });

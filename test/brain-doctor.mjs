@@ -175,13 +175,16 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
   await client.connect(transport);
 
   const names = (await client.listTools()).tools.map(t => t.name);
+  ok(client.getInstructions()?.includes('call brain_sync'),
+    'MCP initialize response carries the portable smart-awareness instructions');
   ok(names.includes('brain_doctor'), 'brain_doctor is a registered MCP tool');
   ok(names.includes('brain_message'), 'brain_message is a registered MCP tool');
+  ok(names.includes('brain_sync'), 'brain_sync is a registered MCP tool');
   ok(names.includes('brain_ask'), 'brain_ask is a registered MCP tool');
   ok(names.includes('brain_challenge'), 'brain_challenge is a registered MCP tool');
   ok(names.includes('canvas_view'), 'canvas_view is a registered MCP tool');
   ok(names.includes('brain_lens'), 'brain_lens is a registered MCP tool');
-  ok(names.length === 17, `tool manifest is 17 verbs (got ${names.length})`);
+  ok(names.length === 18, `tool manifest is 18 verbs (got ${names.length})`);
 
   const r = await client.callTool({ name: 'brain_doctor', arguments: { project: vault } });
   const text = (r.content || []).filter(c => c.type === 'text').map(c => c.text).join('\n');
@@ -189,6 +192,19 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
   ok(/brain_doctor/.test(text) && /VERSION/.test(text) && /CLAUDE/.test(text)
     && /CODEX/.test(text) && /SESSIONS/.test(text),
   'brain_doctor returns the host-neutral layered verdict');
+  ok(/1 active/.test(text), 'the MCP connection itself is counted as a live session without hooks');
+
+  const synced = await client.callTool({
+    name: 'brain_sync',
+    arguments: { phase: 'start', intent: 'verify shared klypix-core MCP protocol awareness', files: ['test/brain-doctor.mjs'] },
+  });
+  const syncedText = (synced.content || []).filter(c => c.type === 'text').map(c => c.text).join('\n');
+  ok(/phase start/.test(syncedText)
+    && /No exact file overlap/.test(syncedText)
+    && /Compact task context/.test(syncedText)
+    && synced.structuredContent?.context?.mode === 'lexical-fast'
+    && Number.isFinite(synced.structuredContent?.timingMs?.total),
+  'brain_sync returns structured coordination + bounded task memory end-to-end over plain MCP');
 
   await client.close();
   fs.rmSync(vault, { recursive: true, force: true });

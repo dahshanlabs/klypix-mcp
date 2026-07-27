@@ -10,18 +10,33 @@ You've seen the setup: point an AI at a folder of notes, watch the graph fill up
 
 ## Quick start
 
-**Claude Code + Codex (native, machine-wide):**
+**Claude Code + Codex:**
 
 ```bash
 npx klypix-mcp install
 ```
 
-Claude Code keeps its live hooks for auto-brief + auto-capture. Codex gets a native
-`~/.codex/config.toml` MCP registration, conditional global guidance, and lifecycle
-hooks for truthful cross-agent presence and one-time messages. Existing MCP servers,
-hooks, settings, and personal instructions are preserved; KLYPIX owns only its fenced
-blocks and `codex-brain-hook.mjs` handlers, with backups before changes. Restart Codex
-after installation and approve the KLYPIX hooks when Codex presents its trust review.
+Claude Code keeps its live hooks for auto-brief + auto-capture. Codex gets native MCP
+tools, **automatic live-session presence**, and approval-free **smart task synchronization**
+from the authorized MCP connection itself. `brain_sync` is a bounded **Context Gateway**:
+one call returns task-relevant brain memory, meaningful active-task peers, structured
+exact-file conflicts, one-time notes, and automatic late-arrival overlap alerts. Idle MCP
+connections stay counted for diagnostics but are hidden from the task-peer list. MCP
+server instructions plus a managed Codex `AGENTS.md` block teach Codex to call it at task
+start, when scope changes, and on completion—no Codex hook approval required. Run inside a
+project containing `brain.klypix`, or run `npx klypix-mcp link` in each brain project.
+The installer removes the obsolete global KLYPIX `--vault "."` table that could resolve
+outside the active project; every unrelated Codex setting and MCP server is preserved.
+
+Optional native lifecycle capture for mechanical prompt/tool/file events:
+
+```bash
+npx klypix-mcp install --codex-hooks
+```
+
+Codex owns this native layer's security decision and asks the user to review/trust the
+hooks on surfaces that expose hook management. `brain_doctor` reports it separately as
+off, execution-unverified, or active; the approval-free smart layer remains active either way.
 
 Give a project a brain by dropping a `brain.klypix` in it — the
 [KLYPIX app](https://klypix.com) does it in one click (*Save canvas as project brain*),
@@ -41,7 +56,7 @@ managed files without changing them with `npx klypix-mcp link --check`.
 
 The difference from a folder of notes is not the shape — it's that this memory is a **mechanism, not a filing convention**:
 
-- **It briefs every session.** Each agent session starts already knowing the project's decisions, open questions, and standing rules — a compact brief (≈3–5k tokens even at 600+ cards, growing sublinearly). Measured on our own brain: **73% of past decisions recovered with one search round (55% brief-only) vs 0% cold** (n=20).
+- **It briefs each task, not just each session.** `brain_sync` ranks a bounded memory capsule from the actual task intent and expected files. The full generated brief remains available for broad history/status work, while the always-loaded `AGENTS.md` fallback stays compact. Measured on our own brain: **73% of past decisions recovered with one search round (55% brief-only) vs 0% cold** (n=20).
 - **It argues back.** `brain_challenge`: propose a decision and the brain answers with receipts — *"you reversed this on June 12; here's the correction — captured by a different agent, coordinate before overriding."* Deterministic evidence only (correction-cues, opposite-polarity), never mere topical similarity. A memory that can't disagree with you is flattery.
 - **It knows when it's stale.** Decision cards can anchor to the exact code they were decided against (git blob OID). When that code moves on, the card raises its hand in the next brief. Their notes rot silently; ours confess.
 - **It answers from the past.** `brain_ask` with `as_of: 2026-03-01` answers what the project believed *then* — corrections from the future never leak backwards.
@@ -59,7 +74,8 @@ And it's not a cage: everything **exports to Markdown and JSON Canvas** in one c
 
 ## Setup for plain MCP clients
 
-Any MCP client gets the tools without the hooks. For **Claude Desktop**, in `claude_desktop_config.json`:
+Any MCP client gets the tools and connection-lifecycle presence without host hooks. For
+**Claude Desktop**, in `claude_desktop_config.json`:
 
 ```json
 {
@@ -72,9 +88,14 @@ Any MCP client gets the tools without the hooks. For **Claude Desktop**, in `cla
 }
 ```
 
-Then ask your agent things like *"what did we decide about auth?"*, *"challenge this: let's switch to polling"*, or *"turn these notes into a board."*
+If the vault contains `brain.klypix`, that MCP connection also appears as an active
+session. `brain_sync` adds compact task memory, expected-file coordination, task-only peer
+reporting, structured exact-overlap warnings, automatic conflict alerts, timing receipts,
+and one-time peer-note delivery. Then ask your
+agent things like *"what did we decide about auth?"*, *"challenge this: let's switch
+to polling"*, or *"turn these notes into a board."*
 
-## The 17 verbs
+## The 18 verbs
 
 | Tool | What it does |
 |---|---|
@@ -83,9 +104,11 @@ Then ask your agent things like *"what did we decide about auth?"*, *"challenge 
 | `brain_note` | Capture with the full lifecycle — supersede / ✓ resolve / ~ update / 🛠 skill / closes: |
 | `brain_reconcile` | Find stale-vs-correction pairs + unrecorded migrations |
 | `brain_insights` | Hubs, orphaned decisions, stale questions, area sizes |
+| `brain_lens` | Machine-readable freshness, provenance, activity, timeline, orrery, and unresolved views |
 | `brain_garden` | Maintenance pass over the brain |
-| `brain_doctor` | Self-diagnosis: version, host adapters, active lifecycle sessions, projection drift |
+| `brain_doctor` | Self-diagnosis: version, core/enhanced host adapters, active sessions, projection drift |
 | `brain_message` | Session-to-session coordination notes |
+| `brain_sync` | Context Gateway: compact task memory, active-task peers, structured conflicts, automatic alerts, and timing |
 | `brain_connect` | Find + draw related-but-unlinked cards |
 | `canvas_view` | The board as an MCP App — Apps-capable chats get an interactive spatial view; everyone else gets clean text |
 | `read_canvas` | A canvas as markdown (cards, connection graph, `[[links]]`, `#tags`) |
@@ -97,23 +120,25 @@ Then ask your agent things like *"what did we decide about auth?"*, *"challenge 
 
 ### Tools vs. the *automatic* brain
 
-This package is the **agent-neutral read/write surface** — any MCP client gets the tools above on demand (*pull*), in any project. `install` wires Claude Code's existing capture path plus Codex's native MCP, conditional guidance, and separate presence adapter; `link` projects the repository-level MCP and instruction files used by other coding agents. Full transcript-driven auto-capture remains a Claude Code capability. Codex reports lifecycle presence and captures durable decisions explicitly through `brain_note`; hookless clients can use the MCP surface but are not reported as active.
+This package is the **agent-neutral read/write surface** — any MCP client gets the tools above on demand (*pull*), automatically registers presence for the lifetime of its authorized connection, and receives the Context Gateway workflow through standard MCP server instructions. `install` wires Claude Code's existing capture path and installs the local runtime; `link` projects repository-level MCP and instruction files for Codex and other coding agents. Codex and other clients retrieve relevant project memory and coordinate task intent/files through one `brain_sync` call, while `brain_note` captures durable decisions explicitly; optional host hooks add mechanically guaranteed lifecycle capture.
 
 ### Agent-neutral live presence
 
-An active session means a host lifecycle hook heartbeated within 10 minutes; a row in a
-recent-chat list is history, not presence. Claude Code and Codex publish into the same
-per-brain lane, while each host keeps its own adapter and capture behavior. `SessionEnd`
-removes clean exits immediately, and the TTL covers crashes.
+An active session means an authorized MCP connection or host lifecycle adapter
+heartbeated within 10 minutes; a row in a recent-chat list is history, not presence.
+Each MCP connection registers at initialization and removes itself on disconnect.
+Optional host adapters merge into that same logical session rather than double-counting
+it, enrich it with intent/files, and remove only their own channel. The TTL covers crashes.
 
-Future hosts can import `klypix-mcp/presence` and map their lifecycle events to
-`upsertSession`, `removeSession`, and `receiveMessages`. The shared contract accepts
-`id`, `client`, `surface`, `model`, `branch`, `intent`, and touched `files`; host-specific
-transcript parsing stays outside the protocol.
+Future hosts get baseline support merely by connecting the MCP server. A deeper adapter
+can import `klypix-mcp/presence` and map lifecycle events to `upsertSession`,
+`removeSession`, and `receiveMessages`. The shared contract accepts `id`, `client`,
+`surface`, `model`, `branch`, `intent`, touched `files`, and adapter `channel`;
+host-specific transcript parsing stays outside the protocol.
 
 ### Updates — the propagation contract
 
-`install` lays the whole brain (hooks + engine + local MCP server) into `~/.claude/project-brain`, then points both Claude and Codex at that installed bundle so there is no npx cache to go stale. Updates are automatic through the Claude session-start hook: it checks npm (≤ once/24h, fail-open, disable with `KLYPIX_AUTO_UPDATE=0`) and self-installs newer releases, including healing the Codex registration. One honest caveat: a running stdio server can't hot-swap — a new binary loads on the next full app launch (or `/mcp` reconnect); `brain_doctor`'s RUNNING line tells you when that's needed.
+`install` lays the whole brain (hooks + engine + local MCP server) into `~/.claude/project-brain` and keeps the current brain project's Codex config machine-portable. Updates are automatic through the Claude session-start hook: it checks npm (≤ once/24h, fail-open, disable with `KLYPIX_AUTO_UPDATE=0`) and self-installs newer releases. One honest caveat: a running stdio server can't hot-swap — a new binary loads on the next full app launch (or `/mcp` reconnect); `brain_doctor`'s RUNNING line tells you when that's needed.
 
 ## Also speaks A2A (Agent-to-Agent)
 

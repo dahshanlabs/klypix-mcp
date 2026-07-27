@@ -11,10 +11,10 @@
 //                 stamp's version key is channel-dependent (npm writes `brainVersion`,
 //                 the desktop app writes `appVersion`). + the deploy `dirty` flag.
 //   • CLAUDE    — are all 4 existing Claude Code hooks wired (HOOK_MARK present)?
-//   • CODEX     — are all 5 Codex presence lifecycle hooks wired?
+//   • CODEX     — automatic MCP presence + optional enhanced lifecycle hooks.
 //   • TOOLS     — the discoverable MCP verb manifest (what the installed server
 //                 REALLY registers) so a caller can't assume a phantom tool.
-//   • SESSIONS  — all live lifecycle sessions on this project's brain, by host.
+//   • SESSIONS  — all live MCP/lifecycle sessions on this project's brain, by host.
 //   • HARNESS   — per-file projection drift (ok/stale/hand-edited/missing) via the
 //                 versioned fence in agent-rules.
 //
@@ -25,7 +25,7 @@ import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
-import { auditProject, resolveVersion } from './agent-rules.mjs';
+import { auditProject, codexGlobalInstructionsInstalled, resolveVersion } from './agent-rules.mjs';
 import { codexPresenceHookStatus } from './codex-hooks.mjs';
 
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -164,6 +164,7 @@ function inspectPeers(brainDir, brainPath, now) {
       branch: s.branch || null,
       intent: s.intent || '',
       files: Array.isArray(s.files) ? s.files : [],
+      channels: Array.isArray(s.channels) ? s.channels : [],
       lastSeenMin: Math.round((now - (s.lastSeen || 0)) / 60000),
     }));
   return { file, live, count: live.length };
@@ -187,6 +188,10 @@ export function inspect(opts = {}) {
   const running = inspectRunning(brainDir, version.baked, now, opts.self);
   const hooks = inspectHooks(home);
   const codexHooks = codexPresenceHookStatus(home);
+  const codexSmart = {
+    mcpInstructions: true,
+    globalInstructions: codexGlobalInstructionsInstalled(home),
+  };
   const tools = inspectTools(brainDir, PKG_ROOT);
   const peers = inspectPeers(brainDir, brainPath, now);
 
@@ -208,7 +213,13 @@ export function inspect(opts = {}) {
     // is NOT drift; it's a reconnect prompt.
     running: !running.known ? 'unknown' : (running.matchesInstalled === false ? 'drift' : 'ok'),
     hooks: !hooks.settingsPresent ? 'absent' : (hooks.missing.length ? 'drift' : 'ok'),
-    codexHooks: codexHooks.installed ? 'ok' : 'drift',
+    // Codex MCP presence is the automatic baseline. Hooks are an OPTIONAL
+    // enrichment layer, so off/unverified must never make the brain "drifted".
+    codexHooks: codexHooks.error
+      ? 'warning'
+      : (!codexHooks.installed
+        ? 'optional'
+        : (codexHooks.executionStatus === 'observed' ? 'ok' : 'warning')),
     harness: hasBrain ? (harness.ok ? 'ok' : 'drift') : 'n/a',
   };
   const drifted = Object.values(layers).filter(s => s === 'drift').length;
@@ -222,11 +233,10 @@ export function inspect(opts = {}) {
     if (npm && npm.matches === false) actions.push(`npx klypix-mcp install   # installed brain v${version.baked} < npm latest v${npm.latest}`);
     if (running.matchesInstalled === false) actions.push(`/mcp reconnect (or restart the session)   # LIVE server v${running.version} ≠ installed v${version.baked} — the running MCP server is stale`);
     if (hooks.missing.length) actions.push(`npx klypix-mcp install   # half-wired: hooks not active — ${hooks.missing.join(', ')}`);
-    if (!codexHooks.installed) actions.push(`npx klypix-mcp install   # Codex live presence hooks missing: ${codexHooks.missing.join(', ')}`);
     if (hasBrain && !harness.ok) actions.push('npx klypix-mcp link      # harness configs drifted — re-project managed blocks');
   }
 
-  return { verdict, layers, drifted, version, running, hooks, codexHooks, tools, peers, sessions: peers, harness, npm, project: { dir: projectDir, brainPath, hasBrain }, brainDir, actions };
+  return { verdict, layers, drifted, version, running, hooks, codexSmart, codexHooks, tools, peers, sessions: peers, harness, npm, project: { dir: projectDir, brainPath, hasBrain }, brainDir, actions };
 }
 
 // One-line drift summary (empty when clean) — for a footer / status line.
@@ -238,7 +248,6 @@ export function driftLine(r) {
   if (r.npm && r.npm.matches === false) bits.push(`v${r.version.baked}<${r.npm.latest}`);
   if (r.running && r.running.matchesInstalled === false) bits.push(`live server v${r.running.version}≠installed v${r.version.baked} (/mcp reconnect)`);
   if (r.hooks.missing.length) bits.push(`${r.hooks.missing.length} hook(s) unwired`);
-  if (!r.codexHooks.installed) bits.push(`${r.codexHooks.missing.length} Codex presence hook(s) unwired`);
   if (r.project.hasBrain && !r.harness.ok) bits.push(`${r.harness.drift.length} harness file(s) drifted`);
   return bits.length ? `⚠️ brain DRIFTED: ${bits.join(' · ')}` : '';
 }
@@ -279,19 +288,29 @@ export function render(r, opts = {}) {
   if (!r.hooks.settingsPresent) L.push(`${hmark} ${c.bold}CLAUDE${c.rst}   no ~/.claude/settings.json found`);
   else if (r.hooks.missing.length) L.push(`${hmark} ${c.bold}CLAUDE${c.rst}   half-wired — missing: ${c.yel}${r.hooks.missing.join(', ')}${c.rst}  ${c.dim}(liveness up, readiness no)${c.rst}`);
   else L.push(`${hmark} ${c.bold}CLAUDE${c.rst}   existing 4-hook capture path intact: ${r.hooks.wired.join(', ')}`);
-  const chmark = r.layers.codexHooks === 'ok' ? ok : warn;
-  if (r.codexHooks.error) L.push(`${chmark} ${c.bold}CODEX${c.rst}    ${c.yel}${r.codexHooks.error}${c.rst}`);
-  else if (!r.codexHooks.installed) L.push(`${chmark} ${c.bold}CODEX${c.rst}    live presence missing: ${c.yel}${r.codexHooks.missing.join(', ')}${c.rst}`);
-  else L.push(`${chmark} ${c.bold}CODEX${c.rst}    all 5 live-presence hooks wired: ${r.codexHooks.wired.join(', ')}`);
+  const chmark = r.layers.codexHooks === 'warning' ? warn : ok;
+  const smart = r.codexSmart?.globalInstructions
+    ? 'approval-free Context Gateway active (task memory + clean peers + auto-alerts)'
+    : 'approval-free brain_sync Context Gateway available through MCP';
+  if (r.codexHooks.error) {
+    L.push(`${chmark} ${c.bold}CODEX${c.rst}    automatic MCP presence + ${smart}; optional native-hook config unreadable: ${c.yel}${r.codexHooks.error}${c.rst}`);
+  } else if (!r.codexHooks.installed) {
+    L.push(`${chmark} ${c.bold}CODEX${c.rst}    automatic MCP presence + ${smart} · native hooks off ${c.dim}(optional)${c.rst}`);
+  } else if (r.codexHooks.executionStatus !== 'observed') {
+    L.push(`${chmark} ${c.bold}CODEX${c.rst}    automatic MCP presence + ${smart} · ${c.yel}native hooks configured but execution not verified${c.rst}`);
+    L.push(`        ${c.dim}Context Gateway memory/coordination already works. Native hooks add mechanical lifecycle capture on Codex surfaces that support trust review.${c.rst}`);
+  } else {
+    L.push(`${chmark} ${c.bold}CODEX${c.rst}    automatic MCP presence + ${smart} · native hooks active ${c.dim}(last observed ${r.codexHooks.lastExecutedAt})${c.rst}`);
+  }
 
   // TOOLS
   L.push(`${ok} ${c.bold}TOOLS${c.rst}    ${r.tools.count} MCP verb(s)${r.tools.hash ? ` ${c.dim}[#${r.tools.hash}, ${r.tools.source}]${c.rst}` : ''}${r.tools.count ? `: ${c.dim}${r.tools.names.join(', ')}${c.rst}` : ''}`);
 
   // SESSIONS: this is an all-session count. A recent-chat row is not a heartbeat.
-  if (!r.sessions.count) L.push(`${ok} ${c.bold}SESSIONS${c.rst}  0 active lifecycle sessions ${c.dim}(saved/recent chats are history, not active)${c.rst}`);
+  if (!r.sessions.count) L.push(`${ok} ${c.bold}SESSIONS${c.rst}  0 active sessions ${c.dim}(saved/recent chats are history, not active)${c.rst}`);
   else {
-    L.push(`${r.sessions.count > 1 ? warn : ok} ${c.bold}SESSIONS${c.rst}  ${r.sessions.count} active lifecycle session${r.sessions.count === 1 ? '' : 's'} ${c.dim}(all hosts; 10-minute crash TTL)${c.rst}`);
-    for (const p of r.sessions.live) L.push(`        · ${p.client}:${p.id}${p.branch ? ' @' + p.branch : ''}${p.intent ? ` “${p.intent.slice(0, 50)}”` : ''} ${c.dim}(${p.lastSeenMin}m ago)${c.rst}`);
+    L.push(`${r.sessions.count > 1 ? warn : ok} ${c.bold}SESSIONS${c.rst}  ${r.sessions.count} active session${r.sessions.count === 1 ? '' : 's'} ${c.dim}(all hosts; MCP/lifecycle; 10-minute crash TTL)${c.rst}`);
+    for (const p of r.sessions.live) L.push(`        · ${p.client}:${p.id}${p.branch ? ' @' + p.branch : ''}${p.channels.length ? ` [${p.channels.join('+')}]` : ''}${p.intent ? ` “${p.intent.slice(0, 50)}”` : ''} ${c.dim}(${p.lastSeenMin}m ago)${c.rst}`);
   }
 
   // HARNESS

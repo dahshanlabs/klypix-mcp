@@ -11,6 +11,11 @@ import {
   SESSION_FRESH_MS,
   upsertSession,
 } from '../src/agent-presence.mjs';
+import {
+  buildPresenceSnapshot,
+  createMcpPresence,
+  KLYPIX_MCP_INSTRUCTIONS,
+} from '../src/mcp-presence.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const hook = path.join(root, 'src', 'codex-brain-hook.mjs');
@@ -71,6 +76,115 @@ upsertSession({ brainPath, home, now, id: 'one', client: 'codex' });
 removeSession({ brainPath, home, now: now + 1, id: 'one' });
 ok(!listActiveSessions({ brainPath, home, now: now + 1 }).some((session) => session.id === 'one'),
   'SessionEnd semantics remove a session immediately');
+
+upsertSession({ brainPath, home, now, id: 'merged', client: 'codex', channel: 'mcp' });
+upsertSession({ brainPath, home, now: now + 1, id: 'merged', client: 'codex', channel: 'lifecycle' });
+let merged = listActiveSessions({ brainPath, home, now: now + 1 }).find((session) => session.id === 'merged');
+ok(merged?.channels?.length === 2, 'MCP and lifecycle adapters merge into one logical session');
+removeSession({ brainPath, home, now: now + 2, id: 'merged', channel: 'mcp' });
+merged = listActiveSessions({ brainPath, home, now: now + 2 }).find((session) => session.id === 'merged');
+ok(merged?.channels?.length === 1 && merged.channels[0] === 'lifecycle',
+  'closing MCP preserves a still-live lifecycle channel');
+removeSession({ brainPath, home, now: now + 3, id: 'merged', channel: 'lifecycle' });
+ok(!listActiveSessions({ brainPath, home, now: now + 3 }).some((session) => session.id === 'merged'),
+  'logical session disappears after its final presence channel closes');
+
+fs.rmSync(path.dirname(laneFileFor(brainPath, home)), { recursive: true, force: true });
+
+const fakeServer = (name) => {
+  const notices = [];
+  return {
+    notices,
+    server: { getClientVersion: () => ({ name, version: 'test' }) },
+    sendLoggingMessage: (message) => { notices.push(message); },
+  };
+};
+const timer = () => ({ unref() {} });
+const mcpA = createMcpPresence({
+  server: fakeServer('codex-mcp-client'),
+  initialVault: project,
+  env: { KLYPIX_SESSION_ID: 'mcp-a' },
+  home,
+  now: () => now,
+  setIntervalFn: timer,
+  clearIntervalFn: () => {},
+});
+const mcpBServer = fakeServer('cursor');
+const mcpB = createMcpPresence({
+  server: mcpBServer,
+  initialVault: project,
+  env: { KLYPIX_SESSION_ID: 'mcp-b-full-session' },
+  home,
+  now: () => now + 1,
+  setIntervalFn: timer,
+  clearIntervalFn: () => {},
+});
+const queuedLane = laneFileFor(brainPath, home);
+fs.mkdirSync(path.dirname(queuedLane), { recursive: true });
+fs.writeFileSync(queuedLane, JSON.stringify({
+  sessions: [],
+  messages: [{
+    id: 'queued-message',
+    from: 'test-seed',
+    to: 'mcp-b-full-session',
+    text: 'queued before MCP initialization',
+    ts: now,
+    seen: [],
+  }],
+}));
+mcpA.start();
+const mcpBStart = mcpB.start();
+ok(mcpBStart.sessions.length === 2 && mcpBStart.notice.includes('2 active sessions'),
+  'a second authorized MCP connection automatically sees the first');
+ok(!mcpBStart.notice.includes('queued before MCP initialization'),
+  'MCP initialization does not consume a peer message through best-effort logging');
+ok(KLYPIX_MCP_INSTRUCTIONS.includes('call brain_sync') && KLYPIX_MCP_INSTRUCTIONS.includes('before editing'),
+  'standard MCP server instructions teach approval-free smart synchronization');
+const syncA = mcpA.sync({
+  phase: 'start',
+  intent: 'implement the shared runtime',
+  files: ['src/mcp-presence.mjs'],
+});
+ok(syncA.text.includes('phase start')
+  && syncA.structured.counts.activeTasks === 1
+  && syncA.structured.counts.backgroundConnections === 1
+  && syncA.structured.peers.length === 0,
+  'brain_sync publishes task intent while hiding idle MCP connections from the task-peer list');
+const syncB = mcpB.sync({
+  phase: 'start',
+  intent: 'review the shared runtime',
+  files: ['src\\mcp-presence.mjs', 'README.md'],
+});
+ok(syncB.conflicts.length === 1
+  && syncB.conflicts[0].files.includes('src/mcp-presence.mjs')
+  && syncB.text.includes('file-overlap warning')
+  && syncB.text.includes('queued before MCP initialization')
+  && syncB.alertsQueued.length === 1
+  && syncB.structured.counts.activeTasks === 2,
+  'brain_sync delivers queued messages, returns structured task peers, and flags exact overlap across path separators');
+const decorated = mcpA.decorateToolResult({ content: [{ type: 'text', text: 'tool result' }] });
+ok(decorated.content.some((block) => block.text?.includes('Automatic KLYPIX overlap alert')),
+  'a later conflicting task automatically alerts the earlier peer on its next KLYPIX action');
+const repeatB = mcpB.sync({
+  phase: 'checkpoint',
+  intent: 'review the shared runtime',
+  files: ['src/mcp-presence.mjs'],
+});
+ok(repeatB.alertsQueued.length === 0,
+  'automatic overlap alerts are exact-once within a task instead of spamming every checkpoint');
+const snapshot = buildPresenceSnapshot(repeatB.sessions, 'mcp-b-full-session', { now: now + 1 });
+ok(snapshot.activeTaskCount === 2 && snapshot.peers.length === 1 && snapshot.backgroundConnectionCount === 0,
+  'task presence is structurally separated from raw connection presence');
+const completed = mcpB.sync({ phase: 'complete' });
+const completedSession = completed.sessions.find((session) => session.id === 'mcp-b-full-session');
+ok(completedSession?.intent === '' && completedSession?.files?.length === 0,
+  'brain_sync completion clears stale task intent and expected files while the connection remains live');
+mcpB.stop();
+ok(listActiveSessions({ brainPath, home, now: now + 2 }).length === 1,
+  'closing one MCP connection removes only that live session');
+mcpA.stop();
+ok(listActiveSessions({ brainPath, home, now: now + 2 }).length === 0,
+  'closing the final MCP connection leaves no phantom sessions');
 
 fs.rmSync(path.dirname(laneFileFor(brainPath, home)), { recursive: true, force: true });
 const env = { ...process.env, HOME: home, USERPROFILE: home };

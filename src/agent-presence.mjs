@@ -79,9 +79,31 @@ function releaseLock(lockFile) {
   catch { /* best effort */ }
 }
 
+function freshChannelSeen(channelSeen, now) {
+  if (!channelSeen || typeof channelSeen !== 'object' || Array.isArray(channelSeen)) return {};
+  return Object.fromEntries(Object.entries(channelSeen)
+    .filter(([channel, seen]) => channel && now - Number(seen || 0) < SESSION_FRESH_MS));
+}
+
 function pruneSessions(sessions, now) {
-  return (Array.isArray(sessions) ? sessions : [])
-    .filter((session) => session?.id && now - Number(session.lastSeen || 0) < SESSION_FRESH_MS);
+  const out = [];
+  for (const session of (Array.isArray(sessions) ? sessions : [])) {
+    if (!session?.id) continue;
+    const hadChannels = session.channelSeen
+      && typeof session.channelSeen === 'object'
+      && !Array.isArray(session.channelSeen)
+      && Object.keys(session.channelSeen).length > 0;
+    const channelSeen = freshChannelSeen(session.channelSeen, now);
+    const seenValues = Object.values(channelSeen).map(Number).filter(Number.isFinite);
+    const lastSeen = seenValues.length ? Math.max(...seenValues) : Number(session.lastSeen || 0);
+    if ((hadChannels && !seenValues.length) || now - lastSeen >= SESSION_FRESH_MS) continue;
+    out.push({
+      ...session,
+      ...(hadChannels ? { channelSeen, channels: Object.keys(channelSeen) } : {}),
+      lastSeen,
+    });
+  }
+  return out;
 }
 
 function pruneMessages(messages, now) {
@@ -117,7 +139,9 @@ export function upsertSession({
   branch = null,
   intent,
   files,
+  replaceFiles = false,
   event = null,
+  channel = null,
   cwd = null,
   home,
   now = Date.now(),
@@ -131,9 +155,11 @@ export function upsertSession({
     const data = readLane(laneFile);
     const sessions = pruneSessions(data.sessions, now);
     const previous = sessions.find((session) => session.id === id) || {};
+    const channelSeen = freshChannelSeen(previous.channelSeen, now);
+    if (channel) channelSeen[String(channel)] = now;
     const mergedFiles = files === undefined
       ? normalizeFiles(previous.files)
-      : normalizeFiles([...(previous.files || []), ...(files || [])]);
+      : normalizeFiles(replaceFiles ? files : [...(previous.files || []), ...(files || [])]);
     const next = {
       ...previous,
       id: String(id),
@@ -147,6 +173,9 @@ export function upsertSession({
       intent: intent !== undefined ? String(intent || '').replace(/\s+/g, ' ').trim().slice(0, 160) : (previous.intent || ''),
       files: mergedFiles,
       event: event ?? previous.event ?? null,
+      ...(Object.keys(channelSeen).length
+        ? { channels: Object.keys(channelSeen), channelSeen }
+        : {}),
       cwd: cwd ? path.resolve(cwd) : (previous.cwd || path.dirname(brainPath)),
       startedAt: previous.startedAt || now,
       lastSeen: now,
@@ -165,7 +194,7 @@ export function upsertSession({
   }
 }
 
-export function removeSession({ brainPath, id, home, now = Date.now() }) {
+export function removeSession({ brainPath, id, channel = null, home, now = Date.now() }) {
   if (!brainPath || !id) return [];
   const laneFile = laneFileFor(brainPath, home);
   const lockFile = laneFile + '.lock';
@@ -173,7 +202,24 @@ export function removeSession({ brainPath, id, home, now = Date.now() }) {
   if (!gotLock) return listActiveSessions({ brainPath, home, now });
   try {
     const data = readLane(laneFile);
-    const sessions = pruneSessions(data.sessions, now).filter((session) => session.id !== id);
+    const sessions = [];
+    for (const session of pruneSessions(data.sessions, now)) {
+      if (session.id !== id) {
+        sessions.push(session);
+        continue;
+      }
+      if (!channel || !session.channelSeen || typeof session.channelSeen !== 'object') continue;
+      const channelSeen = freshChannelSeen(session.channelSeen, now);
+      delete channelSeen[String(channel)];
+      const seenValues = Object.values(channelSeen).map(Number).filter(Number.isFinite);
+      if (!seenValues.length) continue;
+      sessions.push({
+        ...session,
+        channels: Object.keys(channelSeen),
+        channelSeen,
+        lastSeen: Math.max(...seenValues),
+      });
+    }
     fs.mkdirSync(path.dirname(laneFile), { recursive: true });
     fs.writeFileSync(laneFile, JSON.stringify({
       ...data,
@@ -190,6 +236,7 @@ function messageTargetsSession(message, session, sessionId) {
   const target = String(message?.to || '').trim().toLowerCase();
   if (!target || target === 'all' || target === '*') return true;
   const searchable = [
+    String(sessionId || ''),
     String(sessionId || '').slice(0, 8),
     session?.branch,
     session?.intent,
@@ -245,6 +292,55 @@ export function receiveMessages({
   }
 }
 
+// Queue a one-time coordination message directly on the shared presence lane.
+// `dedupeKey` makes machine-generated alerts (for example, exact file overlap)
+// idempotent without weakening deliberate brain_message notes.
+export function postPresenceMessage({
+  brainPath,
+  from,
+  to = 'all',
+  text,
+  dedupeKey = '',
+  home,
+  now = Date.now(),
+}) {
+  const body = String(text || '').replace(/\s+/g, ' ').trim().slice(0, 400);
+  if (!brainPath || !from || !body) return { posted: false, message: null };
+  const laneFile = laneFileFor(brainPath, home);
+  const lockFile = laneFile + '.lock';
+  const gotLock = acquireLock(lockFile);
+  if (!gotLock) return { posted: false, message: null };
+  try {
+    const data = readLane(laneFile);
+    const sessions = pruneSessions(data.sessions, now);
+    const messages = pruneMessages(data.messages, now);
+    const key = String(dedupeKey || '').replace(/\s+/g, ' ').trim().slice(0, 240);
+    if (key) {
+      const existing = messages.find((message) => message?.dedupeKey === key);
+      if (existing) return { posted: false, message: existing };
+    }
+    const message = {
+      id: sha16(`${from}|${to}|${body}|${now}|${crypto.randomBytes(4).toString('hex')}`),
+      from: String(from).slice(0, 160),
+      to: String(to || 'all').replace(/\s+/g, ' ').trim().slice(0, 160) || 'all',
+      text: body,
+      ts: now,
+      seen: [],
+      ...(key ? { dedupeKey: key } : {}),
+    };
+    messages.push(message);
+    fs.mkdirSync(path.dirname(laneFile), { recursive: true });
+    fs.writeFileSync(laneFile, JSON.stringify({
+      ...data,
+      sessions,
+      messages: messages.slice(-30),
+    }));
+    return { posted: true, message };
+  } finally {
+    releaseLock(lockFile);
+  }
+}
+
 const clientLabel = (session) => {
   const client = String(session?.client || '').toLowerCase();
   if (!client) return 'Claude Code';
@@ -268,7 +364,7 @@ export function formatPresenceMessage(sessions, selfId, { includeSolo = false, n
     `KLYPIX session awareness: ${active.length} active session${active.length === 1 ? '' : 's'} on this project (${mix || 'none'}); ${others.length} other${others.length === 1 ? '' : 's'} besides this chat.`,
   ];
   if (!others.length) {
-    lines.push('Saved/recent chat rows are history, not active sessions; a session counts only while its lifecycle hook has heartbeated in the last 10 minutes.');
+    lines.push('Saved/recent chat rows are history, not active sessions; a session counts only while an authorized MCP connection or lifecycle adapter has heartbeated in the last 10 minutes.');
     return lines.join('\n');
   }
   lines.push('Other active sessions:');

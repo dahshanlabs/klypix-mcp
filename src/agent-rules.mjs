@@ -214,9 +214,11 @@ export function safeReadCodexConfig(configPath) {
     const block = raw.slice(table.start, table.end);
     const commandLine = block.match(/^[ \t]*command[ \t]*=[ \t]*(.+)$/m);
     const command = commandLine ? parseTomlStringValue(commandLine[1]) : null;
+    const cwdLine = block.match(/^[ \t]*cwd[ \t]*=[ \t]*(.+)$/m);
+    const cwd = cwdLine ? parseTomlStringValue(cwdLine[1]) : null;
     const launchesKlypix = /(?:klypix-mcp-server\.mjs|(?:^|["'\s,])klypix-mcp(?:["'\s,]|$))/i.test(block)
       && !!command && /(?:^|[\\/])(node|node\.exe|npx|npx\.cmd|cmd|cmd\.exe)$/i.test(command);
-    servers[name] = { command, launchesKlypix, raw: block };
+    servers[name] = { command, cwd, launchesKlypix, raw: block };
   }
   return { ok: true, raw, servers, tables: scanned.tables };
 }
@@ -650,7 +652,17 @@ export function linkProject(projectDir, opts = {}) {
         if (!parsed.ok) return { tool: m.tool, file, status: 'hand-edited', why: parsed.error };
         const name = Object.keys(parsed.servers).find(k => /klypix/i.test(k));
         const entry = name ? parsed.servers[name] : null;
-        return { tool: m.tool, file, status: entry ? (entry.launchesKlypix ? 'ok' : 'hand-edited') : 'missing', why: entry && !entry.launchesKlypix ? 'entry no longer launches klypix-mcp' : undefined };
+        const escapesProject = entry?.cwd === '..';
+        return {
+          tool: m.tool,
+          file,
+          status: entry ? (entry.launchesKlypix && !escapesProject ? 'ok' : 'hand-edited') : 'missing',
+          why: entry && !entry.launchesKlypix
+            ? 'entry no longer launches klypix-mcp'
+            : escapesProject
+              ? 'legacy cwd = ".." starts Codex MCP outside the project'
+              : undefined,
+        };
       }
       // Project config is commonly committed. Keep it machine-portable; the
       // 120s Codex startup timeout covers the one-time npx bootstrap.

@@ -49,6 +49,15 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
   ok(statusOf(a, '.codex/config.toml') === 'ok', 'Codex project MCP config generated + audited');
   const codexRaw = fs.readFileSync(path.join(proj, '.codex', 'config.toml'), 'utf8');
   ok(codexRaw.includes('model = "gpt-test"') && codexRaw.includes('[mcp_servers.docs]'), 'Codex merge preserves unrelated settings, comments, and MCP servers');
+  fs.writeFileSync(path.join(proj, '.codex', 'config.toml'), codexRaw.replace('cwd = "."', 'cwd = ".."'));
+  a = auditProject(proj, { version: '1.2.3' });
+  const legacyCodex = a.files.find(f => f.file === '.codex/config.toml');
+  ok(legacyCodex?.status === 'hand-edited' && /outside the project/.test(legacyCodex?.why || ''),
+    'doctor flags the legacy Codex cwd that escapes the project');
+  linkProject(proj, { version: '1.2.3' });
+  ok(fs.readFileSync(path.join(proj, '.codex', 'config.toml'), 'utf8').includes('cwd = "."'),
+    're-link repairs the legacy Codex project cwd');
+  a = auditProject(proj, { version: '1.2.3' });
   ok(statusOf(a, 'GEMINI.md') === 'ok' && statusOf(a, 'CONVENTIONS.md') === 'ok', 'GEMINI.md + CONVENTIONS.md generated (were "not generated")');
 
   // ZERO-TOUCH — newer current version but IDENTICAL content → still ok (a version-

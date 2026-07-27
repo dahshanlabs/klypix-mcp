@@ -7,6 +7,7 @@ import {
   formatPresenceMessage,
   laneFileFor,
   listActiveSessions,
+  MCP_SESSION_FRESH_MS,
   removeSession,
   SESSION_FRESH_MS,
   upsertSession,
@@ -79,6 +80,13 @@ ok(soloSummary.includes('recent chat rows are history, not active sessions'),
 
 const pruned = listActiveSessions({ brainPath, home, now: now + SESSION_FRESH_MS + 2000 });
 ok(pruned.length === 0, 'crashed sessions expire after the presence TTL');
+
+upsertSession({ brainPath, home, now, id: 'mcp-crash', client: 'codex', channel: 'mcp' });
+upsertSession({ brainPath, home, now, id: 'lifecycle-idle', client: 'claude-code', channel: 'lifecycle' });
+const channelPruned = listActiveSessions({ brainPath, home, now: now + MCP_SESSION_FRESH_MS + 1000 });
+ok(!channelPruned.some((session) => session.id === 'mcp-crash')
+  && channelPruned.some((session) => session.id === 'lifecycle-idle'),
+'heartbeat-backed MCP crashes expire quickly without shortening lifecycle-only session grace');
 
 upsertSession({ brainPath, home, now, id: 'one', client: 'codex' });
 removeSession({ brainPath, home, now: now + 1, id: 'one' });

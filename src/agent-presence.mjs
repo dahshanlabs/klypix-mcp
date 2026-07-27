@@ -10,6 +10,7 @@ import os from 'os';
 import path from 'path';
 
 export const SESSION_FRESH_MS = 10 * 60 * 1000;
+export const MCP_SESSION_FRESH_MS = 3 * 60 * 1000;
 export const MESSAGE_FRESH_MS = 24 * 60 * 60 * 1000;
 
 const sha16 = (value) => crypto.createHash('sha1').update(String(value)).digest('hex').slice(0, 16);
@@ -82,7 +83,8 @@ function releaseLock(lockFile) {
 function freshChannelSeen(channelSeen, now) {
   if (!channelSeen || typeof channelSeen !== 'object' || Array.isArray(channelSeen)) return {};
   return Object.fromEntries(Object.entries(channelSeen)
-    .filter(([channel, seen]) => channel && now - Number(seen || 0) < SESSION_FRESH_MS));
+    .filter(([channel, seen]) => channel
+      && now - Number(seen || 0) < (channel === 'mcp' ? MCP_SESSION_FRESH_MS : SESSION_FRESH_MS)));
 }
 
 function pruneSessions(sessions, now) {

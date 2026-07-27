@@ -20,7 +20,9 @@ Claude Code keeps its live hooks for auto-brief + auto-capture. Codex gets nativ
 tools, **automatic live-session presence**, and approval-free **smart task synchronization**
 from the authorized MCP connection itself. `brain_sync` is a bounded **Context Gateway**:
 one call returns task-relevant brain memory, meaningful active-task peers, structured
-exact-file conflicts, one-time notes, and automatic late-arrival overlap alerts. Idle MCP
+exact-file conflicts, one-time notes, and automatic late-arrival overlap alerts. The
+earlier session gets a best-effort live MCP logging notification within seconds, while
+the same alert remains guaranteed on its next KLYPIX action if its host hides logs. Idle MCP
 connections stay counted for diagnostics but are hidden from the task-peer list. MCP
 server instructions plus a managed Codex `AGENTS.md` block teach Codex to call it at task
 start, when scope changes, and on completion—no Codex hook approval required. Run inside a
@@ -35,8 +37,19 @@ npx klypix-mcp install --codex-hooks
 ```
 
 Codex owns this native layer's security decision and asks the user to review/trust the
-hooks on surfaces that expose hook management. `brain_doctor` reports it separately as
-off, execution-unverified, or active; the approval-free smart layer remains active either way.
+hooks on surfaces that expose hook management. Once trusted, the enhanced layer
+automatically injects bounded task-ranked brain memory on every prompt and warns before
+an exact overlapping file edit. `brain_doctor` reports it separately as off,
+execution-unverified, or active; the approval-free smart layer remains active either way.
+
+Prove the exact installed runtime with two isolated real MCP clients:
+
+```bash
+npx klypix-mcp conformance
+```
+
+The test touches only a temporary fixture. It verifies tool discovery, task memory,
+truthful peers, blocking overlap detection, proactive logging, and guaranteed in-band delivery.
 
 Give a project a brain by dropping a `brain.klypix` in it — the
 [KLYPIX app](https://klypix.com) does it in one click (*Save canvas as project brain*),
@@ -91,7 +104,7 @@ Any MCP client gets the tools and connection-lifecycle presence without host hoo
 If the vault contains `brain.klypix`, that MCP connection also appears as an active
 session. `brain_sync` adds compact task memory, expected-file coordination, task-only peer
 reporting, structured exact-overlap warnings, automatic conflict alerts, timing receipts,
-and one-time peer-note delivery. Then ask your
+best-effort proactive notifications, and guaranteed one-time peer-note delivery. Then ask your
 agent things like *"what did we decide about auth?"*, *"challenge this: let's switch
 to polling"*, or *"turn these notes into a board."*
 
@@ -132,7 +145,7 @@ it, enrich it with intent/files, and remove only their own channel. The TTL cove
 
 Future hosts get baseline support merely by connecting the MCP server. A deeper adapter
 can import `klypix-mcp/presence` and map lifecycle events to `upsertSession`,
-`removeSession`, and `receiveMessages`. The shared contract accepts `id`, `client`,
+`removeSession`, `peekMessages`, and `receiveMessages`. The shared contract accepts `id`, `client`,
 `surface`, `model`, `branch`, `intent`, touched `files`, and adapter `channel`;
 host-specific transcript parsing stays outside the protocol.
 

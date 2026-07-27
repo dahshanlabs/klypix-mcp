@@ -276,7 +276,11 @@ try {
     for (const f of ['global-brain-hook.mjs', 'brain-semantic.mjs', 'brain-note.mjs', 'brain-git-hook.mjs', 'klypix-format.mjs', 'klypix-core.mjs', 'agent-rules.mjs', 'brain-doctor.mjs', 'agent-presence.mjs', 'mcp-presence.mjs', 'codex-brain-hook.mjs', 'codex-hooks.mjs', 'canvas-view-app.html']) {
         const s = path.join(SRC, f); if (exists(s)) staged.push({ dst: f, content: fs.readFileSync(s, 'utf8') });
     }
-    for (const [src, dst] of [['klypix-mcp.mjs', 'klypix-mcp-server.mjs'], ['klypix-a2a.mjs', 'klypix-a2a-server.mjs']]) {
+    for (const [src, dst] of [
+        ['klypix-mcp.mjs', 'klypix-mcp-server.mjs'],
+        ['klypix-a2a.mjs', 'klypix-a2a-server.mjs'],
+        ['klypix-conformance.mjs', 'klypix-conformance.mjs'],
+    ]) {
         const s = path.join(BIN, src); if (exists(s)) staged.push({ dst, content: flatten(fs.readFileSync(s, 'utf8')) });
     }
     for (const st of staged) fs.writeFileSync(path.join(BRAIN_DIR, st.dst + '.klypix-new'), st.content);
@@ -344,10 +348,10 @@ try {
     else console.error(`⚠ readiness: ${notWired.length} hook(s) did NOT take (${notWired.join(', ')}) — the brain will read but not capture/sync. Re-run \`npx klypix-mcp install --force\` or check ${SETTINGS}.`);
     console.log(`✓ MCP server runs from the local bundle (node ${fwd(path.join(BRAIN_DIR, 'klypix-mcp-server.mjs'))}) — no npx cache, works offline, always the installed version.`);
     if (migrated) console.log(`✓ migrated ${migrated.file} klypix-canvas server: ${migrated.from} → ${migrated.to} (backup: .mcp.json.klypix-bak). Reconnect (/mcp) or restart to pick it up.`);
-    console.log('  Claude Code keeps its existing auto-brief/capture hooks; Codex gets the brain_sync Context Gateway (compact task memory + clean peers + automatic conflict alerts) with no hook trust prompt.');
-    console.log('  Optional mechanical Codex lifecycle capture: re-run with `--codex-hooks`, then approve/review KLYPIX in a Codex surface that supports hook trust.');
+    console.log('  Claude Code keeps its existing auto-brief/capture hooks; Codex gets the brain_sync Context Gateway (compact task memory + clean peers + proactive/guaranteed conflict alerts) with no hook trust prompt.');
+    console.log('  Enhanced Codex auto-context + pre-edit overlap guard: re-run with `--codex-hooks`, then approve/review KLYPIX once in a Codex surface that supports hook trust.');
     console.log('  ⚠ Open sessions keep their OLD server until relaunched: fully quit & reopen the app (a session resume / new chat does NOT respawn the MCP server). `brain_doctor`\'s RUNNING line confirms when you\'re current.');
-    console.log('  Verify anytime: `npx klypix-mcp doctor` (is the brain current + wired + in sync, who else is live).');
+    console.log('  Verify anytime: `npx klypix-mcp doctor`; prove two-client behavior with `npx klypix-mcp conformance`.');
 } catch (e) {
     if (gotLock) releaseLock();
     console.error(`✗ install failed: ${e?.message || e}`);

@@ -57,6 +57,11 @@ if (process.argv[2] === 'link') { await import('./klypix-link.mjs'); process.exi
 // projection in sync? One verdict, one reconcile block. Exits 1 on drift (CI gate).
 if (process.argv[2] === 'doctor') { await import('./klypix-doctor.mjs'); process.exit(0); }
 
+// `npx klypix-mcp conformance` — launch two real, isolated MCP clients against
+// this exact installed server and verify task memory, truthful peers, blocking
+// overlap detection, proactive logging, and guaranteed next-action delivery.
+if (process.argv[2] === 'conformance') { await import('./klypix-conformance.mjs'); process.exit(0); }
+
 // `npx klypix-mcp garden-code` — the HUMAN half of the garden approval gate.
 // brain_garden's apply requires an 8-char code derived from the exact dormant
 // candidate set + day; the agent is deliberately never shown it. The human runs
@@ -106,7 +111,10 @@ const vaultArgIdx = process.argv.indexOf('--vault');
 const VAULT = resolveVault(vaultArgIdx >= 0 ? process.argv[vaultArgIdx + 1] : undefined);
 const server = new McpServer(
   { name: 'klypix-canvas', version: PKG_VERSION },
-  { instructions: KLYPIX_MCP_INSTRUCTIONS },
+  {
+    instructions: KLYPIX_MCP_INSTRUCTIONS,
+    capabilities: { logging: {} },
+  },
 );
 const mcpPresence = createMcpPresence({ server, initialVault: VAULT });
 

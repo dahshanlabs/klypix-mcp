@@ -11,6 +11,7 @@ import {
   SESSION_FRESH_MS,
   upsertSession,
 } from '../src/agent-presence.mjs';
+import { buildKlypixMap } from '../src/klypix-core.mjs';
 import {
   buildPresenceSnapshot,
   createMcpPresence,
@@ -30,7 +31,14 @@ const project = path.join(os.tmpdir(), 'klypix-presence-project');
 for (const dir of [home, project]) fs.rmSync(dir, { recursive: true, force: true });
 fs.mkdirSync(project, { recursive: true });
 const brainPath = path.join(project, 'brain.klypix');
-fs.writeFileSync(brainPath, 'fixture');
+fs.writeFileSync(brainPath, await buildKlypixMap({
+  title: 'presence fixture',
+  kind: 'brain',
+  areas: [{
+    title: 'Brain',
+    cards: [{ text: 'When working on a different file, load the compact task context before editing.' }],
+  }],
+}));
 
 const now = 2_000_000_000_000;
 upsertSession({
@@ -100,8 +108,9 @@ const fakeServer = (name) => {
   };
 };
 const timer = () => ({ unref() {} });
+const mcpAServer = fakeServer('codex-mcp-client');
 const mcpA = createMcpPresence({
-  server: fakeServer('codex-mcp-client'),
+  server: mcpAServer,
   initialVault: project,
   env: { KLYPIX_SESSION_ID: 'mcp-a' },
   home,
@@ -162,9 +171,15 @@ ok(syncB.conflicts.length === 1
   && syncB.alertsQueued.length === 1
   && syncB.structured.counts.activeTasks === 2,
   'brain_sync delivers queued messages, returns structured task peers, and flags exact overlap across path separators');
+const previewed = mcpA.pollInbox();
+ok(previewed.some((message) => message.text.includes('Automatic KLYPIX overlap alert'))
+  && mcpAServer.notices.some((notice) => String(notice.data).includes('Automatic KLYPIX overlap alert')),
+  'the earlier session receives a proactive MCP logging notification without waiting for another tool');
+ok(mcpA.pollInbox().length === 0,
+  'proactive logging is de-duplicated instead of repeating on every inbox poll');
 const decorated = mcpA.decorateToolResult({ content: [{ type: 'text', text: 'tool result' }] });
 ok(decorated.content.some((block) => block.text?.includes('Automatic KLYPIX overlap alert')),
-  'a later conflicting task automatically alerts the earlier peer on its next KLYPIX action');
+  'proactive preview does not consume the guaranteed next-action alert');
 const repeatB = mcpB.sync({
   phase: 'checkpoint',
   intent: 'review the shared runtime',
@@ -205,6 +220,14 @@ const startJson = JSON.parse(startOutput);
 ok(startJson.continue === true && /1 active session/.test(startJson.systemMessage),
   'real Codex SessionStart hook publishes and returns truthful awareness');
 
+runHook({
+  session_id: 'codex-real-a',
+  cwd: project,
+  hook_event_name: 'PostToolUse',
+  turn_id: 'turn-overlap',
+  tool_name: 'apply_patch',
+  tool_input: { patch: '*** Update File: src/example.mjs\n@@\n-old\n+peer\n' },
+});
 const promptOutput = runHook({
   session_id: 'codex-real-b',
   cwd: project,
@@ -214,17 +237,42 @@ const promptOutput = runHook({
 const promptJson = JSON.parse(promptOutput);
 ok(/2 active sessions/.test(promptJson.systemMessage) && /codex-r/.test(promptJson.systemMessage),
   'a second real Codex hook sees the first active session');
+ok(/Compact task context/.test(promptJson.systemMessage)
+  && /load the compact task context/.test(promptJson.systemMessage),
+  'UserPromptSubmit automatically injects bounded task-ranked brain memory');
+
+const preToolOutput = runHook({
+  session_id: 'codex-real-b',
+  cwd: project,
+  hook_event_name: 'PreToolUse',
+  turn_id: 'turn-overlap',
+  tool_name: 'apply_patch',
+  tool_input: { patch: '*** Update File: src/example.mjs\n@@\n-old\n+new\n' },
+});
+const preToolJson = JSON.parse(preToolOutput);
+ok(/BLOCKING exact-file overlap/.test(preToolJson.systemMessage)
+  && /src\/example\.mjs/.test(preToolJson.systemMessage),
+  'PreToolUse warns the later Codex session before an exact overlapping edit');
 
 runHook({
   session_id: 'codex-real-b',
   cwd: project,
   hook_event_name: 'PostToolUse',
+  turn_id: 'turn-overlap',
   tool_name: 'apply_patch',
   tool_input: { patch: '*** Update File: src/example.mjs\n@@\n-old\n+new\n' },
 });
 const live = listActiveSessions({ brainPath, home });
 ok(live.find((session) => session.id === 'codex-real-b')?.files.includes('src/example.mjs'),
   'PostToolUse records touched files without reading a transcript');
+const peerAlertOutput = runHook({
+  session_id: 'codex-real-a',
+  cwd: project,
+  hook_event_name: 'Stop',
+});
+const peerAlertJson = JSON.parse(peerAlertOutput);
+ok(/Automatic KLYPIX pre-edit overlap alert/.test(peerAlertJson.systemMessage),
+  'the pre-edit hook automatically alerts the earlier peer through its lifecycle channel');
 
 runHook({
   session_id: 'codex-real-a',

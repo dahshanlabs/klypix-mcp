@@ -292,6 +292,39 @@ export function receiveMessages({
   }
 }
 
+// Non-destructive inbox preview for MCP logging notifications. Unlike
+// receiveMessages(), this NEVER appends the session id to message.seen, so a
+// host that ignores notifications cannot make a coordination warning vanish.
+// The next KLYPIX tool result or lifecycle hook still receives + acknowledges
+// the same message through the guaranteed in-band path.
+export function peekMessages({
+  brainPath,
+  sessionId,
+  ignoreTexts = [],
+  home,
+  now = Date.now(),
+}) {
+  if (!brainPath || !sessionId) return [];
+  const data = readLane(laneFileFor(brainPath, home));
+  const sessions = pruneSessions(data.sessions, now);
+  const messages = pruneMessages(data.messages, now);
+  const me = sessions.find((session) => session.id === sessionId);
+  const ignored = new Set(ignoreTexts.map((value) =>
+    String(value || '').replace(/\s+/g, ' ').trim().toLowerCase()));
+  const shown = [];
+  const seenText = new Set();
+  for (const message of messages) {
+    if (message.from === sessionId
+      || (Array.isArray(message.seen) && message.seen.includes(sessionId))
+      || !messageTargetsSession(message, me, sessionId)) continue;
+    const key = String(message.text || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    if (!key || ignored.has(key) || seenText.has(key)) continue;
+    seenText.add(key);
+    shown.push(message);
+  }
+  return shown.slice(0, 6);
+}
+
 // Queue a one-time coordination message directly on the shared presence lane.
 // `dedupeKey` makes machine-generated alerts (for example, exact file overlap)
 // idempotent without weakening deliberate brain_message notes.

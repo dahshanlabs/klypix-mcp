@@ -194,6 +194,9 @@ function runInstall(home, projectCwd, args = []) {
     fs.existsSync(path.join(bd, name))
     && crypto.createHash('sha256').update(fs.readFileSync(path.join(bd, name))).digest('hex') === expected),
   'D: runtime pointer hashes verify every staged file');
+  const installedAudit = inspect({ home, projectDir: proj });
+  ok(installedAudit.tools.count === new Set(installedAudit.tools.names).size,
+    'D: doctor reports the exact unique tool count when App and fallback registrations share a name');
   const baked = fs.readFileSync(path.join(bd, 'klypix-mcp-server.mjs'), 'utf8');
   ok(new RegExp(`const PKG_VERSION = '${PKG_VERSION.replace(/\./g, '\\.')}'`).test(baked), 'D: server has the baked version (flat layout has no package.json)');
   // migration: the project .mcp.json flipped npx → local node, with a backup.

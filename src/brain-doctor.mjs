@@ -98,7 +98,8 @@ function inspectTools(brainDir, pkgRoot) {
     // MCP App registers through it; the manifest must count it or doctor drifts.
     const re = /(?:server\.registerTool|registerAppTool)\(\s*(?:server\s*,\s*)?['"]([^'"]+)['"]/g;
     let mm; while ((mm = re.exec(src))) names.push(mm[1]);
-    if (names.length) return { names, count: names.length, source: f.startsWith(brainDir) ? 'deployed' : 'package', hash: sha(names.slice().sort().join(',')).slice(0, 8) };
+    const uniqueNames = [...new Set(names)];
+    if (uniqueNames.length) return { names: uniqueNames, count: uniqueNames.length, source: f.startsWith(brainDir) ? 'deployed' : 'package', hash: sha(uniqueNames.slice().sort().join(',')).slice(0, 8) };
   }
   return { names: [], count: 0, source: null, hash: null };
 }

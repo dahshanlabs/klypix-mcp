@@ -709,7 +709,20 @@ function filesInEntry(entry) {
 // tool_use blocks, no model marker required. Only commands that SUCCEEDED (their
 // tool_result wasn't an error) count, so a failed `gh pr merge` never fabricates a
 // card; dedup rides the same persistent seen-set as markers.
-const SHELL_TOOLS = new Set(['Bash', 'run_shell', 'shell']);
+// One membership test for "is this tool a shell?" across every host the brain
+// rides in: Claude Code (Bash, PowerShell), Codex CLI (shell, local_shell),
+// Gemini CLI (run_shell_command), Cursor (run_terminal_cmd), Cline/Roo
+// (execute_command), VS Code Copilot (run_in_terminal), plus generic bridge
+// names. Compared case-insensitively — hosts disagree on casing before they
+// disagree on names. 2026-07-29 field hole: this Stop-side set lacked
+// 'PowerShell' while the live detector included it, so on Windows a
+// `gh release create` run through the PowerShell tool produced NO ship card —
+// the v1.3.69 ship triggered no claim reconciliation at all.
+const SHELL_TOOL_NAMES = new Set([
+    'bash', 'powershell', 'shell', 'local_shell', 'run_shell', 'run_shell_command',
+    'run_terminal_cmd', 'execute_command', 'run_in_terminal', 'run_command', 'terminal', 'exec',
+]);
+const isShellTool = (name) => SHELL_TOOL_NAMES.has(String(name || '').toLowerCase());
 const SHIP_PATTERNS = [
     // PR number is read ONLY from the `pr merge <n>` argument — not "any number in the
     // command" (which grabbed a stray digit from `-R owner/repo4`, mislabeling it #4).
@@ -726,7 +739,7 @@ function scanToolBlocks(entry, shellCmds, errorIds) {
     const c = (entry?.message ?? entry)?.content;
     if (!Array.isArray(c)) return;
     for (const b of c) {
-        if (b?.type === 'tool_use' && SHELL_TOOLS.has(b.name) && typeof b.input?.command === 'string') shellCmds.push({ id: b.id, cmd: b.input.command });
+        if (b?.type === 'tool_use' && isShellTool(b.name) && typeof b.input?.command === 'string') shellCmds.push({ id: b.id, cmd: b.input.command });
         else if (b?.type === 'tool_result' && b.is_error && b.tool_use_id) errorIds.add(b.tool_use_id);
     }
 }
@@ -760,6 +773,35 @@ const COMMIT_STATE = path.resolve(CWD, '.claude', 'brain-last-commit');
 const readLastCommit = () => { try { return fs.readFileSync(COMMIT_STATE, 'utf8').trim() || null; } catch { return null; } };
 const writeLastCommit = (s) => { try { fs.mkdirSync(path.dirname(COMMIT_STATE), { recursive: true }); fs.writeFileSync(COMMIT_STATE, String(s || '')); } catch { /* best-effort */ } };
 const git = (args) => execSync(`git ${args}`, { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 4000 }).trim();
+
+// --- Out-of-session ship observation (class-C decay leg, 2026-07-29) --------
+// A ship that happens with NO hooked session watching — another host, a human
+// terminal, CI — used to produce no 🏁 card and trigger no claim
+// reconciliation: the brain only learned what a session narrated (the v1.3.69
+// ship arrived exactly this way and its resolved ❓ stayed open for a day).
+// SessionStart now OBSERVES the two deterministic, zero-network ship signals —
+// the newest local git tag and package.json's version — against a per-project
+// sidecar, QUEUES a pending ship record, and lets the next Stop capture drain
+// it through the existing lock + persistent dedup + fulfillment cross-check.
+// SessionStart itself stays a no-brain-write path (the 1.41.0 print-path
+// contract); first run BASELINES silently, mirroring the commit channel.
+// Ship observation lives in the ENGINE (klypix-format observeShipDrift) so every
+// host shares one implementation — the incident class is worst exactly where no
+// Claude hook runs. These thin wrappers bind it to this hook's CWD + git runner
+// and stay version-skew-safe behind typeof guards.
+function observeOutOfSessionShips(lib) {
+    try {
+        if (typeof lib?.observeShipDrift !== 'function') return '';
+        const { notice } = lib.observeShipDrift(CWD, { gitRun: git, now: nowIso });
+        return notice ? `\n${notice}\n` : '';
+    } catch { return ''; }
+}
+const advanceShipBaseline = (lib) => {
+    try {
+        if (typeof lib?.writeShipObsState !== 'function' || typeof lib?.readShipSignals !== 'function') return;
+        lib.writeShipObsState(CWD, lib.readShipSignals(CWD, git));
+    } catch { /* best-effort */ }
+};
 const CC_RE = /^(feat|fix|perf)(?:\(([^)]+)\))?!?:\s*(.+)$/i;
 function parseCommitLog(raw) {
     return String(raw).split('\x1e').map(s => s.trim()).filter(Boolean).map(rec => {
@@ -958,7 +1000,7 @@ function detectLiveEvent(input) {
     const tool = input.tool_name || '';
     const ti = input.tool_input || {};
     // SHIP — a release/merge/publish/tag from a shell tool that wasn't interrupted/errored.
-    if ((tool === 'Bash' || tool === 'PowerShell' || SHELL_TOOLS.has(tool)) && typeof ti.command === 'string' && ti.command) {
+    if (isShellTool(tool) && typeof ti.command === 'string' && ti.command) {
         const tr = input.tool_response;
         const interrupted = tr && typeof tr === 'object' && tr.interrupted === true;
         if (!interrupted) {
@@ -1480,6 +1522,39 @@ async function capture(lib) {
             break;                                            // one pattern per command
         }
     }
+    // Drain out-of-session ship observations queued by SessionStart (class-C
+    // decay leg) — same card shape and the same persistent dedup keys as
+    // in-session ship events, so a ship both narrated AND observed lands
+    // exactly once. Skipped under --dry-run (an inspection must not consume
+    // the queue). Queue is cleared BEFORE processing — a throwing entry must
+    // not wedge the drain forever; entries lost to a crash re-observe at the
+    // next SessionStart because the sidecar only advances on write.
+    // The queue is NOT deleted here — it is deleted only after the brain write
+    // is durable (next to writeState/writeLastCommit), mirroring the commit
+    // channel's "advance the baseline only after a successful write". Deleting
+    // up front meant an EBUSY/rename failure — routine on Windows when the
+    // desktop app holds brain.klypix — silently destroyed the observation with
+    // no card and no retry (2026-07-29 review, CONFIRMED). Per-row JSON.parse
+    // already tolerates a poison row, so nothing needs the early unlink.
+    let drainedShips = false;
+    if (!DRY && typeof lib.readPendingShips === 'function') {
+        try {
+            const rows = lib.readPendingShips(CWD);
+            drainedShips = rows.length > 0;
+            // A version already narrated by a session (this batch or an earlier
+            // one, via the persistent seen-set) is not news — see pendingShipCards.
+            const priorNarrated = ['cut release v', 'tagged v', 'tagged ', 'published to npm ']
+                .flatMap(p => rows.filter(r => r.version).map(r => p + r.version))
+                .filter(s => seen.has(sha(('ship|release|' + s).toLowerCase())))
+                .map(s => s.replace(/^[a-z ]+/, ''));
+            for (const c of lib.pendingShipCards(rows, { isSeen: (k) => seen.has(k), narrated: [...shipSummaries, ...priorNarrated], sha })) {
+                if (c.key) seen.add(c.key);
+                cards.push({ text: `${c.area}: 🏁 ${c.summary}\n#${slugify(c.area)} #auto`, area: c.area, borderColor: 'rgba(59,130,246,0.8)', createdVia: 'ship-observed' });
+                shipSummaries.push(c.summary);
+                ledger.push({ action: 'ship-observed', area: c.area, preview: c.summary.slice(0, 90) });
+            }
+        } catch { /* pending-ship drain is best-effort */ }
+    }
     // Refresh this session's lane with what it ACTUALLY did — files it EDITED this
     // session (per-session, from the transcript; NOT the shared working-tree diff,
     // which is identical for two sessions in one repo) + recent ship-events, so a
@@ -1527,6 +1602,10 @@ async function capture(lib) {
         // Record the commit baseline / advance even with nothing to capture, so
         // the next run doesn't re-scan the same commits.
         if (newLastCommit && newLastCommit !== prevCommit) writeLastCommit(newLastCommit);
+        // This session WAS watching, so whatever ship state it ends with is by
+        // definition already observed — baseline it, or the next SessionStart
+        // reports our own narrated release as a new signal.
+        if (!DRY) advanceShipBaseline(lib);
         // Nothing new — but if markers were SEEN-and-skipped or example-rejected,
         // record that so "the brief looks stale" has a paper trail.
         if (ledger.length) appendJsonl(LEDGER, { ts: nowIso(), mode: 'capture', stats: { added: 0 }, decisions: ledger }, 1000);
@@ -1552,6 +1631,10 @@ async function capture(lib) {
         await lib.atomicWrite(BRAIN, out);
         writeState(merged);
         writeLastCommit(newLastCommit); // advance the commit baseline only after a successful write
+        // Same discipline for the two ship channels: the queue is consumed and
+        // the observation baseline advances ONLY now that the cards are durable.
+        if (drainedShips && typeof lib.clearPendingShips === 'function') lib.clearPendingShips(CWD);
+        advanceShipBaseline(lib);
         try { await refreshAgentsBrief(lib, out); } catch { /* AGENTS.md refresh is best-effort */ }
     } finally {
         if (gotLock) releaseLock(LOCK);
@@ -2248,6 +2331,10 @@ async function read(lib) {
             return peerCount ? `\n👥 ${peerCount} other live session(s) in this project right now (snapshot at session start — the per-prompt peer footer stays current; \`npx klypix-mcp doctor\` lists all).` : '';
         } catch { return ''; }
     })();
+    // Class-C decay leg: notice ships that happened while no hooked session was
+    // watching (tag/version drift vs the per-project sidecar) and queue them
+    // for the Stop capture. The line rides BOTH emit tiers.
+    const shipObsLine = observeOutOfSessionShips(lib);
     const { struct } = await lib.parseKlypix(fs.readFileSync(BRAIN));
     const { freshness, drifted } = computeFreshness(struct);
     // The FULL brief: tiered brief + every self-heal/health footer. Messages are
@@ -2258,7 +2345,7 @@ async function read(lib) {
         + ruleDraftsFooter(input.session_id, struct, { markShown: false })
         + selfCheckFooter() + doctorFooter() + versionCurrencyFooter() + legendFooter() + memoryFooter();
     const emitFull = () => {
-        process.stdout.write(full + presenceLine + messageFooter(input.session_id || '', input.transcript_path, lib));
+        process.stdout.write(full + presenceLine + shipObsLine + messageFooter(input.session_id || '', input.transcript_path, lib));
         appendJsonl(HEALTH, { ts: nowIso(), project: path.basename(CWD), mode: 'read', ok: true, briefBytes: Buffer.byteLength(full), cards: struct?.counts?.cards ?? null }, 500);
     };
     // --full = everything to stdout (manual runs); also the fallback when the
@@ -2299,7 +2386,7 @@ async function read(lib) {
     // go right after the ultra brief, at the top of the visible window, never
     // after a stack of footers that could push them past a preview cut.
     const messages = messageFooter(input.session_id || '', input.transcript_path, lib);
-    const out = ultra + messages + presenceLine + healLine + draftLine
+    const out = ultra + messages + presenceLine + shipObsLine + healLine + draftLine
         + inflightFooter(input.session_id, struct)
         + selfCheckFooter() + doctorFooter() + versionCurrencyFooter();
     process.stdout.write(out);

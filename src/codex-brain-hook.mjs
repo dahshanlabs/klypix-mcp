@@ -31,6 +31,21 @@ function readInput() {
   }
 }
 
+// Thin binding of the engine's host-neutral ship observer to a Codex project
+// dir. Guarded on the export so an older bundled klypix-format degrades to no
+// observation rather than killing the hook.
+function observeShipDrift(projectDir) {
+  try {
+    if (!projectDir || typeof brainFormat.observeShipDrift !== 'function') return '';
+    const gitRun = (args) => execFileSync('git', String(args).split(/\s+/).filter(Boolean), {
+      cwd: projectDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 4000,
+    });
+    return brainFormat.observeShipDrift(projectDir, { gitRun }).notice || '';
+  } catch {
+    return '';
+  }
+}
+
 function gitBranch(cwd) {
   try {
     const branch = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], {
@@ -262,6 +277,11 @@ async function main() {
   if (event === 'SessionStart') {
     emitSystemMessage([
       formatPresenceMessage(sessions, sessionId, { includeSolo: true }),
+      // Class-C ship observation — the engine's, not a Claude-hook-local copy.
+      // Codex-driven projects had NO out-of-session ship detection at all, which
+      // is exactly where the incident class bites hardest (2026-07-29 review).
+      // The queue drains at the next brain write from any host.
+      observeShipDrift(projectDir),
       stampReceivedMessages(messages),
     ]);
     return;

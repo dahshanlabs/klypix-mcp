@@ -32,6 +32,7 @@ import {
   statusContextToMarkdown, findFulfillmentCandidates,
   splitQueryTokens, scoreCardsAgainstQuery, correctionOverlaysFor,
   isFastDecayCard, DECAY_STALE_MS, formatDecayAge,
+  readPendingShips, clearPendingShips, pendingShipCards,
 } from './klypix-format.mjs';
 import { capMessages, findProjectBrain } from './agent-presence.mjs';
 
@@ -550,15 +551,15 @@ export async function opBrainAsk({ vault, canvas, question, as_of, k = 10, log =
   // Semantic blend (best-effort, time-bounded): embed the question + the brain's
   // cards on-device, hand rankForQuestion a Map<cardId, cosine>. A missing/warming
   // model degrades cleanly to pure lexical.
-  let semantic = null, mode = 'lexical';
+  let semantic = null, mode = 'lexical', cardVecs = null;
   try {
     const pipe = await Promise.race([getEmbedder(log), new Promise(r => setTimeout(() => r(null), 20_000))]);
     if (pipe) {
       const [qv] = await embedTexts(pipe, [q]);
       const vecs = await vectorsForBrain(pipe, t.file, struct.cards);
-      if (qv && vecs && vecs.size) { semantic = new Map(); for (const [id, v] of vecs) semantic.set(id, dot(qv, v)); mode = 'semantic+lexical (on-device)'; }
+      if (qv && vecs && vecs.size) { semantic = new Map(); for (const [id, v] of vecs) semantic.set(id, dot(qv, v)); cardVecs = vecs; mode = 'semantic+lexical (on-device)'; }
     }
-  } catch { semantic = null; mode = 'lexical (semantic warming — retry for semantic ranking)'; }
+  } catch { semantic = null; cardVecs = null; mode = 'lexical (semantic warming — retry for semantic ranking)'; }
   const kk = Math.max(1, Math.min(20, k || 10));
   const timeTravel = asOfTs != null;
   // Cross-encoder rerank (eval-proven: recall@5 15%→40% on human paraphrase
@@ -569,7 +570,11 @@ export async function opBrainAsk({ vault, canvas, question, as_of, k = 10, log =
   // today's ranking (same sort, longer slice). Overlays are safe: rankForQuestion
   // attaches corrections to ALL candidates before we reorder. KLYPIX_RERANK=0 kills.
   const wantRerank = !timeTravel && process.env.KLYPIX_RERANK !== '0';
-  const result = rankForQuestion(struct, q, { semantic, k: wantRerank ? Math.max(kk, 50) : kk, as_of: timeTravel ? as_of : null });
+  // Card↔card cosine for the serve-time ❓↔🏁 pairing pass — the same on-device
+  // vectors that rank the question, reused; null degrades pairing to its
+  // lexical anchor/coverage fallback (works on every host, embeddings or not).
+  const pairSim = cardVecs ? (a, b) => { const va = cardVecs.get(a), vb = cardVecs.get(b); return va && vb ? dot(va, vb) : null; } : null;
+  const result = rankForQuestion(struct, q, { semantic, k: wantRerank ? Math.max(kk, 50) : kk, as_of: timeTravel ? as_of : null, pairSim });
   if (wantRerank && result.hits.length > 1) {
     try {
       const rr = await Promise.race([getReranker(log), new Promise(r => setTimeout(() => r(null), 8_000))]);
@@ -997,10 +1002,24 @@ export async function opBrainNote({ vault, canvas, text: noteText, area, marker 
   if (!noteText || !String(noteText).trim()) return err('brain_note needs a non-empty text.');
   if (!['', '?', '!', '✓', '~', '+'].includes(marker)) return err(`Invalid marker "${marker}" — use: (none)=decision · ?=open question · !=milestone · +=skill (reusable how-to) · ✓=resolve a matching card · ~=update a matching card.`);
   const input = noteToCaptureInput({ text: noteText, area, marker, closes: closes || '', createdVia: via || 'mcp' });
+  // Deliver any queued out-of-session ship observations on THIS write. The
+  // Claude Stop hook is not the only writer — an MCP-only or Codex-driven
+  // project would otherwise queue observations that never drain (2026-07-29
+  // review, CONFIRMED). Cards ride the same capture batch, so they also pass
+  // through the fulfillment cross-check. Queue is cleared only after the write.
+  const projectDir = path.dirname(file);
+  let pendingShips = [];
+  try { pendingShips = readPendingShips(projectDir); } catch { pendingShips = []; }
+  if (pendingShips.length) {
+    for (const c of pendingShipCards(pendingShips, {})) {
+      input.cards.push({ text: `${c.area}: 🏁 ${c.summary}\n#${String(c.area).toLowerCase()} #auto`, area: c.area, createdVia: 'ship-observed', borderColor: 'rgba(59,130,246,0.8)' });
+    }
+  }
   try {
     const res = await captureIntoBrain(fs.readFileSync(file), input);
     let out = res.buffer; try { out = (await tidyBrain(res.buffer)).buffer; } catch { /* keep append result if tidy fails */ }
     await atomicWrite(file, out);
+    if (pendingShips.length) clearPendingShips(projectDir);   // durable now — safe to consume
     const s = res.stats || {};
     const bits = [`${s.added || 0} added`];
     for (const k of ['resolved', 'updated', 'merged', 'closed', 'superseded', 'linked']) if (s[k]) bits.push(`${s[k]} ${k}`);

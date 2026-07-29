@@ -329,6 +329,24 @@ server.registerTool('brain_sync', {
 }, async ({ project, intent, files, phase, include_context }) => {
   const totalStartedAt = Date.now();
   const report = mcpPresence.sync({ project, intent, files, phase });
+  // Class-C ship observation, host-neutral: brain_sync is the ONE surface every
+  // MCP host calls at task start, so an MCP-only project (no Claude/Codex hook)
+  // still notices a release nobody narrated. Queued here, drained at the next
+  // brain write. Zero network, ~2 cheap git/fs reads, never throws.
+  let shipNotice = '';
+  if (phase === 'start') {
+    try {
+      const dir = project ? path.resolve(project) : mcpPresence.vault;
+      if (typeof brainFormat.observeShipDrift === 'function' && dir) {
+        const { execFileSync } = await import('child_process');
+        shipNotice = brainFormat.observeShipDrift(dir, {
+          gitRun: (args) => execFileSync('git', String(args).split(/\s+/).filter(Boolean), {
+            cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 4000,
+          }),
+        }).notice || '';
+      }
+    } catch { /* observation is best-effort — never fail a sync */ }
+  }
   let taskContext = null;
   if (phase !== 'complete' && include_context !== false && (intent || files?.length)) {
     taskContext = await opBrainTaskContext({
@@ -368,7 +386,7 @@ server.registerTool('brain_sync', {
   return {
     content: [{
       type: 'text',
-      text: [report.text, contextText, timingText].filter(Boolean).join('\n\n'),
+      text: [report.text, shipNotice, contextText, timingText].filter(Boolean).join('\n\n'),
     }],
     structuredContent,
   };

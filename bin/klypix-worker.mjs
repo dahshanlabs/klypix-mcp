@@ -33,6 +33,10 @@ import {
 import { mcpServerEntry } from '../src/agent-rules.mjs';
 import { createMcpPresence, KLYPIX_MCP_INSTRUCTIONS } from '../src/mcp-presence.mjs';
 import { spawnAutoUpdateHelper } from '../src/mcp-auto-update.mjs';
+// Namespace import (already in-process via the klypix-core chain, so zero added
+// load cost) so a bundle whose klypix-format predates classifyDecay degrades
+// gracefully — a named import of a missing export would kill the whole server.
+import * as brainFormat from '../src/klypix-format.mjs';
 
 // Real package version for the MCP handshake (was hardcoded '1.0.0', which
 // misled every client/version diagnosis — it could never reflect the true release).
@@ -118,7 +122,21 @@ const server = new McpServer(
     capabilities: { logging: {} },
   },
 );
-const mcpPresence = createMcpPresence({ server, initialVault: VAULT });
+// Decay-aware LAST-KNOWN stamps for every MCP delivery surface (2026-07-28
+// post-mortem, class B): the classifier lives ONCE in klypix-format.mjs and is
+// INJECTED here so mcp-presence/agent-presence stay builtin-only. The typeof
+// guards let a bundle predating the feature degrade to unstamped delivery —
+// no crash, no stamp, never a throw.
+const mcpPresence = createMcpPresence({
+  server,
+  initialVault: VAULT,
+  decay: typeof brainFormat.classifyDecay === 'function' ? {
+    classifyDecay: brainFormat.classifyDecay,
+    decayStaleMs: brainFormat.DECAY_STALE_MS,
+    decayMessageStamp: typeof brainFormat.decayMessageStamp === 'function' ? brainFormat.decayMessageStamp : undefined,
+    formatDecayAge: typeof brainFormat.formatDecayAge === 'function' ? brainFormat.formatDecayAge : undefined,
+  } : {},
+});
 
 // Map a protocol-neutral core result → an MCP tool result.
 const toContent = (r) => {

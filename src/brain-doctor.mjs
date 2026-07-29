@@ -29,6 +29,16 @@ import { auditProject, codexGlobalInstructionsInstalled, resolveVersion } from '
 import { codexPresenceHookStatus } from './codex-hooks.mjs';
 import { inspectAutoUpdate } from './mcp-auto-update.mjs';
 
+// klypix-format is the DECAY-GUARD seam (classifyDecay + the status renderer),
+// loaded failure-tolerant: the doctor's doctrine is "an absent seam is a fact
+// to report, not an error" — klypix-format pulls jszip, and a broken/partial
+// install must degrade the layer to 'unknown', never kill the doctor. The
+// sibling './' specifier resolves identically in the package (src/) and the
+// flat deployed (~/.claude/project-brain) layouts; top-level await keeps
+// inspect() synchronous for its existing callers.
+let fmtLib = null;
+try { fmtLib = await import('./klypix-format.mjs'); } catch { fmtLib = null; }
+
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 const sha = (s) => crypto.createHash('sha1').update(String(s)).digest('hex').slice(0, 16);
@@ -220,6 +230,49 @@ function inspectPeers(brainDir, brainPath, now) {
   return { file, live, count: live.length };
 }
 
+// ── DECAY-GUARD layer (fast-decay status protection, 2026-07-28) ─────────────
+// The brain is MEMORY, not a SENSOR: completed-status claims near release nouns
+// ("uploaded", "LIVE", "installed", TestFlight/build N/npm/rollout) decay in
+// hours, and a bundle that renders them as current state reproduces the stale-
+// "what is remaining" incident class. This layer proves the protection is
+// PRESENT, end-to-end: (a) the loaded engine exports classifyDecay; (b) its
+// status renderer actually stamps a synthetic 20h-old stale claim as ⏱️ LAST
+// KNOWN (behavior, not just an export string); (c) the DEPLOYED bundle files
+// carry the feature. A bundle that predates the feature reads as DRIFT —
+// silently lacking protection is exactly the failure mode — while an
+// unloadable engine reads as a reportable fact, never a doctor crash.
+export function inspectDecayGuard(brainDir, lib, now = Date.now()) {
+  const libLoaded = !!lib;
+  const exported = !!(lib && typeof lib.classifyDecay === 'function');
+  let rendererStamps = null;   // null = not testable (no lib / no renderer export)
+  if (exported && typeof lib.statusContextToMarkdown === 'function') {
+    try {
+      // Minimal parseKlypix-shaped struct: one 20h-old fast-decay milestone.
+      const struct = {
+        title: 'decay-probe', format: 'probe', counts: { cards: 1, connections: 0 },
+        cards: [{
+          id: 'decay-probe-1', type: 'text', title: '', links: [], tags: [],
+          text: 'Release: 🏁 build 26 uploaded to TestFlight — rollout LIVE',
+          area: 'Release', createdAt: now - 20 * 3_600_000, parentId: null, evidence: null,
+        }],
+        connections: [],
+      };
+      const md = String(lib.statusContextToMarkdown(struct, { budgetChars: 4200, now }) || '');
+      rendererStamps = /⏱/.test(md) && /LAST KNOWN/i.test(md);
+    } catch { rendererStamps = false; }   // a throwing renderer is NOT protecting anything
+  }
+  // Deployed-bundle currency (inspectVersion/inspectTools idiom: read the
+  // DEPLOYED file text — the running package can be newer than the machine's
+  // bundle). Absent files are a fact (null), never drift on their own.
+  const deployedFmt = readText(path.join(brainDir, 'klypix-format.mjs'));
+  const deployedHook = readText(path.join(brainDir, 'global-brain-hook.mjs'));
+  return {
+    libLoaded, exported, rendererStamps,
+    deployedFmtCurrent: deployedFmt == null ? null : /export (?:function|const) classifyDecay\b/.test(deployedFmt),
+    deployedHookCurrent: deployedHook == null ? null : deployedHook.includes('classifyDecay'),
+  };
+}
+
 /**
  * Inspect this machine's brain (+ a project's harness projection) as one report.
  * @param {{ projectDir?: string, home?: string, now?: number, npmLatest?: string|null }} [opts]
@@ -246,6 +299,8 @@ export function inspect(opts = {}) {
   };
   const tools = inspectTools(brainDir, PKG_ROOT);
   const peers = inspectPeers(brainDir, brainPath, now);
+  // opts.fmtLib is a test seam (stub engines); production uses the module lib.
+  const decayGuard = inspectDecayGuard(brainDir, opts.fmtLib !== undefined ? opts.fmtLib : fmtLib, now);
 
   // Harness drift only counts toward the verdict for a real brain project; auditProject
   // against the BAKED brain version (the deployed truth) when available.
@@ -275,6 +330,13 @@ export function inspect(opts = {}) {
         ? 'optional'
         : (codexHooks.executionStatus === 'observed' ? 'ok' : 'warning')),
     harness: hasBrain ? (harness.ok ? 'ok' : 'drift') : 'n/a',
+    // DECAY-GUARD drifts when the protection is provably missing: the loaded
+    // engine lacks classifyDecay, its renderer left the synthetic stale claim
+    // unstamped, or a deployed bundle file predates the feature. An unloadable
+    // engine is 'unknown' (a reportable fact, not a verdict flip).
+    decayGuard: !decayGuard.libLoaded ? 'unknown'
+      : (!decayGuard.exported || decayGuard.rendererStamps === false
+        || decayGuard.deployedFmtCurrent === false || decayGuard.deployedHookCurrent === false) ? 'drift' : 'ok',
   };
   const drifted = Object.values(layers).filter(s => s === 'drift').length;
   const verdict = !version.installed ? 'NOT-INSTALLED' : (drifted ? 'DRIFTED' : 'ALIGNED');
@@ -289,9 +351,10 @@ export function inspect(opts = {}) {
     if (version.supervisorCapable && running.known && !supervisors.active) actions.push('/mcp reconnect once   # activate the zero-restart supervisor; compatible future core updates hot-swap automatically');
     if (hooks.missing.length) actions.push(`npx klypix-mcp install   # half-wired: hooks not active — ${hooks.missing.join(', ')}`);
     if (hasBrain && !harness.ok) actions.push('npx klypix-mcp link      # harness configs drifted — re-project managed blocks');
+    if (layers.decayGuard === 'drift') actions.push('npx klypix-mcp install   # decay-aware status guard missing/stale — stale build/deploy claims can render as CURRENT state');
   }
 
-  return { verdict, layers, drifted, version, running, supervisors, autoUpdate, hooks, codexSmart, codexHooks, tools, peers, sessions: peers, harness, npm, project: { dir: projectDir, brainPath, hasBrain }, brainDir, actions };
+  return { verdict, layers, drifted, version, running, supervisors, autoUpdate, hooks, codexSmart, codexHooks, tools, peers, sessions: peers, harness, npm, decayGuard, project: { dir: projectDir, brainPath, hasBrain }, brainDir, actions };
 }
 
 // One-line drift summary (empty when clean) — for a footer / status line.
@@ -304,6 +367,7 @@ export function driftLine(r) {
   if (r.running && r.running.matchesInstalled === false) bits.push(`live server v${r.running.version}≠installed v${r.version.baked} (/mcp reconnect)`);
   if (r.hooks.missing.length) bits.push(`${r.hooks.missing.length} hook(s) unwired`);
   if (r.project.hasBrain && !r.harness.ok) bits.push(`${r.harness.drift.length} harness file(s) drifted`);
+  if (r.layers?.decayGuard === 'drift') bits.push('decay-guard stale (fast-decay status claims unstamped)');
   return bits.length ? `⚠️ brain DRIFTED: ${bits.join(' · ')}` : '';
 }
 
@@ -387,6 +451,23 @@ export function render(r, opts = {}) {
 
   // TOOLS
   L.push(`${ok} ${c.bold}TOOLS${c.rst}    ${r.tools.count} MCP verb(s)${r.tools.hash ? ` ${c.dim}[#${r.tools.hash}, ${r.tools.source}]${c.rst}` : ''}${r.tools.count ? `: ${c.dim}${r.tools.names.join(', ')}${c.rst}` : ''}`);
+
+  // DECAY-GUARD (fast-decay status claims must stamp as LAST KNOWN, not current)
+  if (r.decayGuard) {
+    const d = r.decayGuard;
+    const dmark = r.layers.decayGuard === 'ok' ? ok : warn;
+    if (r.layers.decayGuard === 'ok') {
+      L.push(`${dmark} ${c.bold}DECAY${c.rst}    stale build/deploy claims stamp as ⏱️ LAST KNOWN ${c.dim}(classifyDecay + renderer self-test pass)${c.rst}`);
+    } else if (r.layers.decayGuard === 'unknown') {
+      L.push(`${dmark} ${c.bold}DECAY${c.rst}    ${c.dim}engine not loadable — decay stamping unverified${c.rst}`);
+    } else {
+      const why = !d.exported ? 'engine predates classifyDecay'
+        : d.rendererStamps === false ? 'status renderer left a synthetic 20h-old stale claim UNSTAMPED'
+          : d.deployedFmtCurrent === false ? 'deployed klypix-format.mjs predates the decay guard'
+            : 'deployed global-brain-hook.mjs predates message stamps';
+      L.push(`${dmark} ${c.bold}DECAY${c.rst}    ${c.red}${why} — stale status claims can render as CURRENT state${c.rst}`);
+    }
+  }
 
   // SESSIONS: this is an all-session count. A recent-chat row is not a heartbeat.
   if (!r.sessions.count) L.push(`${ok} ${c.bold}SESSIONS${c.rst}  0 active sessions ${c.dim}(saved/recent chats are history, not active)${c.rst}`);

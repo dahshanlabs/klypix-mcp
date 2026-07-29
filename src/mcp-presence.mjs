@@ -12,6 +12,7 @@ import {
   findProjectBrain,
   formatPresenceMessage,
   formatReceivedMessages,
+  messageDecayInfo,
   peekMessages,
   postPresenceMessage,
   receiveMessages,
@@ -191,6 +192,14 @@ export function createMcpPresence({
   now = () => Date.now(),
   setIntervalFn = setInterval,
   clearIntervalFn = clearInterval,
+  // Decay-aware LAST-KNOWN stamps (2026-07-28 post-mortem, class B): the
+  // injected engine surface ({ classifyDecay, decayStaleMs, decayMessageStamp,
+  // formatDecayAge } from klypix-format.mjs) that lets every MCP delivery
+  // surface — pollInbox logging, touch/decorateToolResult notices, brain_sync
+  // text + structured messages — stamp a stale build/deploy message as LAST
+  // KNOWN. Injection (not an import) keeps this file builtin-only; absent or
+  // partial (old bundle), delivery degrades to unstamped — never a throw.
+  decay = {},
 } = {}) {
   const sessionId = resolveMcpSessionId({ env });
   const effectiveInboxPollMs = Number(env?.KLYPIX_MCP_INBOX_POLL_MS)
@@ -241,7 +250,7 @@ export function createMcpPresence({
       now: now(),
     }).filter((message) => !announcedMessageIds.has(message.id));
     if (!pending.length) return [];
-    if (sendNotice(formatReceivedMessages(pending, now()))) {
+    if (sendNotice(formatReceivedMessages(pending, now(), decay))) {
       for (const message of pending) announcedMessageIds.add(message.id);
       while (announcedMessageIds.size > 100) {
         announcedMessageIds.delete(announcedMessageIds.values().next().value);
@@ -296,7 +305,7 @@ export function createMcpPresence({
       : '';
     const notice = [
       presence,
-      formatReceivedMessages(messages, stamp),
+      formatReceivedMessages(messages, stamp, decay),
     ].filter(Boolean).join('\n\n');
     if (notice) sendNotice(notice);
     return { sessions, messages, notice };
@@ -428,7 +437,7 @@ export function createMcpPresence({
       ].join('\n')
       : 'No exact file overlap is currently reported by another synchronized task.';
     const durationMs = Math.max(0, Date.now() - syncStartedAt);
-    const messagesText = formatReceivedMessages(report.messages, stamp);
+    const messagesText = formatReceivedMessages(report.messages, stamp, decay);
     const structured = {
       schemaVersion: 1,
       status: completing ? 'complete' : 'active',
@@ -443,12 +452,19 @@ export function createMcpPresence({
       },
       peers: snapshot.peers,
       conflicts,
-      messages: report.messages.map((message) => ({
-        id: message.id,
-        from: message.from,
-        text: message.text,
-        ts: message.ts,
-      })),
+      messages: report.messages.map((message) => {
+        // Raw structured path gets the same decay verdict as the rendered
+        // text: a consumer reading structured.messages directly must see the
+        // LAST-KNOWN marking, not re-derive it (additive fields, schema 1).
+        const decayInfo = messageDecayInfo(message, stamp, decay);
+        return {
+          id: message.id,
+          from: message.from,
+          text: message.text,
+          ts: message.ts,
+          ...(decayInfo ? { lastKnown: true, age: decayInfo.age, stampText: decayInfo.stampText } : {}),
+        };
+      }),
       alertsQueued,
       delivery: {
         proactive: 'mcp-logging-best-effort',

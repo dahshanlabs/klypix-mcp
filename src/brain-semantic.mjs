@@ -82,13 +82,24 @@ function readCachedVecs(brainPath, cards) {
 // the hook keeps its exact lexical behavior). NEVER throws, NEVER embeds cards.
 export async function semanticVecs(brainPath, struct, query, { timeoutMs = 1200 } = {}) {
     try {
-        const pipe = await Promise.race([getEmbedder(), new Promise(r => setTimeout(() => r(null), timeoutMs))]);
-        if (!pipe) return null;
         const q = String(query || '').toLowerCase().trim();
         if (!q) return null;
+        // Deploy-gate, ENFORCED (2026-07-29): read the warm card-vector cache
+        // BEFORE any model work. This lane never embeds cards, so with no cached
+        // vectors there is nothing to rank against — and importing transformers
+        // here would spin onnxruntime worker threads inside a ONE-SHOT hook that
+        // process.exit(0)s the moment retrieval returns. On Windows (Node 24)
+        // that exit-vs-thread-teardown race aborts the whole hook process
+        // (libuv "!(handle->flags & UV_HANDLE_CLOSING)" in async.c), because
+        // `import('@huggingface/transformers')` resolves from ANY ambient
+        // node_modules (a dev repo's) even where the semantic install is absent.
+        // Empty cache → pure-lexical, zero model load, zero threads.
+        const vecsMap = readCachedVecs(brainPath, (struct && struct.cards) || []);
+        if (!vecsMap.size) return null;
+        const pipe = await Promise.race([getEmbedder(), new Promise(r => setTimeout(() => r(null), timeoutMs))]);
+        if (!pipe) return null;
         const [qv] = await embedTexts(pipe, [q]);
         if (!qv) return null;
-        const vecsMap = readCachedVecs(brainPath, (struct && struct.cards) || []);
         return { qv, vecsMap, dot };
     } catch { return null; }
 }

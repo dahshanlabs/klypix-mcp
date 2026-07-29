@@ -31,6 +31,7 @@ import {
   brainLensData, lensToMarkdown, deathDateOfCard,
   statusContextToMarkdown, findFulfillmentCandidates,
   splitQueryTokens, scoreCardsAgainstQuery, correctionOverlaysFor,
+  isFastDecayCard, DECAY_STALE_MS, formatDecayAge,
 } from './klypix-format.mjs';
 import { findProjectBrain } from './agent-presence.mjs';
 
@@ -482,14 +483,26 @@ export async function opBrainTaskContext({
     const clean = flat(value);
     return clean.length > limit ? `${clean.slice(0, limit - 1)}…` : clean;
   };
+  // Decay-aware status (2026-07-28 post-mortem): a fast-decay build/deploy
+  // claim >6h old is stamped ⏱️ LAST KNOWN at the ENTRY level, so every
+  // brain_sync host (Codex included — this is its only context surface, it
+  // never calls statusContextToMarkdown) gets the warning from the engine,
+  // not from model judgment. Best-effort: classification failure → no stamp.
+  const nowTs = Date.now();
   const entries = hits.map((hit) => {
     const correction = overlays.get(hit.card.id)?.by || null;
+    let decayAge = null;
+    try {
+      const ageMs = (hit.card.createdAt || 0) > 0 ? nowTs - hit.card.createdAt : 0;
+      if (ageMs > DECAY_STALE_MS && isFastDecayCard(hit.card)) decayAge = formatDecayAge(ageMs);
+    } catch { decayAge = null; }
     return {
       id: hit.card.id,
       area: flat(hit.card.area) || 'Notes',
       text: clip(hit.card.text, 420),
       score: Number(hit.score.toFixed(2)),
       correctedBy: correction ? clip(correction.text, 420) : null,
+      ...(decayAge ? { lastKnown: true, age: decayAge } : {}),
     };
   });
   const maxChars = Math.max(800, Math.min(5000, Number(budgetChars) || 2800));
@@ -501,7 +514,11 @@ export async function opBrainTaskContext({
   } else {
     for (const entry of entries) {
       if (entry.correctedBy) lines.push(`- [${entry.area}] CURRENT CORRECTION: ${entry.correctedBy}`);
-      lines.push(`- [${entry.area}]${entry.correctedBy ? ' superseded context:' : ''} ${entry.text}`);
+      // The LAST KNOWN stamp is a PREFIX: the final .slice(0, maxChars) can cut
+      // a line's tail, and the warning must never be the part that gets cut
+      // (v1.32.0 law — a claim may truncate, its warning may not).
+      const stamp = entry.lastKnown ? ` ⏱️ LAST KNOWN (${entry.age} old — verify live before reporting):` : '';
+      lines.push(`- [${entry.area}]${entry.correctedBy ? ' superseded context:' : ''}${stamp} ${entry.text}`);
       if (lines.join('\n').length >= maxChars) break;
     }
     lines.push('This is a bounded start-of-task capsule, not the whole brain; use brain_ask for broad status/history questions.');
@@ -568,6 +585,9 @@ export async function opBrainAsk({ vault, canvas, question, as_of, k = 10, log =
   // STRONG shape only: a work request that merely mentions 'pending'/'TODO'
   // must keep its ranked answer (review fix); the phrase-shaped "what is
   // remaining?" gets the computed section.
+  // Decay-aware stamps (⏱️ LAST KNOWN + VERIFY probe on >6h build/deploy
+  // claims) ride IN the renderer — statusContextToMarkdown stamps internally,
+  // so this call inherits them with no options needed (now defaults inside).
   let statusMd = '';
   if (result.statusStrong && !timeTravel) {
     try { statusMd = statusContextToMarkdown(struct); mode += ' + status-mode'; } catch { statusMd = ''; }

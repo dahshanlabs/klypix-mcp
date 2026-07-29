@@ -15,6 +15,10 @@ import {
 } from './agent-presence.mjs';
 import { recordCodexHookExecution } from './codex-hooks.mjs';
 import { opBrainTaskContext } from './klypix-core.mjs';
+// Namespace import (already in-process via the klypix-core chain, so zero added
+// load cost) so a bundle whose klypix-format predates classifyDecay degrades
+// gracefully — a named import of a missing export would kill the whole hook.
+import * as brainFormat from './klypix-format.mjs';
 import { findPresenceConflicts } from './mcp-presence.mjs';
 
 function readInput() {
@@ -85,6 +89,77 @@ function emitSystemMessage(parts) {
   const systemMessage = parts.filter(Boolean).join('\n\n').trim();
   if (!systemMessage) return;
   process.stdout.write(JSON.stringify({ continue: true, systemMessage }));
+}
+
+// ── Decay-aware LAST-KNOWN stamps (2026-07-28 post-mortem, class B) ──────────
+// Codex-lane parity with the Claude hook's messageFooter: a delivered message
+// older than 6h whose text asserts fast-decay build/deploy status must never
+// read as current state — the ENGINE stamps it, never the reading model. The
+// classifier lives ONCE in klypix-format (typeof-guarded: a stale bundle
+// degrades to no stamp, never a throw). Stamps are appended AFTER
+// formatReceivedMessages' 400-char render slice so no cut can eat them (the
+// v1.32.0 law: a warning is never subject to the budget it warns about), and
+// exist in render output only — the lane file, its dedup keys, and its ack
+// semantics are untouched. The shared renderer (agent-presence) stamps
+// internally when handed the classifier; the pass below is belt-and-braces for
+// a mixed bundle whose agent-presence predates that, and its dedup is
+// per-MESSAGE — a message the renderer already stamped is skipped without
+// suppressing stamps the other messages still need.
+const MSG_DECAY_STAMP_MS = 6 * 60 * 60 * 1000;
+// Precision-first consumption (mirrors the Claude hook): only an explicit
+// `true` / explicitly fast-shaped object stamps — ambiguity never does.
+const isFastDecayResult = (r) => r === true || r === 'fast'
+  || (!!r && typeof r === 'object' && (r.fast === true || r.fastDecay === true || r.decay === 'fast' || r.class === 'fast' || r.kind === 'fast'));
+export function stampReceivedMessages(messages, now = Date.now(),
+  classifier = (typeof brainFormat.classifyDecay === 'function' ? brainFormat.classifyDecay : null)) {
+  const list = Array.isArray(messages) ? messages : [];
+  // Thread the full engine surface through — the shared renderer stamps each
+  // qualifying message internally (agent-presence stays builtin-only, so the
+  // engine functions ride the same injection; guarded for a stale bundle).
+  const base = classifier
+    ? formatReceivedMessages(list, now, {
+      classifyDecay: classifier,
+      decayStaleMs: brainFormat.DECAY_STALE_MS,
+      decayMessageStamp: typeof brainFormat.decayMessageStamp === 'function' ? brainFormat.decayMessageStamp : undefined,
+      formatDecayAge: typeof brainFormat.formatDecayAge === 'function' ? brainFormat.formatDecayAge : undefined,
+    })
+    : formatReceivedMessages(list, now);
+  if (!base || !classifier) return base;
+  const staleMs = Number(brainFormat.DECAY_STALE_MS) > 0 ? Number(brainFormat.DECAY_STALE_MS) : MSG_DECAY_STAMP_MS;   // threshold single-sourced in the engine
+  const stamps = list.map((m) => {
+    try {
+      const ts = Number(m?.ts) || 0;
+      if (!ts || now - ts < staleMs) return '';
+      if (!isFastDecayResult(classifier(String(m?.text || '')))) return '';
+      // Wording single-sourced in the engine (decayMessageStamp) so the
+      // renderers can never drift apart; local fallback for a stale bundle.
+      if (typeof brainFormat.decayMessageStamp === 'function') return `  ${brainFormat.decayMessageStamp(now - ts)}`;
+      const h = Math.floor((now - ts) / 3_600_000);
+      const label = h >= 48 ? `${Math.floor(h / 24)}d` : `${Math.max(1, h)}h`;
+      return `  ⏱️ This message is ${label} old and contains build/deploy status — treat as LAST KNOWN, verify live before reporting it.`;
+    } catch { return ''; }   // best-effort — a classifier bug must never break delivery
+  });
+  if (!stamps.some(Boolean)) return base;
+  // Per-MESSAGE dedup granularity, not whole-output: pair each `- from …`
+  // render line with its message and add a stamp only when the line right
+  // after it is not already a stamp. A ⏱ inside a message's own quoted text is
+  // NOT a stamp and must not suppress the stamps the OTHER messages need (the
+  // old whole-output includes('⏱') guard silenced them all).
+  const isStampLine = (l) => /^\s*⏱/.test(String(l || ''));
+  const lines = base.split('\n');
+  const out = [];
+  let msgIdx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    out.push(lines[i]);
+    if (!lines[i].startsWith('- from ')) continue;
+    msgIdx++;
+    if (msgIdx >= list.length || !stamps[msgIdx]) continue;
+    if (isStampLine(lines[i + 1])) { stamps[msgIdx] = ''; continue; }   // renderer already stamped this one
+    out.push(stamps[msgIdx]);
+    stamps[msgIdx] = '';
+  }
+  const leftovers = stamps.filter(Boolean);   // unknown layout → stamps still delivered at the end
+  return leftovers.length ? [...out, ...leftovers].join('\n') : out.join('\n');
 }
 
 function formatConflictWarning(conflicts, event) {
@@ -187,7 +262,7 @@ async function main() {
   if (event === 'SessionStart') {
     emitSystemMessage([
       formatPresenceMessage(sessions, sessionId, { includeSolo: true }),
-      formatReceivedMessages(messages),
+      stampReceivedMessages(messages),
     ]);
     return;
   }
@@ -197,18 +272,24 @@ async function main() {
     emitSystemMessage([
       context,
       formatPresenceMessage(sessions, sessionId),
-      formatReceivedMessages(messages),
+      stampReceivedMessages(messages),
     ]);
     return;
   }
   if (event === 'PreToolUse' || event === 'PostToolUse') {
     emitSystemMessage([
       formatConflictWarning(conflicts, event),
-      formatReceivedMessages(messages),
+      stampReceivedMessages(messages),
     ]);
     return;
   }
-  if (messages.length) emitSystemMessage([formatReceivedMessages(messages)]);
+  if (messages.length) emitSystemMessage([stampReceivedMessages(messages)]);
 }
 
-main().catch(() => {}).finally(() => process.exit(0));
+// Run as the hook by default. The ONLY skip is the explicit opt-out flag a
+// hermetic test sets before importing this module for its pure exports —
+// production never sets it (mirrors global-brain-hook.mjs), so runtime
+// behavior is byte-identical.
+if (!process.env.KLYPIX_BRAIN_NO_MAIN) {
+  main().catch(() => {}).finally(() => process.exit(0));
+}

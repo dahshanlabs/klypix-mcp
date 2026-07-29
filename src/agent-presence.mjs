@@ -417,12 +417,62 @@ export function formatPresenceMessage(sessions, selfId, { includeSolo = false, n
   return lines.join('\n');
 }
 
-export function formatReceivedMessages(messages, now = Date.now()) {
+// ── Decay-aware LAST-KNOWN stamps (2026-07-28 post-mortem, class B) ──────────
+// A delivered inter-session message is MEMORY, not a SENSOR: one older than 6h
+// whose text asserts fast-decay build/deploy status ("no TestFlight upload
+// triggered yet") must never read as CURRENT state — the ENGINE stamps it,
+// never the reading model. The classifier lives ONCE in klypix-format.mjs;
+// this file stays builtin-only, so consumers INJECT it (the optional third
+// `decay` argument). With no injection the output is byte-identical to the
+// unstamped form — an old bundle degrades to no stamp, never a throw. Each
+// stamp is its OWN line appended AFTER the 400-char render slice (the v1.32.0
+// law: a warning is never subject to the budget/cut it warns about) and exists
+// in render output only — the lane file is never mutated.
+const MSG_DECAY_STAMP_MS = 6 * 60 * 60 * 1000;
+// classifyDecay is precision-first; mirror that here — only an explicit `true`
+// or an explicitly fast-shaped object stamps. Anything ambiguous does NOT
+// (a false stamp erodes trust in every stamp).
+const isFastDecayResult = (r) => r === true || r === 'fast'
+  || (!!r && typeof r === 'object' && (r.fast === true || r.fastDecay === true || r.decay === 'fast' || r.class === 'fast' || r.kind === 'fast'));
+const decayAgeLabel = (ms) => {
+  const h = Math.floor(Math.max(0, ms) / 3_600_000);
+  return h >= 48 ? `${Math.floor(h / 24)}d` : `${Math.max(1, h)}h`;
+};
+
+// Decay verdict for ONE delivered message: null, or { age, stampText } when it
+// is stale (ts older than the engine threshold) AND its RAW text classifies
+// fast-decay (raw, not the render slice — a claim cut out of the 400 chars
+// must still stamp). Threshold, wording, and age format come from the injected
+// engine surface ({ classifyDecay, decayStaleMs, decayMessageStamp,
+// formatDecayAge }) so the renderers can never drift apart; the local
+// fallbacks mirror klypix-format verbatim for a bundle old enough to carry the
+// classifier but not the helpers.
+export function messageDecayInfo(message, now = Date.now(), decay = {}) {
+  const { classifyDecay, decayStaleMs, decayMessageStamp, formatDecayAge } = decay || {};
+  if (typeof classifyDecay !== 'function') return null;
+  try {
+    const ts = Number(message?.ts) || 0;
+    const staleMs = Number(decayStaleMs) > 0 ? Number(decayStaleMs) : MSG_DECAY_STAMP_MS;
+    if (!ts || now - ts < staleMs) return null;
+    if (!isFastDecayResult(classifyDecay(String(message?.text || '')))) return null;
+    const ageMs = now - ts;
+    return {
+      age: typeof formatDecayAge === 'function' ? String(formatDecayAge(ageMs)) : decayAgeLabel(ageMs),
+      stampText: typeof decayMessageStamp === 'function'
+        ? String(decayMessageStamp(ageMs))
+        : `⏱️ This message is ${decayAgeLabel(ageMs)} old and contains build/deploy status — treat as LAST KNOWN, verify live before reporting it.`,
+    };
+  } catch { return null; }   // stamping is best-effort — a classifier bug must never break delivery
+}
+
+export function formatReceivedMessages(messages, now = Date.now(), decay = {}) {
   if (!Array.isArray(messages) || !messages.length) return '';
   const lines = ['KLYPIX message(s) from another active session:'];
   for (const message of messages) {
     const ageMin = Math.max(0, Math.round((now - Number(message.ts || now)) / 60_000));
     lines.push(`- from ${String(message.from || '?').slice(0, 12)} (${ageMin}m ago): ${String(message.text || '').replace(/\s+/g, ' ').trim().slice(0, 400)}`);
+    const info = messageDecayInfo(message, now, decay);
+    if (info) lines.push(`  ${info.stampText}`);
   }
   return lines.join('\n');
 }

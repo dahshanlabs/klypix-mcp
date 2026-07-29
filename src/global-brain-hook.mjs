@@ -40,6 +40,11 @@ const STATE = path.resolve(CWD, '.claude', 'brain-capture-state.json');
 //                · ev: <path[:line]>, <path>, PR#<n> — evidence anchors; file
 //                  paths get their git blob OID stamped so the brief can later
 //                  flag the card when that code drifts.
+//                · verify: <command> — the exact live-probe for a fast-decay
+//                  status claim (build/deploy/release state). Once the claim is
+//                  stale, the status renderer re-prints it as "VERIFY: <cmd>"
+//                  instead of asserting the claim as current. Emit PS-5.1-safe
+//                  commands (no && chaining; use `;` or separate lines).
 const MARKER = /🧠\s*BRAIN\s*(?:\[([^\]]+)\])?\s*([?!✓~+]?)\s*:\s*(.+)$/i;
 const sha = (s) => crypto.createHash('sha1').update(s).digest('hex').slice(0, 16);
 // Numeric semver compare (major.minor.patch; pre-release tags ignored). <0 if
@@ -72,20 +77,25 @@ function parseEvidence(s) {
     }
     return refs.length ? refs : null;
 }
-// Pull optional `closes:` / `ev:` suffixes off the END of a marker body (either
-// order), returning the cleaned body + parsed extras. The suffix region starts
-// at the first " closes:"/" ev:" key, so a decision can carry neither, either,
-// or both without the keywords leaking into the card text.
+// Pull optional `closes:` / `ev:` / `verify:` suffixes off the END of a marker
+// body (any order), returning the cleaned body + parsed extras. The suffix
+// region starts at the first known key, so a decision can carry none, any, or
+// all without the keywords leaking into the card text. The three value regexes
+// must stay in LOCKSTEP: each value ends at the NEXT known key (or end of
+// line), so omitting a key from one lookahead silently folds "verify: …" into
+// that key's value — parseEvidence would mint junk file refs from it.
 function splitMarkerSuffixes(body) {
-    const m = body.match(/\s+(?:closes|ev):/i);
-    if (!m) return { body, closes: '', evidence: null };
+    const m = body.match(/\s+(?:closes|ev|verify):/i);
+    if (!m) return { body, closes: '', evidence: null, verify: '' };
     const suffix = body.slice(m.index);
-    const closesM = suffix.match(/\bcloses:\s*(.+?)\s*(?=\s+\bev:|$)/i);
-    const evM = suffix.match(/\bev:\s*(.+?)\s*(?=\s+\bcloses:|$)/i);
+    const closesM = suffix.match(/\bcloses:\s*(.+?)\s*(?=\s+\bev:|\s+\bverify:|$)/i);
+    const evM = suffix.match(/\bev:\s*(.+?)\s*(?=\s+\bcloses:|\s+\bverify:|$)/i);
+    const verifyM = suffix.match(/\bverify:\s*(.+?)\s*(?=\s+\bcloses:|\s+\bev:|$)/i);
     return {
         body: body.slice(0, m.index).trim(),
         closes: closesM ? closesM[1].trim() : '',
         evidence: evM ? parseEvidence(evM[1].trim()) : null,
+        verify: verifyM ? verifyM[1].trim().slice(0, 200) : '',
     };
 }
 // ── Self-healing brain (decision lifecycle, part 3) ──────────────────────────
@@ -421,8 +431,43 @@ function ownMcpSendTexts(tp) {
         return out;
     } catch { return new Set(); }
 }
+// ── Decay-aware message stamps (2026-07-28 post-mortem, class B) ─────────────
+// A delivered inter-session message is MEMORY, not a SENSOR: a peer's "no
+// TestFlight upload triggered yet" relayed ~12h later read as CURRENT state and
+// produced the third stale-"what is remaining" incident. The ENGINE stamps any
+// delivered message older than 6h whose text asserts fast-decay build/deploy
+// status — the discipline lives in the output contract, never in the reading
+// model's judgment. The classifier lives ONCE in klypix-format.mjs
+// (lib.classifyDecay), consumed behind a typeof guard so an older bundled lib
+// degrades to no stamp — never a throw. The stamp is its OWN line appended
+// AFTER the 400-char render slice (the v1.32.0 law: a warning is never subject
+// to the budget/cut it warns about) and lives in render output only — the lane
+// file is never mutated (dedup + ack key on the RAW message text).
+const MSG_DECAY_STAMP_MS = 6 * 60 * 60 * 1000;
+// classifyDecay is precision-first; mirror that here — only an explicit `true`
+// or an explicitly fast-shaped object stamps. Anything ambiguous does NOT
+// (a false stamp erodes trust in every stamp).
+const isFastDecayResult = (r) => r === true || r === 'fast'
+    || (!!r && typeof r === 'object' && (r.fast === true || r.fastDecay === true || r.decay === 'fast' || r.class === 'fast' || r.kind === 'fast'));
+const msgAgeLabel = (ms) => { const h = Math.floor(ms / 3_600_000); return h >= 48 ? `${Math.floor(h / 24)}d` : `${Math.max(1, h)}h`; };
+function decayStampForMessage(text, ts, now, lib) {
+    try {
+        if (!lib || typeof lib.classifyDecay !== 'function') return '';   // old bundled lib → no stamp, never a throw
+        const t = Number(ts) || 0;
+        const staleMs = Number(lib.DECAY_STALE_MS) > 0 ? Number(lib.DECAY_STALE_MS) : MSG_DECAY_STAMP_MS;   // threshold single-sourced in the engine
+        if (!t || now - t < staleMs) return '';
+        if (!isFastDecayResult(lib.classifyDecay(String(text || '')))) return '';
+        // Wording single-sourced in the engine (lib.decayMessageStamp) so the
+        // renderers can never drift apart; local fallback only for a lib old
+        // enough to have the classifier but not the stamp builder.
+        return typeof lib.decayMessageStamp === 'function'
+            ? lib.decayMessageStamp(now - t)
+            : `⏱️ This message is ${msgAgeLabel(now - t)} old and contains build/deploy status — treat as LAST KNOWN, verify live before reporting it.`;
+    } catch { return ''; }   // stamping is best-effort — a classifier bug must never break delivery
+}
 // Surface unseen messages addressed to me, mark them seen (delivered once) under lock.
-function messageFooter(sid, tp) {
+// `lib` (the loaded klypix-format) is optional — absent/old lib just skips stamps.
+function messageFooter(sid, tp, lib) {
     if (!sid) return '';
     let data = {}; try { data = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8')); } catch { return ''; }
     const all = Array.isArray(data.messages) ? data.messages : [];
@@ -455,7 +500,12 @@ function messageFooter(sid, tp) {
     if (!showUniq.length) return '';
     const ago = (ts) => { const mm = Math.max(0, Math.round((now - (ts || now)) / 60000)); return mm <= 0 ? 'just now' : `${mm}m ago`; };
     const out = ['', '## 📨 Message(s) from another session in this project (delivered once — act on or reply to them)'];
-    for (const m of showUniq.slice(0, 6)) out.push(`- from ${String(m.from || '?').slice(0, 8)} · ${ago(m.ts)}: ${String(m.text).replace(/\s+/g, ' ').trim().slice(0, 400)}`);
+    for (const m of showUniq.slice(0, 6)) {
+        out.push(`- from ${String(m.from || '?').slice(0, 8)} · ${ago(m.ts)}: ${String(m.text).replace(/\s+/g, ' ').trim().slice(0, 400)}`);
+        // Engine-emitted LAST-KNOWN stamp — its own line, after the 400-char slice.
+        const stamp = decayStampForMessage(m.text, m.ts, now, lib);
+        if (stamp) out.push(`  ${stamp}`);
+    }
     out.push('Reply with `🧠 MSG [<their-id or all>]: <text>` — it reaches them on their next prompt.');
     return '\n' + out.join('\n');
 }
@@ -1149,9 +1199,10 @@ async function capture(lib) {
             const m = MARKER.exec(trimmed); if (!m) continue;
             const area = (m[1] || '').trim(), type = m[2] || '';
             let body = m[3].trim(); if (!body) continue;
-            // Strip optional `closes:` / `ev:` suffixes off the body so they don't
-            // leak into the card text; they drive the close-link + evidence below.
-            const { body: cleanBody, closes, evidence } = splitMarkerSuffixes(body);
+            // Strip optional `closes:` / `ev:` / `verify:` suffixes off the body so
+            // they don't leak into the card text; they drive the close-link,
+            // evidence, and live-probe below.
+            const { body: cleanBody, closes, evidence, verify } = splitMarkerSuffixes(body);
             body = cleanBody; if (!body) continue;
             const preview = body.slice(0, 90);
             // EXAMPLE/doc guard — rejects marker-SYNTAX documentation (which
@@ -1183,7 +1234,7 @@ async function capture(lib) {
             // ✓ resolves an EXISTING card (stamped ✅ + archived) — not a new card.
             if (type === '✓') { resolutions.push({ area, text: body }); ledger.push({ action: 'resolve', area, preview }); continue; }
             // ~ updates the matching card in place (small corrections).
-            if (type === '~') { updates.push({ area, text: body, createdVia: 'claude-code', ...(evidence ? { evidence } : {}) }); ledger.push({ action: 'update', area, preview, ...(evidence ? { ev: evidence.map(e => e.ref) } : {}) }); continue; }
+            if (type === '~') { updates.push({ area, text: body, createdVia: 'claude-code', ...(evidence ? { evidence } : {}), ...(verify ? { verify } : {}) }); ledger.push({ action: 'update', area, preview, ...(evidence ? { ev: evidence.map(e => e.ref) } : {}) }); continue; }
             // Type → scannable prefix + border color: ? open question (amber),
             // ! milestone (blue), + skill (violet), else decision (green). A plain
             // decision whose text reads as a reusable RULE is AUTO-promoted to a
@@ -1199,7 +1250,7 @@ async function capture(lib) {
             const fileTags = recentTags.slice(-4).filter(t => t !== areaTag);
             const tagLine = [areaTag, ...fileTags].filter(Boolean).join(' ');
             const card = (area ? `${area}: ${prefix}${body}` : `${prefix}${body}`) + (tagLine ? `\n${tagLine}` : '');
-            cards.push({ text: card, area, borderColor, ...(closes ? { closes } : {}), ...(evidence ? { evidence } : {}) });
+            cards.push({ text: card, area, borderColor, ...(closes ? { closes } : {}), ...(evidence ? { evidence } : {}), ...(verify ? { verify } : {}) });
             ledger.push({ action: type === '?' ? 'add-question' : type === '!' ? 'add-milestone' : isSkill ? 'add-skill' : 'add-decision', area, preview, files: fileTags, ...(closes ? { closes } : {}), ...(evidence ? { ev: evidence.map(e => e.ref) } : {}) });
         }
     }
@@ -1286,7 +1337,7 @@ async function capture(lib) {
     try {
         const merged = readState(); for (const k of seen) merged.add(k);
         const res = await lib.captureIntoBrain(fs.readFileSync(BRAIN), {
-            cards: cards.map(c => ({ text: c.text, color: '#e8e8ed', borderColor: c.borderColor, area: c.area, createdVia: c.createdVia || 'claude-code', ...(c.closes ? { closes: c.closes } : {}), ...(c.evidence ? { evidence: c.evidence } : {}) })),
+            cards: cards.map(c => ({ text: c.text, color: '#e8e8ed', borderColor: c.borderColor, area: c.area, createdVia: c.createdVia || 'claude-code', ...(c.closes ? { closes: c.closes } : {}), ...(c.evidence ? { evidence: c.evidence } : {}), ...(c.verify ? { verify: c.verify } : {}) })),
             resolutions,
             updates,
         });
@@ -1449,7 +1500,7 @@ async function promptRetrieve(lib) {
     // Other live sessions in THIS repo — surfaced even when the prompt retrieves
     // nothing (a peer's presence/ship is itself the signal). Empty string when solo.
     const peers = peerFooter(sid);
-    const messages = messageFooter(sid, input.transcript_path);   // 📨 deliberate notes another session left for me (delivered once)
+    const messages = messageFooter(sid, input.transcript_path, lib);   // 📨 deliberate notes another session left for me (delivered once)
     let hits = [], repeats = [], struct = null;
     if (tokens.length) {
         struct = await cachedStruct(lib);
@@ -1984,7 +2035,7 @@ async function read(lib) {
         + ruleDraftsFooter(input.session_id, struct, { markShown: false })
         + selfCheckFooter() + doctorFooter() + versionCurrencyFooter() + legendFooter() + memoryFooter();
     const emitFull = () => {
-        process.stdout.write(full + messageFooter(input.session_id || '', input.transcript_path));
+        process.stdout.write(full + messageFooter(input.session_id || '', input.transcript_path, lib));
         appendJsonl(HEALTH, { ts: nowIso(), project: path.basename(CWD), mode: 'read', ok: true, briefBytes: Buffer.byteLength(full), cards: struct?.counts?.cards ?? null }, 500);
     };
     // --full = everything to stdout (manual runs); also the fallback when the
@@ -2021,7 +2072,7 @@ async function read(lib) {
     // 📨 messages are delivered-ONCE (acked the moment this reads them) — they
     // go right after the ultra brief, at the top of the visible window, never
     // after a stack of footers that could push them past a preview cut.
-    const messages = messageFooter(input.session_id || '', input.transcript_path);
+    const messages = messageFooter(input.session_id || '', input.transcript_path, lib);
     const out = ultra + messages + healLine + draftLine
         + inflightFooter(input.session_id, struct)
         + selfCheckFooter() + doctorFooter() + versionCurrencyFooter();
@@ -2103,5 +2154,5 @@ if (!process.env.KLYPIX_BRAIN_NO_MAIN) {
 
 // Exported for hermetic unit tests only (gated by KLYPIX_BRAIN_NO_MAIN above so the
 // import doesn't run main()/exit the test). Not part of the runtime hook contract.
-export { refreshNpmCurrency, versionCurrencyFooter, bakedBrainVersion, httpsFetchLatest, cmpSemver };
+export { refreshNpmCurrency, versionCurrencyFooter, bakedBrainVersion, httpsFetchLatest, cmpSemver, decayStampForMessage, messageFooter, splitMarkerSuffixes };
 // (shouldSelfUpdate is exported at its declaration above — the auto-propagation decision seam for tests)

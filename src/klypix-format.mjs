@@ -63,6 +63,21 @@ export async function atomicWrite(filePath, buf) {
     catch (e) { try { fs.rmSync(tmp); } catch { /* */ } throw e; }
 }
 
+// ── verify: suffix (decay-aware status, 2026-07-28 post-mortem) ──────────────
+// A card may carry the EXACT live-probe command for its fast-decay claim as a
+// `verify:` suffix ("🏁 build 26 uploaded verify: gh run list --limit 5"), the
+// same marker grammar as closes:/ev: (value runs to the next known key or end
+// of line). The hook strips+persists it as a machine field at capture; cards
+// authored by humans/the app/brain_note keep it in prose — so parseKlypix
+// falls back to a prose parse and every render surface sees ONE `verify` field.
+const VERIFY_SUFFIX_RE = /(?:^|\s)verify:\s*([^\n]+)/i;
+export function parseVerifySuffix(text) {
+    const m = VERIFY_SUFFIX_RE.exec(String(text || ''));
+    if (!m) return null;
+    const v = m[1].split(/\s+\b(?:closes|ev):/i)[0].trim();
+    return v || null;
+}
+
 /**
  * Parse a .klypix/.any buffer into a structured object + the loaded zip (so
  * callers can extract binary assets). Throws on a non-canvas file.
@@ -122,6 +137,11 @@ export async function parseKlypix(buffer) {
             // Evidence anchors (file:line / PR#) with the git blob OID stamped at
             // capture-time — lets the hook flag a card whose cited code drifted.
             evidence: Array.isArray(it.evidence) && it.evidence.length ? it.evidence : null,
+            // Live-probe command for a fast-decay status claim (decay-aware
+            // status): machine field when captured via a verify: marker suffix,
+            // else parsed from prose so non-hook-authored cards count too.
+            verify: (typeof it.verify === 'string' && it.verify.trim()) ? it.verify.trim()
+                : (it.type === 'text' ? parseVerifySuffix(it.content) : null),
             // Machine death-date (epoch ms) written by the gardener at
             // consolidation — the prose "⤵ consolidated" stamp's reliable twin,
             // so as_of time-travel never depends on parsing prose.
@@ -518,6 +538,8 @@ export async function appendIntoContainers(buffer, addition) {
             ...(card.createdVia ? { createdVia: String(card.createdVia) } : {}),
             // Evidence anchors (file:line / PR#) — additive, ignored by older readers.
             ...(Array.isArray(card.evidence) && card.evidence.length ? { evidence: card.evidence } : {}),
+            // Live-probe command for a fast-decay claim — additive, ignored by older readers.
+            ...(typeof card.verify === 'string' && card.verify.trim() ? { verify: card.verify.trim() } : {}),
             content: wrapped, fontSize: G.FONT,
             color: card.color || '#e8e8ed', border: true, borderColor: card.borderColor || card.color || 'rgba(16,185,129,0.45)',
             fillColor: 'rgba(18,18,26,0.85)', heading: !!card.heading, fontFamily: 'Thmanyah Sans',
@@ -1182,7 +1204,15 @@ export function areaStatusDigest(struct, { activeDays = 30, maxAreas = 20, now =
         const miles = cs.filter(isMilestoneCard).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
         const opens = cs.filter(isOpenCard);
         const m = miles[0];
-        const mileTxt = m ? `last 🏁 ${day(m.createdAt)} “${cut(flat(m.text).replace(/^[^:\n]{1,40}:\s*/, '').replace(/^🏁\s*/, ''), 70)}”` : 'no 🏁 yet';
+        // Decay-aware headline (2026-07-28 post-mortem): a fast-decay milestone
+        // older than DECAY_STALE_MS never leads an area as bare current state.
+        // The engine appends the age + a verify cue — the brief is the one
+        // surface every session reads, and models do not compute ages from the
+        // ISO date on their own (that omission was the exact incident).
+        const mAge = m ? now - (m.createdAt || 0) : 0;
+        const mileStale = m && mAge >= DECAY_STALE_MS && isFastDecayCard(m)
+            ? ` (${formatDecayAge(mAge)} — verify live)` : '';
+        const mileTxt = m ? `last 🏁 ${day(m.createdAt)}${mileStale} “${cut(flat(m.text).replace(/^[^:\n]{1,40}:\s*/, '').replace(/^🏁\s*/, ''), 70)}”` : 'no 🏁 yet';
         rows.push({ newest, line: `- ${area} — ${mileTxt} · ${opens.length} open · latest ${day(newest)}` });
     }
     rows.sort((a, b) => b.newest - a.newest);
@@ -1678,6 +1708,86 @@ export function questionContextToMarkdown(question, result, { mode = 'lexical', 
     return out.join('\n') + '\n';
 }
 
+// ── Decay-aware status assertions (2026-07-28 post-mortem, 3rd stale-status ──
+// incident). The brain is a MEMORY, not a SENSOR: for fast-decay facts (what's
+// on TestFlight, what's on npm, whether the rollout flipped) its job is to
+// carry WHERE to look, never assert WHAT is currently true. classifyDecay
+// detects texts that make such assertions so every render surface can stamp
+// them ⏱️ LAST KNOWN instead of presenting them as current state. This moves
+// the "verify before reporting" discipline from model judgment (fails on weak
+// models, occasionally on strong ones) into the engine's output contract.
+//
+// PRECISION OVER RECALL — a missed stamp is the status quo; a false stamp
+// erodes trust in every stamp. A text classifies ONLY when, inside one
+// sentence/line segment (split on .!?\n — NOT ';', the actual incident text
+// was "ready for next TestFlight build; no upload/tag triggered yet"), BOTH:
+//   VERB class — completed-status forms: uploaded / published / released /
+//     deployed / installed / shipped / submitted / staged / flipped /
+//     triggered / rolled out|back / went|is|now live / green — or a
+//     NEGATIVE-pending assertion ("no upload triggered yet", "not yet
+//     published", "awaiting App Store review"), which decays just as fast.
+//   NOUN class — release-shaped subjects: TestFlight / App Store / npm / CI /
+//     release(s) / rollout / build N / vX.Y[.Z] and X.Y.Z version literals.
+// Or the text carries an ev: run/release id ("ev: gh run 16204339183") — a
+// machine receipt is by definition a point-in-time observation.
+// DELIBERATE NON-MATCHES (each is a live false-positive class we tested out):
+//   · bare-infinitive process/architecture prose — "releases go through OIDC
+//     npm publish", "the release pipeline: build → sign → upload" (no
+//     completed verb form; 'publish'/'upload' ≠ 'published'/'uploaded');
+//   · "staged rollout/release/deployment" AND the hyphenated "staged-rollout"
+//     as adjectives (vs "draft staged") — the hyphen form was a live FP on the
+//     real brain's Capabilities card ("staged-rollout auto-updater");
+//   · 'released'/'shipped' with no release noun in the segment — "shipped the
+//     garden fix" is a durable milestone, not a fast-decay build status;
+//   · hyphenated 'live-' adjectives ("live-verified", "live-traced");
+//   · questions/plans about releasing ("should we upload nightly builds?").
+export const DECAY_STALE_MS = 6 * 3_600_000;   // older than this → LAST KNOWN, never current
+const DECAY_VERB_RE = /\b(?:uploaded|published|released|deployed|installed|shipped|submitted|flipped|triggered|green)\b|\bstaged\b(?![\s-]+(?:rollout|rollouts|release[sd]?|deploy\w*|migration\w*|approach))|\brolled[\s-]?(?:out|back)\b|\brolling[\s-]?out\b|\b(?:went|is|are|now|already)\s+live\b|\blive\b(?!-)/i;
+const DECAY_PENDING_RE = /\b(?:not\s+yet|hasn'?t(?:\s+been)?|haven'?t(?:\s+been)?|nothing(?:\s+has)?(?:\s+been)?|never)\s+(?:been\s+)?(?:uploaded|published|released|deployed|installed|shipped|triggered|tagged|submitted|gone\s+live)\b|\bno\s+(?:\w+[\s/-]+){0,2}?(?:upload|publish|deploy|release|install|build|tag|rollout)[\w/-]*(?:\s+\S+){0,3}?\s+(?:yet|so\s+far|triggered|started|fired|happened)\b|\b(?:awaiting|waiting\s+(?:for|on)|pending)\s+(?:apple|app\s?store|testflight|review|approval|upload|release|rollout)\b/i;
+const DECAY_NOUN_RE = /\btest\s?flight\b|\bapp\s?store\b|\bnpm\b|\bci\b|\brelease(?:s)?\b|\brollout(?:s)?\b|\bbuild\s*#?\s*\d+\b|\bv\d+(?:\.\d+)+\b|\b\d+\.\d+\.\d+\b/i;
+const DECAY_EVRUN_RE = /\bev:\s*[^\n]{0,60}?\b(?:run|workflow|release|build|rollout|deploy)[a-z-]*\s*[#:/]?\s*\d{3,}/i;
+export function classifyDecay(text) {
+    const t = String(text || '');
+    if (!t.trim()) return false;
+    if (DECAY_EVRUN_RE.test(t)) return true;
+    // A '.' only ends a segment when followed by whitespace/end — a bare-dot
+    // split shredded version literals ("1.3.28 live" became "1"/"3"/"28 live"
+    // and the noun never met its verb).
+    for (const seg of t.split(/[\n!?]+|\.(?=\s|$)/)) {
+        if (!seg.trim()) continue;
+        if (DECAY_NOUN_RE.test(seg) && (DECAY_VERB_RE.test(seg) || DECAY_PENDING_RE.test(seg))) return true;
+    }
+    return false;
+}
+// A struct card decays if its TEXT classifies, or its machine evidence carries
+// a run/release-shaped receipt (the ev: suffix is stripped from hook-captured
+// prose, so the text alone can't see it).
+export const isFastDecayCard = (c) => classifyDecay(c?.text)
+    || (Array.isArray(c?.evidence) && c.evidence.some(e => DECAY_EVRUN_RE.test('ev: ' + String(e?.ref || ''))));
+// Compact age for stamps ("20h", "3d") — both message renderers show minutes
+// only, which reads as noise at 12h+ ("720m ago").
+export const formatDecayAge = (ms) => {
+    const h = Math.floor(Math.max(0, ms) / 3_600_000);
+    if (h < 1) return `${Math.max(1, Math.floor(Math.max(0, ms) / 60_000))}m`;
+    return h < 48 ? `${h}h` : `${Math.floor(h / 24)}d`;
+};
+// The live-probe to print after a LAST KNOWN claim: the card's own verify:
+// command wins; else a per-area default; else a generic re-verify line.
+// Emitted probes must be PS-5.1-safe: ';' separators, never '&&'.
+export function decayVerifyProbe(card) {
+    const v = typeof card?.verify === 'string' && card.verify.trim() ? card.verify.trim() : null;
+    if (v) return v;
+    const a = String(card?.area || '').toLowerCase();
+    if (/release|app\s?store|appstore|\bios\b|testflight|ship|deploy|rollout/.test(a)) return 'gh run list --limit 5; gh release list --limit 5';
+    if (/drive|admin/.test(a)) return 'probe the live prod endpoint (HTTP) before reporting';
+    return 're-verify live before reporting this as current';
+}
+// Engine-emitted stamp for a delivered inter-session message (class B of the
+// post-mortem taxonomy) — EXACT wording from the brief, single-sourced here so
+// the Claude-hook and agent-presence renderers can never drift apart.
+export const decayMessageStamp = (ageMs) =>
+    `⏱️ This message is ${formatDecayAge(ageMs)} old and contains build/deploy status — treat as LAST KNOWN, verify live before reporting it.`;
+
 // ── Status mode (T7, 2026-07-23) — the computed answer for status questions ──
 // "What is remaining?" must be answered from STATE, not lexical matching:
 // status vocabulary is anti-correlated with truth (cards saying "remaining"
@@ -1688,10 +1798,24 @@ export function questionContextToMarkdown(question, result, { mode = 'lexical', 
 // maxOpen defaults to NO cap: the open list is the answer to a status question,
 // so it is sized to fit (per-card width adapts) rather than sliced. Callers can
 // still pass a cap explicitly.
-export function statusContextToMarkdown(struct, { maxOpen = Infinity, budgetChars = 4200 } = {}) {
+export function statusContextToMarkdown(struct, { maxOpen = Infinity, budgetChars = 4200, now = Date.now() } = {}) {
     if (!struct || !Array.isArray(struct.cards)) return '';
     const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
     const day = (ts) => ts ? new Date(ts).toISOString().slice(0, 10) : '';
+    // ⏱️ LAST KNOWN (decay-aware status, 2026-07-28): a fast-decay claim older
+    // than 6h renders as last-known observation + live probe, NEVER as current
+    // state. The stamp scaffolding lives OUTSIDE cut() and rides pushAlways —
+    // the v1.32.0 law: a warning is never subject to the budget/width it warns
+    // about, so a crowded brain can shorten the CLAIM but never the WARNING.
+    // best-effort try: a malformed card must degrade to an unstamped line, not
+    // take down the whole status section (opBrainAsk catch would eat it all).
+    const decayStamp = (c) => {
+        try {
+            const age = (c.createdAt || 0) > 0 ? now - c.createdAt : 0;
+            if (age <= DECAY_STALE_MS || !isFastDecayCard(c)) return null;
+            return { age: formatDecayAge(age), probe: decayVerifyProbe(c) };
+        } catch { return null; }
+    };
     const isArchived = (c) => /^archive$/i.test(c.area || '');
     const live = struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim() && !isArchived(c));
     const out = [];
@@ -1750,7 +1874,9 @@ export function statusContextToMarkdown(struct, { maxOpen = Infinity, budgetChar
         for (const c of top) {
             if (used > budgetChars) break;
             const flags = `${overdueById.has(c.id) ? ' ⏰OVERDUE' : ''}${overlays.has(c.id) ? ' ⚠️CORRECTED' : ''}${fulfills.has(c.id) ? ' ⏳likely-fulfilled' : ''}`;
-            pushAlways(`- [${flat(c.area) || 'Notes'}]${flags} ${cut(flat(c.text), perCard)}`);
+            const d = decayStamp(c);
+            if (d) pushAlways(`- [${flat(c.area) || 'Notes'}]${flags} ⏱️ LAST KNOWN (${d.age}): ${cut(flat(c.text), perCard)} — VERIFY: ${d.probe}`);
+            else pushAlways(`- [${flat(c.area) || 'Notes'}]${flags} ${cut(flat(c.text), perCard)}`);
             shown++;
         }
         if (shown < opens.length) pushAlways(`- ⚠️ …and ${opens.length - shown} more open item(s) — this list is NOT complete; call brain_ask before reporting what remains.`);
@@ -1759,7 +1885,11 @@ export function statusContextToMarkdown(struct, { maxOpen = Infinity, budgetChar
     if (miles.length) {
         pushAlways('');
         pushAlways('## Newest milestones');
-        for (const m of miles.slice(0, 3)) pushAlways(`- [${flat(m.area) || '?'}] ${day(m.createdAt)} ${cut(flat(m.text), 130)}`);
+        for (const m of miles.slice(0, 3)) {
+            const d = decayStamp(m);
+            if (d) pushAlways(`- [${flat(m.area) || '?'}] ${day(m.createdAt)} ⏱️ LAST KNOWN (${d.age}): ${cut(flat(m.text), 130)} — VERIFY: ${d.probe}`);
+            else pushAlways(`- [${flat(m.area) || '?'}] ${day(m.createdAt)} ${cut(flat(m.text), 130)}`);
+        }
     }
     pushAlways('');
     return out.join('\n') + '\n';
@@ -2870,13 +3000,14 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                     // Self-heal: a ~ update re-stamps the evidence (fresh OID +
                     // verifiedAt), so confirming/correcting a drifted fact marks it ✅.
                     if (Array.isArray(u.evidence) && u.evidence.length) j.evidence = u.evidence;
+                    if (typeof u.verify === 'string' && u.verify.trim()) j.verify = u.verify.trim();
                 });
                 best.text = isTerseConfirm ? `${best.text}\n(re-affirmed ${today}: ${u.text})` : u.text;
                 stats.updated++;
             } else if (!nearDupExists(u.text)) {
                 // ~ fallback add is guarded like ✓'s: an unmatched ~ re-harvested
                 // from the transcript tail must not stack a copy every turn.
-                cards.push({ text: (u.area ? `${u.area}: ` : '') + u.text + (u.area ? `\n#${u.area.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : ''), area: u.area, createdVia: u.createdVia, ...(Array.isArray(u.evidence) && u.evidence.length ? { evidence: u.evidence } : {}) });
+                cards.push({ text: (u.area ? `${u.area}: ` : '') + u.text + (u.area ? `\n#${u.area.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : ''), area: u.area, createdVia: u.createdVia, ...(Array.isArray(u.evidence) && u.evidence.length ? { evidence: u.evidence } : {}), ...(typeof u.verify === 'string' && u.verify.trim() ? { verify: u.verify.trim() } : {}) });
             }
         }
 
@@ -2901,6 +3032,7 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                     j.createdAt = now;
                     if (card.createdVia) j.createdVia = String(card.createdVia);
                     if (Array.isArray(card.evidence) && card.evidence.length) j.evidence = card.evidence;
+                    if (typeof card.verify === 'string' && card.verify.trim()) j.verify = card.verify.trim();
                 });
                 best.text = String(card.text);
                 cards.splice(i, 1);
@@ -3561,17 +3693,17 @@ export function findOverdueOpenCards(struct, { now = Date.now() } = {}) {
 // (milestone) | '✓' (resolve+archive a match) | '~' (update a match in place) |
 // '+' (skill — a REUSABLE how-to/gotcha/procedure, standing reference that always
 // surfaces and never ages out, distinct from a point-in-time decision).
-export function noteToCaptureInput({ text = '', area = '', marker = '', closes = '', evidence = null, createdVia = 'mcp' } = {}) {
+export function noteToCaptureInput({ text = '', area = '', marker = '', closes = '', evidence = null, verify = null, createdVia = 'mcp' } = {}) {
     const body = String(text).trim();
     if (!body) return { cards: [], resolutions: [], updates: [] };
     const a = String(area || '').trim();
     if (marker === '✓') return { cards: [], resolutions: [{ area: a, text: body }], updates: [] };
-    if (marker === '~') return { cards: [], resolutions: [], updates: [{ area: a, text: body, createdVia, ...(evidence ? { evidence } : {}) }] };
+    if (marker === '~') return { cards: [], resolutions: [], updates: [{ area: a, text: body, createdVia, ...(evidence ? { evidence } : {}), ...(verify ? { verify } : {}) }] };
     const prefix = marker === '?' ? '❓ ' : marker === '!' ? '🏁 ' : marker === '+' ? '🛠️ ' : '';
     const borderColor = marker === '?' ? 'rgba(245,166,35,0.8)' : marker === '!' ? 'rgba(59,130,246,0.8)' : marker === '+' ? 'rgba(139,92,246,0.85)' : 'rgba(16,185,129,0.6)';
     const tag = a ? `\n#${a.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : '';
     const cardText = (a ? `${a}: ${prefix}${body}` : `${prefix}${body}`) + tag;
-    return { cards: [{ text: cardText, area: a, color: '#e8e8ed', borderColor, createdVia, ...(closes ? { closes } : {}), ...(evidence ? { evidence } : {}) }], resolutions: [], updates: [] };
+    return { cards: [{ text: cardText, area: a, color: '#e8e8ed', borderColor, createdVia, ...(closes ? { closes } : {}), ...(evidence ? { evidence } : {}), ...(verify ? { verify } : {}) }], resolutions: [], updates: [] };
 }
 
 /**

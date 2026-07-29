@@ -2,7 +2,11 @@
 // statusContextToMarkdown / corpseRate — including a faithful reproduction of
 // the 2026-07-23 field incident (a "remaining: web tray UI + next desktop
 // release" clause that outlived its shipped-portal milestone).
-import { extractOpenClauses, findFulfillmentCandidates, statusContextToMarkdown, corpseRate, splitQueryTokens, rankForQuestion } from '../src/klypix-format.mjs';
+import {
+    extractOpenClauses, findFulfillmentCandidates, findStaleOpenCards, statusContextToMarkdown,
+    corpseRate, splitQueryTokens, rankForQuestion, stemLight, fulfillmentOverlaysFor,
+    buildKlypix, parseKlypix, captureIntoBrain, addBrainConnections,
+} from '../src/klypix-format.mjs';
 
 let pass = 0, fail = 0;
 const ok = (cond, name) => { if (cond) { pass++; console.log(`✓ ${name}`); } else { fail++; console.log(`✗ ${name}`); } };
@@ -142,6 +146,212 @@ ok(splitQueryTokens('how does the sync status indicator work?').content.includes
     const { hits } = rankForQuestion(struct, 'web tray contracts drive portal', { k: 5 });
     const openHit = hits.find(h => h.card.id === 'o1');
     ok(!!(openHit && openHit.fulfillment), 'recalled open card carries its fulfillment overlay');
+}
+
+// ── 2026-07-29 incident geometry: verbose diagnostic ❓ vs terse fix 🏁 ───────
+// The pair every prior reproduction shares (07-23, 07-25, 07-28): a forensic
+// narrative ❓ whose whole-card token denominator can never reach the 0.6 flat
+// bar against a tersely-worded fix milestone (0.21 measured live) — even
+// though the two share the brain's rarest tokens. Locked here in the verbatim
+// STORED (hard-wrapped) form, which also exercises the wrap-normalization.
+const WRAPPED_INCIDENT_Q =
+    'Release: ❓ PACKAGED LOCAL-AI\nREGRESSION FOUND 2026-07-28 in live\nv1.3.68: package.json excludes all\n'
+    + 'node_modules/node-llama-cpp/llama/**\nas presumed dead C++ sources, but\nnode-llama-cpp 3.19.1 runtime reads\n'
+    + 'llama/binariesGithubRelease.json even\nwith getLlama({build:\'never\'}).\nNarrow the prune to retain metadata\nand verify a packaged Local answer E2E.';
+const TERSE_INCIDENT_M =
+    'Release: 🏁 Local-AI dogfood fixes are source-complete: packaging retains node-llama-cpp binariesGithubRelease.json while excluding only the 32 MB git bundle';
+
+// stemLight — the comparison-time morphology that made the pair visible.
+ok(stemLight('excludes') === stemLight('excluding'), 'stemLight unifies excludes/excluding');
+ok(stemLight('packaged') === stemLight('packaging'), 'stemLight unifies packaged/packaging');
+ok(stemLight('retains') === stemLight('retained'), 'stemLight unifies retains/retained');
+ok(stemLight('shipped') === stemLight('ships'), 'stemLight unifies shipped/ships');
+
+// Imperative-ask cue: the ❓'s ask sentence becomes a claim clause; a 🏁's
+// imperative prose stays exempt (open-shaped cards only).
+{
+    const cl = extractOpenClauses(WRAPPED_INCIDENT_Q);
+    ok(cl.some(c => /^narrow the prune/i.test(c.clause)), 'imperative ask sentence extracts as a claim clause on a ❓ card');
+    ok(extractOpenClauses('🏁 shipped it. Verify the rollout dashboards weekly.').length === 0, 'imperative prose on a 🏁 card is NOT a claim');
+}
+
+// findFulfillmentCandidates: the incident pair pairs via the anchor OR-path —
+// suggestion-only by construction (never ✓-resolvable).
+{
+    const o = { id: 'iq1', type: 'text', area: 'Release', createdAt: D0, text: WRAPPED_INCIDENT_Q };
+    const m = { id: 'im1', type: 'text', area: 'Release', createdAt: D0 + 86_400_000, text: TERSE_INCIDENT_M };
+    const cands = findFulfillmentCandidates(mkStruct([o, m]), [m]);
+    ok(cands.length >= 1, 'incident pair: verbose ❓ pairs with the terse fix 🏁');
+    ok(cands.some(c => c.via === 'anchor'), 'incident pair: matched via rare-anchor OR-path (flat coverage below bar)');
+    ok(cands.filter(c => c.via === 'anchor').every(c => c.resolvable === false), 'anchor-path candidates never suggest a ✓ (suggestion-only)');
+}
+// Anchor precision: 2 shared rare tokens pair SAME-area only; cross-area needs ≥3.
+{
+    const oR = { id: 'ap1', type: 'text', area: 'Release', createdAt: D0, text: '❓ quuxflux gadget frobnicator pipeline still failing on parse step' };
+    const mSame = { id: 'ap2', type: 'text', area: 'Release', createdAt: D0 + 1000, text: 'Release: 🏁 quuxflux frobnicator repaired in the parser build' };
+    const mCross = { id: 'ap3', type: 'text', area: 'iOS', createdAt: D0 + 1000, text: 'iOS: 🏁 quuxflux frobnicator repaired in the parser build' };
+    ok(findFulfillmentCandidates(mkStruct([oR, mSame]), [mSame]).length >= 1, '2 rare anchors pair within the same area');
+    ok(findFulfillmentCandidates(mkStruct([oR, mCross]), [mCross]).length === 0, '2 rare anchors do NOT pair across areas (needs 3)');
+}
+// findStaleOpenCards inherits the same geometry (SessionStart self-heal path)
+// and honors dismissals.
+{
+    const o = { id: 'sq1', type: 'text', area: 'Release', createdAt: D0, text: WRAPPED_INCIDENT_Q };
+    const m = { id: 'sm1', type: 'text', area: 'Release', createdAt: D0 + 86_400_000, text: TERSE_INCIDENT_M };
+    const { gaps } = findStaleOpenCards(mkStruct([o, m]));
+    ok(gaps.length === 1 && gaps[0].by.id === 'sm1', 'self-heal detector catches the incident pair via anchors');
+    const dismissed = findStaleOpenCards(mkStruct([o, m], [{ fromId: 'sq1', toId: 'sm1', relationship: 'not_fulfilled' }]));
+    ok(dismissed.gaps.length === 0, 'a not_fulfilled dismissal suppresses the self-heal pair too (parity)');
+}
+
+// ── Serve-time ❓↔🏁 pairing inside the answer's own hit set ─────────────────
+{
+    const o = { id: 'sv1', type: 'text', area: 'Release', createdAt: D0, text: 'Release: ❓ packaged local answers fail — binariesgithubrelease metadata json missing from the asar bundle', tags: [], links: [] };
+    const m = { id: 'sv2', type: 'text', area: 'Release', createdAt: D0 + 86_400_000, text: 'Release: 🏁 packaging retains binariesgithubrelease metadata json in the asar bundle', tags: [], links: [] };
+    const { hits } = rankForQuestion(mkStruct([o, m]), 'packaged local answers asar bundle', { k: 5 });
+    const oh = hits.find(h => h.card.id === 'sv1');
+    ok(!!(oh && oh.fulfillment), 'serve-time: co-ranked ❓ gets a fulfillment hint with NO persisted edge');
+    ok(!!(oh && oh.fulfillment && oh.fulfillment.unconfirmed === true), 'serve-time hint is flagged unconfirmed (hedged render)');
+    const { hits: hits2 } = rankForQuestion(mkStruct([o, m], [{ fromId: 'sv1', toId: 'sv2', relationship: 'not_fulfilled' }]), 'packaged local answers asar bundle', { k: 5 });
+    const oh2 = hits2.find(h => h.card.id === 'sv1');
+    ok(!(oh2 && oh2.fulfillment), 'serve-time pairing respects a not_fulfilled dismissal');
+    // An OLDER milestone must never serve-time-pair with a newer open card.
+    const { hits: hits3 } = rankForQuestion(mkStruct([{ ...o, createdAt: D0 + 172_800_000 }, m]), 'packaged local answers asar bundle', { k: 5 });
+    const oh3 = hits3.find(h => h.card.id === 'sv1');
+    ok(!(oh3 && oh3.fulfillment), 'serve-time pairing requires the milestone to post-date the open card');
+}
+
+// statusContextToMarkdown: serve-time augmentation flags an edge-less pair with
+// the hedged '?' variant, never the confirmed flag.
+{
+    const o = { id: 'st1', type: 'text', area: 'Release', createdAt: Date.now() - 2 * 86_400_000, text: 'Release: ❓ packaged local answers fail — binariesgithubrelease metadata json missing from the asar bundle' };
+    const m = { id: 'st2', type: 'text', area: 'Release', createdAt: Date.now() - 3_600_000, text: 'Release: 🏁 packaging retains binariesgithubrelease metadata json in the asar bundle' };
+    const md = statusContextToMarkdown(mkStruct([o, m]));
+    ok(/⏳likely-fulfilled\?/.test(md), 'status open-list flags the edge-less pair as ⏳likely-fulfilled? (unconfirmed)');
+}
+
+// ── captureIntoBrain persists detection as edges (2026-07-29) ────────────────
+// A pair the self-heal detector can see must survive as a dashed edge after any
+// capture — prose-only detection died with the SessionStart that printed it.
+{
+    const buf = await buildKlypix({
+        title: 'hint-fixture',
+        cards: [{ text: 'Release: ❓ caps handshake wiring for the drive portal still open', area: 'Release' }],
+    });
+    await new Promise(r => setTimeout(r, 20));    // the fulfilling 🏁 must post-date the ❓
+    const res = await captureIntoBrain(buf, {
+        cards: [{ text: 'Release: 🏁 caps handshake wiring for the drive portal shipped', area: 'Release' }],
+    });
+    const { struct } = await parseKlypix(res.buffer);
+    const q = struct.cards.find(c => /caps handshake wiring.*still open/s.test(c.text || ''));
+    const f = struct.cards.find(c => /🏁.*caps handshake wiring/s.test(c.text || ''));
+    const edge = (struct.connections || []).find(cn => cn.label === 'likely closed by' && q && f && cn.fromId === q.id && cn.toId === f.id);
+    ok(!!edge, 'capture persists a dashed likely-closed-by edge for the detected pair');
+}
+
+// ── Review fixes (2026-07-29 adversarial pass over the 1.43.0 diff) ──────────
+// Each of these reproduces a CONFIRMED finding and must stay dead.
+
+// F1 · A dismissal must SURVIVE STORAGE. The REL allowlist silently coerced
+// not_fulfilled → relates_to, so every settled-set check was dead in production
+// since 1.31.0: the tool said "Drew 1 connection(s)" and the dismissed hint came
+// back on the next render, forever. Tests passed only because fixtures fabricate
+// the connection object and never round-trip it through the writer.
+{
+    const buf = await buildKlypix({
+        title: 'dismiss-fixture',
+        cards: [{ text: 'x: ❓ caps handshake wiring still open' }, { text: 'x: 🏁 caps handshake wiring shipped' }],
+    });
+    const { struct: s0 } = await parseKlypix(buf);
+    const [a, b] = s0.cards.filter(c => c.type !== 'container');
+    const res = await addBrainConnections(buf, [{ fromId: a.id, toId: b.id, relationship: 'not_fulfilled' }]);
+    ok(res.added === 1, 'a not_fulfilled dismissal is accepted by the writer');
+    const { struct: s1 } = await parseKlypix(res.buffer);
+    ok((s1.connections || []).some(c => c.relationship === 'not_fulfilled'), 'the dismissal survives storage as not_fulfilled (not coerced to relates_to)');
+    // …and end-to-end: a stored dismissal suppresses the serve-time hint.
+    const { hits } = rankForQuestion(s1, 'caps handshake wiring', { k: 5 });
+    const oh = hits.find(h => h.card.id === a.id);
+    ok(!(oh && oh.fulfillment), 'a ROUND-TRIPPED dismissal actually suppresses the hint');
+}
+// F2 · A dismissal must not be pair-deduped away by the very hint it dismisses.
+{
+    const buf = await buildKlypix({
+        title: 'dismiss-after-hint',
+        cards: [{ text: 'y: ❓ phone inbox drain routing still open' }, { text: 'y: 🏁 phone inbox drain routing shipped' }],
+    });
+    const { struct: s0 } = await parseKlypix(buf);
+    const [a, b] = s0.cards.filter(c => c.type !== 'container');
+    const hinted = await addBrainConnections(buf, [{ fromId: a.id, toId: b.id, relationship: 'relates_to', label: 'likely closed by' }]);
+    const dismissed = await addBrainConnections(hinted.buffer, [{ fromId: a.id, toId: b.id, relationship: 'not_fulfilled' }]);
+    ok(dismissed.added === 1, 'a dismissal is recorded even when a hint edge already occupies the pair');
+    const { struct: s2 } = await parseKlypix(dismissed.buffer);
+    ok(!(s2.connections || []).some(c => c.label === 'likely closed by'), 'the dismissed machine hint is retired, not left rendering');
+    ok(fulfillmentOverlaysFor(s2, s2.cards.filter(c => c.type !== 'container')).size === 0, 'no overlay survives the dismissal');
+    // A second identical dismissal is still deduped.
+    const again = await addBrainConnections(dismissed.buffer, [{ fromId: a.id, toId: b.id, relationship: 'not_fulfilled' }]);
+    ok(again.added === 0, 'a duplicate dismissal is deduped');
+}
+// F3 · A persisted machine hint stays HEDGED. One capture used to promote a
+// suggestion to the confirmed "⏳ LIKELY FULFILLED" tier.
+{
+    const o = { id: 'h1', type: 'text', area: 'x', createdAt: D0, text: 'x: ❓ caps handshake wiring for the drive portal still open' };
+    const m = { id: 'h2', type: 'text', area: 'x', createdAt: D0 + 1000, text: 'x: 🏁 caps handshake wiring for the drive portal shipped' };
+    const ov = fulfillmentOverlaysFor(mkStruct([o, m], [{ fromId: 'h1', toId: 'h2', label: 'likely closed by' }]), [o]);
+    ok(ov.get('h1')?.unconfirmed === true, 'a machine-written hint edge renders as unconfirmed, not settled truth');
+}
+// F4 · Anchor precision: the area-name prefix every stored card carries is
+// shared BY CONSTRUCTION and can never be evidence; rarity is relative to
+// corpus size. Probe from the review: an SSO ship "fulfilling" a changelog ❓.
+{
+    const o = { id: 'p1', type: 'text', area: 'Release', createdAt: D0, text: 'Release: ❓ decide the changelog format for enterprise customers before launch' };
+    const m = { id: 'p2', type: 'text', area: 'Release', createdAt: D0 + 1000, text: 'Release: 🏁 enterprise SSO login shipped to production' };
+    ok(findStaleOpenCards(mkStruct([o, m])).gaps.length === 0, 'area prefix + one topic word does NOT pair unrelated cards');
+    ok(findFulfillmentCandidates(mkStruct([o, m]), [m]).length === 0, '…and the capture-side matcher agrees');
+}
+// F5 · stemLight collisions must not mint anchors (state↔stats, notes↔noting).
+// The stems genuinely collide; the raw-word guard is what stops the collision
+// from becoming EVIDENCE. Fixtures share nothing but the colliding words.
+ok(stemLight('state') === stemLight('stats'), 'stemLight DOES collide state/stats (documented)');
+ok(stemLight('notes') === stemLight('noting'), 'stemLight DOES collide notes/noting (documented)');
+{
+    const o = { id: 'c1', type: 'text', area: 'Canvas', createdAt: D0, text: 'Canvas: ❓ undo discards rotation state plus authored notes' };
+    const m = { id: 'c2', type: 'text', area: 'Canvas', createdAt: D0 + 1000, text: 'Canvas: 🏁 cost stats panel shipped, noting hourly spend' };
+    ok(findStaleOpenCards(mkStruct([o, m])).gaps.length === 0, '…but the raw-word guard stops two collisions from pairing the cards');
+    ok(findFulfillmentCandidates(mkStruct([o, m]), [m]).length === 0, '…on the capture side too');
+    // Real morphology still counts as the same word.
+    ok(stemLight('excludes') === stemLight('excluding'), 'genuine variants still unify (excludes/excluding)');
+}
+// F6 · A "remaining:" clause must stop at a SENTENCE boundary, or unwrapping
+// lets it swallow following DONE sentences and suggest a ✓ for untouched work.
+{
+    const t = 'QA: ❓ remaining: mobile safari test matrix. Desktop test matrix shipped in the v2 rollout already.';
+    const cl = extractOpenClauses(t);
+    const first = cl.find(c => /mobile safari/i.test(c.clause));
+    ok(!!first && !/desktop/i.test(first.clause), 'the claim clause stops at the period, not at paragraph end');
+    const o = { id: 'q1', type: 'text', area: 'QA', createdAt: D0, text: t };
+    const m = { id: 'q2', type: 'text', area: 'QA', createdAt: D0 + 1000, text: 'QA: 🏁 desktop test matrix shipped in the v2 rollout' };
+    const cands = findFulfillmentCandidates(mkStruct([o, m]), [m]);
+    ok(!cands.some(c => c.resolvable && /mobile safari/i.test(c.item)), 'no ✓ is suggested for the untouched mobile-safari item');
+}
+// F7 · Serve-time coverage needs a minimum claim size: a 2-token ❓ is trivially
+// "covered" by any milestone reusing its words, cross-area, at cov 1.0.
+{
+    const o = { id: 's1', type: 'text', area: 'Release', createdAt: Date.now() - 2 * 86_400_000, text: 'Release: ❓ npm publish?' };
+    const m = { id: 's2', type: 'text', area: 'Docs', createdAt: Date.now() - 3_600_000, text: 'Docs: 🏁 nightly job publishes release notes to the wiki' };
+    const md = statusContextToMarkdown(mkStruct([o, m]));
+    ok(!/⏳likely-fulfilled/.test(md), 'a 2-token open card is never flagged fulfilled by word reuse alone');
+}
+// F8 · Anchor-grade evidence is NEVER persisted as an edge — it stays
+// serve-time-only so being wrong about it costs nothing beyond one render.
+{
+    const buf = await buildKlypix({
+        title: 'anchor-no-persist',
+        cards: [{ text: 'Release: ❓ quuxflux frobnicator pipeline still failing on the parse step for large inputs', area: 'Release' }],
+    });
+    await new Promise(r => setTimeout(r, 20));
+    const res = await captureIntoBrain(buf, { cards: [{ text: 'Release: 🏁 quuxflux frobnicator repaired inside the parser build', area: 'Release' }] });
+    const { struct } = await parseKlypix(res.buffer);
+    ok(!(struct.connections || []).some(c => c.label === 'likely closed by'), 'an anchor-grade pair leaves no persisted hint edge');
 }
 
 console.log(fail ? `✗ ${fail} assertion(s) failed` : '✓ claim-engine: all assertions passed');

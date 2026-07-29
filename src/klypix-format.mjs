@@ -161,7 +161,16 @@ export async function parseKlypix(buffer) {
 // it between two cards a reconcile pass flagged as a FALSE contradiction, and
 // detectContradictions then treats the pair as settled forever (the persisted
 // dismiss path the correction-cue false-positive previously lacked).
-const REL = new Set(['leads_to', 'depends_on', 'relates_to', 'conflicts_with', 'supports', 'questions', 'costs', 'blocks', 'not_contradiction']);
+// 'not_fulfilled' is its twin for the claim engine — and its ABSENCE here was a
+// silent critical: every fulfillment surface has told users to dismiss a wrong
+// ⏳ hint with brain_connect relationship:"not_fulfilled" since 1.31.0, but this
+// allowlist coerced it to 'relates_to', so the stored edge never matched any
+// settled-set check. The tool reported "✓ Drew 1 connection(s)" and the
+// dismissed hint came back on the very next render, forever. Every claim-engine
+// test passed because the fixtures fabricate the connection object directly and
+// never round-trip it through this writer (2026-07-29 review, CONFIRMED).
+export const DISMISSAL_RELS = new Set(['not_contradiction', 'not_fulfilled']);
+const REL = new Set(['leads_to', 'depends_on', 'relates_to', 'conflicts_with', 'supports', 'questions', 'costs', 'blocks', ...DISMISSAL_RELS]);
 
 /**
  * Build a real .klypix v4 file (nodebuffer) from a simple spec:
@@ -1605,7 +1614,7 @@ export const deathDateOfCard = (card) => {
     const m = /(?:↩︎ superseded|↩ superseded|✅|⤵ consolidated) (\d{4}-\d{2}-\d{2})/.exec(String(c.text || ''));
     return m ? Date.parse(m[1]) : null;
 };
-export function rankForQuestion(struct, question, { semantic = null, k = 10, as_of = null, now = Date.now(), semFloor = 0.30, recentDays = 30 } = {}) {
+export function rankForQuestion(struct, question, { semantic = null, k = 10, as_of = null, now = Date.now(), semFloor = 0.30, recentDays = 30, pairSim = null } = {}) {
     // Status-shaped questions score by their CONTENT tokens only — "remaining"
     // must never lexically select the stale cards that say "remaining:".
     const { content: tokens, statusShaped, strong: statusStrong } = splitQueryTokens(question);
@@ -1668,6 +1677,54 @@ export function rankForQuestion(struct, question, { semantic = null, k = 10, as_
     let fulfills = new Map();
     if (!timeTravel) { try { fulfills = fulfillmentOverlaysFor(struct, top.map(h => h.card)); } catch { /* best-effort */ } }
     const hits = top.map(h => ({ ...h, correction: overlays.get(h.card.id) || null, fulfillment: fulfills.get(h.card.id) || null }));
+    // SERVE-TIME ❓↔🏁 PAIRING (2026-07-29 incident): an answer's own hit set
+    // can contain an open card AND the newer milestone that likely fulfilled
+    // it, side by side, unlinked — the incident answer carried both at sims
+    // 0.44/0.46 and the agent quoted the ❓ as a live blocker. Fulfillment used
+    // to be a persisted-edge lookup only; one missed capture-time check
+    // silenced every ⏳ surface forever. This pass inspects relationships
+    // WITHIN the candidate set only (≤k², no brain scan), embedding-first
+    // (pairSim = card↔card cosine from the caller's vectors) with a lexical
+    // anchor/coverage fallback, respects human dismissals, and renders through
+    // the ⏳ overlay as an UNCONFIRMED hint — suggestion-only, hedged wording.
+    if (!timeTravel) {
+        try {
+            const openHits = hits.filter(h => !h.correction && !h.fulfillment && !h.archived && isUnresolvedOpenCard(h.card));
+            const mileHits = hits.filter(h => isMilestoneCard(h.card) && !/^archive$/i.test(h.card.area || ''));
+            if (openHits.length && mileHits.length) {
+                const settled = new Set();
+                for (const cn of struct.connections || []) {
+                    if (cn.label === 'likely closed by' || cn.relationship === 'not_fulfilled') settled.add(`${cn.fromId}|${cn.toId}`);
+                }
+                let df = null;
+                const dfMap = () => (df ??= buildStemDf(struct));
+                for (const oh of openHits) {
+                    let best = null, bestScore = 0;
+                    for (const mh of mileHits) {
+                        const o = oh.card, m = mh.card;
+                        if (m.id === o.id || (m.createdAt || 0) <= (o.createdAt || 0)) continue;
+                        if (settled.has(`${o.id}|${m.id}`)) continue;
+                        const sim = typeof pairSim === 'function' ? pairSim(o.id, m.id) : null;
+                        const lex = likelyFulfillsLexical(o, m, dfMap());
+                        const sameArea = (o.area || '') === (m.area || '');
+                        // Accept: strong embedding agreement backed by ANY lexical
+                        // signal, or lexical evidence alone at the anchor/coverage
+                        // bars. Pure-semantic pairs (zero shared vocabulary) stay
+                        // out — precision-first for a rendered hint.
+                        const accept = (sim != null && sim >= 0.55 && (lex.size || 0) >= SERVE_MIN_STEMS && (lex.anchors.length >= 1 || lex.cov >= 0.2))
+                            || serveTimeAccepts(lex, sameArea);
+                        if (!accept) continue;
+                        const score = (sim ?? 0) + lex.cov + lex.anchors.length * 0.2;
+                        if (score > bestScore) { bestScore = score; best = m; }
+                    }
+                    if (best) {
+                        const head = String(best.text || '').replace(/\s+/g, ' ').trim().slice(0, 100);
+                        oh.fulfillment = { by: head, byId: best.id, unconfirmed: true };
+                    }
+                }
+            }
+        } catch { /* pairing is a best-effort overlay — never fail the answer */ }
+    }
     return { hits, total: scored.length, tokens, statusShaped, statusStrong };
 }
 
@@ -1698,7 +1755,12 @@ export function questionContextToMarkdown(question, result, { mode = 'lexical', 
             block += `\n\n  ⚠️ CORRECTED — this card is STALE; the current truth is:\n  ${flat(h.correction.by.text).slice(0, 600)}`;
         } else if (h.fulfillment) {
             // Precedence: a correction outranks a fulfills-hint (never stack both).
-            block += `\n\n  ⏳ LIKELY FULFILLED — a newer milestone appears to cover this open item: “${flat(h.fulfillment.by).slice(0, 200)}”. Verify before treating it as still-to-do; confirm with a ✓ marker if done.`;
+            // Serve-time pairs (detected inside THIS answer's hit set, no
+            // persisted edge yet) hedge harder than edge-confirmed hints — the
+            // reader must verify, not inherit a machine guess as settled truth.
+            block += h.fulfillment.unconfirmed
+                ? `\n\n  ⏳ POSSIBLY FULFILLED (serve-time hint — detected within this answer, no confirmed link): a newer milestone in this same answer may cover this open item: “${flat(h.fulfillment.by).slice(0, 200)}”. VERIFY before treating it as still-to-do; confirm with a ✓ marker if done, or dismiss via brain_connect relationship:"not_fulfilled".`
+                : `\n\n  ⏳ LIKELY FULFILLED — a newer milestone appears to cover this open item: “${flat(h.fulfillment.by).slice(0, 200)}”. Verify before treating it as still-to-do; confirm with a ✓ marker if done.`;
         }
         if (used + block.length + 2 > budgetChars && shown > 0) { out.push(`\n_…and ${hits.length - shown} more matched card(s) omitted for length — narrow the question or use search for the rest._`); break; }
         out.push(block, '');
@@ -1746,8 +1808,35 @@ const DECAY_VERB_RE = /\b(?:uploaded|published|released|deployed|installed|shipp
 const DECAY_PENDING_RE = /\b(?:not\s+yet|hasn'?t(?:\s+been)?|haven'?t(?:\s+been)?|nothing(?:\s+has)?(?:\s+been)?|never)\s+(?:been\s+)?(?:uploaded|published|released|deployed|installed|shipped|triggered|tagged|submitted|gone\s+live)\b|\bno\s+(?:\w+[\s/-]+){0,2}?(?:upload|publish|deploy|release|install|build|tag|rollout)[\w/-]*(?:\s+\S+){0,3}?\s+(?:yet|so\s+far|triggered|started|fired|happened)\b|\b(?:awaiting|waiting\s+(?:for|on)|pending)\s+(?:apple|app\s?store|testflight|review|approval|upload|release|rollout)\b/i;
 const DECAY_NOUN_RE = /\btest\s?flight\b|\bapp\s?store\b|\bnpm\b|\bci\b|\brelease(?:s)?\b|\brollout(?:s)?\b|\bbuild\s*#?\s*\d+\b|\bv\d+(?:\.\d+)+\b|\b\d+\.\d+\.\d+\b/i;
 const DECAY_EVRUN_RE = /\bev:\s*[^\n]{0,60}?\b(?:run|workflow|release|build|rollout|deploy)[a-z-]*\s*[#:/]?\s*\d{3,}/i;
-export function classifyDecay(text) {
-    const t = String(text || '');
+// Cards are STORED hard-wrapped (~37 chars/line via wrapText), so a mid-sentence
+// '\n' is layout, not punctuation. Any extractor that treats lines or [^\n] runs
+// as semantic units must rebuild sentences first, or a wrap point silently
+// gates it (2026-07-29 incident: the wrap fell between "in live" and "v1.3.68",
+// so classifyDecay saw a verb-only segment and a noun-only segment and the one
+// card that most needed a ⏱️ LAST KNOWN stamp rendered plain). Rules:
+//   · pure tag lines ("#release #file-x #auto") are dropped, not joined — a
+//     "#file-release-notes" tag would otherwise donate a release NOUN to the
+//     sentence above it (probe-confirmed false-positive class);
+//   · a single '\n' joins to a space; a blank line stays a paragraph boundary.
+export function normalizeWrappedProse(text) {
+    return String(text || '')
+        .split('\n')
+        .filter(l => !/^\s*(?:#[\p{L}\p{N}_-]+\s*)+$/u.test(l))
+        .join('\n')
+        .replace(/([^\n])\n(?!\n)/g, '$1 ');
+}
+// Unwrapping is OPT-IN, and only the card store may opt in. An inter-session
+// message's newlines are AUTHORED separators: joining them merged a verb line
+// with an unrelated release-noun line and invented a ⏱️ stamp on every host
+// lane (2026-07-29 review, CONFIRMED — "shipped the auth fix to the beta
+// testers\nremaining: npm audit + release notes" is two claims, neither
+// fast-decay). Line-length geometry cannot tell the two apart either: that
+// message's authored lines are 40 and 36 chars, well inside wrap range. So the
+// caller who KNOWS its text came from wrapText declares it, and every other
+// caller — message stampers on all hosts — keeps raw '\n' segmentation.
+export function classifyDecay(text, { wrapped = false } = {}) {
+    const raw = String(text || '');
+    const t = wrapped ? normalizeWrappedProse(raw) : raw;
     if (!t.trim()) return false;
     if (DECAY_EVRUN_RE.test(t)) return true;
     // A '.' only ends a segment when followed by whitespace/end — a bare-dot
@@ -1762,7 +1851,9 @@ export function classifyDecay(text) {
 // A struct card decays if its TEXT classifies, or its machine evidence carries
 // a run/release-shaped receipt (the ev: suffix is stripped from hook-captured
 // prose, so the text alone can't see it).
-export const isFastDecayCard = (c) => classifyDecay(c?.text)
+// Card text IS wrapped by construction (wrapText at capture), so the card path
+// unwraps explicitly rather than relying on geometry detection.
+export const isFastDecayCard = (c) => classifyDecay(c?.text, { wrapped: true })
     || (Array.isArray(c?.evidence) && c.evidence.some(e => DECAY_EVRUN_RE.test('ev: ' + String(e?.ref || ''))));
 // Compact age for stamps ("20h", "3d") — both message renderers show minutes
 // only, which reads as noise at 12h+ ("720m ago").
@@ -1857,6 +1948,33 @@ export function statusContextToMarkdown(struct, { maxOpen = Infinity, budgetChar
         // question (review scale finding).
         const top = sorted.slice(0, maxOpen);
         const fulfills = fulfillmentOverlaysFor(struct, top);
+        // Serve-time augmentation (2026-07-29): edge-lookup alone renders a
+        // fulfilled ❓ plain when the one capture-time check missed the pair.
+        // Re-detect lexically against the newest milestones for the opens THIS
+        // render will show — bounded (top × ≤40 miles), suggestion-only, and
+        // flagged '?' so an unconfirmed hint never reads as a settled one.
+        try {
+            const newestMiles = live.filter(isMilestoneCard)
+                .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)).slice(0, 40);
+            if (newestMiles.length && top.length && top.length <= 80) {
+                const settled = new Set();
+                for (const cn of struct.connections || []) {
+                    if (cn.relationship === 'not_fulfilled') settled.add(`${cn.fromId}|${cn.toId}`);
+                }
+                let df = null;
+                const dfMap = () => (df ??= buildStemDf(struct));
+                for (const o of top) {
+                    if (fulfills.has(o.id)) continue;
+                    for (const m of newestMiles) {
+                        if (m.id === o.id || (m.createdAt || 0) <= (o.createdAt || 0) || settled.has(`${o.id}|${m.id}`)) continue;
+                        const lex = likelyFulfillsLexical(o, m, dfMap());
+                        if (!serveTimeAccepts(lex, (o.area || '') === (m.area || ''))) continue;
+                        fulfills.set(o.id, { by: String(m.text || '').replace(/\s+/g, ' ').trim().slice(0, 100), byId: m.id, unconfirmed: true });
+                        break;
+                    }
+                }
+            }
+        } catch { /* augmentation is best-effort — the base render stands */ }
         let overlays = new Map();
         try { overlays = correctionOverlaysFor(struct, top); } catch { /* best-effort */ }
         pushAlways('');
@@ -1873,7 +1991,7 @@ export function statusContextToMarkdown(struct, { maxOpen = Infinity, budgetChar
         let shown = 0;
         for (const c of top) {
             if (used > budgetChars) break;
-            const flags = `${overdueById.has(c.id) ? ' ⏰OVERDUE' : ''}${overlays.has(c.id) ? ' ⚠️CORRECTED' : ''}${fulfills.has(c.id) ? ' ⏳likely-fulfilled' : ''}`;
+            const flags = `${overdueById.has(c.id) ? ' ⏰OVERDUE' : ''}${overlays.has(c.id) ? ' ⚠️CORRECTED' : ''}${fulfills.has(c.id) ? (fulfills.get(c.id)?.unconfirmed ? ' ⏳likely-fulfilled?' : ' ⏳likely-fulfilled') : ''}`;
             const d = decayStamp(c);
             if (d) pushAlways(`- [${flat(c.area) || 'Notes'}]${flags} ⏱️ LAST KNOWN (${d.age}): ${cut(flat(c.text), perCard)} — VERIFY: ${d.probe}`);
             else pushAlways(`- [${flat(c.area) || 'Notes'}]${flags} ${cut(flat(c.text), perCard)}`);
@@ -1893,6 +2011,113 @@ export function statusContextToMarkdown(struct, { maxOpen = Infinity, budgetChar
     }
     pushAlways('');
     return out.join('\n') + '\n';
+}
+
+// ── Out-of-session ship observation (class-C decay, host-neutral) ────────────
+// A ship that happens with NO hooked session watching — another host, a human
+// terminal, CI — produced no 🏁 card and triggered no claim reconciliation: the
+// brain only learned what a session narrated. The v1.3.69 desktop release
+// arrived exactly that way and the ❓ it resolved stayed open for a day.
+//
+// This lives in the ENGINE, not in one host's hook, because the incident class
+// is worst precisely where no Claude hook runs (Codex CLI, Cursor, a
+// MCP-only project). Every host calls observeShipDrift at task start and
+// drainPendingShips at write time; both take an explicit projectDir so nothing
+// depends on a hook's CWD. Two deterministic, zero-network signals only:
+// the newest local git tag and package.json's version.
+export const shipObsPaths = (projectDir) => ({
+    state: path.join(projectDir || '.', '.claude', 'brain-ship-obs.json'),
+    queue: path.join(projectDir || '.', '.claude', 'brain-pending-ships.jsonl'),
+});
+// Tag names may carry '@' (changesets / lerna: "klypix-mcp@1.43.0"); shell
+// metacharacters stay out because the tag is interpolated into a git command.
+const SAFE_TAG_RE = /^[\w.@/-]+$/;
+const cmpSemver3 = (a, b) => {
+    const pa = String(a || '').split('.').map(n => parseInt(n, 10) || 0), pb = String(b || '').split('.').map(n => parseInt(n, 10) || 0);
+    for (let i = 0; i < 3; i++) if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) - (pb[i] || 0);
+    return 0;
+};
+export function readShipSignals(projectDir, gitRun) {
+    let tag = '';
+    try { tag = String(gitRun('for-each-ref refs/tags --sort=-creatordate --count=1 --format=%(refname:short)') || '').trim(); } catch { /* no git / no tags */ }
+    let version = '';
+    try { version = String(JSON.parse(fs.readFileSync(path.join(projectDir, 'package.json'), 'utf8')).version || ''); } catch { /* not an npm project */ }
+    return { tag, version };
+}
+export const writeShipObsState = (projectDir, sig) => {
+    const { state } = shipObsPaths(projectDir);
+    try { fs.mkdirSync(path.dirname(state), { recursive: true }); fs.writeFileSync(state, JSON.stringify(sig)); return true; } catch { return false; }
+};
+/**
+ * Compare the live ship signals against this project's last recorded
+ * observation. Returns { events, notice } — events are QUEUED for the next brain
+ * write (so reconciliation runs under the capture lock) and the baseline
+ * advances only after they are durably queued. First call BASELINES silently.
+ * Never throws; a non-git / non-npm project simply yields nothing.
+ */
+export function observeShipDrift(projectDir, { gitRun, now = () => new Date().toISOString() } = {}) {
+    const empty = { events: [], notice: '' };
+    if (!projectDir || typeof gitRun !== 'function') return empty;
+    try {
+        const { state, queue } = shipObsPaths(projectDir);
+        let prev = null; try { prev = JSON.parse(fs.readFileSync(state, 'utf8')); } catch { /* first run */ }
+        const sig = readShipSignals(projectDir, gitRun);
+        if (!prev || typeof prev !== 'object') { writeShipObsState(projectDir, sig); return empty; }
+        const events = [];
+        if (sig.tag && prev.tag && sig.tag !== prev.tag && SAFE_TAG_RE.test(sig.tag)) {
+            let subj = ''; try { subj = String(gitRun(`log -1 --format=%s ${sig.tag}`) || '').trim(); } catch { /* optional */ }
+            events.push({ area: 'Release', key: `tagged ${sig.tag}`, tag: sig.tag, summary: `tagged ${sig.tag}${subj ? ' — ' + subj.slice(0, 90) : ''} (observed at task start — new since this project's last recorded observation)` });
+        }
+        // A version CHANGE, not an increase — a revert is real news, but must not
+        // be called a ship. Provenance is deliberately NOT asserted: this
+        // observer cannot know whether some session narrated it, and claiming
+        // "outside any hooked session" was false on every routine release
+        // (2026-07-29 review, CONFIRMED).
+        if (sig.version && prev.version && sig.version !== prev.version) {
+            const dir = cmpSemver3(sig.version, prev.version) < 0 ? 'reverted to' : '→';
+            events.push({ area: 'Release', key: `version-observed ${sig.version}`, version: sig.version, summary: `version ${dir} ${sig.version} observed at task start (was ${prev.version})` });
+        }
+        if (!events.length) { writeShipObsState(projectDir, sig); return empty; }
+        try {
+            fs.mkdirSync(path.dirname(queue), { recursive: true });
+            for (const e of events) fs.appendFileSync(queue, JSON.stringify({ ts: now(), ...e }) + '\n');
+        } catch { return empty; }                 // couldn't queue → don't advance the baseline
+        writeShipObsState(projectDir, sig);
+        return {
+            events,
+            notice: `⏱️ Ship signal observed since this project's last observation: ${events.map(e => e.key).join(' · ')} — queued for capture + claim reconciliation at the next brain write. Open ❓ cards about this release may already be fulfilled; verify live before reporting them as blockers.`,
+        };
+    } catch { return empty; }
+}
+export function readPendingShips(projectDir) {
+    try {
+        const { queue } = shipObsPaths(projectDir);
+        if (!fs.existsSync(queue)) return [];
+        return fs.readFileSync(queue, 'utf8').split('\n').filter(Boolean)
+            .map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    } catch { return []; }
+}
+export const clearPendingShips = (projectDir) => { try { fs.unlinkSync(shipObsPaths(projectDir).queue); } catch { /* already gone */ } };
+/**
+ * Turn queued observations into capture-ready ship cards. `isSeen(key)` consults
+ * the caller's persistent dedup state; `narrated` are ship summaries captured in
+ * THIS batch. A ship already narrated by some session is not news — an observed
+ * version event keys differently from every narrated summary ("published to
+ * npm", "cut release vX"), which is why the routine release flow used to produce
+ * a duplicate card (2026-07-29 review, CONFIRMED).
+ */
+export function pendingShipCards(rows, { isSeen = () => false, narrated = [], sha } = {}) {
+    const out = [];
+    for (const r of rows || []) {
+        if (!r || !r.summary) continue;
+        const area = r.area || 'Release';
+        const key = typeof sha === 'function' ? sha(('ship|' + area + '|' + String(r.key || r.summary)).toLowerCase()) : null;
+        if (key && isSeen(key)) continue;
+        const ver = r.version || (r.tag ? String(r.tag).replace(/^.*?v?(\d+\.\d+\.\d+)$/, '$1') : '');
+        if (ver && narrated.some(s => String(s).includes(ver))) continue;
+        out.push({ key, area, summary: String(r.summary) });
+    }
+    return out;
 }
 
 // ── External-state reconcile — migration omission tripwire ───────────────────
@@ -2246,7 +2471,23 @@ export async function addBrainConnections(buffer, edges) {
     for (const e of edges || []) {
         if (!e.fromId || !e.toId || e.fromId === e.toId) continue;
         if (!canvas.positions[e.fromId] || !canvas.positions[e.toId]) continue; // both must exist
-        if (linked(e.fromId, e.toId)) continue;
+        // A DISMISSAL must never be pair-deduped away by the very hint it
+        // dismisses. The pair-level guard is right for topical edges (it stops
+        // duplicate arrows) but it made the documented escape hatch a no-op:
+        // an auto-written 'likely closed by' hint occupied the pair, so the
+        // human's not_fulfilled edge was dropped ("Drew 0 connection(s)") and
+        // the wrong hint became permanent (2026-07-29 review, CONFIRMED).
+        // Dismissals therefore RETIRE the machine hint in place and are always
+        // recorded; a second identical dismissal is still deduped.
+        if (DISMISSAL_RELS.has(e.relationship)) {
+            const already = canvas.connections.some(c => c.relationship === e.relationship
+                && ((c.fromId === e.fromId && c.toId === e.toId) || (c.fromId === e.toId && c.toId === e.fromId)));
+            if (already) continue;
+            for (const c of canvas.connections) {
+                const samePair = (c.fromId === e.fromId && c.toId === e.toId) || (c.fromId === e.toId && c.toId === e.fromId);
+                if (samePair && c.label === 'likely closed by') { c.label = '↩ dismissed hint'; c.style = 'dashed'; c.color = 'rgba(148,163,184,0.5)'; }
+            }
+        } else if (linked(e.fromId, e.toId)) continue;
         canvas.connections.push({
             id: `con_${rand()}`, fromId: e.fromId, toId: e.toId,
             relationship: REL.has(e.relationship) ? e.relationship : 'relates_to',
@@ -3147,7 +3388,10 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
             const cands = findFulfillmentCandidates(struct, [{ text: card.text, createdAt: now }], { maxPerMilestone: 2 })
                 .filter(c => !closed.has(c.open.id));
             if (!cands.length) continue;
-            card.__fulfills = cands.map(c => c.open.id);
+            // Only COVERAGE-grade candidates earn a persisted edge; anchor-grade
+            // ones ride the printed receipt (hedged) and are re-derived at serve
+            // time. See the persist pass below for why.
+            card.__fulfills = cands.filter(c => c.via !== 'anchor').map(c => c.open.id);
             for (const c of cands) {
                 stats.fulfillCandidates.push({
                     open: String(c.open.text || '').replace(/\s+/g, ' ').slice(0, 90),
@@ -3155,6 +3399,7 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                     item: c.item,
                     uncovered: c.uncovered,
                     cov: c.cov,
+                    ...(c.via ? { via: c.via } : {}),
                     // A ✓ is suggested ONLY when the claim is FULLY covered and
                     // its tokens can actually clear the resolve matcher's ≥4
                     // floor — a partial ✓ used to archive the whole card
@@ -3227,6 +3472,49 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                 }
             } catch { /* auto-linking is opportunistic */ }
         }
+        // PERSIST DETECTION AS EDGES (2026-07-29): staleOpenFooter printed its
+        // findings as prose and wrote nothing, so a detection that fired at
+        // SessionStart was invisible to brain_ask an hour later — miss the one
+        // capture-time check and every ⏳ surface stayed blind forever. Every
+        // capture now leaves dashed 'likely closed by' edges for the pairs the
+        // detector can currently see. Suggestion-only contract unchanged (the
+        // human ✓ retires cards; addConn dedups; a not_fulfilled dismissal
+        // suppresses the pair inside findStaleOpenCards itself). Bounded: the
+        // detector caps at 8 pairs and runs once per capture batch.
+        try {
+            const { gaps } = findStaleOpenCards(struct, { max: 8 });
+            let hintEdges = 0;
+            for (const g of gaps) {
+                // ANCHOR-GRADE EVIDENCE IS NEVER PERSISTED. Its whole contract is
+                // "suggestion, verify by hand" — persisting it made the next
+                // render treat it as an established link, so a hint the serve
+                // path hedged as "POSSIBLY FULFILLED" came back one capture
+                // later at full strength and entered every settled set, i.e.
+                // permanent unless dismissed (2026-07-29 review, CONFIRMED).
+                // Anchor pairs stay serve-time-only, re-derived and re-hedged
+                // on each render, so they cost nothing to be wrong about.
+                if (g.via === 'anchor') continue;
+                const before = stats.linked;
+                addConn(g.open.id, g.by.id, 'likely closed by', undefined, { style: 'dashed', width: 1.5, color: 'rgba(16,185,129,0.55)' });
+                if (stats.linked > before) { hintEdges++; continue; }
+                // hasConn is pair-level and label-blind, and the structural
+                // auto-linker runs FIRST in this same capture — so a co-tagged
+                // pair already wearing an 'auto' relates_to edge could never
+                // receive its hint, on this or any future capture (2026-07-29
+                // review, CONFIRMED). Upgrade the weaker edge in place instead
+                // of dropping the finding on the floor. Dismissals and existing
+                // hints are left exactly as they are.
+                for (const cn of canvas.connections) {
+                    const samePair = (cn.fromId === g.open.id && cn.toId === g.by.id) || (cn.fromId === g.by.id && cn.toId === g.open.id);
+                    if (!samePair || cn.label === 'likely closed by' || cn.label === '↩ dismissed hint' || DISMISSAL_RELS.has(cn.relationship)) continue;
+                    cn.fromId = g.open.id; cn.toId = g.by.id;
+                    cn.label = 'likely closed by'; cn.style = 'dashed'; cn.width = 1.5; cn.color = 'rgba(16,185,129,0.55)';
+                    hintEdges++;
+                    break;
+                }
+            }
+            if (hintEdges) stats.hintEdges = hintEdges;
+        } catch { /* hint persistence is opportunistic — never fail a capture */ }
         stampBrainKind(manifest);
         work = await finalizeBrainZip(zip, canvas, manifest, now);
     }
@@ -3451,18 +3739,166 @@ export async function applyGarden(buffer, { syntheses = [] } = {}) {
 // are stopword- and URL-free: raw tokenSet keeps any ≥4-char word, so
 // from/this/with/https/github cleared the 0.6 coverage bar against unrelated
 // milestones (four probe-confirmed FP classes, incl. the live dogfood noise).
-const CLAIM_CUE_RE = /\b(?:remaining|pending|still\s+to\s+do|to-?do|outstanding|open\s+items?)\b[^:\n]{0,40}:\s*([^\n]+)|\b(?:next|awaits?)\s*:\s*([^\n]+)/gi;
+// Cue vocabulary is single-sourced: the clause matcher and the line-boundary
+// preserver below must never drift apart (a cue the matcher knows but the
+// preserver doesn't gets its line silently merged into the clause above it).
+const CLAIM_CUE_WORDS = String.raw`remaining|pending|still\s+to\s+do|to-?do|outstanding|open\s+items?`;
+const NEXT_CUE_WORDS = String.raw`next|awaits?`;
+const CLAIM_CUE_RE = new RegExp(String.raw`\b(?:${CLAIM_CUE_WORDS})\b[^:\n]{0,40}:\s*([^\n]+)|\b(?:${NEXT_CUE_WORDS})\s*:\s*([^\n]+)`, 'gi');
+const CUE_LINE_RE = new RegExp(String.raw`^\s*(?:${CLAIM_CUE_WORDS}|${NEXT_CUE_WORDS})\b[^:\n]{0,40}:`, 'i');
 const claimTokens = (s) => new Set([...tokenSet(String(s || '').replace(/https?:\/\/\S+/g, ' '))].filter(t => !STOPWORDS.has(t)));
-export function extractOpenClauses(text) {
+// ── Morphology + rarity (2026-07-29 incident) ────────────────────────────────
+// The incident pair shared the brain's rarest tokens (binariesgithubrelease,
+// node-llama-cpp) yet measured 0.21 flat coverage: the ❓ was a 42-token
+// forensic narrative, the 🏁 a terse fix, and tokenSet is morphology-blind
+// (excludes/excluding, packaged/packaging all count as misses). Two additions,
+// both feeding the SAME suggestion-only pipeline — the generic 0.6 bar stays:
+//   · stemLight — a deliberately tiny suffix stripper (ing/ed/es/s + trailing
+//     double consonant + trailing e) applied at COMPARISON time only, never to
+//     stored tokens, so no other consumer's token sets change;
+//   · anchor tokens — a token whose stemmed form appears in ≤ANCHOR_DF_MAX live
+//     cards is near-unique in the brain; an open↔milestone pair sharing ≥2 such
+//     anchors (same area; ≥3 cross-area) is hint-worthy regardless of flat
+//     coverage. Rare-by-construction, so the genericity guard stays meaningful.
+// Suffix stripping is deliberately conservative and, crucially, only ever
+// consulted through matchesStem below — a bare stem comparison collides distinct
+// vocabulary (state↔stats, notes↔noting, cares↔caring all collapse), and one
+// collision is enough to be the tipping anchor on an unrelated pair
+// (2026-07-29 review, CONFIRMED: 'rotation state' vs 'cost stats').
+export const stemLight = (w) => {
+    let s = String(w);
+    if (s.length >= 6 && /(?:ing|ed)$/.test(s)) s = s.replace(/(?:ing|ed)$/, '');
+    else if (s.length >= 5 && /[^s]s$/.test(s)) s = s.replace(/es$|s$/, '');
+    if (s.length >= 5 && /(.)\1$/.test(s)) s = s.slice(0, -1);
+    if (s.length >= 5 && s.endsWith('e')) s = s.slice(0, -1);
+    return s;
+};
+// Two RAW tokens are the same word only if one is at most one suffix-strip away
+// from the other. excludes↔excluding passes (each strips to the same form AND
+// one strips onto the other's stem); state↔stats does not (neither raw form is
+// the other's stem). This is the guard that makes stemming safe to use as
+// evidence rather than merely as a recall boost.
+export const matchesStem = (a, b) => a === b || stemLight(a) === b || a === stemLight(b);
+// Stem→raw-tokens index: comparison keys on the stem (cheap set intersection),
+// but every accepted match is re-validated on the RAW words behind it.
+export const stemIndex = (tokens) => {
+    const m = new Map();
+    for (const t of tokens) { const s = stemLight(t); if (!m.has(s)) m.set(s, new Set()); m.get(s).add(t); }
+    return m;
+};
+export const stemSet = (tokens) => new Set(stemIndex(tokens).keys());
+const rawMatch = (aRaws, bRaws) => { for (const x of aRaws || []) for (const y of bRaws || []) if (matchesStem(x, y)) return true; return false; };
+// Rarity is RELATIVE to corpus size: an absolute df≤4 meant that in a young
+// brain (or any area with ≤4 cards) EVERY token was "rare" — including the
+// area-name prefix every stored card carries, which handed same-area pairs a
+// free anchor (2026-07-29 review, CONFIRMED: an SSO ship "fulfilling" a
+// changelog question on [releas, enterpris]).
+const anchorDfMax = (liveCount) => Math.max(2, Math.ceil(0.02 * Math.max(0, liveCount)));
+// Document frequency of STEMMED tokens across live (non-archived, non-container)
+// cards — the rarity oracle for anchor matching. O(cards × tokens), built once
+// per detection pass and only when a pass actually needs it (lazy).
+export function buildStemDf(struct) {
+    const df = new Map();
+    let live = 0;
+    for (const c of struct?.cards || []) {
+        if (c.type === 'container' || !(c.text || '').trim() || /^archive$/i.test(c.area || '')) continue;
+        live++;
+        for (const t of stemSet(tokenSet(c.text))) df.set(t, (df.get(t) || 0) + 1);
+    }
+    df.__live = live;
+    df.__max = anchorDfMax(live);
+    return df;
+}
+// Tokens a pair shares BY CONSTRUCTION are never evidence: the area name (every
+// stored card is written "<Area>: …" and containers carry it too) and its #tag
+// slug. Cheap per-call set — areas are short.
+const structuralStems = (...areas) => {
+    const out = new Set();
+    for (const a of areas) for (const t of stemSet(tokenSet(String(a || '').replace(/[^\p{L}\p{N}]+/gu, ' ')))) out.add(t);
+    return out;
+};
+export function sharedAnchors(aIdx, bIdx, df, { exclude = null } = {}) {
     const out = [];
-    for (const m of String(text || '').matchAll(CLAIM_CUE_RE)) {
-        const clause = (m[1] || m[2] || '').trim();
+    const max = (df && df.__max) || 2;
+    const aIsMap = aIdx instanceof Map, bIsMap = bIdx instanceof Map;
+    for (const t of (aIsMap ? aIdx.keys() : aIdx)) {
+        if (exclude && exclude.has(t)) continue;                 // structural (area/tag) token — shared by construction
+        if (!(bIsMap ? bIdx.has(t) : bIdx.has(t))) continue;
+        if ((df?.get(t) || 0) > max) continue;                   // not rare enough for this corpus size
+        if (aIsMap && bIsMap && !rawMatch(aIdx.get(t), bIdx.get(t))) continue;   // stem collision, not the same word
+        out.push(t);
+    }
+    return out;
+}
+// Anchors must CORROBORATE topical overlap, never substitute for it entirely:
+// a small coverage floor keeps two rare words from pairing cards that share
+// nothing else.
+const ANCHOR_COV_FLOOR = 0.15;
+// One pair-scorer for every serve-/heal-time surface: stemmed coverage of the
+// open card's claim by the milestone + shared rare anchors. Suggestion-grade
+// evidence, never a close verdict.
+export function likelyFulfillsLexical(openCard, milestone, df) {
+    const oIdx = stemIndex(claimTokens(normalizeWrappedProse(openCard?.text)));
+    const mIdx = stemIndex(tokenSet(milestone?.text));
+    if (!oIdx.size || !mIdx.size) return { cov: 0, anchors: [], size: oIdx.size };
+    const cov = coverageOf(new Set(oIdx.keys()), new Set(mIdx.keys()));
+    const anchors = df ? sharedAnchors(oIdx, mIdx, df, { exclude: structuralStems(openCard?.area, milestone?.area) }) : [];
+    return { cov: Math.round(cov * 100) / 100, anchors, size: oIdx.size };
+}
+const anchorsSufficient = (anchors, sameArea, cov = 1) =>
+    anchors.length >= (sameArea ? 2 : 3) && cov >= ANCHOR_COV_FLOOR;
+// Serve-time acceptance for a whole-card claim, mirroring the capture paths'
+// size floors (it.tokens.size≥2 / oTok.size≥3 / tk.size≥4). Without one, a
+// 2-token open card ("Release: ❓ npm publish?") is trivially covered by any
+// milestone reusing its words, cross-area, at cov 1.0 (2026-07-29 review,
+// CONFIRMED) — and a ⏳ flag instructs the reader not to treat it as open.
+// Small claims must therefore earn a hint through rare anchors, never coverage.
+const SERVE_COV_BAR = 0.35;
+const SERVE_MIN_STEMS = 3;
+export const serveTimeAccepts = (lex, sameArea) =>
+    anchorsSufficient(lex.anchors, sameArea, lex.cov)
+    || ((lex.size || 0) >= SERVE_MIN_STEMS && lex.cov >= SERVE_COV_BAR);
+// Imperative-ask cue (2026-07-29): a narrative ❓ card often carries no
+// colon-anchored "remaining:" clause — its ask is an imperative sentence
+// ("Narrow the prune … and verify a packaged answer E2E"). For OPEN-shaped
+// cards only (❓/🎯 in text — a milestone's prose stays exempt), such sentences
+// become claim clauses, so the ASK is the coverage denominator instead of the
+// whole diagnosis. Curated base-form verbs, sentence-initial, ≥8 chars of
+// payload — commit-style "fix:" prefixes never reach here (no ❓/🎯).
+const IMPERATIVE_ASK_RE = /(?:^|[.!?]\s+)((?:narrow|fix|verify|ship|wire|apply|investigate|add|restore|re-?run|prove|close|migrate|land|publish|deploy|implement|rotate|upgrade|remove|rename|extend|measure|benchmark|audit|rehydrate|persist|surface)\b[^\n.!?]{8,160})/gi;
+export function extractOpenClauses(text) {
+    // Sentence-shaped cues ([^:\n], [^\n]+, sentence-initial verbs) read the
+    // UNWRAPPED prose — stored hard-wraps otherwise truncate every clause at
+    // the first wrap point (~37 chars), which silently crippled clause capture
+    // for all STORED cards while tests fed unwrapped text and stayed green.
+    // A line that OPENS with its own cue ("remaining: A" under "pending: B")
+    // is an authored list entry, not a soft wrap — promote it to a paragraph
+    // boundary before joining, or the join would fold sibling claims into one.
+    const t = normalizeWrappedProse(String(text || '').split('\n').map(l => CUE_LINE_RE.test(l) ? '\n' + l : l).join('\n'));
+    const out = [];
+    for (const m of t.matchAll(CLAIM_CUE_RE)) {
+        // Stop the clause at the first SENTENCE boundary, not at paragraph end.
+        // Unwrapping made a stored card one long paragraph, so "remaining: X."
+        // followed by "Y shipped already." absorbed the done-sentence into the
+        // claim — coverage then cleared the bar against the milestone that
+        // shipped Y and the footer suggested a ✓ for a card whose real
+        // remaining item was untouched (2026-07-29 review, CONFIRMED).
+        // Same version-literal-safe split as classifyDecay: '1.3.28' survives.
+        const clause = (m[1] || m[2] || '').split(/[!?]\s|\.(?=\s|$)/)[0].trim();
         if (!clause) continue;
         const items = clause.split(/\s*(?:\+|·|;)\s*/)
-            .map(t => t.trim()).filter(t => t.length >= 4)
-            .map(t => ({ text: t, tokens: claimTokens(t) }))
+            .map(x => x.trim()).filter(x => x.length >= 4)
+            .map(x => ({ text: x, tokens: claimTokens(x) }))
             .filter(it => it.tokens.size >= 1);
         if (items.length) out.push({ clause, items });
+    }
+    if (/❓|🎯/.test(t)) {
+        for (const m of t.matchAll(IMPERATIVE_ASK_RE)) {
+            const clause = (m[1] || '').trim();
+            if (!clause) continue;
+            const tokens = claimTokens(clause);
+            if (tokens.size >= 3) out.push({ clause, items: [{ text: clause, tokens }] });
+        }
     }
     return out;
 }
@@ -3492,8 +3928,14 @@ export function findFulfillmentCandidates(struct, milestones, { coverAt = 0.6, r
     }
     // Milestone token sets ONCE — this used to sit in the innermost item loop
     // (claims × items × milestones tokenizations; output caps bound results,
-    // not work — the 9000-card constraint is about work).
-    const mPre = milestones.map(m => ({ m, tok: tokenSet(m.text) }));
+    // not work — the 9000-card constraint is about work). Comparison happens on
+    // STEMMED sets (stemLight) so excludes/excluding, packaged/packaging count
+    // as the hits they are — stored token sets stay untouched.
+    const mPre = milestones.map(m => ({ m, idx: stemIndex(tokenSet(m.text)), tok: stemSet(tokenSet(m.text)) }));
+    // Rarity oracle for the anchor OR-path — built lazily: most captures carry
+    // no open-shaped claims at all and must not pay the corpus scan.
+    let df = null;
+    const dfMap = () => (df ??= buildStemDf(struct));
     const out = [];
     for (const o of live) {
         const clauses = extractOpenClauses(o.text);
@@ -3506,14 +3948,28 @@ export function findFulfillmentCandidates(struct, milestones, { coverAt = 0.6, r
         for (const cl of clauses) {
             for (const it of cl.items) {
                 if (it.tokens.size < 2) continue;              // one-token items match everything
-                for (const { m, tok: mTok } of mPre) {
+                const itIdx = stemIndex(it.tokens);
+                const itStems = new Set(itIdx.keys());
+                for (const { m, idx: mIdx, tok: mTok } of mPre) {
                     if (m.id && m.id === o.id) continue;       // a milestone never fulfils its own clause
                     if (m.id && settled.has(`${o.id}|${m.id}`)) continue;
                     if (requireNewer && Number.isFinite(m.createdAt) && m.createdAt <= (o.createdAt || 0)) continue;
-                    const cov = coverageOf(it.tokens, mTok);
-                    if (cov < coverAt) continue;
-                    const uncovered = cl.items.filter(x => x !== it && coverageOf(x.tokens, mTok) < coverAt).map(x => x.text);
-                    out.push({ open: o, clause: cl.clause, item: it.text, uncovered, milestone: m, cov: Math.round(cov * 100) / 100, resolvable: it.tokens.size >= 4 });
+                    const cov = coverageOf(itStems, mTok);
+                    // ANCHOR OR-PATH (2026-07-29 incident): a verbose diagnostic
+                    // ❓ vs a terse differently-worded 🏁 can NEVER reach the flat
+                    // bar (42-token denominator, 0.21 measured) — but the pair
+                    // shares near-unique tokens. ≥2 rare anchors in the same
+                    // area (≥3 cross-area) is hint-grade evidence on its own.
+                    // Suggestion-only by construction: via:'anchor' candidates
+                    // are never ✓-resolvable and get their own per-milestone cap.
+                    let viaAnchor = false;
+                    if (cov < coverAt) {
+                        const anchors = sharedAnchors(itIdx, mIdx, dfMap(), { exclude: structuralStems(o.area, m.area) });
+                        if (!anchorsSufficient(anchors, (o.area || '') === (m.area || ''), cov)) continue;
+                        viaAnchor = true;
+                    }
+                    const uncovered = cl.items.filter(x => x !== it && coverageOf(stemSet(x.tokens), mTok) < coverAt).map(x => x.text);
+                    out.push({ open: o, clause: cl.clause, item: it.text, uncovered, milestone: m, cov: Math.round(cov * 100) / 100, resolvable: !viaAnchor && it.tokens.size >= 4, ...(viaAnchor ? { via: 'anchor' } : {}) });
                 }
             }
         }
@@ -3538,14 +3994,21 @@ export function findFulfillmentCandidates(struct, milestones, { coverAt = 0.6, r
         byItem.get(k).push(c);
     }
     const perMile = new Map();
+    const perMileAnchor = new Map();
     const kept = [];
     for (const group of byItem.values()) {
         if (group.length > 3) continue;                    // too generic — no hint
         for (const c of group.sort((a, b) => b.cov - a.cov).slice(0, 2)) {
             const mk = c.milestone.id || milestones.indexOf(c.milestone);
-            const n = perMile.get(mk) || 0;
-            if (n >= maxPerMilestone) continue;
-            perMile.set(mk, n + 1);
+            // Anchor-path candidates spend a SEPARATE (smaller) per-milestone
+            // budget: the coverage-path cap must not crowd them out — the exact
+            // starvation the 2026-07-29 critic probe found at low bars — and
+            // they must not inflate the coverage path's spray allowance either.
+            const budget = c.via === 'anchor' ? perMileAnchor : perMile;
+            const cap = c.via === 'anchor' ? 2 : maxPerMilestone;
+            const n = budget.get(mk) || 0;
+            if (n >= cap) continue;
+            budget.set(mk, n + 1);
             kept.push(c);
         }
     }
@@ -3562,12 +4025,24 @@ export function fulfillmentOverlaysFor(struct, cards) {
     if (!struct || !Array.isArray(struct.connections)) return map;
     const byId = new Map(struct.cards.map(c => [c.id, c]));
     const want = new Set((cards || []).map(c => c.id));
+    // A dismissal WINS even if both edges coexist on the pair — the relabel in
+    // addBrainConnections handles new dismissals, and this covers any brain
+    // where the two edges got written independently (or by an older build).
+    const dismissed = new Set();
+    for (const cn of struct.connections) {
+        if (DISMISSAL_RELS.has(cn.relationship)) { dismissed.add(`${cn.fromId}|${cn.toId}`); dismissed.add(`${cn.toId}|${cn.fromId}`); }
+    }
     for (const cn of struct.connections) {
         if (cn.label !== 'likely closed by' || !want.has(cn.fromId)) continue;
+        if (dismissed.has(`${cn.fromId}|${cn.toId}`)) continue;
         const m = byId.get(cn.toId);
         if (!m || /^archive$/i.test(m.area || '')) continue;    // a since-archived milestone no longer vouches
         const head = String(m.text || '').replace(/\s+/g, ' ').trim().slice(0, 100);
-        if (!map.has(cn.fromId)) map.set(cn.fromId, { by: head, byId: m.id });
+        // Machine-written hints (capture-time detection, no human ✓) stay
+        // HEDGED after persistence. Before this, one capture silently promoted
+        // a suggestion to the confirmed "⏳ LIKELY FULFILLED" tier — the diff's
+        // own hedging defeated one session later (2026-07-29 review, CONFIRMED).
+        if (!map.has(cn.fromId)) map.set(cn.fromId, { by: head, byId: m.id, unconfirmed: cn.hintVia !== 'human' });
     }
     return map;
 }
@@ -3619,9 +4094,25 @@ export function findStaleOpenCards(struct, { coverAt = 0.6, max = 5 } = {}) {
     const opens = live.filter(isOpenCard);
     const miles = live.filter(isMilestoneCard);
     if (!opens.length || !miles.length) return empty;
+    // Human dismissals + existing hint edges suppress a pair here exactly as in
+    // findFulfillmentCandidates — a rejected hint must never resurface in the
+    // self-heal footer either (parity fix, 2026-07-29).
+    const settled = new Set();
+    for (const cn of struct.connections || []) {
+        if (cn.label === 'likely closed by' || cn.relationship === 'not_fulfilled') settled.add(`${cn.fromId}|${cn.toId}`);
+    }
+    // Milestone stem sets ONCE — this sat inside the opens loop (opens × miles
+    // tokenizations per SessionStart; pure waste at 1,500 cards).
+    const mPre = miles.map(m => ({ m, idx: stemIndex(tokenSet(m.text)), tok: stemSet(tokenSet(m.text)) }));
+    let df = null;
+    const dfMap = () => (df ??= buildStemDf(struct));
     const out = [];
     for (const o of opens) {
-        const oTok = tokenSet(o.text);
+        // claimTokens (stopword-stripped, URL-free) — parity with
+        // findFulfillmentCandidates. The raw tokenSet left from/this/with in the
+        // denominator, which both inflated coverage and offered junk anchors.
+        const oIdx = stemIndex(claimTokens(normalizeWrappedProse(o.text)));
+        const oTok = new Set(oIdx.keys());
         if (oTok.size < 3) continue;                       // too vague to match safely → leave it
         // CLAUSE-KEYED coverage (2026-07-23): the old whole-card denominator
         // meant a 6-token "remaining: X" clause inside a 40-token card could
@@ -3630,16 +4121,27 @@ export function findStaleOpenCards(struct, { coverAt = 0.6, max = 5 } = {}) {
         // best of (whole card, any clause item ≥2 tokens).
         // ≥3 tokens per clause item: 2-token items ('docs update') hit cov 1.0
         // against unrelated milestones (probe-confirmed false stale flags).
-        const clauseToks = extractOpenClauses(o.text).flatMap(cl => cl.items.map(it => it.tokens)).filter(t => t.size >= 3);
-        let best = null, bestCov = 0;
-        for (const m of miles) {
+        const clauseToks = extractOpenClauses(o.text).flatMap(cl => cl.items.map(it => stemSet(it.tokens))).filter(t => t.size >= 3);
+        let best = null, bestCov = 0, bestVia = null;
+        for (const { m, idx: mIdx, tok: mTok } of mPre) {
             if ((m.createdAt || 0) <= (o.createdAt || 0)) continue; // only a milestone shipped AFTER the goal
-            const mTok = tokenSet(m.text);
+            if (m.id && settled.has(`${o.id}|${m.id}`)) continue;
             let cov = coverageOf(oTok, mTok);              // how much of the goal the milestone covers
             for (const ct of clauseToks) cov = Math.max(cov, coverageOf(ct, mTok));
-            if (cov > bestCov) { bestCov = cov; best = m; }
+            if (cov >= coverAt) {
+                if (cov > bestCov || bestVia === 'anchor') { bestCov = cov; best = m; bestVia = 'coverage'; }
+                continue;
+            }
+            // Anchor OR-path — the verbose-❓/terse-🏁 geometry (see
+            // findFulfillmentCandidates). Coverage wins over anchors when both fire.
+            if (bestVia !== 'coverage') {
+                const anchors = sharedAnchors(oIdx, mIdx, dfMap(), { exclude: structuralStems(o.area, m.area) });
+                if (anchorsSufficient(anchors, (o.area || '') === (m.area || ''), cov) && cov > bestCov) {
+                    bestCov = cov; best = m; bestVia = 'anchor';
+                }
+            }
         }
-        if (best && bestCov >= coverAt) out.push({ open: o, by: best, cov: Math.round(bestCov * 100) / 100 });
+        if (best) out.push({ open: o, by: best, cov: Math.round(bestCov * 100) / 100, ...(bestVia === 'anchor' ? { via: 'anchor' } : {}) });
     }
     out.sort((a, b) => b.cov - a.cov);
     return { gaps: out.slice(0, max), total: out.length };

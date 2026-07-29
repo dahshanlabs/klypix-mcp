@@ -60,6 +60,40 @@ for (const t of MUST_NOT_MATCH) ok(classifyDecay(t) === false, `no match: ${t.sl
 ok(isFastDecayCard({ text: '🏁 iOS build shipped to testers', evidence: [{ ref: 'gh run 16204339183', kind: 'pr' }] }),
   'isFastDecayCard: machine ev run-id classifies even when prose alone would not');
 
+console.log('\n── C2 · stored hard-wrap geometry (2026-07-29 incident) ──');
+// Cards are STORED hard-wrapped (~37 chars/line). The incident ❓'s wrap fell
+// exactly between the decay VERB ("in live") and NOUN ("v1.3.68"), so the raw
+// stored text classified false while its flattened form classified true — the
+// one card that most needed a ⏱️ LAST KNOWN stamp rendered plain. Verbatim
+// pre-✅-stamp geometry, locked:
+const WRAPPED_INCIDENT =
+  'Release: ❓ PACKAGED LOCAL-AI\nREGRESSION FOUND 2026-07-28 in live\nv1.3.68: package.json excludes all\n'
+  + 'node_modules/node-llama-cpp/llama/**\nas presumed dead C++ sources, but\nnode-llama-cpp 3.19.1 runtime reads\n'
+  + 'llama/binariesGithubRelease.json even\nwith getLlama({build:\'never\'}).\nNarrow the prune to retain metadata\nand verify a packaged Local answer E2E.';
+// Asserted through isFastDecayCard — the REAL production path for card text
+// (it is the only caller that declares wrapped:true).
+const card = (text) => isFastDecayCard({ text });
+ok(card(WRAPPED_INCIDENT) === true, 'wrapped incident ❓ classifies fast-decay (verb/noun split across a wrap point)');
+// A wrapped ev: receipt used to fail the same way ([^\n]{0,60} stopped at the wrap).
+ok(card('ev: gh run\n16204339183') === true, 'wrapped ev: run-id receipt classifies across the wrap');
+// Precision holds under joining: wrapped architecture prose stays a non-match.
+ok(card('Architecture: the release process\nuses a staged rollout with manual\napproval') === false,
+  'wrapped architecture prose is still not build status');
+// Tag lines are DROPPED, not joined — "#file-release-notes" must never donate a
+// release NOUN to the sentence above it.
+ok(card('fonts and the new theme are now live\nin the app shell\n#release-notes #file-release-notes') === false,
+  'a #release-… tag line cannot make an unrelated "now live" sentence classify');
+// A real paragraph break still separates claims (verb-only ¶ + noun-only ¶ ≠ match).
+ok(card('the tray fix went live for testers\n\nnpm release checklist drafted here') === false,
+  'blank-line paragraphs remain separate segments after wrap-joining');
+// UNWRAPPING IS OPT-IN: a MESSAGE's authored newlines must never be joined, or
+// two unrelated claims merge into one false fast-decay assertion. Both lines
+// here are inside wrap range (40 and 36 chars), so geometry can't save us —
+// only the explicit opt-in can.
+const AUTHORED_MSG = 'shipped the auth fix to the beta testers\nremaining: npm audit + release notes';
+ok(classifyDecay(AUTHORED_MSG) === false, 'message text (default, un-opted-in) keeps authored newlines as segment breaks');
+ok(classifyDecay(AUTHORED_MSG, { wrapped: true }) === true, '…and the same text DOES classify when a caller declares it wrapped (opt-in works)');
+
 console.log('\n── R1 · renderer: >6h fast-decay claims are LAST KNOWN, never current ──');
 const NOW = Date.parse('2026-07-29T12:00:00Z');
 const H = 3_600_000;

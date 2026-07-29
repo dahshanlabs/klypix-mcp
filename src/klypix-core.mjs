@@ -33,7 +33,7 @@ import {
   splitQueryTokens, scoreCardsAgainstQuery, correctionOverlaysFor,
   isFastDecayCard, DECAY_STALE_MS, formatDecayAge,
 } from './klypix-format.mjs';
-import { findProjectBrain } from './agent-presence.mjs';
+import { capMessages, findProjectBrain } from './agent-presence.mjs';
 
 // ── Card / connection input shape (single source for every face) ─────────────
 export const cardSchema = z.object({
@@ -1079,7 +1079,10 @@ export async function opBrainMessage({ vault, canvas, text: msgText, to, via }) 
     const kept = (Array.isArray(data.messages) ? data.messages : []).filter(m => m && now - (m.ts || 0) < LANE_MSG_FRESH_MS);
     kept.push(msg);
     fs.mkdirSync(path.dirname(laneFile), { recursive: true });
-    fs.writeFileSync(laneFile, JSON.stringify({ sessions, messages: kept.slice(-30) }));
+    // Delivered-first eviction + ...data spread — the other two lane writers were
+    // converted in the 2026-07-29 overhaul; a flat slice here still destroyed the
+    // oldest UNDELIVERED note at cap (review-caught).
+    fs.writeFileSync(laneFile, JSON.stringify({ ...data, sessions, messages: capMessages(kept, 30) }));
   } catch (e) {
     return err(`brain_message failed: ${e.message}`);
   } finally { if (got) { try { fs.unlinkSync(lock); } catch { /* */ } } }

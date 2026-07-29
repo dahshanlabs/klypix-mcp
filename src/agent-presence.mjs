@@ -113,6 +113,29 @@ function pruneMessages(messages, now) {
     .filter((message) => message?.id && now - Number(message.ts || 0) < MESSAGE_FRESH_MS);
 }
 
+// Cap the message lane WITHOUT silently destroying undelivered notes: the old
+// flat `.slice(-30)` evicted the OLDEST rows first regardless of delivery, so a
+// burst of >30 messages could destroy a note nobody had seen yet. Evict
+// delivered (seen-by-someone) messages first, oldest first; only then the
+// oldest undelivered ones. Order of survivors is preserved.
+export function capMessages(messages, cap = 30) {
+  const list = Array.isArray(messages) ? messages : [];
+  if (list.length <= cap) return list;
+  let excess = list.length - cap;
+  const dropped = new Set();
+  const evict = (predicate) => {
+    for (const message of list) {
+      if (!excess) return;
+      if (dropped.has(message) || !predicate(message)) continue;
+      dropped.add(message);
+      excess--;
+    }
+  };
+  evict((m) => Array.isArray(m?.seen) && m.seen.length > 0);   // delivered at least once
+  evict(() => true);                                            // still over cap → oldest of the rest
+  return list.filter((message) => !dropped.has(message));
+}
+
 function normalizeFiles(files) {
   const seen = new Set();
   const out = [];
@@ -140,11 +163,13 @@ export function upsertSession({
   permissionMode = null,
   branch = null,
   intent,
+  intentSource = null,
   files,
   replaceFiles = false,
   event = null,
   channel = null,
   cwd = null,
+  hostPid = null,
   home,
   now = Date.now(),
 }) {
@@ -162,6 +187,14 @@ export function upsertSession({
     const mergedFiles = files === undefined
       ? normalizeFiles(previous.files)
       : normalizeFiles(replaceFiles ? files : [...(previous.files || []), ...(files || [])]);
+    // Intent freshness is its OWN timestamp: lastSeen is refreshed by heartbeats
+    // that never touch intent, so without intentAt a 100-minute-old intent renders
+    // under "active just now" (2026-07-29 audit). Stamped only when the intent
+    // VALUE actually changes; additive — old rows/readers are unaffected.
+    const nextIntent = intent !== undefined
+      ? String(intent || '').replace(/\s+/g, ' ').trim().slice(0, 160)
+      : (previous.intent || '');
+    const intentChanged = intent !== undefined && nextIntent !== (previous.intent || '');
     const next = {
       ...previous,
       id: String(id),
@@ -172,13 +205,19 @@ export function upsertSession({
       model: model ?? previous.model ?? null,
       permissionMode: permissionMode ?? previous.permissionMode ?? null,
       branch: branch ?? previous.branch ?? null,
-      intent: intent !== undefined ? String(intent || '').replace(/\s+/g, ' ').trim().slice(0, 160) : (previous.intent || ''),
+      intent: nextIntent,
+      ...(intentChanged ? { intentAt: now, intentSource: intentSource || 'declared' }
+        : (previous.intentAt ? { intentAt: previous.intentAt, intentSource: previous.intentSource || null } : {})),
       files: mergedFiles,
       event: event ?? previous.event ?? null,
       ...(Object.keys(channelSeen).length
         ? { channels: Object.keys(channelSeen), channelSeen }
         : {}),
       cwd: cwd ? path.resolve(cwd) : (previous.cwd || path.dirname(brainPath)),
+      // Host-process correlation (e.g. Claude Code exports CLAUDE_PID to every
+      // child): lets readers recognize one logical session's lifecycle row and
+      // MCP row as TWINS instead of two independent peers.
+      hostPid: Number(hostPid) || previous.hostPid || null,
       startedAt: previous.startedAt || now,
       lastSeen: now,
     };
@@ -188,7 +227,7 @@ export function upsertSession({
     fs.writeFileSync(laneFile, JSON.stringify({
       ...data,
       sessions: kept.slice(-40),
-      messages: pruneMessages(data.messages, now).slice(-30),
+      messages: capMessages(pruneMessages(data.messages, now), 30),
     }));
     return kept.sort((a, b) => Number(b.lastSeen || 0) - Number(a.lastSeen || 0));
   } finally {
@@ -226,7 +265,7 @@ export function removeSession({ brainPath, id, channel = null, home, now = Date.
     fs.writeFileSync(laneFile, JSON.stringify({
       ...data,
       sessions,
-      messages: pruneMessages(data.messages, now).slice(-30),
+      messages: capMessages(pruneMessages(data.messages, now), 30),
     }));
     return sessions;
   } finally {
@@ -271,24 +310,45 @@ export function receiveMessages({
       && messageTargetsSession(message, me, sessionId));
     if (!unseen.length) return [];
 
-    const unseenIds = new Set(unseen.map((message) => message.id));
-    for (const message of messages) {
-      if (!unseenIds.has(message.id)) continue;
-      if (!Array.isArray(message.seen)) message.seen = [];
-      if (!message.seen.includes(sessionId)) message.seen.push(sessionId);
-    }
-    fs.writeFileSync(laneFile, JSON.stringify({ ...data, sessions, messages }));
-
+    // Deliver-then-ack, never ack-then-truncate: the old path acked EVERY unseen
+    // message under lock but returned only the first 6 — anything past the cap
+    // was marked seen without ever being shown, permanently lost under the
+    // delivered-once contract (2026-07-29 audit). Ack exactly: the delivered 6,
+    // plus self-ignored texts and text-duplicates OF a delivered message (their
+    // content was shown once via the twin). Overflow stays unacked and arrives
+    // on the next call.
+    const normText = (message) => String(message.text || '').replace(/\s+/g, ' ').trim().toLowerCase();
     const ignored = new Set(ignoreTexts.map((text) => String(text || '').replace(/\s+/g, ' ').trim().toLowerCase()));
     const shown = [];
+    const dropped = [];   // ignored (own sends) — content intentionally never shown
     const seenText = new Set();
+    const dupesByText = new Map();
     for (const message of unseen) {
-      const key = String(message.text || '').replace(/\s+/g, ' ').trim().toLowerCase();
-      if (!key || ignored.has(key) || seenText.has(key)) continue;
+      const key = normText(message);
+      if (!key || ignored.has(key)) { dropped.push(message); continue; }
+      if (seenText.has(key)) {
+        if (!dupesByText.has(key)) dupesByText.set(key, []);
+        dupesByText.get(key).push(message);
+        continue;
+      }
       seenText.add(key);
       shown.push(message);
     }
-    return shown.slice(0, 6);
+    const delivered = shown.slice(0, 6);
+    const ackIds = new Set(delivered.map((message) => message.id));
+    for (const message of dropped) ackIds.add(message.id);
+    for (const message of delivered) {
+      for (const dupe of dupesByText.get(normText(message)) || []) ackIds.add(dupe.id);
+    }
+    if (ackIds.size) {
+      for (const message of messages) {
+        if (!ackIds.has(message.id)) continue;
+        if (!Array.isArray(message.seen)) message.seen = [];
+        if (!message.seen.includes(sessionId)) message.seen.push(sessionId);
+      }
+      fs.writeFileSync(laneFile, JSON.stringify({ ...data, sessions, messages }));
+    }
+    return delivered;
   } finally {
     if (gotLock) releaseLock(lockFile);
   }
@@ -368,7 +428,7 @@ export function postPresenceMessage({
     fs.writeFileSync(laneFile, JSON.stringify({
       ...data,
       sessions,
-      messages: messages.slice(-30),
+      messages: capMessages(messages, 30),
     }));
     return { posted: true, message };
   } finally {
@@ -405,15 +465,22 @@ export function formatPresenceMessage(sessions, selfId, { includeSolo = false, n
   lines.push('Other active sessions:');
   for (const session of others.slice(0, 8)) {
     const ageMin = Math.max(0, Math.round((now - Number(session.lastSeen || now)) / 60_000));
+    // A heartbeat refreshes lastSeen while carrying an old intent forward — show
+    // the INTENT's own age when it meaningfully lags the heartbeat, so a
+    // 100-minute-old task line can never read as "what they're doing right now".
+    const intentAgeMin = session.intentAt ? Math.max(0, Math.round((now - Number(session.intentAt)) / 60_000)) : null;
+    const intentAge = intentAgeMin !== null && intentAgeMin - ageMin > 3 ? ` (intent set ${intentAgeMin}m ago)` : '';
     const details = [
       clientLabel(session),
       session.branch ? `branch ${session.branch}` : null,
-      session.intent ? `"${String(session.intent).slice(0, 90)}"` : null,
+      session.intent ? `"${String(session.intent).slice(0, 90)}"${intentAge}` : null,
       `${ageMin}m ago`,
     ].filter(Boolean);
     lines.push(`- ${String(session.id).slice(0, 8)}: ${details.join(' | ')}`);
   }
-  lines.push('Coordinate before touching shared files; use brain_message for a targeted note.');
+  // v1.32.0 law: a truncated list must never render as a complete one.
+  if (others.length > 8) lines.push(`- …and ${others.length - 8} more live session(s) not listed — brain_doctor shows all.`);
+  lines.push(`Presence is point-in-time (as of ${new Date(now).toISOString().slice(11, 16)}Z) — re-check before coordinating; use brain_message for a targeted note.`);
   return lines.join('\n');
 }
 

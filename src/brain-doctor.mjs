@@ -183,6 +183,11 @@ function inspectRunning(brainDir, baked, now, self) {
 }
 
 // ── PEERS (alignment) layer ──────────────────────────────────────────────────
+// A supervisor with a live pid can still be a ZOMBIE: recovery-failed means it
+// has NO worker and every queued host request hangs — the pid-alive check alone
+// rendered exactly that state as "✅ SUPERVISOR N live" (2026-07-29 audit,
+// field pid 12312 exit 0xC0000142). These statuses mean the transport is
+// impaired regardless of process liveness.
 function inspectSupervisors(brainDir, baked) {
   const dir = path.join(brainDir, '.supervisors');
   let names = [];
@@ -191,9 +196,15 @@ function inspectSupervisors(brainDir, baked) {
   for (const name of names) {
     const state = readJson(path.join(dir, name), null);
     if (!state?.pid || !isAlivePid(state.pid)) continue;
+    const status = state.status || 'unknown';
     live.push({
       pid: state.pid,
-      status: state.status || 'unknown',
+      status,
+      // IMPAIRED = no live worker outside the normal boot window: tool calls
+      // hang/fail. 'restart-required' with a live active worker is DEGRADED
+      // (an update was rejected, the old worker keeps serving) — flagging that
+      // red as "tool calls hang" would be factually wrong (review-caught).
+      impaired: !state.active && status !== 'starting' && status !== 'awaiting-initialize',
       activePid: state.active?.pid || null,
       activeVersion: state.active?.version || null,
       hotReloads: Number(state.hotReloads || 0),
@@ -205,29 +216,60 @@ function inspectSupervisors(brainDir, baked) {
     active: live.length > 0,
     count: live.length,
     live,
+    impaired: live.filter(state => state.impaired),
     matchesInstalled: live.length && baked
       ? live.every(state => state.activeVersion && cmpSemver(state.activeVersion, baked) === 0)
       : null,
   };
 }
 
+// Channel-aware liveness, mirroring agent-presence.mjs: an mcp-channel heartbeat
+// is dead after 3 minutes even though the flat 10-minute window keeps the row —
+// without this the hook, brain_sync, and doctor reported three different counts.
+const MCP_SESSION_FRESH_MS = 3 * 60 * 1000;
+const sessionLiveness = (s, now) => {
+  const channelSeen = (s?.channelSeen && typeof s.channelSeen === 'object' && !Array.isArray(s.channelSeen)) ? s.channelSeen : null;
+  if (channelSeen && Object.keys(channelSeen).length) {
+    const fresh = Object.entries(channelSeen)
+      .filter(([ch, seen]) => ch && now - Number(seen || 0) < (ch === 'mcp' ? MCP_SESSION_FRESH_MS : SESSION_FRESH_MS));
+    if (!fresh.length) return null;
+    return { lastSeen: Math.max(...fresh.map(([, seen]) => Number(seen))), channels: fresh.map(([ch]) => ch) };
+  }
+  const lastSeen = Number(s?.lastSeen || 0);
+  return now - lastSeen < SESSION_FRESH_MS ? { lastSeen, channels: Array.isArray(s?.channels) ? s.channels : [] } : null;
+};
+
 function inspectPeers(brainDir, brainPath, now) {
   const file = path.join(brainDir, 'sessions', `${sha(normBrainPath(brainPath))}.json`);
   const data = readJson(file, null);
   const sessions = Array.isArray(data?.sessions) ? data.sessions : [];
-  const live = sessions.filter(s => s && now - (s.lastSeen || 0) < SESSION_FRESH_MS)
-    .map(s => ({
+  const rawRecent = sessions.filter(s => s && now - (s.lastSeen || 0) < SESSION_FRESH_MS).length;
+  const live = sessions
+    .map(s => ({ s, liveness: sessionLiveness(s, now) }))
+    .filter(({ liveness }) => liveness)
+    .map(({ s, liveness }) => ({
       id: String(s.id || '').slice(0, 8),
-      client: s.client || 'claude-code',
+      // 'unknown' stays 'unknown' — the old 'claude-code' fallback silently
+      // relabeled client-less rows, masking the writer that forgot to stamp.
+      client: s.client || 'unknown',
       surface: s.surface || null,
       model: s.model || null,
       branch: s.branch || null,
       intent: s.intent || '',
+      intentAgeMin: s.intentAt ? Math.round((now - Number(s.intentAt)) / 60000) : null,
       files: Array.isArray(s.files) ? s.files : [],
-      channels: Array.isArray(s.channels) ? s.channels : [],
-      lastSeenMin: Math.round((now - (s.lastSeen || 0)) / 60000),
+      channels: liveness.channels,
+      hostPid: s.hostPid || null,
+      // Sync-rich vs sync-silent: has this session declared any task scope?
+      synced: Boolean(String(s.intent || '').trim() || (Array.isArray(s.files) && s.files.length)),
+      lastSeenMin: Math.round((now - liveness.lastSeen) / 60000),
     }));
-  return { file, live, count: live.length };
+  // Twin rows = channel merge NOT occurring: >1 live row sharing one hostPid is
+  // one logical session split across ids (each twin inflates every count).
+  const byHost = new Map();
+  for (const p of live) { if (p.hostPid) byHost.set(p.hostPid, [...(byHost.get(p.hostPid) || []), p.id]); }
+  const twinGroups = [...byHost.entries()].filter(([, ids]) => ids.length > 1).map(([hostPid, ids]) => ({ hostPid, ids }));
+  return { file, live, count: live.length, rawRecent, syncedCount: live.filter(p => p.synced).length, twinGroups };
 }
 
 // ── DECAY-GUARD layer (fast-decay status protection, 2026-07-28) ─────────────
@@ -319,7 +361,12 @@ export function inspect(opts = {}) {
     // stale-server incident. Unknown (server not booted since the heartbeat shipped)
     // is NOT drift; it's a reconnect prompt.
     running: !running.known ? 'unknown' : (running.matchesInstalled === false ? 'drift' : 'ok'),
-    supervisor: supervisors.active ? 'ok' : (version.supervisorCapable ? 'pending-reconnect' : 'legacy'),
+    // A recovery-failed / worker-less supervisor is an OUTAGE (queued tool calls
+    // hang), not health — pid-alive alone must never render it ok. A stale
+    // active-worker version is the same class of drift RUNNING reports.
+    supervisor: supervisors.active
+      ? (supervisors.impaired.length ? 'drift' : (supervisors.matchesInstalled === false ? 'drift' : 'ok'))
+      : (version.supervisorCapable ? 'pending-reconnect' : 'legacy'),
     autoUpdate: !autoUpdate.enabled ? 'off' : (autoUpdate.result === 'failed' ? 'warning' : 'ok'),
     hooks: !hooks.settingsPresent ? 'absent' : (hooks.missing.length ? 'drift' : 'ok'),
     // Codex MCP presence is the automatic baseline. Hooks are an OPTIONAL
@@ -352,6 +399,8 @@ export function inspect(opts = {}) {
     if (hooks.missing.length) actions.push(`npx klypix-mcp install   # half-wired: hooks not active — ${hooks.missing.join(', ')}`);
     if (hasBrain && !harness.ok) actions.push('npx klypix-mcp link      # harness configs drifted — re-project managed blocks');
     if (layers.decayGuard === 'drift') actions.push('npx klypix-mcp install   # decay-aware status guard missing/stale — stale build/deploy claims can render as CURRENT state');
+    for (const s of supervisors.impaired || []) actions.push(`/mcp reconnect   # supervisor pid ${s.pid} is ${s.status} with no live worker — its tool calls hang until reconnected`);
+    if (peers.twinGroups && peers.twinGroups.length) actions.push(`/mcp reconnect   # ${peers.twinGroups.length} session(s) split across twin lane rows (channel merge not occurring) — reconnect adopts the merged id`);
   }
 
   return { verdict, layers, drifted, version, running, supervisors, autoUpdate, hooks, codexSmart, codexHooks, tools, peers, sessions: peers, harness, npm, decayGuard, project: { dir: projectDir, brainPath, hasBrain }, brainDir, actions };
@@ -365,6 +414,7 @@ export function driftLine(r) {
   if (r.version.dirty) bits.push('dirty deploy');
   if (r.npm && r.npm.matches === false) bits.push(`v${r.version.baked}<${r.npm.latest}`);
   if (r.running && r.running.matchesInstalled === false) bits.push(`live server v${r.running.version}≠installed v${r.version.baked} (/mcp reconnect)`);
+  if (r.supervisors?.impaired?.length) bits.push(`${r.supervisors.impaired.length} supervisor(s) IMPAIRED — tool calls hang (/mcp reconnect)`);
   if (r.hooks.missing.length) bits.push(`${r.hooks.missing.length} hook(s) unwired`);
   if (r.project.hasBrain && !r.harness.ok) bits.push(`${r.harness.drift.length} harness file(s) drifted`);
   if (r.layers?.decayGuard === 'drift') bits.push('decay-guard stale (fast-decay status claims unstamped)');
@@ -405,9 +455,13 @@ export function render(r, opts = {}) {
   // SUPERVISOR (stable host connection + replaceable worker)
   if (r.supervisors?.active) {
     const totalReloads = r.supervisors.live.reduce((sum, state) => sum + state.hotReloads, 0);
-    L.push(`${ok} ${c.bold}SUPERVISOR${c.rst}  ${r.supervisors.count} live · zero-restart core activation ready${totalReloads ? ` · ${totalReloads} hot-swap${totalReloads === 1 ? '' : 's'}` : ''}`);
+    const impaired = r.supervisors.impaired || [];
+    const smark = impaired.length ? warn : ok;
+    const healthy = r.supervisors.count - impaired.length;
+    L.push(`${smark} ${c.bold}SUPERVISOR${c.rst}  ${healthy} healthy${impaired.length ? ` · ${c.red}${impaired.length} IMPAIRED (no live worker — its tool calls hang)${c.rst}` : ' · zero-restart core activation ready'}${totalReloads ? ` · ${totalReloads} hot-swap${totalReloads === 1 ? '' : 's'}` : ''}`);
     for (const state of r.supervisors.live) {
-      if (state.lastError) L.push(`        ${c.yel}· pid ${state.pid} ${state.status}: ${state.lastError}${c.rst}`);
+      if (state.impaired) L.push(`        ${c.red}· pid ${state.pid} ${state.status}${state.lastError ? `: ${state.lastError}` : ''} — /mcp reconnect${c.rst}`);
+      else if (state.lastError) L.push(`        ${c.yel}· pid ${state.pid} ${state.status}: ${state.lastError}${c.rst}`);
     }
   } else if (r.version.supervisorCapable) {
     L.push(`${warn} ${c.bold}SUPERVISOR${c.rst}  installed but this is a legacy direct-worker session · reconnect once to activate`);
@@ -472,8 +526,15 @@ export function render(r, opts = {}) {
   // SESSIONS: this is an all-session count. A recent-chat row is not a heartbeat.
   if (!r.sessions.count) L.push(`${ok} ${c.bold}SESSIONS${c.rst}  0 active sessions ${c.dim}(saved/recent chats are history, not active)${c.rst}`);
   else {
-    L.push(`${r.sessions.count > 1 ? warn : ok} ${c.bold}SESSIONS${c.rst}  ${r.sessions.count} active session${r.sessions.count === 1 ? '' : 's'} ${c.dim}(all hosts; MCP/lifecycle; 10-minute crash TTL)${c.rst}`);
-    for (const p of r.sessions.live) L.push(`        · ${p.client}:${p.id}${p.branch ? ' @' + p.branch : ''}${p.channels.length ? ` [${p.channels.join('+')}]` : ''}${p.intent ? ` “${p.intent.slice(0, 50)}”` : ''} ${c.dim}(${p.lastSeenMin}m ago)${c.rst}`);
+    const hiddenIdle = Math.max(0, (r.sessions.rawRecent || r.sessions.count) - r.sessions.count);
+    L.push(`${r.sessions.count > 1 ? warn : ok} ${c.bold}SESSIONS${c.rst}  ${r.sessions.count} active session${r.sessions.count === 1 ? '' : 's'} · ${r.sessions.syncedCount ?? r.sessions.count} with declared task scope ${c.dim}(all hosts; channel-aware liveness${hiddenIdle ? `; +${hiddenIdle} row(s) with only a dead mcp channel excluded` : ''})${c.rst}`);
+    for (const p of r.sessions.live) {
+      const intentAge = p.intentAgeMin !== null && p.intentAgeMin - p.lastSeenMin > 3 ? ` (set ${p.intentAgeMin}m ago)` : '';
+      L.push(`        · ${p.client}:${p.id}${p.branch ? ' @' + p.branch : ''}${p.channels.length ? ` [${p.channels.join('+')}]` : ''}${p.intent ? ` “${p.intent.slice(0, 50)}”${intentAge}` : ''}${p.synced ? '' : ` ${c.yel}· sync-silent (no brain_sync intent/scope)${c.rst}`} ${c.dim}(${p.lastSeenMin}m ago)${c.rst}`);
+    }
+    for (const g of (r.sessions.twinGroups || [])) {
+      L.push(`        ${c.yel}⚠ twin rows — channel merge NOT occurring: host pid ${g.hostPid} appears as ${g.ids.join(' + ')} (one logical session counted ${g.ids.length}×)${c.rst}`);
+    }
   }
 
   // HARNESS

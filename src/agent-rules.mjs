@@ -521,8 +521,15 @@ function classifyFenced(file, version, frontmatter = null) {
   const raw = fs.readFileSync(file, 'utf8');
   const fence = parseFence(raw);
   if (!fence) return { status: 'missing' };
-  if (fence.hash && sha8(fence.body.trim()) !== fence.hash) return { status: 'hand-edited', stampedVersion: fence.version };
-  const bodyCurrent = sha8(fence.body.trim()) === INSTRUCTIONS_HASH;
+  // Normalize CRLF before hashing (matching norm() in the frontmatter branch
+  // below): the stamped hash is always computed from the LF-only canonical
+  // instructions, so a git-autocrlf checkout or CRLF-saving editor flipped
+  // EVERY projected file to hand-edited at once — the destructive-repair class
+  // — when the true status was a losslessly healable 'stale' (2026-07-29 audit,
+  // the likely cause of "9/14 HAND-EDITED at the same stamp").
+  const bodyHash = sha8(fence.body.replace(/\r\n/g, '\n').trim());
+  if (fence.hash && bodyHash !== fence.hash) return { status: 'hand-edited', stampedVersion: fence.version };
+  const bodyCurrent = bodyHash === INSTRUCTIONS_HASH;
   const stampConsistent = !fence.hash || fence.hash === INSTRUCTIONS_HASH;
   if (bodyCurrent && stampConsistent) {
     // Owned dedicated files are OURS wholesale — frontmatter included. Compare the
@@ -541,11 +548,20 @@ function classifyFenced(file, version, frontmatter = null) {
 
 // Shared markdown (AGENTS.md, copilot-instructions.md, GEMINI.md): merge our fenced
 // block in place, preserving the user's own prose outside the fence.
+// A hand-edited file is about to be rebuilt wholesale — keep the human's version.
+// One rolling .klypix-bak per file (repair stops being an all-or-nothing choice).
+function backupHandEdited(file, status) {
+  if (status !== 'hand-edited' || !exists(file)) return;
+  try { fs.copyFileSync(file, file + '.klypix-bak'); } catch { /* best-effort */ }
+}
+
 function fenceMerge(file, version) {
   // Zero-touch IFF the audit says 'ok' (same classifier, so check and write can
   // never disagree): current+consistent block → byte-identical file, no stamp-only
   // churn; a hand-edited stamp or stale body falls through and gets rebuilt.
-  if (classifyFenced(file, version).status === 'ok') return { action: 'unchanged' };
+  const status = classifyFenced(file, version).status;
+  if (status === 'ok') return { action: 'unchanged' };
+  backupHandEdited(file, status);
   let cur = '';
   let had = false;
   if (exists(file)) { cur = fs.readFileSync(file, 'utf8'); had = true; }
@@ -564,7 +580,9 @@ function fenceMerge(file, version) {
 function writeDedicated(file, frontmatter, version) {
   // Zero-touch IFF the audit says 'ok' — which for owned dedicated files includes
   // the frontmatter (a stripped alwaysApply/trigger MUST be repaired, not skipped).
-  if (classifyFenced(file, version, frontmatter || '').status === 'ok') return { action: 'unchanged' };
+  const status = classifyFenced(file, version, frontmatter || '').status;
+  if (status === 'ok') return { action: 'unchanged' };
+  backupHandEdited(file, status);
   const had = exists(file);
   const body = (frontmatter ? frontmatter + '\n' : '') + fencedBlock(version) + '\n';
   ensureDir(file); fs.writeFileSync(file, body, 'utf8');

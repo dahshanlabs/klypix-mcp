@@ -57,6 +57,15 @@ fs.writeFileSync(path.join(vault, 'brain.klypix'), await buildKlypixMap({
 const baseEnv = Object.fromEntries(
   Object.entries(process.env).filter(([, value]) => typeof value === 'string'),
 );
+// The harness simulates two INDEPENDENT hosts. When it itself runs inside an
+// agent session (Claude Code exports CLAUDE_PID + CLAUDE_CODE_SESSION_ID to
+// children), both simulated clients would inherit the SAME host identity and
+// be correctly treated as one session's twin halves — failing every two-client
+// check. Strip host/session identity; each client gets its own KLYPIX_SESSION_ID.
+for (const key of [
+  'CLAUDE_PID', 'KLYPIX_HOST_PID', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_SESSION_ID',
+  'CODEX_THREAD_ID', 'CURSOR_SESSION_ID', 'CLINE_SESSION_ID', 'WINDSURF_SESSION_ID',
+]) delete baseEnv[key];
 
 async function connect(name, sessionId) {
   const logs = [];

@@ -33,6 +33,14 @@ const DEFAULT_TIMEOUT_MS = 15000;
 const DEFAULT_ROLLBACK_GRACE_MS = 3000;
 const DEFAULT_AUTO_UPDATE_POLL_MS = 60 * 60 * 1000;
 const DEFAULT_AUTO_UPDATE_START_DELAY_MS = 2000;
+// Worker-recovery retry policy: capped exponential backoff (1s → 2s → 4s …,
+// ceiling 60s), bounded attempts. After the last attempt the supervisor answers
+// requests with a retryable error instead of queueing them forever.
+const RECOVERY_MAX_ATTEMPTS = 5;
+const RECOVERY_BACKOFF_BASE_MS = 1000;
+const RECOVERY_BACKOFF_MAX_MS = 60_000;
+// Unbounded queue growth is its own failure mode while a recovery is running.
+const HOST_QUEUE_MAX = 200;
 
 const log = (...args) => console.error('[klypix-supervisor]', ...args);
 const sha256 = (value) => crypto.createHash('sha256').update(value).digest('hex');
@@ -260,6 +268,12 @@ class Supervisor {
     this.lastError = null;
     this.hotReloads = 0;
     this.checking = false;
+    // Recovery must not be a one-shot: 0xC0000142-class worker failures are
+    // transient, and the old permanent signature blacklist turned one bad spawn
+    // into a silent zombie that queued host requests forever (2026-07-29 audit).
+    this.recoveryAttempts = 0;
+    this.recoveryTimer = null;
+    this.lastFailedSignature = null;
   }
 
   writeState(extra = {}) {
@@ -446,7 +460,33 @@ class Supervisor {
     this.lastError = `active worker exited (${code ?? signal ?? 'unknown'})`;
     this.writeState();
     setTimeout(() => {
-      if (!this.closed && !this.active && !this.candidate) this.startCandidate(failedTarget, { recovery: true });
+      if (this.closed || this.active || this.candidate) return;
+      // Pre-handshake death: the candidate path NEEDS the host's initialize,
+      // but that message is parked in hostQueue (active=null) and only flushes
+      // on commit — a candidate would wedge in pendingTarget forever
+      // (review-caught). Respawn a DIRECT active worker like first boot; the
+      // queued initialize then flows to it naturally. Bounded by the same
+      // recovery budget so a crash-looping worker still settles to failure.
+      if (!this.initializeRequest || !this.hostInitialized) {
+        if (this.lastFailedSignature && this.lastFailedSignature !== failedTarget.signature) this.recoveryAttempts = 0;
+        this.lastFailedSignature = failedTarget.signature;
+        this.recoveryAttempts++;
+        if (this.recoveryAttempts >= RECOVERY_MAX_ATTEMPTS) {
+          this.status = 'recovery-failed';
+          this.rejectedSignature = failedTarget.signature;
+          const detail = `KLYPIX worker unavailable (crashed ${this.recoveryAttempts}× before the host handshake) — /mcp reconnect to restart.`;
+          for (const queued of this.hostQueue.splice(0)) this.failHostRequest(queued, detail);
+          this.writeState({ recoveryAttempts: this.recoveryAttempts });
+          log(`pre-handshake recovery FAILED after ${this.recoveryAttempts} attempts`);
+          return;
+        }
+        this.active = this.spawnWorker(failedTarget, 'active');
+        this.status = 'awaiting-initialize';
+        this.writeState();
+        this.flushHostQueue();
+        return;
+      }
+      this.startCandidate(failedTarget, { recovery: true });
     }, 150).unref?.();
   }
 
@@ -478,9 +518,29 @@ class Supervisor {
     this.taskScope.files = [...new Set([...(this.taskScope.files || []), ...nextFiles])];
   }
 
+  // A retryable JSON-RPC error for one host request — used instead of silent
+  // infinite queueing once worker recovery has genuinely failed.
+  failHostRequest(message, detail) {
+    if (!Object.prototype.hasOwnProperty.call(message || {}, 'id') || !message.method) return;
+    this.sendHost({ jsonrpc: '2.0', id: message.id, error: { code: -32603, message: detail } });
+  }
+
   onHostMessage(message) {
     if (this.closed) return;
     if (!this.active) {
+      // recovery-failed with no candidate in flight = a settled outage: answer
+      // id-bearing requests with a retryable error (the host can surface it and
+      // retry after /mcp reconnect); notifications are dropped. While a recovery
+      // attempt IS still running, keep queueing — bounded, with the overflow
+      // failed loudly rather than swallowed.
+      if (this.status === 'recovery-failed' && !this.candidate && !this.recoveryTimer) {
+        this.failHostRequest(message, `KLYPIX worker unavailable (recovery failed after ${RECOVERY_MAX_ATTEMPTS} attempts${this.lastError ? `: ${this.lastError}` : ''}) — /mcp reconnect to restart.`);
+        return;
+      }
+      if (this.hostQueue.length >= HOST_QUEUE_MAX) {
+        this.failHostRequest(message, 'KLYPIX worker is recovering and its request queue is full — retry shortly.');
+        return;
+      }
       this.hostQueue.push(message);
       return;
     }
@@ -507,6 +567,8 @@ class Supervisor {
     }
     if (message?.method === 'notifications/initialized') {
       this.status = 'ready';
+      this.recoveryAttempts = 0;   // a completed handshake proves the worker healthy — fresh budget
+      this.lastFailedSignature = null;
       this.writeState();
       this.loadToolManifest(this.active).catch(error => {
         this.lastError = `initial tool manifest unavailable: ${error.message}`;
@@ -596,10 +658,46 @@ class Supervisor {
     const candidate = this.candidate;
     if (!candidate) return;
     this.candidate = null;
-    this.rejectedSignature = candidate.target.signature;
     this.status = this.active ? 'restart-required' : 'recovery-failed';
     this.lastError = reason;
     if (terminate && !candidate.exited) this.retireWorker(candidate, 0);
+    if (!this.active) {
+      // RECOVERY rejection: transient spawn failures (0xC0000142-class) must
+      // retry with backoff, not blacklist the only installed runtime forever.
+      // A DIFFERENT target signature (fresh install landed mid-recovery) gets a
+      // fresh attempt budget — the counter must not starve the fix.
+      if (this.lastFailedSignature && this.lastFailedSignature !== candidate.target.signature) this.recoveryAttempts = 0;
+      this.lastFailedSignature = candidate.target.signature;
+      this.recoveryAttempts++;
+      if (this.recoveryTimer) { clearTimeout(this.recoveryTimer); this.recoveryTimer = null; }   // never stack retry timers
+      if (this.recoveryAttempts < RECOVERY_MAX_ATTEMPTS) {
+        const delay = Math.min(RECOVERY_BACKOFF_BASE_MS * 2 ** (this.recoveryAttempts - 1), RECOVERY_BACKOFF_MAX_MS);
+        // Signature STAYS blacklisted during the backoff window so the 1s
+        // checkForUpdate poller cannot burn the attempt budget at poll cadence
+        // (review-caught); the timer lifts it right before the retry.
+        this.rejectedSignature = candidate.target.signature;
+        this.writeState({ rejectedVersion: candidate.version || candidate.target.version, recoveryAttempts: this.recoveryAttempts, nextRetryMs: delay });
+        log(`recovery attempt ${this.recoveryAttempts}/${RECOVERY_MAX_ATTEMPTS} failed (${reason}); retrying in ${delay}ms`);
+        this.recoveryTimer = setTimeout(() => {
+          this.recoveryTimer = null;
+          if (this.closed || this.active || this.candidate) return;
+          this.rejectedSignature = null;
+          this.startCandidate(candidate.target, { recovery: true });
+        }, delay);
+        this.recoveryTimer.unref?.();
+        return;
+      }
+      // Final failure: stop pretending. Blacklist the signature, fail everything
+      // queued with a retryable error, and tell the host via MCP logging.
+      this.rejectedSignature = candidate.target.signature;
+      const detail = `KLYPIX worker unavailable (recovery failed after ${RECOVERY_MAX_ATTEMPTS} attempts: ${reason}) — /mcp reconnect to restart.`;
+      for (const queued of this.hostQueue.splice(0)) this.failHostRequest(queued, detail);
+      this.sendHost({ jsonrpc: '2.0', method: 'notifications/message', params: { level: 'error', logger: 'klypix-supervisor', data: detail } });
+      this.writeState({ rejectedVersion: candidate.version || candidate.target.version, recoveryAttempts: this.recoveryAttempts });
+      log(`recovery FAILED permanently after ${this.recoveryAttempts} attempts: ${reason}`);
+      return;
+    }
+    this.rejectedSignature = candidate.target.signature;
     this.writeState({ rejectedVersion: candidate.version || candidate.target.version });
     log(`kept v${this.active?.version || 'none'}; rejected v${candidate.version || candidate.target.version}: ${reason}`);
   }
@@ -613,6 +711,8 @@ class Supervisor {
     next.role = 'active';
     this.active = next;
     this.rejectedSignature = null;
+    this.recoveryAttempts = 0;   // a committed worker resets the retry budget
+    if (this.recoveryTimer) { clearTimeout(this.recoveryTimer); this.recoveryTimer = null; }
     this.status = 'ready';
     this.lastError = null;
     this.lastSwapAt = new Date().toISOString();
@@ -682,6 +782,7 @@ class Supervisor {
 
   async checkForUpdate() {
     if (this.closed || this.checking) return;
+    if (this.recoveryTimer) return;   // a recovery backoff owns the next attempt — the poller must not preempt it
     this.checking = true;
     try {
       const runtime = readRuntimeTarget(this.runtimeManifest, { allowExternal: this.allowExternal });
@@ -772,6 +873,7 @@ class Supervisor {
     clearInterval(this.poller);
     clearTimeout(this.autoUpdateStarter);
     clearInterval(this.autoUpdatePoller);
+    if (this.recoveryTimer) { clearTimeout(this.recoveryTimer); this.recoveryTimer = null; }
     for (const worker of [this.active, this.candidate, this.standby]) this.retireWorker(worker, 0);
     try { fs.unlinkSync(this.stateFile); } catch { /* */ }
     this.resolveRun?.();

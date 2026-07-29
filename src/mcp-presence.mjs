@@ -6,12 +6,14 @@
 // Host hooks may enrich the same session id with prompt/file detail, but are not
 // required for truthful active-session counts or pull-based message delivery.
 import crypto from 'crypto';
+import fs from 'fs';
 import { execFileSync } from 'child_process';
 import path from 'path';
 import {
   findProjectBrain,
   formatPresenceMessage,
   formatReceivedMessages,
+  laneFileFor,
   messageDecayInfo,
   peekMessages,
   postPresenceMessage,
@@ -30,6 +32,7 @@ export const MCP_INBOX_POLL_MS = 3_000;
 export const KLYPIX_MCP_INSTRUCTIONS = [
   'KLYPIX is the shared project brain for repositories containing ./brain.klypix.',
   'At the start of each task, call brain_sync with the current project root, a one-sentence intent, and any expected files before editing; the explicit project root keeps separate repositories on separate brains even when an MCP host launches servers from its own install directory.',
+  'A session that never calls brain_sync appears to every peer as a connection with no declared scope — sync early so concurrent sessions can coordinate with you.',
   'Use its active-task, message, and file-overlap report to coordinate concurrent work.',
   'Call brain_sync again when your file scope materially changes, and with phase "complete" before your final response.',
   'Do not read the full brain brief unless brain_sync says its compact context is insufficient or the task asks for broad history/status; use brain_ask for deeper retrieval.',
@@ -45,6 +48,14 @@ const normalizeFileKey = (value) => String(value || '')
   .trim()
   .toLowerCase();
 
+// TWIN recognition: one logical session can (still) appear as two lane rows —
+// its lifecycle id and an mcp-<pid> id — whenever id adoption failed. Rows that
+// share a hostPid belong to ONE host process; treating the twin as a peer would
+// raise a "blocking" file conflict against the session itself and queue it an
+// overlap alert. Suppression is explicit (suspectedTwin), never silent.
+export const isSuspectedTwin = (peer, me) =>
+  Boolean(peer && me && peer.hostPid && me.hostPid && peer.hostPid === me.hostPid);
+
 export function findPresenceConflicts(sessions, selfId) {
   const active = Array.isArray(sessions) ? sessions : [];
   const me = active.find((session) => session.id === selfId);
@@ -56,6 +67,7 @@ export function findPresenceConflicts(sessions, selfId) {
   const conflicts = [];
   for (const peer of active) {
     if (peer.id === selfId) continue;
+    if (isSuspectedTwin(peer, me)) continue;   // own twin row — a session cannot conflict with itself
     const overlap = [...new Set((peer.files || [])
       .map(normalizeFileKey)
       .filter((file) => mine.has(file))
@@ -85,44 +97,58 @@ const publicSession = (session, now) => ({
   surface: session?.surface || null,
   branch: session?.branch || null,
   intent: session?.intent || '',
+  intentAgeMs: session?.intentAt ? Math.max(0, now - Number(session.intentAt)) : null,
+  intentSource: session?.intentSource || null,
   files: Array.isArray(session?.files) ? session.files : [],
   ageMs: Math.max(0, now - Number(session?.lastSeen || now)),
 });
 
 export function buildPresenceSnapshot(sessions, selfId, { now = Date.now() } = {}) {
   const connected = Array.isArray(sessions) ? sessions : [];
-  const tasks = connected.filter(isTaskSession);
   const self = connected.find((session) => session.id === selfId) || null;
+  // A session's own twin rows are IT, not peers or background connections.
+  const others = connected.filter((session) => session.id !== selfId && !isSuspectedTwin(session, self));
+  const twinCount = connected.length - 1 - others.length;
+  const tasks = others.filter(isTaskSession);
   return {
-    connectionCount: connected.length,
-    activeTaskCount: tasks.length,
-    backgroundConnectionCount: connected.length - tasks.length,
+    connectionCount: connected.length - Math.max(0, twinCount),
+    activeTaskCount: tasks.length + (self && isTaskSession(self) ? 1 : 0),
+    // "background" here means SYNC-SILENT, not idle: a connection that never
+    // declared a task may still be actively working — say so, don't bury it.
+    backgroundConnectionCount: others.length - tasks.length,
+    suspectedTwinCount: Math.max(0, twinCount),
     self: self ? publicSession(self, now) : null,
-    peers: tasks.filter((session) => session.id !== selfId).map((session) => publicSession(session, now)),
+    peers: tasks.map((session) => publicSession(session, now)),
   };
 }
 
-function formatTaskPresence(snapshot) {
+function formatTaskPresence(snapshot, now = Date.now()) {
   const taskWord = snapshot.activeTaskCount === 1 ? 'task' : 'tasks';
   const connectionWord = snapshot.connectionCount === 1 ? 'connection' : 'connections';
   const lines = [
     `KLYPIX task presence: ${snapshot.activeTaskCount} active ${taskWord} across ${snapshot.connectionCount} live ${connectionWord}`
-      + (snapshot.backgroundConnectionCount ? ` (${snapshot.backgroundConnectionCount} background/idle)` : '') + '.',
+      + (snapshot.backgroundConnectionCount ? ` (${snapshot.backgroundConnectionCount} connected without a declared task — presence known, scope unknown)` : '') + '.',
   ];
   if (!snapshot.peers.length) {
-    lines.push('No other synchronized task is currently active; idle MCP connections are hidden from the peer list.');
+    lines.push('No other DECLARED task is active; connections that never called brain_sync are not listed here — they may still be working (see the connection count above).');
     return lines.join('\n');
   }
   lines.push('Other active tasks:');
   for (const peer of snapshot.peers.slice(0, 8)) {
+    const intentAgeMin = peer.intentAgeMs !== null ? Math.round(peer.intentAgeMs / 60_000) : null;
+    const heartbeatMin = Math.round(peer.ageMs / 60_000);
+    const intentAge = intentAgeMin !== null && intentAgeMin - heartbeatMin > 3 ? ` (intent set ${intentAgeMin}m ago)` : '';
     const details = [
       peer.client,
       peer.branch ? `branch ${peer.branch}` : null,
-      peer.intent ? `"${String(peer.intent).slice(0, 90)}"` : null,
-      peer.files.length ? peer.files.slice(0, 4).join(', ') : null,
+      peer.intent ? `"${String(peer.intent).slice(0, 90)}"${intentAge}` : null,
+      peer.files.length ? peer.files.slice(0, 4).join(', ') + (peer.files.length > 4 ? ` (+${peer.files.length - 4} more)` : '') : null,
     ].filter(Boolean);
     lines.push(`- ${String(peer.id).slice(0, 12)}: ${details.join(' | ')}`);
   }
+  // v1.32.0 law: a truncated list must never render as a complete one.
+  if (snapshot.peers.length > 8) lines.push(`- …and ${snapshot.peers.length - 8} more active task(s) not listed — brain_doctor shows all.`);
+  lines.push(`Point-in-time as of ${new Date(now).toISOString().slice(11, 16)}Z — re-sync before acting on it.`);
   return lines.join('\n');
 }
 
@@ -146,6 +172,11 @@ export function resolveMcpSessionId({
   for (const key of [
     'KLYPIX_SESSION_ID',
     'CODEX_THREAD_ID',
+    // Claude Code exports CLAUDE_CODE_SESSION_ID (live-verified 2026-07-29);
+    // the list only carried the speculative CLAUDE_SESSION_ID name, so every
+    // Claude MCP server fell through to mcp-<pid>-<nonce> and one logical
+    // session produced two unmerged lane rows. Both names stay, either wins.
+    'CLAUDE_CODE_SESSION_ID',
     'CLAUDE_SESSION_ID',
     'CURSOR_SESSION_ID',
     'CLINE_SESSION_ID',
@@ -154,6 +185,30 @@ export function resolveMcpSessionId({
     if (compact(env?.[key])) return compact(env[key]).slice(0, 160);
   }
   return `mcp-${pid}-${nonce}`;
+}
+
+// The host-pid this server belongs to (Claude Code exports CLAUDE_PID to every
+// child process). Used for the hostmap rotation below and for twin recognition.
+export function resolveHostPid(env = process.env) {
+  const pid = Number(env?.CLAUDE_PID || env?.KLYPIX_HOST_PID || 0);
+  return Number.isFinite(pid) && pid > 0 ? pid : null;
+}
+
+// Hostmap: the lifecycle hook writes `<lane>.hostmap.json` mapping its host
+// process pid → the CURRENT session id on every prompt. A spawn-time env id
+// goes stale when the MCP server outlives /clear or a resume (the server
+// process persists; the session id rotates) — re-reading the hostmap on every
+// touch keeps the adopted id current with zero agent cooperation.
+export function hostmapSessionId({ brainPath, hostPid, home, now = Date.now() } = {}) {
+  if (!brainPath || !hostPid) return null;
+  try {
+    const file = laneFileFor(brainPath, home).replace(/\.json$/, '.hostmap');
+    const map = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const entry = map && typeof map === 'object' ? map[String(hostPid)] : null;
+    if (!entry || !compact(entry.sessionId)) return null;
+    if (now - Number(entry.ts || 0) > 10 * 60 * 1000) return null;   // stale mapping — host gone
+    return compact(entry.sessionId).slice(0, 160);
+  } catch { return null; }
 }
 
 function gitBranch(cwd) {
@@ -201,7 +256,8 @@ export function createMcpPresence({
   // partial (old bundle), delivery degrades to unstamped — never a throw.
   decay = {},
 } = {}) {
-  const sessionId = resolveMcpSessionId({ env });
+  let sessionId = resolveMcpSessionId({ env });
+  const hostPid = resolveHostPid(env);
   const effectiveInboxPollMs = Number(env?.KLYPIX_MCP_INBOX_POLL_MS)
     || Number(inboxPollMs)
     || MCP_INBOX_POLL_MS;
@@ -212,9 +268,28 @@ export function createMcpPresence({
   let started = false;
   let lastPeers = '';
   let taskStartedAt = 0;
+  let syncNudgeShown = false;
   const sentTexts = new Set();
   const notifiedConflicts = new Set();
   const announcedMessageIds = new Set();
+
+  // Session-id rotation: the id is resolved once at spawn, but this server
+  // process outlives /clear and session resume — the hook-written hostmap is
+  // re-checked on every touch so the lane row follows the CURRENT session id
+  // instead of silently mislabeling every later conversation (2026-07-29 audit).
+  const adoptHostSession = (stamp) => {
+    try {
+      if (!brainPath || !hostPid) return;
+      const mapped = hostmapSessionId({ brainPath, hostPid, home, now: stamp });
+      if (!mapped || mapped === sessionId) return;
+      const previous = sessionId;
+      sessionId = mapped;
+      // The old row's mcp channel is ours — release it so the lane never holds
+      // two rows for one logical session longer than a single touch interval.
+      removeSession({ brainPath, id: previous, channel: 'mcp', home, now: stamp });
+      lastPeers = '';
+    } catch { /* rotation is best-effort — an fs error must never kill the heartbeat */ }
+  };
 
   const clientInfo = () => {
     let version = {};
@@ -270,6 +345,7 @@ export function createMcpPresence({
   } = {}) => {
     if (!brainPath) return { sessions: [], messages: [], notice: '' };
     const stamp = now();
+    adoptHostSession(stamp);
     const { client, surface } = clientInfo();
     const sessions = upsertSession({
       brainPath,
@@ -278,11 +354,13 @@ export function createMcpPresence({
       surface,
       branch: gitBranch(path.dirname(brainPath)),
       intent,
+      intentSource: intent !== undefined ? 'declared' : null,
       files,
       replaceFiles,
       event,
       channel: 'mcp',
       cwd: path.dirname(brainPath),
+      hostPid,
       home,
       now: stamp,
     });
@@ -468,13 +546,16 @@ export function createMcpPresence({
       alertsQueued,
       delivery: {
         proactive: 'mcp-logging-best-effort',
-        guaranteed: 'next-klypix-action',
+        // Honest scope: in-band delivery is guaranteed only while the message
+        // survives the lane's 24h TTL / 30-message cap (undelivered notes are
+        // preferred at eviction, but a target offline past the TTL misses it).
+        guaranteed: 'next-klypix-action (within the 24h message TTL)',
       },
       timingMs: { coordination: durationMs },
     };
     const text = [
       `KLYPIX Context Gateway: session ${sessionId} · phase ${nextPhase} · coordination ${durationMs}ms.`,
-      formatTaskPresence(snapshot),
+      formatTaskPresence(snapshot, stamp),
       messagesText,
       conflictText,
     ].filter(Boolean).join('\n\n');
@@ -483,11 +564,26 @@ export function createMcpPresence({
 
   const decorateToolResult = (result) => {
     if (!started) start(vault);
-    const { notice } = touch({ event: 'McpToolUse', deliverMessages: true });
-    if (!notice || !result || !Array.isArray(result.content)) return result;
+    const { sessions, notice } = touch({ event: 'McpToolUse', deliverMessages: true });
+    // Mechanical brain_sync nudge (once per server session): the "call
+    // brain_sync first" contract was instructions-only — zero enforcement —
+    // which is why Claude sessions sat sync-silent while Codex's gateway
+    // declared scope automatically (2026-07-29 audit). If this session's own
+    // row still has no intent AND no files after a real KLYPIX tool call,
+    // say so once, in-band, where the agent actually reads it.
+    let nudge = '';
+    if (!syncNudgeShown && brainPath) {
+      const self = (sessions || []).find((session) => session.id === sessionId);
+      if (self && !isTaskSession(self)) {
+        syncNudgeShown = true;
+        nudge = 'KLYPIX presence: this session has not declared its task — peers see it as a connection with no scope. Call brain_sync {intent, files} so concurrent sessions can coordinate with you.';
+      }
+    }
+    const extra = [notice, nudge].filter(Boolean).join('\n\n');
+    if (!extra || !result || !Array.isArray(result.content)) return result;
     return {
       ...result,
-      content: [...result.content, { type: 'text', text: notice }],
+      content: [...result.content, { type: 'text', text: extra }],
     };
   };
 
@@ -497,7 +593,7 @@ export function createMcpPresence({
   };
 
   return {
-    id: sessionId,
+    get id() { return sessionId; },   // getter — hostmap rotation can change it mid-life
     start,
     stop,
     touch,

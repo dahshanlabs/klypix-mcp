@@ -285,31 +285,102 @@ const laneCanon = (p) => { try { return fs.realpathSync.native(p); } catch { ret
 const SESSIONS_FILE = path.join(SESSIONS_DIR, `${sha(normBrainPath(laneCanon(BRAIN)))}.json`); // one lane-file per PROJECT (shared by its concurrent sessions)
 const SESSIONS_LOCK = SESSIONS_FILE + '.lock';
 const SESSION_FRESH_MS = 10 * 60 * 1000;   // a lane unseen for 10min is treated as ended
+const MCP_SESSION_FRESH_MS = 3 * 60 * 1000; // an mcp-channel heartbeat is dead after 3min (matches agent-presence)
+// The host CLI's pid (Claude Code exports CLAUDE_PID to every child, including
+// this hook AND the MCP server it spawns): the correlation key that lets the two
+// halves of ONE logical session — the lifecycle row and the mcp row — recognize
+// each other instead of rendering as independent peers (2026-07-29 audit).
+const HOST_PID = Number(process.env.CLAUDE_PID || 0) > 0 ? Number(process.env.CLAUDE_PID) : null;
+// NOTE: deliberately NOT *.json — several consumers glob the sessions dir for
+// lane files and would choke on a hostmap's different shape (same convention
+// as the .lock sibling).
+const HOSTMAP_FILE = SESSIONS_FILE.replace(/\.json$/, '.hostmap');
 const safeGit = (args, timeout = 1500) => { try { return execSync(`git ${args}`, { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout }); } catch { return ''; } };
 const gitBranch = () => { const b = safeGit('rev-parse --abbrev-ref HEAD', 1000).trim(); return b && b !== 'HEAD' ? b : null; };
 const gitChangedPaths = () => safeGit('diff --name-only HEAD').split('\n').map(s => s.trim()).filter(Boolean);
 const fileSlug = (p) => slugify(String(p).replace(/\\/g, '/').split('/').pop().replace(/\.[a-z0-9]+$/i, ''));
 const changedToSlugs = (paths) => [...new Set(paths.map(fileSlug).filter(s => s.length >= 3))].slice(0, 12);
+// A tool-touched path → project-relative form (forward slashes), or null when it
+// falls outside this project. The lane's files[] carries THESE (interoperable
+// with Codex/brain_sync overlap detection) — slugs are only for card #file- tags.
+const projRelPath = (p) => {
+    try {
+        const abs = path.resolve(CWD, String(p || ''));
+        const rel = path.relative(CWD, abs);
+        if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return null;
+        return rel.replace(/\\/g, '/');
+    } catch { return null; }
+};
 const readSessions = () => { try { const d = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8')); return Array.isArray(d.sessions) ? d.sessions : []; } catch { return []; } };
-const pruneSessions = (list, now) => list.filter(s => s && s.id && (now - (s.lastSeen || 0) < SESSION_FRESH_MS));
+// Channel-aware prune, mirroring agent-presence.mjs pruneSessions: an mcp-only
+// row whose heartbeat stopped 3min ago is DEAD even though the flat 10-minute
+// window would keep it — the hook, brain_sync, and doctor previously disagreed
+// on what "live" means (three different counts for one lane).
+const freshChannelSeen = (channelSeen, now) => {
+    if (!channelSeen || typeof channelSeen !== 'object' || Array.isArray(channelSeen)) return {};
+    return Object.fromEntries(Object.entries(channelSeen)
+        .filter(([ch, seen]) => ch && now - Number(seen || 0) < (ch === 'mcp' ? MCP_SESSION_FRESH_MS : SESSION_FRESH_MS)));
+};
+const pruneSessions = (list, now) => {
+    const out = [];
+    for (const s of (Array.isArray(list) ? list : [])) {
+        if (!s || !s.id) continue;
+        const hadChannels = s.channelSeen && typeof s.channelSeen === 'object' && !Array.isArray(s.channelSeen) && Object.keys(s.channelSeen).length > 0;
+        const channelSeen = freshChannelSeen(s.channelSeen, now);
+        const seenValues = Object.values(channelSeen).map(Number).filter(Number.isFinite);
+        const lastSeen = seenValues.length ? Math.max(...seenValues) : Number(s.lastSeen || 0);
+        if ((hadChannels && !seenValues.length) || now - lastSeen >= SESSION_FRESH_MS) continue;
+        out.push({ ...s, ...(hadChannels ? { channelSeen, channels: Object.keys(channelSeen) } : {}), lastSeen });
+    }
+    return out;
+};
 // Upsert THIS session's lane. Best-effort + never-throw: a missing session_id, a
 // lock-timeout, or a write error just skips coordination for this turn (a dropped
 // heartbeat is harmless — the next event re-registers it).
+// SCHEMA PARITY: this writer and agent-presence.mjs upsertSession() write the
+// SAME row shape (client/surface/cwd/hostPid/channelSeen/intentAt/intentSource) —
+// `...prev` first so either writer's fields survive the other's touch (T8 class).
 function touchSession(sid, patch = {}) {
     if (!sid) return;
     try {
         const now = Date.now();
-        const got = acquireLock(SESSIONS_LOCK, { tries: 20, waitMs: 25 });   // ~0.5s budget then best-effort
+        const got = acquireLock(SESSIONS_LOCK, { tries: 20, waitMs: 25 });   // ~0.5s budget
+        // Lock timeout → SKIP, never write: an unlocked read-modify-write of the
+        // whole lane can erase a peer's just-posted message or just-refreshed
+        // heartbeat (review-caught). A dropped touch is harmless — the next
+        // event re-registers it; a stale full-file snapshot is data loss.
+        if (!got) return;
         try {
             let data0 = {}; try { data0 = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8')); } catch { /* fresh */ }
             const all = pruneSessions(Array.isArray(data0.sessions) ? data0.sessions : [], now);
             const prev = all.find(s => s.id === sid) || {};
             const list = all.filter(s => s.id !== sid);
+            const channelSeen = freshChannelSeen(prev.channelSeen, now);
+            channelSeen.lifecycle = now;   // this writer IS the lifecycle channel
+            // Intent provenance + no-clobber: the per-prompt intent is the user's RAW
+            // prompt (a fallback description), and it must not overwrite a FRESH
+            // intent the session DECLARED via brain_sync on a merged row. A declared
+            // EMPTY intent (brain_sync phase "complete" clears it) never blocks the
+            // fallback — there is nothing to protect (review-caught).
+            const declaredFresh = prev.intentSource === 'declared' && String(prev.intent || '').trim()
+                && prev.intentAt && (now - prev.intentAt) < 10 * 60 * 1000;
+            const wantsIntent = patch.intent !== undefined && !declaredFresh;
+            const nextIntent = wantsIntent ? patch.intent : (prev.intent ?? '');
+            const intentChanged = wantsIntent && nextIntent !== (prev.intent ?? '');
             list.push({
+                ...prev,   // unknown/foreign keys (an MCP writer's, a future field) survive this touch
                 id: sid, pid: process.pid, project: path.basename(CWD),
+                client: 'claude-code', surface: prev.surface || 'claude-code',
+                cwd: prev.cwd || CWD,
+                ...(HOST_PID ? { hostPid: HOST_PID } : {}),
                 branch: patch.branch !== undefined ? patch.branch : (prev.branch ?? null),
-                intent: patch.intent !== undefined ? patch.intent : (prev.intent ?? ''),
-                files: patch.files !== undefined ? patch.files : (prev.files ?? []),
+                intent: nextIntent,
+                ...(intentChanged ? { intentAt: now, intentSource: 'prompt' } : {}),
+                // addFiles UNIONS under the lane lock (live observed scope);
+                // files REPLACES (Stop rewrites the session's full set).
+                files: patch.addFiles !== undefined
+                    ? [...new Set([...(prev.files || []), ...patch.addFiles])].slice(-20)
+                    : (patch.files !== undefined ? patch.files : (prev.files ?? [])),
                 // ships ACCUMULATE across turns (deduped, last 5) so a peer sees the
                 // session's recent ship-events, not just the latest turn's.
                 ships: patch.ships !== undefined ? [...new Set([...(prev.ships || []), ...patch.ships])].slice(-5) : (prev.ships ?? []),
@@ -327,19 +398,46 @@ function touchSession(sid, patch = {}) {
                 // list silently dropped unknown patch keys, which made the
                 // dedup dead code (review-caught).
                 statusDigestHash: patch.statusDigestHash !== undefined ? patch.statusDigestHash : (prev.statusDigestHash ?? null),
+                channels: Object.keys(channelSeen), channelSeen,
                 startedAt: prev.startedAt || now, lastSeen: now,
             });
             fs.mkdirSync(SESSIONS_DIR, { recursive: true });
             // Preserve the messages lane — touchSession runs AFTER postMessages in a
             // capture, and dropping the field here would clobber a just-posted note.
-            const keptMsgs = (Array.isArray(data0.messages) ? data0.messages : []).filter(m => m && (now - (m.ts || 0) < MSG_FRESH_MS));
-            fs.writeFileSync(SESSIONS_FILE, JSON.stringify({ sessions: list.slice(-20), messages: keptMsgs }));
-        } finally { if (got) releaseLock(SESSIONS_LOCK); }
+            // Cap 40 (was 20 — the MCP writer caps 40; a lower cap here could evict
+            // MCP-written rows on every heartbeat). Message eviction prefers
+            // delivered notes (capMsgs) so an unseen note is never silently lost.
+            const keptMsgs = capMsgs((Array.isArray(data0.messages) ? data0.messages : []).filter(m => m && (now - (m.ts || 0) < MSG_FRESH_MS)));
+            fs.writeFileSync(SESSIONS_FILE, JSON.stringify({ ...data0, sessions: list.slice(-40), messages: keptMsgs }));
+            // Hostmap: host-pid → CURRENT session id, re-read by the MCP server on
+            // every touch so its lane row follows /clear + resume id rotation. The
+            // file is per-PROJECT (all host pids write it), so its read-modify-write
+            // runs INSIDE the same lane lock, and the write is atomic (temp+rename) —
+            // an unlocked plain write let host B revert host A's fresh rotation and a
+            // torn read wiped every other host's mapping (review-caught).
+            if (HOST_PID) {
+                try {
+                    let map = {}; try { const m0 = JSON.parse(fs.readFileSync(HOSTMAP_FILE, 'utf8')); if (m0 && typeof m0 === 'object') map = m0; } catch { /* fresh */ }
+                    const kept = {};
+                    for (const [k, v] of Object.entries(map)) if (v && now - Number(v.ts || 0) < SESSION_FRESH_MS) kept[k] = v;
+                    kept[String(HOST_PID)] = { sessionId: sid, ts: now };
+                    const tmp = HOSTMAP_FILE + '.' + process.pid + '.tmp';
+                    fs.writeFileSync(tmp, JSON.stringify(kept));
+                    fs.renameSync(tmp, HOSTMAP_FILE);
+                } catch { /* best-effort */ }
+            }
+        } finally { releaseLock(SESSIONS_LOCK); }
     } catch { /* coordination is best-effort */ }
 }
-// Other live lanes in THIS project (exclude me by session id AND pid).
+// Other live lanes in THIS project (exclude me by session id, pid, AND host pid).
+// Own-twin = an MCP-CHANNEL-ONLY row sharing this host's pid — that is this
+// host's own MCP server half, which must never render as a phantom peer. A
+// same-hostPid row with a LIFECYCLE channel is NOT excluded (a /clear
+// predecessor is a real, aging-out session — hiding it would lie).
+const isOwnTwin = (s) => Boolean(HOST_PID && s && s.hostPid === HOST_PID
+    && Array.isArray(s.channels) && s.channels.length && s.channels.every(ch => ch === 'mcp'));
 function livePeers(sid) {
-    try { return pruneSessions(readSessions(), Date.now()).filter(s => s.id !== sid && s.pid !== process.pid); }
+    try { return pruneSessions(readSessions(), Date.now()).filter(s => s.id !== sid && s.pid !== process.pid && !isOwnTwin(s)); }
     catch { return []; }
 }
 // Zero-cost-UNLESS-a-peer-exists footer: lists other live sessions and ESCALATES
@@ -348,30 +446,51 @@ function livePeers(sid) {
 // contract, so it only ever speaks up when there's a real collision to avoid.
 function peerFooter(sid) {
     if (!sid) return '';
-    let list; try { list = pruneSessions(readSessions(), Date.now()); } catch { return ''; }
-    const peers = list.filter(s => s.id !== sid && s.pid !== process.pid);
-    if (!peers.length) return '';
-    // "My files" = what THIS session edited (set at Stop from its own transcript),
-    // NOT the shared working-tree diff (identical for two sessions in one repo).
-    const me = list.find(s => s.id === sid);
-    const myFiles = new Set((me && Array.isArray(me.files)) ? me.files : []);
-    const myBranch = me && me.branch;
     const now = Date.now();
+    let raw, list;
+    try { raw = readSessions(); list = pruneSessions(raw, now); } catch { return ''; }
+    const peers = list.filter(s => s.id !== sid && s.pid !== process.pid && !isOwnTwin(s));
+    if (!peers.length) return '';
+    // Honest hiding: rows pruned as inactive are DISCLOSED as a count, matching
+    // the MCP side's "(N background/idle)" wording — a filtered list must never
+    // read as the whole lane (2026-07-29 field incident: 13 live, 4 rendered).
+    const hiddenIdle = Math.max(0, raw.filter(s => s && s.id).length - list.length);
+    // "My files" = what THIS session edited (live-observed per tool call + set at
+    // Stop from its own transcript), NOT the shared working-tree diff (identical
+    // for two sessions in one repo).
+    const me = list.find(s => s.id === sid);
+    // Normalize like the MCP detector's normalizeFileKey (slashes, ./ prefix,
+    // case) so hook-observed and brain_sync-declared spellings cross-match.
+    const fileKey = (f) => String(f || '').replace(/\\/g, '/').replace(/^\.\//, '').trim().toLowerCase();
+    const myFiles = new Set(((me && Array.isArray(me.files)) ? me.files : []).map(fileKey));
+    const myBranch = me && me.branch;
     const ago = (ts) => { const m = Math.max(0, Math.round((now - (ts || now)) / 60000)); return m <= 0 ? 'just now' : `${m}m ago`; };
-    const lines = ['', '## ⚠️ Other live session(s) in this project — coordinate (the brain is shared, NOT live-merged)'];
+    const asOf = new Date(now).toISOString().slice(11, 16) + 'Z';
+    const lines = ['', `## ⚠️ Other live session(s) in this project — ${peers.length} total, as of ${asOf}${hiddenIdle ? ` (+${hiddenIdle} inactive not shown)` : ''} — coordinate (the brain is shared, NOT live-merged)`];
     for (const p of peers.slice(0, 4)) {
         const bits = [];
         if (p.branch) bits.push(`branch \`${p.branch}\``);
         bits.push(`active ${ago(p.lastSeen)}`);
-        if (p.intent) bits.push(`“${String(p.intent).replace(/\s+/g, ' ').trim().slice(0, 60)}”`);
+        if (p.intent) {
+            // A heartbeat refreshes lastSeen while carrying the old intent — show the
+            // intent's OWN age when it lags, so it can't read as "doing this right now".
+            const iAgeMin = p.intentAt ? Math.max(0, Math.round((now - p.intentAt) / 60000)) : null;
+            const hAgeMin = Math.max(0, Math.round((now - (p.lastSeen || now)) / 60000));
+            const iAge = iAgeMin !== null && iAgeMin - hAgeMin > 3 ? ` (set ${iAgeMin}m ago)` : '';
+            bits.push(`“${String(p.intent).replace(/\s+/g, ' ').trim().slice(0, 60)}”${iAge}`);
+        }
         const ships = Array.isArray(p.ships) ? p.ships : [];
         if (ships.length) bits.push(`🏁 shipped: ${ships.slice(-3).join('; ')}`);
-        const shared = (Array.isArray(p.files) ? p.files : []).filter(f => myFiles.has(f));
+        if (Array.isArray(p.files) && p.files.length) bits.push(`✏️ ${p.files.slice(-4).join(', ')}${p.files.length > 4 ? ` (+${p.files.length - 4})` : ''}`);
+        const shared = (Array.isArray(p.files) ? p.files : []).filter(f => myFiles.has(fileKey(f)));
         let warn = '';
         if (shared.length) warn = `  · ⚠️ both edited: ${shared.slice(0, 5).join(', ')} — expect a conflict, KEEP BOTH`;
         else if (p.branch && myBranch && p.branch === myBranch) warn = '  · ⚠️ same branch — pull/rebase before you commit';
         lines.push(`- session ${String(p.id).slice(0, 8)} · ${bits.join(' · ')}${warn}`);
     }
+    // v1.32.0 law: a truncated list must never render as a complete one. This
+    // overflow line is unconditional — never subject to any budget.
+    if (peers.length > 4) lines.push(`- …and ${peers.length - 4} more live session(s) not shown — \`npx klypix-mcp doctor\` or brain_sync lists all.`);
     lines.push('Coordinate BEFORE touching shared files: reply with `🧠 MSG [<their id-prefix or branch>]: <text>` (or call the `brain_message` MCP tool) — delivered once at their next prompt. Check the brain for what they decided/shipped.');
     return lines.join('\n');
 }
@@ -386,9 +505,23 @@ function peerFooter(sid) {
 // async (delivered at the peer's next hook event), by design — not real-time.
 const MSG_RE = /🧠\s*MSG\s*(?:\[([^\]]*)\])?\s*:\s*(.+)$/i;
 const MSG_FRESH_MS = 24 * 60 * 60 * 1000;
+// Cap the message lane WITHOUT silently destroying undelivered notes (mirrors
+// agent-presence.mjs capMessages): evict delivered (seen-by-someone) messages
+// first, oldest first; only then the oldest undelivered ones.
+function capMsgs(list, cap = 30) {
+    const msgs = Array.isArray(list) ? list : [];
+    if (msgs.length <= cap) return msgs;
+    let excess = msgs.length - cap;
+    const dropped = new Set();
+    const evict = (pred) => { for (const m of msgs) { if (!excess) return; if (dropped.has(m) || !pred(m)) continue; dropped.add(m); excess--; } };
+    evict(m => Array.isArray(m?.seen) && m.seen.length > 0);
+    evict(() => true);
+    return msgs.filter(m => !dropped.has(m));
+}
 function postMessages(msgs) {
     if (!msgs || !msgs.length) return;
     const got = acquireLock(SESSIONS_LOCK, { tries: 20, waitMs: 25 });
+    if (!got) return;   // never write the whole lane without the lock (review-caught)
     try {
         let data = {}; try { data = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8')); } catch { /* fresh */ }
         const sessions = Array.isArray(data.sessions) ? data.sessions : [];
@@ -396,7 +529,7 @@ function postMessages(msgs) {
         const kept = (Array.isArray(data.messages) ? data.messages : []).filter(m => m && (now - (m.ts || 0) < MSG_FRESH_MS));
         for (const m of msgs) kept.push(m);
         fs.mkdirSync(SESSIONS_DIR, { recursive: true });
-        fs.writeFileSync(SESSIONS_FILE, JSON.stringify({ sessions, messages: kept.slice(-30) }));
+        fs.writeFileSync(SESSIONS_FILE, JSON.stringify({ ...data, sessions, messages: capMsgs(kept) }));
     } catch { /* best-effort */ } finally { if (got) releaseLock(SESSIONS_LOCK); }
 }
 // to==='all'/'' → everyone; else the hint must appear in my id-prefix / branch / intent.
@@ -479,33 +612,57 @@ function messageFooter(sid, tp, lib) {
     if (!unseen.length) return '';
     const own = ownMcpSendTexts(tp);
     const show = own.size ? unseen.filter(m => !own.has(String(m.text || '').trim().slice(0, 400))) : unseen;
-    const got = acquireLock(SESSIONS_LOCK, { tries: 15, waitMs: 25 });   // ack under lock so a peer read can't lose it
-    try {
-        let d2 = {}; try { d2 = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8')); } catch { /* */ }
-        const ids = new Set(unseen.map(u => u.id));   // ack self-sent notes too — they must never resurface here
-        for (const m of (Array.isArray(d2.messages) ? d2.messages : [])) {
-            if (!ids.has(m.id)) continue;
-            if (!Array.isArray(m.seen)) m.seen = [];
-            if (!m.seen.includes(sid)) m.seen.push(sid);
-        }
-        fs.writeFileSync(SESSIONS_FILE, JSON.stringify(d2));
-    } catch { /* */ } finally { if (got) releaseLock(SESSIONS_LOCK); }
-    if (!show.length) return '';
     // De-dupe identical message TEXT within one delivery: the same note can reach
     // the lane twice (posted via both the 🧠 MSG marker and the brain_message MCP
-    // twin, or re-sent) as two distinct ids — all are already acked above, so
-    // dropping the repeats here shows each note once without ever re-surfacing it.
-    const seenTxt = new Set();
-    const showUniq = show.filter(m => { const k = String(m.text || '').replace(/\s+/g, ' ').trim().toLowerCase(); if (!k || seenTxt.has(k)) return false; seenTxt.add(k); return true; });
-    if (!showUniq.length) return '';
+    // twin, or re-sent) as two distinct ids — a dupe of a DELIVERED message is
+    // acked with it; a dupe of an overflowed one stays unacked with its twin.
+    const normTxt = (m) => String(m.text || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    const seenTxt = new Set(); const dupes = new Map();
+    const showUniq = [];
+    for (const m of show) {
+        const k = normTxt(m);
+        if (!k) continue;
+        if (seenTxt.has(k)) { if (!dupes.has(k)) dupes.set(k, []); dupes.get(k).push(m); continue; }
+        seenTxt.add(k); showUniq.push(m);
+    }
+    // Deliver-then-ack, never ack-then-truncate: the old path acked EVERY unseen
+    // message but rendered only 6 — anything past the cap was marked seen without
+    // ever being shown, permanently destroyed under the delivered-once contract
+    // (2026-07-29 audit). Ack exactly what renders (+ own sends + dupes of a
+    // rendered note); the overflow stays unacked and arrives next prompt.
+    const delivered = showUniq.slice(0, 6);
+    const overflow = showUniq.length - delivered.length;
+    const ackIds = new Set(delivered.map(m => m.id));
+    for (const m of unseen) if (!show.includes(m)) ackIds.add(m.id);   // own MCP sends — never resurface
+    for (const m of delivered) for (const d of (dupes.get(normTxt(m)) || [])) ackIds.add(d.id);
+    if (ackIds.size) {
+        const got = acquireLock(SESSIONS_LOCK, { tries: 15, waitMs: 25 });
+        // Lock timeout → deliver NOTHING this prompt (mirror the MCP twin,
+        // agent-presence.receiveMessages): rendering without acking would
+        // re-deliver, and acking via an unlocked full-file write can erase a
+        // peer's just-posted note mid-write — permanent loss (review-caught).
+        if (!got) return '';
+        try {
+            let d2 = {}; try { d2 = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8')); } catch { /* */ }
+            for (const m of (Array.isArray(d2.messages) ? d2.messages : [])) {
+                if (!ackIds.has(m.id)) continue;
+                if (!Array.isArray(m.seen)) m.seen = [];
+                if (!m.seen.includes(sid)) m.seen.push(sid);
+            }
+            fs.writeFileSync(SESSIONS_FILE, JSON.stringify(d2));
+        } catch { /* */ } finally { releaseLock(SESSIONS_LOCK); }
+    }
+    if (!delivered.length) return '';
     const ago = (ts) => { const mm = Math.max(0, Math.round((now - (ts || now)) / 60000)); return mm <= 0 ? 'just now' : `${mm}m ago`; };
     const out = ['', '## 📨 Message(s) from another session in this project (delivered once — act on or reply to them)'];
-    for (const m of showUniq.slice(0, 6)) {
+    for (const m of delivered) {
         out.push(`- from ${String(m.from || '?').slice(0, 8)} · ${ago(m.ts)}: ${String(m.text).replace(/\s+/g, ' ').trim().slice(0, 400)}`);
         // Engine-emitted LAST-KNOWN stamp — its own line, after the 400-char slice.
         const stamp = decayStampForMessage(m.text, m.ts, now, lib);
         if (stamp) out.push(`  ${stamp}`);
     }
+    // Unconditional overflow notice (v1.32.0 law) — the rest are still unread.
+    if (overflow > 0) out.push(`- …${overflow} more message(s) waiting — they arrive on your next prompt.`);
     out.push('Reply with `🧠 MSG [<their-id or all>]: <text>` — it reaches them on their next prompt.');
     return '\n' + out.join('\n');
 }
@@ -835,6 +992,28 @@ function detectLiveEvent(input) {
     return null;
 }
 
+// Live scope observation: one write-tool file path → the session lane, union
+// semantics under the lane lock (touchSession addFiles). Gated on FILE_TOOLS
+// (write tools only — reads would over-anchor every browsed file) and an
+// unlocked pre-check so the common already-recorded edit costs one JSON read,
+// no lock. Paths are project-relative (Codex/brain_sync-interoperable); a path
+// outside the project is skipped. Never throws.
+function observeFileScope(input, sid) {
+    try {
+        if (!FILE_TOOLS.has(input.tool_name)) return;
+        const ti = input.tool_input || {};
+        const fp = ti.file_path || ti.path || ti.notebook_path;
+        if (typeof fp !== 'string' || !fp) return;
+        const rel = projRelPath(fp);
+        if (!rel) return;
+        try {
+            const me = readSessions().find(s => s.id === sid);
+            if (me && Array.isArray(me.files) && me.files.includes(rel)) return;   // already recorded — skip the lock
+        } catch { /* pre-check is best-effort */ }
+        touchSession(sid, { addFiles: [rel] });
+    } catch { /* observation is best-effort */ }
+}
+
 // --live (PostToolUse): the WRITE path. Near-zero-cost on the common non-matching
 // branch (string checks → return). Appends ONE deduped line under the shared
 // advisory lock; prunes >6h and caps the file on every append. No lazy lib import.
@@ -844,6 +1023,13 @@ function liveCapture() {
         const input = readHookInput();
         const sid = input.session_id;
         if (!sid) return;
+        // OBSERVED file scope (2026-07-29): record every write-tool touch into
+        // this session's lane files[] AS IT HAPPENS — previously files were set
+        // only at Stop (as slugs), so mid-session (exactly when peers need the
+        // overlap signal) a Claude session always showed files=[] while Codex
+        // declared full scopes via brain_sync. MUST run BEFORE the detectLiveEvent
+        // early-return: ordinary edits are precisely the non-event turns.
+        observeFileScope(input, sid);
         const ev = detectLiveEvent(input);
         if (!ev) return;                                                        // non-matching branch — done
         const text = String(ev.text).replace(/\s+/g, ' ').trim().slice(0, 200);
@@ -962,6 +1148,8 @@ function inflightFooter(sid, struct) {
         const ago = (t) => { const m = Math.max(0, Math.round((now - t) / 60000)); return m <= 0 ? 'just now' : `${m}m ago`; };
         const lines = ['## ⚡ In-flight in other sessions (live — not yet in the brain)'];
         for (const e of survivors.slice(0, 6)) lines.push(`- ${ago(e._t)} · session ${String(e.sessionId).slice(0, 8)} · ${String(e.text).replace(/\s+/g, ' ').trim().slice(0, 140)}`);
+        // v1.32.0 law: a truncated list must never render as a complete one.
+        if (survivors.length > 6) lines.push(`- …and ${survivors.length - 6} more in-flight event(s) not shown.`);
         return '\n\n' + lines.join('\n');
     } catch { return ''; }
 }
@@ -1164,10 +1352,24 @@ async function capture(lib) {
     // work touched — captured by scanning EVERY entry's tool_use, not just the
     // marker turns (markers carry no tool_use of their own).
     const recentTags = [];
+    // Path-form twin of recentTags for the LANE: the coordination row carries
+    // project-relative PATHS ("src/canvas/KlypixCanvas.tsx"), not slugs
+    // ("klypixcanvas") — slugs can never exact-match a Codex/brain_sync path, so
+    // cross-agent file-overlap detection involving a Claude row was structurally
+    // dead (2026-07-29 audit). Slugs remain for card #file- tags only.
+    const recentPaths = [];
     const noteFiles = (paths) => {
-        for (const p of paths) for (const tag of fileTagsFor(p)) {
-            const i = recentTags.indexOf(tag); if (i >= 0) recentTags.splice(i, 1);
-            recentTags.push(tag);
+        for (const p of paths) {
+            const rel = projRelPath(p);
+            if (rel) {
+                const j = recentPaths.indexOf(rel); if (j >= 0) recentPaths.splice(j, 1);
+                recentPaths.push(rel);
+                while (recentPaths.length > 20) recentPaths.shift();
+            }
+            for (const tag of fileTagsFor(p)) {
+                const i = recentTags.indexOf(tag); if (i >= 0) recentTags.splice(i, 1);
+                recentTags.push(tag);
+            }
         }
         while (recentTags.length > 8) recentTags.shift();
     };
@@ -1282,9 +1484,12 @@ async function capture(lib) {
     // session (per-session, from the transcript; NOT the shared working-tree diff,
     // which is identical for two sessions in one repo) + recent ship-events, so a
     // peer sees "merged #244, edited foo.ts", not a degenerate shared diff.
+    // addFiles (union) — PATH form, never slugs: replacing would clobber the
+    // live-observed scope with a truncated transcript view, and slugs can't
+    // match Codex/brain_sync paths in either overlap detector.
     {
-        const laneFiles = [...new Set(recentTags.filter(t => t.startsWith('#file-')).map(t => t.slice(6)))].filter(Boolean).slice(0, 12);
-        touchSession(input.session_id, { branch: gitBranch(), files: laneFiles, ...(shipSummaries.length ? { ships: shipSummaries } : {}) });
+        const laneFiles = recentPaths.slice(-20);
+        touchSession(input.session_id, { branch: gitBranch(), ...(laneFiles.length ? { addFiles: laneFiles } : {}), ...(shipSummaries.length ? { ships: shipSummaries } : {}) });
     }
     // Commit-body auto-capture: rationale-bearing feat/fix/perf commits since
     // the last run (independent of markers), pushed into the SAME capture batch.
@@ -1775,7 +1980,15 @@ function selfCheckFooter() {
         // dogfooding brain shouldn't run unreviewed logic). Stamped by deploy-brain.mjs.
         try {
             const stamp = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.claude', 'project-brain', '.brain-version.json'), 'utf8'));
-            if (stamp && stamp.dirty) probs.push(`running a DIRTY deploy — uncommitted hook code (source ${stamp.sourceSha || '?'}); commit + \`node scripts/deploy-brain.mjs\` for an auditable brain`);
+            if (stamp && stamp.dirty) {
+                // The flag is a DEPLOY-TIME snapshot — show its age and say so, so a
+                // week-old DIRTY (or one whose source was since committed) reads as
+                // "re-deploy to re-evaluate", not as a live fact (2026-07-29 audit).
+                const dep = Date.parse(stamp.deployedAt);
+                const age = Number.isFinite(dep) ? Math.round((Date.now() - dep) / 3_600_000) : null;
+                const ageLabel = age === null ? '' : age >= 48 ? ` ${Math.floor(age / 24)}d ago` : ` ${Math.max(1, age)}h ago`;
+                probs.push(`running a DIRTY deploy — uncommitted hook code at deploy time (source ${stamp.sourceSha || '?'}, deployed${ageLabel}; the flag is deploy-time — committing alone does NOT clear it). Re-run \`node scripts/deploy-brain.mjs\` for an auditable brain`);
+            }
         } catch { /* no stamp → deployed the old way; stay silent */ }
         if (!probs.length) return '';
         return '\n\n---\n## ⚠️ Brain self-check — the brain reported a problem with ITSELF\n'
@@ -2023,8 +2236,18 @@ async function read(lib) {
     // fail-open) so a newer published brain installs itself for the next session.
     maybeSelfUpdate();
     // Register presence at session start so a peer already running sees this session
-    // immediately. Files/ships come from Stop (what this session actually edits).
+    // immediately. Files/ships come from live observation + Stop.
     touchSession(input.session_id, { branch: gitBranch() });
+    // One-line presence summary — session start is exactly when an agent decides
+    // whether to coordinate, and this surface previously listed ZERO peers (the
+    // peer footer is prompt-path-only; 2026-07-29 audit). Count only, explicitly
+    // stamped as a snapshot: the per-prompt footer carries the live detail.
+    const presenceLine = (() => {
+        try {
+            const peerCount = livePeers(input.session_id).length;
+            return peerCount ? `\n👥 ${peerCount} other live session(s) in this project right now (snapshot at session start — the per-prompt peer footer stays current; \`npx klypix-mcp doctor\` lists all).` : '';
+        } catch { return ''; }
+    })();
     const { struct } = await lib.parseKlypix(fs.readFileSync(BRAIN));
     const { freshness, drifted } = computeFreshness(struct);
     // The FULL brief: tiered brief + every self-heal/health footer. Messages are
@@ -2035,7 +2258,7 @@ async function read(lib) {
         + ruleDraftsFooter(input.session_id, struct, { markShown: false })
         + selfCheckFooter() + doctorFooter() + versionCurrencyFooter() + legendFooter() + memoryFooter();
     const emitFull = () => {
-        process.stdout.write(full + messageFooter(input.session_id || '', input.transcript_path, lib));
+        process.stdout.write(full + presenceLine + messageFooter(input.session_id || '', input.transcript_path, lib));
         appendJsonl(HEALTH, { ts: nowIso(), project: path.basename(CWD), mode: 'read', ok: true, briefBytes: Buffer.byteLength(full), cards: struct?.counts?.cards ?? null }, 500);
     };
     // --full = everything to stdout (manual runs); also the fallback when the
@@ -2049,8 +2272,11 @@ async function read(lib) {
     const briefRel = '.claude/brain-brief.md';
     try {
         fs.mkdirSync(path.resolve(CWD, '.claude'), { recursive: true });
+        // The absolute as-of stamp makes a stale copy self-evident: presence /
+        // in-flight / session lines inside are a snapshot of THIS instant, and a
+        // long-lived chat must re-query (brain_sync / doctor), not re-report them.
         fs.writeFileSync(path.resolve(CWD, briefRel),
-            '<!-- auto-generated by the brain hook at session start — read it, don\'t edit it; regenerated next session -->\n' + full, 'utf8');
+            `<!-- auto-generated by the brain hook at session start (${nowIso()}) — read it, don't edit it; regenerated next session. Presence/in-flight/session lines are a snapshot of that instant — query brain_sync or \`npx klypix-mcp doctor\` for live peers before reporting them. -->\n` + full, 'utf8');
     } catch { return emitFull(); }
     const ultra = lib.structToUltraBrief(struct, { freshness, briefPath: briefRel });
     // Self-heal tiers compress to ONE line up here; the actionable detail (which
@@ -2073,7 +2299,7 @@ async function read(lib) {
     // go right after the ultra brief, at the top of the visible window, never
     // after a stack of footers that could push them past a preview cut.
     const messages = messageFooter(input.session_id || '', input.transcript_path, lib);
-    const out = ultra + messages + healLine + draftLine
+    const out = ultra + messages + presenceLine + healLine + draftLine
         + inflightFooter(input.session_id, struct)
         + selfCheckFooter() + doctorFooter() + versionCurrencyFooter();
     process.stdout.write(out);

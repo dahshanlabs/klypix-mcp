@@ -224,3 +224,37 @@ State these plainly rather than assuming them away:
 - **It does not verify the installed flat bundle end to end**, only the npm tarball.
 - **It cannot unpublish.** Every gate exists because the one thing that cannot be undone
   is a bad publish.
+
+---
+
+## KNOWN ISSUE — the post-publish provenance check false-negatives
+
+**Found on the first real run of this pipeline (v1.44.0, 2026-07-30).**
+
+The run showed a red ❌ but **the publish succeeded and the artifact carries
+provenance.** Evidence from that run's log:
+
+```
+npm notice publish Signed provenance statement with source and build information from GitHub Actions
+npm notice publish Provenance statement published to transparency log: https://search.sigstore.dev/?logIndex=2291390085
++ klypix-mcp@1.44.0
+```
+
+`npm view klypix-mcp version` → `1.44.0`. The gate job passed. Only the final
+**"Verify the published artifact carries provenance"** step failed.
+
+**Cause:** that step reads the package back from the registry ~2s after publish.
+Its retry loop breaks as soon as the response is non-empty — but before indexing
+completes npm can return a non-empty body that is *not the package*. It parses to
+`undefined@undefined`, the `.dist.attestations.provenance` lookup is undefined,
+and the step reports "NO provenance" on an artifact that has it.
+
+**Fix (not yet applied — an attempt broke the YAML and was reverted):** the retry
+guard must require a *parsable `.name`* before accepting the response, not merely
+a non-empty body, and must fall through to the existing warn-and-exit-0 path when
+the registry never indexes in time. Edit it carefully — the step is a multi-line
+`run:` block and a naive string replacement corrupts the block mapping.
+
+**Until it is fixed:** a red X on this step alone does **not** mean the publish
+failed. Check the publish step's own log for `+ <name>@<version>` and the sigstore
+line before reacting. Every other gate failure is real.

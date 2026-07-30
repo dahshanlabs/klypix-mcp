@@ -34,6 +34,11 @@ const PKG_ROOT = path.resolve(__dirname, '..');
 const SRC = path.join(PKG_ROOT, 'src');
 const BIN = path.join(PKG_ROOT, 'bin');
 const VERSION = (() => { try { return JSON.parse(fs.readFileSync(path.join(PKG_ROOT, 'package.json'), 'utf8')).version || ''; } catch { return ''; } })();
+// ARGV: flag lookup is position-independent, so this file is correct for both
+// `klypix-install --force` and `klypix-mcp install --force` (the dispatcher splices
+// its verb out before importing — see bin/klypix-worker.mjs runVerb). It takes no
+// positional argument; if one is ever added, read process.argv.slice(2) so both
+// invocation shapes stay identical (locked by test/cli-args.mjs).
 const FORCE = process.argv.includes('--force');
 const CODEX_HOOKS = process.argv.includes('--codex-hooks');
 const RUNTIME_ONLY = process.argv.includes('--runtime-only');

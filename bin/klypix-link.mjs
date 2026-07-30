@@ -16,11 +16,24 @@
 //
 // Synchronous top-level by design: the dispatcher does `await import(this); process.exit(0)`,
 // so all work (and its logs) must complete during module evaluation, before exit.
+import fs from 'fs';
 import path from 'path';
 import { compactAgentsBrief, linkProject } from '../src/agent-rules.mjs';
 
+// ARGV: this file is BOTH `klypix-link` (its own published bin) and the target of
+// `klypix-mcp link` (the dispatcher splices its verb out of process.argv before
+// importing us — see bin/klypix-worker.mjs runVerb). slice(2) is therefore the ONE
+// correct shape for both. It used to be slice(3), which is right only via the
+// dispatcher: as a standalone bin `klypix-link --check` silently dropped --check
+// and WROTE all 14 managed files with exit 0, and `klypix-link <dir>` wrote into
+// the cwd instead of <dir>. The strip below is belt-and-braces for a dispatcher
+// that did not splice, and it refuses to eat a project folder actually named
+// ./link.
+const isDir = (p) => { try { return fs.statSync(p).isDirectory(); } catch { return false; } };
+
 try {
-  const args = process.argv.slice(3);
+  const raw = process.argv.slice(2);
+  const args = (raw[0] === 'link' && !isDir(path.resolve(raw[0]))) ? raw.slice(1) : raw;
   const check = args.includes('--check');
   const dirArg = args.find(a => !a.startsWith('-'));
   const projectDir = path.resolve(dirArg || process.cwd());
@@ -56,6 +69,20 @@ try {
   }
 
   const changed = [...rules, ...mcp, compactBrief].filter(r => r.action && !['unchanged', 'skipped'].includes(r.action)).length;
+  // A SKIPPED target is not wired (invalid MCP JSON left untouched, or a Codex
+  // TOML write that failed). Write mode used to filter those out of the count,
+  // print the blanket "every agent … now reads + captures" line anyway, and exit
+  // 0 — while `--check` on the same project correctly reported drift and exited 1.
+  // Report the truth and fail, so the two modes agree.
+  const skipped = [...rules, ...mcp].filter(r => r.action === 'skipped');
+  const managed = rules.length + mcp.length;
+  if (skipped.length) {
+    console.log(`\n✗ ${skipped.length} target(s) could not be wired:`);
+    for (const r of skipped) console.log(`    ⚠ ${r.tool.padEnd(26)} ${r.file}${r.why ? ' — ' + r.why : ''}`);
+    console.log(`\n  wired ${managed - skipped.length} of ${managed} managed file(s) (${changed} written/updated this run).`);
+    console.log('  Fix the file(s) above (or move them aside) and re-run `npx klypix-mcp link`.');
+    process.exit(1);
+  }
   console.log(`\n✓ ${changed} file(s) written/updated — every agent opened in this project now reads + captures ./brain.klypix.`);
   console.log('  Codex, Cline, Gemini/Antigravity, Cursor, and VS Code get project MCP configs; Windsurf uses its global MCP plus project rules.');
   console.log('  Verify anytime with `npx klypix-mcp link --check` (or `npx klypix-mcp doctor`).');

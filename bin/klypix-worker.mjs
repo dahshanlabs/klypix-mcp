@@ -45,28 +45,62 @@ const PKG_VERSION = (() => { try { return createRequire(import.meta.url)('../pac
 // IMPORTANT: stdout is the JSON-RPC channel. Never console.log — only stderr.
 const log = (...a) => console.error('[klypix-mcp]', ...a);
 
+// ── ARGV NORMALIZATION — the ONE place the dispatcher prefix is handled ───────
+// Every verb below is ALSO published as its own bin (package.json bin.klypix-link
+// / klypix-doctor / klypix-install / klypix-conformance), so each of those files
+// would otherwise have to satisfy TWO argv shapes:
+//   dispatcher: [node, klypix-mcp.mjs, 'link', '--check']
+//   standalone: [node, klypix-link.mjs, '--check']
+// Instead of making every sub-bin guess, the dispatcher REMOVES its own verb token
+// before handing over, so a sub-bin can unconditionally parse process.argv.slice(2)
+// and both shapes are byte-identical.
+//
+// This closes a silent P0: klypix-link.mjs parsed slice(3), which is correct only
+// via the dispatcher. Run as its own bin, `klypix-link --check` DROPPED --check,
+// wrote all 14 managed project files and exited 0 — so a CI drift gate wired to
+// `npx -p klypix-mcp klypix-link --check` rewrote the working tree and passed
+// unconditionally, and `klypix-link <dir>` wrote into the cwd instead of <dir>.
+// Regression-locked by test/cli-args.mjs (parity: bin vs dispatcher).
+const runVerb = async (verb, moduleId) => {
+  if (process.argv[2] !== verb) return;
+  process.argv.splice(2, 1);          // sub-bins see the STANDALONE shape, always
+  try {
+    await import(moduleId);
+  } catch (error) {
+    // The flattened ~/.claude/project-brain bundle stages this worker but not the
+    // link/doctor/install bins, so the import used to die with a raw
+    // ERR_MODULE_NOT_FOUND stack. Say what is actually wrong instead.
+    const missing = error?.code === 'ERR_MODULE_NOT_FOUND'
+      && String(error?.message || '').includes(moduleId.replace('./', ''));
+    if (!missing) throw error;
+    console.error(`klypix: \`${verb}\` is not available in this installed bundle — run \`npx klypix-mcp ${verb}\` from the npm package instead.`);
+    process.exit(2);
+  }
+  process.exit(0);
+};
+
 // `npx klypix-mcp install` — lay the WHOLE brain (hook + engine + local servers)
 // into ~/.claude/project-brain and wire the Claude Code hooks. This is the single
 // agent-neutral installer, so a brain release reaches every machine via one npm
 // publish + this command (the global brain serves every project). Runs before any
 // server setup; delegates to the dedicated bin so `npx klypix-install` also works.
-if (process.argv[2] === 'install') { await import('./klypix-install.mjs'); process.exit(0); }
+await runVerb('install', './klypix-install.mjs');
 
 // `npx klypix-mcp link` — make THIS project's brain automatic for EVERY agent tool,
 // not just Claude Code: drop each tool's native MCP config + rules file (Cursor, Cline,
 // Windsurf, Copilot/VS Code, AGENTS.md) so any agent opened here reads + captures the
 // brain on its own. Project-scoped (cwd); idempotent. Runs before any server setup.
-if (process.argv[2] === 'link') { await import('./klypix-link.mjs'); process.exit(0); }
+await runVerb('link', './klypix-link.mjs');
 
 // `npx klypix-mcp doctor` — the brain's READ-ONLY self-check: is this machine's brain
 // current, are the 4 hooks wired, what verbs does it expose, who's live, is the harness
 // projection in sync? One verdict, one reconcile block. Exits 1 on drift (CI gate).
-if (process.argv[2] === 'doctor') { await import('./klypix-doctor.mjs'); process.exit(0); }
+await runVerb('doctor', './klypix-doctor.mjs');
 
 // `npx klypix-mcp conformance` — launch two real, isolated MCP clients against
 // this exact installed server and verify task memory, truthful peers, blocking
 // overlap detection, proactive logging, and guaranteed next-action delivery.
-if (process.argv[2] === 'conformance') { await import('./klypix-conformance.mjs'); process.exit(0); }
+await runVerb('conformance', './klypix-conformance.mjs');
 
 // `npx klypix-mcp garden-code` — the HUMAN half of the garden approval gate.
 // brain_garden's apply requires an 8-char code derived from the exact dormant
@@ -155,7 +189,7 @@ server.registerTool('list_canvases', {
 
 server.registerTool('read_canvas', {
   title: 'Read a KLYPIX canvas',
-  description: 'Read a canvas as structured markdown (every card, the connection graph, [[wikilinks]], #tags) AND return its images so you can SEE them, not just their filenames. Pass the canvas TITLE directly (e.g. "SS2") — a filename, vault-relative path, or absolute path also work; you do NOT need to list or search first.',
+  description: 'Read a canvas as structured markdown (every card, the connection graph, [[wikilinks]], #tags) AND attach its image assets so you can SEE them, not just their filenames (capped: the first 8 images under ~5MB each — a bigger canvas returns the rest as filenames only). Pass the canvas TITLE directly (e.g. "SS2") — a filename, vault-relative path, or absolute path also work; you do NOT need to list or search first.',
   inputSchema: { canvas: z.string().describe('Canvas title or filename (e.g. "SS2"), vault-relative path, or absolute path.') },
 }, async ({ canvas }) => toContent(await opReadCanvas({ vault: mcpPresence.vault, canvas })));
 
@@ -167,7 +201,7 @@ server.registerTool('search_canvases', {
 
 server.registerTool('search_all_brains', {
   title: 'Search every project brain on this machine',
-  description: 'Cross-project memory search: looks through every brain.klypix this machine has worked with (auto-registered by the brain hook), not just the current vault. Semantic (on-device) + lexical hybrid ranking. Use when the answer may live in ANOTHER project\'s decisions. Optional as_of (YYYY-MM-DD) answers "what was true then" — superseded cards count as live if they were current at that date.',
+  description: 'Cross-project memory search: looks through every brain.klypix this machine has REGISTERED, not just the current vault. Ranking is lexical, blended with on-device semantic similarity ONLY when the optional local model is installed (a fresh `npx klypix-mcp install` is lexical) — it degrades cleanly, never errors. Use when the answer may live in ANOTHER project\'s decisions. Optional as_of (YYYY-MM-DD) answers "what was true then" — superseded cards count as live if they were current at that date. LIMIT: the cross-project registry is written by the Claude Code lifecycle hook and by nothing else, so on a Codex-only or Cursor-only machine this returns an empty result — that is a missing registry, not "no match".',
   inputSchema: {
     query: z.string().describe('What to find across all project brains.'),
     as_of: z.string().optional().describe('Optional YYYY-MM-DD: rank what was TRUE at that date (time-travel query).'),
@@ -176,7 +210,7 @@ server.registerTool('search_all_brains', {
 
 server.registerTool('brain_ask', {
   title: 'Ask the project brain a question (whole-brain, correction-aware answer)',
-  description: 'Answer a natural-language question from the WHOLE project brain — "what did we decide about X?", "where did the auth work land?", "why did we drop Y?". Ranks every card (semantic on-device + lexical hybrid), INCLUDES superseded/archived history (flagged, so you can see how a decision changed), and attaches each stale card\'s live CORRECTION so the answer reflects the current truth, not an outdated card. Returns a synthesis-ready context (full cards + provenance + lifecycle) for you to turn into a direct, cited answer — it does not itself write prose. Prefer this over search_canvases when the user asks a QUESTION (not a keyword lookup). Optional as_of (YYYY-MM-DD) answers "what was true then". Defaults to the project brain ("brain").',
+  description: 'Answer a natural-language question from the WHOLE project brain — "what did we decide about X?", "where did the auth work land?", "why did we drop Y?". Ranks every card lexically, blended with on-device semantic similarity ONLY when the optional local model is installed (a fresh install is lexical; it degrades cleanly). INCLUDES superseded/archived history (flagged, so you can see how a decision changed), and attaches each stale card\'s live CORRECTION so the answer reflects the current truth, not an outdated card. Returns a synthesis-ready context (full cards + provenance + lifecycle) for you to turn into a direct, cited answer — it does not itself write prose. Prefer this over search_canvases when the user asks a QUESTION (not a keyword lookup). Optional as_of (YYYY-MM-DD) answers "what was true then". Defaults to the project brain ("brain").',
   inputSchema: {
     question: z.string().describe('The natural-language question to answer from the brain.'),
     canvas: z.string().optional().describe('Brain canvas filename/path. Defaults to the project brain ("brain").'),
@@ -244,7 +278,7 @@ server.registerTool('brain_reconcile', {
 
 server.registerTool('brain_garden', {
   title: 'Garden the brain — consolidate over-grown areas (sleep-time compute)',
-  description: 'Tidy an over-grown brain WITHOUT losing anything — SMART and non-invasive: it only consolidates DORMANT cards (old + peripheral), never load-bearing ones. Two phases: call it with no apply to get the areas that have accumulated forgotten cards (deterministic: >3 cards that are older than 14 days, beyond the area\'s newest 8, AND have ≤1 connection — so hubs and still-referenced decisions are left untouched; Focus/Instructions/Archive/Open-questions areas protected) plus their card text; YOU write one tight synthesis per area; then call again with apply:true and syntheses:[{title, synthesis}]. Each area gets a 🌿 synthesis card, the originals are stamped "⤵ consolidated", moved to Archive, and arrowed to the synthesis — nothing is deleted, and one undo un-gardens. Run it when brain_insights or the brief shows an area has grown noisy.',
+  description: 'Tidy an over-grown brain WITHOUT losing anything — SMART and non-invasive: it only consolidates DORMANT cards (old + peripheral), never load-bearing ones. Two phases: call it with no apply to get the areas that have accumulated forgotten cards (deterministic: >3 cards that are older than 14 days, beyond the area\'s newest 8, AND have ≤1 connection — so hubs and still-referenced decisions are left untouched; Focus/Instructions/Archive/Open-questions areas protected) plus their card text; YOU write one tight synthesis per area; then call again with apply:true, syntheses:[{title, synthesis}] AND the human\'s 8-char `approve` code (apply is REFUSED without it — you are never shown the code; the human generates it with `npx klypix-mcp garden-code` after reviewing your plan). Each area gets a 🌿 synthesis card, the originals are stamped "⤵ consolidated", moved to Archive, and arrowed to the synthesis — nothing is deleted, and one undo un-gardens. Run it when brain_insights or the brief shows an area has grown noisy.',
   inputSchema: {
     canvas: z.string().optional().describe('Brain canvas filename/path. Defaults to the project brain ("brain").'),
     apply: z.boolean().optional().describe('false (default) = list over-grown areas + cards to synthesize; true = consolidate using the supplied syntheses.'),
@@ -299,7 +333,7 @@ server.registerTool('brain_note', {
 
 server.registerTool('brain_message', {
   title: 'Message the other live agent sessions on this project (one-time note, not a brain card)',
-  description: 'Leave a DELIBERATE, targeted note for the OTHER active agent sessions working on this project right now ("merged the hook refactor — rebase before you commit", "don\'t touch canvasStore, mid-refactor"). Any MCP client can send and receive through the shared presence lane. Hookless MCP peers receive each note once on their next KLYPIX tool call (and may also see a host logging notification); lifecycle hooks provide more proactive delivery. Ephemeral (expires in 24h) and NOT persisted to the brain — for a durable decision use brain_note instead.',
+  description: 'Leave a DELIBERATE, targeted note for the OTHER active agent sessions working on this project right now ("merged the hook refactor — rebase before you commit", "don\'t touch canvasStore, mid-refactor"). Any MCP client can send and receive through the shared presence lane. Hookless MCP peers receive each note once on their next KLYPIX tool call (and may also see a host logging notification); lifecycle hooks provide more proactive delivery. Delivery is BEST-EFFORT, not guaranteed: the lane is machine-local and OS-user-local (a teammate on another machine never sees it) and a peer that takes no KLYPIX action within the 24h TTL misses the note entirely — so never tell the user a note was received. Ephemeral (expires in 24h) and NOT persisted to the brain — for a durable decision use brain_note instead.',
   inputSchema: {
     text: z.string().describe('The note to deliver (kept to 400 chars).'),
     to: z.string().optional().describe('Target hint — a peer session id-prefix or branch name; omit or "all" for every live session.'),
@@ -313,7 +347,7 @@ server.registerTool('brain_message', {
 
 server.registerTool('brain_sync', {
   title: 'KLYPIX Context Gateway — synchronize task, peers, conflicts, and relevant memory',
-  description: 'APPROVAL-FREE task gateway over the authorized MCP connection. Call FIRST with a concise intent and expected files, again when scope changes, and with phase:"complete" before the final response. One bounded response returns compact task-relevant brain context, active TASK peers (idle connections hidden), one-time messages, structured exact-file conflicts, and automatic late-arrival overlap alerts. Portable across Codex/Antigravity and every MCP host; native hooks are optional.',
+  description: 'APPROVAL-FREE task gateway over the authorized MCP connection. Call FIRST with a concise intent and expected files, again when scope changes, and with phase:"complete" before the final response. One bounded response returns compact task-relevant brain context, active TASK peers (idle connections hidden), one-time messages, structured exact-file conflicts, and late-arrival overlap alerts. Works on any MCP host — it needs only the authorized MCP connection, so native lifecycle hooks are optional. LIMITS: conflict matching is EXACT-PATH and both sessions must have declared their files, coordination is machine-local and OS-user-local (a teammate on another machine is invisible), and overlap is ADVISORY — nothing is blocked.',
   annotations: {
     destructiveHint: false,
     idempotentHint: true,
@@ -394,7 +428,7 @@ server.registerTool('brain_sync', {
 
 server.registerTool('brain_doctor', {
   title: 'Brain doctor — is this brain current, wired, and in sync?',
-  description: 'Read-only self-check of the installed klypix brain, as ONE verdict: VERSION (deployed brain-core + optional npm currency), CLAUDE (existing 4-hook capture readiness), CODEX (automatic MCP presence plus optional enhanced-hook status), TOOLS (discoverable MCP verbs), SESSIONS (all active presence-adapter sessions across hosts, never recent-chat history), and HARNESS (projection drift). Use to answer "is my brain current, correctly installed, in sync, and who is actually live?" without file-spelunking. Never writes. The MCP-callable twin of `npx klypix-mcp doctor`.',
+  description: 'Read-only self-check of the installed klypix brain, as ONE verdict: VERSION (deployed brain-core + optional npm currency), CLAUDE (existing 4-hook capture readiness), CODEX (automatic MCP presence plus optional enhanced-hook status), TOOLS (discoverable MCP verbs), SESSIONS (all active presence-adapter sessions across hosts, never recent-chat history), and HARNESS (projection drift). Use to answer "is my brain current, correctly installed, in sync, and who is actually live?" without file-spelunking. Never writes. SCOPE: only CLAUDE and CODEX get behavioural verdicts. HARNESS classifies the projected config/rules FILES on disk — a project can read fully ok while no other host has ever actually loaded them, so do not report a clean HARNESS as "Cursor/Cline/Windsurf/Copilot is working". The MCP-callable twin of `npx klypix-mcp doctor`.',
   inputSchema: {
     project: z.string().optional().describe('Project dir to audit harness + peers for. Defaults to the server\'s working directory.'),
     check_npm: z.boolean().optional().describe('Also fetch npm latest to flag a stale brain (default false — this one does a network `npm view`).'),
@@ -493,7 +527,7 @@ function recordRunningServer({ remove = false } = {}) {
 // deps from a hardcoded queue (bin/klypix-install.mjs), so a missing module must
 // cost exactly this one tool's UI, never the server. The whole App registration
 // is try/caught (import, HTML load, register) and degrades to a plain text tool.
-const CANVAS_VIEW_DESC = 'Render a KLYPIX canvas/brain as a SPATIAL BOARD. In an MCP Apps host (Claude, VS Code, Goose) this opens an interactive read-only whiteboard — cards, containers, connection arrows, pan/zoom — of any .klypix canvas (defaults to the project brain). In hosts without the apps extension it returns a text summary of the board. Use when the user asks to SEE the canvas/brain/board, not just query it.';
+const CANVAS_VIEW_DESC = 'Read any .klypix canvas/brain as a SPATIAL BOARD (defaults to the project brain): returns a text summary plus a structured render spec of cards, containers and connection arrows. It ALSO declares an MCP Apps (SEP-1865) UI resource, so a host with that extension can render the spec as an interactive read-only whiteboard — EXPERIMENTAL: no host has been observed rendering it, so do not promise the user a visual board. Hosts without the extension get the text summary, which is the verified path. Use when the user asks to SEE the canvas/brain/board layout, not just query it.';
 const canvasViewHandler = async ({ canvas }) => {
   const r = await opCanvasView({ vault: mcpPresence.vault, canvas });
   const c = toContent(r);

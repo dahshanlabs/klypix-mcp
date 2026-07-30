@@ -13,12 +13,21 @@
 //
 // Synchronous-ish top-level by design: the dispatcher does `await import(this);
 // process.exit(...)`, so all work completes during module evaluation.
+import fs from 'fs';
 import path from 'path';
 import { execSync } from 'child_process';
 import { inspect, render, inspectAll } from '../src/brain-doctor.mjs';
 
+// ARGV: same dual shape as klypix-link — this file is both `klypix-doctor` and the
+// target of `klypix-mcp doctor` (the dispatcher splices its verb out first, see
+// bin/klypix-worker.mjs runVerb). slice(2) is the one correct shape; the strip is
+// belt-and-braces for a dispatcher that did not splice, and refuses to eat a
+// directory actually named ./doctor.
+const isDir = (p) => { try { return fs.statSync(p).isDirectory(); } catch { return false; } };
+
 try {
-  const argv = process.argv.slice(2);
+  const raw = process.argv.slice(2);
+  const argv = (raw[0] === 'doctor' && !isDir(path.resolve(raw[0]))) ? raw.slice(1) : raw;
   const has = (f) => argv.includes(f);
   const val = (f) => { const i = argv.indexOf(f); return i >= 0 ? argv[i + 1] : undefined; };
   const color = !has('--no-color') && process.stdout.isTTY !== false;

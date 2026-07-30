@@ -17,6 +17,10 @@ import { LoggingMessageNotificationSchema } from '@modelcontextprotocol/sdk/type
 import { buildKlypixMap } from '../src/klypix-core.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
+// ARGV: flag lookup is position-independent, so this file is already correct for
+// both `klypix-conformance --json` and `klypix-mcp conformance --json` (the
+// dispatcher splices its verb out — see bin/klypix-worker.mjs runVerb). Kept as
+// `includes` deliberately; test/cli-args.mjs asserts the two forms stay identical.
 const jsonMode = process.argv.includes('--json');
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const PKG_VERSION = (() => {

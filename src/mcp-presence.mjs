@@ -42,26 +42,74 @@ export const KLYPIX_MCP_INSTRUCTIONS = [
 
 const compact = (value) => String(value || '').replace(/\s+/g, ' ').trim();
 
-const normalizeFileKey = (value) => String(value || '')
-  .replace(/\\/g, '/')
-  .replace(/^\.\//, '')
-  .trim()
-  .toLowerCase();
+// File-key normalization. `root` (optional) is the project root the two rows share
+// — passing it folds an ABSOLUTE declaration and a REPO-RELATIVE one onto the same
+// key. Without it, one session declaring "E:/repo/src/App.tsx" and another
+// declaring "src/App.tsx" never matched, so the overlap warning silently never
+// fired for the commonest mixed pair (2026-07-30 hardening). Defensive by design:
+// a path that cannot be placed under `root` keeps the previous (absolute,
+// lowercased) key, so an unrelated file still compares as itself and a
+// declaration is never dropped.
+const normalizeFileKey = (value, root) => {
+  const raw = String(value || '')
+    .replace(/\\/g, '/')
+    .replace(/^\.\//, '')
+    .trim()
+    .toLowerCase();
+  if (!raw || !root) return raw;
+  const rootKey = String(root)
+    .replace(/\\/g, '/')
+    .replace(/\/+$/, '')
+    .trim()
+    .toLowerCase();
+  if (!rootKey || raw === rootKey) return raw;
+  return raw.startsWith(`${rootKey}/`) ? raw.slice(rootKey.length + 1) : raw;
+};
 
 // TWIN recognition: one logical session can (still) appear as two lane rows —
 // its lifecycle id and an mcp-<pid> id — whenever id adoption failed. Rows that
 // share a hostPid belong to ONE host process; treating the twin as a peer would
 // raise a "blocking" file conflict against the session itself and queue it an
 // overlap alert. Suppression is explicit (suspectedTwin), never silent.
-export const isSuspectedTwin = (peer, me) =>
-  Boolean(peer && me && peer.hostPid && me.hostPid && peer.hostPid === me.hostPid);
+//
+// hostPid ALONE is not identity (2026-07-30 hardening). A pid number is only
+// unique per machine and per moment: a lane read from a synced/shared home, or a
+// recycled pid whose previous host died inside the 10-minute freshness window,
+// made two UNRELATED sessions suppress each other's overlap warnings — and a
+// MISSING warning is invisible, so nothing surfaced the mistake. Two extra
+// discriminators are required, both drawn from fields the lane row already
+// carries (see agent-presence.mjs upsertSession):
+//   machine — must match when BOTH rows carry it. Absent on rows written by an
+//             older build or by the lifecycle hook, so absence must not un-suppress
+//             a genuine twin; it degrades to the previous behaviour.
+//   client  — must match when BOTH are specifically known. 'mcp'/'unknown' are
+//             placeholders (getClientVersion() is optional), so a generic value on
+//             either side stays compatible. This is what separates a codex row from
+//             a claude-code row that collided on one pid.
+const sameMachine = (a, b) => !a.machine || !b.machine || String(a.machine) === String(b.machine);
+const genericClient = (value) => !value || value === 'mcp' || value === 'unknown';
+const compatibleClient = (a, b) => {
+  const x = String(a.client || '').toLowerCase();
+  const y = String(b.client || '').toLowerCase();
+  return genericClient(x) || genericClient(y) || x === y;
+};
+export const isSuspectedTwin = (peer, me) => Boolean(
+  peer && me
+  && peer.hostPid && me.hostPid && peer.hostPid === me.hostPid
+  && sameMachine(peer, me)
+  && compatibleClient(peer, me),
+);
 
-export function findPresenceConflicts(sessions, selfId) {
+export function findPresenceConflicts(sessions, selfId, { projectRoot } = {}) {
   const active = Array.isArray(sessions) ? sessions : [];
   const me = active.find((session) => session.id === selfId);
   if (!me) return [];
+  // The lane is per-brain, so every row in it shares one project root; this
+  // session's own cwd is that root (mcp-presence sets it to dirname(brain.klypix),
+  // and brain_sync's explicit `project` flows into it).
+  const root = projectRoot || me.cwd || null;
   const mine = new Map((me.files || [])
-    .map((file) => [normalizeFileKey(file), String(file || '').replace(/\\/g, '/')])
+    .map((file) => [normalizeFileKey(file, root), String(file || '').replace(/\\/g, '/')])
     .filter(([key]) => key));
   if (!mine.size) return [];
   const conflicts = [];
@@ -69,7 +117,7 @@ export function findPresenceConflicts(sessions, selfId) {
     if (peer.id === selfId) continue;
     if (isSuspectedTwin(peer, me)) continue;   // own twin row — a session cannot conflict with itself
     const overlap = [...new Set((peer.files || [])
-      .map(normalizeFileKey)
+      .map((file) => normalizeFileKey(file, root))
       .filter((file) => mine.has(file))
       .map((file) => mine.get(file)))];
     if (!overlap.length) continue;
@@ -343,7 +391,7 @@ export function createMcpPresence({
     files,
     replaceFiles = false,
   } = {}) => {
-    if (!brainPath) return { sessions: [], messages: [], notice: '' };
+    if (!brainPath) return { sessions: [], messages: [], notice: '', laneWriteOk: null, laneWriteSkippedReason: 'no-lane' };
     const stamp = now();
     adoptHostSession(stamp);
     const { client, surface } = clientInfo();
@@ -386,7 +434,18 @@ export function createMcpPresence({
       formatReceivedMessages(messages, stamp, decay),
     ].filter(Boolean).join('\n\n');
     if (notice) sendNotice(notice);
-    return { sessions, messages, notice };
+    // Additive, non-breaking: surface whether this touch's lane write actually
+    // landed (agent-presence.mjs withWriteVerdict). A lock timeout returns a
+    // read-only peer snapshot that does NOT include this heartbeat, and that used
+    // to be indistinguishable from a successful write. null = unknown (an older
+    // bundled agent-presence.mjs that does not stamp the verdict).
+    return {
+      sessions,
+      messages,
+      notice,
+      laneWriteOk: sessions?.laneWriteOk ?? null,
+      laneWriteSkippedReason: sessions?.laneWriteSkippedReason ?? null,
+    };
   };
 
   const stop = () => {
@@ -485,7 +544,10 @@ export function createMcpPresence({
     const alertsQueued = [];
     if (!completing) {
       for (const peer of conflicts) {
-        const filesKey = peer.files.map(normalizeFileKey).sort().join('|');
+        // Explicit arrow: normalizeFileKey now takes an optional `root` second
+        // argument, so a bare `.map(normalizeFileKey)` would hand it the array
+        // INDEX as the project root.
+        const filesKey = peer.files.map((file) => normalizeFileKey(file)).sort().join('|');
         const key = `${peer.id}|${filesKey}`;
         if (notifiedConflicts.has(key)) continue;
         notifiedConflicts.add(key);

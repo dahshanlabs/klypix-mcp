@@ -24,6 +24,33 @@ const sleepSync = (ms) => {
   catch { /* best effort */ }
 };
 
+// Machine identity for a lane row. A host PID is unique only per machine and per
+// moment, so twin recognition (mcp-presence.mjs isSuspectedTwin) cannot rest on
+// pid alone — see the comment there. There was no machine identifier anywhere in
+// this codebase, so one is introduced here, in the single place lane rows are
+// written. ADDITIVE: rows written by an older build (or by the Claude Code
+// lifecycle hook, which has its own writer) simply carry no `machine`, and every
+// reader must treat that as "unknown", never as "different".
+export const MACHINE_ID = (() => {
+  try { return sha16(`${os.hostname()}|${os.platform()}|${os.userInfo().username}`); }
+  catch { return sha16(`${os.hostname?.() || 'unknown'}|${os.platform?.() || 'unknown'}`); }
+})();
+
+// A lane write can legitimately FAIL: the lock is held and we give up rather than
+// clobber a peer's just-posted message. That path returned listActiveSessions(),
+// i.e. the exact same shape as a success — so a dropped heartbeat was
+// indistinguishable from a written one and no caller could report it. The verdict
+// now rides on the returned array as NON-ENUMERABLE own properties: the type stays
+// Array, so every existing consumer (.find / .map / spread / JSON.stringify) is
+// byte-for-byte unaffected, while a caller that cares can check `laneWriteOk`.
+const withWriteVerdict = (sessions, ok, reason = null) => {
+  try {
+    Object.defineProperty(sessions, 'laneWriteOk', { value: ok, enumerable: false, configurable: true });
+    Object.defineProperty(sessions, 'laneWriteSkippedReason', { value: reason, enumerable: false, configurable: true });
+  } catch { /* frozen/exotic array — the verdict is best-effort, never a throw */ }
+  return sessions;
+};
+
 export function findProjectBrain(cwd = process.cwd()) {
   let dir = path.resolve(cwd);
   for (;;) {
@@ -173,11 +200,14 @@ export function upsertSession({
   home,
   now = Date.now(),
 }) {
-  if (!brainPath || !id) return [];
+  if (!brainPath || !id) return withWriteVerdict([], false, 'no-brain-or-id');
   const laneFile = laneFileFor(brainPath, home);
   const lockFile = laneFile + '.lock';
   const gotLock = acquireLock(lockFile);
-  if (!gotLock) return listActiveSessions({ brainPath, home, now });
+  // Lock timeout → read-only fallback, and SAY SO (see withWriteVerdict): this
+  // session's heartbeat did NOT land, so the list is a peer snapshot that does not
+  // include this touch.
+  if (!gotLock) return withWriteVerdict(listActiveSessions({ brainPath, home, now }), false, 'lane-locked');
   try {
     const data = readLane(laneFile);
     const sessions = pruneSessions(data.sessions, now);
@@ -216,8 +246,11 @@ export function upsertSession({
       cwd: cwd ? path.resolve(cwd) : (previous.cwd || path.dirname(brainPath)),
       // Host-process correlation (e.g. Claude Code exports CLAUDE_PID to every
       // child): lets readers recognize one logical session's lifecycle row and
-      // MCP row as TWINS instead of two independent peers.
+      // MCP row as TWINS instead of two independent peers. `machine` scopes that
+      // pid — a pid number is unique only per machine and per moment, so twin
+      // recognition needs both (mcp-presence.mjs isSuspectedTwin).
       hostPid: Number(hostPid) || previous.hostPid || null,
+      machine: MACHINE_ID,
       startedAt: previous.startedAt || now,
       lastSeen: now,
     };
@@ -229,7 +262,7 @@ export function upsertSession({
       sessions: kept.slice(-40),
       messages: capMessages(pruneMessages(data.messages, now), 30),
     }));
-    return kept.sort((a, b) => Number(b.lastSeen || 0) - Number(a.lastSeen || 0));
+    return withWriteVerdict(kept.sort((a, b) => Number(b.lastSeen || 0) - Number(a.lastSeen || 0)), true);
   } finally {
     if (gotLock) releaseLock(lockFile);
   }

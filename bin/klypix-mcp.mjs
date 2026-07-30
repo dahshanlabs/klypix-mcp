@@ -20,7 +20,38 @@ const PKG_VERSION = (() => {
 })();
 
 const DIRECT = new Set(['install', 'link', 'doctor', 'conformance', 'garden-code', 'init']);
-if (DIRECT.has(process.argv[2])) {
+
+const USAGE = [
+  `klypix-mcp ${PKG_VERSION} — shared project brain + MCP coordination server.`,
+  '',
+  'Verbs:',
+  '  install [--force] [--codex-hooks]   install/update this machine\'s brain engine + Claude Code hooks',
+  '  link [dir] [--check]                project this project\'s 14 managed agent config files (--check audits, writes nothing, exits 1 on drift)',
+  '  doctor [--npm] [--all] [--json]     read-only self-check; exits 1 on drift',
+  '  conformance [--json]                launch two real MCP clients against this build',
+  '  init                                seed a starter ./brain.klypix + print an MCP config',
+  '  garden-code [brain]                 print the human approval code for brain_garden',
+  '',
+  'With no verb (or any --flag, e.g. --vault <dir>) it runs as an MCP stdio server.',
+  'There is no uninstall command — removal is manual (see README).',
+].join('\n');
+
+const verb = process.argv[2];
+if (verb === '--help' || verb === '-h' || verb === 'help') {
+  console.log(USAGE);
+  process.exit(0);
+}
+// A bare unknown WORD used to fall through to the stdio server, which then sat
+// waiting on a stdin that no host was driving — so `npx klypix-mcp uninstall`
+// (or any typo) printed nothing and exited 0, indistinguishable from success.
+// Only non-dash tokens are rejected: a real host launch is `--vault <dir>`,
+// and the local-bundle launch form puts '--vault' at argv[2] too.
+if (verb && !verb.startsWith('-') && !DIRECT.has(verb)) {
+  console.error(`klypix-mcp: unknown command "${verb}".\n\n${USAGE}`);
+  process.exit(2);
+}
+
+if (DIRECT.has(verb)) {
   await import('./klypix-worker.mjs');
 } else {
   const { runMcpSupervisor } = await import('../src/mcp-supervisor.mjs');

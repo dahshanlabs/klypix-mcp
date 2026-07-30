@@ -11,21 +11,348 @@ name: Publish to npm
 #   - permissions id-token:write (mints the OIDC token) + contents:read
 #   - GitHub-hosted runner (self-hosted not supported)
 #   - Trusted Publisher configured on npm BEFORE the first run
+#
+# HARDENED 2026-07-30 — this workflow used to publish WITHOUT running anything.
+# It now FAILS CLOSED behind a `gate` job that must go green first. `publish`
+# declares `needs: gate`, so a red gate means npm never sees a tarball.
+# What the gate proves is documented in docs/RELEASE_CHECKLIST.md.
+#
+# TRIGGER SAFETY: `release: published` + `workflow_dispatch` only. There is NO
+# pull_request / pull_request_target trigger and there must never be one — a fork
+# PR must not be able to reach a job that can mint an npm OIDC token. Both jobs
+# additionally assert the event name at runtime, so adding a trigger without
+# reading this comment fails instead of publishing.
+#
+# PERMISSION SPLIT: the token-minting grant (`id-token: write`) lives ONLY on the
+# `publish` job. The gate runs the full test suite and installs the tarball — i.e.
+# it executes third-party code — and is deliberately given `contents: read` only,
+# so a compromised dependency in the test path cannot exchange an OIDC token for
+# npm publish rights.
 on:
   release:
     types: [published]
   workflow_dispatch:
 
 permissions:
-  id-token: write   # REQUIRED: lets GitHub Actions mint the OIDC token npm exchanges
-  contents: read    # checkout
+  contents: read
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
-  publish:
+  gate:
+    name: Release gate (tests · tarball contents · CLI smoke)
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read   # NO id-token here — see PERMISSION SPLIT above
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
+      - name: Assert the trigger is release-only
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          case "$EVENT_NAME" in
+            pull_request|pull_request_target|issue_comment|fork)
+              echo "::error::Refusing to run the publish pipeline from a '$EVENT_NAME' context."
+              exit 1
+              ;;
+            release|workflow_dispatch)
+              echo "trigger '$EVENT_NAME' — allowed"
+              ;;
+            *)
+              echo "::error::Unexpected trigger '$EVENT_NAME'. Publishing is release-only; add it here deliberately or not at all."
+              exit 1
+              ;;
+          esac
+
+      # fetch-depth 0 + tags: the version gate below verifies that a manual
+      # dispatch is standing on the tag it claims to be publishing.
+      - name: Checkout (clean, full history + tags)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      # Lockfile ENFORCED. `npm ci` fails if package.json and package-lock.json
+      # disagree — the whole point of gating on it rather than `npm install`.
+      # Optional deps are NOT omitted here (unlike the publish job, which needs
+      # no runtime deps at all): @huggingface/transformers being present is the
+      # HARDER case for test/semantic-gate.mjs, which exists to prove the hook
+      # never loads the embedding model from an ambient node_modules.
+      - name: Install (npm ci — lockfile enforced)
+        run: |
+          set -euo pipefail
+          npm --version
+          npm ci
+
+      # The gate is only as good as the chain it runs. These two files are the
+      # ones a future edit is most likely to drop: conformance is slow, and
+      # cli-args is new. Assert they are still wired before trusting `npm test`.
+      - name: Assert the test chain still contains the load-bearing suites
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("fs");
+            const script = JSON.parse(fs.readFileSync("package.json", "utf8")).scripts?.test || "";
+            const required = ["test/conformance.mjs", "test/cli-args.mjs"];
+            const missing = required.filter((f) => !script.includes(f));
+            if (!script.trim()) { console.error("::error::package.json has no test script — the gate would prove nothing."); process.exit(1); }
+            if (missing.length) {
+              console.error(`::error::The npm test chain no longer runs: ${missing.join(", ")}. Re-add them or move them to their own gate step deliberately.`);
+              process.exit(1);
+            }
+            console.log(`npm test chain: ${script.split("&&").length} suite(s), including ${required.join(" + ")}`);
+          '
+
+      # Full suite. The conformance suite runs INSIDE this chain
+      # (test/conformance.mjs spawns `klypix-mcp conformance --json` and asserts
+      # every published check), so it is not duplicated as a separate step; the
+      # step above guarantees it cannot silently leave the chain.
+      - name: npm test (full suite, conformance included)
+        run: npm test
+
+      - name: Version validation (the tag must match package.json)
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./package.json').version")"
+          NAME="$(node -p "require('./package.json').name")"
+          echo "package.json: $NAME@$VERSION"
+
+          TAG=""
+          if [ "$EVENT_NAME" = "release" ]; then
+            TAG="$RELEASE_TAG"
+          elif [ "$REF_TYPE" = "tag" ]; then
+            TAG="$REF_NAME"
+          fi
+
+          if [ -n "$TAG" ]; then
+            if [ "${TAG#v}" != "$VERSION" ]; then
+              echo "::error::Tag '$TAG' does not match package.json version '$VERSION'. Fix the version or re-tag; do not publish a mismatched pair."
+              exit 1
+            fi
+            echo "tag '$TAG' matches package.json version '$VERSION'"
+          else
+            # Manual dispatch from a branch: still require a real tag, pointing at
+            # exactly this commit, so a dispatch can never publish untagged code.
+            if ! git rev-parse -q --verify "refs/tags/v$VERSION^{commit}" >/dev/null; then
+              echo "::error::No tag 'v$VERSION' exists. A manual dispatch may only publish a tagged commit."
+              exit 1
+            fi
+            TAGGED_SHA="$(git rev-list -n 1 "v$VERSION")"
+            if [ "$TAGGED_SHA" != "$COMMIT_SHA" ]; then
+              echo "::error::Tag 'v$VERSION' points at $TAGGED_SHA but this run is on $COMMIT_SHA. Re-tag or dispatch from the tag."
+              exit 1
+            fi
+            echo "manual dispatch validated against tag 'v$VERSION' at $COMMIT_SHA"
+          fi
+
+          # Already on npm? Fail here with a readable message rather than deep in
+          # `npm publish`. A network error must NOT be read as "not published":
+          # only a definitive non-empty answer blocks.
+          PUBLISHED="$(npm view "$NAME@$VERSION" version 2>/dev/null || true)"
+          if [ -n "$PUBLISHED" ]; then
+            echo "::error::$NAME@$VERSION is already published on npm. Bump the version — npm versions are immutable."
+            exit 1
+          fi
+          echo "$NAME@$VERSION is not yet on npm"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Tarball contents (npm pack --dry-run + assertions)
+        env:
+          PACK_JSON: ${{ runner.temp }}/pack.json
+        run: |
+          set -euo pipefail
+          npm pack --dry-run --json > "$PACK_JSON"
+          node --input-type=module -e '
+            import fs from "fs";
+            const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            const pack = JSON.parse(fs.readFileSync(process.env.PACK_JSON, "utf8"));
+            const entry = Array.isArray(pack) ? pack[0] : pack;
+            const files = new Set((entry.files || []).map((f) => f.path.replace(/\\\\/g, "/")));
+            const problems = [];
+            const need = (p, why) => {
+              const rel = String(p).replace(/^\.\//, "");
+              if (!files.has(rel)) problems.push(`MISSING    ${rel}   — ${why}`);
+            };
+
+            // 1. Every published command must BE in the tarball, or `npm i -g`
+            //    creates a shim pointing at nothing.
+            for (const [name, rel] of Object.entries(pkg.bin || {})) need(rel, `package.json bin.${name}`);
+
+            // 2. Every import surface.
+            if (pkg.main) need(pkg.main, "package.json main");
+            for (const [key, value] of Object.entries(pkg.exports || {})) {
+              if (typeof value === "string") need(value, `package.json exports["${key}"]`);
+            }
+
+            // 3. Everything package.json PROMISES to ship: literal files must be
+            //    present (catches an .npmignore slip), declared directories must
+            //    be non-empty (catches a silently emptied directory).
+            for (const declared of pkg.files || []) {
+              const rel = String(declared).replace(/^\.\//, "").replace(/\/$/, "");
+              if (fs.existsSync(rel) && fs.statSync(rel).isDirectory()) {
+                if (![...files].some((f) => f.startsWith(`${rel}/`))) {
+                  problems.push(`EMPTY      ${rel}/   — declared in package.json "files" but no entry shipped`);
+                }
+              } else {
+                need(rel, "declared in package.json \"files\"");
+              }
+            }
+            for (const doc of ["README.md", "LICENSE", "NOTICE"]) need(doc, "documentation / licensing must ship");
+
+            // 4. THE REGRESSION GATE. The README tells users to open example
+            //    canvases at a literal node_modules/klypix-mcp/examples/... path.
+            //    Those files were EXCLUDED from the tarball until 2026-07-30, so
+            //    the documented command failed on a fresh install. Every example
+            //    path the README names must resolve inside the tarball.
+            const readme = fs.readFileSync("README.md", "utf8");
+            const exampleRefs = new Set();
+            for (const m of readme.matchAll(/(?:\]\(|node_modules\/klypix-mcp\/|["\x27`\s])(examples\/[A-Za-z0-9._\/-]+\.[A-Za-z0-9]+)/g)) exampleRefs.add(m[1]);
+            if (exampleRefs.size === 0) {
+              problems.push("VACUOUS    README.md references no examples/ path, so this assertion now checks nothing. Restore the references or remove this gate deliberately.");
+            }
+            for (const ref of exampleRefs) need(ref, "README.md tells users to open this exact path inside node_modules/klypix-mcp");
+
+            // 5. Things that must never be published.
+            for (const f of [...files].filter((p) => /^node_modules\//.test(p)
+              || /^\.git\//.test(p)
+              || /(^|\/)\.env($|\.)/.test(p)
+              || /\.klypix-bak$/.test(p)
+              || /(^|\/)\.impeccable\//.test(p))) {
+              problems.push(`FORBIDDEN  ${f}   — must never be published`);
+            }
+
+            console.log(`tarball: ${entry.name}@${entry.version} — ${files.size} entries, ${entry.size} B packed / ${entry.unpackedSize} B unpacked`);
+            console.log(`README example paths asserted: ${[...exampleRefs].join(", ") || "(none)"}`);
+            if (problems.length) {
+              console.error(`::error::Tarball contents gate failed with ${problems.length} problem(s)`);
+              for (const p of problems) console.error(`  ${p}`);
+              process.exit(1);
+            }
+            console.log("\ntarball contents gate: PASS");
+          '
+
+      # Everything above tests the WORKING TREE. This step tests what a user
+      # actually receives: pack it, install that tarball into a throwaway
+      # directory, and drive the installed binaries.
+      - name: CLI smoke test (install the packed tarball, run the bins)
+        env:
+          SMOKE_HOME: ${{ runner.temp }}/smoke-home
+        run: |
+          set -euo pipefail
+          TGZ_DIR="$RUNNER_TEMP/tgz"
+          SMOKE="$RUNNER_TEMP/smoke"
+          FIXTURE="$RUNNER_TEMP/fixture"
+          rm -rf "$TGZ_DIR" "$SMOKE" "$FIXTURE" "$SMOKE_HOME"
+          mkdir -p "$TGZ_DIR" "$SMOKE" "$FIXTURE" "$SMOKE_HOME"
+
+          TGZ_NAME="$(npm pack --silent --pack-destination "$TGZ_DIR" | tail -1)"
+          TGZ="$TGZ_DIR/$TGZ_NAME"
+          echo "packed: $TGZ ($(stat -c%s "$TGZ") bytes)"
+
+          cd "$SMOKE"
+          npm init -y > /dev/null
+          # --ignore-scripts: never run a dependency lifecycle script in the gate.
+          npm install --no-save --ignore-scripts --omit=optional "$TGZ"
+          BIN="$SMOKE/node_modules/.bin"
+
+          # A throwaway HOME so nothing here can touch a real ~/.claude.
+          export HOME="$SMOKE_HOME"
+          export KLYPIX_MCP_INSTALL_DIR="$SMOKE_HOME/bundle"
+          export KLYPIX_AUTO_UPDATE=0
+
+          echo "--- 1. the binary runs and reports its verbs ---"
+          HELP="$(timeout 60 "$BIN/klypix-mcp" --help)"
+          echo "$HELP"
+          grep -q '^Verbs:' <<< "$HELP"
+
+          echo "--- 2. link --check exits NON-ZERO on drift and creates ZERO files ---"
+          # This is the regression gate for the P0 fixed on 2026-07-30: the
+          # standalone bin used to DROP --check, write all 14 managed files and
+          # exit 0 — so a CI drift gate rewrote the tree and passed silently.
+          cd "$FIXTURE"
+          BEFORE="$(find . | LC_ALL=C sort | sha256sum)"
+          set +e
+          CHECK_OUT="$(timeout 60 "$BIN/klypix-link" --check 2>&1)"
+          CHECK_CODE=$?
+          set -e
+          AFTER="$(find . | LC_ALL=C sort | sha256sum)"
+          CREATED="$(find . -type f | wc -l)"
+          echo "$CHECK_OUT"
+          echo "exit=$CHECK_CODE  files_created=$CREATED"
+          if [ "$CHECK_CODE" -eq 0 ]; then
+            echo "::error::klypix-link --check exited 0 on a directory with 14 missing targets. It must exit non-zero on drift."
+            exit 1
+          fi
+          if [ "$CREATED" -ne 0 ] || [ "$BEFORE" != "$AFTER" ]; then
+            echo "::error::klypix-link --check MODIFIED the fixture ($CREATED file(s)). --check must never write. This is the P0 regression gate."
+            exit 1
+          fi
+          grep -q 'auditing the brain projection' <<< "$CHECK_OUT"
+          if grep -q 'file(s) written/updated' <<< "$CHECK_OUT"; then
+            echo "::error::klypix-link --check printed the WRITE banner."
+            exit 1
+          fi
+
+          echo "--- 3. dispatcher parity: klypix-mcp link --check behaves identically ---"
+          set +e
+          DISP_OUT="$(timeout 60 "$BIN/klypix-mcp" link --check 2>&1)"
+          DISP_CODE=$?
+          set -e
+          if [ "$DISP_CODE" -ne "$CHECK_CODE" ] || [ "$(find . -type f | wc -l)" -ne 0 ]; then
+            echo "::error::The dispatcher form disagrees with the standalone bin (exit $DISP_CODE vs $CHECK_CODE) or wrote files."
+            exit 1
+          fi
+
+          echo "--- 4. the README's documented example path resolves in the install ---"
+          cd "$SMOKE"
+          # Captured, not piped: `| head` under `pipefail` can fail the step on SIGPIPE.
+          READ_OUT="$(timeout 60 "$BIN/klypix-read" node_modules/klypix-mcp/examples/showcase-brain.klypix)"
+          printf '%s\n' "$READ_OUT" | head -3 || true
+          grep -q '## Cards' <<< "$READ_OUT"
+
+          echo "CLI smoke test: PASS"
+
+  publish:
+    name: Publish (OIDC trusted publishing)
+    needs: gate
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # REQUIRED: lets GitHub Actions mint the OIDC token npm exchanges
+      contents: read    # checkout
+    steps:
+      - name: Assert the trigger is release-only
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          case "$EVENT_NAME" in
+            release|workflow_dispatch) echo "trigger '$EVENT_NAME' — allowed" ;;
+            *) echo "::error::Refusing to publish from a '$EVENT_NAME' context."; exit 1 ;;
+          esac
+
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -44,11 +371,64 @@ jobs:
       # so skip the heavy optional ML dep (@huggingface/transformers) — keep a
       # deterministic core-tree check only. (--omit=optional avoids a flaky native
       # download that has zero bearing on the published tarball.)
+      # The GATE job already ran `npm ci` with the full lockfile and the whole
+      # test suite against this same commit.
       - name: Install (core deps only, deterministic)
         run: npm ci --omit=optional
+
+      # The gate proved this exact commit; re-assert that the artifact this job is
+      # about to push is the version the gate cleared, so a `needs:` that ever
+      # stops implying "same commit" cannot slip a different version through.
+      - name: Confirm the version the gate cleared
+        env:
+          GATE_VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./package.json').version")"
+          if [ "$VERSION" != "$GATE_VERSION" ]; then
+            echo "::error::This checkout is version $VERSION but the gate cleared $GATE_VERSION."
+            exit 1
+          fi
+          echo "publishing version $VERSION (gate-cleared)"
 
       # Tokenless: do NOT set NODE_AUTH_TOKEN / NPM_TOKEN. setup-node writes an
       # empty-token .npmrc line which npm >= 11.5.1 ignores under OIDC. Provenance
       # is generated AUTOMATICALLY (public repo + public package); no flag needed.
+      # VERIFIED on the registry: klypix-mcp@1.43.1 carries
+      # dist.attestations.provenance (predicateType slsa.dev/provenance/v1) and
+      # _npmUser "GitHub Actions <npm-oidc-no-reply@github.com>". Do NOT add
+      # `--provenance` — this path already produces it, and the step below fails
+      # the run if a future change ever silently drops it.
       - name: Publish (OIDC, auto-provenance)
         run: npm publish --access public
+
+      - name: Verify the published artifact carries provenance
+        env:
+          GATE_VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          NAME="$(node -p "require('./package.json').name")"
+          # The registry needs a moment to index a fresh publish.
+          for attempt in 1 2 3 4 5; do
+            META="$(npm view "$NAME@$GATE_VERSION" --json 2>/dev/null || true)"
+            if [ -n "$META" ]; then break; fi
+            echo "registry not indexed yet (attempt $attempt) — waiting"
+            sleep 10
+          done
+          if [ -z "$META" ]; then
+            echo "::warning::Could not read $NAME@$GATE_VERSION back from the registry to verify provenance. The publish itself succeeded; verify manually with 'npm view $NAME@$GATE_VERSION --json'."
+            exit 0
+          fi
+          printf '%s' "$META" | node -e '
+            let s = "";
+            process.stdin.on("data", (d) => { s += d; }).on("end", () => {
+              const meta = JSON.parse(s);
+              const prov = meta?.dist?.attestations?.provenance;
+              console.log(`published ${meta.name}@${meta.version} by ${meta._npmUser?.name || "unknown"}`);
+              if (!prov) {
+                console.error("::error::The published artifact has NO provenance attestation. The OIDC trusted-publishing path is broken — investigate before the next release.");
+                process.exit(1);
+              }
+              console.log(`provenance: ${prov.predicateType}`);
+            });
+          '

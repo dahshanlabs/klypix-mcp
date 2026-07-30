@@ -85,16 +85,28 @@ It verifies 7 coordination behaviours — not the 18 tools, and not the retrieva
 
 ## Quick start
 
-**Claude Code + Codex — one machine-global command:**
+**Claude Code + Codex:**
 
 ```bash
 npx klypix-mcp install
 ```
 
 This copies the engine and a local MCP runtime into `~/.claude/project-brain`, wires Claude Code's
-four lifecycle hooks, and wires Codex's project MCP connection. It is machine-global: every project
-on that machine with a `./brain.klypix` is covered. It does **not** set up Cursor, Cline, Windsurf,
-Copilot, Gemini CLI or Aider — those need `link`.
+four lifecycle hooks, writes Codex's global `~/.codex/AGENTS.md` guidance block, and wires Codex's
+MCP connection **for the project you run it in**.
+
+Be precise about what "machine-global" covers:
+
+- **Machine-global** — the engine + runtime in `~/.claude/project-brain`, the four Claude Code
+  hooks in `~/.claude/settings.json`, and the `~/.codex/AGENTS.md` guidance. Claude Code is
+  therefore covered in every project on that machine that has a `./brain.klypix`.
+- **Per project** — Codex's MCP connection. `install` writes it into `<cwd>/.codex/config.toml`,
+  only when that directory has a `brain.klypix`, and it deliberately **removes** any *global*
+  `~/.codex/config.toml` KLYPIX entry (a global entry resolves its `--vault` from the wrong
+  directory and binds the wrong brain). Run `install` — or `link` — once inside each brain project
+  you want Codex wired to.
+
+It does **not** set up Cursor, Cline, Windsurf, Copilot, Gemini CLI or Aider — those need `link`.
 
 Optional, opt-in, and approved inside Codex itself:
 
@@ -174,8 +186,9 @@ behaviour is unverified.
 | **Aider** | Rules file only (no MCP) | `link` | CLI path: `npx klypix-read` | CLI path: `npx klypix-append` | — |
 | **Claude Desktop** | One-time manual config edit | you | Model must call `brain_sync` | Model must call `brain_note` | For the MCP connection |
 
-`install` and `link` are different things and are not interchangeable: `install` is machine-global
-and only touches Claude Code and Codex; `link` is per project and is what wires everything else.
+`install` and `link` are different things and are not interchangeable: `install` only touches Claude
+Code and Codex, and is machine-global for everything except Codex's MCP connection, which it writes
+per project (see *Quick start*); `link` is per project and is what wires everything else.
 
 **Claude Desktop** — add this to `claude_desktop_config.json` by hand; nothing writes that file
 for you:
@@ -329,10 +342,12 @@ Exactly 18, machine-verifiable with `npx klypix-mcp doctor`.
 
 ## One file you can hold
 
-The whole brain — layout, cards, arrows, and the actual bytes (images, PDFs, audio, code) — is a
+The whole brain — layout, cards, arrows, and the actual bytes (images, PDFs, audio, video) — is a
 single `.klypix` file: a plain ZIP with `manifest.json`, `canvas.json`, one JSON file per card, and
 an `assets/` folder. Email it. Git it. Hand it to an agent. A folder of markdown points at its
-attachments; this file carries them.
+attachments; this file carries them. (Binaries are embedded by the **KLYPIX app** when you drop a
+file onto a canvas; this package's `create_canvas` / `add_to_canvas` / `buildKlypix` write cards and
+arrows, not assets — they read assets fine, they just don't create them.)
 
 The parser is this package, Apache-2.0, so any tool or agent can read and write the format. Full
 spec: [FORMAT.md](FORMAT.md).
@@ -341,13 +356,23 @@ Markdown export, JSON Canvas 1.0 export and direct opening of Obsidian `.canvas`
 of the **KLYPIX desktop app**, not of this package — there is no export command among this
 package's binaries.
 
-**"Project" means any project.** Two showcase brains ship in the GitHub repo under
-[`examples/`](examples/), identical in engine, different in life:
+**"Project" means any project.** Two showcase brains ship in the npm package *and* the GitHub repo
+under [`examples/`](examples/), identical in engine, different in life:
 [`showcase-brain.klypix`](examples/showcase-brain.klypix) is *Aurora*, a fictional weather app
 mid-build (radar tiles, API caps, a correction with its receipt), and
 [`showcase-wedding.klypix`](examples/showcase-wedding.klypix) is *Our Wedding* (venue, vendors,
 guest list, the same correction machinery pointed at a caterer). Same 📌 Focus, same arrows, same
 brief. If it has decisions worth keeping, it gets a brain.
+
+They ship inside the tarball, so you can read one straight out of `node_modules`:
+
+```bash
+npm i klypix-mcp
+npx klypix-read node_modules/klypix-mcp/examples/showcase-brain.klypix
+```
+
+Both are text-and-arrows only — 14 cards, 4 arrows, no `assets/` entry — so they demonstrate the
+card / container / connection model, not the embedded-binaries half of the format.
 
 ## Use it as a library
 
@@ -407,9 +432,11 @@ entirely.
 - **Coordination state is local files.** The brain is a file in your repo; the presence lane is a
   file under your home directory. Nothing is uploaded.
 - **`install` writes to your home directory:** `~/.claude/project-brain` (engine + runtime),
-  `~/.claude/settings.json` (four hooks — written even if Claude Code is not installed) and Codex
-  config. **`link` writes 14 files inside the project** you run it in; `link --check` audits them
-  without writing.
+  `~/.claude/settings.json` (four hooks — written even if Claude Code is not installed),
+  `~/.codex/AGENTS.md` (guidance block), and with `--codex-hooks`, `~/.codex/hooks.json`. It also
+  writes `<cwd>/.codex/config.toml` **inside the project** you run it in, and removes any KLYPIX
+  entry from the global `~/.codex/config.toml`. **`link` writes 14 files inside the project** you
+  run it in; `link --check` audits them without writing.
 - **Codex hooks require Codex's own trust approval** and are opt-in via `--codex-hooks`.
 
 ## Current limitations
@@ -498,5 +525,15 @@ and write.
 
 ---
 
-Apache-2.0 © [Dahshan Labs](https://klypix.com). The KLYPIX desktop app is a separate, proprietary
-product — the format and this server are fully open and work without it.
+## Licence
+
+This package — the MCP server, the agent hooks and the `.klypix` format parser — is
+**Apache-2.0** ([`LICENSE`](LICENSE), attribution in [`NOTICE`](NOTICE)). Versions up to and
+including **1.28.0** were published under MIT and remain available under those terms; **1.29.0** was
+the first Apache-2.0 release.
+
+The KLYPIX desktop app and the klypix.com web app are **separate, proprietary products** — their
+source is not public, and their terms do not restrict anything Apache-2.0 grants you here. This
+package works with no app installed.
+
+Apache-2.0 © [Dahshan Labs](https://klypix.com).

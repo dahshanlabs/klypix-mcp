@@ -1667,6 +1667,15 @@ async function capture(lib) {
             process.stderr.write(`[brain] ⏳ likely fulfilled (${f.cov}): "${f.item.slice(0, 70)}"${rest} ${act}\n`);
         }
     }
+    // 🛠️ staleness receipts (2026-08-01): a captured 🏁 that appears to REMOVE a
+    // limitation a standing skill still asserts. The skill is NEVER archived —
+    // the receipt hands the session a ready-to-fill ~ amendment, because a rule
+    // whose limitation half died usually keeps a trap half worth saving.
+    if (Array.isArray(stats.skillStale) && stats.skillStale.length) {
+        for (const f of stats.skillStale.slice(0, 3)) {
+            process.stderr.write(`[brain] ⚠️ rule may be obsolete (${f.cov}): skill "${f.skill.slice(0, 70)}" asserts "${String(f.clause || '').slice(0, 60)}" — this ship appears to remove it. If so, amend: ${f.marker} (retire by naming it in closes:, or dismiss via brain_connect relationship:"not_fulfilled")\n`);
+        }
+    }
     appendJsonl(LEDGER, { ts: nowIso(), mode: 'capture', stats, decisions: ledger }, 1000);
     appendJsonl(HEALTH, { ts: nowIso(), project: path.basename(CWD), mode: 'capture', ok: true, brainBytes: brainBytes(), added: stats.added, skipped: ledger.filter(d => d.action.startsWith('skipped')).length }, 500);
 }

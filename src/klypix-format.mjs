@@ -1343,10 +1343,57 @@ export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMile
     }
     if (skills.length) {
         push('', '## 🛠️ Skills — how we do things here (reusable; applies every session)');
+        // 🛠️↔🏁 staleness suffix (2026-08-01 incident): the brief is the ONE
+        // surface every session reads, and skills never age out of it — so a
+        // rule encoding a since-removed limitation lies here every morning
+        // with a freshness badge next to it. Persisted 'may obsolete' edges
+        // apply first (capture-time detection); the fresh scan is bounded to
+        // the SHOWN clause-bearing skills × milestones newer than the oldest
+        // of them (milestone token sets built once, lazily — most briefs have
+        // zero clause-bearing skills and pay nothing).
+        const staleBySkill = new Map();
+        try {
+            const shownSkills = skills.slice(0, maxSkills);
+            const persisted = obsolescenceOverlaysFor(struct, shownSkills);
+            for (const [id, o] of persisted) staleBySkill.set(id, o.by);
+            const clauseSkills = shownSkills
+                .filter(c => !staleBySkill.has(c.id))
+                .map(c => ({ c, claims: extractLimitationClaims(c.text) }))
+                .filter(x => x.claims.length);
+            if (clauseSkills.length) {
+                const oldest = Math.min(...clauseSkills.map(x => x.c.createdAt || 0));
+                const newerMiles = miles.filter(m => (m.createdAt || 0) > oldest);
+                if (newerMiles.length) {
+                    const settled = new Set();
+                    for (const cn of struct.connections || []) {
+                        if (cn.label === 'may obsolete' || DISMISSAL_RELS.has(cn.relationship)) settled.add(`${cn.fromId}|${cn.toId}`);
+                    }
+                    const mPre = newerMiles.map(m => ({ m, idx: stemIndex(tokenSet(m.text)) }));
+                    let df = null;
+                    const dfMap = () => (df ??= buildStemDf(struct));
+                    for (const { c, claims } of clauseSkills) {
+                        let best = null, bestScore = 0;
+                        for (const { m, idx: mIdx } of mPre) {
+                            if ((m.createdAt || 0) <= (c.createdAt || 0) || settled.has(`${c.id}|${m.id}`)) continue;
+                            for (const cl of claims) {
+                                const clIdx = stemIndex(cl.tokens);
+                                const cov = coverageOf(new Set(clIdx.keys()), new Set(mIdx.keys()));
+                                const anchors = sharedAnchors(clIdx, mIdx, dfMap(), { exclude: structuralStems(c.area, m.area) });
+                                if (!serveTimeAccepts({ cov, anchors, size: clIdx.size }, (c.area || '') === (m.area || ''))) continue;
+                                const score = cov + anchors.length * 0.2;
+                                if (score > bestScore) { bestScore = score; best = m; }
+                            }
+                        }
+                        if (best) staleBySkill.set(c.id, flat(best.text).slice(0, 70));
+                    }
+                }
+            }
+        } catch { /* staleness suffix is best-effort — never break the brief */ }
         let shown = 0;
         for (const c of skills.slice(0, maxSkills)) {
             if (used > BUDGET_CHARS * 0.85) break;
-            push(`- ${fr(c)}${flat(c.text)}`);
+            const ob = staleBySkill.get(c.id);
+            push(`- ${fr(c)}${flat(c.text)}${ob ? ` ⚠️ a newer 🏁 may have removed this limitation (“${ob}…”) — verify before applying; ~ amend, closes:<its title> to retire, or dismiss via brain_connect not_fulfilled` : ''}`);
             shown++;
         }
         if (shown < skills.length) push(`- …and ${skills.length - shown} more skill(s) — search the brain.`);
@@ -1725,6 +1772,64 @@ export function rankForQuestion(struct, question, { semantic = null, k = 10, as_
             }
         } catch { /* pairing is a best-effort overlay — never fail the answer */ }
     }
+    // SERVE-TIME 🛠️↔🏁 OBSOLESCENCE (2026-08-01 incident): the ❓ pass above
+    // cannot see the class where a SKILL encodes a since-removed limitation —
+    // skills are excluded from claim sources by design, get a +1 ranking boost,
+    // and never age out, so "Chat has no tools" kept outranking the same-day
+    // milestone that shipped chat tools, and an agent asserted the limitation
+    // to the founder as current fact. Persisted 'may obsolete' edges apply
+    // first; then the same in-answer pairing discipline as the ❓ pass, but
+    // coverage runs against the skill's LIMITATION CLAUSES (a skill is long;
+    // its whole text would drown the claim). Negative capability claims are
+    // the highest-risk kind — the fix that falsifies one is exactly the card
+    // that will not match a question phrased around the limitation — so the
+    // hedge renders even when the milestone barely made the hit set.
+    if (!timeTravel) {
+        try {
+            const skillHits = hits.filter(h => !h.correction && !h.archived && isSkillCard(h.card));
+            if (skillHits.length) {
+                const persisted = obsolescenceOverlaysFor(struct, skillHits.map(h => h.card));
+                for (const sh of skillHits) if (persisted.has(sh.card.id)) sh.obsolescence = persisted.get(sh.card.id);
+                const fresh = skillHits.filter(h => !h.obsolescence);
+                const mileHits = hits.filter(h => isMilestoneCard(h.card) && !/^archive$/i.test(h.card.area || ''));
+                if (fresh.length && mileHits.length) {
+                    const settled = new Set();
+                    for (const cn of struct.connections || []) {
+                        if (cn.label === 'may obsolete' || DISMISSAL_RELS.has(cn.relationship)) settled.add(`${cn.fromId}|${cn.toId}`);
+                    }
+                    let df = null;
+                    const dfMap = () => (df ??= buildStemDf(struct));
+                    const mPre = mileHits.map(mh => ({ mh, idx: stemIndex(tokenSet(mh.card.text)) }));
+                    for (const sh of fresh) {
+                        const claims = extractLimitationClaims(sh.card.text);
+                        if (!claims.length) continue;                  // no state claim → advice; never flagged
+                        let best = null, bestScore = 0, bestClause = null;
+                        for (const { mh, idx: mIdx } of mPre) {
+                            const s = sh.card, m = mh.card;
+                            if (m.id === s.id || (m.createdAt || 0) <= (s.createdAt || 0)) continue;
+                            if (settled.has(`${s.id}|${m.id}`)) continue;
+                            const sim = typeof pairSim === 'function' ? pairSim(s.id, m.id) : null;
+                            for (const cl of claims) {
+                                const clIdx = stemIndex(cl.tokens);
+                                const cov = coverageOf(new Set(clIdx.keys()), new Set(mIdx.keys()));
+                                const anchors = sharedAnchors(clIdx, mIdx, dfMap(), { exclude: structuralStems(s.area, m.area) });
+                                const lex = { cov, anchors, size: clIdx.size };
+                                const accept = (sim != null && sim >= 0.55 && lex.size >= SERVE_MIN_STEMS && (anchors.length >= 1 || cov >= 0.2))
+                                    || serveTimeAccepts(lex, (s.area || '') === (m.area || ''));
+                                if (!accept) continue;
+                                const score = (sim ?? 0) + cov + anchors.length * 0.2;
+                                if (score > bestScore) { bestScore = score; best = m; bestClause = cl.clause; }
+                            }
+                        }
+                        if (best) {
+                            const head = String(best.text || '').replace(/\s+/g, ' ').trim().slice(0, 100);
+                            sh.obsolescence = { by: head, byId: best.id, clause: bestClause, unconfirmed: true };
+                        }
+                    }
+                }
+            }
+        } catch { /* best-effort overlay — never fail the answer */ }
+    }
     return { hits, total: scored.length, tokens, statusShaped, statusStrong };
 }
 
@@ -1761,6 +1866,12 @@ export function questionContextToMarkdown(question, result, { mode = 'lexical', 
             block += h.fulfillment.unconfirmed
                 ? `\n\n  ⏳ POSSIBLY FULFILLED (serve-time hint — detected within this answer, no confirmed link): a newer milestone in this same answer may cover this open item: “${flat(h.fulfillment.by).slice(0, 200)}”. VERIFY before treating it as still-to-do; confirm with a ✓ marker if done, or dismiss via brain_connect relationship:"not_fulfilled".`
                 : `\n\n  ⏳ LIKELY FULFILLED — a newer milestone appears to cover this open item: “${flat(h.fulfillment.by).slice(0, 200)}”. Verify before treating it as still-to-do; confirm with a ✓ marker if done.`;
+        } else if (h.obsolescence) {
+            // A 🛠️ rule asserting a since-removed limitation (2026-08-01
+            // incident). Same hedging discipline as ⏳: a hint instructs the
+            // reader to verify, never to inherit the machine's guess — but the
+            // DIRECTION flips: for current capability, trust the NEWER card.
+            block += `\n\n  ⚠️ RULE MAY BE OBSOLETE${h.obsolescence.unconfirmed ? ' (serve-time hint — no confirmed link)' : ''}: this skill asserts a limitation${h.obsolescence.clause ? ` — “${flat(h.obsolescence.clause).slice(0, 140)}”` : ''} that a newer milestone appears to REMOVE: “${flat(h.obsolescence.by).slice(0, 200)}”. For current capability trust the newer card; VERIFY before citing this limitation as still true. If obsolete, amend the skill (~ marker), or retire it deliberately by NAMING it in a closes: (fuzzy ✓/supersede never touch a 🛠️); if it still holds, dismiss via brain_connect relationship:"not_fulfilled".`;
         }
         if (used + block.length + 2 > budgetChars && shown > 0) { out.push(`\n_…and ${hits.length - shown} more matched card(s) omitted for length — narrow the question or use search for the rest._`); break; }
         out.push(block, '');
@@ -3040,7 +3151,7 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
     // corrections[] lists cross-area/low-bar supersedes driven by a correction
     // cue, so the surface (brain_note result / capture stderr) can say WHAT was
     // archived and how to undo — the confirmation channel for the widened match.
-    const stats = { added: 0, superseded: 0, resolved: 0, linked: 0, updated: 0, closed: 0, merged: 0, corrections: [], fulfillCandidates: [] };
+    const stats = { added: 0, superseded: 0, resolved: 0, linked: 0, updated: 0, closed: 0, merged: 0, corrections: [], fulfillCandidates: [], skillStale: [] };
 
     // Pass 1 — resolutions + supersede marking operate on EXISTING cards.
     if (resolutions.length || cards.length || updates.length) {
@@ -3340,8 +3451,18 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
             // generic to trust beyond the strongest few.
             const matches = [];
             for (const c of liveTextCards()) {
-                if (/🛠/.test(c.text)) continue; // skills are standing reference — a closes: must never archive one (mirror the supersede guard)
                 const ct = (c.title || '').trim().toLowerCase();
+                // A 🛠️ retires ONLY by being NAMED: exact/prefix match of its
+                // glyph-and-area-stripped title. Never the contains path (titles
+                // are derived from prose, so a skill that merely MENTIONS the
+                // target span mid-sentence would be swept — review-B's exact
+                // trap), and never token coverage (2026-08-01: naming is a
+                // deliberate human act; overlap is not).
+                if (/🛠/.test(c.text)) {
+                    const core = ct.replace(/^[^:\n]{1,40}:\s*/, '').replace(/^[🛠️❓🎯🏁✅\s]+/u, '');
+                    if (core && wantTitle.length >= 6 && (core === wantTitle || core.startsWith(wantTitle) || wantTitle.startsWith(core))) matches.push({ c, cov: 1 });
+                    continue;
+                }
                 // Title fast-path: exact / prefix (≥6 chars), or the card title
                 // CONTAINS the target — the contains variant needs a LONGER target
                 // (≥10) because a short generic word ("sandbox") appears in many
@@ -3409,6 +3530,35 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                 });
             }
         }
+
+        // 🛠️↔🏁 OBSOLESCENCE CROSS-CHECK (2026-08-01 incident) — the write-side
+        // twin of the serve-time skill pass, mirroring T6 exactly one class
+        // over: a new 🏁 is reconciled against live SKILLS' limitation clauses
+        // ("chat has no tools") the way T6 reconciles it against open claims.
+        // Output is a receipt (stats.skillStale, printed by the hook with a
+        // ready-to-emit ~ amendment) plus a dashed amber 'may obsolete' edge
+        // for coverage-grade pairs. NEVER archives — the supersede and closes:
+        // passes deliberately refuse to retire a 🛠️, and this pass inherits
+        // that: a rule leaves the brain by human hand or not at all.
+        for (const card of cards) {
+            if (!/🏁/.test(card.text) || card.__fromResolve) continue;
+            const cands = findSkillObsolescenceCandidates(struct, [{ text: card.text, createdAt: now }], { maxPerMilestone: 2 });
+            if (!cands.length) continue;
+            card.__obsoletes = cands.filter(c => c.via !== 'anchor').map(c => c.skill.id);
+            for (const c of cands) {
+                stats.skillStale.push({
+                    skill: String(c.skill.text || '').replace(/\s+/g, ' ').slice(0, 90),
+                    area: c.skill.area || null,
+                    clause: c.clause,
+                    cov: c.cov,
+                    ...(c.via ? { via: c.via } : {}),
+                    // The suggested act is an AMENDMENT (~), not an archive: most
+                    // stale rules want the correction written into them — the
+                    // trap half often survives even when the limitation half died.
+                    marker: `🧠 BRAIN [${c.skill.area || 'Notes'}] ~: ${String(c.skill.title || c.skill.text).replace(/\s+/g, ' ').replace(/^🛠️?\s*/, '').slice(0, 60)} — CORRECTION: <what this ship changed>`,
+                });
+            }
+        }
         stampBrainKind(manifest);
         work = await finalizeBrainZip(zip, canvas, manifest, now);
     }
@@ -3450,6 +3600,10 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
             // Dashed, muted hint — a suggestion must never render pixel-identical
             // to a confirmed 'closed by' verdict edge on the human's canvas.
             for (const cid of (card.__fulfills || [])) addConn(cid, created.id, 'likely closed by', undefined, { style: 'dashed', width: 1.5, color: 'rgba(16,185,129,0.55)' });
+            // 🛠️ staleness hints are AMBER, never the fulfilment emerald — "this
+            // ship may retire that rule" and "this ship may close that task" must
+            // stay visually distinct on the human's canvas.
+            for (const sid of (card.__obsoletes || [])) addConn(sid, created.id, 'may obsolete', undefined, { style: 'dashed', width: 1.5, color: 'rgba(245,158,11,0.6)' });
             for (const link of (created.links || [])) {
                 const want = String(link).trim().toLowerCase();
                 if (!want) continue;
@@ -4042,6 +4196,149 @@ export function fulfillmentOverlaysFor(struct, cards) {
         // HEDGED after persistence. Before this, one capture silently promoted
         // a suggestion to the confirmed "⏳ LIKELY FULFILLED" tier — the diff's
         // own hedging defeated one session later (2026-07-29 review, CONFIRMED).
+        if (!map.has(cn.fromId)) map.set(cn.fromId, { by: head, byId: m.id, unconfirmed: cn.hintVia !== 'human' });
+    }
+    return map;
+}
+
+// ── 🛠️↔🏁 obsolescence (2026-08-01 field incident) ──────────────────────────
+// A 🛠️ skill that encodes a TEMPORARY limitation is more dangerous stale than
+// an open ❓: skills are BUILT to resurface every session, never age out, and
+// carry a ranking boost — so when a later 🏁 removes the limitation, the wrong
+// half keeps outranking the fix for any question phrased around the limitation.
+// Field case: an agent told the founder "Chat can talk but not act" off skill
+// 32d1c2a ("Chat (Gemini Flash) has no tools…") while milestone 2440361 — SAME
+// DAY — had shipped native tool-use in chat. An open ❓ at least reads as
+// unsettled; a 🛠️ reads as settled law. The ❓↔🏁 machinery cannot see this
+// class (skills are excluded from claim sources BY DESIGN, and must stay
+// excluded — a milestone must never archive advice), so this is its sibling:
+// detect and HEDGE, never retire. Retiring a rule stays a human act.
+//
+// The extractor is the precision gate. It matches STATE claims — sentences
+// asserting what the system currently does or lacks ("has no tools", "returns
+// mock streams", "not implemented") — and refuses IMPERATIVE advice ("never
+// set backgroundThrottling:false", "always dedup zKeys"), which is the
+// evergreen content skills exist for. A skill with no state claim can never be
+// flagged, so the failure mode of an over-eager cue is a missed hint, not a
+// slandered rule.
+const LIMITATION_CUE_RE = new RegExp([
+    /\b(?:has|have|had) no \p{L}/u.source,
+    /\bno \p{L}+ (?:yet|at all|anywhere)\b/u.source,
+    /\bcan(?:not|['’]t) \p{L}/u.source,
+    /\b(?:does|do)(?:es)?(?: not|n['’]t) (?:support|have|act|work|exist|persist|stream|fire|write|read|speak|run|apply|reach|see|know|check|enforce)\b/u.source,
+    /\bnot (?:implemented|wired|supported|available|built|shipped|published|deployed|enforced|persisted|possible|reachable|exposed|functional)\b/u.source,
+    /\breturns? (?:a )?(?:mock|stub|null|nothing)\b/u.source,
+    /\bis (?:dead|unused|missing|absent|unreachable|unwired|talk[- ]?only)\b/u.source,
+    /\bonly (?:works|runs|streams|answers|covers|supports|reads)\b/u.source,
+    /\bstill (?:missing|absent|manual|unwired|blocked|mocked?)\b/u.source,
+].join('|'), 'iu');
+// Imperative openers = advice, not state. Anchored to the CLAUSE start so
+// "Chat has no tools" (subject-first) passes while "never set X" is refused.
+const ADVICE_OPENER_RE = /^(?:never|always|do not|don['’]t|avoid|prefer|remember|must|treat|use|keep|before|when|if)\b/i;
+export function extractLimitationClaims(text) {
+    // Same unwrap discipline as extractOpenClauses: stored hard-wraps would
+    // otherwise truncate every sentence at the first wrap point. Same
+    // version-literal-safe sentence split ('1.3.28' survives).
+    const t = normalizeWrappedProse(String(text || ''));
+    const out = [];
+    for (const raw of t.split(/[!?]\s+|\.(?=\s|$)/)) {
+        let clause = raw.replace(/^[\s\-–—•·"“”'‘’()[\]]+/, '').trim();
+        if (!clause || clause.length < 12) continue;
+        if (ADVICE_OPENER_RE.test(clause)) continue;
+        if (!LIMITATION_CUE_RE.test(clause)) continue;
+        // CONTRAST CUT: the limitation is the pre-contrast span — "Chat has no
+        // tools, but the system prompt claimed…" claims only "Chat has no
+        // tools"; the tail is elaboration whose tokens drown the coverage
+        // denominator (measured on the incident card: whole-sentence cov 0.31
+        // → cut cov 0.75). Keep the cut only if it still carries the cue.
+        const cut = clause.split(/,?\s+(?:but|however|yet|whereas|--+|—)\s+/i)[0].trim();
+        if (cut.length >= 12 && LIMITATION_CUE_RE.test(cut) && claimTokens(cut).size >= 3) clause = cut;
+        const tokens = claimTokens(clause);
+        if (tokens.size < 3) continue;                       // tiny claims match everything
+        out.push({ clause: clause.slice(0, 160), tokens });
+        if (out.length >= 4) break;                          // a skill is one lesson, not a spec sheet
+    }
+    return out;
+}
+
+// One-sided scan: which live 🛠️ limitation claims do these milestones appear to
+// REMOVE? Mirrors findFulfillmentCandidates (bounded, receipt-bearing, archives
+// nothing): a milestone must post-date the skill, acceptance is clause coverage
+// OR rare-anchor corroboration, dismissals (`not_fulfilled`) and existing hint
+// edges are never re-suggested, and one generic ship is capped so it can never
+// spray edges across the rulebook.
+export function findSkillObsolescenceCandidates(struct, milestones, { coverAt = 0.6, maxPerMilestone = 3 } = {}) {
+    if (!struct || !Array.isArray(struct.cards) || !Array.isArray(milestones) || !milestones.length) return [];
+    const isArchived = (c) => /^archive$/i.test(c.area || '');
+    const liveSkills = struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim()
+        && !isArchived(c) && isSkillCard(c) && !/↩|⤵/.test(c.text));
+    if (!liveSkills.length) return [];
+    const settled = new Set();
+    for (const cn of struct.connections || []) {
+        if (cn.label === 'may obsolete' || DISMISSAL_RELS.has(cn.relationship)) settled.add(`${cn.fromId}|${cn.toId}`);
+    }
+    const mPre = milestones.map(m => ({ m, idx: stemIndex(tokenSet(m.text)) }));
+    let df = null;
+    const dfMap = () => (df ??= buildStemDf(struct));
+    const out = [];
+    for (const s of liveSkills) {
+        const claims = extractLimitationClaims(s.text);
+        for (const cl of claims) {
+            const clIdx = stemIndex(cl.tokens);
+            const clStems = new Set(clIdx.keys());
+            for (const { m, idx: mIdx } of mPre) {
+                if (m.id && m.id === s.id) continue;
+                if (m.id && settled.has(`${s.id}|${m.id}`)) continue;
+                if (Number.isFinite(m.createdAt) && m.createdAt <= (s.createdAt || 0)) continue;   // a rule written AFTER the ship is post-fix knowledge, not stale
+                const cov = coverageOf(clStems, new Set(mIdx.keys()));
+                let viaAnchor = false;
+                if (cov < coverAt) {
+                    const anchors = sharedAnchors(clIdx, mIdx, dfMap(), { exclude: structuralStems(s.area, m.area) });
+                    if (!anchorsSufficient(anchors, (s.area || '') === (m.area || ''), cov)) continue;
+                    viaAnchor = true;
+                }
+                out.push({ skill: s, clause: cl.clause, milestone: m, cov: Math.round(cov * 100) / 100, ...(viaAnchor ? { via: 'anchor' } : {}) });
+            }
+        }
+    }
+    // Best candidate per (skill, milestone) pair, then per-milestone cap.
+    const byPair = new Map();
+    for (const c of out) {
+        const key = `${c.skill.id}|${c.milestone.id || milestones.indexOf(c.milestone)}`;
+        if (!byPair.has(key) || byPair.get(key).cov < c.cov) byPair.set(key, c);
+    }
+    const byMile = new Map();
+    for (const c of byPair.values()) {
+        const k = c.milestone.id || String(milestones.indexOf(c.milestone));
+        if (!byMile.has(k)) byMile.set(k, []);
+        byMile.get(k).push(c);
+    }
+    const capped = [];
+    for (const list of byMile.values()) {
+        list.sort((a, b) => b.cov - a.cov);
+        capped.push(...list.slice(0, maxPerMilestone));
+    }
+    return capped;
+}
+
+// Persisted-edge overlay reader for 'may obsolete' hints — the 🛠️ twin of
+// fulfillmentOverlaysFor, same rules: dismissals win, a since-archived
+// milestone no longer vouches, machine-written hints stay hedged forever.
+export function obsolescenceOverlaysFor(struct, cards) {
+    const map = new Map();
+    if (!struct || !Array.isArray(struct.connections)) return map;
+    const byId = new Map(struct.cards.map(c => [c.id, c]));
+    const want = new Set((cards || []).map(c => c.id));
+    const dismissed = new Set();
+    for (const cn of struct.connections) {
+        if (DISMISSAL_RELS.has(cn.relationship)) { dismissed.add(`${cn.fromId}|${cn.toId}`); dismissed.add(`${cn.toId}|${cn.fromId}`); }
+    }
+    for (const cn of struct.connections) {
+        if (cn.label !== 'may obsolete' || !want.has(cn.fromId)) continue;
+        if (dismissed.has(`${cn.fromId}|${cn.toId}`)) continue;
+        const m = byId.get(cn.toId);
+        if (!m || /^archive$/i.test(m.area || '') || /↩|⤵/.test(m.text || '')) continue;
+        const head = String(m.text || '').replace(/\s+/g, ' ').trim().slice(0, 100);
         if (!map.has(cn.fromId)) map.set(cn.fromId, { by: head, byId: m.id, unconfirmed: cn.hintVia !== 'human' });
     }
     return map;

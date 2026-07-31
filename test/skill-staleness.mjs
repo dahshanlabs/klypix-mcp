@@ -7,7 +7,7 @@
 // edge, the brief suffix, the dismissal path, and the closes: title-only
 // retirement — including a faithful reproduction of the incident pair.
 import {
-    extractLimitationClaims, findSkillObsolescenceCandidates, obsolescenceOverlaysFor,
+    extractLimitationClaims, findSkillObsolescenceCandidates, obsolescenceOverlaysFor, formatCaptureReceipts,
     rankForQuestion, questionContextToMarkdown, structToBrief,
     buildKlypix, buildKlypixMap, parseKlypix, captureIntoBrain,
 } from '../src/klypix-format.mjs';
@@ -145,5 +145,45 @@ const skillCard = { id: 's1', type: 'text', area: 'Chat', createdAt: D0, text: I
     ok(named.stats.closed === 1, 'closes: naming the skill title retires it');
 }
 
-console.log(`\n${fail ? '❌' : '✅'} skill-staleness: ${pass} passed, ${fail} failed`);
+
+// ── 1.45.1: cues from the FIRST real-world miss (the presence-bugs card) ─────
+// The day after 1.45.0 shipped, the 🛠️ "Two SILENT presence bugs" card kept
+// reading as settled law a full session after ab10688 fixed all three claims —
+// because "compares hostPid ALONE", "only lowercases+slash-normalizes" and
+// "indistinguishable from success" matched no cue. Each addition is anchored
+// to this incident; the advice-guard fixtures prove precision survived.
+const PRESENCE_SKILL = 'Brain: 🛠️ Two SILENT presence bugs: isSuspectedTwin compares hostPid ALONE, so two unrelated sessions suppress each other. normalizeFileKey only lowercases and slash-normalizes, so an absolute and a relative declaration never match and the overlap warning silently misses. upsertSession returns listActiveSessions on lock failure, making a dropped heartbeat indistinguishable from success.';
+{
+    const claims = extractLimitationClaims(PRESENCE_SKILL);
+    ok(claims.length >= 2, `presence miss: state claims now extract (got ${claims.length})`);
+    ok(claims.some(c => /hostpid alone/i.test(c.clause)), 'presence miss: "compares hostPid ALONE" is a claim');
+    ok(claims.some(c => /silently misses|only lowercases/i.test(c.clause)), 'presence miss: the normalizeFileKey claim extracts');
+}
+{
+    const skill = { id: 'ps1', type: 'text', area: 'Brain', createdAt: D0, text: PRESENCE_SKILL };
+    const fix = { id: 'pm1', type: 'text', area: 'Brain', createdAt: D0 + 1000, text: 'Brain: 🏁 presence hardening shipped — normalizeFileKey folds absolute and relative declarations onto one key via the session root, isSuspectedTwin requires machine and client agreement beyond hostPid, and a lane lock failure returns an explicit lane-locked verdict instead of success.' };
+    const cands = findSkillObsolescenceCandidates(mkStruct([skill, fix]), [fix]);
+    ok(cands.length >= 1, 'presence miss: the hardening milestone now flags the stale presence skill');
+}
+// Precision re-checks: evergreen advice with adjacent vocabulary stays silent.
+ok(extractLimitationClaims('🛠️ NEVER put an absolute path in a committed .mcp.json — a container rewrites it and the breakage is silent').length === 0,
+    'advice with "silent" vocabulary is still not a state claim');
+ok(extractLimitationClaims('🛠️ always dedup zKeys before permuting; duplicates silently no-op').length === 0,
+    '"silently no-op" advice stays unflagged (no-op is not in the cue verbs)');
+
+// ── formatCaptureReceipts — host-neutral parity (MCP + CLI = the hook) ───────
+{
+    const stats = {
+        fulfillCandidates: [{ item: 'wire the caps handshake', cov: 0.7, uncovered: ['ship build 7'], marker: null }],
+        skillStale: [{ skill: 'the exporter does not support rotated strokes', clause: 'does not support rotated strokes', cov: 0.8, marker: '🧠 BRAIN [Export] ~: exporter — CORRECTION: <what this ship changed>' }],
+    };
+    const lines = formatCaptureReceipts(stats);
+    ok(lines.length === 2, 'receipts: one line per candidate class');
+    ok(/likely fulfilled/.test(lines[0]) && /does NOT cover/.test(lines[0]), 'receipts: fulfillment line carries the uncovered remainder');
+    ok(/rule may be obsolete/.test(lines[1]) && /~/.test(lines[1]), 'receipts: staleness line carries the ~ amendment');
+    ok(formatCaptureReceipts({}).length === 0, 'receipts: empty stats → no lines');
+}
+
+console.log(`
+${fail ? '❌' : '✅'} skill-staleness: ${pass} passed, ${fail} failed`);
 if (fail) process.exit(1);

@@ -19,7 +19,7 @@
 // Optional trailing path picks a different .klypix (default ./brain.klypix).
 import fs from 'fs';
 import path from 'path';
-import { captureIntoBrain, tidyBrain, atomicWrite, noteToCaptureInput } from './klypix-format.mjs';
+import { captureIntoBrain, tidyBrain, atomicWrite, noteToCaptureInput, formatCaptureReceipts } from './klypix-format.mjs';
 
 const MARKERS = { '': '', '?': '?', '!': '!', '✓': '✓', '~': '~', question: '?', milestone: '!', resolve: '✓', update: '~', decision: '', done: '✓' };
 const normMarker = (m) => MARKERS[String(m || '').toLowerCase()] ?? '';
@@ -66,6 +66,7 @@ try {
     const bits = [`${s.added || 0} added`];
     for (const k of ['resolved', 'updated', 'closed', 'superseded', 'linked']) if (s[k]) bits.push(`${s[k]} ${k}`);
     console.error(`✓ brain-note → ${path.basename(file)} (${bits.join(' · ')})`);
+    for (const line of formatCaptureReceipts(s)) console.error(`  ${line}`);
 } catch (e) {
     console.error(`brain-note failed (brain unchanged): ${e?.message || e}`);
     process.exit(1);

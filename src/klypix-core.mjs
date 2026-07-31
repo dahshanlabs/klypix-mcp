@@ -32,7 +32,7 @@ import {
   statusContextToMarkdown, findFulfillmentCandidates,
   splitQueryTokens, scoreCardsAgainstQuery, correctionOverlaysFor,
   isFastDecayCard, DECAY_STALE_MS, formatDecayAge,
-  readPendingShips, clearPendingShips, pendingShipCards,
+  readPendingShips, clearPendingShips, pendingShipCards, formatCaptureReceipts,
 } from './klypix-format.mjs';
 import { capMessages, findProjectBrain } from './agent-presence.mjs';
 
@@ -1031,7 +1031,12 @@ export async function opBrainNote({ vault, canvas, text: noteText, area, marker 
       : '';
     // Name the resolved brain explicitly (basename + how) so a write never lands
     // in a surprise file silently — the write-side twin of the read-op stamp.
-    return { blocks: [text(`✓ brain_note → ${path.basename(file)} (via ${t.how}) · ${bits.join(' · ')}. Reopen the brain in the KLYPIX app to see it.${corr}`)] };
+    // Host-neutral capture receipts (2026-08-01): Codex/Cursor/Cline capture
+    // through THIS verb, not the Claude Stop hook — without these lines the
+    // write-side ⏳/⚠️ nudges existed only on one host brand.
+    const receipts = formatCaptureReceipts(s);
+    const rc = receipts.length ? `\n${receipts.join('\n')}` : '';
+    return { blocks: [text(`✓ brain_note → ${path.basename(file)} (via ${t.how}) · ${bits.join(' · ')}. Reopen the brain in the KLYPIX app to see it.${corr}${rc}`)] };
   } catch (e) {
     return err(`brain_note failed (brain unchanged): ${e.message}`);
   }

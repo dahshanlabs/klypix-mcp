@@ -4229,8 +4229,17 @@ const LIMITATION_CUE_RE = new RegExp([
     /\bnot (?:implemented|wired|supported|available|built|shipped|published|deployed|enforced|persisted|possible|reachable|exposed|functional)\b/u.source,
     /\breturns? (?:a )?(?:mock|stub|null|nothing)\b/u.source,
     /\bis (?:dead|unused|missing|absent|unreachable|unwired|talk[- ]?only)\b/u.source,
-    /\bonly (?:works|runs|streams|answers|covers|supports|reads)\b/u.source,
+    /\bonly (?:works|runs|streams|answers|covers|supports|reads|checks|compares|matches|lowercases|normalizes)\b/u.source,
     /\bstill (?:missing|absent|manual|unwired|blocked|mocked?)\b/u.source,
+    // 2026-08-01, first real-world miss (the day after shipping): the presence-
+    // bugs skill card asserted "compares hostPid ALONE", "only lowercases+slash-
+    // normalizes" and "indistinguishable from success" — all state claims, none
+    // matched a cue, so the card kept reading as settled law for a full session
+    // after ab10688 had fixed every one of them. Cues grow ON-DEMAND from real
+    // misses, never speculatively — each addition below names its incident.
+    /\b(?:compares?|keys?|keyed|matches?) [\p{L}\p{N}_-]+ alone\b/u.source,
+    /\bindistinguishable from\b/u.source,
+    /\bsilently (?:miss(?:es|ed)?|fail(?:s|ed)?|drop(?:s|ped)?)\b/u.source,
 ].join('|'), 'iu');
 // Imperative openers = advice, not state. Anchored to the CLAUSE start so
 // "Chat has no tools" (subject-first) passes while "never set X" is refused.
@@ -4319,6 +4328,29 @@ export function findSkillObsolescenceCandidates(struct, milestones, { coverAt = 
         capped.push(...list.slice(0, maxPerMilestone));
     }
     return capped;
+}
+
+// ── Capture receipts, host-neutral (2026-08-01 parity fix) ──────────────────
+// The ⏳/⚠️ capture receipts used to print ONLY through the Claude Stop-hook's
+// stderr — a Codex / Cursor / Cline session capturing through brain_note (MCP
+// or CLI) got "1 added · 1 superseded" and never saw the nudge, so on those
+// hosts the write-side half of both detection classes was silently absent.
+// One formatter, consumed by opBrainNote (MCP) and brain-note (CLI), so every
+// host hears what the hook hears; the hook keeps its own prefix style.
+export function formatCaptureReceipts(stats, { maxEach = 3 } = {}) {
+    const s = stats || {};
+    const lines = [];
+    for (const f of (Array.isArray(s.fulfillCandidates) ? s.fulfillCandidates : []).slice(0, maxEach)) {
+        const rest = f.uncovered && f.uncovered.length ? ` · does NOT cover: ${f.uncovered.map(u => `"${String(u).slice(0, 50)}"`).join(', ')}` : '';
+        const act = f.marker
+            ? `— if truly done, emit: ${f.marker}`
+            : '— PARTIAL/short: the card stays open (verify by hand; dismiss via brain_connect relationship:"not_fulfilled")';
+        lines.push(`⏳ likely fulfilled (${f.cov}): "${String(f.item).slice(0, 70)}"${rest} ${act}`);
+    }
+    for (const f of (Array.isArray(s.skillStale) ? s.skillStale : []).slice(0, maxEach)) {
+        lines.push(`⚠️ rule may be obsolete (${f.cov}): skill "${String(f.skill).slice(0, 70)}" asserts "${String(f.clause || '').slice(0, 60)}" — this ship appears to remove it. If so, amend: ${f.marker} (retire by naming it in closes:, or dismiss via brain_connect relationship:"not_fulfilled")`);
+    }
+    return lines;
 }
 
 // Persisted-edge overlay reader for 'may obsolete' hints — the 🛠️ twin of

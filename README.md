@@ -79,7 +79,7 @@ npx klypix-mcp conformance
 
 It runs in a temporary fixture and touches nothing else. It checks tool discovery, task memory,
 truthful peer reporting, overlap surfacing, proactive logging, and in-band delivery of a peer note.
-It verifies 7 coordination behaviours — not the 18 tools, and not the retrieval engine.
+It verifies 12 required coordination behaviours — not the 18 tools, and not the retrieval engine.
 
 ---
 
@@ -133,9 +133,9 @@ content.
 npx klypix-mcp link --check    # audits without writing; exits non-zero on drift
 ```
 
-> Use that exact form. The standalone `klypix-link` binary currently drops the `--check` flag and
-> writes instead (`bin/klypix-link.mjs:23`). Do not wire `npx -p klypix-mcp klypix-link --check`
-> into CI until that is fixed.
+> Either form works, and both are safe in CI: `npx -p klypix-mcp klypix-link --check` used to
+> drop `--check` and write anyway — fixed, and locked by `test/cli-args.mjs`, which asserts the
+> standalone bin and the dispatcher parse arguments identically.
 
 **Give a project a brain** by dropping a `brain.klypix` into it — the
 [KLYPIX app](https://klypix.com) does it in one click (*Save canvas as project brain*), or
@@ -494,7 +494,10 @@ Read this section before you build on any of it.
 
 - **Coordination is machine-local and OS-user-local.** The presence lane is a file in your home
   directory. Two developers on two machines do not see each other's sessions, peers, overlaps or
-  messages. There is no cross-machine or cross-team coordination today.
+  messages. This package ships the cross-machine presence *core* (`./presence-relay` — versioned
+  metadata-only frames, a symmetric default-off consent gate, loop prevention and message dedup),
+  but no transport: carrying frames between machines is the desktop app's job. With `klypix-mcp`
+  alone, coordination is machine-local.
 - **Overlap matching is exact-path, and both sides must declare.** A session that never declares
   its expected files is invisible to overlap detection, and `src/auth/token.ts` does not match a
   rename or a parent directory.
@@ -502,10 +505,9 @@ Read this section before you build on any of it.
   `blocking`; the mechanism is not.
 - **Codex has no automatic capture**, with or without `--codex-hooks`. The Codex hook never writes
   the brain.
-- **There is no uninstall command.** Removing Klypix means hand-editing `~/.claude/settings.json`,
-  `~/.codex/config.toml` and `~/.codex/hooks.json`, deleting `~/.claude/project-brain`, and
-  deleting the 14 per-project files. The removal primitives exist in the source but no CLI reaches
-  them yet.
+- **Uninstall does not remove per-project files.** `npx klypix-mcp uninstall` handles the
+  machine-global install; the 14 files `link` wrote into each project are listed by
+  `npx klypix-mcp link --check` and removed by `uninstall unlink` **per project**, one at a time.
 - **Drift detection is single-host and opt-in per card.** It needs an `ev:` anchor written by the
   card's author, and it runs only in the Claude Code hook path — the MCP tools do not compute
   freshness.
@@ -517,8 +519,10 @@ Read this section before you build on any of it.
 - **A fresh `npx klypix-mcp install` gets lexical retrieval.** The optional on-device model is
   deliberately not installed.
 - **The capture lock is fail-open** past ~3.6 seconds of contention (see *Git and concurrency*).
-- **Tests are developer-run, not CI-gated.** The npm publish workflow runs no tests, and `test/` is
-  not in the published tarball.
+- **`test/` is not in the published tarball.** Run the suite from a clone. The publish workflow
+  *does* gate on it — a `gate` job runs `npm ci`, asserts the test chain is intact, runs `npm test`,
+  validates the version/tag, and checks the packed tarball; `publish` declares `needs: gate`, so a
+  red gate means npm never sees a tarball.
 - **`canvas_view`'s MCP Apps UI has never been verified on a real Apps host.**
 
 ## Numbers and methodology
@@ -542,14 +546,15 @@ independently validated.
 
 ## Uninstall
 
-There is no uninstall command yet. To remove Klypix by hand:
-
 ```bash
-rm -rf ~/.claude/project-brain
-# then remove the klypix hook entries from ~/.claude/settings.json
-# and the klypix MCP entry from ~/.codex/config.toml (and ~/.codex/hooks.json if you used --codex-hooks)
-npx klypix-mcp link --check      # lists the 14 managed files in a project, so you know what to delete
+npx klypix-mcp uninstall --check   # full inventory — writes nothing
+npx klypix-mcp uninstall           # asks, then removes the machine-global install
+npx klypix-mcp uninstall unlink    # run inside a project: removes the files `link` wrote there
 ```
+
+It strips only KLYPIX's own entries — every other hook and setting in
+`~/.claude/settings.json` stays — backs up each file it edits, and **never deletes a `.klypix`**.
+`--yes` skips the prompt for scripted removal.
 
 Your `brain.klypix` is yours — it is a plain ZIP and stays readable with or without this package.
 
@@ -557,10 +562,11 @@ Your `brain.klypix` is yours — it is a plain ZIP and stays readable with or wi
 
 Issues and pull requests: [github.com/dahshanlabs/klypix-mcp](https://github.com/dahshanlabs/klypix-mcp).
 
-The repository carries 28 test files covering the presence lane, Context Gateway, supervisor
-hot-swap, auto-update, retrieval quality, decay, challenge, lenses and conformance. Run them with
-`npm test` from a clone — they are not in the published tarball and the publish workflow does not
-run them. There is a known intermittent Windows `EPERM` flake on rename in
+The repository carries 38 test files, 34 of them in the `npm test` chain, covering the presence
+lane and its cross-machine relay, the Context Gateway, supervisor hot-swap, auto-update, retrieval
+quality, decay, challenge, lenses, the format guard, the git tools (including a real `git merge`
+through the merge driver), uninstall, and conformance. Run them with `npm test` from a clone — they
+are not in the published tarball, though the publish workflow does run them as a gate. There is a known intermittent Windows `EPERM` flake on rename in
 `test/mcp-supervisor.mjs`.
 
 ## Why this exists

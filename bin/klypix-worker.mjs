@@ -110,6 +110,13 @@ await runVerb('git-driver', './klypix-git-driver.mjs');
 await runVerb('diff', './klypix-diff.mjs');
 await runVerb('pr-brief', './klypix-pr-brief.mjs');
 
+// `npx klypix-mcp uninstall` — the machine-global removal tool. `--check` prints a full
+// inventory and writes nothing; every write is backed up; a `.klypix` brain is never
+// touched. Wired into the dispatcher 2026-08-01: it shipped as a bin-only verb, so
+// `npx klypix-mcp uninstall` answered "unknown command" while the README (and this
+// CLI's own --help) said no uninstall existed at all.
+await runVerb('uninstall', './klypix-uninstall.mjs');
+
 // `npx klypix-mcp garden-code` — the HUMAN half of the garden approval gate.
 // brain_garden's apply requires an 8-char code derived from the exact dormant
 // candidate set + day; the agent is deliberately never shown it. The human runs

@@ -206,11 +206,20 @@ const run = (args, { cwd = REPO, home = HOME_ROOT, timeout = 60_000 } = {}) => {
 {
   const help = run([MCP, '--help']);
   ok(help.code === 0 && /Verbs:/.test(help.out), 'H: `--help` prints the verb list and exits 0');
-  const unknown = run([MCP, 'uninstall']);
-  ok(unknown.code === 2 && /unknown command "uninstall"/.test(unknown.err),
+  // `uninstall` was this test's example of an unknown verb, and it also asserted
+  // the usage said no uninstall existed — both froze a claim that was FALSE from
+  // 1.43.1 onward (bin/klypix-uninstall.mjs shipped as a published bin, reachable
+  // only as `npx -p klypix-mcp klypix-uninstall`). Wired into the dispatcher
+  // 2026-08-01; the unknown-verb guard is now proven with a verb that really is
+  // unknown, and the usage must ADVERTISE uninstall rather than deny it.
+  const unknown = run([MCP, 'definitely-not-a-verb']);
+  ok(unknown.code === 2 && /unknown command "definitely-not-a-verb"/.test(unknown.err),
     'H: an unknown verb exits 2 with a message (was: exit 0, zero output)');
-  ok(/There is no uninstall command/.test(unknown.err),
-    'H: the usage text states plainly that there is no uninstall');
+  ok(/^\s*uninstall\s/m.test(help.out),
+    'H: the usage advertises the uninstall verb (it exists — do not re-freeze the old denial)');
+  const uninstallCheck = run([MCP, 'uninstall', '--check']);
+  ok(uninstallCheck.code === 0 && /removal|inventory|STRIP|KEEP/i.test(uninstallCheck.out + uninstallCheck.err),
+    'H: `klypix-mcp uninstall --check` reaches the removal tool and reports without writing');
   // A dash token is a SERVER launch (`--vault <dir>`), never a verb — the guard
   // must not swallow it. The server blocks on stdio, so a short timeout is
   // expected; the assertion is only that the guard did not reject it.

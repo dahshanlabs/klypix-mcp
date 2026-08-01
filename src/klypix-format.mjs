@@ -126,12 +126,27 @@ export async function parseKlypix(buffer) {
     // (merge, arrange, capture) a structure it does not understand. The merge
     // driver inherits this automatically: the throw exits it non-zero, which
     // degrades to a normal manual git conflict.
+    // Both dimensions, or the guard has a hole: `version` is the CONTAINER shape and
+    // `schemaVersion` is the DOCUMENT (item/connection) shape, and they move
+    // independently. The desktop codec already refused a future value of either
+    // (klypixFormatV4.ts assertManifestReadable); checking only `version` here left
+    // {version:4, schemaVersion:5} parsed by this engine and refused by the app —
+    // the asymmetric case, where merge/git-driver/capture would happily write back a
+    // document they did not understand. Found by the 2026-08-01 doc audit.
     const KLYPIX_FORMAT_CEILING = 4;
-    if (manifest && manifest.format === 'klypix' && Number(manifest.version) > KLYPIX_FORMAT_CEILING) {
-        throw new Error(
-            `This .klypix was saved by a newer format (v${manifest.version}); this engine reads up to v${KLYPIX_FORMAT_CEILING}. ` +
-            'Update KLYPIX / klypix-mcp instead of parsing it — a blind read could damage it.'
+    if (manifest && manifest.format === 'klypix') {
+        const layout = Number(manifest.version);
+        const schema = Number(manifest.schemaVersion);
+        const tooNew = Math.max(
+            Number.isFinite(layout) ? layout : 0,
+            Number.isFinite(schema) ? schema : 0,
         );
+        if (tooNew > KLYPIX_FORMAT_CEILING) {
+            throw new Error(
+                `This .klypix was saved by a newer format (v${tooNew}); this engine reads up to v${KLYPIX_FORMAT_CEILING}. ` +
+                'Update KLYPIX / klypix-mcp instead of parsing it — a blind read could damage it.'
+            );
+        }
     }
     const canvas = JSON.parse(canvasRaw);
     // v4 manifests are {format:"klypix", version:4}; positions presence is the

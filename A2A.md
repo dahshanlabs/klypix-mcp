@@ -46,11 +46,13 @@ the skills below.
 |---|---|---|
 | `make_board` | Create a new `.klypix` from cards + connections | a `.klypix` **FilePart** + summary |
 | `remember` | Append cards/decisions to an existing canvas (positions preserved) | the updated `.klypix` |
+| `learn_skill` | Capture a reusable how-to / gotcha as a 🛠 skill card — resurfaces every session | the updated `.klypix` |
 | `recall` | Search card text/titles/`#tags` across the vault | matching cards (text) |
 | `read_canvas` | Read one canvas (cards, graph, `[[links]]`) + its images | markdown + image FileParts |
 | `list_canvases` | List canvases with counts | text |
 | `brain_insights` | Hubs / orphans / stale questions in a brain | text |
 | `search_all_brains` | Cross-project memory search (semantic + lexical) | text |
+| `brain_connect` | Find and draw related-but-unlinked cards (proposes before it applies) | text |
 
 ## Talk to it (JSON-RPC 2.0)
 

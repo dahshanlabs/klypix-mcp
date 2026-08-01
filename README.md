@@ -292,18 +292,67 @@ Apache-2.0 and work with no app installed. The app's interface is available in E
 
 ## Git and concurrency
 
-One file in your repo, committed with your code — versioned, branchable, portable.
+One file in your repo, committed with your code — versioned, branchable, portable. So two
+developers already share one brain the way they share code: clone, branch, pull.
 
-Be precise about what git does here: `brain.klypix` is a binary ZIP. Git shows
-`Bin 1308328 -> 1309005 bytes`, produces zero line diffs, and a merge conflict on it is an
-all-or-nothing take-ours or take-theirs. You cannot review a brain change in a PR diff. **All
-card-level merge safety comes from the KLYPIX engine, not from git.**
+Be precise about what git does on its own: `brain.klypix` is a binary ZIP. Git shows
+`Bin 1308328 -> 1309005 bytes` and produces zero line diffs, so out of the box a conflict on it is
+an all-or-nothing take-ours or take-theirs, and a reviewer sees nothing. **Card-level merge safety
+comes from the KLYPIX engine** — but since 1.48.0 you can hand that engine to git and read its
+output in a PR:
+
+```bash
+npx klypix-mcp git-driver install     # once per clone, in any repo
+```
+
+That registers a merge driver for `*.klypix` (a per-machine git config line plus a `.gitattributes`
+rule you commit) and provisions the engine it needs. When two people change the brain and one
+pulls, git calls the engine instead of stopping: new cards from both sides are kept, a card only
+one side edited takes that edit, and a card edited differently on both sides keeps **both**
+versions — the second as a linked twin, never a silent overwrite. Before returning, the merge
+asserts it still contains every surviving card from both sides and refuses rather than hand back a
+result that lost one.
+
+The honest boundary: a machine that has not run `git-driver install` simply gets the old binary
+conflict — safe degradation, not corruption — and git keeps both parents of every merge, so even a
+merge you dislike is reconstructable. It is a merge *on pull*, not live sync.
+
+For review, two commands turn a binary blob into something a human can read:
+
+```bash
+npx klypix-mcp diff main            # card-level: what was added / updated / removed
+npx klypix-mcp pr-brief origin/main # the brain cards that reference this PR's changed files
+```
+
+`diff` compares meaning rather than bytes (a re-save restamps timestamps; that is not a change).
+`pr-brief` matches a card's `#file-…` evidence anchors against the changed paths, so a reviewer
+sees the decisions already recorded about the code in front of them. `examples/github/brain-pr.yml`
+wires both into a sticky pull-request comment using nothing but the checkout and the default
+`GITHUB_TOKEN` — no KLYPIX service in the path.
 
 Concurrent sessions serialize behind a capture lock, and each write is a temp file plus an atomic
 rename, so a crash mid-write leaves the previous good file intact. The lock is advisory with a
 ~3.6-second budget: past that, a writer proceeds anyway and flags it in the health log, so
 sustained contention can still lose an update. That is a deliberate trade — dropping the markers
 was judged worse — but it is a real limit, not a guarantee.
+
+---
+
+## The command line
+
+The MCP verbs below are what agents call. These are what **you** call:
+
+| Command | What it does |
+|---|---|
+| `npx klypix-mcp init` | Seed a starter `brain.klypix` here and print an MCP config |
+| `npx klypix-mcp install` | Install the engine + Claude Code hooks on this machine (see Quick start) |
+| `npx klypix-mcp link` | Wire this project for Cursor, Cline, Windsurf, Copilot, Gemini CLI, Aider (`--check` audits) |
+| `npx klypix-mcp doctor` | One verdict: version, hosts, live sessions, tool count, drift. Exits non-zero — usable as a CI gate |
+| `npx klypix-mcp conformance` | Launch two real MCP clients against this build and verify coordination behaviour |
+| `npx klypix-mcp git-driver` | Register the lossless `.klypix` merge driver for a repo (`status` to check) |
+| `npx klypix-mcp diff [ref]` | Card-level brain diff against a git ref, as markdown |
+| `npx klypix-mcp pr-brief [ref]` | Brain cards referencing the files changed since a ref, as markdown |
+| `npx klypix-mcp garden-code` | Print the human approval code `brain_garden` requires |
 
 ---
 
@@ -477,9 +526,9 @@ Read this section before you build on any of it.
 Every number here is measured on our own project brain. Nothing below is published, benchmarked or
 independently validated.
 
-- **Dogfood scale.** KLYPIX itself is built with its own brain: **1,523 cards and 1,404
+- **Dogfood scale.** KLYPIX itself is built with its own brain: **1,645 cards and 1,521
   connections**, written by multiple concurrent agent sessions, receipts in the file. Current as of
-  2026-07-30.
+  2026-08-01.
 - **Recall.** 73% of past decisions recovered with one search round, 55% brief-only, 0% cold.
   Caveat that travels with it: n=20, our own brain, self-authored questions, LLM-judged.
 - **Ranker.** recall@5 of the true source card went **15% → 40%** across two upgrades (n=20 frozen
@@ -487,7 +536,7 @@ independently validated.
   experiment that *regressed* — contextual prefixes on short cards — is recorded next to the wins.
 - **What we do not publish.** No download count: this package's own 24-hour auto-updater generates
   most of it, so it is not a user count. No adoption, team or customer figures. No brief-token
-  figure — the last one was measured at ~600 cards and is stale at 1,523.
+  figure — the last one was measured at ~600 cards and is stale at 1,645.
 - **The eval harness is not in this repo.** It lives in the private KLYPIX desktop repository. The
   numbers above are ours to defend, not yours to reproduce from here — treat them accordingly.
 

@@ -22,6 +22,11 @@ const required = [
   'alertQueued',
   'proactiveLogging',
   'guaranteedInBandDelivery',
+  'crossMachineConsentGate',
+  'crossMachinePeerVisibility',
+  'crossMachineOverlapWarning',
+  'crossMachineMessageOnce',
+  'crossMachineOfflineDegradation',
 ];
 let failures = 0;
 const ok = (condition, label) => {

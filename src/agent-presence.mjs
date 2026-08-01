@@ -268,6 +268,87 @@ export function upsertSession({
   }
 }
 
+// ── Cross-PC remote rows (presence-relay.mjs is the only intended caller) ───
+// Writes rows RECEIVED from the cloud presence channel into the same per-brain
+// lane every reader already renders (peer footer, brain_sync peers, overlap
+// conflicts, doctor) — one rendering path, zero reader changes. Precedence is
+// explicit (D3, 2026-08-01): a row claiming THIS machine is refused (own-echo
+// insurance beyond the frame-level drop), and a session id that already exists
+// as a LOCAL row is never overwritten by a cloud frame — a session on this
+// machine renders once, as local. Rows land with via:'cloud' + channelSeen.cloud
+// so existing TTL pruning governs their lifetime (P3) and buildPresenceFrame
+// refuses to re-broadcast them (loop prevention).
+export function upsertRemoteSessions({ brainPath, rows, machineId = MACHINE_ID, home, now = Date.now() }) {
+  if (!brainPath || !Array.isArray(rows) || !rows.length) return withWriteVerdict([], false, 'nothing-to-write');
+  const laneFile = laneFileFor(brainPath, home);
+  const lockFile = laneFile + '.lock';
+  const gotLock = acquireLock(lockFile);
+  if (!gotLock) return withWriteVerdict(listActiveSessions({ brainPath, home, now }), false, 'lane-locked');
+  try {
+    const data = readLane(laneFile);
+    const sessions = pruneSessions(data.sessions, now);
+    for (const row of rows) {
+      if (!row?.id || !row.machine || row.via !== 'cloud') continue;
+      if (String(row.machine) === String(machineId)) continue;   // never a remote row for this machine
+      const existingIdx = sessions.findIndex((session) => session.id === row.id);
+      if (existingIdx >= 0 && sessions[existingIdx].via !== 'cloud') continue;   // local row wins
+      const previous = existingIdx >= 0 ? sessions[existingIdx] : {};
+      const next = {
+        ...previous,
+        id: String(row.id),
+        project: path.basename(path.dirname(brainPath)),
+        client: String(row.client || previous.client || 'unknown'),
+        surface: row.surface ?? previous.surface ?? null,
+        branch: row.branch ?? previous.branch ?? null,
+        intent: String(row.intent || '').slice(0, 160),
+        files: normalizeFiles(row.files),
+        machine: String(row.machine),
+        host: row.host ?? previous.host ?? null,
+        via: 'cloud',
+        channels: ['cloud'],
+        channelSeen: { cloud: now },   // receiver clock (P4) — frame time never decides freshness
+        startedAt: previous.startedAt || now,
+        lastSeen: now,
+      };
+      if (existingIdx >= 0) sessions[existingIdx] = next;
+      else sessions.push(next);
+    }
+    fs.mkdirSync(path.dirname(laneFile), { recursive: true });
+    fs.writeFileSync(laneFile, JSON.stringify({
+      ...data,
+      sessions: sessions.slice(-40),
+      messages: capMessages(pruneMessages(data.messages, now), 30),
+    }));
+    return withWriteVerdict(sessions.sort((a, b) => Number(b.lastSeen || 0) - Number(a.lastSeen || 0)), true);
+  } finally {
+    if (gotLock) releaseLock(lockFile);
+  }
+}
+
+// Consent revoked, or the channel deliberately left: receive-display stops too
+// (symmetric consent, P9). Removes ONLY cloud-sourced rows — local presence is
+// untouched, so degradation lands exactly on today's local-only behavior.
+export function purgeRemoteSessions({ brainPath, home, now = Date.now() }) {
+  if (!brainPath) return [];
+  const laneFile = laneFileFor(brainPath, home);
+  const lockFile = laneFile + '.lock';
+  const gotLock = acquireLock(lockFile);
+  if (!gotLock) return listActiveSessions({ brainPath, home, now });
+  try {
+    const data = readLane(laneFile);
+    const sessions = pruneSessions(data.sessions, now).filter((session) => session.via !== 'cloud');
+    fs.mkdirSync(path.dirname(laneFile), { recursive: true });
+    fs.writeFileSync(laneFile, JSON.stringify({
+      ...data,
+      sessions,
+      messages: capMessages(pruneMessages(data.messages, now), 30),
+    }));
+    return sessions;
+  } finally {
+    if (gotLock) releaseLock(lockFile);
+  }
+}
+
 export function removeSession({ brainPath, id, channel = null, home, now = Date.now() }) {
   if (!brainPath || !id) return [];
   const laneFile = laneFileFor(brainPath, home);

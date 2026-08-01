@@ -160,6 +160,103 @@ try {
     a.client.callTool({ name: 'brain_sync', arguments: { phase: 'complete' } }),
     b.client.callTool({ name: 'brain_sync', arguments: { phase: 'complete' } }),
   ]);
+
+  // ── Cross-PC presence: simulated two-machine scenario ─────────────────────
+  // Two isolated registries (one per "machine") + a mock channel around the
+  // pure transport seam (src/presence-relay.mjs relayOutbound/relayInbound —
+  // the exact functions the desktop relay wraps its Realtime channel with).
+  // Proves: peer visibility across machines, overlap warning on the canonical
+  // file key, message delivered once under double-delivery, clean degradation
+  // with the channel dead, and the consent gate at the seam.
+  {
+    const [{ relayOutbound, relayInbound, PRESENCE_CONSENT_VERSION, PRESENCE_CONSENT_PURPOSE, PRESENCE_CONSENT_SCOPE },
+      { upsertSession, upsertRemoteSessions, listActiveSessions, postPresenceMessage, receiveMessages },
+      { findPresenceConflicts }] = await Promise.all([
+      import('../src/presence-relay.mjs'),
+      import('../src/agent-presence.mjs'),
+      import('../src/mcp-presence.mjs'),
+    ]);
+    const GRANT = {
+      version: PRESENCE_CONSENT_VERSION, decision: 'granted', decidedAt: new Date().toISOString(),
+      purpose: PRESENCE_CONSENT_PURPOSE, scope: PRESENCE_CONSENT_SCOPE,
+    };
+    const xpcRoot = path.join(tempRoot, 'xpc');
+    const homeA = path.join(xpcRoot, 'homeA');
+    const homeB = path.join(xpcRoot, 'homeB');
+    const repoA = path.join(xpcRoot, 'machineA', 'repo');
+    const repoB = path.join(xpcRoot, 'machineB', 'repo');
+    for (const dir of [homeA, homeB, repoA, repoB]) fs.mkdirSync(dir, { recursive: true });
+    const brainA = path.join(repoA, 'brain.klypix');
+    const brainB = path.join(repoB, 'brain.klypix');
+    fs.writeFileSync(brainA, 'xpc-fixture');
+    fs.writeFileSync(brainB, 'xpc-fixture');
+    const now = Date.now();
+
+    upsertSession({
+      brainPath: brainA, home: homeA, now, id: 'xpc-dev-a', client: 'claude-code', branch: 'main',
+      intent: 'edit the shared component', files: [path.join(repoA, 'src', 'Shared.tsx')],
+    });
+    upsertSession({
+      brainPath: brainB, home: homeB, now, id: 'xpc-dev-b', client: 'codex', branch: 'main',
+      intent: 'restyle the shared component', files: ['src/Shared.tsx'],
+    });
+
+    // Consent gate FIRST: with no record, the seam must emit nothing.
+    let framesSent = 0;
+    const gated = relayOutbound({
+      sessions: listActiveSessions({ brainPath: brainA, home: homeA, now }),
+      consent: null, machineId: 'xpc-mach-a', root: repoA, now, send: () => { framesSent++; },
+    });
+    checks.crossMachineConsentGate = framesSent === 0 && gated.reason === 'no-consent';
+
+    // Live channel: A's session and message reach B exactly once.
+    const wire = [];
+    relayOutbound({
+      sessions: listActiveSessions({ brainPath: brainA, home: homeA, now }),
+      messages: (() => {
+        postPresenceMessage({ brainPath: brainA, from: 'xpc-dev-a', text: 'starting on Shared.tsx now', home: homeA, now });
+        try { return JSON.parse(fs.readFileSync(path.join(homeA, '.claude', 'project-brain', 'sessions', fs.readdirSync(path.join(homeA, '.claude', 'project-brain', 'sessions')).find((f) => f.endsWith('.json'))), 'utf8')).messages || []; }
+        catch { return []; }
+      })(),
+      consent: GRANT, machineId: 'xpc-mach-a', hostLabel: 'MACHINE-A', root: repoA, now,
+      send: (frame) => wire.push(frame),
+    });
+    const deliverAll = (stampNow) => {
+      const rows = [];
+      for (const frame of wire) {   // double-delivery: every frame arrives twice (at-least-once transport)
+        for (let i = 0; i < 2; i++) {
+          const inbound = relayInbound(frame, { consent: GRANT, machineId: 'xpc-mach-b', now: stampNow });
+          if (inbound?.type === 'presence') rows.push(inbound.row);
+          if (inbound?.type === 'message') {
+            postPresenceMessage({
+              brainPath: brainB, from: inbound.message.from, to: inbound.message.to,
+              text: inbound.message.text, dedupeKey: inbound.message.dedupeKey, home: homeB, now: stampNow,
+            });
+          }
+        }
+      }
+      if (rows.length) upsertRemoteSessions({ brainPath: brainB, rows, machineId: 'xpc-mach-b', home: homeB, now: stampNow });
+    };
+    deliverAll(now + 500);
+
+    const bSessions = listActiveSessions({ brainPath: brainB, home: homeB, now: now + 500 });
+    const remote = bSessions.find((session) => session.id === 'xpc-dev-a');
+    checks.crossMachinePeerVisibility = !!remote && remote.via === 'cloud' && remote.host === 'MACHINE-A';
+    const overlaps = findPresenceConflicts(bSessions, 'xpc-dev-b', { projectRoot: repoB });
+    checks.crossMachineOverlapWarning = overlaps.length === 1
+      && overlaps[0].id === 'xpc-dev-a'
+      && overlaps[0].files.some((file) => file.toLowerCase().includes('src/shared.tsx'));
+    const delivered = receiveMessages({ brainPath: brainB, sessionId: 'xpc-dev-b', home: homeB, now: now + 600 });
+    checks.crossMachineMessageOnce = delivered.filter((message) => message.text.includes('Shared.tsx')).length === 1;
+
+    // Dead channel: outbound reports without throwing; local presence intact.
+    const dead = relayOutbound({
+      sessions: listActiveSessions({ brainPath: brainA, home: homeA, now: now + 700 }),
+      consent: GRANT, machineId: 'xpc-mach-a', root: repoA, now: now + 700, send: undefined,
+    });
+    checks.crossMachineOfflineDegradation = dead.sent === 0 && dead.reason === 'no-channel'
+      && listActiveSessions({ brainPath: brainA, home: homeA, now: now + 700 }).some((session) => session.id === 'xpc-dev-a');
+  }
 } catch (error) {
   checks.runtime = false;
   checks.error = error?.message || String(error);
@@ -176,6 +273,11 @@ const required = [
   'alertQueued',
   'proactiveLogging',
   'guaranteedInBandDelivery',
+  'crossMachineConsentGate',
+  'crossMachinePeerVisibility',
+  'crossMachineOverlapWarning',
+  'crossMachineMessageOnce',
+  'crossMachineOfflineDegradation',
 ];
 const ok = required.every((name) => checks[name] === true);
 const result = {

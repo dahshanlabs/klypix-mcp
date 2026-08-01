@@ -21,6 +21,12 @@ import {
   removeSession,
   upsertSession,
 } from './agent-presence.mjs';
+// ONE definition of the file key. Exact-overlap detection (here) and finding
+// ROUTING (there) must agree byte for byte — a file "owned" by a peer under one
+// normalizer and not the other is a route that silently never happens. The
+// canonical copy lives in the pure module because that one is import-restricted
+// (crypto only), so it can never grow a dependency this file would inherit.
+import { normalizeFileKey } from './finding-routing.mjs';
 
 export const MCP_HEARTBEAT_MS = 60_000;
 export const MCP_INBOX_POLL_MS = 3_000;
@@ -50,21 +56,6 @@ const compact = (value) => String(value || '').replace(/\s+/g, ' ').trim();
 // a path that cannot be placed under `root` keeps the previous (absolute,
 // lowercased) key, so an unrelated file still compares as itself and a
 // declaration is never dropped.
-const normalizeFileKey = (value, root) => {
-  const raw = String(value || '')
-    .replace(/\\/g, '/')
-    .replace(/^\.\//, '')
-    .trim()
-    .toLowerCase();
-  if (!raw || !root) return raw;
-  const rootKey = String(root)
-    .replace(/\\/g, '/')
-    .replace(/\/+$/, '')
-    .trim()
-    .toLowerCase();
-  if (!rootKey || raw === rootKey) return raw;
-  return raw.startsWith(`${rootKey}/`) ? raw.slice(rootKey.length + 1) : raw;
-};
 
 // TWIN recognition: one logical session can (still) appear as two lane rows —
 // its lifecycle id and an mcp-<pid> id — whenever id adoption failed. Rows that

@@ -24,6 +24,7 @@ import {
   safeReadCodexConfig,
 } from '../src/agent-rules.mjs';
 import { inspect } from '../src/brain-doctor.mjs';
+import { laneFileFor } from '../src/agent-presence.mjs';
 import { makeVault, seedBrain } from './_harness.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -206,13 +207,32 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
   ok(names.includes('brain_lens'), 'brain_lens is a registered MCP tool');
   ok(names.length === 18, `tool manifest is 18 verbs (got ${names.length})`);
 
+  // Seed one real lane receipt for THIS MCP session. The doctor must use the
+  // adopted session id passed by the running worker, not guess a sender.
+  const lane = laneFileFor(path.join(vault, 'brain.klypix'), isolatedHome);
+  const laneData = JSON.parse(fs.readFileSync(lane, 'utf8'));
+  const self = laneData.sessions?.[0];
+  const receiptNow = Date.now();
+  laneData.sessions.push({
+    id: 'doctor-peer', client: 'codex', branch: 'master', intent: 'receipt test',
+    files: ['src/receipt-peer.mjs'], startedAt: receiptNow - 60_000,
+    lastSeen: receiptNow, channelSeen: {},
+  });
+  laneData.messages.push({
+    id: 'doctor-receipt', from: self.id, to: 'all', text: 'verified doctor receipt',
+    ts: receiptNow - 1_000, candidateIds: ['doctor-peer'], seen: ['doctor-peer'],
+  });
+  fs.writeFileSync(lane, JSON.stringify(laneData, null, 2));
+
   const r = await client.callTool({ name: 'brain_doctor', arguments: { project: vault } });
   const text = (r.content || []).filter(c => c.type === 'text').map(c => c.text).join('\n');
   ok(r.isError !== true, 'brain_doctor call is not an error');
   ok(/brain_doctor/.test(text) && /VERSION/.test(text) && /CLAUDE/.test(text)
     && /CODEX/.test(text) && /SESSIONS/.test(text),
   'brain_doctor returns the host-neutral layered verdict');
-  ok(/1 active/.test(text), 'the MCP connection itself is counted as a live session without hooks');
+  ok(/2 active/.test(text), 'the MCP connection and synthetic live peer are counted without hooks');
+  ok(/your last note \(just now\): shown to all 1 peer\(s\) that were live\./.test(text),
+    'brain_doctor renders this session\'s real seen receipt without claiming a human read it');
 
   const synced = await client.callTool({
     name: 'brain_sync',

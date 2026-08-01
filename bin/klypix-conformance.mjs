@@ -161,6 +161,39 @@ try {
     b.client.callTool({ name: 'brain_sync', arguments: { phase: 'complete' } }),
   ]);
 
+  // Finding routing: pure, in-process public proof. This exercises the
+  // canonical seams directly and never touches the durable brain or real lane.
+  {
+    const { routeFinding, summarizeReceipts, renderReceiptSummary } = await import('../src/finding-routing.mjs');
+    const now = Date.now();
+    const lane = [
+      { id: 'finding-sender', branch: 'master', intent: 'routing proof', files: ['src/finding-routing.mjs'], startedAt: now - 60_000, lastSeen: now },
+      { id: 'finding-owner', branch: 'master', intent: 'doctor receipt surface', files: ['src/brain-doctor.mjs'], startedAt: now - 60_000, lastSeen: now },
+    ];
+    const routed = routeFinding({
+      finding: { path: 'src/brain-doctor.mjs', text: 'receipt surface is missing' },
+      sessions: lane, selfId: 'finding-sender', now,
+    });
+    checks.findingRouteOwnerReason = routed.verdict === 'routed'
+      && routed.targets?.[0]?.id === 'finding-owner'
+      && /declared `src\/brain-doctor\.mjs`/.test(routed.reason)
+      && /confidence 1\.00/.test(routed.reason);
+
+    const nobody = routeFinding({
+      finding: { path: 'docs/unowned.md', text: 'documented claim is stale' },
+      sessions: lane, selfId: 'finding-sender', now,
+    });
+    checks.findingRouteNobodyReason = nobody.verdict === 'nobody'
+      && nobody.targets?.length === 0
+      && /no live session declared docs\/unowned\.md/.test(nobody.reason);
+
+    const receipt = summarizeReceipts({
+      messages: [{ id: 'finding-note', from: 'finding-sender', to: 'all', text: 'verified note', ts: now - 1_000, candidateIds: ['finding-owner'], seen: ['finding-owner'] }],
+      sessions: lane, selfId: 'finding-sender', now,
+    });
+    checks.findingReceiptRendered = /shown to all 1 peer\(s\) that were live/.test(renderReceiptSummary(receipt));
+  }
+
   // ── Cross-PC presence: simulated two-machine scenario ─────────────────────
   // Two isolated registries (one per "machine") + a mock channel around the
   // pure transport seam (src/presence-relay.mjs relayOutbound/relayInbound —
@@ -273,6 +306,9 @@ const required = [
   'alertQueued',
   'proactiveLogging',
   'guaranteedInBandDelivery',
+  'findingRouteOwnerReason',
+  'findingRouteNobodyReason',
+  'findingReceiptRendered',
   'crossMachineConsentGate',
   'crossMachinePeerVisibility',
   'crossMachineOverlapWarning',

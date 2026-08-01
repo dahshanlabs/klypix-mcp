@@ -461,7 +461,11 @@ server.registerTool('brain_doctor', {
     // self = THIS running server (the process answering this very call). Passing it
     // makes the RUNNING check report the caller's actual server version, never a
     // phantom another session's heartbeat wrote to the shared registry.
-    const report = inspect({ projectDir: project ? path.resolve(project) : mcpPresence.vault, npmLatest, self: { pid: process.pid, version: PKG_VERSION } });
+    const report = inspect({
+      projectDir: project ? path.resolve(project) : mcpPresence.vault,
+      npmLatest,
+      self: { pid: process.pid, version: PKG_VERSION, id: mcpPresence.id },
+    });
     return mcpPresence.decorateToolResult({ content: [{ type: 'text', text: render(report, { color: false }) }] });
   } catch (e) {
     return { content: [{ type: 'text', text: `brain_doctor unavailable: ${e?.message || e}` }], isError: true };

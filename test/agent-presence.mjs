@@ -8,6 +8,7 @@ import {
   laneFileFor,
   listActiveSessions,
   MCP_SESSION_FRESH_MS,
+  postPresenceMessage,
   removeSession,
   SESSION_FRESH_MS,
   upsertSession,
@@ -74,6 +75,14 @@ ok(summary.includes('2 active sessions') && summary.includes('Claude Code 1') &&
   'presence summary reports the all-host count and mix');
 ok(summary.includes('claude-s') && summary.includes('keep the existing capture path stable'),
   'presence summary identifies the other active session');
+
+const receiptSeed = postPresenceMessage({
+  brainPath, home, now: now + 1000, from: 'codex-session', to: 'all', text: 'receipt audience snapshot',
+});
+ok(receiptSeed.posted
+  && receiptSeed.message?.candidateIds?.length === 1
+  && receiptSeed.message.candidateIds[0] === 'claude-session',
+  'a sent note snapshots its live recipient ids so receipts survive later session cleanup');
 
 const soloSummary = formatPresenceMessage([two.find((session) => session.id === 'codex-session')],
   'codex-session', { includeSolo: true, now: now + 1000 });

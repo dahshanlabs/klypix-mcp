@@ -28,6 +28,7 @@ import { fileURLToPath } from 'url';
 import { auditProject, codexGlobalInstructionsInstalled, resolveVersion } from './agent-rules.mjs';
 import { codexPresenceHookStatus } from './codex-hooks.mjs';
 import { inspectAutoUpdate } from './mcp-auto-update.mjs';
+import { renderReceiptSummary, summarizeReceipts } from './finding-routing.mjs';
 
 // klypix-format is the DECAY-GUARD seam (classifyDecay + the status renderer),
 // loaded failure-tolerant: the doctor's doctrine is "an absent seam is a fact
@@ -239,7 +240,7 @@ const sessionLiveness = (s, now) => {
   return now - lastSeen < SESSION_FRESH_MS ? { lastSeen, channels: Array.isArray(s?.channels) ? s.channels : [] } : null;
 };
 
-function inspectPeers(brainDir, brainPath, now) {
+function inspectPeers(brainDir, brainPath, now, selfId = null) {
   const file = path.join(brainDir, 'sessions', `${sha(normBrainPath(brainPath))}.json`);
   const data = readJson(file, null);
   const sessions = Array.isArray(data?.sessions) ? data.sessions : [];
@@ -269,7 +270,15 @@ function inspectPeers(brainDir, brainPath, now) {
   const byHost = new Map();
   for (const p of live) { if (p.hostPid) byHost.set(p.hostPid, [...(byHost.get(p.hostPid) || []), p.id]); }
   const twinGroups = [...byHost.entries()].filter(([, ids]) => ids.length > 1).map(([hostPid, ids]) => ({ hostPid, ids }));
-  return { file, live, count: live.length, rawRecent, syncedCount: live.filter(p => p.synced).length, twinGroups };
+  const receipts = selfId
+    ? summarizeReceipts({
+      messages: Array.isArray(data?.messages) ? data.messages : [],
+      sessions,
+      selfId,
+      now,
+    })
+    : { sent: 0, receipts: [] };
+  return { file, live, count: live.length, rawRecent, syncedCount: live.filter(p => p.synced).length, twinGroups, receipts };
 }
 
 // ── DECAY-GUARD layer (fast-decay status protection, 2026-07-28) ─────────────
@@ -340,7 +349,14 @@ export function inspect(opts = {}) {
     globalInstructions: codexGlobalInstructionsInstalled(home),
   };
   const tools = inspectTools(brainDir, PKG_ROOT);
-  const peers = inspectPeers(brainDir, brainPath, now);
+  const env = opts.env || process.env;
+  // MCP passes the adopted live id explicitly. The CLI can inherit a host id,
+  // but never invents one: a guessed sender would display somebody else's note.
+  const receiptSessionId = opts.selfId || opts.self?.id || [
+    'KLYPIX_SESSION_ID', 'CODEX_THREAD_ID', 'CLAUDE_CODE_SESSION_ID',
+    'CLAUDE_SESSION_ID', 'CURSOR_SESSION_ID', 'CLINE_SESSION_ID', 'WINDSURF_SESSION_ID',
+  ].map((key) => env?.[key]).find((value) => String(value || '').trim()) || null;
+  const peers = inspectPeers(brainDir, brainPath, now, receiptSessionId);
   // opts.fmtLib is a test seam (stub engines); production uses the module lib.
   const decayGuard = inspectDecayGuard(brainDir, opts.fmtLib !== undefined ? opts.fmtLib : fmtLib, now);
 
@@ -403,7 +419,7 @@ export function inspect(opts = {}) {
     if (peers.twinGroups && peers.twinGroups.length) actions.push(`/mcp reconnect   # ${peers.twinGroups.length} session(s) split across twin lane rows (channel merge not occurring) — reconnect adopts the merged id`);
   }
 
-  return { verdict, layers, drifted, version, running, supervisors, autoUpdate, hooks, codexSmart, codexHooks, tools, peers, sessions: peers, harness, npm, decayGuard, project: { dir: projectDir, brainPath, hasBrain }, brainDir, actions };
+  return { verdict, layers, drifted, version, running, supervisors, autoUpdate, hooks, codexSmart, codexHooks, tools, peers, sessions: peers, receipts: peers.receipts, receiptSessionId, harness, npm, decayGuard, project: { dir: projectDir, brainPath, hasBrain }, brainDir, actions };
 }
 
 // One-line drift summary (empty when clean) — for a footer / status line.
@@ -536,6 +552,13 @@ export function render(r, opts = {}) {
       L.push(`        ${c.yel}⚠ twin rows — channel merge NOT occurring: host pid ${g.hostPid} appears as ${g.ids.join(' + ')} (one logical session counted ${g.ids.length}×)${c.rst}`);
     }
   }
+
+  // RECEIPT: on-demand and agent-neutral. This is deliberately not a verdict
+  // layer: an absent sender id or an empty 24h window is normal, never drift.
+  const receipt = renderReceiptSummary(r.receipts);
+  if (receipt) L.push(receipt.replace(/^\ud83d\udcec Your/, '\ud83d\udcec your'));
+  else if (r.receiptSessionId) L.push(`${c.dim}\u00b7 NOTES     no sent note from this session in the last 24h${c.rst}`);
+  else L.push(`${c.dim}\u00b7 NOTES     receipt unavailable (caller session id not exposed)${c.rst}`);
 
   // HARNESS
   if (!r.project.hasBrain) L.push(`${c.dim}· HARNESS  no ./brain.klypix in ${r.project.dir} — projection n/a${c.rst}`);

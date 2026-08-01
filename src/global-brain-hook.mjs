@@ -526,8 +526,19 @@ function postMessages(msgs) {
         let data = {}; try { data = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8')); } catch { /* fresh */ }
         const sessions = Array.isArray(data.sessions) ? data.sessions : [];
         const now = Date.now();
+        const live = pruneSessions(sessions, now);
         const kept = (Array.isArray(data.messages) ? data.messages : []).filter(m => m && (now - (m.ts || 0) < MSG_FRESH_MS));
-        for (const m of msgs) kept.push(m);
+        for (const m of msgs) {
+            // Snapshot the SEND-time audience so the receipt remains truthful
+            // after a peer exits, and so a later viewer never inflates X of Y.
+            // This is lane metadata only; no card or message text is copied.
+            if (!Array.isArray(m.candidateIds)) {
+                m.candidateIds = live
+                    .filter(s => s?.id && s.id !== m.from && msgTargetsMe(m, s, s.id))
+                    .map(s => String(s.id).slice(0, 160));
+            }
+            kept.push(m);
+        }
         fs.mkdirSync(SESSIONS_DIR, { recursive: true });
         fs.writeFileSync(SESSIONS_FILE, JSON.stringify({ ...data, sessions, messages: capMsgs(kept) }));
     } catch { /* best-effort */ } finally { if (got) releaseLock(SESSIONS_LOCK); }
@@ -1220,7 +1231,14 @@ const RULE_DRAFT_MAX_SURFACINGS = 5;                  // ignored across this man
 // calls (a fix/perf commit is also a verify — you commit verified work).
 const VERIFY_CMD = /\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|build|lint|typecheck|check|verify|e2e)\b|\bnpm\s+ci\b|\bvitest\b|\bjest\b|\bplaywright\b|\bpytest\b|\bgo\s+test\b|\bcargo\s+(?:test|build|check|clippy)\b|\btsc\b|\bmocha\b|\beslint\b|\bphpunit\b|\brspec\b|\bgradle\s+(?:test|build|check)\b|\bmvn\s+(?:test|verify)\b/i;
 const readRuleDrafts = () => { try { const d = JSON.parse(fs.readFileSync(RULE_DRAFTS, 'utf8')); return Array.isArray(d.drafts) ? d.drafts : []; } catch { return []; } };
-const writeRuleDrafts = (drafts) => { try { fs.mkdirSync(path.dirname(RULE_DRAFTS), { recursive: true }); fs.writeFileSync(RULE_DRAFTS, JSON.stringify({ drafts: (drafts || []).slice(-RULE_DRAFTS_MAX) }, null, 2)); } catch { /* best-effort */ } };
+// PRESERVE SIBLING KEYS. This sidecar now carries a second, independent list
+// (`findings` — routed cross-lane findings), and the old writer serialized a
+// fresh `{ drafts }` object, so ANY rule-draft write silently destroyed every
+// pending finding and vice versa. Both writers now read the file first and
+// replace only their own key. Adding a third list is safe by the same rule.
+const readSidecar = () => { try { const d = JSON.parse(fs.readFileSync(RULE_DRAFTS, 'utf8')); return d && typeof d === 'object' && !Array.isArray(d) ? d : {}; } catch { return {}; } };
+const writeSidecar = (patch) => { try { fs.mkdirSync(path.dirname(RULE_DRAFTS), { recursive: true }); fs.writeFileSync(RULE_DRAFTS, JSON.stringify({ ...readSidecar(), ...patch }, null, 2)); } catch { /* best-effort */ } };
+const writeRuleDrafts = (drafts) => writeSidecar({ drafts: (drafts || []).slice(-RULE_DRAFTS_MAX) });
 const draftKey = (area, text) => sha(((area || '') + '|' + String(text)).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim());
 // Token overlap: is a draft seed substantially covered by a (skill) card's text?
 // Used to (a) retire a draft a captured 🛠️ skill fulfils and (b) NOT surface a draft
@@ -1371,6 +1389,118 @@ function ruleDraftsFooter(sid, struct, { markShown = true } = {}) {
             });
         }
         return '\n' + lines.join('\n') + '\n';
+    } catch { return ''; }
+}
+
+// ── Cross-lane FINDING routing (2026-08-01) ─────────────────────────────────
+// The incident: an 8-agent doc audit found four real defects in OTHER sessions'
+// lanes, and all four reached their owners only because the founder happened to
+// say "message them". The lane already stores every session's declared `files`;
+// nothing read them for this. So: when a session VERIFIES something about a file
+// OUTSIDE its own scope, work out whose lane it is, DRAFT the note, and let the
+// human send it with one paste. Same contract as the rule drafts above — draft
+// automatically, send DELIBERATELY, never auto-send, never a brain write.
+//
+// The engine is src/finding-routing.mjs, imported LAZILY and fail-open: a
+// deployment whose ~/.claude/project-brain predates it simply gets no finding
+// drafts, exactly as before. This hook must never throw, in any project, ever.
+let _routingLib = undefined;
+async function routingLib() {
+    if (_routingLib !== undefined) return _routingLib;
+    try { _routingLib = await import(new URL('./finding-routing.mjs', import.meta.url).href); }
+    catch { _routingLib = null; }   // older deployment → the feature is simply absent
+    return _routingLib;
+}
+const readFindings = () => { const d = readSidecar(); return Array.isArray(d.findings) ? d.findings : []; };
+// Locked read-modify-write of the FINDINGS half of the shared sidecar. Mirrors
+// persistDrafts exactly, including the "disk already matches → no write" no-op
+// that keeps an adopter project from growing an empty sidecar.
+function persistFindings(mutate) {
+    const got = acquireLock(RULE_DRAFTS_LOCK, { tries: 20, waitMs: 25 });
+    try {
+        const now = Date.now();
+        const raw = readFindings();
+        const rawJson = JSON.stringify(raw);
+        const next = (mutate(raw, now) || raw);
+        if (JSON.stringify(next) === rawJson) return;
+        writeSidecar({ findings: next.slice(-40) });
+    } catch { /* best-effort */ } finally { if (got) releaseLock(RULE_DRAFTS_LOCK); }
+}
+// Live lane rows, freshness-pruned — the routing candidate set.
+const laneRows = () => { try { return pruneSessions(readSessions(), Date.now()); } catch { return []; } };
+
+// DETECT + ROUTE + PERSIST. Called from capture() with the same `verified`
+// signal that gates rule drafts. Never throws; returns a count for the ledger.
+async function draftFindingsFromCards(cards, verified, sid, ownedPaths) {
+    try {
+        const R = await routingLib();
+        if (!R || !verified || !Array.isArray(cards) || !cards.length) return 0;
+        const now = Date.now();
+        const sessions = laneRows();
+        // Own scope = what this session DECLARED on the lane plus everything it
+        // actually touched this turn. Both, because a session that edited a file
+        // without declaring it still owns findings about it (R4 at the source).
+        const mine = sessions.find(s => s.id === sid);
+        const owned = [...new Set([...(ownedPaths || []), ...(Array.isArray(mine?.files) ? mine.files : [])])];
+        const { drafts } = R.buildFindingDrafts({ cards, verified, ownedPaths: owned, sessions, selfId: sid, root: CWD, now });
+        let added = 0;
+        persistFindings((existing) => {
+            const merged = R.mergeFindingDrafts(existing, drafts, {
+                now,
+                // Re-route every surviving draft: an owner may have gone offline
+                // (R3) or a held no-owner finding may finally have one (R1).
+                reroute: (d) => R.routeFinding({ finding: { path: d.path, text: d.text }, sessions, selfId: sid, root: CWD, now }),
+            });
+            added = merged.added;
+            return merged.drafts;
+        });
+        return added;
+    } catch { return 0; }
+}
+
+// DELIVER. The surface mirrors ruleDraftsFooter exactly — same shape, same
+// markShown contract (per-prompt marks, SessionStart lists read-only), same
+// decay — because that is the approval idiom agents in this repo already know.
+async function findingDraftsFooter(sid, { markShown = true } = {}) {
+    try {
+        if (!sid) return '';
+        const R = await routingLib();
+        if (!R) return '';
+        const all = R.pendingFindingDrafts(readFindings(), { sid: markShown ? sid : null });
+        if (!all.length) return '';
+        const display = all.slice(0, 3);
+        const out = R.renderFindingDrafts(display, { limit: 3, total: all.length });
+        if (markShown) {
+            const shown = new Set(display.map(d => d.id));
+            persistFindings((drafts) => {
+                for (const d of drafts) {
+                    if (!shown.has(d.id)) continue;
+                    if (!Array.isArray(d.shownSessions)) d.shownSessions = [];
+                    if (!d.shownSessions.includes(sid)) d.shownSessions = [...d.shownSessions, sid].slice(-5);
+                }
+                return drafts;
+            });
+        }
+        return out;
+    } catch { return ''; }
+}
+
+// THE RECEIPT. `message.seen[]` has always been recorded and nothing ever
+// rendered it, so "did they get it?" was unanswerable. Read-only: it never acks,
+// never writes, and only ever reports on THIS session's OWN sent notes.
+async function receiptFooter(sid) {
+    try {
+        if (!sid) return '';
+        const R = await routingLib();
+        if (!R) return '';
+        let data = {}; try { data = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8')); } catch { return ''; }
+        const summary = R.summarizeReceipts({
+            messages: Array.isArray(data.messages) ? data.messages : [],
+            sessions: Array.isArray(data.sessions) ? data.sessions : [],
+            selfId: sid,
+        });
+        const text = R.renderReceiptSummary(summary);
+        return text ? '\n' + text : '';
     } catch { return ''; }
 }
 
@@ -1596,7 +1726,13 @@ async function capture(lib) {
     // perf commit this session counts as a verify (you commit verified work).
     {
         const hadFixCommit = commitCards.some(cc => cc.createdVia === 'commit' && !/🏁/.test(String(cc.text || '')));
-        draftRulesFromFixes(lib, cards, sessionVerified(shellCmds, errorIds, hadFixCommit), sid);
+        const verified = sessionVerified(shellCmds, errorIds, hadFixCommit);
+        draftRulesFromFixes(lib, cards, verified, sid);
+        // Cross-lane FINDING routing rides the SAME verify gate: a finding this
+        // session verified about a file outside its own scope is drafted and
+        // routed to whoever declared that file. Nothing is sent. `recentPaths`
+        // is this turn's real touch-set — the other half of "own scope".
+        await draftFindingsFromCards(cards, verified, sid, recentPaths);
     }
     if (!cards.length && !resolutions.length && !updates.length) {
         // Record the commit baseline / advance even with nothing to capture, so
@@ -1900,7 +2036,11 @@ async function promptRetrieve(lib) {
     // leaves struct null; SessionStart's own draft surface + count line cover that
     // case) and so a terse prompt pays zero extra parse cost.
     const drafts = struct ? ruleDraftsFooter(sid, struct, { markShown: true }) : '';
-    if (!repeats.length && !freshHits.length && !peers && !inflight && !messages && !drafts && !statusMd) return; // nothing → zero output, zero added context
+    // Routed cross-lane findings — NOT gated on struct: a routed finding is about
+    // the LANE (who declared which path), never about brain content, so a
+    // token-less prompt must still surface it. Same markShown contract as above.
+    const findings = await findingDraftsFooter(sid, { markShown: true });
+    if (!repeats.length && !freshHits.length && !peers && !inflight && !messages && !drafts && !findings && !statusMd) return; // nothing → zero output, zero added context
     const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
     const day = (ts) => ts ? new Date(ts).toISOString().slice(0, 10) : '';
     const head = (c, n = 120) => { const t = flat(c.text); return t.length > n ? t.slice(0, n - 1) + '…' : t; };
@@ -1998,6 +2138,7 @@ async function promptRetrieve(lib) {
     const parts = [];
     if (lines.length) parts.push(lines.join('\n'));
     if (drafts) parts.push(drafts.replace(/^\n+/, '')); // 🛠️ pending rule drafts awaiting approval (its own block)
+    if (findings) parts.push(findings.replace(/^\n+/, '')); // 📬 routed cross-lane findings awaiting a deliberate send
     if (inflight) parts.push(inflight.replace(/^\n+/, '')); // ⚡ in-flight peers' events (its own block)
     if (peers) parts.push(peers.replace(/^\n+/, '')); // live-session presence footer (its own block)
     if (messages) parts.push(messages.replace(/^\n+/, '')); // 📨 inbound deliberate peer notes
@@ -2340,6 +2481,10 @@ async function read(lib) {
             return peerCount ? `\n👥 ${peerCount} other live session(s) in this project right now (snapshot at session start — the per-prompt peer footer stays current; \`npx klypix-mcp doctor\` lists all).` : '';
         } catch { return ''; }
     })();
+    // One compact receipt at SessionStart closes the sender's "did it surface?"
+    // loop without repeating on every prompt. Full lane health remains available
+    // on demand through brain_doctor; `seen` means rendered-to, never human-read.
+    const receiptLine = await receiptFooter(input.session_id || '');
     // Class-C decay leg: notice ships that happened while no hooked session was
     // watching (tag/version drift vs the per-project sidecar) and queue them
     // for the Stop capture. The line rides BOTH emit tiers.
@@ -2352,7 +2497,7 @@ async function read(lib) {
     const full = ((typeof lib.structToBrief === 'function') ? lib.structToBrief(struct, { freshness }) : lib.structToMarkdown(struct))
         + inflightFooter(input.session_id, struct) + selfHealFooter(drifted) + reconcileFooter(lib, struct) + staleOpenFooter(lib, struct)
         + ruleDraftsFooter(input.session_id, struct, { markShown: false })
-        + selfCheckFooter() + doctorFooter() + versionCurrencyFooter() + legendFooter() + memoryFooter();
+        + receiptLine + selfCheckFooter() + doctorFooter() + versionCurrencyFooter() + legendFooter() + memoryFooter();
     const emitFull = () => {
         process.stdout.write(full + presenceLine + shipObsLine + messageFooter(input.session_id || '', input.transcript_path, lib));
         appendJsonl(HEALTH, { ts: nowIso(), project: path.basename(CWD), mode: 'read', ok: true, briefBytes: Buffer.byteLength(full), cards: struct?.counts?.cards ?? null }, 500);
@@ -2396,6 +2541,7 @@ async function read(lib) {
     // after a stack of footers that could push them past a preview cut.
     const messages = messageFooter(input.session_id || '', input.transcript_path, lib);
     const out = ultra + messages + presenceLine + shipObsLine + healLine + draftLine
+        + receiptLine
         + inflightFooter(input.session_id, struct)
         + selfCheckFooter() + doctorFooter() + versionCurrencyFooter();
     process.stdout.write(out);

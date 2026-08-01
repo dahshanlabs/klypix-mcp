@@ -528,13 +528,23 @@ export function postPresenceMessage({
       const existing = messages.find((message) => message?.dedupeKey === key);
       if (existing) return { posted: false, message: existing };
     }
+    const senderId = String(from).slice(0, 160);
+    const target = String(to || 'all').replace(/\s+/g, ' ').trim().slice(0, 160) || 'all';
+    // Receipt truth must survive peers ending before the sender checks doctor.
+    // Snapshot only recipient session ids (already lane metadata) at SEND time;
+    // old messages without this additive field retain reconstruction fallback.
+    const candidateIds = sessions
+      .filter((session) => session?.id && session.id !== senderId
+        && messageTargetsSession({ to: target }, session, session.id))
+      .map((session) => String(session.id).slice(0, 160));
     const message = {
       id: sha16(`${from}|${to}|${body}|${now}|${crypto.randomBytes(4).toString('hex')}`),
-      from: String(from).slice(0, 160),
-      to: String(to || 'all').replace(/\s+/g, ' ').trim().slice(0, 160) || 'all',
+      from: senderId,
+      to: target,
       text: body,
       ts: now,
       seen: [],
+      candidateIds,
       ...(key ? { dedupeKey: key } : {}),
     };
     messages.push(message);

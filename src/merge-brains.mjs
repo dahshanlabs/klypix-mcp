@@ -158,7 +158,11 @@ export async function mergeBrains({ base = null, ours, theirs, deletedIds = [] }
 
     // ── Explicit human delete (tombstone) — the ONLY path that drops a card ──
     if (del.has(id)) {
-      const theirsChanged = inT && inB && T.items[id] !== baseItem(id);
+      // A save restamps volatile metadata (updatedAt/zIndex), and JSON writers
+      // may reorder keys. Those byte differences are not edits. Tombstone
+      // handling must use the SAME semantic comparator as the content branch
+      // below or a delete-vs-untouched card becomes a bogus conflict twin.
+      const theirsChanged = inT && inB && !sameMeaning(T.items[id], baseItem(id));
       if (inT && theirsChanged) {
         // delete-vs-edit: the human deleted it but a hook edited it after open →
         // KEEP theirs (never lose the hook's new info); record the conflict.
@@ -190,12 +194,23 @@ export async function mergeBrains({ base = null, ours, theirs, deletedIds = [] }
         conflicts.push({ id, kind: 'content', keptLive: 'ours', twin: twinId });
       } else if (tChg && !oChg) { json = T.items[id]; side = 'theirs'; delta.updated.push(id); }
       else if (!inB && diverged) {
-        // Same NEW card (same id) present on BOTH sides but never in base — e.g. an
-        // agent card the app also holds via live-apply, re-serialized slightly
-        // differently. It's the SAME card, NOT a conflict → take the disk/agent
-        // bytes; NEVER spawn a twin for a card that was never in base (the
-        // live-apply-then-save duplication bug).
-        json = T.items[id]; side = 'theirs';
+        if (!B) {
+          // With NO baseline we cannot prove which meaning is newer or whether
+          // the two copies descended from one another. Choosing either side is
+          // silent loss on first Brain Sync / an empty-ancestor git merge.
+          // Keep ours live and materialize theirs as a twin, exactly like a
+          // normal two-sided edit: convergence is not enough if one meaning dies.
+          json = O.items[id]; side = 'ours';
+          const twinId = `${id}__agconf_${rand()}`;
+          extras.push({ id: twinId, json: T.items[id], srcPos: T.positions[id] || O.positions[id], of: id });
+          conflicts.push({ id, kind: 'content-no-base', keptLive: 'ours', twin: twinId });
+        } else {
+          // The base EXISTS but this id is new since it: the same new agent card
+          // can be present on both sides after live-apply and re-serialized with
+          // slightly different bytes. It is one card, not a conflict — keep the
+          // disk/agent bytes and never create the historical duplicate twin.
+          json = T.items[id]; side = 'theirs';
+        }
       }
       else { json = O.items[id]; side = 'ours'; }
     } else if (inT) {

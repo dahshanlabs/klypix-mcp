@@ -63,9 +63,75 @@ export function extractTags(text) {
     while ((m = TAG.exec(text || '')) !== null) out.push(m[2].slice(1));
     return out;
 }
+// ── Media cards: label + searchable body ─────────────────────────────────────
+// A .klypix canvas holds eleven item types; only `text` and `container` carry
+// prose. Every OTHER type (file, image, video, audio, code, link, canvas-link)
+// used to parse to title=null AND text=null, because the reader looked for a
+// field named `name` that NO item type declares — every media type spells it
+// `fileName` (src/canvas/items/types.ts:297/379/522/539/562, written by
+// dropHandler.ts:277). `it.name` was therefore dead code, and since ~30
+// downstream sites gate on `(c.text || '').trim()`, a file or folder dropped
+// into a brain was stored perfectly (real bytes, asset no-loss invariant) and
+// was invisible to brain_ask, brain_sync, the session brief, search_canvases,
+// search_all_brains, the semantic embedder, the gardener and insights.
+// The human saw the card; every agent denied it existed.
+//
+// mediaLabel() is the card's human name. mediaText() is its SEARCHABLE body —
+// for a dropped folder that means the manifest's relative paths, so "where is
+// the auth migration?" can surface the folder card that contains
+// migrations/0001_auth.sql. Truncation is announced, never silent (the v1.32.0
+// "a truncated list must never render as a complete one" law).
+const FOLDER_PATH_CAP = 200, FOLDER_TEXT_CAP = 4000;
+export function mediaLabel(item) {
+    if (!item) return null;
+    switch (item.type) {
+        case 'file': case 'image': case 'video': case 'audio':
+            return (item.fileName || '').trim() || null;
+        case 'code':
+            return (item.fileName || '').trim() || (item.language ? `${item.language} snippet` : null);
+        case 'link':
+            return (item.title || '').trim() || (item.url || '').trim() || null;
+        case 'canvas-link':
+            return (item.title || '').trim() || null;
+        default:
+            return null;
+    }
+}
+export function mediaText(item) {
+    const label = mediaLabel(item);
+    if (!item) return null;
+    if (item.type === 'code') {
+        // A code card's body IS text and must be searchable — it is the one
+        // media type whose content is already indexable prose.
+        const body = String(item.code ?? '').trim();
+        return [label, body].filter(Boolean).join('\n') || null;
+    }
+    if (item.type === 'link') {
+        // Description too: an OG blurb is the only prose a link card carries.
+        return [label, (item.description || '').trim(), (item.url || '').trim()]
+            .filter(Boolean).join('\n') || null;
+    }
+    if (item.type === 'file' && item.isFolder && Array.isArray(item.folderManifest)) {
+        const paths = item.folderManifest.map(e => String(e?.path ?? '').trim()).filter(Boolean);
+        const shown = paths.slice(0, FOLDER_PATH_CAP);
+        let body = shown.join('\n');
+        let dropped = paths.length - shown.length;
+        if (body.length > FOLDER_TEXT_CAP) {           // char cap can bite before the count cap
+            const keep = [];
+            let used = 0;
+            for (const p of shown) { if (used + p.length + 1 > FOLDER_TEXT_CAP) break; keep.push(p); used += p.length + 1; }
+            dropped = paths.length - keep.length;
+            body = keep.join('\n');
+        }
+        // Announce the truncation — a partial list must never read as complete.
+        const more = dropped > 0 ? `\n… +${dropped} more file${dropped === 1 ? '' : 's'}` : '';
+        return [label, body + more].filter(Boolean).join('\n') || null;
+    }
+    return label;
+}
 export function cardTitle(item) {
     if (item?.type === 'container') return item.title || null;
-    if (item?.type !== 'text') return null;
+    if (item?.type !== 'text') return mediaLabel(item);
     for (const line of String(item.content ?? '').split('\n')) {
         const t = line.trim();
         if (t) return t.replace(/^([#>\-*•]+\s+|\d+\.\s+)/, '').trim() || t;
@@ -177,7 +243,7 @@ export async function parseKlypix(buffer) {
         cards: cards.map(it => ({
             id: it.id, type: it.type,
             title: cardTitle(it),
-            text: it.type === 'text' ? it.content : (it.name || it.title || it.url || null),
+            text: it.type === 'text' ? it.content : mediaText(it),
             links: it.type === 'text' ? extractLinks(it.content) : [],
             tags: it.type === 'text' ? extractTags(it.content) : [],
             pos: { x: it.x, y: it.y },
@@ -1238,9 +1304,15 @@ const lifecycleScope = (text) => {
     const l1 = t.split('\n', 1)[0];
     return STATE_GLYPH.test(l1) ? l1 : t;
 };
-export const isSkillCard = (c) => SKILL_GLYPH.test(String(c?.text || ''));
-export const isOpenCard = (c) => !isSkillCard(c) && OPEN_GLYPH.test(lifecycleScope(c?.text));
-export const isMilestoneCard = (c) => !isSkillCard(c) && !isOpenCard(c) && MILE_GLYPH.test(lifecycleScope(c?.text));
+// Lifecycle is a property of PROSE, so only text cards can carry it. Media
+// cards gained a non-null `text` when the reader stopped dropping them, which
+// means a file literally named "🏁 launch.png" would otherwise be counted as a
+// milestone and a folder holding "❓ open questions.md" as an open question.
+// Missing/undefined type stays eligible so legacy .any items are unaffected.
+const lifecycleEligible = (c) => { const t = c?.type; return t == null || t === 'text'; };
+export const isSkillCard = (c) => lifecycleEligible(c) && SKILL_GLYPH.test(String(c?.text || ''));
+export const isOpenCard = (c) => lifecycleEligible(c) && !isSkillCard(c) && OPEN_GLYPH.test(lifecycleScope(c?.text));
+export const isMilestoneCard = (c) => lifecycleEligible(c) && !isSkillCard(c) && !isOpenCard(c) && MILE_GLYPH.test(lifecycleScope(c?.text));
 // "Open AND not already resolved in prose" — the status surfaces carry this
 // extra guard so a ✅/↩/⤵-stamped card is never reported as plainly still-open.
 export const isUnresolvedOpenCard = (c) => isOpenCard(c) && !RESOLVED_GLYPH.test(String(c?.text || ''));

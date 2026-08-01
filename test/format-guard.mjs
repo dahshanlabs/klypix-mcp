@@ -4,7 +4,16 @@
 // downstream writer (merge, arrange, capture) trusts parseKlypix's output, and
 // with brains syncing between machines mixed versions are a guaranteed state.
 import JSZip from 'jszip';
-import { __resetAuthorCache, buildKlypixMap, parseKlypix, resolveAuthor } from '../src/klypix-format.mjs';
+import {
+  __resetAuthorCache,
+  buildKlypix,
+  buildKlypixMap,
+  isMilestoneCard,
+  isOpenCard,
+  parseKlypix,
+  resolveAuthor,
+  shard,
+} from '../src/klypix-format.mjs';
 
 let failures = 0;
 const ok = (condition, label) => {
@@ -43,6 +52,64 @@ const legacy = await legacyZip.generateAsync({ type: 'nodebuffer' });
 let legacyOk = true;
 try { await parseKlypix(legacy); } catch { legacyOk = false; }
 ok(legacyOk, 'legacy manifest-less file still parses (guard is v4-manifest-scoped)');
+
+// ── Media cards stay visible to every text-indexed brain surface ─────────────
+// Inject real v4 item JSON rather than testing mediaText() in isolation: the
+// regression lived in parseKlypix's projection, and every search/brief/insight
+// surface consumes that projection.
+const withRawItems = async (buffer, rawItems) => {
+  const mediaZip = await JSZip.loadAsync(buffer);
+  const canvas = JSON.parse(await mediaZip.file('canvas.json').async('string'));
+  canvas.order ||= [];
+  canvas.positions ||= {};
+  for (const item of rawItems) {
+    canvas.order.push(item.id);
+    canvas.positions[item.id] = { x: item.x ?? 0, y: item.y ?? 0, w: item.w ?? 280, h: item.h ?? 84 };
+    const { id, x, y, w, h, ...stored } = item;
+    mediaZip.file(`items/${shard(id)}/${id}.json`, JSON.stringify(stored));
+  }
+  mediaZip.file('canvas.json', JSON.stringify(canvas));
+  return mediaZip.generateAsync({ type: 'nodebuffer' });
+};
+
+{
+  const paths = Array.from({ length: 205 }, (_, i) => ({
+    path: i === 1 ? 'migrations/0001_auth.sql' : `m/${String(i).padStart(4, '0')}`,
+    size: 1,
+    mime: 'text/plain',
+  }));
+  const mediaBrain = await withRawItems(base, [
+    { id: 'file_spec', type: 'file', fileName: 'spec.pdf' },
+    { id: 'file_folder', type: 'file', fileName: 'backend', isFolder: true, folderManifest: paths },
+    { id: 'code_auth', type: 'code', fileName: 'auth.ts', language: 'typescript', code: 'export const authMigration = "0001_auth";' },
+    { id: 'image_milestone', type: 'image', fileName: '🏁 launch.png' },
+    { id: 'file_question', type: 'file', fileName: 'project', isFolder: true, folderManifest: [{ path: '❓ open questions.md' }] },
+  ]);
+  const mediaParsed = (await parseKlypix(mediaBrain)).struct.cards;
+  const byId = (id) => mediaParsed.find((card) => card.id === id);
+
+  ok(byId('file_spec')?.title === 'spec.pdf' && byId('file_spec')?.text === 'spec.pdf',
+    'file cards expose fileName as both title and searchable text');
+  ok(byId('file_folder')?.text?.includes('migrations/0001_auth.sql'),
+    'folder cards expose manifest leaf paths to brain search');
+  ok(byId('file_folder')?.text?.includes('m/0199')
+      && !byId('file_folder')?.text?.includes('m/0200')
+      && byId('file_folder')?.text?.includes('… +5 more files'),
+    'folder indexing caps at 200 paths and announces the omitted count');
+  ok(byId('code_auth')?.text === 'auth.ts\nexport const authMigration = "0001_auth";',
+    'code cards expose their code body to brain search');
+  ok(!isMilestoneCard(byId('image_milestone')) && !isOpenCard(byId('file_question')),
+    'media filenames and folder paths cannot impersonate lifecycle cards');
+}
+
+{
+  const textBody = '# Auth plan\nKeep [[Migration]] visible #backend';
+  const textBrain = await buildKlypix({ title: 'text compatibility', cards: [{ id: 'txt_compat', text: textBody }] });
+  const textCard = (await parseKlypix(textBrain)).struct.cards.find((card) => card.id === 'txt_compat');
+  ok(JSON.stringify({ title: textCard?.title, text: textCard?.text, tags: textCard?.tags, links: textCard?.links })
+      === JSON.stringify({ title: 'Auth plan', text: textBody, tags: ['backend'], links: ['Migration'] }),
+    'text-card title/text/tags/links projection is unchanged');
+}
 
 // ── Author identity on cards (team attribution, 2026-08-01) ────────────────
 // Cards must carry WHOSE agent wrote them — same identity source as the dev's

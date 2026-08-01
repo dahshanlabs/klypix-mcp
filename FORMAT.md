@@ -47,7 +47,8 @@ writer guarantees the content-addressed `images/ files/ thumbs/` split.
   "updatedAt": "ISO-8601",
   "title": "My board",
   "stats": { "itemCount": 12, "assetCount": 3, "totalBytes": 0 },
-  "sync": { "enabled": false, "lastSyncRev": null, "lastSyncAt": null, "deviceId": "dev_…" }
+  "sync": { "enabled": false, "lastSyncRev": null, "lastSyncAt": null, "deviceId": "dev_…" },
+  "cloud": { "blobId": "702ecfe0-…", "linkedAt": "ISO-8601", "linkedBy": "Sara Ali" }
 }
 ```
 
@@ -65,6 +66,13 @@ writer guarantees the content-addressed `images/ files/ thumbs/` split.
   `items/`. Never use `stats` as an integrity check.
 - `sync` records whether the file is opted into the app's cloud sync; it carries no
   content and no credentials.
+- **`cloud`** — optional and additive; written by the KLYPIX app when a brain is
+  shared, naming the encrypted cloud copy this file pairs with. It exists so the
+  mapping **travels inside the file**: clone the repo, or email the `.klypix`, and the
+  copy that arrives already knows its cloud twin — no server lookup, works offline.
+  **The encryption key is never here.** The `blobId` alone reaches nothing: the cloud
+  copy is ciphertext, and the key travels only in a share link's URL fragment. A
+  reader that does not care about cloud sync should ignore this object.
 
 ## `canvas.json`
 
@@ -115,12 +123,26 @@ strings: `text`, `box`, `image`, `file`, `container`, `approval`, `link`,
   "border": true,
   "heading": false,
   "createdBy": "agent",
-  "createdVia": "claude-code"
+  "createdVia": "claude-code",
+  "author": "Sara Ali",
+  "updatedAt": 1785500000000
 }
 ```
 
 `createdBy` (`user` | `agent`) and the optional `createdVia` (which agent/channel
 captured it) are the provenance bits the brain surfaces as badges and lenses.
+
+The optional **`author`** answers the question a team actually asks: `createdBy` says
+*what* wrote a card, `author` says *whose*. It is resolved from `git config user.name`
+so brain attribution matches commit attribution with no configuration (override with
+`KLYPIX_AUTHOR`; falls back to the OS user; simply absent if neither resolves).
+
+**`updatedAt` is VOLATILE — never treat it as content.** It is restamped by the act of
+writing, so two copies of an identical card differ in it. Any comparison that decides
+"did this card change" must strip `updatedAt` (and the derived `zIndex` in
+`positions`) before comparing, or a plain re-save reads as an edit. The merge engine
+learned this the hard way: a byte-compare spawned conflict twins for cards nobody
+touched. `mergeBrains` exports `sameMeaning(a, b)` as the single correct comparison.
 
 ## Bytes: when they are embedded vs referenced
 

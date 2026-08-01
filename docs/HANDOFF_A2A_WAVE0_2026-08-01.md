@@ -30,6 +30,9 @@ the full standalone suite passed; `verify:mcp` reported an exact current bundle;
 suite passed; desktop prebuild security/recovery/runtime gates passed; app and Electron TypeScript
 checks passed; and Vitest passed 76/76 files and 680/680 tests. An isolated
 `npx -y klypix-mcp@1.50.1 --help` also proved that the published registry package boots.
+After clean deployment and project linking, a live MCP `brain_doctor` check with npm currency enabled
+reported `ALIGNED`: core, installed runtime, running server, and npm were all `1.50.1`, with all 14
+projected harness files in sync.
 
 The A2A face now binds only to loopback, validates Host/Origin/content type/body size, confines the
 effective canvas target (including symlinks and text-part references), hides vault paths, disables

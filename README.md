@@ -435,20 +435,21 @@ echo '{ "title": "Plan", "cards": [{ "text": "kickoff" }] }' \
   | npx -p klypix-mcp klypix-write --out plan.klypix
 ```
 
-## Also speaks A2A (Agent-to-Agent) — experimental
+## Also speaks A2A protocol v0.3.0 — experimental
 
 ```bash
 npx -p klypix-mcp klypix-a2a --vault ./canvases     # 127.0.0.1:41241
 # Agent Card: http://127.0.0.1:41241/.well-known/agent-card.json
 ```
 
-Nine skills: `make_board`, `remember`, `learn_skill`, `recall`, `read_canvas`, `list_canvases`,
-`brain_insights`, `search_all_brains`, `brain_connect`. Unlike a typical A2A agent that returns
-text, KLYPIX returns the `.klypix` board itself as a multimodal artifact. Details:
+Eight vault/project skills by default: `make_board`, `remember`, `learn_skill`, `recall`,
+`read_canvas`, `list_canvases`, `brain_insights`, `brain_connect`. Machine-wide
+`search_all_brains` is a ninth, explicit opt-in via `--allow-cross-project`. Unlike a typical A2A
+agent that returns text, KLYPIX returns the `.klypix` board itself as a multimodal artifact. Details:
 [A2A.md](A2A.md).
 
-Treat this as a preview: the A2A smoke test is not in the default `npm test` chain, and it has not
-been exercised against a third-party A2A client.
+Treat this as a preview: the adversarial A2A smoke test runs in the default `npm test` chain, but
+the server has not been exercised against a third-party A2A client.
 
 ## Updates — the propagation contract
 

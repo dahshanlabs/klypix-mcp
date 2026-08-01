@@ -1,4 +1,4 @@
-# KLYPIX speaks A2A
+# KLYPIX speaks A2A protocol v0.3.0
 
 KLYPIX is the **shared, human-owned memory node** for a multi-agent stack.
 **A2A moves the messages between agents; `.klypix` holds the context they read
@@ -23,11 +23,13 @@ KLYPIX_VAULT=./canvases KLYPIX_A2A_PORT=41241 npx -p klypix-mcp klypix-a2a
 ```
 
 Flags / env: `--vault` (`KLYPIX_VAULT`), `--port` (`KLYPIX_A2A_PORT`, default
-`41241`), `--host` (`KLYPIX_A2A_HOST`, default `127.0.0.1`).
+`41241`), `--host` (`KLYPIX_A2A_HOST`, loopback only), and
+`--allow-cross-project` (opt in to machine-wide registered-brain search).
 
-It is **local-first**: it binds loopback and needs no auth, because the file
-lives on your disk. To expose it, set `--host 0.0.0.0` behind a reverse proxy
-that terminates TLS and adds authentication.
+It is **local-only**: it binds loopback and needs no auth because callers are on
+the same machine. Non-loopback `--host` values are refused. Remote exposure is
+unsupported until authentication, TLS, a real identity model, and cross-process
+write coordination exist together.
 
 ## Discover it
 
@@ -45,13 +47,13 @@ the skills below.
 | Skill `id` | Does | Returns |
 |---|---|---|
 | `make_board` | Create a new `.klypix` from cards + connections | a `.klypix` **FilePart** + summary |
-| `remember` | Append cards/decisions to an existing canvas (positions preserved) | the updated `.klypix` |
-| `learn_skill` | Capture a reusable how-to / gotcha as a 🛠 skill card — resurfaces every session | the updated `.klypix` |
+| `remember` | Append cards/decisions to an existing canvas (positions preserved) | result summary; flat card appends also return a `.klypix` FilePart |
+| `learn_skill` | Capture a reusable how-to / gotcha as a 🛠 skill card — resurfaces every session | result summary |
 | `recall` | Search card text/titles/`#tags` across the vault | matching cards (text) |
 | `read_canvas` | Read one canvas (cards, graph, `[[links]]`) + its images | markdown + image FileParts |
 | `list_canvases` | List canvases with counts | text |
 | `brain_insights` | Hubs / orphans / stale questions in a brain | text |
-| `search_all_brains` | Cross-project memory search (semantic + lexical) | text |
+| `search_all_brains` | Cross-project memory search (semantic + lexical); advertised only with `--allow-cross-project` | text |
 | `brain_connect` | Find and draw related-but-unlinked cards (proposes before it applies) | text |
 
 ## Talk to it (JSON-RPC 2.0)
@@ -86,7 +88,8 @@ POST /
 
 The result is an A2A `Task` whose `artifacts[0].parts` contains a
 `{ kind: "file", file: { mimeType: "application/vnd.klypix+zip", bytes } }` — the
-board itself.
+board itself. If `configuration.acceptedOutputModes` excludes that MIME type,
+the server honors the negotiation and does not send the FilePart.
 
 **Free-text invocation** — a plain message is routed by intent (a convenience
 for chat-style callers):
@@ -109,11 +112,27 @@ server resumes it with a stable id and accumulated history).
   returns a terminal `Task`. `message/stream` emits a **monotonic** lifecycle in
   one burst — a non-terminal `Task` (`submitted`), then (for completed work) an
   `artifact-update`, then exactly one terminal `status-update` with `final:true`.
-- The server binds loopback and exposes no auth; the A2A face additionally
-  refuses any `canvas` reference that resolves **outside the vault** (absolute or
-  `..` paths), even though the underlying engine would allow it for the trusted
-  MCP/stdio caller.
-- Provenance: writes are stamped with the calling agent's name when supplied via
-  `message.metadata.agentName` (or a `DataPart` `agentName`), else `a2a`.
-- The A2A and MCP faces share one engine (`src/klypix-core.mjs`); neither can
-  corrupt the other, and both operate only on the `.klypix` files in the vault.
+- The server validates the request `Host`, rejects foreign browser `Origin`
+  headers, accepts only `application/json` POST bodies (maximum 1 MiB), and emits
+  no permissive CORS header. The Agent Card and health endpoint do not disclose
+  the local vault path.
+- For every caller-supplied canvas reference — including a path supplied in a
+  text part — the server resolves the effective target once, follows symlinks,
+  and refuses it if the resulting file is outside the configured vault. The
+  project brain selected by the operator's launch `cwd` remains a separate,
+  intentional default for brain-specific operations.
+- Provenance is a claim, not authentication: supplied agent names are bounded,
+  slugged, and stamped as `a2a:<name>` so they cannot render like an attested
+  local `createdVia` identity.
+- `search_all_brains` is absent from the default Agent Card and rejected unless
+  the operator starts the server with `--allow-cross-project`; it intentionally
+  reads the machine-wide brain registry and cannot be made vault-scoped.
+- A2A writes are serialized **within the server process only**. The desktop app,
+  hooks, and other processes are not coordinated by that lock. Any move off
+  loopback or to concurrent multi-process callers requires the shared
+  cross-process lock first. Do not describe this as conflict-free or lossless
+  across processes.
+- A2A does not provide `brain_sync`, presence registration, `brain_message`, or
+  `brain_garden` apply. HTTP has no reliable session-close lifecycle for presence,
+  messaging would be send-only, and garden's out-of-band human approval gate must
+  not be weakened for protocol symmetry.

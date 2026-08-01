@@ -18,10 +18,18 @@ and are superseded by this receipt.
 | A2A protocol boundary hardening + adversarial suite | `1d4fe71 fix(a2a): harden the local protocol boundary` |
 | Cross-process brain-write protocol + real process races | `4df940e fix(core): serialize project brain writes across processes` |
 | Desktop launcher, truthful Settings copy, i18n, claims matrix | KLYPIX desktop `8951c2c fix(a2a): secure the desktop launcher` |
+| Published standalone runtime | `b3c4e2c release: klypix-mcp 1.50.1` — registry artifact boot-probed successfully |
+| Generated desktop bundle | KLYPIX desktop `0fc7d5a chore(brain): bundle klypix-mcp 1.50.1` |
 
 Independent canonical verification after `4df940e`: `npm test` passed all 1,353 assertions in
 112.2 seconds. That run includes the installer/flat-runtime boot gate, 40/40 in-process writes,
 separate-process note/connect/garden/create races, and the adversarial A2A HTTP suite.
+
+Final release verification was repeated from the `1.50.1` source and generated desktop artifact:
+the full standalone suite passed; `verify:mcp` reported an exact current bundle; the bundled package
+suite passed; desktop prebuild security/recovery/runtime gates passed; app and Electron TypeScript
+checks passed; and Vitest passed 76/76 files and 680/680 tests. An isolated
+`npx -y klypix-mcp@1.50.1 --help` also proved that the published registry package boots.
 
 The A2A face now binds only to loopback, validates Host/Origin/content type/body size, confines the
 effective canvas target (including symlinks and text-part references), hides vault paths, disables

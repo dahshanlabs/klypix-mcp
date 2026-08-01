@@ -35,6 +35,7 @@ import {
   readPendingShips, clearPendingShips, pendingShipCards, formatCaptureReceipts,
 } from './klypix-format.mjs';
 import { capMessages, findProjectBrain } from './agent-presence.mjs';
+import { brainCaptureLockPath, vaultCreateLockPath, withAdvisoryWriteLock } from './brain-write-lock.mjs';
 
 // ── Card / connection input shape (single source for every face) ─────────────
 export const cardSchema = z.object({
@@ -843,11 +844,11 @@ export const gardenApprovalCode = (areas) =>
 // — but the defect is here in the engine, so the MCP server and every CLI bin
 // inherit the fix.
 //
-// SCOPE, deliberately stated: this is an IN-PROCESS lock. It does not coordinate
-// with the desktop app or the Claude Stop hook, which are separate processes with
-// their own advisory `.claude/brain-capture.lock` that this engine does not yet
-// honour. Cross-process convergence is a separate, larger change; do not read this
-// as "concurrent writes are safe from every direction".
+// The promise chain is layer 1 (within this server). Layer 2 below joins the
+// SAME cross-process `.claude/brain-capture.lock` used by the desktop app and
+// lifecycle hooks, so separate MCP/A2A servers cannot race each other or those
+// writers. Both layers are required: a rename is atomic but read-modify-write
+// is not.
 const writeChains = new Map();   // resolved lowercased path → tail promise
 
 function withWriteLock(key, fn) {
@@ -869,13 +870,24 @@ function withWriteLock(key, fn) {
 
 // Writes to an existing canvas serialize on that canvas. Different files stay
 // fully parallel.
-const withCanvasWriteLock = (file, fn) => withWriteLock(path.resolve(file), fn);
+const lockBusy = (kind) => err(
+  `${kind} write was not applied because another process held the project write lock past the safety budget. ` +
+  'Nothing was overwritten; retry the same operation.'
+);
+
+const withCanvasWriteLock = (file, fn, { brain = false } = {}) =>
+  withWriteLock(path.resolve(file), () => {
+    if (!brain) return fn();
+    return withAdvisoryWriteLock(brainCaptureLockPath(file), (locked) => locked ? fn() : lockBusy('Brain'));
+  });
 
 // Creation serializes on the VAULT, not the file: `safeName` picks a name by
 // probing the directory, so two concurrent creates of the same title would both
 // see the name free and the second would overwrite the first. Creates are rare;
 // serializing them per-vault costs nothing real.
-const withVaultCreateLock = (vault, fn) => withWriteLock('vault:' + path.resolve(vault), fn);
+const withVaultCreateLock = (vault, fn) => withWriteLock('vault:' + path.resolve(vault), () =>
+  withAdvisoryWriteLock(vaultCreateLockPath(vault), (locked) => locked ? fn() : lockBusy('Canvas creation'))
+);
 
 export async function opBrainGarden({ vault, canvas, apply = false, syntheses, approve = '' }) {
   const t = brainTarget(vault, canvas);
@@ -911,7 +923,7 @@ export async function opBrainGarden({ vault, canvas, apply = false, syntheses, a
     } catch (e) {
       return err(`Garden apply failed (brain unchanged): ${e.message}`);
     }
-  });
+  }, { brain: true });
 }
 
 export async function opBrainConnect({ vault, canvas, apply = false, max = 24, threshold = 0.45, pairs = null, relationship = null, label = null, log = () => {} }) {
@@ -947,7 +959,7 @@ export async function opBrainConnect({ vault, canvas, apply = false, max = 24, t
         await atomicWrite(file, buffer);
         return { blocks: [text(`✓ Drew ${added} connection(s)${rel === 'not_contradiction' ? ' — these pair(s) are now dismissed and will NOT resurface as brain_reconcile contradiction candidates' : ''}.\n\n${explicit.slice(0, added).map(render2).join('\n')}`)] };
       } catch (e) { return err(`Apply failed (brain unchanged): ${e.message}`); }
-    });
+    }, { brain: true });
   }
 
   let edges = [];
@@ -995,7 +1007,7 @@ export async function opBrainConnect({ vault, canvas, apply = false, max = 24, t
   } catch (e) {
     return err(`Apply failed (brain unchanged): ${e.message}`);
   }
-  });
+  }, { brain: true });
 }
 
 export async function opCreateCanvas({ vault, title, cards, connections, filename }) {
@@ -1024,6 +1036,15 @@ export async function opCreateCanvas({ vault, title, cards, connections, filenam
 export async function opAddToCanvas({ vault, canvas, cards, connections, via }) {
   const file = resolveCanvas(vault, canvas);
   if (!file) return err(`Canvas not found: ${canvas}`);
+  // add_to_canvas is generic, so infer the document kind before choosing the
+  // cross-process layer. Filename is the legacy signal; manifest.kind keeps a
+  // renamed brain protected. The actual read-modify-write still happens only
+  // after both locks are held below.
+  let isBrain = /^brain\.(klypix|any)$/i.test(path.basename(file));
+  if (!isBrain) {
+    try { isBrain = (await parseKlypix(fs.readFileSync(file))).manifest?.kind === 'brain'; }
+    catch { /* the inner operation will report the parse failure */ }
+  }
   // The read MUST be inside the lock: reading first and appending later is exactly
   // the interleaving that loses the other writer's cards.
   return withCanvasWriteLock(file, async () => {
@@ -1047,7 +1068,7 @@ export async function opAddToCanvas({ vault, canvas, cards, connections, via }) 
     } catch (e) {
       return err(`Add failed: ${e.message}`);
     }
-  });
+  }, { brain: isBrain });
 }
 
 // brain_note — the DELIBERATE, marker-aware write every agent (not just the
@@ -1108,7 +1129,7 @@ export async function opBrainNote({ vault, canvas, text: noteText, area, marker 
   } catch (e) {
     return err(`brain_note failed (brain unchanged): ${e.message}`);
   }
-  });
+  }, { brain: true });
 }
 
 // ── brain_message — the MCP twin of the hook's 🧠 MSG marker ─────────────────

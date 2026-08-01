@@ -1,0 +1,339 @@
+#!/usr/bin/env node
+// merge-brains — the pure, provable core of the desktop-app<->hooks brain
+// concurrency fix. A 3-way UNION-by-stable-id reconcile of two .klypix brains
+// that share a common ancestor, designed so that NO CARD CAN BE LOST.
+//
+// Why this exists: the desktop app used to SAVE the brain with a blind full-file
+// overwrite, clobbering any card the Claude Code hooks captured after the app
+// opened. This replaces overwrite with union: the app re-reads the disk copy
+// INSIDE the capture lock and merges, so a hook capture written after open is
+// always kept — even if the lock is missed (union is non-destructive).
+//
+// HARDENED against the adversarial design review (data-loss blockers):
+//   • Deletes are honored ONLY via explicit tombstones (deletedIds) — a card
+//     merely ABSENT from `ours` is NEVER inferred as a delete (that absence can
+//     be a deferred/gated renderer apply, not a deletion). This is the fix for
+//     the "false-delete clobber" + "delete-by-absence" blockers.
+//   • assets/ entries are UNIONed by path (else theirs-only images ship blank).
+//   • Content conflict (both edited the same card) keeps BOTH texts losslessly:
+//     the human's stays live on the card, the agent's is preserved as a linked
+//     twin card — never silently dropped.
+//   • zKeys are de-collided (duplicate keys silently no-op in the app reducer).
+//   • Post-merge SUPERSET VERIFICATION: the result is asserted to contain every
+//     surviving id from both sides; the function throws rather than return a
+//     buffer that lost a card.
+//
+// Pure + dependency-light: reads via the shared parseKlypix, so it stays correct
+// as the format evolves. CANONICAL HOME: klypix-mcp/src (moved 2026-08-01 so the
+// git merge driver is npm-distributable to ANY repo — supersedes the old
+// "APP-maintained, edit in KLYPIX scripts/" note). The KLYPIX app bundles this
+// file back via sync-bundled-mcp exactly like klypix-format.mjs, and its
+// brainEngine/deploy paths keep loading it unchanged. Edit it HERE — the app
+// copy is GENERATED. It flattens into ~/.claude/project-brain on install, where
+// jszip + fractional-indexing already live.
+
+import JSZip from 'jszip';
+import { parseKlypix, shard } from './klypix-format.mjs';
+import { generateKeyBetween } from 'fractional-indexing';
+
+const isValidZKey = (k) => { try { generateKeyBetween(k, null); return true; } catch { return false; } };
+const rand = () => Math.random().toString(36).slice(2, 10);
+const ARCHIVE = /^archive$/i;
+
+// Load one .klypix buffer into a flat, comparison-friendly shape. Unchanged
+// cards across ancestor/descendant buffers keep byte-identical item JSON, so a
+// simple string compare detects real content edits.
+async function loadSide(buf) {
+  if (!buf) return null;
+  const { zip, canvas, manifest, struct } = await parseKlypix(buf);
+  const order = Array.isArray(canvas.order) ? canvas.order : [];
+  const positions = canvas.positions || {};
+  const items = {};                 // id -> raw item JSON string (verbatim bytes)
+  const idSet = new Set(order.length ? order : Object.keys(positions));
+  for (const id of idSet) {
+    const f = zip.file(`items/${shard(id)}/${id}.json`);
+    items[id] = f ? await f.async('string') : null;
+  }
+  const assets = {};                // "assets/<id>" -> nodebuffer
+  for (const p of Object.keys(zip.files)) {
+    if (p.startsWith('assets/') && !zip.files[p].dir) assets[p] = await zip.file(p).async('nodebuffer');
+  }
+  const titleById = new Map(struct.cards.map(c => [c.id, c.title || '']));
+  return {
+    order, positions, items, assets, manifest,
+    connections: Array.isArray(canvas.connections) ? canvas.connections : [],
+    lines: Array.isArray(canvas.lines) ? canvas.lines : [],
+    strokes: Array.isArray(canvas.strokes) ? canvas.strokes : [],
+    settings: canvas.settings || {},
+    nextGroupNumber: Number(canvas.nextGroupNumber) || 1,   // top-level key, NOT settings
+    view: canvas.view || null,
+    titleById,
+    ids: idSet,
+  };
+}
+
+const samePos = (a, b) => !!a && !!b &&
+  a.x === b.x && a.y === b.y && (a.w ?? null) === (b.w ?? null) && (a.h ?? null) === (b.h ?? null);
+const sameParent = (a, b) => (a?.parentId ?? null) === (b?.parentId ?? null);
+
+/**
+ * mergeBrains — 3-way union of two brains sharing ancestor `base`.
+ * @param {{base?:Buffer|null, ours:Buffer, theirs:Buffer, deletedIds?:string[]}} args
+ *   base      = on-disk struct snapshotted when the app opened (null → pure union).
+ *   ours      = the app's in-memory brain (what the human is saving).
+ *   theirs    = the current on-disk brain, re-read INSIDE the lock (has hook captures).
+ *   deletedIds= ids the HUMAN explicitly deleted (tombstones). ONLY these can drop.
+ * @returns {Promise<{buffer:Buffer, delta:{added:string[],updated:string[],archived:string[],removed:string[]}, conflicts:object[], stats:object}>}
+ */
+export async function mergeBrains({ base = null, ours, theirs, deletedIds = [] }) {
+  if (!ours || !theirs) throw new Error('mergeBrains needs both ours and theirs buffers');
+  const B = await loadSide(base);
+  const O = await loadSide(ours);
+  const T = await loadSide(theirs);
+  const del = new Set(deletedIds);
+
+  const baseItem = (id) => (B && B.items[id]) || null;
+  const basePos = (id) => (B && B.positions[id]) || null;
+  const parentTitle = (side, pos) => {
+    const pid = pos?.parentId; if (!pid) return '';
+    return String(side.titleById.get(pid) || '');
+  };
+
+  const allIds = new Set([...O.ids, ...T.ids]);
+  const merged = new Map();          // id -> { json, pos }
+  const extras = [];                 // conflict-twin cards to append
+  const conflicts = [];
+  const delta = { added: [], updated: [], archived: [], removed: [] };
+
+  for (const id of allIds) {
+    const inO = O.items[id] != null, inT = T.items[id] != null;
+    const inB = baseItem(id) != null;
+
+    // ── Explicit human delete (tombstone) — the ONLY path that drops a card ──
+    if (del.has(id)) {
+      const theirsChanged = inT && inB && T.items[id] !== baseItem(id);
+      if (inT && theirsChanged) {
+        // delete-vs-edit: the human deleted it but a hook edited it after open →
+        // KEEP theirs (never lose the hook's new info); record the conflict.
+        conflicts.push({ id, kind: 'delete-vs-edit', kept: 'theirs' });
+        // fall through to keep from theirs below
+      } else {
+        delta.removed.push(id);
+        continue;                    // honored delete
+      }
+    }
+
+    if (!inO && !inT) continue;
+
+    // ── Choose CONTENT ──────────────────────────────────────────────────────
+    let json, side;
+    if (inO && inT) {
+      const oChg = !inB || O.items[id] !== baseItem(id);
+      const tChg = !inB || T.items[id] !== baseItem(id);
+      if (inB && oChg && tChg && O.items[id] !== T.items[id]) {
+        // GENUINE content conflict: a card that EXISTED at open, edited differently
+        // on both sides → human stays live, agent version preserved as a twin.
+        json = O.items[id]; side = 'ours';
+        const twinId = `${id}__agconf_${rand()}`;
+        extras.push({ id: twinId, json: T.items[id], srcPos: T.positions[id] || O.positions[id], of: id });
+        conflicts.push({ id, kind: 'content', keptLive: 'ours', twin: twinId });
+      } else if (tChg && !oChg) { json = T.items[id]; side = 'theirs'; delta.updated.push(id); }
+      else if (!inB && O.items[id] !== T.items[id]) {
+        // Same NEW card (same id) present on BOTH sides but never in base — e.g. an
+        // agent card the app also holds via live-apply, re-serialized slightly
+        // differently. It's the SAME card, NOT a conflict → take the disk/agent
+        // bytes; NEVER spawn a twin for a card that was never in base (the
+        // live-apply-then-save duplication bug).
+        json = T.items[id]; side = 'theirs';
+      }
+      else { json = O.items[id]; side = 'ours'; }
+    } else if (inT) {
+      json = T.items[id]; side = 'theirs';
+      if (!inB) delta.added.push(id);            // agent added since open — the anti-clobber core
+    } else {
+      json = O.items[id]; side = 'ours';
+    }
+
+    // ── Choose POSITION + parent (human spatial intent wins; hook archive
+    //    applies only if the human didn't move/re-parent the card) ───────────
+    const oP = O.positions[id], tP = T.positions[id], bP = basePos(id);
+    const oMoved = oP && (!bP || !samePos(oP, bP));
+    const finalXY = oMoved ? oP : (tP || oP);
+
+    let parentId;
+    const oParentChg = oP && (!bP || !sameParent(oP, bP));
+    const tParentChg = tP && (!bP || !sameParent(tP, bP));
+    if (oParentChg) parentId = oP.parentId ?? null;
+    else if (tParentChg) parentId = tP.parentId ?? null;
+    else parentId = (finalXY?.parentId ?? oP?.parentId ?? tP?.parentId ?? null);
+
+    const pos = { ...(finalXY || oP || tP || {}), parentId };
+    // Detect a hook archive-move for the delta receipt.
+    if (side === 'theirs' && tParentChg && ARCHIVE.test(parentTitle(T, tP))) delta.archived.push(id);
+
+    merged.set(id, { json, pos });
+  }
+
+  // ── Conflict twins: place beside their source card, own valid zKey ─────────
+  for (const ex of extras) {
+    const src = ex.srcPos || {};
+    merged.set(ex.id, { json: ex.json, pos: { x: (src.x || 0) + 24, y: (src.y || 0) + 24, w: src.w, h: src.h, parentId: src.parentId ?? null } });
+  }
+
+  // ── Order + zKey heal (de-collide: duplicate zKeys silently no-op in-app) ──
+  const order = [];
+  const seen = new Set();
+  for (const id of [...T.order, ...O.order, ...extras.map(e => e.id)]) {
+    if (merged.has(id) && !seen.has(id)) { seen.add(id); order.push(id); }
+  }
+  // Any merged id not in either order[] (defensive) — append.
+  for (const id of merged.keys()) if (!seen.has(id)) { seen.add(id); order.push(id); }
+
+  const usedZ = new Set();
+  let lastZ = null;
+  for (const id of order) {
+    const rec = merged.get(id);
+    let z = rec.pos.zKey;
+    if (!z || !isValidZKey(z) || usedZ.has(z)) z = generateKeyBetween(lastZ, null);
+    usedZ.add(z); lastZ = z;
+    rec.pos = { ...rec.pos, zKey: z, zIndex: order.indexOf(id) };
+  }
+
+  // ── Union connections / lines / strokes by id; drop dangling connections ──
+  const byId = (arr) => { const m = new Map(); for (const x of arr) if (x && x.id) m.set(x.id, x); return m; };
+  const connMap = new Map([...byId(T.connections), ...byId(O.connections)]);
+  const liveIds = new Set(order);
+  // Collapse EXACT duplicate edges (same endpoints + relationship + label,
+  // different ids). Connection deletes have no tombstone, so an arrange/de-dup
+  // that dropped a redundant edge in-app used to see it resurrected from disk
+  // by this union — as a byte-identical twin arrow. Never meaningful to keep.
+  const seenEdge = new Set();
+  const connections = [...connMap.values()].filter(c => {
+    if (!(liveIds.has(c.fromId) && liveIds.has(c.toId))) return false;
+    const k = `${c.fromId}|${c.toId}|${c.relationship || ''}|${c.label || ''}`;
+    if (seenEdge.has(k)) return false;
+    seenEdge.add(k);
+    return true;
+  });
+  const lines = [...new Map([...byId(T.lines), ...byId(O.lines)]).values()];
+  const strokes = [...new Map([...byId(T.strokes), ...byId(O.strokes)]).values()];
+
+  // ── Union assets by path (theirs preferred, then ours, then base) ─────────
+  const assets = {};
+  for (const src of [B, O, T]) if (src) for (const [p, bytes] of Object.entries(src.assets)) assets[p] = bytes;
+
+  // ── Build merged zip ──────────────────────────────────────────────────────
+  const zip = new JSZip();
+  const now = Date.now();
+  for (const id of order) zip.file(`items/${shard(id)}/${id}.json`, merged.get(id).json);
+  for (const [p, bytes] of Object.entries(assets)) zip.file(p, bytes);
+
+  const positions = {};
+  for (const id of order) positions[id] = merged.get(id).pos;
+
+  // Per-field manifest UNION, theirs-precedence: theirs still wins every field
+  // it carries (the original semantics — disk/hook-side stamps survive an app
+  // save), but a field only OURS has is no longer dropped. Concretely: the
+  // cloud-link stamp (manifest.cloud) added on the local side must survive a
+  // merge against an older cloud copy that predates the link.
+  const manifest = { format: 'klypix', version: 4, ...(O.manifest || {}), ...(T.manifest || {}) };
+  manifest.updatedAt = new Date(now).toISOString();
+  manifest.stats = { ...(manifest.stats || {}), itemCount: order.length, assetCount: Object.keys(assets).length };
+  zip.file('manifest.json', JSON.stringify(manifest));
+
+  const canvasJson = {
+    version: 4,
+    view: O.view || T.view || { panX: 0, panY: 0, zoom: 0.7 },   // human's viewport
+    order, connections, lines, strokes,
+    nextGroupNumber: Math.max(1, ...[O, T].map(s => Number(s.nextGroupNumber) || 1)),
+    positions,
+    settings: { ...(T.settings || {}), ...(O.settings || {}) },
+  };
+  zip.file('canvas.json', JSON.stringify(canvasJson));
+  const buffer = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+
+  // ── SUPERSET VERIFICATION — prove no card was lost ─────────────────────────
+  // Every id that survived on either side (minus honored deletes) MUST be in the
+  // result; every asset path from either side MUST be present. Throw otherwise.
+  const survivors = new Set();
+  for (const id of O.ids) if (!delta.removed.includes(id)) survivors.add(id);
+  for (const id of T.ids) if (!delta.removed.includes(id)) survivors.add(id);
+  const resultIds = new Set(order);
+  const missing = [...survivors].filter(id => !resultIds.has(id));
+  if (missing.length) throw new Error(`mergeBrains INVARIANT VIOLATED — dropped ${missing.length} card(s): ${missing.slice(0, 5).join(', ')}`);
+  const wantAssets = new Set([...Object.keys(O.assets), ...Object.keys(T.assets)]);
+  const missingAssets = [...wantAssets].filter(p => !(p in assets));
+  if (missingAssets.length) throw new Error(`mergeBrains INVARIANT VIOLATED — dropped ${missingAssets.length} asset(s): ${missingAssets.slice(0, 3).join(', ')}`);
+  // Re-parse to guarantee the buffer round-trips (never ship an unreadable brain).
+  await parseKlypix(buffer);
+
+  const stats = {
+    ours: O.ids.size, theirs: T.ids.size, base: B ? B.ids.size : 0,
+    merged: order.length, conflicts: conflicts.length,
+    added: delta.added.length, updated: delta.updated.length,
+    archived: delta.archived.length, removed: delta.removed.length,
+    assets: Object.keys(assets).length,
+  };
+  return { buffer, delta, conflicts, stats };
+}
+
+/**
+ * Human deletions inferred SAFELY for the merge-on-SAVE path: ids present in the
+ * open-snapshot BASE but absent from OURS (the full current app state at save).
+ * Sound precisely because base is FROZEN at open — a card the agent added after
+ * open is never in base, so this returns ONLY cards the human actually removed,
+ * and can never mistake an un-applied agent card for a deletion. Feed the result
+ * to mergeBrains({...deletedIds}). NOTE: a card the human deletes that the AGENT
+ * added mid-session isn't in base → not returned here (it re-unions until the
+ * next reopen folds it into base); persisting that stricter case needs explicit
+ * renderer tombstones, a later increment. NEVER use this for the live watcher,
+ * where absence≠delete.
+ */
+export async function deletedByAbsence(baseBuf, oursBuf) {
+  if (!baseBuf || !oursBuf) return [];
+  const [b, o] = await Promise.all([parseKlypix(baseBuf), parseKlypix(oursBuf)]);
+  const oIds = new Set(o.struct.cards.map((c) => c.id));
+  return b.struct.cards.map((c) => c.id).filter((id) => !oIds.has(id));
+}
+
+/**
+ * Delta for the LIVE agent→human watcher: the cards ADDED to `newBuf` since the
+ * frozen open-snapshot `baseBuf`, with each added card's raw item JSON + position
+ * so the renderer can build it with its normal v4 deserializer. Added-only by
+ * design — a new id can never clobber a human's in-progress edit, and the renderer
+ * applies it idempotently, so re-sending the full accumulated added-set every time
+ * lets a briefly-gated tab catch up without any ack/queue. (Updates/removes
+ * reconcile on the next save/reopen — safe, since the merge never loses.)
+ */
+export async function brainDelta(baseBuf, newBuf) {
+  const empty = { added: [], updated: [], removed: [], items: {}, positions: {}, connections: [], manifest: null };
+  if (!baseBuf || !newBuf) return empty;
+  const [b, n] = await Promise.all([parseKlypix(baseBuf), parseKlypix(newBuf)]);
+  const baseIds = new Set(b.struct.cards.map((c) => c.id));
+  const newIds = new Set(n.struct.cards.map((c) => c.id));
+  const bPos = (b.canvas && b.canvas.positions) || {};
+  const nPos = (n.canvas && n.canvas.positions) || {};
+  const posKey = (p) => (p ? JSON.stringify([p.x, p.y, p.w, p.h, p.parentId ?? null]) : '');   // ignore zKey/zIndex noise
+  const raw = async (zip, id) => { const f = zip.file(`items/${shard(id)}/${id}.json`); return f ? f.async('string') : null; };
+
+  const added = [...newIds].filter((id) => !baseIds.has(id));
+  const removed = [...baseIds].filter((id) => !newIds.has(id));
+  const updated = [];
+  for (const id of newIds) {
+    if (!baseIds.has(id)) continue;
+    const [bStr, nStr] = await Promise.all([raw(b.zip, id), raw(n.zip, id)]);
+    if (bStr !== nStr || posKey(bPos[id]) !== posKey(nPos[id])) updated.push(id);
+  }
+
+  const items = {}, positions = {};
+  for (const id of [...added, ...updated]) {
+    const s = await raw(n.zip, id);
+    if (s) items[id] = s;
+    if (nPos[id]) positions[id] = nPos[id];
+  }
+  const baseConn = new Set((b.canvas && b.canvas.connections || []).map((c) => c.id));
+  const connections = (n.canvas && n.canvas.connections || []).filter((c) => c && c.id && !baseConn.has(c.id));
+  return { added, updated, removed, items, positions, connections, manifest: n.manifest || null };
+}
+
+export default mergeBrains;

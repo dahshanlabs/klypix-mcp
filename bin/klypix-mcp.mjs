@@ -19,7 +19,7 @@ const PKG_VERSION = (() => {
   }
 })();
 
-const DIRECT = new Set(['install', 'link', 'doctor', 'conformance', 'garden-code', 'init']);
+const DIRECT = new Set(['install', 'link', 'doctor', 'conformance', 'garden-code', 'init', 'git-driver', 'diff', 'pr-brief']);
 
 const USAGE = [
   `klypix-mcp ${PKG_VERSION} — shared project brain + MCP coordination server.`,
@@ -31,6 +31,9 @@ const USAGE = [
   '  conformance [--json]                launch two real MCP clients against this build',
   '  init                                seed a starter ./brain.klypix + print an MCP config',
   '  garden-code [brain]                 print the human approval code for brain_garden',
+  '  git-driver [install|status] [repo]  register the lossless .klypix merge driver for a repo (zero-command teams)',
+  '  diff [ref] [--brain <path>]         readable brain diff vs a git ref (default HEAD) — markdown to stdout',
+  '  pr-brief [baseRef] [--brain <path>] brain decisions touching the files changed since baseRef — PR-comment markdown',
   '',
   'With no verb (or any --flag, e.g. --vault <dir>) it runs as an MCP stdio server.',
   'There is no uninstall command — removal is manual (see README).',

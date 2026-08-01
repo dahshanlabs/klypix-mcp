@@ -1,0 +1,68 @@
+# Brain-aware pull requests — copy this file to .github/workflows/brain-pr.yml
+# in any repo whose brain.klypix is committed.
+#
+# On every PR it posts (and keeps updated) ONE sticky comment with:
+#   1. the brain decisions/corrections that reference the files the PR touches
+#      (evidence tags: #file-<name> inside cards), and
+#   2. a readable card-level diff of the brain itself, when the PR changes it.
+#
+# Nothing here talks to any KLYPIX service — the brain is read from the
+# checkout, exactly as your agents read it. Requires only the default
+# GITHUB_TOKEN with pull-requests: write.
+
+name: brain-pr
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  brain-context:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0            # pr-brief and diff need the base ref
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build the comment
+        id: brain
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          {
+            npx --yes klypix-mcp pr-brief "$BASE" || true
+            echo ""
+            # Only show the brain diff when the PR actually changes the brain.
+            if git diff --name-only "$BASE"...HEAD | grep -q '\.klypix$'; then
+              npx --yes klypix-mcp diff "$BASE" || true
+            fi
+          } > brain-comment.md
+          # Skip the comment entirely when there is nothing to say.
+          if ! grep -qE '🧠' brain-comment.md; then
+            echo "post=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "post=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post / update the sticky comment
+        if: steps.brain.outputs.post == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          MARKER="<!-- klypix-brain-pr -->"
+          printf '%s\n\n' "$MARKER" | cat - brain-comment.md > body.md
+          EXISTING=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR}/comments" \
+            --jq ".[] | select(.body | startswith(\"$MARKER\")) | .id" | head -1)
+          if [ -n "$EXISTING" ]; then
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${EXISTING}" -F body=@body.md > /dev/null
+          else
+            gh pr comment "$PR" --body-file body.md > /dev/null
+          fi

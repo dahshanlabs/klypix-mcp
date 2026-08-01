@@ -102,6 +102,14 @@ await runVerb('doctor', './klypix-doctor.mjs');
 // overlap detection, proactive logging, and guaranteed next-action delivery.
 await runVerb('conformance', './klypix-conformance.mjs');
 
+// `npx klypix-mcp git-driver | diff | pr-brief` — the GitHub lane: register the
+// lossless .klypix merge driver for any repo, render a readable brain diff vs a
+// git ref, and print the brain cards touching a PR's changed files. One module,
+// three verbs (it reads argv[2] itself).
+await runVerb('git-driver', './klypix-git-driver.mjs');
+await runVerb('diff', './klypix-diff.mjs');
+await runVerb('pr-brief', './klypix-pr-brief.mjs');
+
 // `npx klypix-mcp garden-code` — the HUMAN half of the garden approval gate.
 // brain_garden's apply requires an 8-char code derived from the exact dormant
 // candidate set + day; the agent is deliberately never shown it. The human runs

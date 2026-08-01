@@ -22,7 +22,7 @@ import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
 import https from 'https';
-import { execSync, spawn } from 'child_process';
+import { execFileSync, execSync, spawn } from 'child_process';
 
 const CWD = process.cwd();
 const BRAIN = path.resolve(CWD, 'brain.klypix');
@@ -55,11 +55,28 @@ const cmpSemver = (a, b) => { const pa = String(a || '').split('.').map(n => par
 // `git rev-parse HEAD:<path>` → the file's blob OID at HEAD (stable across
 // uncommitted edits; changes only when the committed content does). Used to
 // STAMP a card's evidence at capture and to DETECT drift at read. Best-effort.
+// Evidence refs may carry :line/:column or #Lline suffixes, and Codex commonly
+// emits absolute Windows paths. Normalize those without splitting the drive
+// colon, reject paths outside this repository, and pass argv directly to git so
+// an evidence string can never become shell syntax.
+function evidenceGitPath(ref) {
+    let clean = String(ref || '').trim().replace(/^`|`$/g, '');
+    clean = clean.replace(/#L\d+(?:-L?\d+)?$/i, '').replace(/:\d+(?::\d+)?$/, '').trim();
+    if (!clean) return null;
+    if (path.isAbsolute(clean)) {
+        const rel = path.relative(CWD, path.resolve(clean));
+        if (!rel || rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) return null;
+        clean = rel;
+    }
+    clean = clean.replace(/\\/g, '/').replace(/^\.\//, '');
+    if (!clean || clean === '..' || clean.startsWith('../')) return null;
+    return clean;
+}
 function gitBlobOid(relPath) {
     try {
-        const clean = String(relPath).split(':')[0].trim();
+        const clean = evidenceGitPath(relPath);
         if (!clean) return null;
-        const oid = execSync(`git rev-parse "HEAD:${clean}"`, { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 1500 }).trim();
+        const oid = execFileSync('git', ['rev-parse', `HEAD:${clean}`], { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 1500 }).trim();
         return /^[0-9a-f]{7,40}$/.test(oid) ? oid : null;
     } catch { return null; }
 }
@@ -114,13 +131,19 @@ function computeFreshness(struct) {
             const fileRefs = c.evidence.filter(e => e?.kind === 'file' && e.oid);
             if (!fileRefs.length) { freshness[c.id] = '🌱'; continue; }
             let isDrift = false;
+            const missingRefs = [];
             for (const ev of fileRefs) {
-                const clean = String(ev.ref).split(':')[0].trim();
-                if (!oidCache.has(clean)) oidCache.set(clean, gitBlobOid(clean));
-                const cur = oidCache.get(clean);
-                if (cur && cur !== ev.oid) isDrift = true;
+                const clean = evidenceGitPath(ev.ref);
+                const cacheKey = clean || `invalid:${ev.ref}`;
+                if (!oidCache.has(cacheKey)) oidCache.set(cacheKey, clean ? gitBlobOid(clean) : null);
+                const cur = oidCache.get(cacheKey);
+                if (!cur) { isDrift = true; missingRefs.push(ev.ref); }
+                else if (cur !== ev.oid) isDrift = true;
             }
-            if (isDrift) { freshness[c.id] = '⚠️'; drifted.push({ area: c.area, text: c.text, refs: fileRefs.map(e => e.ref) }); }
+            if (isDrift) {
+                freshness[c.id] = missingRefs.length ? '⚠️ missing' : '⚠️';
+                drifted.push({ area: c.area, text: c.text, refs: fileRefs.map(e => e.ref), missingRefs });
+            }
             else freshness[c.id] = '✅';
         }
     } catch { /* best-effort */ }
@@ -130,13 +153,13 @@ function selfHealFooter(drifted) {
     if (!drifted || !drifted.length) return '';
     const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
     const lines = ['', '---',
-        `## 🔧 Self-heal — ${drifted.length} fact(s) cite code that CHANGED; re-verify before trusting them`,
+        `## 🔧 Self-heal — ${drifted.length} fact(s) cite code that CHANGED or went MISSING; re-verify before trusting them`,
         `For each below: re-read the cited file, decide, then emit ONE marker (the human approves the change in chat):`,
         '· still true → `🧠 BRAIN [Area] ~: <same claim> ev: <file>` — re-stamps it ✅ fresh',
         '· now wrong → `🧠 BRAIN [Area] ~: <corrected claim> ev: <file>` — rewrites + re-stamps',
         '· obsolete → `🧠 BRAIN [Area] ✓: <what it resolved to>` — closes + archives',
     ];
-    for (const d of drifted.slice(0, 8)) lines.push(`- ⚠️ [${d.area || '?'}] ${flat(d.text).slice(0, 110)}  ·  cites \`${d.refs.join(', ')}\``);
+    for (const d of drifted.slice(0, 8)) lines.push(`- ⚠️${d.missingRefs?.length ? ' missing' : ''} [${d.area || '?'}] ${flat(d.text).slice(0, 110)}  ·  cites \`${d.refs.join(', ')}\``);
     return '\n' + lines.join('\n') + '\n';
 }
 // ── External-state reconcile — migration omission tripwire (part 4) ──────────
@@ -2622,5 +2645,5 @@ if (!process.env.KLYPIX_BRAIN_NO_MAIN) {
 
 // Exported for hermetic unit tests only (gated by KLYPIX_BRAIN_NO_MAIN above so the
 // import doesn't run main()/exit the test). Not part of the runtime hook contract.
-export { refreshNpmCurrency, versionCurrencyFooter, bakedBrainVersion, httpsFetchLatest, cmpSemver, decayStampForMessage, messageFooter, splitMarkerSuffixes };
+export { refreshNpmCurrency, versionCurrencyFooter, bakedBrainVersion, httpsFetchLatest, cmpSemver, decayStampForMessage, messageFooter, splitMarkerSuffixes, evidenceGitPath, gitBlobOid, computeFreshness, selfHealFooter };
 // (shouldSelfUpdate is exported at its declaration above — the auto-propagation decision seam for tests)

@@ -40,9 +40,56 @@ const isValidZKey = (k) => { try { generateKeyBetween(k, null); return true; } c
 const rand = () => Math.random().toString(36).slice(2, 10);
 const ARCHIVE = /^archive$/i;
 
-// Load one .klypix buffer into a flat, comparison-friendly shape. Unchanged
-// cards across ancestor/descendant buffers keep byte-identical item JSON, so a
-// simple string compare detects real content edits.
+// ── Semantic item comparison (2026-08-01 field fix) ─────────────────────────
+// A raw byte compare of item JSON was the change detector, on the assumption
+// that "unchanged cards keep byte-identical JSON". That assumption DIED the
+// day cards gained touch metadata: `updatedAt` is restamped whenever a card is
+// written, so two sides holding the SAME card with the SAME text differ in
+// bytes — and every first real sync spawned __agconf conflict twins for cards
+// nobody edited (field-proven on the founder's pump-doctor brain: 5 twins,
+// differing field list = ["updatedAt"] exactly).
+//
+// The fix is the same discipline the sync core and the brain diff already use:
+// compare PARSED MEANING with volatile/derived fields stripped, key-sorted so
+// two writers' key orders can't fake a difference. Byte-compare survives as the
+// fallback for anything unparseable — a malformed item must never crash a merge.
+//
+// VOLATILE = written by the act of saving, not by a human/agent decision:
+//   updatedAt — touch timestamp        zIndex — display order derived from zKey
+// Everything else (content, colors, geometry, evidence, author…) stays load-
+// bearing: a real edit to any of them is still a real conflict.
+const VOLATILE_ITEM_FIELDS = ['updatedAt', 'zIndex'];
+
+const sortedStable = (v) => JSON.stringify(v, (_k, val) =>
+  (val && typeof val === 'object' && !Array.isArray(val))
+    ? Object.fromEntries(Object.keys(val).sort().map(k => [k, val[k]]))
+    : val);
+
+function itemSignature(json) {
+  if (json == null) return null;
+  try {
+    const obj = JSON.parse(json);
+    for (const f of VOLATILE_ITEM_FIELDS) delete obj[f];
+    return sortedStable(obj);
+  } catch {
+    return json;                      // unparseable → byte identity, as before
+  }
+}
+
+/** True when two item JSON strings mean the same thing (volatile fields aside).
+ *  EXPORTED as the single definition of "did this card actually change" — the
+ *  git merge driver and the Brain Sync core both decide committed-absence
+ *  tombstones with it, so all three transports agree on what an edit is. */
+export const sameMeaning = (a, b) => {
+  if (a === b) return true;           // fast path: byte-identical
+  if (a == null || b == null) return false;
+  return itemSignature(a) === itemSignature(b);
+};
+
+// Load one .klypix buffer into a flat, comparison-friendly shape. Item JSON is
+// kept VERBATIM (the merge must write back exactly what a side held); whether
+// two versions actually differ is decided by sameMeaning(), never by these
+// bytes — see its note on volatile fields.
 async function loadSide(buf) {
   if (!buf) return null;
   const { zip, canvas, manifest, struct } = await parseKlypix(buf);
@@ -128,9 +175,13 @@ export async function mergeBrains({ base = null, ours, theirs, deletedIds = [] }
     // ── Choose CONTENT ──────────────────────────────────────────────────────
     let json, side;
     if (inO && inT) {
-      const oChg = !inB || O.items[id] !== baseItem(id);
-      const tChg = !inB || T.items[id] !== baseItem(id);
-      if (inB && oChg && tChg && O.items[id] !== T.items[id]) {
+      // Change + divergence are judged by MEANING, not bytes (see sameMeaning):
+      // a restamped `updatedAt` is not an edit, and two copies of one card that
+      // differ only in volatile fields are not in conflict.
+      const oChg = !inB || !sameMeaning(O.items[id], baseItem(id));
+      const tChg = !inB || !sameMeaning(T.items[id], baseItem(id));
+      const diverged = !sameMeaning(O.items[id], T.items[id]);
+      if (inB && oChg && tChg && diverged) {
         // GENUINE content conflict: a card that EXISTED at open, edited differently
         // on both sides → human stays live, agent version preserved as a twin.
         json = O.items[id]; side = 'ours';
@@ -138,7 +189,7 @@ export async function mergeBrains({ base = null, ours, theirs, deletedIds = [] }
         extras.push({ id: twinId, json: T.items[id], srcPos: T.positions[id] || O.positions[id], of: id });
         conflicts.push({ id, kind: 'content', keptLive: 'ours', twin: twinId });
       } else if (tChg && !oChg) { json = T.items[id]; side = 'theirs'; delta.updated.push(id); }
-      else if (!inB && O.items[id] !== T.items[id]) {
+      else if (!inB && diverged) {
         // Same NEW card (same id) present on BOTH sides but never in base — e.g. an
         // agent card the app also holds via live-apply, re-serialized slightly
         // differently. It's the SAME card, NOT a conflict → take the disk/agent

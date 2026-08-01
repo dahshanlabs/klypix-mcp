@@ -31,7 +31,7 @@
 // resolves to the edit — no-loss wins over delete).
 
 import fs from 'node:fs';
-import { mergeBrains } from './merge-brains.mjs';
+import { mergeBrains, sameMeaning } from './merge-brains.mjs';
 import { parseKlypix, shard } from './klypix-format.mjs';
 
 // id -> verbatim item JSON string for one side (null for an empty/absent side).
@@ -68,8 +68,11 @@ try {
       const inA = ai.has(id), inB = ti.has(id);
       if (inA && inB) continue;                                   // alive on both
       if (!inA && !inB) { deletedIds.push(id); continue; }        // deleted on both
+      // "Untouched" by MEANING, not bytes — a side that merely re-saved the
+      // file restamps volatile fields (updatedAt), and a byte compare would
+      // read that as an edit and silently refuse to propagate a real delete.
       const survivorJson = inA ? ai.get(id) : ti.get(id);
-      if (survivorJson === baseJson) deletedIds.push(id);         // delete vs untouched → honor
+      if (sameMeaning(survivorJson, baseJson)) deletedIds.push(id);   // delete vs untouched → honor
       // delete vs EDIT → no tombstone; union keeps the edited card
     }
   }

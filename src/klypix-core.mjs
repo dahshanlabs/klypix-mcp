@@ -829,6 +829,54 @@ export async function opBrainReconcile({ vault, canvas, root, mode = 'all' }) {
 export const gardenApprovalCode = (areas) =>
   sha1(areas.map(a => a.candidates.map(c => c.id).sort().join(',')).sort().join('|') + '|' + new Date().toISOString().slice(0, 10)).slice(0, 8);
 
+// ── in-process write serialization ──────────────────────────────────────────
+// EVERY write below is read-modify-write: read the file, append/merge/tidy, write
+// it back. Two callers that interleave inside ONE process both read the same
+// pre-write bytes, and the second rename wins — so the first caller's cards are
+// gone while its result still says "added". `atomicWrite` is rename-atomic: it
+// prevents a TORN file, never a LOST UPDATE. Measured before this landed: five
+// parallel opAddToCanvas calls reported five successes and left ONE card on disk;
+// the same five run serially left five. That is silent loss in the subsystem whose
+// promise is lossless merge.
+//
+// The A2A face is what made it reachable — node:http serves requests concurrently
+// — but the defect is here in the engine, so the MCP server and every CLI bin
+// inherit the fix.
+//
+// SCOPE, deliberately stated: this is an IN-PROCESS lock. It does not coordinate
+// with the desktop app or the Claude Stop hook, which are separate processes with
+// their own advisory `.claude/brain-capture.lock` that this engine does not yet
+// honour. Cross-process convergence is a separate, larger change; do not read this
+// as "concurrent writes are safe from every direction".
+const writeChains = new Map();   // resolved lowercased path → tail promise
+
+function withWriteLock(key, fn) {
+  const k = String(key).toLowerCase();
+  const prev = writeChains.get(k) || Promise.resolve();
+  // Run regardless of how the predecessor settled: one caller's failed write must
+  // not fail the next. Two separate callbacks, NOT `.then(fn, fn)` — that form
+  // passes the previous result/error in as fn's first argument.
+  const run = prev.then(() => fn(), () => fn());
+  // Store a settled-either-way tail so a rejection here is never unhandled.
+  const tail = run.then(() => {}, () => {});
+  writeChains.set(k, tail);
+  // Prune once we are the last link, so a long-lived server cannot retain one
+  // entry per canvas path forever. If a newer caller already replaced the tail,
+  // leave it alone — that chain is still live.
+  tail.then(() => { if (writeChains.get(k) === tail) writeChains.delete(k); });
+  return run;
+}
+
+// Writes to an existing canvas serialize on that canvas. Different files stay
+// fully parallel.
+const withCanvasWriteLock = (file, fn) => withWriteLock(path.resolve(file), fn);
+
+// Creation serializes on the VAULT, not the file: `safeName` picks a name by
+// probing the directory, so two concurrent creates of the same title would both
+// see the name free and the second would overwrite the first. Creates are rare;
+// serializing them per-vault costs nothing real.
+const withVaultCreateLock = (vault, fn) => withWriteLock('vault:' + path.resolve(vault), fn);
+
 export async function opBrainGarden({ vault, canvas, apply = false, syntheses, approve = '' }) {
   const t = brainTarget(vault, canvas);
   if (t.ambiguous) return ambiguousBrainErr(t.ambiguous);
@@ -850,18 +898,20 @@ export async function opBrainGarden({ vault, canvas, apply = false, syntheses, a
   if (String(approve || '').trim() !== gardenApprovalCode(areas)) {
     return err('Garden apply requires HUMAN approval: show the human the dry-run plan + your syntheses, then ask them to run `npx klypix-mcp garden-code` in this project and paste the 8-character code — pass it as approve:"<code>". The code is never shown to you directly. (It changes when the candidate set or the day changes — if it expired, re-run the dry run and re-confirm.)');
   }
-  try {
-    const { buffer, stats } = await applyGarden(fs.readFileSync(file), { syntheses });
-    const skippedNote = (stats.skipped && stats.skipped.length)
-      ? `\n\n⚠️ Left untouched (faithfulness guard): ${stats.skipped.map(s => `"${s.title}" — ${s.reason}`).join('; ')}.`
-      : '';
-    if (!stats.synthCards) return { blocks: [text(`No areas consolidated — each synthesis \`title\` must match a dry-run area title exactly.${skippedNote}`)] };
-    let out = buffer; try { out = (await tidyBrain(buffer)).buffer; } catch { /* keep apply result if tidy fails */ }
-    await atomicWrite(file, out);
-    return { blocks: [text(`🌿 Gardened ${stats.areas} area(s): ${stats.archived} old card(s) → ${stats.synthCards} synthesis card(s); originals archived with "consolidated into" arrows (any prose-dropped figures appended verbatim). Reopen the brain in the KLYPIX app to see it.${skippedNote}`)] };
-  } catch (e) {
-    return err(`Garden apply failed (brain unchanged): ${e.message}`);
-  }
+  return withCanvasWriteLock(file, async () => {
+    try {
+      const { buffer, stats } = await applyGarden(fs.readFileSync(file), { syntheses });
+      const skippedNote = (stats.skipped && stats.skipped.length)
+        ? `\n\n⚠️ Left untouched (faithfulness guard): ${stats.skipped.map(s => `"${s.title}" — ${s.reason}`).join('; ')}.`
+        : '';
+      if (!stats.synthCards) return { blocks: [text(`No areas consolidated — each synthesis \`title\` must match a dry-run area title exactly.${skippedNote}`)] };
+      let out = buffer; try { out = (await tidyBrain(buffer)).buffer; } catch { /* keep apply result if tidy fails */ }
+      await atomicWrite(file, out);
+      return { blocks: [text(`🌿 Gardened ${stats.areas} area(s): ${stats.archived} old card(s) → ${stats.synthCards} synthesis card(s); originals archived with "consolidated into" arrows (any prose-dropped figures appended verbatim). Reopen the brain in the KLYPIX app to see it.${skippedNote}`)] };
+    } catch (e) {
+      return err(`Garden apply failed (brain unchanged): ${e.message}`);
+    }
+  });
 }
 
 export async function opBrainConnect({ vault, canvas, apply = false, max = 24, threshold = 0.45, pairs = null, relationship = null, label = null, log = () => {} }) {
@@ -891,11 +941,13 @@ export async function opBrainConnect({ vault, canvas, apply = false, max = 24, t
     if (!explicit.length) return err('pairs needs [{fromId, toId}, …] where both ids are real cards in this brain (see the ids in brain_reconcile output).');
     const render2 = (e) => `- ${flat(byId.get(e.fromId)?.text)} ↔ ${flat(byId.get(e.toId)?.text)}  (${e.relationship}${e.label ? `: ${e.label}` : ''})`;
     if (!apply) return { blocks: [text(`# ${explicit.length} explicit connection(s) to draw\n_Re-run with apply:true to draw them.${rel === 'not_contradiction' ? ' These pairs will then be permanently dismissed as contradiction candidates.' : ''}_\n\n${explicit.map(render2).join('\n')}`)] };
-    try {
-      const { buffer, added } = await addBrainConnections(fs.readFileSync(file), explicit);
-      await atomicWrite(file, buffer);
-      return { blocks: [text(`✓ Drew ${added} connection(s)${rel === 'not_contradiction' ? ' — these pair(s) are now dismissed and will NOT resurface as brain_reconcile contradiction candidates' : ''}.\n\n${explicit.slice(0, added).map(render2).join('\n')}`)] };
-    } catch (e) { return err(`Apply failed (brain unchanged): ${e.message}`); }
+    return withCanvasWriteLock(file, async () => {
+      try {
+        const { buffer, added } = await addBrainConnections(fs.readFileSync(file), explicit);
+        await atomicWrite(file, buffer);
+        return { blocks: [text(`✓ Drew ${added} connection(s)${rel === 'not_contradiction' ? ' — these pair(s) are now dismissed and will NOT resurface as brain_reconcile contradiction candidates' : ''}.\n\n${explicit.slice(0, added).map(render2).join('\n')}`)] };
+      } catch (e) { return err(`Apply failed (brain unchanged): ${e.message}`); }
+    });
   }
 
   let edges = [];
@@ -935,6 +987,7 @@ export async function opBrainConnect({ vault, canvas, apply = false, max = 24, t
   if (!apply) {
     return { blocks: [text(`# ${chosen.length} suggested connection(s) · ${mode}\n_Review, then re-run with apply:true to draw them._\n\n${chosen.map(render).join('\n')}`)] };
   }
+  return withCanvasWriteLock(file, async () => {
   try {
     const { buffer, added } = await addBrainConnections(fs.readFileSync(file), chosen);
     await atomicWrite(file, buffer);
@@ -942,49 +995,59 @@ export async function opBrainConnect({ vault, canvas, apply = false, max = 24, t
   } catch (e) {
     return err(`Apply failed (brain unchanged): ${e.message}`);
   }
+  });
 }
 
 export async function opCreateCanvas({ vault, title, cards, connections, filename }) {
   if (!fs.existsSync(vault)) { try { fs.mkdirSync(vault, { recursive: true }); } catch { /* ignore */ } }
-  try {
-    const buf = await buildKlypix({ title, cards, connections });
-    const name = filename ? safeName(vault, filename.replace(IS_CANVAS, '')) : safeName(vault, title);
-    const out = path.join(vault, name);
-    await atomicWrite(out, buf);
-    let detail = '', struct;
-    try { ({ struct } = await parseKlypix(buf)); detail = cardDetailBlock(struct); } catch { /* detail is optional */ }
-    return {
-      blocks: [text(`Created ${out} — ${cards.length} cards, ${(connections || []).length} connections. Open it in the KLYPIX app (Canvas → Open).${detail}`)],
-      file: { name, buffer: buf }, struct,
-    };
-  } catch (e) {
-    return err(`Create failed: ${e.message}`);
-  }
+  // Locked on the VAULT: safeName picks a free name by probing the directory, so
+  // two concurrent creates of the same title would both see it free and the second
+  // atomicWrite would silently replace the first canvas.
+  return withVaultCreateLock(vault, async () => {
+    try {
+      const buf = await buildKlypix({ title, cards, connections });
+      const name = filename ? safeName(vault, filename.replace(IS_CANVAS, '')) : safeName(vault, title);
+      const out = path.join(vault, name);
+      await atomicWrite(out, buf);
+      let detail = '', struct;
+      try { ({ struct } = await parseKlypix(buf)); detail = cardDetailBlock(struct); } catch { /* detail is optional */ }
+      return {
+        blocks: [text(`Created ${out} — ${cards.length} cards, ${(connections || []).length} connections. Open it in the KLYPIX app (Canvas → Open).${detail}`)],
+        file: { name, buffer: buf }, struct,
+      };
+    } catch (e) {
+      return err(`Create failed: ${e.message}`);
+    }
+  });
 }
 
 export async function opAddToCanvas({ vault, canvas, cards, connections, via }) {
   const file = resolveCanvas(vault, canvas);
   if (!file) return err(`Canvas not found: ${canvas}`);
-  try {
-    const original = fs.readFileSync(file);
-    let beforeIds = new Set();
-    try { const b = await parseKlypix(original); beforeIds = new Set(b.struct.cards.map(c => c.id)); } catch { /* new/legacy → treat all as new */ }
-    // Provenance: stamp WHICH agent wrote these cards (cursor / claude / cline / a2a).
-    const stamped = via ? cards.map(c => ({ ...c, createdVia: via })) : cards;
-    const buf = await appendToKlypix(original, { cards: stamped, connections });
-    await atomicWrite(file, buf);
-    let detail = '', struct;
+  // The read MUST be inside the lock: reading first and appending later is exactly
+  // the interleaving that loses the other writer's cards.
+  return withCanvasWriteLock(file, async () => {
     try {
-      ({ struct } = await parseKlypix(buf));
-      detail = cardDetailBlock(struct, new Set(struct.cards.map(c => c.id).filter(id => !beforeIds.has(id))));
-    } catch { /* detail is optional */ }
-    return {
-      blocks: [text(`Added ${cards.length} card(s) to ${path.relative(vault, file)}. Reopen the canvas in the KLYPIX app to see them.${detail}`)],
-      file: { name: path.basename(file), buffer: buf }, struct,
-    };
-  } catch (e) {
-    return err(`Add failed: ${e.message}`);
-  }
+      const original = fs.readFileSync(file);
+      let beforeIds = new Set();
+      try { const b = await parseKlypix(original); beforeIds = new Set(b.struct.cards.map(c => c.id)); } catch { /* new/legacy → treat all as new */ }
+      // Provenance: stamp WHICH agent wrote these cards (cursor / claude / cline / a2a).
+      const stamped = via ? cards.map(c => ({ ...c, createdVia: via })) : cards;
+      const buf = await appendToKlypix(original, { cards: stamped, connections });
+      await atomicWrite(file, buf);
+      let detail = '', struct;
+      try {
+        ({ struct } = await parseKlypix(buf));
+        detail = cardDetailBlock(struct, new Set(struct.cards.map(c => c.id).filter(id => !beforeIds.has(id))));
+      } catch { /* detail is optional */ }
+      return {
+        blocks: [text(`Added ${cards.length} card(s) to ${path.relative(vault, file)}. Reopen the canvas in the KLYPIX app to see them.${detail}`)],
+        file: { name: path.basename(file), buffer: buf }, struct,
+      };
+    } catch (e) {
+      return err(`Add failed: ${e.message}`);
+    }
+  });
 }
 
 // brain_note — the DELIBERATE, marker-aware write every agent (not just the
@@ -1008,6 +1071,11 @@ export async function opBrainNote({ vault, canvas, text: noteText, area, marker 
   // review, CONFIRMED). Cards ride the same capture batch, so they also pass
   // through the fulfillment cross-check. Queue is cleared only after the write.
   const projectDir = path.dirname(file);
+  // The pending-ships drain reads a queue, folds it into THIS batch and clears it
+  // only after the write — so it has to sit inside the lock too, or two concurrent
+  // notes both drain the same queue and one batch of ship cards is lost with the
+  // write that carried it.
+  return withCanvasWriteLock(file, async () => {
   let pendingShips = [];
   try { pendingShips = readPendingShips(projectDir); } catch { pendingShips = []; }
   if (pendingShips.length) {
@@ -1040,6 +1108,7 @@ export async function opBrainNote({ vault, canvas, text: noteText, area, marker 
   } catch (e) {
     return err(`brain_note failed (brain unchanged): ${e.message}`);
   }
+  });
 }
 
 // ── brain_message — the MCP twin of the hook's 🧠 MSG marker ─────────────────

@@ -16,6 +16,8 @@ import { buildKlypixMap } from '../src/klypix-core.mjs';
 import {
   buildPresenceSnapshot,
   createMcpPresence,
+  findPresenceConflicts,
+  isSuspectedTwin,
   KLYPIX_MCP_INSTRUCTIONS,
 } from '../src/mcp-presence.mjs';
 
@@ -338,6 +340,33 @@ runHook({
 });
 ok(!listActiveSessions({ brainPath, home }).some((session) => session.id === 'codex-real-a'),
   'real Codex SessionEnd removes the session immediately');
+
+// ── 2026-07-30 hardening regression locks (added 2026-08-01) ────────────────
+// These two behaviors shipped as comments-and-code with no test pinning them;
+// the cross-PC presence lane inherits both, so they must not silently regress.
+{
+  // (1) Mixed declaration spelling: one session declares ABSOLUTE (backslashes,
+  // odd case), the other REPO-RELATIVE — with a shared root they must collide.
+  const mixed = [
+    { id: 'abs', hostPid: 111, cwd: 'E:/ANTIGRAVITY/Repo', files: ['E:\\ANTIGRAVITY\\Repo\\src\\App.TSX'] },
+    { id: 'rel', hostPid: 222, cwd: 'E:/ANTIGRAVITY/Repo', files: ['src/app.tsx'] },
+  ];
+  const hits = findPresenceConflicts(mixed, 'abs', { projectRoot: 'E:/ANTIGRAVITY/Repo' });
+  ok(hits.length === 1 && hits[0].id === 'rel',
+    'absolute vs repo-relative declarations of one file conflict when a root is known');
+
+  // (2) A recycled/collided pid must NOT twin-suppress unrelated sessions:
+  // different machines, or two specifically-known different clients, un-twin.
+  const me = { id: 'a', hostPid: 500, machine: 'pc-one', client: 'claude-code' };
+  ok(!isSuspectedTwin({ id: 'b', hostPid: 500, machine: 'pc-two', client: 'claude-code' }, me),
+    'same pid on a DIFFERENT machine is not a twin (overlap warnings survive)');
+  ok(!isSuspectedTwin({ id: 'c', hostPid: 500, machine: 'pc-one', client: 'codex' }, me),
+    'same pid + same machine but two specifically-known clients is not a twin');
+  ok(isSuspectedTwin({ id: 'd', hostPid: 500, machine: 'pc-one', client: 'mcp' }, me),
+    'generic client on one side still degrades to twin (genuine twins stay suppressed)');
+  ok(isSuspectedTwin({ id: 'e', hostPid: 500, client: 'claude-code' }, me),
+    'missing machine field degrades to twin (older lane rows stay compatible)');
+}
 
 for (const dir of [home, project]) fs.rmSync(dir, { recursive: true, force: true });
 console.log(failures ? `\n[x] ${failures} assertion(s) failed` : '\n[ok] agent-presence: all assertions passed');

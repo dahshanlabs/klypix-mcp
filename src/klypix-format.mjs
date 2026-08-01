@@ -9,7 +9,35 @@
 import JSZip from 'jszip';
 import path from 'path';
 import fs from 'fs';
+import os from 'os';
+import { execFileSync } from 'child_process';
 import { generateKeyBetween } from 'fractional-indexing';
+
+// ── Card author identity (team attribution, 2026-08-01) ─────────────────────
+// `createdBy: 'agent'` says WHAT wrote a card; on a team brain the question is
+// WHOSE agent. Identity rides the same source as the dev's commits — git
+// `user.name` in the project — so brain attribution matches git attribution
+// with zero configuration; `KLYPIX_AUTHOR` overrides, OS account name is the
+// fallback, and on total failure the field is simply absent (additive — older
+// readers and older cards are untouched; merge preserves item bytes verbatim,
+// so authorship survives every sync route).
+let cachedAuthor;
+export function resolveAuthor() {
+    if (cachedAuthor !== undefined) return cachedAuthor;
+    const env = String(process.env.KLYPIX_AUTHOR || '').trim();
+    if (env) return (cachedAuthor = env.slice(0, 80));
+    try {
+        const name = execFileSync('git', ['config', 'user.name'], { stdio: ['ignore', 'pipe', 'ignore'], timeout: 1500 })
+            .toString().trim();
+        if (name) return (cachedAuthor = name.slice(0, 80));
+    } catch { /* not a repo / git absent — fall through */ }
+    try { cachedAuthor = String(os.userInfo().username || '').slice(0, 80) || null; }
+    catch { cachedAuthor = null; }
+    return cachedAuthor;
+}
+// Test seam: clears the per-process cache so env overrides can be exercised.
+export function __resetAuthorCache() { cachedAuthor = undefined; }
+const authorField = () => { const a = resolveAuthor(); return a ? { author: a } : {}; };
 
 // Valid fractional-indexing z-keys. Hand-rolled keys (e.g. 'a0000' / 'z00013')
 // are REJECTED by the fractional-indexing lib the KLYPIX app uses and crash it
@@ -91,6 +119,20 @@ export async function parseKlypix(buffer) {
     if (!canvasRaw) throw new Error('Not a valid .klypix/.any — no canvas.json inside.');
 
     const manifest = manifestRaw ? JSON.parse(manifestRaw) : null;
+    // Forward-compat guard: this engine reads format v4. A file stamped by a
+    // FUTURE format must be refused loudly, never parsed blindly — with brains
+    // syncing between machines (git / Brain Sync), mixed versions are a
+    // guaranteed state, and a blind parse here feeds every downstream writer
+    // (merge, arrange, capture) a structure it does not understand. The merge
+    // driver inherits this automatically: the throw exits it non-zero, which
+    // degrades to a normal manual git conflict.
+    const KLYPIX_FORMAT_CEILING = 4;
+    if (manifest && manifest.format === 'klypix' && Number(manifest.version) > KLYPIX_FORMAT_CEILING) {
+        throw new Error(
+            `This .klypix was saved by a newer format (v${manifest.version}); this engine reads up to v${KLYPIX_FORMAT_CEILING}. ` +
+            'Update KLYPIX / klypix-mcp instead of parsing it — a blind read could damage it.'
+        );
+    }
     const canvas = JSON.parse(canvasRaw);
     // v4 manifests are {format:"klypix", version:4}; positions presence is the
     // robust fallback (legacy .any keeps an inline items array, no positions).
@@ -272,7 +314,7 @@ export async function buildKlypix(spec) {
     const itemJson = (card, w) => {
         if (card.type === 'text') {
             return {
-                type: 'text', locked: false, createdAt: now, createdBy: 'agent',
+                type: 'text', locked: false, createdAt: now, createdBy: 'agent', ...authorField(),
                 content: String(card.text ?? ''), fontSize: FONT,
                 // PLAIN text (no border) renders at max-content width unless
                 // authoredWidth pins the wrap — without it a long single line
@@ -284,7 +326,7 @@ export async function buildKlypix(spec) {
                 textDecoration: 'none', textAlign: 'left', verticalAlign: 'top',
             };
         }
-        return { type: card.type, locked: false, createdAt: now, createdBy: 'agent', ...(card._raw || {}) };
+        return { type: card.type, locked: false, createdAt: now, createdBy: 'agent', ...authorField(), ...(card._raw || {}) };
     };
 
     const zip = new JSZip();
@@ -369,7 +411,7 @@ export async function appendToKlypix(buffer, addition) {
     const nextZKey = makeZKeyGen(existingTop);
     for (const a of added) {
         zip.file(`items/${shard(a.id)}/${a.id}.json`, JSON.stringify({
-            type: 'text', locked: false, createdAt: now, createdBy: 'agent',
+            type: 'text', locked: false, createdAt: now, createdBy: 'agent', ...authorField(),
             ...(a.card.createdVia ? { createdVia: String(a.card.createdVia) } : {}),
             content: String(a.card.text), fontSize: FONT,
             color: a.card.color || '#1a1a1f', border: !!a.card.border, borderColor: '#1e1e2e',
@@ -542,8 +584,10 @@ export async function appendIntoContainers(buffer, addition) {
         const id = `txt_${rand()}`;
         zip.file(`items/${shard(id)}/${id}.json`, JSON.stringify({
             type: 'text', locked: false, createdAt: now, createdBy: 'agent',
-            // Provenance: WHICH agent remembered this (claude-code / cursor /
-            // cline / …) — additive field, ignored by older readers.
+            // Provenance: WHOSE agent (git user.name — matches commit identity)…
+            ...authorField(),
+            // …and WHICH agent remembered this (claude-code / cursor /
+            // cline / …) — both additive fields, ignored by older readers.
             ...(card.createdVia ? { createdVia: String(card.createdVia) } : {}),
             // Evidence anchors (file:line / PR#) — additive, ignored by older readers.
             ...(Array.isArray(card.evidence) && card.evidence.length ? { evidence: card.evidence } : {}),
@@ -3837,7 +3881,7 @@ export async function applyGarden(buffer, { syntheses = [] } = {}) {
         // `sources` = machine lineage (which originals fed this synthesis, with
         // their birth dates) — as_of and future provenance passes read the
         // field, never the prose.
-        zip.file(`items/${shard(sid)}/${sid}.json`, JSON.stringify({ type: 'text', locked: false, createdAt: now, createdBy: 'agent', createdVia: 'gardener', content, fontSize: 12, color: '#e8e8ed', border: true, borderColor: 'rgba(59,130,246,0.6)', heading: false, sources: area.candidates.map(c => ({ id: c.id, createdAt: c.createdAt || 0 })) }));
+        zip.file(`items/${shard(sid)}/${sid}.json`, JSON.stringify({ type: 'text', locked: false, createdAt: now, createdBy: 'agent', ...authorField(), createdVia: 'gardener', content, fontSize: 12, color: '#e8e8ed', border: true, borderColor: 'rgba(59,130,246,0.6)', heading: false, sources: area.candidates.map(c => ({ id: c.id, createdAt: c.createdAt || 0 })) }));
         canvas.positions[sid] = { x: ctnPos.x + 20, y: ctnPos.y + (ctnPos.h || 0) + 10, w: 300, h: measureCardH(content), zKey: nextZKey(), zIndex: canvas.order.length, parentId: area.containerId };
         canvas.order.push(sid);
         newCards.push(sid);
@@ -4617,7 +4661,7 @@ export async function buildKlypixMap(spec) {
             const id = `txt_${rand()}_${ai}_${ci}`;
             const h = measured[ci];
             items[id] = {
-                type: 'text', locked: false, createdAt: now, createdBy: 'agent',
+                type: 'text', locked: false, createdAt: now, createdBy: 'agent', ...authorField(),
                 content: String(c.text), fontSize: FONT,
                 color: c.color || '#e8e8ed', border: true,
                 borderColor: c.color || 'rgba(16,185,129,0.35)',

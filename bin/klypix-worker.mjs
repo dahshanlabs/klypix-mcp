@@ -30,9 +30,13 @@ import {
   opBrainInsights, opBrainConnect, opBrainReconcile, opBrainGarden, opCreateCanvas, opAddToCanvas, opBrainNote, opBrainMessage, opBrainAsk, opBrainChallenge, opCanvasView, opBrainLens,
   opBrainTaskContext,
 } from '../src/klypix-core.mjs';
-import { mcpServerEntry } from '../src/agent-rules.mjs';
+import { auditProject, compactAgentsBrief, linkProject, mcpServerEntry } from '../src/agent-rules.mjs';
 import { createMcpPresence, KLYPIX_MCP_INSTRUCTIONS } from '../src/mcp-presence.mjs';
-import { spawnAutoUpdateHelper } from '../src/mcp-auto-update.mjs';
+import {
+  reconcileRegisteredProjects,
+  registerProjectBrain,
+  spawnAutoUpdateHelper,
+} from '../src/mcp-auto-update.mjs';
 // Namespace import (already in-process via the klypix-core chain, so zero added
 // load cost) so a bundle whose klypix-format predates classifyDecay degrades
 // gracefully — a named import of a missing export would kill the whole server.
@@ -41,6 +45,10 @@ import * as brainFormat from '../src/klypix-format.mjs';
 // Real package version for the MCP handshake (was hardcoded '1.0.0', which
 // misled every client/version diagnosis — it could never reflect the true release).
 const PKG_VERSION = (() => { try { return createRequire(import.meta.url)('../package.json').version; } catch { return '0.0.0'; } })();
+const RUNTIME_BRAIN_DIR = path.dirname(
+  process.env.KLYPIX_MCP_RUNTIME_MANIFEST
+  || path.join(os.homedir(), '.claude', 'project-brain', '.mcp-runtime.json'),
+);
 
 // IMPORTANT: stdout is the JSON-RPC channel. Never console.log — only stderr.
 const log = (...a) => console.error('[klypix-mcp]', ...a);
@@ -216,7 +224,7 @@ server.registerTool('search_canvases', {
 
 server.registerTool('search_all_brains', {
   title: 'Search every project brain on this machine',
-  description: 'Cross-project memory search: looks through every brain.klypix this machine has REGISTERED, not just the current vault. Ranking is lexical, blended with on-device semantic similarity ONLY when the optional local model is installed (a fresh `npx klypix-mcp install` is lexical) — it degrades cleanly, never errors. Use when the answer may live in ANOTHER project\'s decisions. Optional as_of (YYYY-MM-DD) answers "what was true then" — superseded cards count as live if they were current at that date. LIMIT: the cross-project registry is written by the Claude Code lifecycle hook and by nothing else, so on a Codex-only or Cursor-only machine this returns an empty result — that is a missing registry, not "no match".',
+  description: 'Cross-project memory search: looks through every brain.klypix this machine has REGISTERED, not just the current vault. Ranking is lexical, blended with on-device semantic similarity ONLY when the optional local model is installed (a fresh `npx klypix-mcp install` is lexical) — it degrades cleanly, never errors. Use when the answer may live in ANOTHER project\'s decisions. Optional as_of (YYYY-MM-DD) answers "what was true then" — superseded cards count as live if they were current at that date. The registry is populated by Claude lifecycle and by brain_sync on any MCP host; a project that has never started through either path is absent from cross-project search.',
   inputSchema: {
     query: z.string().describe('What to find across all project brains.'),
     as_of: z.string().optional().describe('Optional YYYY-MM-DD: rank what was TRUE at that date (time-travel query).'),
@@ -378,6 +386,24 @@ server.registerTool('brain_sync', {
 }, async ({ project, intent, files, phase, include_context }) => {
   const totalStartedAt = Date.now();
   const report = mcpPresence.sync({ project, intent, files, phase });
+  // Zero-manual harness convergence: brain_sync is the one project-aware
+  // gateway every MCP host can call. Register MCP-only projects here (Claude's
+  // lifecycle hook is no longer the sole registry writer), then reconcile only
+  // KLYPIX-managed instructions/config entries before task work begins.
+  let harness = null;
+  let registration = null;
+  if (phase === 'start' && report.structured?.brain) {
+    registration = registerProjectBrain({
+      brainPath: report.structured.brain,
+      brainDir: RUNTIME_BRAIN_DIR,
+    });
+    harness = await reconcileRegisteredProjects({
+      brainDir: RUNTIME_BRAIN_DIR,
+      version: PKG_VERSION,
+      brainPaths: [report.structured.brain],
+      rules: { auditProject, compactAgentsBrief, linkProject },
+    });
+  }
   // Class-C ship observation, host-neutral: brain_sync is the ONE surface every
   // MCP host calls at task start, so an MCP-only project (no Claude/Codex hook)
   // still notices a release nobody narrated. Queued here, drained at the next
@@ -429,13 +455,20 @@ server.registerTool('brain_sync', {
       context: taskContext?.context?.durationMs || 0,
       total: totalMs,
     },
+    ...(registration ? { registration } : {}),
+    ...(harness ? { harness } : {}),
   };
+  const harnessText = harness?.failed
+    ? `KLYPIX harness self-heal needs attention: ${harness.failed} project(s) remain partially aligned; brain_doctor has the exact files.`
+    : harness?.updated
+      ? `KLYPIX harness self-healed automatically: ${harness.updated} project(s) refreshed; no manual link command is required.`
+      : '';
   const timingText = `Context Gateway total: ${totalMs}ms`
     + (taskContext?.context ? ` (memory ${taskContext.context.durationMs}ms)` : '') + '.';
   return {
     content: [{
       type: 'text',
-      text: [report.text, shipNotice, contextText, timingText].filter(Boolean).join('\n\n'),
+      text: [report.text, harnessText, shipNotice, contextText, timingText].filter(Boolean).join('\n\n'),
     }],
     structuredContent,
   };
@@ -608,12 +641,8 @@ server.server.oninitialized = () => {
   // older stable supervisor acquire the updater immediately after hot-swapping
   // to a compatible new worker; no extra host reconnect is needed for the
   // scheduler itself. Stamp + lock make the duplicate trigger effectively free.
-  const autoUpdateDir = path.dirname(
-    process.env.KLYPIX_MCP_RUNTIME_MANIFEST
-    || path.join(os.homedir(), '.claude', 'project-brain', '.mcp-runtime.json'),
-  );
   const checkForCoreUpdate = () => spawnAutoUpdateHelper({
-    brainDir: autoUpdateDir,
+    brainDir: RUNTIME_BRAIN_DIR,
     currentVersion: PKG_VERSION,
   });
   autoUpdateStarter = setTimeout(checkForCoreUpdate, 2000);

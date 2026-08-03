@@ -54,9 +54,14 @@ for (const bad of ['123', 'v1.14.0', 'latest', '1.14', '']) {
 
 writeCache({ pkg: 'klypix-mcp', latest: '1.14.0', checkedAt: 1 });
 const line = footer();
-ok(/v1\.13\.0/.test(line) && /v1\.14\.0/.test(line) && /npx klypix-mcp install/.test(line),
-   'stale (latest > baked) → advisory line with both versions + remedy');
+ok(/v1\.13\.0/.test(line) && /v1\.14\.0/.test(line) && /automatically in the background/.test(line) && /no action required/.test(line),
+   'stale (latest > baked) → advisory line with both versions + automatic remedy');
+ok(!/npx klypix-mcp install/.test(line), 'default auto-update footer never asks the user to install manually');
 ok(line.split('\n').filter(l => /Brain update available/.test(l)).length === 1, 'exactly ONE advisory line');
+
+const manualLine = versionCurrencyFooter({ file: cacheFile, brainDir: dir, env: { KLYPIX_AUTO_UPDATE: '0' } });
+ok(/Automatic updates are off/.test(manualLine) && /npx klypix-mcp install/.test(manualLine),
+   'explicit auto-update opt-out → manual fallback remains available');
 
 writeCache({ pkg: 'klypix-mcp', latest: '9.9.9', checkedAt: 1 });
 ok(versionCurrencyFooter({ file: cacheFile, brainDir: path.join(dir, 'nope') }) === '',

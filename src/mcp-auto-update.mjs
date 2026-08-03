@@ -10,7 +10,10 @@
 //   - one registry check per machine per 24 hours;
 //   - stable, same-major releases only (a new major requires a manual install);
 //   - npm installs an exact version and verifies the package's registry integrity;
-//   - runtime-only install: no host settings or project files are rewritten;
+//   - runtime installation is isolated; only after verification do we reconcile
+//     KLYPIX-managed blocks/config entries in registered brain projects;
+//   - project reconciliation preserves non-KLYPIX content, is per-file isolated,
+//     and never turns a harness failure into a broken MCP runtime;
 //   - installer commits .mcp-runtime.json last; the supervisor validates and
 //     compatibility-gates the worker before a zero-restart hot-swap;
 //   - offline, registry, npm, or filesystem failures are fail-open.
@@ -21,7 +24,7 @@ import path from 'path';
 import crypto from 'crypto';
 import https from 'https';
 import { spawn } from 'child_process';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 
 export const AUTO_UPDATE_TTL_MS = 24 * 60 * 60 * 1000;
 export const AUTO_UPDATE_LOCK_STALE_MS = 30 * 60 * 1000;
@@ -45,8 +48,13 @@ const readJson = (file) => {
 const atomicJson = (file, value) => {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
-  fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
-  fs.renameSync(tmp, file);
+  try {
+    fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+    fs.renameSync(tmp, file);
+  } catch (error) {
+    try { fs.unlinkSync(tmp); } catch { /* nothing staged / already moved */ }
+    throw error;
+  }
 };
 const cleanError = (error) => String(error?.message || error || 'unknown error')
   .replace(/[\r\n]+/g, ' ')
@@ -66,7 +74,192 @@ export function autoUpdatePaths(brainDir = path.join(os.homedir(), '.claude', 'p
     lock: path.join(root, '.autoupdate.lock'),
     runtime: path.join(root, '.mcp-runtime.json'),
     version: path.join(root, '.brain-version.json'),
+    registry: path.join(root, 'registry.json'),
+    registryLock: path.join(root, '.registry.lock'),
   };
+}
+
+const normalizeBrainPath = (value) => {
+  const resolved = path.resolve(String(value || ''));
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+};
+
+/**
+ * Register a project from any MCP host, not only Claude's lifecycle hook.
+ * The small lock + atomic replace prevents concurrent brain_sync calls from
+ * losing one another's projects. Failure is deliberately non-fatal: the next
+ * task start retries registration.
+ */
+export function registerProjectBrain({
+  brainPath,
+  brainDir = path.join(os.homedir(), '.claude', 'project-brain'),
+  now = Date.now(),
+} = {}) {
+  const candidate = path.resolve(String(brainPath || ''));
+  if (!['brain.klypix', 'brain.any'].includes(path.basename(candidate).toLowerCase())) {
+    return { registered: false, reason: 'invalid-brain-path' };
+  }
+  try {
+    if (!fs.statSync(candidate).isFile()) return { registered: false, reason: 'missing-brain' };
+  } catch { return { registered: false, reason: 'missing-brain' }; }
+
+  const files = autoUpdatePaths(brainDir);
+  let token = null;
+  for (let attempt = 0; attempt < 20 && !token; attempt++) {
+    token = acquireLock(files.registryLock, Date.now(), 10_000);
+    if (!token) {
+      try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5); } catch { /* retry */ }
+    }
+  }
+  if (!token) return { registered: false, reason: 'busy' };
+  try {
+    const current = readJson(files.registry) || { brains: [] };
+    const byPath = new Map();
+    for (const item of Array.isArray(current.brains) ? current.brains : []) {
+      if (!item?.path) continue;
+      const key = normalizeBrainPath(item.path);
+      const prior = byPath.get(key);
+      if (!prior || Number(item.lastSeen || 0) >= Number(prior.lastSeen || 0)) {
+        byPath.set(key, { ...prior, ...item, path: path.resolve(item.path) });
+      }
+    }
+    const key = normalizeBrainPath(candidate);
+    byPath.set(key, {
+      ...(byPath.get(key) || {}),
+      path: candidate,
+      project: path.basename(path.dirname(candidate)),
+      lastSeen: now,
+    });
+    const brains = [...byPath.values()]
+      .filter((item) => {
+        try { return fs.statSync(item.path).isFile(); } catch { return false; }
+      })
+      .sort((a, b) => Number(a.lastSeen || 0) - Number(b.lastSeen || 0))
+      .slice(-200);
+    atomicJson(files.registry, { ...current, brains });
+    return { registered: true, brainPath: candidate, projects: brains.length };
+  } catch (error) {
+    return { registered: false, reason: cleanError(error) };
+  } finally {
+    releaseLock(files.registryLock, token);
+  }
+}
+
+export function readRegisteredProjectBrains(brainDir = path.join(os.homedir(), '.claude', 'project-brain')) {
+  const registry = readJson(autoUpdatePaths(brainDir).registry);
+  const out = [];
+  const seen = new Set();
+  for (const item of Array.isArray(registry?.brains) ? registry.brains : []) {
+    if (!item?.path) continue;
+    const brainPath = path.resolve(item.path);
+    const key = normalizeBrainPath(brainPath);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ brainPath, projectDir: path.dirname(brainPath), project: item.project || path.basename(path.dirname(brainPath)) });
+  }
+  return out;
+}
+
+async function loadInstalledAgentRules(brainDir, version) {
+  const file = path.join(path.resolve(brainDir), 'agent-rules.mjs');
+  if (!fs.existsSync(file)) throw new Error('installed agent-rules.mjs is missing');
+  // Query-bust because this helper may have loaded the pre-update module before
+  // the installer atomically replaced it. The newly verified runtime must
+  // project its own instructions, never the prior version's cached module.
+  return import(`${pathToFileURL(file).href}?harness=${encodeURIComponent(version || 'current')}-${Date.now()}`);
+}
+
+/** Reconcile every registered project (or an explicit brain subset). */
+export async function reconcileRegisteredProjects({
+  brainDir = path.join(os.homedir(), '.claude', 'project-brain'),
+  version = null,
+  brainPaths = null,
+  rules = null,
+} = {}) {
+  const requested = Array.isArray(brainPaths)
+    ? brainPaths.map((brainPath) => ({
+      brainPath: path.resolve(brainPath),
+      projectDir: path.dirname(path.resolve(brainPath)),
+      project: path.basename(path.dirname(path.resolve(brainPath))),
+    }))
+    : readRegisteredProjectBrains(brainDir);
+  const unique = [];
+  const seen = new Set();
+  for (const item of requested.slice(0, 200)) {
+    const key = normalizeBrainPath(item.brainPath);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(item);
+  }
+
+  const summary = { checked: unique.length, updated: 0, unchanged: 0, failed: 0, skipped: 0, projects: [] };
+  if (!unique.length) return summary;
+  let projector;
+  try { projector = rules || await loadInstalledAgentRules(brainDir, version); }
+  catch (error) {
+    summary.failed = unique.length;
+    summary.projects = unique.map((item) => ({ project: item.project, status: 'failed', error: cleanError(error) }));
+    return summary;
+  }
+
+  for (const item of unique) {
+    const brainName = path.basename(item.brainPath).toLowerCase();
+    const projectLock = path.join(
+      path.resolve(brainDir),
+      '.harness-locks',
+      `${crypto.createHash('sha1').update(normalizeBrainPath(item.brainPath)).digest('hex').slice(0, 16)}.lock`,
+    );
+    let projectToken = null;
+    try {
+      if (!['brain.klypix', 'brain.any'].includes(brainName) || !fs.statSync(item.brainPath).isFile()) {
+        summary.skipped++;
+        summary.projects.push({ project: item.project, status: 'skipped', reason: 'brain-missing' });
+        continue;
+      }
+      for (let attempt = 0; attempt < 20 && !projectToken; attempt++) {
+        projectToken = acquireLock(projectLock, Date.now(), 2 * 60 * 1000);
+        if (!projectToken) {
+          try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10); } catch { /* retry */ }
+        }
+      }
+      if (!projectToken) {
+        summary.skipped++;
+        summary.projects.push({ project: item.project, status: 'skipped', reason: 'busy' });
+        continue;
+      }
+      const before = projector.auditProject(item.projectDir, { version });
+      if (before.ok) {
+        summary.unchanged++;
+        summary.projects.push({ project: item.project, status: 'unchanged' });
+        continue;
+      }
+      const written = projector.linkProject(item.projectDir, { version });
+      if (typeof projector.compactAgentsBrief === 'function') {
+        await projector.compactAgentsBrief(item.projectDir);
+      }
+      const after = projector.auditProject(item.projectDir, { version });
+      const changed = [...written.rules, ...written.mcp]
+        .filter((entry) => !['unchanged', 'skipped'].includes(entry.action)).length;
+      if (!after.ok) {
+        summary.failed++;
+        summary.projects.push({
+          project: item.project,
+          status: 'partial',
+          changed,
+          drift: after.drift.map((entry) => ({ file: entry.file, status: entry.status, why: entry.why })).slice(0, 20),
+        });
+      } else {
+        summary.updated++;
+        summary.projects.push({ project: item.project, status: 'updated', changed });
+      }
+    } catch (error) {
+      summary.failed++;
+      summary.projects.push({ project: item.project, status: 'failed', error: cleanError(error) });
+    } finally {
+      if (projectToken) releaseLock(projectLock, projectToken);
+    }
+  }
+  return summary;
 }
 
 export function readInstalledRuntime(brainDir, fallbackVersion = null) {
@@ -104,6 +297,7 @@ export function inspectAutoUpdate(brainDir, { now = Date.now(), env = process.en
     installedVersion: status?.installedVersion || null,
     lastUpdatedAt: status?.lastUpdatedAt || null,
     error: status?.error || null,
+    harness: status?.harness || null,
   };
 }
 
@@ -291,6 +485,7 @@ export async function runAutoUpdateCheck({
   ttlMs = AUTO_UPDATE_TTL_MS,
   fetchLatest = fetchLatestStableVersion,
   installVersion = installExactRuntime,
+  reconcileProjects = reconcileRegisteredProjects,
 } = {}) {
   const files = autoUpdatePaths(brainDir);
   if (!enabled) return { checked: false, result: 'disabled' };
@@ -314,6 +509,29 @@ export async function runAutoUpdateCheck({
     const installed = readInstalledRuntime(files.brainDir, currentVersion);
     const checkedAt = new Date(now).toISOString();
     atomicJson(files.stamp, { protocol: 1, lastCheck: now, checkedAt });
+
+    const finalize = async (status, harnessVersion) => {
+      let harness;
+      try {
+        harness = await reconcileProjects({
+          brainDir: files.brainDir,
+          version: harnessVersion || installed.version,
+        });
+      } catch (error) {
+        harness = {
+          checked: 0,
+          updated: 0,
+          unchanged: 0,
+          failed: 1,
+          skipped: 0,
+          projects: [],
+          error: cleanError(error),
+        };
+      }
+      const complete = { ...status, harness };
+      atomicJson(files.status, complete);
+      return { checked: true, ...complete };
+    };
 
     if (installed.dev) {
       const status = {
@@ -342,8 +560,7 @@ export async function runAutoUpdateCheck({
           latestVersion,
           error: `major update v${installed.version} → v${latestVersion} requires a manual install`,
         };
-        atomicJson(files.status, status);
-        return { checked: true, ...status };
+        return finalize(status, installed.version);
       }
 
       // A direct-package launch bootstraps a managed runtime when it is equal
@@ -360,8 +577,7 @@ export async function runAutoUpdateCheck({
           currentVersion: installed.version,
           latestVersion,
         };
-        atomicJson(files.status, status);
-        return { checked: true, ...status };
+        return finalize(status, installed.version);
       }
 
       await installVersion(latestVersion, { brainDir: files.brainDir });
@@ -379,8 +595,7 @@ export async function runAutoUpdateCheck({
         installedVersion: verified.version,
         lastUpdatedAt: completedAt,
       };
-      atomicJson(files.status, status);
-      return { checked: true, ...status };
+      return finalize(status, verified.version);
     } catch (error) {
       const status = {
         protocol: 1,

@@ -383,7 +383,9 @@ export function inspect(opts = {}) {
     supervisor: supervisors.active
       ? (supervisors.impaired.length ? 'drift' : (supervisors.matchesInstalled === false ? 'drift' : 'ok'))
       : (version.supervisorCapable ? 'pending-reconnect' : 'legacy'),
-    autoUpdate: !autoUpdate.enabled ? 'off' : (autoUpdate.result === 'failed' ? 'warning' : 'ok'),
+    autoUpdate: !autoUpdate.enabled
+      ? 'off'
+      : (autoUpdate.result === 'failed' || Number(autoUpdate.harness?.failed || 0) > 0 ? 'warning' : 'ok'),
     hooks: !hooks.settingsPresent ? 'absent' : (hooks.missing.length ? 'drift' : 'ok'),
     // Codex MCP presence is the automatic baseline. Hooks are an OPTIONAL
     // enrichment layer, so off/unverified must never make the brain "drifted".
@@ -402,7 +404,20 @@ export function inspect(opts = {}) {
         || decayGuard.deployedFmtCurrent === false || decayGuard.deployedHookCurrent === false) ? 'drift' : 'ok',
   };
   const drifted = Object.values(layers).filter(s => s === 'drift').length;
-  const verdict = !version.installed ? 'NOT-INSTALLED' : (drifted ? 'DRIFTED' : 'ALIGNED');
+  // A live session that has not declared task scope cannot contribute overlap
+  // coordination. That is a readiness gap, not file/runtime drift: say PARTIAL
+  // instead of the misleading all-clear that prompted the field audit.
+  const readinessWarnings = [];
+  const silentSessions = Math.max(0, peers.count - peers.syncedCount);
+  if (peers.count > 1 && silentSessions > 0) {
+    readinessWarnings.push(`${silentSessions} of ${peers.count} active sessions have not declared task scope`);
+  }
+  if (Number(autoUpdate.harness?.failed || 0) > 0) {
+    readinessWarnings.push(`${autoUpdate.harness.failed} automatic harness repair(s) remain partial`);
+  }
+  const verdict = !version.installed
+    ? 'NOT-INSTALLED'
+    : (drifted ? 'DRIFTED' : (readinessWarnings.length ? 'PARTIAL' : 'ALIGNED'));
 
   // ── one reconciliation block ──────────────────────────────────────────────
   const actions = [];
@@ -413,18 +428,19 @@ export function inspect(opts = {}) {
     if (running.matchesInstalled === false) actions.push(`/mcp reconnect (or restart the session)   # LIVE server v${running.version} ≠ installed v${version.baked} — the running MCP server is stale`);
     if (version.supervisorCapable && running.known && !supervisors.active) actions.push('/mcp reconnect once   # activate the zero-restart supervisor; compatible future core updates hot-swap automatically');
     if (hooks.missing.length) actions.push(`npx klypix-mcp install   # half-wired: hooks not active — ${hooks.missing.join(', ')}`);
-    if (hasBrain && !harness.ok) actions.push('npx klypix-mcp link      # harness configs drifted — re-project managed blocks');
+    if (hasBrain && !harness.ok) actions.push('automatic harness repair pending   # retried at the next brain_sync/update check; no manual link command required');
     if (layers.decayGuard === 'drift') actions.push('npx klypix-mcp install   # decay-aware status guard missing/stale — stale build/deploy claims can render as CURRENT state');
     for (const s of supervisors.impaired || []) actions.push(`/mcp reconnect   # supervisor pid ${s.pid} is ${s.status} with no live worker — its tool calls hang until reconnected`);
     if (peers.twinGroups && peers.twinGroups.length) actions.push(`/mcp reconnect   # ${peers.twinGroups.length} session(s) split across twin lane rows (channel merge not occurring) — reconnect adopts the merged id`);
   }
 
-  return { verdict, layers, drifted, version, running, supervisors, autoUpdate, hooks, codexSmart, codexHooks, tools, peers, sessions: peers, receipts: peers.receipts, receiptSessionId, harness, npm, decayGuard, project: { dir: projectDir, brainPath, hasBrain }, brainDir, actions };
+  return { verdict, layers, drifted, readinessWarnings, version, running, supervisors, autoUpdate, hooks, codexSmart, codexHooks, tools, peers, sessions: peers, receipts: peers.receipts, receiptSessionId, harness, npm, decayGuard, project: { dir: projectDir, brainPath, hasBrain }, brainDir, actions };
 }
 
 // One-line drift summary (empty when clean) — for a footer / status line.
 export function driftLine(r) {
   if (r.verdict === 'ALIGNED') return '';
+  if (r.verdict === 'PARTIAL') return `⚠️ brain PARTIAL: ${(r.readinessWarnings || []).join(' · ')}`;
   const bits = [];
   if (!r.version.installed) return 'brain NOT installed — run `npx klypix-mcp install`';
   if (r.version.dirty) bits.push('dirty deploy');
@@ -444,7 +460,13 @@ export function render(r, opts = {}) {
   const c = color ? C : new Proxy({}, { get: () => '' });
   const ok = color ? '✅' : '[ok]', warn = color ? '⚠️ ' : '[!]';
   const L = [];
-  const head = r.verdict === 'ALIGNED' ? `${ok} ALIGNED` : r.verdict === 'NOT-INSTALLED' ? `${warn}NOT INSTALLED` : `${warn}DRIFTED (${r.drifted} layer${r.drifted === 1 ? '' : 's'})`;
+  const head = r.verdict === 'ALIGNED'
+    ? `${ok} ALIGNED`
+    : r.verdict === 'PARTIAL'
+      ? `${warn}PARTIAL (${r.readinessWarnings.length} readiness warning${r.readinessWarnings.length === 1 ? '' : 's'})`
+      : r.verdict === 'NOT-INSTALLED'
+        ? `${warn}NOT INSTALLED`
+        : `${warn}DRIFTED (${r.drifted} layer${r.drifted === 1 ? '' : 's'})`;
   L.push(`${c.bold}# brain_doctor${c.rst}  —  ${head}`);
   L.push('');
 
@@ -497,6 +519,11 @@ export function render(r, opts = {}) {
     L.push(`${ok} ${c.bold}AUTO-UPDATE${c.rst}  enabled · machine-wide 24h check · last result ${r.autoUpdate.result}${versionText ? ` v${versionText}` : ''}`);
   } else {
     L.push(`${ok} ${c.bold}AUTO-UPDATE${c.rst}  enabled · machine-wide 24h check starts with the MCP supervisor`);
+  }
+  if (r.autoUpdate?.harness) {
+    const h = r.autoUpdate.harness;
+    const hmark = Number(h.failed || 0) > 0 ? warn : ok;
+    L.push(`${hmark} ${c.bold}AUTO-HARNESS${c.rst}  ${h.checked || 0} registered project(s) checked · ${h.updated || 0} refreshed · ${h.unchanged || 0} current · ${h.failed || 0} partial${h.skipped ? ` · ${h.skipped} busy/missing` : ''}`);
   }
 
   // Host adapters

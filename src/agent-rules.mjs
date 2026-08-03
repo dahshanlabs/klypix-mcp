@@ -414,7 +414,7 @@ export async function compactAgentsBrief(projectDir, { check = false, budgetChar
     const next = raw.replace(re, block);
     if (next === raw) return { status: 'ok', action: 'unchanged', bytes: Buffer.byteLength(block) };
     if (check) return { status: 'stale', action: 'check', bytes: Buffer.byteLength(block) };
-    fs.writeFileSync(agentsFile, next, 'utf8');
+    atomicWrite(agentsFile, next);
     return { status: 'ok', action: 'updated', bytes: Buffer.byteLength(block) };
   } catch (error) {
     return { status: 'error', action: 'error', reason: error?.message || String(error) };
@@ -479,7 +479,7 @@ const FENCE_END = '<!-- klypix-brain:end -->';
 // Versioned + hashed start marker. The attrs are between `start` and the closing `-->`,
 // so the BROAD FENCE_RE (which matches any start…end) still replaces an OLD unstamped
 // block on the next `link` — the upgrade is idempotent.
-const fenceStart = (ver) => `<!-- klypix-brain:start v=${ver} hash=${INSTRUCTIONS_HASH} (managed by klypix-mcp — re-run \`npx klypix-mcp link\`) -->`;
+const fenceStart = (ver) => `<!-- klypix-brain:start v=${ver} hash=${INSTRUCTIONS_HASH} (automatically managed by klypix-mcp) -->`;
 const FENCE_RE = /<!--\s*klypix-brain:start[\s\S]*?klypix-brain:end\s*-->/;
 // Capturing parse: v=(group1) hash=(group2) inner-body(group3). Attrs optional so a
 // legacy unstamped block parses too (version/hash come back undefined → treated as stale).
@@ -489,6 +489,23 @@ const fencedBlock = (ver) => `${fenceStart(ver)}\n${BRAIN_INSTRUCTIONS}\n${FENCE
 
 const exists = (p) => { try { fs.statSync(p); return true; } catch { return false; } };
 const ensureDir = (p) => fs.mkdirSync(path.dirname(p), { recursive: true });
+
+// Harness refreshes can run unattended after a runtime update or at the first
+// brain_sync for a project. Never expose a truncated rules/config file to an
+// agent host: stage beside the target, close the complete file, then
+// atomically replace. A crash leaves either the complete old file or complete
+// new file; a stray temp is harmless and is removed on the failure path.
+function atomicWrite(file, content) {
+  ensureDir(file);
+  const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.klypix-tmp`;
+  try {
+    fs.writeFileSync(tmp, content, 'utf8');
+    fs.renameSync(tmp, file);
+  } catch (error) {
+    try { fs.unlinkSync(tmp); } catch { /* nothing staged / already moved */ }
+    throw error;
+  }
+}
 
 // Parse a managed block out of arbitrary file text → { version, hash, body } | null.
 function parseFence(text) {
@@ -572,7 +589,7 @@ function fenceMerge(file, version) {
   else if (cur.trim()) { next = cur.replace(/\s*$/, '') + '\n\n' + block + '\n'; action = 'merged'; }
   else { next = block + '\n'; action = had ? 'merged' : 'created'; }
   if (next === cur) return { action: 'unchanged' };
-  ensureDir(file); fs.writeFileSync(file, next, 'utf8');
+  atomicWrite(file, next);
   return { action };
 }
 
@@ -585,7 +602,7 @@ function writeDedicated(file, frontmatter, version) {
   backupHandEdited(file, status);
   const had = exists(file);
   const body = (frontmatter ? frontmatter + '\n' : '') + fencedBlock(version) + '\n';
-  ensureDir(file); fs.writeFileSync(file, body, 'utf8');
+  atomicWrite(file, body);
   return { action: had ? 'updated' : 'created' };
 }
 
@@ -608,7 +625,7 @@ function mergeMcpJson(file, wrapKey, withType, projectDir) {
   const before = JSON.stringify(cfg[wrapKey]['klypix-canvas']);
   cfg[wrapKey]['klypix-canvas'] = entry;
   if (JSON.stringify(cfg[wrapKey]['klypix-canvas']) === before) return { action: 'unchanged' };
-  ensureDir(file); fs.writeFileSync(file, JSON.stringify(cfg, null, 2) + '\n', 'utf8');
+  atomicWrite(file, JSON.stringify(cfg, null, 2) + '\n');
   return { action: before === undefined ? 'created' : 'updated' };
 }
 
@@ -684,9 +701,13 @@ export function linkProject(projectDir, opts = {}) {
 
   const rules = t.rules.map((r) => {
     const file = relFile(projectDir, r.file);
-    if (check) return { tool: r.tool, file, ...classifyFenced(r.file, version, r.kind === 'dedicated' ? (r.frontmatter || '') : null) };
-    const res = r.kind === 'merge' ? fenceMerge(r.file, version) : writeDedicated(r.file, r.frontmatter, version);
-    return { tool: r.tool, file, ...res };
+    try {
+      if (check) return { tool: r.tool, file, ...classifyFenced(r.file, version, r.kind === 'dedicated' ? (r.frontmatter || '') : null) };
+      const res = r.kind === 'merge' ? fenceMerge(r.file, version) : writeDedicated(r.file, r.frontmatter, version);
+      return { tool: r.tool, file, ...res };
+    } catch (error) {
+      return { tool: r.tool, file, action: 'skipped', status: 'error', why: error?.message || String(error) };
+    }
   });
 
   const boundProject = path.resolve(projectDir).replace(/\\/g, '/');
@@ -695,37 +716,41 @@ export function linkProject(projectDir, opts = {}) {
   // project-scoped configs plus brain_sync's explicit project fallback.
   const mcp = t.mcp.map((m) => {
     const file = relFile(projectDir, m.file);
-    if (m.format === 'toml') {
-      if (check) {
-        const parsed = safeReadCodexConfig(m.file);
-        if (!parsed.ok) return { tool: m.tool, file, status: 'hand-edited', why: parsed.error };
-        const name = Object.keys(parsed.servers).find(k => /klypix/i.test(k));
-        const entry = name ? parsed.servers[name] : null;
-        const vaultMatch = entry?.raw?.match(/^[ \t]*args[ \t]*=[ \t]*\[[\s\S]*?["']--vault["'][ \t]*,[ \t]*["']([^"']+)["']/m);
-        const configuredVault = vaultMatch?.[1] || null;
-        const bound = !!configuredVault
-          && path.isAbsolute(configuredVault)
-          && path.resolve(configuredVault) === path.resolve(projectDir)
-          && !!entry?.cwd
-          && path.isAbsolute(entry.cwd)
-          && path.resolve(entry.cwd) === path.resolve(projectDir);
-        return {
-          tool: m.tool,
-          file,
-          status: entry ? (entry.launchesKlypix && bound ? 'ok' : 'hand-edited') : 'missing',
-          why: entry && !entry.launchesKlypix
-            ? 'entry no longer launches klypix-mcp'
-            : entry && !bound
-              ? `Codex MCP is not explicitly bound to this project (${boundProject})`
-              : undefined,
-        };
+    try {
+      if (m.format === 'toml') {
+        if (check) {
+          const parsed = safeReadCodexConfig(m.file);
+          if (!parsed.ok) return { tool: m.tool, file, status: 'hand-edited', why: parsed.error };
+          const name = Object.keys(parsed.servers).find(k => /klypix/i.test(k));
+          const entry = name ? parsed.servers[name] : null;
+          const vaultMatch = entry?.raw?.match(/^[ \t]*args[ \t]*=[ \t]*\[[\s\S]*?["']--vault["'][ \t]*,[ \t]*["']([^"']+)["']/m);
+          const configuredVault = vaultMatch?.[1] || null;
+          const bound = !!configuredVault
+            && path.isAbsolute(configuredVault)
+            && path.resolve(configuredVault) === path.resolve(projectDir)
+            && !!entry?.cwd
+            && path.isAbsolute(entry.cwd)
+            && path.resolve(entry.cwd) === path.resolve(projectDir);
+          return {
+            tool: m.tool,
+            file,
+            status: entry ? (entry.launchesKlypix && bound ? 'ok' : 'hand-edited') : 'missing',
+            why: entry && !entry.launchesKlypix
+              ? 'entry no longer launches klypix-mcp'
+              : entry && !bound
+                ? `Codex MCP is not explicitly bound to this project (${boundProject})`
+                : undefined,
+          };
+        }
+        const boundEntry = mcpServerEntry({ vault: boundProject });
+        const res = connectCodexMcpServer({ configPath: m.file, entry: boundEntry, cwd: boundProject });
+        return res.ok ? { tool: m.tool, file, ...res } : { tool: m.tool, file, action: 'skipped', why: res.error };
       }
-      const boundEntry = mcpServerEntry({ vault: boundProject });
-      const res = connectCodexMcpServer({ configPath: m.file, entry: boundEntry, cwd: boundProject });
-      return res.ok ? { tool: m.tool, file, ...res } : { tool: m.tool, file, action: 'skipped', why: res.error };
+      if (check) return { tool: m.tool, file, ...classifyMcp(m.file, m.wrapKey, projectDir) };
+      return { tool: m.tool, file, ...mergeMcpJson(m.file, m.wrapKey, m.withType, projectDir) };
+    } catch (error) {
+      return { tool: m.tool, file, action: 'skipped', status: 'error', why: error?.message || String(error) };
     }
-    if (check) return { tool: m.tool, file, ...classifyMcp(m.file, m.wrapKey, projectDir) };
-    return { tool: m.tool, file, ...mergeMcpJson(m.file, m.wrapKey, m.withType, projectDir) };
   });
 
   return { rules, mcp, hasBrain, version, check };

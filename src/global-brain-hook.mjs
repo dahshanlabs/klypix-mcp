@@ -2320,7 +2320,7 @@ function bakedBrainVersion(brainDir = path.dirname(NPM_CURRENCY)) {
 // installed brain is behind npm `latest`. SILENT when current/ahead, when the cache
 // is missing or unknown ("(offline)" sentinel), or when there's no baked version to
 // compare against — no nag, no noise.
-function versionCurrencyFooter({ file = NPM_CURRENCY, brainDir = path.dirname(NPM_CURRENCY) } = {}) {
+function versionCurrencyFooter({ file = NPM_CURRENCY, brainDir = path.dirname(NPM_CURRENCY), env = process.env } = {}) {
     try {
         let cache; try { cache = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return ''; }
         const latest = cache && cache.latest;
@@ -2331,7 +2331,10 @@ function versionCurrencyFooter({ file = NPM_CURRENCY, brainDir = path.dirname(NP
         const baked = bakedBrainVersion(brainDir);
         if (!baked) return '';                                           // nothing to compare → silent
         if (cmpSemver(latest, baked) <= 0) return '';                    // current or ahead → silent
-        return `\n\n---\n⚠️ **Brain update available** — installed brain core \`v${baked}\` < npm latest \`v${latest}\`. Update: \`npx klypix-mcp install\`.\n`;
+        if (!autoUpdateEnabled(env)) {
+            return `\n\n---\n⚠️ **Brain update available** — installed brain core \`v${baked}\` < npm latest \`v${latest}\`. Automatic updates are off; run \`npx klypix-mcp install\`.\n`;
+        }
+        return `\n\n---\n⬆️ **Brain update available** — installed brain core \`v${baked}\` < npm latest \`v${latest}\`. KLYPIX will install it automatically in the background; no action required.\n`;
     } catch { return ''; }
 }
 
@@ -2403,7 +2406,7 @@ function legendFooter() {
 
 // ── Self-update on SessionStart (auto-propagation, part B — the lever) ────────
 // The one trigger that fires for EVERY user EVERY session. Turn the passive advisory
-// ("Update: npx klypix-mcp install", which nobody runs) into an ACTION: if a newer
+// ("an update is available", which is not itself delivery) into an ACTION: if a newer
 // version is on npm, spawn a DETACHED, fail-open updater so the NEXT session runs it —
 // "publish ⇒ everywhere, automatically." Non-negotiables, all enforced here:
 //   • fail-open — any error/offline/missing-npx degrades silently to the current version;
@@ -2414,8 +2417,8 @@ function legendFooter() {
 // It reads the npm-latest CACHE the Stop hook already maintains (zero network here).
 const AUTOUPDATE_STAMP = path.join(os.homedir(), '.claude', 'project-brain', '.autoupdate-check.json');
 const AUTOUPDATE_TTL = 24 * 60 * 60 * 1000;
-function autoUpdateEnabled() {
-    const v = String(process.env.KLYPIX_AUTO_UPDATE ?? '').trim().toLowerCase();
+function autoUpdateEnabled(env = process.env) {
+    const v = String(env?.KLYPIX_AUTO_UPDATE ?? '').trim().toLowerCase();
     return !(v === '0' || v === 'off' || v === 'false' || v === 'no');   // default ON
 }
 function writeAutoUpdateStamp(now) { try { fs.mkdirSync(path.dirname(AUTOUPDATE_STAMP), { recursive: true }); fs.writeFileSync(AUTOUPDATE_STAMP, JSON.stringify({ lastCheck: now })); } catch { /* */ } }
@@ -2577,7 +2580,18 @@ async function read(lib) {
 // read by the MCP's search_all_brains for vault-wide, cross-project memory
 // ("what did I decide about auth — in ANY project?"). Zero-config data gravity:
 // just having worked in a brain project makes it searchable. Never throws.
-function registerBrain() {
+async function registerBrain() {
+    // Current runtimes share the same locked+atomic registry writer as
+    // brain_sync, so simultaneous Claude/Codex/other-host starts cannot lose a
+    // project. Keep the legacy body below as a compatibility fallback for an
+    // older flat deployment that does not contain mcp-auto-update.mjs yet.
+    try {
+        const registry = await import('./mcp-auto-update.mjs');
+        if (typeof registry.registerProjectBrain === 'function') {
+            const result = registry.registerProjectBrain({ brainPath: BRAIN });
+            if (result?.registered || result?.reason === 'busy') return;
+        }
+    } catch { /* legacy fallback below */ }
     try {
         const dir = path.join(os.homedir(), '.claude', 'project-brain');
         const reg = path.join(dir, 'registry.json');
@@ -2612,7 +2626,7 @@ async function main() {
     // Per-prompt retrieval runs on EVERY prompt — skip the registry write and
     // go straight to the (mtime-cached) ranked lookup to keep it cheap.
     if (process.argv.includes('--prompt')) { await promptRetrieve(lib); return; }
-    registerBrain();
+    await registerBrain();
     if (process.argv.includes('--capture')) {
         // Stop = fold-in + clear: capture() writes this turn's markers/ships into the
         // brain, then we drop this session's now-durable in-flight ledger entries.

@@ -18,6 +18,8 @@
 //        (stale/ok), never hand-edited; hand-edited rewrites leave a .klypix-bak.
 //   V10 — brain_doctor: a recovery-failed supervisor is DRIFT, not healthy;
 //        sync-silent sessions and twin rows are called out.
+//   V11 — otherwise-healthy multi-session state with a sync-silent peer is
+//        PARTIAL, never the misleading ALIGNED all-clear.
 import { execFileSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
@@ -273,6 +275,36 @@ ok(aging.intentAt === now + 6 * 60 * 1000, 'V4: a CHANGED intent re-stamps inten
     `V10: sync-silent sessions are counted distinctly (${report.sessions.syncedCount}/${report.sessions.count} declared scope)`);
   ok((report.sessions.twinGroups || []).some(g => g.hostPid === 777),
     'V10: twin lane rows sharing one host pid are surfaced as a merge failure');
+  fs.rmSync(docHome, { recursive: true, force: true });
+  fs.rmSync(docProj, { recursive: true, force: true });
+}
+
+// ── V11: doctor — sync-silent readiness prevents an ALIGNED verdict ─────────
+{
+  const docHome = path.join(os.tmpdir(), 'klypix-presvis-partial-home');
+  const docProj = path.join(os.tmpdir(), 'klypix-presvis-partial-project');
+  for (const dir of [docHome, docProj]) fs.rmSync(dir, { recursive: true, force: true });
+  const brainDir = path.join(docHome, '.claude', 'project-brain');
+  fs.mkdirSync(brainDir, { recursive: true });
+  fs.mkdirSync(docProj, { recursive: true });
+  fs.writeFileSync(path.join(docProj, 'brain.klypix'), 'placeholder');
+  fs.writeFileSync(path.join(brainDir, 'klypix-mcp-server.mjs'), "const PKG_VERSION = '9.9.9'\nrunMcpSupervisor\n");
+  fs.writeFileSync(path.join(brainDir, 'mcp-supervisor.mjs'), '// present');
+  linkProject(docProj, { version: '9.9.9' });
+  const laneKey = laneFileFor(path.join(docProj, 'brain.klypix'), docHome);
+  fs.mkdirSync(path.dirname(laneKey), { recursive: true });
+  fs.writeFileSync(laneKey, JSON.stringify({
+    sessions: [
+      { id: 'scoped', client: 'codex', lastSeen: Date.now(), intent: 'editing one file', files: ['src/a.mjs'] },
+      { id: 'silent', client: 'other-host', lastSeen: Date.now(), intent: '', files: [] },
+    ],
+    messages: [],
+  }));
+  const report = doctorInspect({ home: docHome, projectDir: docProj });
+  ok(report.drifted === 0 && report.verdict === 'PARTIAL',
+    `V11: one sync-silent live peer makes an otherwise clean doctor PARTIAL (got ${report.verdict})`);
+  ok(report.readinessWarnings.some((warning) => /1 of 2 active sessions/.test(warning)),
+    'V11: PARTIAL names the exact session adoption gap');
   fs.rmSync(docHome, { recursive: true, force: true });
   fs.rmSync(docProj, { recursive: true, force: true });
 }

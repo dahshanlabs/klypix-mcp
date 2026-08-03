@@ -214,11 +214,13 @@ function runInstall(home, projectCwd, args = []) {
     result: 'current',
     currentVersion: PKG_VERSION,
     latestVersion: PKG_VERSION,
+    harness: { checked: 2, updated: 1, unchanged: 1, failed: 0, skipped: 0, projects: [] },
   }));
   const updateAudit = inspect({ home, projectDir: proj });
   ok(updateAudit.autoUpdate.enabled && updateAudit.autoUpdate.result === 'current'
-    && /AUTO-UPDATE.*machine-wide 24h check.*current/.test(render(updateAudit, { color: false })),
-  'D: doctor exposes the host-neutral automatic-update receipt');
+    && /AUTO-UPDATE.*machine-wide 24h check.*current/.test(render(updateAudit, { color: false }))
+    && /AUTO-HARNESS.*2 registered project\(s\) checked.*1 refreshed.*1 current.*0 partial/.test(render(updateAudit, { color: false })),
+  'D: doctor exposes the host-neutral update and automatic harness receipts');
   const baked = fs.readFileSync(path.join(bd, 'klypix-mcp-server.mjs'), 'utf8');
   ok(new RegExp(`const PKG_VERSION = '${PKG_VERSION.replace(/\./g, '\\.')}'`).test(baked), 'D: server has the baked version (flat layout has no package.json)');
   // migration: the project .mcp.json flipped npx → local node, with a backup.

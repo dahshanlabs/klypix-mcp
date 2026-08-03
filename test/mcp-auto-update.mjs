@@ -11,9 +11,13 @@ import {
   autoUpdatePaths,
   installExactRuntime,
   inspectAutoUpdate,
+  readRegisteredProjectBrains,
+  reconcileRegisteredProjects,
+  registerProjectBrain,
   runAutoUpdateCheck,
   spawnAutoUpdateHelper,
 } from '../src/mcp-auto-update.mjs';
+import { auditProject, compactAgentsBrief, linkProject } from '../src/agent-rules.mjs';
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-auto-update-'));
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -85,6 +89,66 @@ try {
     const status = JSON.parse(fs.readFileSync(autoUpdatePaths(dir).status, 'utf8'));
     ok(result.result === 'updated' && exact === '1.5.2', 'new compatible release installs by exact immutable version');
     ok(status.installedVersion === '1.5.2' && !fs.existsSync(autoUpdatePaths(dir).lock), 'successful update is verified, receipted, and unlocks');
+  }
+
+  {
+    const dir = scenario('current-reconciles-harness');
+    writeRuntime(dir, '1.5.2');
+    let reconciledVersion = null;
+    const result = await runAutoUpdateCheck({
+      brainDir: dir,
+      now: 250_000,
+      fetchLatest: async () => '1.5.2',
+      reconcileProjects: async ({ version }) => {
+        reconciledVersion = version;
+        return { checked: 2, updated: 1, unchanged: 1, failed: 0, skipped: 0, projects: [] };
+      },
+    });
+    const diagnostic = inspectAutoUpdate(dir, { now: 250_001 });
+    ok(result.result === 'current' && reconciledVersion === '1.5.2', 'a current runtime still repairs registered project harnesses automatically');
+    ok(diagnostic.harness?.updated === 1 && diagnostic.harness?.unchanged === 1, 'automatic harness reconciliation leaves a durable diagnostic receipt');
+  }
+
+  {
+    const dir = scenario('registered-project-reconciliation');
+    const projectA = path.join(dir, 'project-a');
+    const projectB = path.join(dir, 'project-b');
+    for (const project of [projectA, projectB]) {
+      fs.mkdirSync(project, { recursive: true });
+      fs.writeFileSync(path.join(project, 'brain.klypix'), 'placeholder brain');
+    }
+    fs.writeFileSync(path.join(projectA, 'AGENTS.md'), '# Human project law\n\nKeep this paragraph.\n');
+    fs.mkdirSync(path.join(projectB, '.cline'), { recursive: true });
+    fs.writeFileSync(path.join(projectB, '.cline', 'mcp.json'), '{ invalid-json');
+
+    const a = registerProjectBrain({ brainPath: path.join(projectA, 'brain.klypix'), brainDir: dir, now: 10 });
+    const b = registerProjectBrain({ brainPath: path.join(projectB, 'brain.klypix'), brainDir: dir, now: 20 });
+    registerProjectBrain({ brainPath: path.join(projectA, 'brain.klypix'), brainDir: dir, now: 30 });
+    const registered = readRegisteredProjectBrains(dir);
+    const receipt = await reconcileRegisteredProjects({
+      brainDir: dir,
+      version: '1.5.2',
+      rules: { auditProject, compactAgentsBrief, linkProject },
+    });
+    const humanAgents = fs.readFileSync(path.join(projectA, 'AGENTS.md'), 'utf8');
+    const pendingDirs = [dir];
+    const tempLeaks = [];
+    while (pendingDirs.length) {
+      const current = pendingDirs.pop();
+      for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+        const full = path.join(current, entry.name);
+        if (entry.isDirectory()) pendingDirs.push(full);
+        else if (entry.name.endsWith('.klypix-tmp')) tempLeaks.push(full);
+      }
+    }
+    ok(a.registered && b.registered && registered.length === 2, 'all MCP hosts share one locked, de-duplicated project registry');
+    ok(receipt.checked === 2 && receipt.updated === 1 && receipt.failed === 1, 'one malformed host config is isolated while every other project/file still converges');
+    ok(auditProject(projectA, { version: '1.5.2' }).ok, 'a registered drifted project reaches all projected harness targets without a manual link');
+    ok(humanAgents.startsWith('# Human project law\n\nKeep this paragraph.') && /klypix-brain:start v=1\.5\.2/.test(humanAgents), 'automatic repair preserves human AGENTS.md content outside the managed fence');
+    ok(fs.readFileSync(path.join(projectB, '.cline', 'mcp.json'), 'utf8') === '{ invalid-json'
+      && receipt.projects.find((item) => item.project === 'project-b')?.status === 'partial',
+    'an invalid human-owned JSON file is left untouched and reported as partial');
+    ok(tempLeaks.length === 0, 'atomic harness writes leave no staged temp files behind');
   }
 
   {

@@ -579,6 +579,7 @@ Your `brain.klypix` is yours — it is a plain ZIP and stays readable with or wi
 ## Contributing
 
 Issues and pull requests: [github.com/dahshanlabs/klypix-mcp](https://github.com/dahshanlabs/klypix-mcp).
+Questions or feedback: [hello@klypix.com](mailto:hello@klypix.com).
 
 The repository carries 38 test files, 34 of them in the `npm test` chain, covering the presence
 lane and its cross-machine relay, the Context Gateway, supervisor hot-swap, auto-update, retrieval

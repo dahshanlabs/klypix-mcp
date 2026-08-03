@@ -28,6 +28,10 @@
     "type": "git",
     "url": "https://github.com/dahshanlabs/klypix-mcp"
   },
+  "bugs": {
+    "url": "https://github.com/dahshanlabs/klypix-mcp/issues",
+    "email": "hello@klypix.com"
+  },
   "bin": {
     "klypix-mcp": "bin/klypix-mcp.mjs",
     "klypix-conformance": "bin/klypix-conformance.mjs",

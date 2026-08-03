@@ -191,7 +191,7 @@ function runInstall(home, projectCwd, args = []) {
   fs.writeFileSync(path.join(proj, '.mcp.json'), JSON.stringify({ mcpServers: { 'klypix-canvas': { command: 'npx', args: ['-y', 'klypix-mcp', '--vault', '.'] } } }, null, 2));
   runInstall(home, proj);
   const bd = path.join(home, '.claude', 'project-brain');
-  for (const f of ['global-brain-hook.mjs', 'klypix-format.mjs', 'klypix-core.mjs', 'semantic-memory.mjs', 'brain-write-lock.mjs', 'klypix-mcp-server.mjs', 'klypix-mcp-worker.mjs', 'mcp-supervisor.mjs', 'mcp-auto-update.mjs', 'klypix-conformance.mjs', 'agent-rules.mjs', 'brain-doctor.mjs', 'agent-presence.mjs', 'mcp-presence.mjs', 'codex-brain-hook.mjs', 'codex-hooks.mjs']) {
+  for (const f of ['global-brain-hook.mjs', 'klypix-format.mjs', 'klypix-core.mjs', 'semantic-memory.mjs', 'brain-write-lock.mjs', 'klypix-mcp-server.mjs', 'klypix-mcp-worker.mjs', 'mcp-supervisor.mjs', 'mcp-auto-update.mjs', 'klypix-conformance.mjs', 'klypix-runtime.mjs', 'klypix-semantic-warm.mjs', 'runtime-inspector.mjs', 'agent-rules.mjs', 'brain-doctor.mjs', 'agent-presence.mjs', 'mcp-presence.mjs', 'codex-brain-hook.mjs', 'codex-hooks.mjs']) {
     ok(fs.existsSync(path.join(bd, f)), `D: installed ${f}`);
   }
   ok(fs.existsSync(path.join(bd, 'node_modules', 'jszip')), 'D: runtime deps (jszip) copied');
@@ -201,6 +201,10 @@ function runInstall(home, projectCwd, args = []) {
   const runtime = JSON.parse(fs.readFileSync(path.join(bd, '.mcp-runtime.json'), 'utf8'));
   ok(runtime.protocol === 1 && runtime.version === PKG_VERSION && runtime.worker === 'klypix-mcp-worker.mjs',
     'D: atomic runtime pointer targets the replaceable worker');
+  ok(fs.readFileSync(path.join(bd, 'klypix-semantic-warm.mjs'), 'utf8').includes("from './semantic-memory.mjs'"),
+    'D: background semantic migration helper is flattened for the installed runtime');
+  ok(fs.readFileSync(path.join(bd, 'klypix-runtime.mjs'), 'utf8').includes("from './runtime-inspector.mjs'"),
+    'D: passive runtime inspector CLI is flattened for the installed runtime');
   ok(Object.entries(runtime.files).every(([name, expected]) =>
     fs.existsSync(path.join(bd, name))
     && crypto.createHash('sha256').update(fs.readFileSync(path.join(bd, name))).digest('hex') === expected),

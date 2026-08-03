@@ -23,6 +23,7 @@ const calls = clamp(process.env.KLYPIX_MEMORY_SOAK_CALLS, 10, 2, 1000);
 const maxRssMb = clamp(process.env.KLYPIX_MEMORY_MAX_RSS_MB, 750, 100, 16_384);
 const maxGrowthMb = clamp(process.env.KLYPIX_MEMORY_MAX_GROWTH_MB, 100, 10, 4096);
 const deadlineMs = clamp(process.env.KLYPIX_MEMORY_SOAK_TIMEOUT_MS, 300_000, 30_000, 3_600_000);
+const verifyReload = process.env.KLYPIX_MEMORY_VERIFY_RELOAD === '1';
 const questions = [
   'What is the current project focus and why?',
   'Which correction changed an earlier decision?',
@@ -86,12 +87,37 @@ try {
   console.log(JSON.stringify(summary));
   if (peak > maxRssMb) { console.error(`Peak RSS ${peak} MB exceeded ${maxRssMb} MB`); failures++; }
   if (growth > maxGrowthMb) { console.error(`Post-warm-up growth ${growth} MB exceeded ${maxGrowthMb} MB`); failures++; }
+  if (verifyReload) {
+    const question = questions[0];
+    const before = await opBrainAsk({ vault: path.dirname(brain), canvas: brain, question, k: 10 });
+    const fingerprint = (result) => JSON.stringify((result?.blocks || []).map((block) => block?.text || ''));
+    const beforeFingerprint = fingerprint(before);
+    await disposeSemanticModels();
+    global.gc?.();
+    const after = await opBrainAsk({ vault: path.dirname(brain), canvas: brain, question, k: 10 });
+    const equivalent = beforeFingerprint === fingerprint(after);
+    console.log(JSON.stringify({ event: 'reload-equivalence', equivalent, question }));
+    if (!equivalent) {
+      console.error('Semantic answer changed after disposing and reloading the same model generation.');
+      failures++;
+    }
+  }
 } catch (error) {
   console.error(error?.stack || error);
   failures++;
 } finally {
   clearTimeout(watchdog);
   await disposeSemanticModels();
+  global.gc?.();
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const disposed = semanticMemorySnapshot();
+  console.log(JSON.stringify({
+    event: 'disposed',
+    rssMb: mb(disposed.memory.rss),
+    heapUsedMb: mb(disposed.memory.heapUsed),
+    externalMb: mb(disposed.memory.external),
+    arrayBuffersMb: mb(disposed.memory.arrayBuffers),
+  }));
 }
 
 // onnxruntime can retain background handles after model disposal on Windows;

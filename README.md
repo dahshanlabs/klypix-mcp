@@ -162,18 +162,21 @@ not a filing convention.
 - **You can ask what the project believed then.** `brain_ask` with `as_of: 2026-03-01` reweights
   ranking by card lifecycle dates, so corrections made later do not leak backwards.
 - **Retrieval is local.** Lexical by default. If the optional on-device model is installed,
-  `brain_ask` and `search_all_brains` blend semantic similarity with lexical scoring and rerank
-  with a cross-encoder — still entirely on your machine. Without it, retrieval degrades cleanly to
-  lexical. `npx klypix-mcp install` deliberately does not install that model, so a fresh install
-  is lexical.
+  `brain_ask` and `search_all_brains` use BGE semantic ranking with lexical help for exact
+  identifiers, paths, and versions — still entirely on your machine. The previous cross-encoder
+  is available for experiments with `KLYPIX_RERANK=1`, but is off by default because it reduced
+  precision and added latency on the frozen human-paraphrase evaluation. Without the embedding
+  model, retrieval degrades cleanly to lexical. `npx klypix-mcp install` deliberately does not
+  install that model, so a fresh install is lexical.
 
 ### Bounded semantic-memory runtime
 
 Long-lived MCP and A2A workers use the bounded semantic-memory runtime by default. Models load only
 when semantic work is requested, native inference is serialized per process, embedding work is
-split into small batches, cross-encoder candidates are scored in bounded batches before one global
-sort, and temporary tensors are released after use. These controls change the resource lifecycle
-only; brain cards, ranking rules, project coordination, and the on-disk brain format are unchanged.
+split into small batches, and temporary tensors are released after use. Loaded models retire after
+an idle interval and transparently reload on the next semantic request, so warm queries stay fast
+without permanently pinning native model memory. These controls change the resource lifecycle only;
+brain cards, project coordination, and the on-disk brain format are unchanged.
 
 The previous runtime remains available as an emergency rollback. Set
 `KLYPIX_SEMANTIC_MEMORY_MODE=legacy` in the MCP server environment and reconnect or restart the
@@ -183,6 +186,12 @@ deleting brain data. Remove the variable (or set it to `bounded`) to return to t
 Run the deterministic lifecycle tests with `npm run test:memory`. For an opt-in real-model soak
 against a disposable or backed-up brain, set `KLYPIX_MEMORY_SOAK_BRAIN` to its path and run
 `npm run test:memory:soak`.
+
+For process-level attribution, run `npx klypix-mcp runtime` (or add `--json`; `--watch 30` samples
+every 30 seconds). It reports KLYPIX workers, supervisors, and legacy launcher overhead separately,
+excludes the owning IDE/chat application's RAM, redacts command-line secrets, and never opens a
+brain or terminates a process. Multiple processes under one host are reported as parallel sessions,
+not called duplicates without an authoritative logical-session receipt.
 
 ---
 
@@ -365,6 +374,7 @@ The MCP verbs below are what agents call. These are what **you** call:
 | `npx klypix-mcp install` | Install the engine + Claude Code hooks on this machine (see Quick start) |
 | `npx klypix-mcp link` | Wire this project for Cursor, Cline, Windsurf, Copilot, Gemini CLI, Aider (`--check` audits) |
 | `npx klypix-mcp doctor` | One verdict: version, hosts, live sessions, tool count, drift. Exits non-zero — usable as a CI gate |
+| `npx klypix-mcp runtime` | Passive per-connection process/RAM attribution (`--json`, optional `--watch seconds`); never kills or deduplicates |
 | `npx klypix-mcp conformance` | Launch two real MCP clients against this build and verify coordination behaviour |
 | `npx klypix-mcp git-driver` | Register the lossless `.klypix` merge driver for a repo (`status` to check) |
 | `npx klypix-mcp diff [ref]` | Card-level brain diff against a git ref, as markdown |
@@ -488,6 +498,12 @@ settings and project files. The check is detached and fail-open, developer-owned
 protected, concurrent sessions collapse behind one lock, and `KLYPIX_AUTO_UPDATE=0` opts out
 entirely.
 
+When the optional semantic runtime is already enabled, an update also schedules one detached,
+single-writer cache migration across registered brains. That removes the multi-minute first-query
+re-index after a model/cache upgrade; cache writes are model-keyed and atomic across concurrent
+agent sessions. Lexical-only installs download nothing. Set `KLYPIX_SEMANTIC_WARM_ON_UPDATE=0` to
+keep lazy first-use indexing instead.
+
 ## Security and permissions
 
 - **Apache-2.0, source public** at [github.com/dahshanlabs/klypix-mcp](https://github.com/dahshanlabs/klypix-mcp).
@@ -495,7 +511,8 @@ entirely.
   deterministic and local; the only LLM anywhere is *your* agent. The one exception in this package
   is the supervisor's once-per-24h npm version check described above — turn it off with
   `KLYPIX_AUTO_UPDATE=0`.
-- **The optional semantic model runs on device.** No cloud inference on any retrieval path.
+- **The optional semantic model runs on device.** Enabling it (or upgrading its model) can fetch
+  model weights from Hugging Face; retrieval inference and brain data stay local.
 - **Coordination state is local files.** The brain is a file in your repo; the presence lane is a
   file under your home directory. Nothing is uploaded.
 - **`install` writes to your home directory:** `~/.claude/project-brain` (engine + runtime),

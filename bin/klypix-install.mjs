@@ -17,6 +17,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
+import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 import {
     connectCodexMcpServer,
@@ -225,7 +226,7 @@ const flatten = (code) => code
     .replace(/\.\.\/src\/klypix-(core|format)\.mjs/g, './klypix-$1.mjs')
     // brain-doctor + agent-rules (the server's lazy `import('../src/brain-doctor.mjs')`
     // for the brain_doctor tool) → flat sibling refs in the runtime layout.
-    .replace(/\.\.\/src\/(brain-doctor|agent-rules|mcp-presence|mcp-supervisor|mcp-auto-update)\.mjs/g, './$1.mjs')
+    .replace(/\.\.\/src\/(brain-doctor|agent-rules|mcp-presence|mcp-supervisor|mcp-auto-update|semantic-memory|runtime-inspector)\.mjs/g, './$1.mjs')
     .replace(/klypix-worker\.mjs/g, 'klypix-mcp-worker.mjs')
     .replace(/const PKG_VERSION = \(\(\) => \{[\s\S]*?\}\)\(\);/, `const PKG_VERSION = '${VERSION}'; // baked at install (flat layout has no package.json)`);
 
@@ -292,7 +293,7 @@ try {
     // canvas-view-app.html is the canvas_view MCP App UI — staged raw (an HTML
     // file must never get a JS-comment banner) beside the flat server, which
     // resolves it via its ./canvas-view-app.html candidate path.
-    for (const f of ['global-brain-hook.mjs', 'brain-semantic.mjs', 'semantic-memory.mjs', 'brain-note.mjs', 'brain-git-hook.mjs', 'klypix-format.mjs', 'klypix-core.mjs', 'brain-write-lock.mjs', 'agent-rules.mjs', 'brain-doctor.mjs', 'agent-presence.mjs', 'mcp-presence.mjs', 'finding-routing.mjs', 'mcp-supervisor.mjs', 'mcp-auto-update.mjs', 'codex-brain-hook.mjs', 'codex-hooks.mjs', 'canvas-view-app.html']) {
+    for (const f of ['global-brain-hook.mjs', 'brain-semantic.mjs', 'semantic-memory.mjs', 'brain-note.mjs', 'brain-git-hook.mjs', 'klypix-format.mjs', 'klypix-core.mjs', 'brain-write-lock.mjs', 'agent-rules.mjs', 'brain-doctor.mjs', 'agent-presence.mjs', 'mcp-presence.mjs', 'finding-routing.mjs', 'mcp-supervisor.mjs', 'mcp-auto-update.mjs', 'runtime-inspector.mjs', 'codex-brain-hook.mjs', 'codex-hooks.mjs', 'canvas-view-app.html']) {
         const s = path.join(SRC, f); if (exists(s)) staged.push({ dst: f, content: fs.readFileSync(s, 'utf8') });
     }
     for (const [src, dst] of [
@@ -300,6 +301,8 @@ try {
         ['klypix-worker.mjs', 'klypix-mcp-worker.mjs'],
         ['klypix-a2a.mjs', 'klypix-a2a-server.mjs'],
         ['klypix-conformance.mjs', 'klypix-conformance.mjs'],
+        ['klypix-runtime.mjs', 'klypix-runtime.mjs'],
+        ['klypix-semantic-warm.mjs', 'klypix-semantic-warm.mjs'],
     ]) {
         const s = path.join(BIN, src); if (exists(s)) staged.push({ dst, content: flatten(fs.readFileSync(s, 'utf8')) });
     }
@@ -381,6 +384,27 @@ try {
     const notWired = ['SessionStart', 'UserPromptSubmit', 'Stop', 'PostToolUse'].filter(e => !wiredFor(e));
 
     if (gotLock) releaseLock();
+    // Users who already enabled the optional local semantic runtime should not
+    // pay a multi-minute first question after a model/cache contract upgrade.
+    // Migrate registered brains once in a detached process after the atomic
+    // runtime commit. Fresh lexical-only installs download nothing.
+    let semanticWarm = 'not-enabled';
+    const semanticRuntime = path.join(BRAIN_DIR, 'semantic', 'node_modules', '@huggingface', 'transformers');
+    if (process.env.KLYPIX_SEMANTIC_WARM_ON_UPDATE !== '0' && exists(semanticRuntime)) {
+        try {
+            const warmArgs = [path.join(BRAIN_DIR, 'klypix-semantic-warm.mjs'), '--brain-dir', BRAIN_DIR];
+            const currentBrain = ['brain.klypix', 'brain.any'].map(name => path.join(process.cwd(), name)).find(exists);
+            if (currentBrain) warmArgs.push('--brain', currentBrain);
+            const warm = spawn(process.execPath, warmArgs, {
+                detached: true,
+                stdio: 'ignore',
+                windowsHide: true,
+                env: { ...process.env, KLYPIX_SEMANTIC_WARM_ON_UPDATE: '1' },
+            });
+            warm.unref();
+            semanticWarm = 'scheduled';
+        } catch { semanticWarm = 'deferred'; }
+    }
     if (!RUNTIME_ONLY) reportCodex(codex);
     console.log(`✓ installed klypix brain v${VERSION} → ${BRAIN_DIR}  (${n} scripts, ${deps} dep packages)`);
     if (RUNTIME_ONLY) console.log('✓ runtime-only update: host settings and project files were preserved');

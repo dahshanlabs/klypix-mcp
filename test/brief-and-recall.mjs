@@ -79,6 +79,7 @@ function fixture(tag) {
             { title: 'Strategy', cards: [{ text: STALE }] },
             { title: 'Runtime', cards: [{ text: CORRECTION }] },
         ],
+        connections: [{ from: STALE, to: CORRECTION, label: 'superseded by' }],
     }));
     const out = f.run(['--prompt'], { session_id: 'sess-recall', prompt: 'so is off-cloud skill execution still deferred on purpose? plan around the executor' });
     ok(/CORRECTED — current:/.test(out) && /WIRED/.test(out), 'P1: the correction is injected FIRST, labeled as current');
@@ -96,6 +97,7 @@ function fixture(tag) {
             { title: 'Strategy', cards: [{ text: STALE }] },
             { title: 'Runtime', cards: [{ text: CORRECTION }] },
         ],
+        connections: [{ from: STALE, to: CORRECTION, label: 'superseded by' }],
     }));
     // Prompt shares more tokens with the CORRECTION card → it outranks the stale one.
     const prompt = 'the runner executes skills off-cloud since the connectivity arc — wired or deferred? plan the executor rollout';

@@ -263,6 +263,13 @@ function inspectPeers(brainDir, brainPath, now, selfId = null) {
       hostPid: s.hostPid || null,
       // Sync-rich vs sync-silent: has this session declared any task scope?
       synced: Boolean(String(s.intent || '').trim() || (Array.isArray(s.files) && s.files.length)),
+      // Transport liveness is not task activity. Only real prompt/tool work
+      // stamps activityAt; heartbeats deliberately preserve rather than refresh it.
+      activityAt: Number(s.activityAt || 0) || null,
+      activityKind: s.activityKind || null,
+      activeUnscoped: !Boolean(String(s.intent || '').trim() || (Array.isArray(s.files) && s.files.length))
+        && Number(s.activityAt || 0) > 0
+        && now - Number(s.activityAt) < SESSION_FRESH_MS,
       lastSeenMin: Math.round((now - liveness.lastSeen) / 60000),
     }));
   // Twin rows = channel merge NOT occurring: >1 live row sharing one hostPid is
@@ -278,7 +285,13 @@ function inspectPeers(brainDir, brainPath, now, selfId = null) {
       now,
     })
     : { sent: 0, receipts: [] };
-  return { file, live, count: live.length, rawRecent, syncedCount: live.filter(p => p.synced).length, twinGroups, receipts };
+  const syncedCount = live.filter(p => p.synced).length;
+  const activeUnscopedCount = live.filter(p => p.activeUnscoped).length;
+  return {
+    file, live, count: live.length, rawRecent, syncedCount, activeUnscopedCount,
+    idleUnscopedCount: Math.max(0, live.length - syncedCount - activeUnscopedCount),
+    twinGroups, receipts,
+  };
 }
 
 // ── DECAY-GUARD layer (fast-decay status protection, 2026-07-28) ─────────────
@@ -408,9 +421,9 @@ export function inspect(opts = {}) {
   // coordination. That is a readiness gap, not file/runtime drift: say PARTIAL
   // instead of the misleading all-clear that prompted the field audit.
   const readinessWarnings = [];
-  const silentSessions = Math.max(0, peers.count - peers.syncedCount);
-  if (peers.count > 1 && silentSessions > 0) {
-    readinessWarnings.push(`${silentSessions} of ${peers.count} active sessions have not declared task scope`);
+  const activeSilentSessions = peers.activeUnscopedCount || 0;
+  if (peers.count > 1 && activeSilentSessions > 0) {
+    readinessWarnings.push(`${activeSilentSessions} active session${activeSilentSessions === 1 ? '' : 's'} used KLYPIX without declared task scope (${peers.count} live connections total)`);
   }
   if (Number(autoUpdate.harness?.failed || 0) > 0) {
     readinessWarnings.push(`${autoUpdate.harness.failed} automatic harness repair(s) remain partial`);
@@ -570,10 +583,17 @@ export function render(r, opts = {}) {
   if (!r.sessions.count) L.push(`${ok} ${c.bold}SESSIONS${c.rst}  0 active sessions ${c.dim}(saved/recent chats are history, not active)${c.rst}`);
   else {
     const hiddenIdle = Math.max(0, (r.sessions.rawRecent || r.sessions.count) - r.sessions.count);
-    L.push(`${r.sessions.count > 1 ? warn : ok} ${c.bold}SESSIONS${c.rst}  ${r.sessions.count} active session${r.sessions.count === 1 ? '' : 's'} · ${r.sessions.syncedCount ?? r.sessions.count} with declared task scope ${c.dim}(all hosts; channel-aware liveness${hiddenIdle ? `; +${hiddenIdle} row(s) with only a dead mcp channel excluded` : ''})${c.rst}`);
+    const activeSilent = r.sessions.activeUnscopedCount || 0;
+    const idleConnections = r.sessions.idleUnscopedCount || 0;
+    L.push(`${activeSilent ? warn : ok} ${c.bold}SESSIONS${c.rst}  ${r.sessions.count} live connection${r.sessions.count === 1 ? '' : 's'} · ${r.sessions.syncedCount ?? r.sessions.count} with declared task scope${activeSilent ? ` · ${activeSilent} active without scope` : ''}${idleConnections ? ` · ${idleConnections} idle/unscoped (not graded)` : ''} ${c.dim}(all hosts; channel-aware liveness${hiddenIdle ? `; +${hiddenIdle} row(s) with only a dead mcp channel excluded` : ''})${c.rst}`);
     for (const p of r.sessions.live) {
       const intentAge = p.intentAgeMin !== null && p.intentAgeMin - p.lastSeenMin > 3 ? ` (set ${p.intentAgeMin}m ago)` : '';
-      L.push(`        · ${p.client}:${p.id}${p.branch ? ' @' + p.branch : ''}${p.channels.length ? ` [${p.channels.join('+')}]` : ''}${p.intent ? ` “${p.intent.slice(0, 50)}”${intentAge}` : ''}${p.synced ? '' : ` ${c.yel}· sync-silent (no brain_sync intent/scope)${c.rst}`} ${c.dim}(${p.lastSeenMin}m ago)${c.rst}`);
+      const scopeState = p.synced
+        ? ''
+        : (p.activeUnscoped
+          ? ` ${c.yel}· active sync-silent (used KLYPIX without brain_sync scope)${c.rst}`
+          : ` ${c.dim}· idle connection (no task activity to grade)${c.rst}`);
+      L.push(`        · ${p.client}:${p.id}${p.branch ? ' @' + p.branch : ''}${p.channels.length ? ` [${p.channels.join('+')}]` : ''}${p.intent ? ` “${p.intent.slice(0, 50)}”${intentAge}` : ''}${scopeState} ${c.dim}(${p.lastSeenMin}m ago)${c.rst}`);
     }
     for (const g of (r.sessions.twinGroups || [])) {
       L.push(`        ${c.yel}⚠ twin rows — channel merge NOT occurring: host pid ${g.hostPid} appears as ${g.ids.join(' + ')} (one logical session counted ${g.ids.length}×)${c.rst}`);

@@ -249,6 +249,11 @@ class Supervisor {
       || path.join(path.dirname(this.runtimeManifest), '.supervisors'),
     );
     this.stateFile = path.join(this.stateDir, `${process.pid}.json`);
+    this.connectionId = String(options.connectionId || crypto.randomUUID());
+    this.parentPid = Number(process.ppid) || null;
+    this.clientInfo = null;
+    this.lastHostMessageAt = null;
+    this.lastActivityStateWriteAt = 0;
     this.hostRequests = new Map();
     this.workerRequests = new Map();
     this.hostQueue = [];
@@ -281,8 +286,13 @@ class Supervisor {
       atomicJson(this.stateFile, {
         protocol: 1,
         pid: process.pid,
+        connectionId: this.connectionId,
+        parentPid: this.parentPid,
+        cwd: process.cwd().replace(/\\/g, '/'),
         bootedAt: this.bootedAt,
         updatedAt: new Date().toISOString(),
+        lastHostMessageAt: this.lastHostMessageAt,
+        clientInfo: this.clientInfo,
         status: this.status,
         hotReloads: this.hotReloads,
         lastSwapAt: this.lastSwapAt,
@@ -322,6 +332,7 @@ class Supervisor {
         ...process.env,
         KLYPIX_MCP_SUPERVISED: '1',
         KLYPIX_MCP_SUPERVISOR_PID: String(process.pid),
+        KLYPIX_MCP_CONNECTION_ID: this.connectionId,
       },
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
@@ -527,6 +538,22 @@ class Supervisor {
 
   onHostMessage(message) {
     if (this.closed) return;
+    this.lastHostMessageAt = new Date().toISOString();
+    // MCP initialization is the one host-neutral source of client identity.
+    // Persist only bounded name/version metadata; never capabilities, prompts,
+    // environment variables, or request content.
+    if (message?.method === 'initialize') {
+      const info = message?.params?.clientInfo || {};
+      this.clientInfo = {
+        name: String(info.name || 'unknown').replace(/[\r\n]/g, ' ').slice(0, 120),
+        version: String(info.version || '').replace(/[\r\n]/g, ' ').slice(0, 80) || null,
+      };
+    }
+    const activityNow = Date.now();
+    if (activityNow - this.lastActivityStateWriteAt >= 60_000) {
+      this.lastActivityStateWriteAt = activityNow;
+      this.writeState();
+    }
     if (!this.active) {
       // recovery-failed with no candidate in flight = a settled outage: answer
       // id-bearing requests with a retryable error (the host can surface it and

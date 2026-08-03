@@ -1801,7 +1801,11 @@ export function rankForQuestion(struct, question, { semantic = null, k = 10, as_
     const asOfTs = as_of ? Date.parse(as_of) : null;
     const timeTravel = asOfTs != null && Number.isFinite(asOfTs);
     const cutoff = now - recentDays * 86_400_000;
+    const exactAnchorQuery = /(?:\b(?:pr|issue)\s*#?\d+|\bv?\d+\.\d+(?:\.\d+)?\b|\b[a-f0-9]{7,40}\b|[\\/]|\b[\w-]+\.(?:ts|tsx|mjs|js|json|sql|md|klypix)\b)/i.test(String(question || ''));
     const scored = [];
+    const wordMatches = (raw, stems, token) => raw.has(token)
+        || raw.has(stemLight(token))
+        || stems.has(token);
     for (const c of struct.cards) {
         if (c.type === 'container' || !(c.text || '').trim()) continue;
         const arch = isArchived(c);
@@ -1819,31 +1823,72 @@ export function rankForQuestion(struct, question, { semantic = null, k = 10, as_
         }
         const titleW = wordsOf(c.title);
         const bodyW = wordsOf(c.text);
-        const tagStems = new Set((c.tags || []).map(t => String(t).toLowerCase().replace(/^#/, '').replace(/^(file|dir)-/, '')).filter(Boolean));
+        const tagWords = new Set((c.tags || []).map(t => String(t).toLowerCase().replace(/^#/, '').replace(/^(file|dir)-/, '')).filter(Boolean));
+        const titleStems = stemSet(titleW);
+        const bodyStems = stemSet(bodyW);
+        const tagStems = stemSet(tagWords);
         const lenNorm = Math.min(1, 6 / Math.max(6, Math.log2(bodyW.size || 1)));
         let lex = 0;
         for (const tok of tokens) {
-            if (titleW.has(tok)) lex += 3;
-            else if (tagStems.has(tok)) lex += 3;
-            else if (bodyW.has(tok)) lex += lenNorm;
+            if (wordMatches(titleW, titleStems, tok)) lex += 3;
+            else if (wordMatches(tagWords, tagStems, tok)) lex += 3;
+            else if (wordMatches(bodyW, bodyStems, tok)) lex += lenNorm;
         }
         const sem = semantic ? (semantic.get(c.id) ?? null) : null;
-        if (lex <= 0 && (sem == null || sem < semFloor)) continue;         // no lexical AND no strong semantic → skip
+        if (!semantic && lex <= 0) continue;
+        if (semantic && lex <= 0 && sem == null) continue;
         // In time-travel a surviving card WAS live at as_of, so it is NOT stale
         // history — don't demote or flag it as archived (that status is a present
         // fact). Outside time-travel, archived cards are demoted but never excluded
         // (history matters for "what did we…").
         const effArch = timeTravel ? false : arch;
-        let score = sem != null ? sem * 10 + Math.min(lex, 6) * 0.5 : lex;
-        if (!timeTravel && (c.createdAt || 0) >= cutoff) score += 0.5;
-        if (/🛠/.test(c.text)) score += 1;                                  // standing skills
-        if (effArch) score -= 1.5;
-        scored.push({ card: c, score, sem, archived: effArch });
+        let score = lex;
+        if (!semantic) {
+            if (!timeTravel && (c.createdAt || 0) >= cutoff) score += 0.5;
+            if (/🛠/.test(c.text)) score += 1;                              // standing skills
+            if (effArch) score -= 1.5;
+        }
+        scored.push({ card: c, score, lex, sem, archived: effArch });
+    }
+    if (semantic && scored.length) {
+        // Rank fusion, not raw cosine arithmetic. Different embedding families
+        // have incompatible score distributions (MiniLM unrelated≈0; E5 often
+        // clusters around 0.7–1.0), so `sem*10 + lex` can let lexical noise erase
+        // a much better model. Reciprocal-rank fusion uses the ORDER from each
+        // independent retriever and remains calibrated across model upgrades.
+        const semRank = new Map(scored
+            .filter(hit => Number.isFinite(hit.sem))
+            .sort((a, b) => b.sem - a.sem)
+            .map((hit, index) => [hit.card.id, index]));
+        const lexRank = new Map(scored
+            .filter(hit => hit.lex > 0)
+            .sort((a, b) => b.lex - a.lex || (b.card.createdAt || 0) - (a.card.createdAt || 0))
+            .map((hit, index) => [hit.card.id, index]));
+        // Keep a broad bi-encoder pool internally; only the caller's top-k is
+        // returned (and optionally reranked). This raises paraphrase recall with
+        // no additional model calls or tensors.
+        const semanticPool = Math.max(200, Math.min(400, Math.max(1, k) * 8));
+        for (let i = scored.length - 1; i >= 0; i--) {
+            const hit = scored[i];
+            const sr = semRank.get(hit.card.id);
+            const lr = lexRank.get(hit.card.id);
+            if (lr == null && (sr == null || sr >= semanticPool)) { scored.splice(i, 1); continue; }
+            hit.semRank = sr ?? null;
+            hit.lexRank = lr ?? null;
+            hit.score = (sr == null ? 0 : 100 / (61 + sr))
+                // Natural-language questions follow the semantic order. Sparse
+                // lexical participates only when the query carries an exact
+                // identifier/path/version anchor; otherwise fresh keyword noise
+                // displaced the correct paraphrase even with a tiny weight.
+                + (!exactAnchorQuery || lr == null ? 0 : 15 / (61 + lr));
+            if (hit.archived) hit.score -= 0.1;
+        }
     }
     scored.sort((a, b) => b.score - a.score || (b.card.createdAt || 0) - (a.card.createdAt || 0));
     const top = scored.slice(0, k);
     // Correction overlays on the surfaced hits — a stale card gets its live
-    // corrector so the agent answers from the truth (edge or cue; P1 machinery).
+    // corrector so the agent answers from graph-confirmed truth. Similarity can
+    // propose an edge but never asserts correction identity while serving.
     // NOT in time-travel: a correction is a PRESENT fact; importing a future
     // corrector into a "what was true then" answer would contaminate it (a
     // 2026-05 correction leaking into a 2026-02 query). Then-live cards stand
@@ -2856,60 +2901,33 @@ const cueMatch = (a, b, bar) => {
     return (coef >= bar || (inter >= CUE_STRONG_SHARED && coef >= CUE_RELAXED_COEF)) ? coef : 0;
 };
 
-// Recall-side guard: given the cards recall is about to inject, return for each
-// one the card that CORRECTS it, found two ways:
-//   • edge — an outgoing "superseded by"/"closed by" arrow (drawn by capture or
-//     a confirmed reconcile) whose successor still has text;
-//   • cue  — a LIVE correction-cue card that lexically overlaps it ≥ `at`, ANY
-//     area (the un-edged pair the capture-time supersede missed) — EXCEPT:
-//       - a cue STRICTLY OLDER than the card (recency guard — an old correction
-//         must never be served as the current truth for a card that post-dated
-//         it; field 2026-07-12: 17 of 32 live overlays pointed backward),
-//       - a 🛠 skill card as the overlay TARGET (standing reference, corrected
-//         in place with ~ — never labeled stale by a lexical match),
-//       - a pair dismissed with a not_contradiction edge (same human verdict).
-// The caller injects the corrector FIRST (labeled) and reduces the stale hit to
-// a headline — the stale text never stands alone. Pure + cheap: correction-cue
-// cards are rare and the hit list is ≤topK.
-export function correctionOverlaysFor(struct, cards, { at = CORRECTION_SUPERSEDE_AT } = {}) {
+// Recall-side truth guard: label a card stale ONLY when the graph contains an
+// explicit identity-bearing lifecycle edge ("superseded by" / "closed by").
+// Lexical correction matching remains useful at capture/reconcile time, where
+// it can create or propose a reviewable edge, but similarity alone must never
+// assert claim identity while serving an answer. Follow A→B→C chains so recall
+// presents the latest graph-confirmed truth.
+export function correctionOverlaysFor(struct, cards) {
     const out = new Map();
     if (!struct || !Array.isArray(struct.cards) || !Array.isArray(cards) || !cards.length) return out;
     const byId = new Map(struct.cards.map(c => [c.id, c]));
-    const isArchived = (c) => /^archive$/i.test(c.area || '');
     const successorOf = new Map();
-    // A confirmed not_contradiction dismissal is the same human verdict for the
-    // overlay: that cue does not correct that card — the CUE path never
-    // re-attaches the pair (an explicit superseded-by edge still wins: both are
-    // deliberate verdicts and the edge is the stronger one).
-    const dismissed = new Set();
     for (const cn of struct.connections || []) {
         if (cn.label === 'superseded by' || cn.label === 'closed by') successorOf.set(cn.fromId, cn.toId);
-        if (cn.relationship === 'not_contradiction' || cn.label === 'not a contradiction') { dismissed.add(cn.fromId + '|' + cn.toId); dismissed.add(cn.toId + '|' + cn.fromId); }
     }
-    const cues = struct.cards.filter(c => c.type !== 'container' && !isArchived(c) && (c.text || '').trim() && hasCorrectionCue(c.text));
     for (const card of cards) {
         if (!card || !card.id) continue;
-        const succ = successorOf.has(card.id) ? byId.get(successorOf.get(card.id)) : null;
-        if (succ && (succ.text || '').trim()) { out.set(card.id, { kind: 'edge', by: succ }); continue; }
-        if (hasCorrectionCue(card.text)) continue;   // the hit IS a correction — nothing to overlay
-        if (/🛠/.test(card.text || '')) continue;    // skills are standing reference, corrected in place with ~ — never labeled STALE by a lexical cue (mirror the supersede/resolve guards)
-        const cTok = tokenSet(card.text);
-        let best = null, bestS = 0;
-        for (const cue of cues) {
-            if (cue.id === card.id) continue;
-            if (dismissed.has(cue.id + '|' + card.id)) continue;
-            // Recency guard: a correction can only correct facts that existed when
-            // it was written — a cue STRICTLY older than the card must never be
-            // served as its "current truth" (field 2026-07-12: a 07-11 audit
-            // correction overlaid the 07-12 cards that superseded it, and a June
-            // "deploy did not stick" correction poisoned July version answers,
-            // steering synthesis BACKWARD). Equal/unknown stamps keep the overlay
-            // (same-batch captures share a timestamp; missing dates can't be judged).
-            if ((cue.createdAt || 0) && (card.createdAt || 0) && cue.createdAt < card.createdAt) continue;
-            const s = cueMatch(cTok, stripCueMeta(tokenSet(cue.text)), at);
-            if (s > bestS) { bestS = s; best = cue; }
+        const seen = new Set([card.id]);
+        let nextId = successorOf.get(card.id);
+        let successor = null;
+        while (nextId && !seen.has(nextId)) {
+            seen.add(nextId);
+            const next = byId.get(nextId);
+            if (!next || !(next.text || '').trim()) break;
+            successor = next;
+            nextId = successorOf.get(nextId);
         }
-        if (best && bestS > 0) out.set(card.id, { kind: 'cue', by: best, overlap: Math.round(bestS * 100) / 100 });
+        if (successor) out.set(card.id, { kind: 'edge', by: successor });
     }
     return out;
 }

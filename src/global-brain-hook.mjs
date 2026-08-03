@@ -390,6 +390,10 @@ function touchSession(sid, patch = {}) {
             const wantsIntent = patch.intent !== undefined && !declaredFresh;
             const nextIntent = wantsIntent ? patch.intent : (prev.intent ?? '');
             const intentChanged = wantsIntent && nextIntent !== (prev.intent ?? '');
+            const recordsActivity = patch.intent !== undefined
+                || patch.addFiles !== undefined
+                || patch.files !== undefined
+                || patch.ships !== undefined;
             list.push({
                 ...prev,   // unknown/foreign keys (an MCP writer's, a future field) survive this touch
                 id: sid, pid: process.pid, project: path.basename(CWD),
@@ -421,6 +425,9 @@ function touchSession(sid, patch = {}) {
                 // list silently dropped unknown patch keys, which made the
                 // dedup dead code (review-caught).
                 statusDigestHash: patch.statusDigestHash !== undefined ? patch.statusDigestHash : (prev.statusDigestHash ?? null),
+                ...(recordsActivity
+                    ? { activityAt: now, activityKind: patch.intent !== undefined ? 'UserPromptSubmit' : 'ObservedWork' }
+                    : (prev.activityAt ? { activityAt: prev.activityAt, activityKind: prev.activityKind || null } : {})),
                 channels: Object.keys(channelSeen), channelSeen,
                 startedAt: prev.startedAt || now, lastSeen: now,
             });

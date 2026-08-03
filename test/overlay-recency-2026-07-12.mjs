@@ -3,11 +3,11 @@
 //     truth for July version questions (probe verdict: WRONG), and
 //   • a 07-11 audit correction overlaid the 07-12 R1 cards that superseded it —
 //     older facts "correcting" newer cards, steering synthesis BACKWARD.
-// Guards under test:
-//   G1 correctionOverlaysFor: a cue STRICTLY older than the card never overlays it
-//   G2 correctionOverlaysFor: equal/unknown timestamps keep the overlay (compat)
-//   G3 correctionOverlaysFor: 🛠️ skills never get a cue overlay (standing reference)
-//   G4 correctionOverlaysFor: a not_contradiction edge dismisses the cue pair
+// Guards under test (current precision law):
+//   G1/G2 correctionOverlaysFor: cue similarity never asserts claim identity;
+//         an explicit lifecycle edge overlays regardless of timestamp
+//   G3 correctionOverlaysFor: skills follow the same explicit-edge law
+//   G4 detectContradictions: not_contradiction dismisses the review candidate
 //   G5 detectContradictions: cue older than counterpart → presumption inverts
 //   G6 detectContradictions: 🛠️ skill is never the "likely STALE" side of a cue pair
 import { buildKlypixMap, parseKlypix, correctionOverlaysFor, detectContradictions } from '../src/klypix-format.mjs';
@@ -23,7 +23,7 @@ async function brainWith(areas) {
 }
 const find = (struct, re) => struct.cards.find(c => re.test(c.text || ''));
 
-// ── G1 + G2: recency guard on the cue overlay ────────────────────────────────
+// ── G1 + G2: explicit lifecycle identity at serve time ──────────────────────
 {
     const { struct } = await brainWith([
         { title: 'Strategy', cards: [{ text: STALE }] },
@@ -32,21 +32,18 @@ const find = (struct, re) => struct.cards.find(c => re.test(c.text || ''));
     const card = find(struct, /deferred ON PURPOSE/);
     const cue = find(struct, /WIRED/);
 
-    cue.createdAt = 1000; card.createdAt = 2000;   // cue is OLDER than the card
-    ok(!correctionOverlaysFor(struct, [card]).has(card.id), 'G1: a cue strictly older than the card does NOT overlay it');
-
-    cue.createdAt = 3000; card.createdAt = 2000;   // cue is NEWER — classic case
-    const newer = correctionOverlaysFor(struct, [card]).get(card.id);
-    ok(!!newer && newer.kind === 'cue' && /WIRED/.test(newer.by.text), 'G1: a newer cue still overlays (classic direction intact)');
-
-    cue.createdAt = 2000; card.createdAt = 2000;   // same capture batch
-    ok(correctionOverlaysFor(struct, [card]).has(card.id), 'G2: equal timestamps keep the overlay (compat)');
-
-    delete cue.createdAt;                           // unknown stamp — can't judge
-    ok(correctionOverlaysFor(struct, [card]).has(card.id), 'G2: unknown cue timestamp keeps the overlay (compat)');
+    for (const [cueAt, cardAt, label] of [[1000, 2000, 'older'], [3000, 2000, 'newer'], [2000, 2000, 'equal'], [null, 2000, 'unknown']]) {
+        if (cueAt == null) delete cue.createdAt; else cue.createdAt = cueAt;
+        card.createdAt = cardAt;
+        ok(!correctionOverlaysFor(struct, [card]).has(card.id), `G1: ${label} cue stays proposal-only without a lifecycle edge`);
+    }
+    struct.connections.push({ fromId: card.id, toId: cue.id, label: 'superseded by' });
+    cue.createdAt = 1000; card.createdAt = 2000;
+    const edge = correctionOverlaysFor(struct, [card]).get(card.id);
+    ok(!!edge && edge.kind === 'edge' && /WIRED/.test(edge.by.text), 'G2: explicit superseded-by identity overlays regardless of timestamp');
 }
 
-// ── G3: skills never get a cue overlay ───────────────────────────────────────
+// ── G3: skills also require an explicit lifecycle edge ──────────────────────
 {
     const { struct } = await brainWith([
         { title: 'Strategy', cards: [{ text: `🛠️ ${STALE}` }] },
@@ -62,7 +59,7 @@ const find = (struct, re) => struct.cards.find(c => re.test(c.text || ''));
     ok(!!ov && ov.kind === 'edge', 'G3: an explicit superseded-by edge on a skill still yields an edge overlay');
 }
 
-// ── G4: not_contradiction dismissal blocks the cue overlay ───────────────────
+// ── G4: not_contradiction dismisses the reconcile proposal ──────────────────
 {
     const { struct } = await brainWith([
         { title: 'Strategy', cards: [{ text: STALE }] },
@@ -71,9 +68,10 @@ const find = (struct, re) => struct.cards.find(c => re.test(c.text || ''));
     const card = find(struct, /deferred ON PURPOSE/);
     const cue = find(struct, /WIRED/);
     cue.createdAt = 3000; card.createdAt = 2000;
-    ok(correctionOverlaysFor(struct, [card]).has(card.id), 'G4 precondition: overlay attaches before the dismissal');
+    ok(detectContradictions(struct).some(pair => pair.why.startsWith('correction-cue')), 'G4 precondition: the cue pair is proposed for review');
+    ok(!correctionOverlaysFor(struct, [card]).has(card.id), 'G4: an unconfirmed proposal never becomes a serve-time overlay');
     struct.connections.push({ fromId: card.id, toId: cue.id, relationship: 'not_contradiction', label: 'not a contradiction' });
-    ok(!correctionOverlaysFor(struct, [card]).has(card.id), 'G4: a not_contradiction edge dismisses the cue overlay');
+    ok(!detectContradictions(struct).some(pair => pair.why.startsWith('correction-cue')), 'G4: a not_contradiction edge dismisses the review candidate');
 }
 
 // ── G5: detectContradictions inverts the presumption for an older cue ────────

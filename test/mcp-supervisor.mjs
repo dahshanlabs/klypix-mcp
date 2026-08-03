@@ -197,6 +197,9 @@ try {
   ok(textOf(await client.callTool({ name: 'version', arguments: {} })) === '1.2.0', 'breaking candidate is rejected while v3 stays available');
   const states = fs.readdirSync(stateDir).filter(name => name.endsWith('.json')).map(name => JSON.parse(fs.readFileSync(path.join(stateDir, name), 'utf8')));
   ok(states.some(state => state.status === 'restart-required' && /removed tools/.test(state.lastError || '')), 'supervisor publishes an exact restart-required diagnostic');
+  ok(typeof states[0]?.connectionId === 'string' && states[0].connectionId.length >= 16, 'supervisor assigns a stable connection id for passive attribution');
+  ok(states[0]?.clientInfo?.name === 'klypix-supervisor-test', 'supervisor records bounded MCP client identity from initialize');
+  ok(states[0]?.parentPid > 0 && states[0]?.cwd, 'supervisor receipt includes parent and working-directory attribution');
   lastActivePid = states[0]?.active?.pid || null;
 } finally {
   await client.close().catch(() => {});

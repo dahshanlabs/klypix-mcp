@@ -408,16 +408,29 @@ jobs:
         run: |
           set -euo pipefail
           NAME="$(node -p "require('./package.json').name")"
-          # The registry needs a moment to index a fresh publish.
-          for attempt in 1 2 3 4 5; do
-            META="$(npm view "$NAME@$GATE_VERSION" --json 2>/dev/null || true)"
-            if [ -n "$META" ]; then break; fi
-            echo "registry not indexed yet (attempt $attempt) — waiting"
+          # A fresh publish can briefly return `{}` before its complete manifest
+          # and attestation are indexed. Do not treat merely non-empty JSON as a
+          # finished read-back; wait for this exact name/version + provenance.
+          META=""
+          for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            CANDIDATE="$(npm view "$NAME@$GATE_VERSION" --json 2>/dev/null || true)"
+            if printf '%s' "$CANDIDATE" | node -e '
+              try {
+                const meta = JSON.parse(require("fs").readFileSync(0, "utf8") || "null");
+                process.exit(meta?.name === process.argv[1]
+                  && meta?.version === process.argv[2]
+                  && !!meta?.dist?.attestations?.provenance ? 0 : 1);
+              } catch { process.exit(1); }
+            ' "$NAME" "$GATE_VERSION"; then
+              META="$CANDIDATE"
+              break
+            fi
+            echo "complete registry metadata not indexed yet (attempt $attempt) — waiting"
             sleep 10
           done
           if [ -z "$META" ]; then
-            echo "::warning::Could not read $NAME@$GATE_VERSION back from the registry to verify provenance. The publish itself succeeded; verify manually with 'npm view $NAME@$GATE_VERSION --json'."
-            exit 0
+            echo "::error::Could not read complete provenance metadata for $NAME@$GATE_VERSION after 120 seconds. The publish step succeeded; verify manually with 'npm view $NAME@$GATE_VERSION --json'."
+            exit 1
           fi
           printf '%s' "$META" | node -e '
             let s = "";

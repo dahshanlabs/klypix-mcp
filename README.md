@@ -167,6 +167,23 @@ not a filing convention.
   lexical. `npx klypix-mcp install` deliberately does not install that model, so a fresh install
   is lexical.
 
+### Bounded semantic-memory runtime
+
+Long-lived MCP and A2A workers use the bounded semantic-memory runtime by default. Models load only
+when semantic work is requested, native inference is serialized per process, embedding work is
+split into small batches, cross-encoder candidates are scored in bounded batches before one global
+sort, and temporary tensors are released after use. These controls change the resource lifecycle
+only; brain cards, ranking rules, project coordination, and the on-disk brain format are unchanged.
+
+The previous runtime remains available as an emergency rollback. Set
+`KLYPIX_SEMANTIC_MEMORY_MODE=legacy` in the MCP server environment and reconnect or restart the
+host. This restores eager model prewarming and the previous inference path without migrating or
+deleting brain data. Remove the variable (or set it to `bounded`) to return to the bounded runtime.
+
+Run the deterministic lifecycle tests with `npm run test:memory`. For an opt-in real-model soak
+against a disposable or backed-up brain, set `KLYPIX_MEMORY_SOAK_BRAIN` to its path and run
+`npm run test:memory:soak`.
+
 ---
 
 ## Supported hosts and their integration level

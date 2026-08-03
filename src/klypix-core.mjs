@@ -36,6 +36,15 @@ import {
 } from './klypix-format.mjs';
 import { capMessages, findProjectBrain } from './agent-presence.mjs';
 import { brainCaptureLockPath, vaultCreateLockPath, withAdvisoryWriteLock } from './brain-write-lock.mjs';
+import {
+  dot, embedTexts, getEmbedder, getEmbedderForUse, getRerankerForUse,
+  rerankHits, semanticMemorySnapshot, shouldPrewarmSemantic, vectorsForBrain,
+} from './semantic-memory.mjs';
+
+// The MCP and A2A faces prewarm through this protocol-neutral module. Bounded
+// mode is lazy; setting KLYPIX_SEMANTIC_MEMORY_MODE=legacy restores the exact
+// eager lifecycle without changing any tool contract.
+export { getEmbedder, semanticMemorySnapshot, shouldPrewarmSemantic };
 
 // ── Card / connection input shape (single source for every face) ─────────────
 export const cardSchema = z.object({
@@ -150,68 +159,11 @@ function safeName(vault, title) {
   return `${name}.klypix`;
 }
 
-// ── On-device semantic memory (shared, lazy, self-healing) ───────────────────
-// Embeddings run INSIDE the long-lived host process, 100% local: transformers.js
-// (WASM) + a 23MB MiniLM model cached under ~/.claude/project-brain/hf-cache on
-// first use. Per-brain vectors are cached incrementally (content-hashed per
-// card). Everything degrades to lexical scoring gracefully: no lib, no model, no
-// network → search still works.
+// ── On-device semantic memory (bounded, local, self-healing) ─────────────────
+// Neural lifecycle and resource ownership live in semantic-memory.mjs. The
+// deterministic correction-aware core below remains independently available.
 const PB_DIR = path.join(os.homedir(), '.claude', 'project-brain');
-const EMB_DIR = path.join(PB_DIR, 'embeddings');
 const sha1 = (s) => crypto.createHash('sha1').update(s).digest('hex');
-let embedderPromise = null;
-export function getEmbedder(log = () => {}) {
-  if (!embedderPromise) {
-    embedderPromise = (async () => {
-      // Dual-path: (1) bare specifier — npx/npm installs ship the lib;
-      // (2) ~/.claude/project-brain/semantic — where KLYPIX's one-click
-      // "semantic memory" install places it for the bundled server.
-      let t;
-      try { t = await import('@huggingface/transformers'); }
-      catch {
-        // The optional dep ships dist/transformers.node.mjs on v4 (Node build) and
-        // dist/transformers.mjs on older lines — try both so a correct one-click
-        // install resolves regardless of version.
-        const base = path.join(PB_DIR, 'semantic', 'node_modules', '@huggingface', 'transformers', 'dist');
-        let lastErr;
-        for (const f of ['transformers.node.mjs', 'transformers.mjs']) {
-          try { t = await import(new URL('file:///' + path.join(base, f).replace(/\\/g, '/')).href); lastErr = null; break; }
-          catch (e) { lastErr = e; }
-        }
-        if (!t) throw lastErr;
-      }
-      t.env.cacheDir = path.join(PB_DIR, 'hf-cache');
-      return await t.pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2', { dtype: 'q8' });
-    })().catch(e => { log('semantic unavailable (lexical fallback):', e?.message || e); return null; });
-  }
-  return embedderPromise;
-}
-async function embedTexts(pipe, texts) {
-  const out = await pipe(texts, { pooling: 'mean', normalize: true });
-  const [n, d] = out.dims;
-  const vecs = [];
-  for (let i = 0; i < n; i++) vecs.push(Array.from(out.data.slice(i * d, (i + 1) * d)));
-  return vecs;
-}
-const dot = (a, b) => { let s = 0; for (let i = 0; i < a.length; i++) s += a[i] * b[i]; return s; };
-// Incremental per-brain vector cache: only new/changed cards get embedded.
-async function vectorsForBrain(pipe, brainPath, cards) {
-  const file = path.join(EMB_DIR, sha1(brainPath.replace(/\\/g, '/')) + '.json');
-  let cache = { v: 1, cards: {} };
-  try { cache = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { /* fresh */ }
-  const want = cards.filter(c => c.type !== 'container' && (c.text || '').trim());
-  const missing = want.filter(c => cache.cards[c.id]?.h !== sha1(String(c.text)));
-  if (missing.length) {
-    const vecs = await embedTexts(pipe, missing.map(c => String(c.text).slice(0, 1500)));
-    missing.forEach((c, i) => { cache.cards[c.id] = { h: sha1(String(c.text)), v: vecs[i] }; });
-    const live = new Set(want.map(c => c.id));
-    for (const id of Object.keys(cache.cards)) if (!live.has(id)) delete cache.cards[id];
-    try { fs.mkdirSync(EMB_DIR, { recursive: true }); fs.writeFileSync(file, JSON.stringify(cache)); } catch { /* cache is best-effort */ }
-  }
-  const map = new Map();
-  for (const c of want) { const e = cache.cards[c.id]; if (e?.v) map.set(c.id, e.v); }
-  return map;
-}
 // Death-date reads go through the ONE shared reader in klypix-format —
 // this file used to carry a divergent local regex (missing the bare
 // "↩ superseded" variant AND the gardener's "⤵ consolidated" stamp), so
@@ -221,38 +173,8 @@ async function vectorsForBrain(pipe, brainPath, cards) {
 // Eval-proven on the frozen human-paraphrase set (2026-07-15): recall@5 15%→40%,
 // MRR 0.087→0.28, top-1 0%→20%. Scores (question, cardText) PAIRS jointly (full
 // token interaction, unlike the bi-encoder cosine) and reorders a wide candidate
-// net. Same lazy/self-healing contract as getEmbedder: ~23MB q8 model cached in
-// hf-cache; any failure → null → ranking is byte-identical to the un-reranked
-// order. Disable outright with KLYPIX_RERANK=0.
-let rerankerPromise = null;
-export function getReranker(log = () => {}) {
-  if (!rerankerPromise) {
-    rerankerPromise = (async () => {
-      let t;
-      try { t = await import('@huggingface/transformers'); }
-      catch {
-        const base = path.join(PB_DIR, 'semantic', 'node_modules', '@huggingface', 'transformers', 'dist');
-        let lastErr;
-        for (const f of ['transformers.node.mjs', 'transformers.mjs']) {
-          try { t = await import(new URL('file:///' + path.join(base, f).replace(/\\/g, '/')).href); lastErr = null; break; }
-          catch (e) { lastErr = e; }
-        }
-        if (!t) throw lastErr;
-      }
-      t.env.cacheDir = path.join(PB_DIR, 'hf-cache');
-      const tokenizer = await t.AutoTokenizer.from_pretrained('Xenova/ms-marco-MiniLM-L-6-v2');
-      const model = await t.AutoModelForSequenceClassification.from_pretrained('Xenova/ms-marco-MiniLM-L-6-v2', { dtype: 'q8' });
-      return { tokenizer, model };
-    })().catch(e => { log('reranker unavailable (no rerank):', e?.message || e); return null; });
-  }
-  return rerankerPromise;
-}
-async function rerankHits(rr, question, hits) {
-  const texts = hits.map(h => String(h.card?.text || '').slice(0, 1500));
-  const inputs = rr.tokenizer(new Array(texts.length).fill(String(question)), { text_pair: texts, padding: true, truncation: true });
-  const { logits } = await rr.model(inputs);
-  return hits.map((h, i) => ({ h, s: Number(logits.data[i]) })).sort((a, b) => b.s - a.s).map(x => x.h);
-}
+// net. The bounded runtime keeps the same q8 model and scoring while owning
+// tensor disposal and serialization. Disable outright with KLYPIX_RERANK=0.
 
 // ── small block helpers ──────────────────────────────────────────────────────
 const text = (t) => ({ kind: 'text', text: t });
@@ -366,7 +288,7 @@ export async function opSearchAllBrains({ vault, query, as_of, log = () => {} })
   const asOfTs = as_of ? Date.parse(as_of) : null;
   if (as_of && Number.isNaN(asOfTs)) return err(`Bad as_of date: "${as_of}" — use YYYY-MM-DD.`);
 
-  const pipe = await Promise.race([getEmbedder(log), new Promise(r => setTimeout(() => r(null), 20_000))]);
+  const pipe = await getEmbedderForUse(log, 20_000);
   let qv = null;
   if (pipe) { try { [qv] = await embedTexts(pipe, [q]); } catch { /* lexical only */ } }
 
@@ -554,7 +476,7 @@ export async function opBrainAsk({ vault, canvas, question, as_of, k = 10, log =
   // model degrades cleanly to pure lexical.
   let semantic = null, mode = 'lexical', cardVecs = null;
   try {
-    const pipe = await Promise.race([getEmbedder(log), new Promise(r => setTimeout(() => r(null), 20_000))]);
+    const pipe = await getEmbedderForUse(log, 20_000);
     if (pipe) {
       const [qv] = await embedTexts(pipe, [q]);
       const vecs = await vectorsForBrain(pipe, t.file, struct.cards);
@@ -578,7 +500,7 @@ export async function opBrainAsk({ vault, canvas, question, as_of, k = 10, log =
   const result = rankForQuestion(struct, q, { semantic, k: wantRerank ? Math.max(kk, 50) : kk, as_of: timeTravel ? as_of : null, pairSim });
   if (wantRerank && result.hits.length > 1) {
     try {
-      const rr = await Promise.race([getReranker(log), new Promise(r => setTimeout(() => r(null), 8_000))]);
+      const rr = await getRerankerForUse(log, 8_000);
       if (rr) { result.hits = await rerankHits(rr, q, result.hits); mode += ' + rerank'; }
     } catch { /* keep the pre-rerank order */ }
     result.hits = result.hits.slice(0, kk);
@@ -617,7 +539,7 @@ export async function opBrainChallenge({ vault, canvas, claim, k = 8, via, log =
   const stamp = brainStamp(t.file, struct, t.how);
   let semantic = null, mode = 'lexical';
   try {
-    const pipe = await Promise.race([getEmbedder(log), new Promise(r => setTimeout(() => r(null), 20_000))]);
+    const pipe = await getEmbedderForUse(log, 20_000);
     if (pipe) {
       const [qv] = await embedTexts(pipe, [q]);
       const vecs = await vectorsForBrain(pipe, t.file, struct.cards);
@@ -964,7 +886,7 @@ export async function opBrainConnect({ vault, canvas, apply = false, max = 24, t
 
   let edges = [];
   let mode = 'structural (shared tags + [[mentions]])';
-  const pipe = await Promise.race([getEmbedder(log), new Promise(r => setTimeout(() => r(null), 20_000))]);
+  const pipe = await getEmbedderForUse(log, 20_000);
   if (pipe) {
     try {
       const vecs = await vectorsForBrain(pipe, file, struct.cards);

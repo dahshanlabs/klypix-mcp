@@ -25,7 +25,7 @@ import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
-  resolveVault, getEmbedder, buildKlypixMap, cardSchema, connSchema,
+  resolveVault, getEmbedder, shouldPrewarmSemantic, buildKlypixMap, cardSchema, connSchema,
   opListCanvases, opReadCanvas, opSearchCanvases, opSearchAllBrains,
   opBrainInsights, opBrainConnect, opBrainReconcile, opBrainGarden, opCreateCanvas, opAddToCanvas, opBrainNote, opBrainMessage, opBrainAsk, opBrainChallenge, opCanvasView, opBrainLens,
   opBrainTaskContext,
@@ -625,6 +625,10 @@ server.server.oninitialized = () => {
 server.server.onclose = stopRuntimePresence;
 process.once('exit', stopRuntimePresence);
 await server.connect(transport);
-// Pre-warm the on-device embedder in the BACKGROUND so the first cross-project
-// search of a session is already semantic, not a lexical fallback.
-getEmbedder(log).then(p => log(p ? 'semantic ready (pre-warmed)' : 'semantic unavailable — lexical only')).catch(() => {});
+// Most sessions use brain_sync/presence and should not pay for a private model
+// they never query. Legacy mode restores the old eager lifecycle immediately.
+if (shouldPrewarmSemantic()) {
+  getEmbedder(log).then(p => log(p ? 'semantic ready (pre-warmed)' : 'semantic unavailable — lexical only')).catch(() => {});
+} else {
+  log('semantic lazy · bounded memory runtime');
+}

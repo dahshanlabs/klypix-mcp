@@ -31,7 +31,7 @@ import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { z } from 'zod';
 import {
-  resolveVault, resolveCanvas, getEmbedder, cardSchema, connSchema,
+  resolveVault, resolveCanvas, getEmbedder, shouldPrewarmSemantic, cardSchema, connSchema,
   opListCanvases, opReadCanvas, opSearchCanvases, opSearchAllBrains,
   opBrainInsights, opBrainConnect, opCreateCanvas, opAddToCanvas, opBrainNote,
 } from '../src/klypix-core.mjs';
@@ -656,6 +656,10 @@ server.listen(PORT, HOST, () => {
   log(`ready · vault=${VAULT}`);
   log(`agent card: http://${HOST}:${PORT}/.well-known/agent-card.json`);
   log(`A2A endpoint (JSON-RPC): http://${HOST}:${PORT}/`);
-  // Pre-warm the on-device embedder so the first cross-project search is semantic.
-  getEmbedder(log).then(p => log(p ? 'semantic ready (pre-warmed)' : 'semantic unavailable — lexical only')).catch(() => {});
+  // Bounded mode is lazy; legacy mode is the exact eager-prewarm rollback path.
+  if (shouldPrewarmSemantic()) {
+    getEmbedder(log).then(p => log(p ? 'semantic ready (pre-warmed)' : 'semantic unavailable — lexical only')).catch(() => {});
+  } else {
+    log('semantic lazy · bounded memory runtime');
+  }
 });

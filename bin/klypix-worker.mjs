@@ -278,16 +278,17 @@ server.registerTool('brain_lens', {
 
 server.registerTool('brain_connect', {
   title: 'Connect related-but-unlinked brain cards (densify the graph)',
-  description: 'Finds genuinely related cards that AREN\'T linked yet and proposes connections — semantic similarity when the on-device model is installed, else shared tags + [[mentions]]. Dry-run by default (review the suggestions); pass apply:true to draw them (ADDITIVE — never deletes; the human can remove any arrow). Use after brain_insights flags many orphans, to turn a flat list into a real knowledge graph. To DISMISS a brain_reconcile false-positive contradiction, pass pairs:[{fromId,toId}] (the ids are in the reconcile output) with relationship:"not_contradiction" — a persisted dismissal that stops that pair ever resurfacing as a candidate.',
+  description: 'Repairs orphaned decision/milestone cards first (scope:"orphans", the default) by proposing genuinely related unlinked pairs — semantic similarity at a conservative 0.55 threshold when the on-device model is installed, else shared tags + [[mentions]]. The dry run includes a before→projected orphan receipt; apply:true draws only additive, removable arrows and reports the measured after count. It NEVER archives or rewrites cards. Use scope:"all" for deliberate whole-graph densification. To DISMISS a brain_reconcile false-positive contradiction, pass pairs:[{fromId,toId}] with relationship:"not_contradiction".',
   inputSchema: {
     canvas: z.string().optional().describe('Canvas filename/path. Defaults to the project brain ("brain").'),
     apply: z.boolean().optional().describe('false (default) = suggest only; true = draw the connections.'),
     max: z.number().optional().describe('Max connections to propose/draw (default 24).'),
-    threshold: z.number().optional().describe('Min semantic similarity 0–1 to link (default 0.45). Higher = fewer, tighter links.'),
+    threshold: z.number().optional().describe('Min semantic similarity 0–1. Default 0.55 for orphan repair; 0.45 for scope:"all". Higher = fewer, tighter links.'),
+    scope: z.enum(['orphans', 'all']).optional().describe('"orphans" (default) repairs isolated decision/milestone cards; "all" proposes across every live card.'),
     pairs: z.array(z.object({ fromId: z.string(), toId: z.string() })).optional().describe('Explicit card-id pairs to connect (bypasses auto-proposal). Use to dismiss a reconcile false-positive: pass the two card ids with relationship:"not_contradiction".'),
     relationship: z.string().optional().describe('Relationship for explicit `pairs` (e.g. "not_contradiction" to permanently dismiss a contradiction candidate, or "relates_to", "depends_on", "supports").'),
   },
-}, async ({ canvas, apply, max, threshold, pairs, relationship }) => toContent(await opBrainConnect({ vault: mcpPresence.vault, canvas, apply, max, threshold, pairs, relationship, log })));
+}, async ({ canvas, apply, max, threshold, scope, pairs, relationship }) => toContent(await opBrainConnect({ vault: mcpPresence.vault, canvas, apply, max, threshold, scope, pairs, relationship, log })));
 
 server.registerTool('brain_reconcile', {
   title: 'Reconcile the brain — contradictions between cards + unrecorded migrations',

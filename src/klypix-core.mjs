@@ -37,7 +37,7 @@ import {
 import { capMessages, findProjectBrain } from './agent-presence.mjs';
 import { brainCaptureLockPath, vaultCreateLockPath, withAdvisoryWriteLock } from './brain-write-lock.mjs';
 import {
-  dot, embedTexts, getEmbedder, getEmbedderForUse, getRerankerForUse,
+  dot, embedTexts, getEmbedder, getEmbedderForUse, withRerankerForUse,
   rerankHits, semanticMemorySnapshot, shouldPrewarmSemantic, vectorsForBrain,
 } from './semantic-memory.mjs';
 
@@ -290,7 +290,7 @@ export async function opSearchAllBrains({ vault, query, as_of, log = () => {} })
 
   const pipe = await getEmbedderForUse(log, 20_000);
   let qv = null;
-  if (pipe) { try { [qv] = await embedTexts(pipe, [q]); } catch { /* lexical only */ } }
+  if (pipe) { try { [qv] = await embedTexts(pipe, [q], { kind: 'query' }); } catch { /* lexical only */ } }
 
   let curKey = null;
   try { const cb = resolveDefaultBrain(vault).file; if (cb) curKey = path.resolve(cb).replace(/\\/g, '/').toLowerCase(); } catch { /* no current brain */ }
@@ -478,21 +478,18 @@ export async function opBrainAsk({ vault, canvas, question, as_of, k = 10, log =
   try {
     const pipe = await getEmbedderForUse(log, 20_000);
     if (pipe) {
-      const [qv] = await embedTexts(pipe, [q]);
+      const [qv] = await embedTexts(pipe, [q], { kind: 'query' });
       const vecs = await vectorsForBrain(pipe, t.file, struct.cards);
       if (qv && vecs && vecs.size) { semantic = new Map(); for (const [id, v] of vecs) semantic.set(id, dot(qv, v)); cardVecs = vecs; mode = 'semantic+lexical (on-device)'; }
     }
   } catch { semantic = null; cardVecs = null; mode = 'lexical (semantic warming — retry for semantic ranking)'; }
   const kk = Math.max(1, Math.min(20, k || 10));
   const timeTravel = asOfTs != null;
-  // Cross-encoder rerank (eval-proven: recall@5 15%→40% on human paraphrase
-  // questions): cast a WIDER candidate net (50), rescore (question, card) pairs
-  // jointly on-device, keep the top-k. Precision rules: SUPPRESSED under as_of
-  // (time-travel stays deterministic); own 8s budget; any failure/warm-up →
-  // the un-reranked candidate order, whose top-k slice is byte-identical to
-  // today's ranking (same sort, longer slice). Overlays are safe: rankForQuestion
-  // attaches corrections to ALL candidates before we reorder. KLYPIX_RERANK=0 kills.
-  const wantRerank = !timeTravel && process.env.KLYPIX_RERANK !== '0';
+  // Cross-encoder rerank is OPT-IN. On the frozen human/paraphrase set it made
+  // BGE top-5 recall worse (35%→25%) and added ~3.5s/query. Keep the reversible
+  // escape hatch for experiments, but the best measured experience is the single
+  // BGE pass. Suppressed under as_of either way.
+  const wantRerank = !timeTravel && process.env.KLYPIX_RERANK === '1';
   // Card↔card cosine for the serve-time ❓↔🏁 pairing pass — the same on-device
   // vectors that rank the question, reused; null degrades pairing to its
   // lexical anchor/coverage fallback (works on every host, embeddings or not).
@@ -500,8 +497,8 @@ export async function opBrainAsk({ vault, canvas, question, as_of, k = 10, log =
   const result = rankForQuestion(struct, q, { semantic, k: wantRerank ? Math.max(kk, 50) : kk, as_of: timeTravel ? as_of : null, pairSim });
   if (wantRerank && result.hits.length > 1) {
     try {
-      const rr = await getRerankerForUse(log, 8_000);
-      if (rr) { result.hits = await rerankHits(rr, q, result.hits); mode += ' + rerank'; }
+      const reranked = await withRerankerForUse(log, 8_000, rr => rerankHits(rr, q, result.hits));
+      if (reranked) { result.hits = reranked; mode += ' + rerank'; }
     } catch { /* keep the pre-rerank order */ }
     result.hits = result.hits.slice(0, kk);
   }
@@ -541,7 +538,7 @@ export async function opBrainChallenge({ vault, canvas, claim, k = 8, via, log =
   try {
     const pipe = await getEmbedderForUse(log, 20_000);
     if (pipe) {
-      const [qv] = await embedTexts(pipe, [q]);
+      const [qv] = await embedTexts(pipe, [q], { kind: 'query' });
       const vecs = await vectorsForBrain(pipe, t.file, struct.cards);
       if (qv && vecs && vecs.size) { semantic = new Map(); for (const [id, v] of vecs) semantic.set(id, dot(qv, v)); mode = 'semantic+lexical (on-device)'; }
     }
@@ -848,7 +845,7 @@ export async function opBrainGarden({ vault, canvas, apply = false, syntheses, a
   }, { brain: true });
 }
 
-export async function opBrainConnect({ vault, canvas, apply = false, max = 24, threshold = 0.45, pairs = null, relationship = null, label = null, log = () => {} }) {
+export async function opBrainConnect({ vault, canvas, apply = false, max = 24, threshold = null, scope = 'orphans', pairs = null, relationship = null, label = null, log = () => {} }) {
   const tgt = brainTarget(vault, canvas);
   if (tgt.ambiguous) return ambiguousBrainErr(tgt.ambiguous);
   if (!tgt.file) return err(`No brain found — looked for ./brain.klypix in the project, then ${vault}.`);
@@ -884,6 +881,18 @@ export async function opBrainConnect({ vault, canvas, apply = false, max = 24, t
     }, { brain: true });
   }
 
+  // Graph gardening is orphan-first by default. It is additive and dry-run-first:
+  // no card is archived, rewritten, or silently linked. `scope:"all"` preserves
+  // the broader historical densification mode for deliberate use.
+  const normalizedScope = scope === 'all' ? 'all' : 'orphans';
+  const orphanIds = new Set(brainInsights(struct).orphans.map(card => card.id));
+  const beforeOrphans = orphanIds.size;
+  if (normalizedScope === 'orphans' && !beforeOrphans) {
+    return { blocks: [text('Nothing to connect — this brain has no orphaned decision/milestone cards.')] };
+  }
+  const effectiveThreshold = Number.isFinite(Number(threshold))
+    ? Math.max(0, Math.min(1, Number(threshold)))
+    : (normalizedScope === 'orphans' ? 0.55 : 0.45);
   let edges = [];
   let mode = 'structural (shared tags + [[mentions]])';
   const pipe = await getEmbedderForUse(log, 20_000);
@@ -891,41 +900,60 @@ export async function opBrainConnect({ vault, canvas, apply = false, max = 24, t
     try {
       const vecs = await vectorsForBrain(pipe, file, struct.cards);
       const items = live.filter(c => vecs.get(c.id));
-      for (const a of items) {
+      const sources = normalizedScope === 'orphans' ? items.filter(c => orphanIds.has(c.id)) : items;
+      for (const a of sources) {
         const av = vecs.get(a.id);
         const sims = items
           .filter(b => b.id !== a.id)
           .map(b => ({ b, s: dot(av, vecs.get(b.id)), cross: (b.area || '') !== (a.area || '') }))
-          .sort((x, y) => (y.s + (y.cross ? 0.03 : 0)) - (x.s + (x.cross ? 0.03 : 0)));
+          .sort((x, y) => (y.s + (orphanIds.has(y.b.id) ? 0.02 : 0) + (y.cross ? 0.01 : 0))
+            - (x.s + (orphanIds.has(x.b.id) ? 0.02 : 0) + (x.cross ? 0.01 : 0)));
         let taken = 0;
         for (const { b, s } of sims) {
-          if (s < threshold || taken >= 2) break;
+          if (s < effectiveThreshold || taken >= 2) break;
           const key = [a.id, b.id].sort().join('|');
           if (linked.has(key)) continue;
           linked.add(key);
-          edges.push({ fromId: a.id, toId: b.id, sim: s });
+          edges.push({ fromId: a.id, toId: b.id, sim: s, why: orphanIds.has(b.id) ? 'semantic · two orphans' : 'semantic · orphan to graph' });
           taken++;
         }
       }
       edges.sort((x, y) => y.sim - x.sim);
-      mode = 'semantic (on-device)';
+      mode = `semantic (on-device, threshold ${effectiveThreshold.toFixed(2)})`;
     } catch (e) { mode = `structural (semantic failed: ${e.message})`; }
   }
-  if (!edges.length && mode.startsWith('structural')) {
-    edges = proposeStructuralConnections(struct);
+  if (!edges.length) {
+    edges = proposeStructuralConnections(struct)
+      .filter(e => normalizedScope === 'all' || orphanIds.has(e.fromId) || orphanIds.has(e.toId));
+    if (!mode.startsWith('structural')) mode = `structural (no semantic matches ≥${effectiveThreshold.toFixed(2)})`;
   }
   const chosen = edges.slice(0, max);
-  if (!chosen.length) return { blocks: [text(`Nothing to connect — no related-but-unlinked cards found (mode: ${mode}).`)] };
+  if (!chosen.length) return { blocks: [text(`Nothing to connect — no related-but-unlinked ${normalizedScope === 'orphans' ? 'orphan cards' : 'cards'} found (mode: ${mode}).`)] };
 
-  const render = (e) => `- ${flat(byId.get(e.fromId)?.text)} ↔ ${flat(byId.get(e.toId)?.text)}${e.sim != null ? `  (${e.sim.toFixed(2)})` : e.why ? `  (${e.why})` : ''}`;
+  const repairedIds = new Set();
+  for (const edge of chosen) {
+    if (orphanIds.has(edge.fromId)) repairedIds.add(edge.fromId);
+    if (orphanIds.has(edge.toId)) repairedIds.add(edge.toId);
+  }
+  const projectedOrphans = Math.max(0, beforeOrphans - repairedIds.size);
+
+  const render = (e) => `- ${flat(byId.get(e.fromId)?.text)} ↔ ${flat(byId.get(e.toId)?.text)}${e.sim != null ? `  (${e.sim.toFixed(2)}${e.why ? ` · ${e.why}` : ''})` : e.why ? `  (${e.why})` : ''}`;
   if (!apply) {
-    return { blocks: [text(`# ${chosen.length} suggested connection(s) · ${mode}\n_Review, then re-run with apply:true to draw them._\n\n${chosen.map(render).join('\n')}`)] };
+    const receipt = normalizedScope === 'orphans'
+      ? `Orphan receipt: ${beforeOrphans} now → ${projectedOrphans} projected (${repairedIds.size} repaired if every reviewed edge is applied).`
+      : `Scope: all live cards (${beforeOrphans} current orphans).`;
+    return { blocks: [text(`# ${chosen.length} suggested connection(s) · ${mode}\n_${receipt} Review every pair, then re-run with apply:true to draw them. Additive only: no cards are archived or rewritten._\n\n${chosen.map(render).join('\n')}`)] };
   }
   return withCanvasWriteLock(file, async () => {
   try {
     const { buffer, added } = await addBrainConnections(fs.readFileSync(file), chosen);
     await atomicWrite(file, buffer);
-    return { blocks: [text(`✓ Drew ${added} connection(s) into ${path.relative(vault, file)} (${mode}). Reopen the brain to see the new arrows.\n\n${chosen.slice(0, added).map(render).join('\n')}`)] };
+    let afterOrphans = projectedOrphans;
+    try { afterOrphans = brainInsights((await parseKlypix(buffer)).struct).orphans.length; } catch { /* projected receipt remains honest fallback */ }
+    const receipt = normalizedScope === 'orphans'
+      ? ` Orphan receipt: ${beforeOrphans} → ${afterOrphans} (${Math.max(0, beforeOrphans - afterOrphans)} repaired).`
+      : '';
+    return { blocks: [text(`✓ Drew ${added} additive connection(s) into ${path.relative(vault, file)} (${mode}).${receipt} No cards were archived or rewritten; each arrow remains removable in KLYPIX.\n\n${chosen.slice(0, added).map(render).join('\n')}`)] };
   } catch (e) {
     return err(`Apply failed (brain unchanged): ${e.message}`);
   }

@@ -12,6 +12,10 @@ import crypto from 'crypto';
 const PB_DIR = path.join(os.homedir(), '.claude', 'project-brain');
 const EMB_DIR = path.join(PB_DIR, 'embeddings');
 const sha1 = (s) => crypto.createHash('sha1').update(String(s)).digest('hex');
+export const EMBEDDING_MODEL_ID = 'Xenova/bge-small-en-v1.5';
+export const EMBEDDING_QUERY_PREFIX = 'Represent this sentence for searching relevant passages: ';
+export const EMBEDDING_POOLING = 'cls';
+export const EMBEDDING_CACHE_KEY = `${EMBEDDING_MODEL_ID}|q8|${EMBEDDING_POOLING}|query-instruction-v1`;
 
 const rawMode = String(
   process.env.KLYPIX_SEMANTIC_MEMORY_MODE
@@ -28,6 +32,12 @@ const intEnv = (name, fallback, min, max) => {
 const EMBED_BATCH_SIZE = intEnv('KLYPIX_EMBED_BATCH_SIZE', 16, 1, 64);
 const RERANK_BATCH_SIZE = intEnv('KLYPIX_RERANK_BATCH_SIZE', 4, 1, 32);
 const MAX_INFERENCE_QUEUE = intEnv('KLYPIX_SEMANTIC_MAX_QUEUE', 16, 1, 256);
+const idleRaw = process.env.KLYPIX_SEMANTIC_IDLE_MS;
+const SEMANTIC_IDLE_MS = idleRaw === '0'
+  ? 0
+  : intEnv('KLYPIX_SEMANTIC_IDLE_MS', 10 * 60_000, 1_000, 60 * 60_000);
+const CACHE_LOCK_TIMEOUT_MS = intEnv('KLYPIX_SEMANTIC_CACHE_LOCK_MS', 10 * 60_000, 1_000, 30 * 60_000);
+const CACHE_LOCK_STALE_MS = Math.max(CACHE_LOCK_TIMEOUT_MS + 60_000, 15 * 60_000);
 
 const counters = {
   inferenceCalls: 0,
@@ -38,6 +48,11 @@ const counters = {
   maxQueued: 0,
   cacheFilesMerged: 0,
   cacheWrites: 0,
+  cacheLockWaits: 0,
+  cacheLockTimeouts: 0,
+  modelDisposals: 0,
+  idleDisposals: 0,
+  lastDisposeReason: null,
   highWaterRss: 0,
   highWaterExternal: 0,
   highWaterArrayBuffers: 0,
@@ -48,6 +63,9 @@ let inferenceActive = 0;
 let embedderPromise = null;
 let rerankerPromise = null;
 const vectorBuildTails = new Map();
+let semanticIdleTimer = null;
+let semanticLeases = 0;
+let lastSemanticActivityAt = Date.now();
 
 const sampleMemory = () => {
   const m = process.memoryUsage();
@@ -66,8 +84,12 @@ export function semanticMemorySnapshot() {
       rerankBatchSize: BOUNDED ? RERANK_BATCH_SIZE : null,
       maxInferenceQueue: BOUNDED ? MAX_INFERENCE_QUEUE : null,
       prewarm: shouldPrewarmSemantic(),
+      idleDisposeMs: BOUNDED ? SEMANTIC_IDLE_MS : null,
+      embeddingModel: EMBEDDING_MODEL_ID,
+      embeddingPooling: EMBEDDING_POOLING,
+      rerankDefault: false,
     },
-    queue: { active: inferenceActive, queued: inferenceQueued },
+    queue: { active: inferenceActive, queued: inferenceQueued, leases: semanticLeases },
     counters: { ...counters },
     memory: {
       rss: memory.rss,
@@ -82,6 +104,76 @@ export function semanticMemorySnapshot() {
 export const semanticMemoryMode = () => MODE;
 export const shouldPrewarmSemantic = () => MODE === 'legacy' || process.env.KLYPIX_SEMANTIC_PREWARM === '1';
 
+const clearSemanticIdleTimer = () => {
+  if (!semanticIdleTimer) return;
+  clearTimeout(semanticIdleTimer);
+  semanticIdleTimer = null;
+};
+
+const modelsLoaded = () => Boolean(embedderPromise || rerankerPromise);
+
+async function disposeModelsUnlocked(reason = 'explicit') {
+  clearSemanticIdleTimer();
+  const embedder = await embedderPromise?.catch?.(() => null);
+  const reranker = await rerankerPromise?.catch?.(() => null);
+  if (BOUNDED) {
+    try { await embedder?.dispose?.(); } catch { /* process recycle remains the final fallback */ }
+    try { await reranker?.model?.dispose?.(); } catch { /* */ }
+  }
+  embedderPromise = null;
+  rerankerPromise = null;
+  counters.modelDisposals++;
+  if (reason === 'idle') counters.idleDisposals++;
+  counters.lastDisposeReason = reason;
+  sampleMemory();
+}
+
+function enqueueMaintenance(fn) {
+  const run = inferenceTail.catch(() => {}).then(async () => {
+    inferenceActive++;
+    try { return await fn(); }
+    finally { inferenceActive--; }
+  });
+  inferenceTail = run.catch(() => {});
+  return run;
+}
+
+function armSemanticIdleDisposal() {
+  clearSemanticIdleTimer();
+  if (!BOUNDED || SEMANTIC_IDLE_MS <= 0 || !modelsLoaded()) return;
+  if (semanticLeases || inferenceActive || inferenceQueued) return;
+  const remaining = Math.max(0, SEMANTIC_IDLE_MS - (Date.now() - lastSemanticActivityAt));
+  semanticIdleTimer = setTimeout(() => {
+    semanticIdleTimer = null;
+    if (semanticLeases || inferenceActive || inferenceQueued || !modelsLoaded()) {
+      armSemanticIdleDisposal();
+      return;
+    }
+    enqueueMaintenance(async () => {
+      if (semanticLeases || Date.now() - lastSemanticActivityAt < SEMANTIC_IDLE_MS || !modelsLoaded()) {
+        armSemanticIdleDisposal();
+        return;
+      }
+      await disposeModelsUnlocked('idle');
+    }).catch(() => {});
+  }, remaining);
+  semanticIdleTimer.unref?.();
+}
+
+function acquireSemanticLease() {
+  semanticLeases++;
+  clearSemanticIdleTimer();
+  let released = false;
+  function release() {
+    if (released) return;
+    released = true;
+    semanticLeases = Math.max(0, semanticLeases - 1);
+    lastSemanticActivityAt = Date.now();
+    armSemanticIdleDisposal();
+  }
+  return release;
+}
+
 async function withInferenceSlot(label, fn) {
   if (!BOUNDED) return fn();
   if (inferenceQueued >= MAX_INFERENCE_QUEUE) {
@@ -95,12 +187,16 @@ async function withInferenceSlot(label, fn) {
   const run = inferenceTail.catch(() => {}).then(async () => {
     inferenceQueued--;
     inferenceActive++;
+    clearSemanticIdleTimer();
+    lastSemanticActivityAt = Date.now();
     counters.inferenceCalls++;
     sampleMemory();
     try { return await fn(); }
     finally {
       inferenceActive--;
+      lastSemanticActivityAt = Date.now();
       sampleMemory();
+      armSemanticIdleDisposal();
     }
   });
   // A failed inference must not poison the queue for later lexical/semantic work.
@@ -157,7 +253,10 @@ export function getEmbedder(log = () => {}) {
     embedderPromise = (async () => {
       const t = await loadTransformers();
       t.env.cacheDir = path.join(PB_DIR, 'hf-cache');
-      return t.pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2', { dtype: 'q8' });
+      const pipe = await t.pipeline('feature-extraction', EMBEDDING_MODEL_ID, { dtype: 'q8' });
+      lastSemanticActivityAt = Date.now();
+      queueMicrotask(armSemanticIdleDisposal);
+      return pipe;
     })().catch((error) => {
       log('semantic unavailable (lexical fallback):', error?.message || error);
       return null;
@@ -176,6 +275,8 @@ export function getReranker(log = () => {}) {
         'Xenova/ms-marco-MiniLM-L-6-v2',
         { dtype: 'q8' },
       );
+      lastSemanticActivityAt = Date.now();
+      queueMicrotask(armSemanticIdleDisposal);
       return { tokenizer, model };
     })().catch((error) => {
       log('reranker unavailable (no rerank):', error?.message || error);
@@ -185,22 +286,48 @@ export function getReranker(log = () => {}) {
   return rerankerPromise;
 }
 
-export const getEmbedderForUse = (log = () => {}, timeoutMs = 20_000) => (
-  BOUNDED
-    ? withInferenceSlot('embedder-load', () => withTimeout(getEmbedder(log), timeoutMs))
-    : withTimeout(getEmbedder(log), timeoutMs)
-);
+export const getEmbedderForUse = async (log = () => {}, timeoutMs = 20_000) => {
+  const loaded = BOUNDED
+    ? await withInferenceSlot('embedder-load', () => withTimeout(getEmbedder(log), timeoutMs))
+    : await withTimeout(getEmbedder(log), timeoutMs);
+  if (!loaded || !BOUNDED) return loaded;
+  // Do not hand callers a long-lived reference to a pipeline that idle disposal
+  // may retire. The facade resolves the current generation at invocation time,
+  // so a post-idle query transparently reloads the exact same model.
+  return async (...args) => {
+    const release = acquireSemanticLease();
+    try {
+      const current = await getEmbedder(log);
+      if (!current) throw new Error('semantic embedder is unavailable');
+      return await current(...args);
+    } finally {
+      release();
+    }
+  };
+};
 
-export const getRerankerForUse = (log = () => {}, timeoutMs = 8_000) => (
-  BOUNDED
-    ? withInferenceSlot('reranker-load', () => withTimeout(getReranker(log), timeoutMs))
-    : withTimeout(getReranker(log), timeoutMs)
-);
+export const withRerankerForUse = async (log = () => {}, timeoutMs = 8_000, fn = async value => value) => {
+  const loaded = BOUNDED
+    ? await withInferenceSlot('reranker-load', () => withTimeout(getReranker(log), timeoutMs))
+    : await withTimeout(getReranker(log), timeoutMs);
+  if (!loaded) return null;
+  if (!BOUNDED) return fn(loaded);
+  const release = acquireSemanticLease();
+  try {
+    // Resolve the current generation only after acquiring the lease. Idle
+    // disposal can never retire this model until the complete callback ends.
+    const current = await getReranker(log);
+    return current ? await fn(current) : null;
+  } finally {
+    release();
+  }
+};
 
-async function embedBatch(pipe, texts) {
+async function embedBatch(pipe, texts, kind = 'passage') {
   let output = null;
   try {
-    output = await pipe(texts, { pooling: 'mean', normalize: true });
+    const inputs = kind === 'query' ? texts.map(text => `${EMBEDDING_QUERY_PREFIX}${text}`) : texts;
+    output = await pipe(inputs, { pooling: EMBEDDING_POOLING, normalize: true });
     const [n, d] = output?.dims || [];
     if (!Number.isInteger(n) || !Number.isInteger(d) || n !== texts.length || d <= 0 || !output?.data) {
       throw new Error('semantic embedder returned an invalid tensor shape');
@@ -213,7 +340,7 @@ async function embedBatch(pipe, texts) {
   }
 }
 
-export async function embedTexts(pipe, texts) {
+export async function embedTexts(pipe, texts, { kind = 'passage' } = {}) {
   const list = Array.isArray(texts) ? texts : [texts];
   if (!list.length) return [];
   const batchSize = BOUNDED ? EMBED_BATCH_SIZE : list.length;
@@ -222,8 +349,8 @@ export async function embedTexts(pipe, texts) {
     const batch = list.slice(offset, offset + batchSize);
     counters.embedBatches++;
     const part = BOUNDED
-      ? await withInferenceSlot('embedding', () => embedBatch(pipe, batch))
-      : await embedBatch(pipe, batch);
+      ? await withInferenceSlot('embedding', () => embedBatch(pipe, batch, kind))
+      : await embedBatch(pipe, batch, kind);
     vectors.push(...part);
   }
   return vectors;
@@ -257,29 +384,98 @@ function cacheCandidates(brainPath) {
   return [...new Set(variants)].map((key) => ({ key, file: path.join(EMB_DIR, sha1(key) + '.json') }));
 }
 
+const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+async function withCrossProcessCacheLock(brainPath, fn) {
+  const file = cacheCandidates(brainPath)[0].file;
+  const lockFile = `${file}.lock`;
+  fs.mkdirSync(EMB_DIR, { recursive: true });
+  const deadline = Date.now() + CACHE_LOCK_TIMEOUT_MS;
+  let handle = null;
+  let waited = false;
+  while (!handle) {
+    try {
+      handle = fs.openSync(lockFile, 'wx');
+      fs.writeFileSync(handle, JSON.stringify({ pid: process.pid, at: Date.now(), modelKey: EMBEDDING_CACHE_KEY }));
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error;
+      if (!waited) { counters.cacheLockWaits++; waited = true; }
+      try {
+        const age = Date.now() - fs.statSync(lockFile).mtimeMs;
+        if (age > CACHE_LOCK_STALE_MS) { fs.unlinkSync(lockFile); continue; }
+      } catch { continue; }
+      if (Date.now() >= deadline) {
+        counters.cacheLockTimeouts++;
+        const timeout = new Error(`semantic cache lock timed out for ${path.basename(brainPath)}`);
+        timeout.code = 'KLYPIX_SEMANTIC_CACHE_BUSY';
+        throw timeout;
+      }
+      await wait(75);
+    }
+  }
+  try { return await fn(); }
+  finally {
+    try { fs.closeSync(handle); } catch { /* */ }
+    try { fs.unlinkSync(lockFile); } catch { /* stale cleanup handles leftovers */ }
+  }
+}
+
+function writeCacheAtomic(file, cache) {
+  const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(cache));
+    fs.renameSync(tmp, file);
+  } finally {
+    try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch { /* cache is best-effort */ }
+  }
+}
+
 function readCache(brainPath, desiredHashes) {
   if (!BOUNDED) {
     const key = String(brainPath).replace(/\\/g, '/');
     const file = path.join(EMB_DIR, sha1(key) + '.json');
-    try { return { file, cache: JSON.parse(fs.readFileSync(file, 'utf8')), dirty: false }; }
-    catch { return { file, cache: { v: 1, cards: {} }, dirty: false }; }
+    try {
+      const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (parsed?.modelKey === EMBEDDING_CACHE_KEY) return { file, cache: parsed, dirty: false };
+      return { file, cache: { v: 2, modelKey: EMBEDDING_CACHE_KEY, cards: {} }, dirty: true };
+    } catch { return { file, cache: { v: 2, modelKey: EMBEDDING_CACHE_KEY, cards: {} }, dirty: false }; }
   }
   const candidates = cacheCandidates(brainPath);
   const file = candidates[0].file;
-  const cache = { v: 1, cards: {} };
+  const cache = { v: 2, modelKey: EMBEDDING_CACHE_KEY, cards: {} };
   let found = 0;
+  let canonicalValid = false;
+  let canonicalStale = false;
+  let mergedFromAlias = false;
   for (const candidate of candidates) {
     let parsed;
     try { parsed = JSON.parse(fs.readFileSync(candidate.file, 'utf8')); }
     catch { continue; }
     if (!parsed?.cards) continue;
+    const canonical = candidate.file === file;
+    if (parsed.modelKey !== EMBEDDING_CACHE_KEY) {
+      if (canonical) canonicalStale = true;
+      continue;
+    }
+    if (canonical) canonicalValid = true;
     found++;
     for (const [id, entry] of Object.entries(parsed.cards)) {
-      if (entry?.v && entry.h === desiredHashes.get(id)) cache.cards[id] = entry;
+      if (!entry?.v || entry.h !== desiredHashes.get(id)) continue;
+      if (!cache.cards[id]) {
+        cache.cards[id] = entry;
+        if (!canonical) mergedFromAlias = true;
+      }
     }
   }
   if (found > 1) counters.cacheFilesMerged += found;
-  return { file, cache, dirty: found > 1 || (found === 1 && !fs.existsSync(file)) };
+  return {
+    file,
+    cache,
+    // A stale legacy alias is harmless once the canonical BGE cache is valid.
+    // Rewrite only when the canonical file itself is stale/missing or an alias
+    // contributes a card the canonical cache did not already contain.
+    dirty: canonicalStale || (!canonicalValid && found > 0) || mergedFromAlias,
+  };
 }
 
 async function vectorsForBrainUnlocked(pipe, brainPath, cards) {
@@ -303,7 +499,7 @@ async function vectorsForBrainUnlocked(pipe, brainPath, cards) {
   if (dirty) {
     try {
       fs.mkdirSync(EMB_DIR, { recursive: true });
-      fs.writeFileSync(file, JSON.stringify(cache));
+      writeCacheAtomic(file, cache);
       counters.cacheWrites++;
     } catch { /* disk cache is best-effort; in-memory result remains correct */ }
   }
@@ -319,7 +515,10 @@ export async function vectorsForBrain(pipe, brainPath, cards) {
   if (!BOUNDED) return vectorsForBrainUnlocked(pipe, brainPath, cards);
   const key = canonicalBrainKey(brainPath);
   const previous = vectorBuildTails.get(key) || Promise.resolve();
-  const run = previous.catch(() => {}).then(() => vectorsForBrainUnlocked(pipe, brainPath, cards));
+  const run = previous.catch(() => {}).then(() => withCrossProcessCacheLock(
+    brainPath,
+    () => vectorsForBrainUnlocked(pipe, brainPath, cards),
+  ));
   vectorBuildTails.set(key, run);
   try { return await run; }
   finally { if (vectorBuildTails.get(key) === run) vectorBuildTails.delete(key); }
@@ -368,14 +567,21 @@ export async function rerankHits(rr, question, hits) {
 }
 
 export async function disposeSemanticModels() {
-  await inferenceTail.catch(() => {});
-  const embedder = await embedderPromise?.catch?.(() => null);
-  const reranker = await rerankerPromise?.catch?.(() => null);
-  if (BOUNDED) {
-    try { await embedder?.dispose?.(); } catch { /* process shutdown/recycle is the final fallback */ }
-    try { await reranker?.model?.dispose?.(); } catch { /* */ }
-  }
-  embedderPromise = null;
-  rerankerPromise = null;
-  sampleMemory();
+  clearSemanticIdleTimer();
+  return enqueueMaintenance(() => disposeModelsUnlocked('explicit'));
 }
+
+// Hermetic lifecycle hooks for the memory regression suite. Production callers
+// use only the public load/query/dispose surface above.
+export const __semanticMemoryTest = {
+  installModels({ embedder = null, reranker = null } = {}) {
+    embedderPromise = embedder ? Promise.resolve(embedder) : null;
+    rerankerPromise = reranker ? Promise.resolve(reranker) : null;
+    lastSemanticActivityAt = Date.now();
+  },
+  forceIdleDisposal() {
+    return enqueueMaintenance(() => disposeModelsUnlocked('idle'));
+  },
+  armIdleDisposal: armSemanticIdleDisposal,
+  clearIdleTimer: clearSemanticIdleTimer,
+};

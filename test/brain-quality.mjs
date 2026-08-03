@@ -2,8 +2,8 @@
 // 2026-07-02 field report's findings, at the format-engine level:
 //   P1  capture: a correction-cue note supersedes its stale card ACROSS areas
 //       at the widened 0.4 bar (and a plain cross-area decision still does NOT).
-//   P1  recall:  correctionOverlaysFor pairs a stale card with its un-edged
-//       live correction so recall can never serve the stale card alone.
+//   P1  recall: correctionOverlaysFor labels stale cards only through explicit
+//       lifecycle identity edges; lexical similarity never asserts correction.
 //   P4a close:   `closes:` resolves ALL covered twins, not the first match.
 //   P4b merge:   a rephrased duplicate ❓ updates the existing open question.
 //   P3  graph:   a captured card auto-links to a tag-sharing sibling (label 'auto').
@@ -56,7 +56,7 @@ const archived = (struct) => struct.cards.filter(c => c.type !== 'container' && 
     ok(stats.superseded === 1, 'protect: same-area ≥0.6 supersede unchanged');
 }
 
-// ── P1 recall-side: correctionOverlaysFor (the fixture from the report) ──────
+// ── P1 recall-side: similarity alone must never assert correction identity ──
 {
     const { struct } = await brainWith([
         { title: 'Strategy', cards: [{ text: STALE }] },
@@ -64,10 +64,20 @@ const archived = (struct) => struct.cards.filter(c => c.type !== 'container' && 
     ]);
     const stale = struct.cards.find(c => /deferred ON PURPOSE/.test(c.text || ''));
     const overlays = correctionOverlaysFor(struct, [stale]);
-    const ov = overlays.get(stale.id);
-    ok(!!ov && ov.kind === 'cue' && /WIRED/.test(ov.by.text), 'P1 recall: un-edged cross-area correction found for the stale card (kind=cue)');
+    ok(!overlays.has(stale.id), 'P1 recall: an un-edged lexical correction does NOT label the stale-looking card');
     const corr = struct.cards.find(c => /WIRED/.test(c.text || ''));
     ok(!correctionOverlaysFor(struct, [corr]).has(corr.id), 'P1 recall: the correction card itself gets no overlay');
+}
+// field regressions: shared vocabulary is not claim identity.
+{
+    const { struct } = await brainWith([
+        { title: 'Release', cards: [{ text: 'Release: retrieval benchmark suite ships with the next brain core.' }] },
+        { title: 'Canvas', cards: [{ text: 'Canvas: CORRECTION — large pasted images now downscale before decode.' }] },
+        { title: 'Settings', cards: [{ text: 'Settings: file-search indexing is enabled for documents.' }] },
+        { title: 'Security', cards: [{ text: 'Security: CORRECTION — updater signatures are verified before install.' }] },
+    ]);
+    const plain = struct.cards.filter(c => /benchmark suite|file-search indexing/.test(c.text || ''));
+    ok(correctionOverlaysFor(struct, plain).size === 0, 'P1 precision: unrelated correction-cue cards attach zero overlays');
 }
 // edge variant: an explicit "superseded by" arrow wins and names the successor
 {
@@ -79,6 +89,21 @@ const archived = (struct) => struct.cards.filter(c => c.type !== 'container' && 
     struct.connections.push({ fromId: stale.id, toId: succ.id, label: 'superseded by', from: 'a', to: 'b' });
     const ov = correctionOverlaysFor(struct, [stale]).get(stale.id);
     ok(!!ov && ov.kind === 'edge' && ov.by.id === succ.id, 'P1 recall: a superseded-by edge swaps in the successor (kind=edge)');
+}
+// explicit chains resolve to the latest known truth, not an intermediate stale card
+{
+    const { struct } = await brainWith([{ title: 'Auth', cards: [
+        { text: 'Auth: sessions were stored in redis.' },
+        { text: 'Auth: sessions moved from redis to sqlite.' },
+        { text: 'Auth: sessions now live in postgres.' },
+    ] }]);
+    const [redis, sqlite, postgres] = struct.cards.filter(c => c.type !== 'container');
+    struct.connections.push(
+        { fromId: redis.id, toId: sqlite.id, label: 'superseded by' },
+        { fromId: sqlite.id, toId: postgres.id, label: 'superseded by' },
+    );
+    const ov = correctionOverlaysFor(struct, [redis]).get(redis.id);
+    ok(ov?.by?.id === postgres.id, 'P1 recall: an explicit correction chain resolves to its latest successor');
 }
 
 // ── P4a: closes: resolves ALL covered twins ───────────────────────────────────
@@ -210,11 +235,8 @@ const archived = (struct) => struct.cards.filter(c => c.type !== 'container' && 
 }
 
 // ── P1/P8 long-card reality (verbatim from the AgentLit field brain) ─────────
-// The report's short fixtures pass at pure ratio bars, but the REAL pair
-// measures only ~0.31-0.33 overlap coefficient (long cards — the subject is a
-// fraction of each text; 16-17 shared subject tokens). The cue-gated absolute
-// subject-mass clause (≥10 shared @ ≥0.25) is what makes the real pair fire;
-// this pins it so a future threshold tweak can't silently regress the field case.
+// This real pair remains a contradiction/reconcile candidate, but without an
+// explicit lifecycle edge it must not become an asserted serve-time correction.
 {
     const REAL_STALE = `❓ Off-cloud skill/brain EXECUTION deferred ON PURPOSE 2026-06-16 Making file-embedded skills/brain RUN on desktop/CLI (not just travel as data) was the audit's highest-scored play (9/10) and the deepest moat — deferred deliberately because it's a DISTRIBUTION moat and the founder said to ignore distribution for now. Revisit when distribution is back on. Root cause: quickstart.ts InMemoryPersistenceAdapter.getLatestBlueprint (+ desktop/CLI FileAgentPersistence clones) drop blueprint.skills and file.brain; use_skill dead-ends at "Unknown tool" off-cloud. Fix = widen BlueprintRecord + ship portable file-backed use_skill/brain_lookup executors. #strategy`;
     const REAL_CORR = `Runtime: CORRECTION (stale note resolved): off-cloud self-skilling + agent-brain EXECUTION is now WIRED, not deferred. Verified in main 2026-06-24: desktop (artifacts/agentlit-desktop/src/lib/use-agent-runner.ts:197-204) and CLI (artifacts/agentlit-cli/src/index.ts) both register SaveSkillExecutor/UseSkillExecutor (+ BrainRemember/BrainLookup) against the .agent file via TauriAgentFileStore/FileAgentFileStore, with createLlmSkillVerifier(llm) running the SAME verify-before-keep judge on the user's own key. Portable executors live in artifacts/runtime/src/tools/self-skilling.ts. So a desktop/CLI agent LEARNS + REPLAYS skills locally, keys never leaving — on-thesis. The earlier "use_skill dead-ends at Unknown tool off-cloud / EXECUTION deferred" (2026-06-14/16) is OBSOLETE. #runtime`;
@@ -224,7 +246,7 @@ const archived = (struct) => struct.cards.filter(c => c.type !== 'container' && 
     ]);
     const stale = struct.cards.find(c => /deferred ON PURPOSE/.test(c.text || ''));
     const ov = correctionOverlaysFor(struct, [stale]).get(stale.id);
-    ok(!!ov && ov.kind === 'cue', `P1 field: recall overlay fires on the REAL long-card pair (overlap=${ov ? ov.overlap : 'none'})`);
+    ok(!ov, 'P1 field: even a strong real-world lexical pair is proposal-only until explicitly linked');
     const pairs = detectContradictions(struct);
     ok(pairs.length >= 1 && pairs[0] && /is now WIRED/.test(pairs[0].fresh.text), 'P8 field: the REAL pair is the first contradiction candidate');
 }

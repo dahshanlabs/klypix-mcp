@@ -225,6 +225,12 @@ export function upsertSession({
       ? String(intent || '').replace(/\s+/g, ' ').trim().slice(0, 160)
       : (previous.intent || '');
     const intentChanged = intent !== undefined && nextIntent !== (previous.intent || '');
+    // A connection heartbeat proves transport liveness, not that a task is in
+    // progress. Stamp only events that carry real user/tool work so doctor can
+    // distinguish an idle connected host from an active sync-silent session.
+    const activityEvent = /^(?:McpToolUse|McpTaskStart|McpTaskCheckpoint|UserPromptSubmit|PreToolUse|PostToolUse)$/i.test(String(event || ''))
+      ? String(event)
+      : null;
     const next = {
       ...previous,
       id: String(id),
@@ -240,6 +246,9 @@ export function upsertSession({
         : (previous.intentAt ? { intentAt: previous.intentAt, intentSource: previous.intentSource || null } : {})),
       files: mergedFiles,
       event: event ?? previous.event ?? null,
+      ...(activityEvent
+        ? { activityAt: now, activityKind: activityEvent }
+        : (previous.activityAt ? { activityAt: previous.activityAt, activityKind: previous.activityKind || null } : {})),
       ...(Object.keys(channelSeen).length
         ? { channels: Object.keys(channelSeen), channelSeen }
         : {}),

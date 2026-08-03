@@ -146,8 +146,8 @@ function agentCard(publicUrl) {
     }] : []),
     {
       id: 'brain_connect',
-      name: 'Densify the brain graph (connect related cards)',
-      description: 'Find genuinely related but unlinked cards and propose (or, with apply, draw) connections — semantic when the on-device model is present, else shared tags + [[mentions]]. Additive; never deletes.',
+      name: 'Repair orphaned brain cards (connect related cards)',
+      description: 'Propose related links for orphaned decision/milestone cards by default, with a before→projected receipt; apply draws only additive, removable connections and never archives or rewrites cards. Pass scope:"all" for deliberate whole-graph densification.',
       tags: ['brain', 'graph', 'connect', 'memory'],
       examples: ['Connect the related cards in my project brain'],
       inputModes: ['text/plain', 'application/json'],
@@ -256,8 +256,11 @@ async function runSkill(skill, args, text, via) {
       const target = confinedCanvas(args.canvas);
       if (!target.ok) return refusedCanvas(args.canvas);
       const max = Math.max(1, Math.min(200, Math.floor(finiteNumber(args.max, 24))));
-      const threshold = Math.max(0.3, Math.min(1, finiteNumber(args.threshold, 0.45)));
-      return await opBrainConnect({ vault: VAULT, canvas: target.canvas, apply: args.apply === true, max, threshold, log });
+      const threshold = args.threshold == null
+        ? null
+        : Math.max(0.3, Math.min(1, finiteNumber(args.threshold, 0.55)));
+      const scope = args.scope === 'all' ? 'all' : 'orphans';
+      return await opBrainConnect({ vault: VAULT, canvas: target.canvas, apply: args.apply === true, max, threshold, scope, log });
     }
     case 'make_board':
     {

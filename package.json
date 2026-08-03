@@ -1,6 +1,6 @@
 {
   "name": "klypix-mcp",
-  "version": "1.51.1",
+  "version": "1.52.0",
   "description": "Shared project brain and MCP coordination server for multi-agent coding.",
   "type": "module",
   "license": "Apache-2.0",
@@ -37,6 +37,7 @@
     "klypix-conformance": "bin/klypix-conformance.mjs",
     "klypix-link": "bin/klypix-link.mjs",
     "klypix-doctor": "bin/klypix-doctor.mjs",
+    "klypix-runtime": "bin/klypix-runtime.mjs",
     "klypix-a2a": "bin/klypix-a2a.mjs",
     "klypix-read": "bin/klypix-read.mjs",
     "klypix-write": "bin/klypix-write.mjs",
@@ -53,6 +54,8 @@
     "./mcp-presence": "./src/mcp-presence.mjs",
     "./presence-relay": "./src/presence-relay.mjs",
     "./supervisor": "./src/mcp-supervisor.mjs",
+    "./runtime-inspector": "./src/runtime-inspector.mjs",
+    "./runtime": "./src/runtime-inspector.mjs",
     "./auto-update": "./src/mcp-auto-update.mjs"
   },
   "files": [
@@ -70,9 +73,10 @@
     "node": ">=18"
   },
   "scripts": {
-    "test": "node test/mcp-auto-update.mjs && node test/mcp-supervisor.mjs && node test/codex-hooks.mjs && node test/agent-presence.mjs && node test/finding-routing.mjs && node test/finding-routing-hook.mjs && node test/presence-relay.mjs && node test/context-gateway.mjs && node test/conformance.mjs && node test/brain-doctor.mjs && node test/version-currency.mjs && node test/ship-capture.mjs && node test/lane-message.mjs && node test/brain-quality.mjs && node test/brief-and-recall.mjs && node test/layout-cluster.mjs && node test/brain-ask.mjs && node test/field-report-2026-07-04.mjs && node test/autoprop.mjs && node test/overlay-recency-2026-07-12.mjs && node test/brain-challenge.mjs && node test/brain-lens.mjs && node test/brain-kind.mjs && node test/rule-drafts.mjs && node test/claim-engine.mjs && node test/skill-staleness.mjs && node test/canvas-view.mjs && node test/status-completeness.mjs && node test/semantic-gate.mjs && node test/memory-runtime.mjs && node test/decay-status.mjs && node test/decay-hook.mjs && node test/evidence-anchors.mjs && node test/presence-visibility.mjs && node test/merge-brains.mjs && node test/concurrent-writes.mjs && node test/a2a-smoke.mjs && node test/cli-args.mjs && node test/format-guard.mjs && node test/git-tools.mjs && node test/uninstall.mjs",
+    "test": "node test/mcp-auto-update.mjs && node test/mcp-supervisor.mjs && node test/runtime-inspector.mjs && node test/codex-hooks.mjs && node test/agent-presence.mjs && node test/finding-routing.mjs && node test/finding-routing-hook.mjs && node test/presence-relay.mjs && node test/context-gateway.mjs && node test/conformance.mjs && node test/brain-doctor.mjs && node test/version-currency.mjs && node test/ship-capture.mjs && node test/lane-message.mjs && node test/brain-quality.mjs && node test/brain-connect-orphans.mjs && node test/brief-and-recall.mjs && node test/layout-cluster.mjs && node test/brain-ask.mjs && node test/field-report-2026-07-04.mjs && node test/autoprop.mjs && node test/overlay-recency-2026-07-12.mjs && node test/brain-challenge.mjs && node test/brain-lens.mjs && node test/brain-kind.mjs && node test/rule-drafts.mjs && node test/claim-engine.mjs && node test/skill-staleness.mjs && node test/canvas-view.mjs && node test/status-completeness.mjs && node test/semantic-gate.mjs && node test/memory-runtime.mjs && node test/semantic-cache.mjs && node test/decay-status.mjs && node test/decay-hook.mjs && node test/evidence-anchors.mjs && node test/presence-visibility.mjs && node test/merge-brains.mjs && node test/concurrent-writes.mjs && node test/a2a-smoke.mjs && node test/cli-args.mjs && node test/format-guard.mjs && node test/git-tools.mjs && node test/uninstall.mjs",
     "test:memory": "node test/memory-runtime.mjs",
-    "test:memory:soak": "node --expose-gc test/memory-soak.mjs"
+    "test:memory:soak": "node --expose-gc test/memory-soak.mjs",
+    "runtime": "node bin/klypix-runtime.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/ext-apps": "^1.7.4",

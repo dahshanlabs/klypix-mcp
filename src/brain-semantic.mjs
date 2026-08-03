@@ -2,8 +2,8 @@
 //
 // WHY a separate module: the hook's per-prompt recall is LEXICAL (keyword) — fast
 // and bulletproof. Semantic (embedding) recall would understand paraphrase, but the
-// hook is a ONE-SHOT process (no daemon allowed), so loading the 23MB MiniLM model
-// costs ~550ms EVERY prompt — unacceptable on the common path. The measured-and-
+// hook is a ONE-SHOT process (no daemon allowed), so loading an embedding model
+// on EVERY prompt is unacceptable on the common path. The measured-and-
 // verified design is therefore: run semantic ONLY when lexical found nothing (the
 // paraphrase / keyword-miss case, where you'd otherwise get zero recall), pay the
 // cost just there, timeout-bounded, and read-only.
@@ -22,6 +22,13 @@ import crypto from 'crypto';
 const PB_DIR = path.join(os.homedir(), '.claude', 'project-brain');
 const EMB_DIR = path.join(PB_DIR, 'embeddings');
 const sha1 = (s) => crypto.createHash('sha1').update(s).digest('hex');
+// Keep these values byte-identical to semantic-memory.mjs. The one-shot hook is
+// intentionally standalone, so it does not import the long-lived runtime merely
+// to read configuration.
+export const HOOK_EMBEDDING_MODEL_ID = 'Xenova/bge-small-en-v1.5';
+export const HOOK_EMBEDDING_QUERY_PREFIX = 'Represent this sentence for searching relevant passages: ';
+export const HOOK_EMBEDDING_POOLING = 'cls';
+export const HOOK_EMBEDDING_CACHE_KEY = `${HOOK_EMBEDDING_MODEL_ID}|q8|${HOOK_EMBEDDING_POOLING}|query-instruction-v1`;
 
 // Memoized within THIS process only (a one-shot hook run) — across prompts it
 // reloads cold, which is exactly why we only pay it on a lexical miss.
@@ -41,36 +48,48 @@ function getEmbedder() {
             if (!t) throw last;
         }
         t.env.cacheDir = path.join(PB_DIR, 'hf-cache');
-        return await t.pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2', { dtype: 'q8' });
+        return await t.pipeline('feature-extraction', HOOK_EMBEDDING_MODEL_ID, { dtype: 'q8' });
     })().catch(() => null);   // not installed / load fail → null → lexical fallback
     return _embedder;
 }
 
-async function embedTexts(pipe, texts) {
-    const out = await pipe(texts, { pooling: 'mean', normalize: true });
-    const [n, d] = out.dims;
-    const vecs = [];
-    for (let i = 0; i < n; i++) vecs.push(Array.from(out.data.slice(i * d, (i + 1) * d)));
-    return vecs;
+async function embedQueries(pipe, texts) {
+    let out = null;
+    try {
+        const instructed = texts.map(text => `${HOOK_EMBEDDING_QUERY_PREFIX}${text}`);
+        out = await pipe(instructed, { pooling: HOOK_EMBEDDING_POOLING, normalize: true });
+        const [n, d] = out.dims;
+        const vecs = [];
+        for (let i = 0; i < n; i++) vecs.push(Array.from(out.data.slice(i * d, (i + 1) * d)));
+        return vecs;
+    } finally {
+        try { out?.dispose?.(); } catch { /* one-shot process exit remains the fallback */ }
+    }
 }
 // Vectors are unit-normalized, so dot == cosine.
 export const dot = (a, b) => { let s = 0; const n = Math.min(a.length, b.length); for (let i = 0; i < n; i++) s += a[i] * b[i]; return s; };
 
 // READ-ONLY card-vector cache — NEVER embeds or writes (embedding all cards in the
 // per-prompt process is the multi-second stall we forbid). Reuses the SAME warm
-// cache the MCP host fills, keyed sha1(path, slashes-only). The MCP keys WITHOUT
-// lowercasing the drive letter, so a brain can have an `e:`-keyed and an `E:`-keyed
-// cache file — try the drive-case variants so we hit whichever exists.
+// cache the MCP host fills. Current workers canonicalize absolute Windows paths
+// to a lowercase drive letter; legacy caches used raw drive casing, so probe both
+// identities while accepting only the exact current modelKey.
 function readCachedVecs(brainPath, cards) {
     const slashed = String(brainPath).replace(/\\/g, '/');
+    const resolved = path.resolve(String(brainPath)).replace(/\\/g, '/');
     const variants = [...new Set([
+        resolved.replace(/^([a-zA-Z]):/, (_m, d) => d.toLowerCase() + ':'),
+        resolved,
         slashed,
         slashed.replace(/^([a-zA-Z]):/, (_m, d) => d.toLowerCase() + ':'),
         slashed.replace(/^([a-zA-Z]):/, (_m, d) => d.toUpperCase() + ':'),
     ])];
     let cache = null;
     for (const v of variants) {
-        try { const c = JSON.parse(fs.readFileSync(path.join(EMB_DIR, sha1(v) + '.json'), 'utf8')); if (c && c.cards) { cache = c; break; } } catch { /* try next variant */ }
+        try {
+            const c = JSON.parse(fs.readFileSync(path.join(EMB_DIR, sha1(v) + '.json'), 'utf8'));
+            if (c?.modelKey === HOOK_EMBEDDING_CACHE_KEY && c.cards) { cache = c; break; }
+        } catch { /* try next variant */ }
     }
     const map = new Map();
     if (cache && cache.cards) for (const c of cards) { const e = cache.cards[c.id]; if (e && e.v) map.set(c.id, e.v); }
@@ -98,7 +117,7 @@ export async function semanticVecs(brainPath, struct, query, { timeoutMs = 1200 
         if (!vecsMap.size) return null;
         const pipe = await Promise.race([getEmbedder(), new Promise(r => setTimeout(() => r(null), timeoutMs))]);
         if (!pipe) return null;
-        const [qv] = await embedTexts(pipe, [q]);
+        const [qv] = await embedQueries(pipe, [q]);
         if (!qv) return null;
         return { qv, vecsMap, dot };
     } catch { return null; }

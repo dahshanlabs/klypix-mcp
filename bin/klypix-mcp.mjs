@@ -19,7 +19,7 @@ const PKG_VERSION = (() => {
   }
 })();
 
-const DIRECT = new Set(['install', 'link', 'doctor', 'conformance', 'garden-code', 'init', 'git-driver', 'diff', 'pr-brief', 'uninstall']);
+const DIRECT = new Set(['install', 'link', 'doctor', 'runtime', 'conformance', 'garden-code', 'init', 'git-driver', 'diff', 'pr-brief', 'uninstall']);
 
 const USAGE = [
   `klypix-mcp ${PKG_VERSION} — shared project brain + MCP coordination server.`,
@@ -28,6 +28,7 @@ const USAGE = [
   '  install [--force] [--codex-hooks]   install/update this machine\'s brain engine + Claude Code hooks',
   '  link [dir] [--check]                project this project\'s 14 managed agent config files (--check audits, writes nothing, exits 1 on drift)',
   '  doctor [--npm] [--all] [--json]     read-only self-check; exits 1 on drift',
+  '  runtime [--json] [--watch seconds]  passive MCP process/RAM attribution; never terminates a process',
   '  conformance [--json]                launch two real MCP clients against this build',
   '  init                                seed a starter ./brain.klypix + print an MCP config',
   '  garden-code [brain]                 print the human approval code for brain_garden',
@@ -54,7 +55,10 @@ if (verb && !verb.startsWith('-') && !DIRECT.has(verb)) {
   process.exit(2);
 }
 
-if (DIRECT.has(verb)) {
+if (verb === 'runtime') {
+  process.argv.splice(2, 1);
+  await import('./klypix-runtime.mjs');
+} else if (DIRECT.has(verb)) {
   await import('./klypix-worker.mjs');
 } else {
   const { runMcpSupervisor } = await import('../src/mcp-supervisor.mjs');

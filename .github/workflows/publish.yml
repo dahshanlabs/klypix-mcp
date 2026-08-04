@@ -104,7 +104,7 @@ jobs:
           node -e '
             const fs = require("fs");
             const script = JSON.parse(fs.readFileSync("package.json", "utf8")).scripts?.test || "";
-            const required = ["test/conformance.mjs", "test/cli-args.mjs"];
+            const required = ["test/project-graph.mjs", "test/conformance.mjs", "test/cli-args.mjs"];
             const missing = required.filter((f) => !script.includes(f));
             if (!script.trim()) { console.error("::error::package.json has no test script — the gate would prove nothing."); process.exit(1); }
             if (missing.length) {
@@ -120,6 +120,9 @@ jobs:
       # step above guarantees it cannot silently leave the chain.
       - name: npm test (full suite, conformance included)
         run: npm test
+
+      - name: Runtime dependency audit (development model stack excluded)
+        run: npm audit --omit=dev --audit-level=high
 
       - name: Version validation (the tag must match package.json)
         id: version
@@ -367,14 +370,13 @@ jobs:
           npm install -g npm@latest
           npm --version
 
-      # `npm publish` needs no runtime deps (plain ESM, no build/prepublish script),
-      # so skip the heavy optional ML dep (@huggingface/transformers) — keep a
-      # deterministic core-tree check only. (--omit=optional avoids a flaky native
-      # download that has zero bearing on the published tarball.)
+      # `npm publish` needs no development tooling (plain ESM, no build/prepublish
+      # script). The local ML stack is dev-only so the full gate can exercise the
+      # harder ambient-model case without making it part of a consumer install.
       # The GATE job already ran `npm ci` with the full lockfile and the whole
       # test suite against this same commit.
       - name: Install (core deps only, deterministic)
-        run: npm ci --omit=optional
+        run: npm ci --omit=dev --omit=optional
 
       # The gate proved this exact commit; re-assert that the artifact this job is
       # about to push is the version the gate cleared, so a `needs:` that ever

@@ -205,7 +205,7 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
   ok(names.includes('brain_challenge'), 'brain_challenge is a registered MCP tool');
   ok(names.includes('canvas_view'), 'canvas_view is a registered MCP tool');
   ok(names.includes('brain_lens'), 'brain_lens is a registered MCP tool');
-  ok(names.length === 18, `tool manifest is 18 verbs (got ${names.length})`);
+  ok(names.length === 19, `tool manifest is 19 verbs (got ${names.length})`);
 
   // Seed one real lane receipt for THIS MCP session. The doctor must use the
   // adopted session id passed by the running worker, not guess a sender.

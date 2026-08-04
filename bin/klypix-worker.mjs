@@ -30,6 +30,7 @@ import {
   opBrainInsights, opBrainConnect, opBrainReconcile, opBrainGarden, opCreateCanvas, opAddToCanvas, opBrainNote, opBrainMessage, opBrainAsk, opBrainChallenge, opCanvasView, opBrainLens,
   opBrainTaskContext,
 } from '../src/klypix-core.mjs';
+import { projectGraphContextMarkdown, queryProjectGraph } from '../src/project-graph.mjs';
 import { auditProject, compactAgentsBrief, linkProject, mcpServerEntry } from '../src/agent-rules.mjs';
 import { createMcpPresence, KLYPIX_MCP_INSTRUCTIONS } from '../src/mcp-presence.mjs';
 import {
@@ -201,6 +202,7 @@ const toContent = (r) => {
     ? { type: 'image', data: b.data, mimeType: b.mime }
     : { type: 'text', text: b.text });
   const result = r.isError ? { content, isError: true } : { content };
+  if (r.structured && typeof r.structured === 'object') result.structuredContent = r.structured;
   return mcpPresence.decorateToolResult(result);
 };
 
@@ -241,6 +243,67 @@ server.registerTool('brain_ask', {
     k: z.number().optional().describe('Max cards to surface for synthesis (default 10, capped 20).'),
   },
 }, async ({ question, canvas, as_of, k }) => toContent(await opBrainAsk({ vault: mcpPresence.vault, canvas, question, as_of, k, log })));
+
+server.registerTool('project_map_context', {
+  title: 'Project Map context - current code structure plus brain decisions',
+  description: 'Read-only combined context for a coding question. It queries a provider-neutral, bounded view of the generated project graph (Graphify graphify-out/graph.json is supported first) and places that CURRENT CODE evidence beside fast, correction-aware KLYPIX brain cards (decisions and rationale). KLYPIX never installs or runs Graphify and never copies graph nodes into brain.klypix. Missing graph artifacts degrade cleanly to brain-only context. Source-file anchors are accepted only when they stay inside the declared project root. Set deep_history:true only when superseded history is genuinely needed; the default never loads the local embedding model.',
+  annotations: {
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+  inputSchema: {
+    question: z.string().min(1).describe('Question or code concept to ground in both current structure and project memory.'),
+    project: z.string().optional().describe('Absolute project root. Defaults to this MCP connection\'s configured project/vault.'),
+    graph_path: z.string().optional().describe('Optional project-relative graph JSON path. Defaults to graphify-out/graph.json and may not escape the project root.'),
+    depth: z.number().optional().describe('Relationship hops around the best code matches (0-3, default 1).'),
+    max_nodes: z.number().optional().describe('Maximum code nodes returned (default 60, capped 200).'),
+    k: z.number().optional().describe('Maximum brain cards returned (default 8; fast mode caps 8, deep history caps 20).'),
+    deep_history: z.boolean().optional().describe('false (default) uses the sub-second lexical-fast correction-aware path; true opts into whole-brain semantic/history retrieval, which may cold-load the local model.'),
+  },
+}, async ({ question, project, graph_path, depth, max_nodes, k, deep_history }) => {
+  let graphResult;
+  let graphMarkdown;
+  try {
+    graphResult = queryProjectGraph({
+      project: project || mcpPresence.vault,
+      graphPath: graph_path,
+      query: question,
+      depth,
+      maxNodes: max_nodes,
+    });
+    graphMarkdown = projectGraphContextMarkdown(graphResult);
+  } catch (error) {
+    graphResult = { schemaVersion: 1, status: 'invalid', error: error?.message || String(error) };
+    graphMarkdown = `# Project Map\n\nThe generated graph could not be read safely: ${graphResult.error}`;
+  }
+  const graphFiles = Array.isArray(graphResult?.nodes)
+    ? [...new Set(graphResult.nodes.map(node => node.sourceFile).filter(Boolean))].slice(0, 20)
+    : [];
+  const brainResult = deep_history
+    ? await opBrainAsk({
+      vault: mcpPresence.vault,
+      question,
+      k: Math.max(1, Math.min(20, Number(k) || 8)),
+      log,
+    })
+    : await opBrainTaskContext({
+      vault: mcpPresence.vault,
+      intent: question,
+      files: graphFiles,
+      k: Math.max(1, Math.min(8, Number(k) || 8)),
+      budgetChars: 4_500,
+    });
+  const brainMarkdown = brainResult.blocks
+    .filter(block => block.kind === 'text')
+    .map(block => block.text)
+    .join('\n\n');
+  return toContent({
+    blocks: [{ kind: 'text', text: `${graphMarkdown}\n\n---\n\n# Project Brain - ${deep_history ? 'decisions and history' : 'current decisions and corrections'}\n\n${brainMarkdown}` }],
+    isError: brainResult.isError,
+    structured: { projectGraph: graphResult, brainContext: brainResult.context || null, deepHistory: deep_history === true },
+  });
+});
 
 server.registerTool('brain_challenge', {
   title: 'Challenge a decision against the brain (argue back with receipts)',

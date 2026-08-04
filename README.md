@@ -79,7 +79,7 @@ npx klypix-mcp conformance
 
 It runs in a temporary fixture and touches nothing else. It checks tool discovery, task memory,
 truthful peer reporting, overlap surfacing, proactive logging, and in-band delivery of a peer note.
-It verifies 12 required coordination behaviours — not the 18 tools, and not the retrieval engine.
+It verifies 12 required coordination behaviours — not the 19 tools, and not the retrieval engine.
 
 ---
 
@@ -383,7 +383,7 @@ The MCP verbs below are what agents call. These are what **you** call:
 
 ---
 
-## The 18 verbs
+## The 19 verbs
 
 | Tool | What it does |
 |---|---|
@@ -398,6 +398,7 @@ The MCP verbs below are what agents call. These are what **you** call:
 | `brain_message` | Session-to-session coordination notes (24h TTL, never written into the brain) |
 | `brain_sync` | Context Gateway: task capsule, active-task peers, exact-file overlap, one-time alerts, timing |
 | `brain_connect` | Find and draw related-but-unlinked cards |
+| `project_map_context` | Read-only, bounded code-graph evidence beside correction-aware brain context; Graphify artifacts are supported but never installed or run |
 | `canvas_view` | Returns the board as a structured render spec plus a text summary, and declares an MCP Apps (SEP-1865) UI resource |
 | `read_canvas` | A canvas as markdown (cards, connection graph, `[[links]]`, `#tags`) |
 | `search_canvases` | Search across canvases by name and content |
@@ -406,7 +407,7 @@ The MCP verbs below are what agents call. These are what **you** call:
 | `add_to_canvas` | Append cards/connections (positions preserved) |
 | `list_canvases` | List every `.klypix` in the vault |
 
-Exactly 18, machine-verifiable with `npx klypix-mcp doctor`.
+Exactly 19, machine-verifiable with `npx klypix-mcp doctor`.
 
 > **`canvas_view`:** no MCP Apps host has been observed rendering the UI resource yet — there is no
 > screenshot and no host-level test. Hosts without the extension get clean text, which is the path
@@ -598,7 +599,7 @@ Your `brain.klypix` is yours — it is a plain ZIP and stays readable with or wi
 Issues and pull requests: [github.com/dahshanlabs/klypix-mcp](https://github.com/dahshanlabs/klypix-mcp).
 Questions or feedback: [hello@klypix.com](mailto:hello@klypix.com).
 
-The repository carries 38 test files, 34 of them in the `npm test` chain, covering the presence
+The repository carries 49 test files, 45 of them in the `npm test` chain, covering the presence
 lane and its cross-machine relay, the Context Gateway, supervisor hot-swap, auto-update, retrieval
 quality, decay, challenge, lenses, the format guard, the git tools (including a real `git merge`
 through the merge driver), uninstall, and conformance. Run them with `npm test` from a clone — they

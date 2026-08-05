@@ -26,6 +26,7 @@ import {
   inspectAutoUpdate,
   spawnAutoUpdateHelper,
 } from './mcp-auto-update.mjs';
+import { removeSession, upsertSession } from './agent-presence.mjs';
 
 const INTERNAL_PREFIX = '__klypix_supervisor__';
 const DEFAULT_POLL_MS = 1000;
@@ -300,6 +301,11 @@ class Supervisor {
     this.hibernations = 0;
     this.hibernateProbeInFlight = false;
     this.hibernateSkipReason = null;
+    // Presence identity of the hibernated connection. While the worker is gone
+    // the SUPERVISOR keeps its lane row fresh, so peers see exactly what they
+    // saw before — hibernation buys RAM without spending coordination.
+    this.presenceIdentity = null;
+    this.presenceHeartbeat = null;
   }
 
   writeState(extra = {}) {
@@ -362,42 +368,89 @@ class Supervisor {
     if (!Number.isFinite(last) || Date.now() - last < this.hibernateIdleMs) return;
 
     // PRESENCE IS NON-NEGOTIABLE. A worker's graceful stop calls removeSession,
-    // so hibernating a connection that owns a presence row would delete a LIVE
-    // session from every peer's view — coordination regressing to buy RAM. Ask
-    // the worker first: only a connection with no presence row (no project
-    // brain resolved for it) may hibernate. Scoped connections keep their
-    // worker until supervisor-side heartbeat takeover ships.
+    // so hibernating would delete a LIVE session from every peer's view unless
+    // something keeps its lane row fresh. Probe the worker for its presence
+    // identity; the supervisor then heartbeats that row itself while the worker
+    // sleeps, and pins the SAME session id into the respawned worker's env so
+    // the wake never mints a second row. Identity unavailable → never hibernate.
     this.hibernateProbeInFlight = true;
-    let ownsPresence = true;
+    let identity = null;
+    let probeFailed = false;
     try {
       const probe = await this.sendInternal(this.active, 'tools/call', {
         name: 'brain_sync',
         arguments: { phase: 'checkpoint', include_context: false },
       }, 4000);
       const structured = probe?.structuredContent || null;
-      ownsPresence = Boolean(structured && structured.reason !== 'no-project-brain');
+      if (!structured || structured.reason === 'no-project-brain') {
+        identity = null;                       // no lane row exists → nothing to keep alive
+      } else if (structured.brain && structured.self?.id) {
+        identity = {
+          brainPath: String(structured.brain),
+          id: String(structured.self.id),
+          client: structured.self.client || 'unknown',
+          surface: structured.self.surface || null,
+          branch: structured.self.branch || null,
+        };
+      } else {
+        probeFailed = true;                    // owns presence but unidentifiable → refuse
+      }
     } catch {
-      ownsPresence = true;   // unknown → never hibernate
+      probeFailed = true;
     } finally {
       this.hibernateProbeInFlight = false;
     }
     // Conditions can change across the await — re-verify before retiring.
     if (this.closed || !this.active || this.candidate || this.standby) return;
     if (this.hostRequests.size || this.workerRequests.size || this.hostQueue.length) return;
-    if (ownsPresence) {
-      this.hibernateSkipReason = 'presence-row-live';
+    if (probeFailed) {
+      this.hibernateSkipReason = 'presence-identity-unavailable';
       return;
     }
     this.hibernateSkipReason = null;
+    this.presenceIdentity = identity;
     const worker = this.active;
     this.hibernatedTarget = worker.target;
     this.hibernatedAt = new Date().toISOString();
     this.hibernations++;
     this.active = null;
     this.status = 'hibernated';
-    this.retireWorker(worker, 350);   // grace so the worker's presence cleanup runs
+    this.retireWorker(worker, 350);   // grace so the worker's own cleanup runs
+    this.startPresenceHeartbeat();
     this.writeState();
-    log(`worker hibernated after ${Math.round((Date.now() - last) / 1000)}s idle — wakes on the next request`);
+    log(`worker hibernated after ${Math.round((Date.now() - last) / 1000)}s idle — wakes on the next request${this.presenceIdentity ? ' (presence held by the supervisor)' : ''}`);
+  }
+
+  // Re-register the sleeping connection's lane row on the SAME cadence the
+  // worker used, through the SAME shared upsertSession (one implementation,
+  // one lock). Fields not supplied are preserved by the merge, so a declared
+  // intent/file scope survives hibernation untouched.
+  startPresenceHeartbeat() {
+    this.stopPresenceHeartbeat();
+    const who = this.presenceIdentity;
+    if (!who) return;
+    const beat = () => {
+      try {
+        upsertSession({
+          brainPath: who.brainPath,
+          id: who.id,
+          client: who.client,
+          surface: who.surface,
+          branch: who.branch,
+          channel: 'mcp',
+          event: 'McpHibernated',
+          hostPid: this.parentPid,
+        });
+      } catch { /* presence upkeep is best-effort; TTL is the backstop */ }
+    };
+    beat();
+    this.presenceHeartbeat = setInterval(beat, 60_000);
+    this.presenceHeartbeat.unref?.();
+  }
+
+  stopPresenceHeartbeat() {
+    if (this.presenceHeartbeat) clearInterval(this.presenceHeartbeat);
+    this.presenceHeartbeat = null;
   }
 
   wake() {
@@ -422,6 +475,11 @@ class Supervisor {
         KLYPIX_MCP_SUPERVISED: '1',
         KLYPIX_MCP_SUPERVISOR_PID: String(process.pid),
         KLYPIX_MCP_CONNECTION_ID: this.connectionId,
+        // Pin the session id across a hibernation wake (KLYPIX_SESSION_ID wins
+        // resolveMcpSessionId's precedence chain) so the woken worker adopts the
+        // row the supervisor kept alive instead of minting a second one. Hosts
+        // that export their own id already resolve to the same value.
+        ...(this.presenceIdentity?.id ? { KLYPIX_SESSION_ID: this.presenceIdentity.id } : {}),
       },
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
@@ -837,6 +895,9 @@ class Supervisor {
 
   maybeCommitCandidate() {
     if (!this.candidate?.ready) return;
+    // A woken worker owns its lane row again — hand presence back before it
+    // becomes active so exactly one writer heartbeats at any moment.
+    this.stopPresenceHeartbeat();
     this.expireAbandonedRequests();
     if (this.hostRequests.size || this.workerRequests.size) return;
     const next = this.candidate;
@@ -1026,6 +1087,16 @@ class Supervisor {
     clearInterval(this.poller);
     clearInterval(this.parentWatchdog);
     clearInterval(this.hibernationTimer);
+    // The connection is ending: stop holding its row and remove it, so a
+    // hibernated-then-closed session never lingers as a ghost peer.
+    this.stopPresenceHeartbeat();
+    if (this.status === 'hibernated' && this.presenceIdentity) {
+      const who = this.presenceIdentity;
+      this.presenceIdentity = null;
+      // Same removal the worker performs on its own graceful stop.
+      try { removeSession({ brainPath: who.brainPath, id: who.id, channel: 'mcp' }); }
+      catch { /* TTL prunes it either way */ }
+    }
     clearTimeout(this.autoUpdateStarter);
     clearInterval(this.autoUpdatePoller);
     if (this.recoveryTimer) { clearTimeout(this.recoveryTimer); this.recoveryTimer = null; }

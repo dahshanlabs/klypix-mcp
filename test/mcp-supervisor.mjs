@@ -29,7 +29,7 @@ const isAlive = (pid) => {
   catch { return false; }
 };
 
-function workerSource(version, { extraTool = false, removeVersion = false } = {}) {
+function workerSource(version, { extraTool = false, removeVersion = false, presence = null } = {}) {
   const toolNames = [
     ...(removeVersion ? [] : ['version']),
     'slow',
@@ -41,6 +41,7 @@ function workerSource(version, { extraTool = false, removeVersion = false } = {}
   return `#!/usr/bin/env node
 import readline from 'readline';
 const VERSION = ${JSON.stringify(version)};
+const PRESENCE = ${JSON.stringify(presence)};
 const TOOLS = ${JSON.stringify(toolNames)}.map(name => ({
   name,
   description: name,
@@ -79,7 +80,18 @@ rl.on('line', async line => {
     else scope = { intent: args.intent || '', files: args.files || [] };
   }
   const value = name === 'scope' ? JSON.stringify(scope) : VERSION;
-  send({ jsonrpc: '2.0', id: msg.id, result: { content: [{ type: 'text', text: value }] } });
+  const result = { content: [{ type: 'text', text: value }] };
+  // A worker that OWNS a presence row reports its identity here, exactly like
+  // the real brain_sync does — this is what the supervisor needs to hold the
+  // row while the worker sleeps.
+  if (name === 'brain_sync' && PRESENCE) {
+    result.structuredContent = {
+      status: 'active',
+      brain: PRESENCE.brain,
+      self: { id: process.env.KLYPIX_SESSION_ID || PRESENCE.id, client: 'stub-client', surface: 'stub', branch: 'main' },
+    };
+  }
+  send({ jsonrpc: '2.0', id: msg.id, result });
 });
 `;
 }
@@ -252,6 +264,69 @@ try {
     ok(wokenScope?.intent === 'hibernation continuity' && wokenScope?.files?.[0] === 'src/hib.ts', 'hibernation: the declared task scope survives the wake (peers still see this session correctly)');
   } finally {
     await hibClient.close().catch(() => {});
+  }
+
+  // ── Presence takeover: a SCOPED connection hibernates without vanishing ────
+  // The whole point of Phase 2 is RAM without spending coordination. A worker
+  // that owns a lane row must be able to sleep while peers still see the
+  // session — the supervisor holds the row, and the wake adopts the SAME id
+  // instead of minting a ghost twin.
+  {
+    const presHome = path.join(root, 'home-presence');
+    fs.mkdirSync(path.join(presHome, '.claude', 'project-brain'), { recursive: true });
+    const presBrain = path.join(root, 'presence-project', 'brain.klypix');
+    fs.mkdirSync(path.dirname(presBrain), { recursive: true });
+    fs.writeFileSync(presBrain, 'stub');
+    const presWorker = writeWorker('worker-presence.mjs', '1.4.0', { presence: { brain: presBrain.replace(/\\/g, '/'), id: 'scoped-session-1' } });
+    activate(presWorker, '1.4.0');
+    const presStateDir = path.join(root, 'state-presence');
+    fs.mkdirSync(presStateDir, { recursive: true });
+    const presClient = new Client({ name: 'klypix-presence-hibernation-test', version: '1.0.0' }, { capabilities: {} });
+    const presTransport = new StdioClientTransport({
+      command: process.execPath,
+      args: [BIN],
+      cwd: root,
+      env: {
+        ...process.env,
+        HOME: presHome,
+        USERPROFILE: presHome,
+        KLYPIX_MCP_RUNTIME_MANIFEST: manifestPath,
+        KLYPIX_MCP_STATE_DIR: presStateDir,
+        KLYPIX_MCP_SUPERVISOR_POLL_MS: '10000',
+        KLYPIX_AUTO_UPDATE: '0',
+        KLYPIX_WORKER_HIBERNATE_MS: '1000',
+      },
+      stderr: 'pipe',
+    });
+    const { laneFileFor: laneOf } = await import('../src/agent-presence.mjs');
+    const lane = laneOf(presBrain, presHome);
+    const rows = () => { try { return JSON.parse(fs.readFileSync(lane, 'utf8')).sessions || []; } catch { return []; } };
+    const presStates = () => fs.readdirSync(presStateDir).filter(n => n.endsWith('.json'))
+      .map(n => { try { return JSON.parse(fs.readFileSync(path.join(presStateDir, n), 'utf8')); } catch { return null; } })
+      .filter(Boolean);
+    try {
+      await presClient.connect(presTransport);
+      await presClient.callTool({ name: 'brain_sync', arguments: { phase: 'start', intent: 'scoped work', files: ['src/x.ts'] } });
+      await waitFor(async () => presStates().some(s => s.status === 'hibernated'), 20000);
+      ok(true, 'presence takeover: a SCOPED connection is allowed to hibernate');
+      const sleeping = rows();
+      ok(sleeping.length === 1 && sleeping[0].id === 'scoped-session-1',
+        'presence takeover: the sleeping session STILL has exactly one live lane row (peers keep seeing it)');
+      const heldAt = sleeping[0].lastSeen;
+      ok(Number.isFinite(heldAt) && Date.now() - heldAt < 90_000,
+        'presence takeover: the supervisor keeps that row FRESH while the worker is gone');
+      await presClient.callTool({ name: 'version', arguments: {} });
+      await waitFor(async () => presStates().some(s => s.status === 'ready' && s.active?.pid), 15000);
+      const awake = rows();
+      ok(awake.length === 1 && awake[0].id === 'scoped-session-1',
+        'presence takeover: the wake ADOPTS the same row — no ghost twin, no duplicate peer');
+      const keptScope = JSON.parse(textOf(await presClient.callTool({ name: 'scope', arguments: {} })));
+      ok(keptScope?.intent === 'scoped work' && keptScope?.files?.[0] === 'src/x.ts',
+        'presence takeover: the declared file scope survives — overlap warnings stay correct');
+    } finally {
+      await presClient.close().catch(() => {});
+    }
+    activate(v3, '1.2.0');
   }
 
   // Rollback gate: KLYPIX_WORKER_HIBERNATE_MS=0 must restore today's behavior

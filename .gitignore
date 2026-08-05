@@ -1,1 +1,5 @@
 node_modules/
+.claude/brain-ship-obs.json
+.claude/brain-capture-log.jsonl
+.claude/brain-last-commit*
+.claude/brain-rule-drafts.json

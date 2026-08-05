@@ -26,10 +26,17 @@ Flags / env: `--vault` (`KLYPIX_VAULT`), `--port` (`KLYPIX_A2A_PORT`, default
 `41241`), `--host` (`KLYPIX_A2A_HOST`, loopback only), and
 `--allow-cross-project` (opt in to machine-wide registered-brain search).
 
-It is **local-only**: it binds loopback and needs no auth because callers are on
-the same machine. Non-loopback `--host` values are refused. Remote exposure is
-unsupported until authentication, TLS, a real identity model, and cross-process
-write coordination exist together.
+It is **local-only and OS-user-authenticated**: it binds loopback (non-loopback
+`--host` values are refused), and because loopback is *machine*-local — not
+user-local — every mutating `POST /` requires a bearer token. The server writes
+a fresh token per start to `~/.claude/project-brain/.a2a-token-<port>` (the same
+user-ACL boundary that protects the coordination lane), so only a process
+running as your OS user can read it. Clients: `GET /health` first and check
+`auth.tokenFingerprint` equals `sha256(token)[:16]` from your token file —
+verifying the server before sending the token, so a port-squatting impostor can
+neither pass verification nor harvest it. `KLYPIX_A2A_TOKEN` sets a shared
+secret instead; `--no-auth` opts out explicitly. Remote exposure remains
+unsupported until TLS and a real identity model exist together.
 
 ## Discover it
 

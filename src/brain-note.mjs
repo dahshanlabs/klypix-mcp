@@ -20,6 +20,7 @@
 import fs from 'fs';
 import path from 'path';
 import { captureIntoBrain, tidyBrain, atomicWrite, noteToCaptureInput, formatCaptureReceipts } from './klypix-format.mjs';
+import { brainCaptureLockPath, withAdvisoryWriteLock } from './brain-write-lock.mjs';
 
 const MARKERS = { '': '', '?': '?', '!': '!', '✓': '✓', '~': '~', question: '?', milestone: '!', resolve: '✓', update: '~', decision: '', done: '✓' };
 const normMarker = (m) => MARKERS[String(m || '').toLowerCase()] ?? '';
@@ -58,10 +59,21 @@ if (!fs.existsSync(file)) { console.error(`brain-note: no brain at ${file} (run 
 
 const input = noteToCaptureInput({ text: opts.text, area: opts.area, marker: opts.marker, closes: opts.closes, createdVia: 'cli' });
 try {
-    const res = await captureIntoBrain(fs.readFileSync(file), input);
-    let out = res.buffer;
-    try { out = (await tidyBrain(res.buffer)).buffer; } catch { /* keep append result if tidy fails */ }
-    await atomicWrite(file, out);
+    // Same cross-process lock as the MCP engine, hooks, and desktop app: an
+    // unlocked read-modify-write racing any of them is silent last-writer-wins
+    // loss. On timeout we REFUSE (exit 1) — the caller just reruns the command.
+    const res = await withAdvisoryWriteLock(brainCaptureLockPath(file), async (locked) => {
+        if (!locked) return null;
+        const captured = await captureIntoBrain(fs.readFileSync(file), input);
+        let out = captured.buffer;
+        try { out = (await tidyBrain(captured.buffer)).buffer; } catch { /* keep append result if tidy fails */ }
+        await atomicWrite(file, out);
+        return captured;
+    }, { tries: 100, waitMs: 60 });
+    if (!res) {
+        console.error('brain-note refused (brain unchanged): the brain lock is held by another writer — retry in a moment.');
+        process.exit(1);
+    }
     const s = res.stats || {};
     const bits = [`${s.added || 0} added`];
     for (const k of ['resolved', 'updated', 'closed', 'superseded', 'linked']) if (s[k]) bits.push(`${s[k]} ${k}`);

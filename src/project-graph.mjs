@@ -75,7 +75,13 @@ function safeSourceFile(root, value) {
 
 function shortString(value, max = 1_000) {
   if (value == null) return '';
-  return String(value).replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '').slice(0, max);
+  // Tabs and newlines collapse to one space so a hostile graph label can never
+  // break out of its one-line markdown bullet into headings of its own.
+  return String(value).replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '')
+    .replace(/[\t\n\r]+/g, ' ')
+    .replace(/ {2,}/g, ' ')
+    .trim()
+    .slice(0, max);
 }
 
 function normalizeConfidence(edge) {
@@ -384,6 +390,22 @@ export function suggestProjectGraphBrainLinks(graphResult, brainContext, limit =
   return proposals;
 }
 
+const STALE_ARTIFACT_MS = 7 * 24 * 60 * 60 * 1000;
+
+function artifactAgeLine(artifact) {
+  const iso = artifact?.modifiedAt;
+  if (!iso) return '';
+  const generated = Date.parse(iso);
+  if (!Number.isFinite(generated)) return '';
+  const ageMs = Math.max(0, Date.now() - generated);
+  const days = Math.floor(ageMs / (24 * 60 * 60 * 1000));
+  const age = days >= 1 ? `${days} day(s) ago` : 'today';
+  const warning = ageMs > STALE_ARTIFACT_MS
+    ? ' — the artifact may be stale; regenerate it if the code has moved.'
+    : '.';
+  return `Artifact generated ${iso} (${age})${warning} Graph evidence is only as current as this artifact.`;
+}
+
 export function projectGraphContextMarkdown(result) {
   if (result.status === 'missing') {
     return `# Project Map\n\nNo supported project graph was found at \`${result.artifact.graphJson}\`. KLYPIX did not install or run a provider. Generate the artifact with Graphify, then retry.`;
@@ -400,6 +422,7 @@ export function projectGraphContextMarkdown(result) {
   return [
     '# Project Map: code evidence',
     `Provider artifact: \`${result.artifact.graphJson}\`; ${result.counts.graphNodes.toLocaleString()} nodes; ${result.counts.graphEdges.toLocaleString()} edges; query \`${result.query || '(overview)'}\`.`,
+    artifactAgeLine(result.artifact),
     warnings.length ? `Safety note: ${warnings.join('; ')}.` : '',
     result.change ? `## Change from \`${result.change.comparedArtifact || 'comparison artifact'}\`\nExact total deltas: ${result.change.graphNodesDelta >= 0 ? '+' : ''}${result.change.graphNodesDelta} nodes; ${result.change.graphEdgesDelta >= 0 ? '+' : ''}${result.change.graphEdgesDelta} edges. Named additions and removals are limited to the two bounded query neighborhoods.` : '',
     result.change?.addedNodes?.length ? `Added in bounded result: ${result.change.addedNodes.slice(0, 20).map(node => `\`${node.label || node.id}\``).join(', ')}.` : '',

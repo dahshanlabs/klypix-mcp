@@ -2,6 +2,7 @@
 // proves discovery, portable artifacts, write serialization, target confinement,
 // browser/Host boundaries, continuation semantics, output negotiation, terminal
 // streaming, and dispatcher/engine drift contracts.
+import crypto from 'crypto';
 import fs from 'fs';
 import http from 'http';
 import os from 'os';
@@ -19,6 +20,7 @@ const BIN = path.join(ROOT, 'bin', 'klypix-a2a.mjs');
 const CORE = path.join(ROOT, 'src', 'klypix-core.mjs');
 const PORT = 41299;
 const BASE = `http://127.0.0.1:${PORT}`;
+const TEST_TOKEN = 'a2a-smoke-test-token';
 
 let failures = 0;
 const ok = (cond, label) => { console.log(`${cond ? '✓' : '✗'} ${label}`); if (!cond) failures++; };
@@ -44,7 +46,7 @@ async function rpc(method, params, { stream = false, headers = {} } = {}) {
   const payload = JSON.stringify({ jsonrpc: '2.0', id: Math.floor(Math.random() * 1e6), method, params });
   const response = await request({
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...headers },
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${TEST_TOKEN}`, ...headers },
     body: payload,
   });
   if (stream) {
@@ -72,7 +74,7 @@ const outsideCanvas = path.join(outsideDir, 'outside.klypix');
 fs.copyFileSync(path.join(vault, 'roadmap.klypix'), outsideCanvas);
 
 let serverStderr = '';
-const srv = spawn(process.execPath, [BIN, '--vault', vault, '--port', String(PORT)], { stdio: ['ignore', 'ignore', 'pipe'] });
+const srv = spawn(process.execPath, [BIN, '--vault', vault, '--port', String(PORT)], { stdio: ['ignore', 'ignore', 'pipe'], env: { ...process.env, KLYPIX_A2A_TOKEN: TEST_TOKEN } });
 srv.stderr.setEncoding('utf8');
 srv.stderr.on('data', chunk => { serverStderr += chunk; });
 
@@ -92,15 +94,25 @@ try {
   const health = await getJson('/health');
   ok(!Object.hasOwn(health.json, 'vault') && !health.body.includes(vault), '/health does not disclose the vault path');
 
+  // 1b. OS-user auth boundary: POST requires the bearer token; /health serves a
+  // fingerprint (never the token) so clients can verify the server pre-send.
+  const noAuth = await rpc('message/send', { message: dataMessage('noauth', 'list_canvases', {}) }, { headers: { Authorization: '' } });
+  ok(noAuth.status === 401, 'POST without the bearer token is rejected 401');
+  const badAuth = await rpc('message/send', { message: dataMessage('badauth', 'list_canvases', {}) }, { headers: { Authorization: 'Bearer wrong-token' } });
+  ok(badAuth.status === 401, 'POST with a wrong token is rejected 401');
+  const expectedFp = crypto.createHash('sha256').update(TEST_TOKEN).digest('hex').slice(0, 16);
+  ok(health.json.auth?.scheme === 'bearer' && health.json.auth?.tokenFingerprint === expectedFp, '/health carries the bearer fingerprint (anti-squat verification), never the token');
+  ok(!health.body.includes(TEST_TOKEN), '/health never leaks the token itself');
+
   // 2. Browser/DNS-rebind boundary and strict JSON request shape.
   const foreign = await rpc('message/send', { message: dataMessage('origin', 'list_canvases', {}) }, { headers: { Origin: 'https://evil.example' } });
   ok(foreign.status === 403, 'foreign Origin is rejected before JSON-RPC dispatch');
   ok(!Object.hasOwn(foreign.headers, 'access-control-allow-origin'), 'responses expose no wildcard CORS header');
   const poisonedHost = await rpc('message/send', { message: dataMessage('host', 'list_canvases', {}) }, { headers: { Host: 'evil.example' } });
   ok(poisonedHost.status === 403, 'non-loopback Host header is rejected');
-  const plain = await request({ method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: '{}' });
+  const plain = await request({ method: 'POST', headers: { 'Content-Type': 'text/plain', Authorization: `Bearer ${TEST_TOKEN}` }, body: '{}' });
   ok(plain.status === 415, 'POST requires Content-Type: application/json');
-  const tooLarge = await request({ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ payload: 'x'.repeat(1024 * 1024) }) });
+  const tooLarge = await request({ method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${TEST_TOKEN}` }, body: JSON.stringify({ payload: 'x'.repeat(1024 * 1024) }) });
   ok(tooLarge.status === 413, 'request bodies over 1 MiB are rejected cleanly');
 
   // 3. Portable board artifact round-trip.

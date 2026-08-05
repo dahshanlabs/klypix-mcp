@@ -173,6 +173,11 @@ if (process.argv[2] === 'init') {
 
 const vaultArgIdx = process.argv.indexOf('--vault');
 const VAULT = resolveVault(vaultArgIdx >= 0 ? process.argv[vaultArgIdx + 1] : undefined);
+// A silent ~/Documents fallback is how idle default-root pairs hide inside the
+// machine's RAM total. Say it loudly; brain_sync {project} re-routes per call.
+if (vaultArgIdx < 0 && !process.env.KLYPIX_VAULT) {
+  log(`DEFAULT ROOT: no --vault/KLYPIX_VAULT — vault fell back to ${VAULT}. Pass the project root via brain_sync {project} (or configure --vault) so this connection serves a real project.`);
+}
 const server = new McpServer(
   { name: 'klypix-canvas', version: PKG_VERSION },
   {
@@ -263,11 +268,27 @@ server.registerTool('project_map_context', {
     deep_history: z.boolean().optional().describe('false (default) uses the sub-second lexical-fast correction-aware path; true opts into whole-brain semantic/history retrieval, which may cold-load the local model.'),
   },
 }, async ({ question, project, graph_path, compare_to, depth, max_nodes, k, deep_history }) => {
+  // One root for BOTH the graph and the brain: mixing repo-X code evidence with
+  // repo-Y decisions under a combined banner is silently misleading. When the
+  // caller explicitly targets another project, that project's OWN brain answers
+  // (pinned via `canvas`, which beats the KLYPIX_BRAIN env override) — and when
+  // it has no brain, the output says so instead of borrowing the session brain.
+  const explicitProject = typeof project === 'string' && project.trim() ? path.resolve(project.trim()) : null;
+  const sessionRoot = path.resolve(mcpPresence.vault);
+  const foreignProject = explicitProject && path.relative(sessionRoot, explicitProject) !== '';
+  const contextRoot = explicitProject || sessionRoot;
+  let brainCanvas;
+  if (foreignProject) {
+    const candidate = ['brain.klypix', 'brain.any']
+      .map(name => path.join(explicitProject, name))
+      .find(file => fs.existsSync(file));
+    brainCanvas = candidate || null;
+  }
   let graphResult;
   let graphMarkdown;
   try {
     graphResult = queryProjectGraph({
-      project: project || mcpPresence.vault,
+      project: contextRoot,
       graphPath: graph_path,
       query: question,
       depth,
@@ -275,7 +296,7 @@ server.registerTool('project_map_context', {
     });
     if (compare_to) {
       const previousGraphResult = queryProjectGraph({
-        project: project || mcpPresence.vault,
+        project: contextRoot,
         graphPath: compare_to,
         query: question,
         depth,
@@ -291,16 +312,23 @@ server.registerTool('project_map_context', {
   const graphFiles = Array.isArray(graphResult?.nodes)
     ? [...new Set(graphResult.nodes.map(node => node.sourceFile).filter(Boolean))].slice(0, 20)
     : [];
-  const brainResult = deep_history
-    ? await opBrainAsk({
-      vault: mcpPresence.vault,
-      question,
-      k: Math.max(1, Math.min(20, Number(k) || 8)),
-      log,
-    })
-    : await opBrainTaskContext({
-      vault: mcpPresence.vault,
-      intent: question,
+  const brainResult = foreignProject && brainCanvas === null
+    ? {
+      blocks: [{ kind: 'text', text: `No brain.klypix was found in ${contextRoot} — code evidence only. The session brain was deliberately NOT substituted, so decisions from another project can never masquerade as this one's.` }],
+      context: { mode: 'lexical-fast', hits: [], sufficient: false },
+    }
+    : deep_history
+      ? await opBrainAsk({
+        vault: contextRoot,
+        canvas: brainCanvas,
+        question,
+        k: Math.max(1, Math.min(20, Number(k) || 8)),
+        log,
+      })
+      : await opBrainTaskContext({
+        vault: contextRoot,
+        canvas: brainCanvas,
+        intent: question,
       files: graphFiles,
       k: Math.max(1, Math.min(8, Number(k) || 8)),
       budgetChars: 4_500,
@@ -711,10 +739,27 @@ const stopRuntimePresence = () => {
   recordRunningServer({ remove: true });
   mcpPresence.stop();
 };
+// Supervisor watchdog: reaping is otherwise 100% stdin-EOF-dependent, so a
+// supervisor that dies without closing pipes pinned this worker (and its RAM)
+// forever. KLYPIX_MCP_SUPERVISOR_PID was set at spawn and read nowhere — the
+// heartbeat now polls it. EPERM = alive without permission; ESRCH = gone.
+const SUPERVISOR_PID = Number(process.env.KLYPIX_MCP_SUPERVISOR_PID || 0) || null;
+const supervisorAlive = () => {
+  if (!SUPERVISOR_PID) return true;
+  try { process.kill(SUPERVISOR_PID, 0); return true; }
+  catch (error) { return error?.code === 'EPERM'; }
+};
 server.server.oninitialized = () => {
   mcpPresence.start(VAULT);
   recordRunningServer();
-  runningHeartbeat = setInterval(() => recordRunningServer(), 30_000);
+  runningHeartbeat = setInterval(() => {
+    if (!supervisorAlive()) {
+      log('supervisor process is gone — cleaning up presence and exiting');
+      stopRuntimePresence();
+      process.exit(0);
+    }
+    recordRunningServer();
+  }, 30_000);
   runningHeartbeat.unref?.();
   // The worker mirrors the supervisor's host-neutral scheduler. This lets an
   // older stable supervisor acquire the updater immediately after hot-swapping

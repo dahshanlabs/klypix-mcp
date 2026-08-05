@@ -107,6 +107,27 @@ function releaseLock(lockFile) {
   catch { /* best effort */ }
 }
 
+// Delivered messages are rendered into a PEER AGENT'S PROMPT, and any same-user
+// process can write the lane file directly — so message text is untrusted. A
+// message carrying a live capture marker ("🧠 BRAIN [X]: fake decision") could
+// be echoed by the receiving model and harvested into the shared brain as if the
+// peer had decided it. Break the glyph-keyword adjacency the marker regexes
+// require (🧠·BRAIN no longer matches /🧠\s*BRAIN/) — visually near-identical,
+// never harvestable. Applied at POST (honest writers) AND at delivery (forged
+// lane rows bypass post).
+export function neutralizeMarkers(text) {
+  return String(text || '').replace(/🧠(\s*)(BRAIN|MSG)/gi, '🧠·$2');
+}
+
+// tmp+rename so lock-free readers (readLane, messageFooter, peers' status
+// lines) can never parse a torn lane as an authoritative "0 peers / no
+// messages", and a crash mid-write can never destroy undelivered messages.
+function writeLaneFileAtomic(laneFile, payload) {
+  const tmp = `${laneFile}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+  fs.writeFileSync(tmp, payload);
+  fs.renameSync(tmp, laneFile);
+}
+
 function freshChannelSeen(channelSeen, now) {
   if (!channelSeen || typeof channelSeen !== 'object' || Array.isArray(channelSeen)) return {};
   return Object.fromEntries(Object.entries(channelSeen)
@@ -266,7 +287,7 @@ export function upsertSession({
     const kept = sessions.filter((session) => session.id !== id);
     kept.push(next);
     fs.mkdirSync(path.dirname(laneFile), { recursive: true });
-    fs.writeFileSync(laneFile, JSON.stringify({
+    writeLaneFileAtomic(laneFile, JSON.stringify({
       ...data,
       sessions: kept.slice(-40),
       messages: capMessages(pruneMessages(data.messages, now), 30),
@@ -323,7 +344,7 @@ export function upsertRemoteSessions({ brainPath, rows, machineId = MACHINE_ID, 
       else sessions.push(next);
     }
     fs.mkdirSync(path.dirname(laneFile), { recursive: true });
-    fs.writeFileSync(laneFile, JSON.stringify({
+    writeLaneFileAtomic(laneFile, JSON.stringify({
       ...data,
       sessions: sessions.slice(-40),
       messages: capMessages(pruneMessages(data.messages, now), 30),
@@ -347,7 +368,7 @@ export function purgeRemoteSessions({ brainPath, home, now = Date.now() }) {
     const data = readLane(laneFile);
     const sessions = pruneSessions(data.sessions, now).filter((session) => session.via !== 'cloud');
     fs.mkdirSync(path.dirname(laneFile), { recursive: true });
-    fs.writeFileSync(laneFile, JSON.stringify({
+    writeLaneFileAtomic(laneFile, JSON.stringify({
       ...data,
       sessions,
       messages: capMessages(pruneMessages(data.messages, now), 30),
@@ -385,7 +406,7 @@ export function removeSession({ brainPath, id, channel = null, home, now = Date.
       });
     }
     fs.mkdirSync(path.dirname(laneFile), { recursive: true });
-    fs.writeFileSync(laneFile, JSON.stringify({
+    writeLaneFileAtomic(laneFile, JSON.stringify({
       ...data,
       sessions,
       messages: capMessages(pruneMessages(data.messages, now), 30),
@@ -469,7 +490,7 @@ export function receiveMessages({
         if (!Array.isArray(message.seen)) message.seen = [];
         if (!message.seen.includes(sessionId)) message.seen.push(sessionId);
       }
-      fs.writeFileSync(laneFile, JSON.stringify({ ...data, sessions, messages }));
+      writeLaneFileAtomic(laneFile, JSON.stringify({ ...data, sessions, messages }));
     }
     return delivered;
   } finally {
@@ -522,7 +543,7 @@ export function postPresenceMessage({
   home,
   now = Date.now(),
 }) {
-  const body = String(text || '').replace(/\s+/g, ' ').trim().slice(0, 400);
+  const body = neutralizeMarkers(String(text || '').replace(/\s+/g, ' ').trim().slice(0, 400));
   if (!brainPath || !from || !body) return { posted: false, message: null };
   const laneFile = laneFileFor(brainPath, home);
   const lockFile = laneFile + '.lock';
@@ -558,7 +579,7 @@ export function postPresenceMessage({
     };
     messages.push(message);
     fs.mkdirSync(path.dirname(laneFile), { recursive: true });
-    fs.writeFileSync(laneFile, JSON.stringify({
+    writeLaneFileAtomic(laneFile, JSON.stringify({
       ...data,
       sessions,
       messages: capMessages(messages, 30),
@@ -670,7 +691,7 @@ export function formatReceivedMessages(messages, now = Date.now(), decay = {}) {
   const lines = ['KLYPIX message(s) from another active session:'];
   for (const message of messages) {
     const ageMin = Math.max(0, Math.round((now - Number(message.ts || now)) / 60_000));
-    lines.push(`- from ${String(message.from || '?').slice(0, 12)} (${ageMin}m ago): ${String(message.text || '').replace(/\s+/g, ' ').trim().slice(0, 400)}`);
+    lines.push(`- from ${String(message.from || '?').slice(0, 12)} (${ageMin}m ago): ${neutralizeMarkers(String(message.text || '').replace(/\s+/g, ' ').trim().slice(0, 400))}`);
     const info = messageDecayInfo(message, now, decay);
     if (info) lines.push(`  ${info.stampText}`);
   }

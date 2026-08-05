@@ -196,6 +196,33 @@ export function selectOutboundMessages(messages, { sinceTs = 0 } = {}) {
       && !String(message.dedupeKey || '').startsWith(XPC_DEDUPE_PREFIX));
 }
 
+// ── Frame authenticity (optional per-brain MAC) ─────────────────────────────
+// Channel ACLs live outside this repo, so any channel member could otherwise
+// forge sid/machine (fabricated presence, overlap-warning spam) or claim a
+// victim receiver's machineId so that receiver drops the frames as "own echo"
+// (a targeted mute). With a shared per-brain key (the desktop already holds
+// one for each cloud-linked brain), frames carry an HMAC over their sorted
+// fields; a receiver configured with the key DROPS unsigned or mis-signed
+// frames. No key configured → unsigned tolerated (compat: old builds, and
+// consent remains the outer gate either way).
+function frameMac(frame, key) {
+  const entries = Object.keys(frame).filter((k) => k !== 'mac').sort()
+    .map((k) => [k, frame[k]]);
+  return crypto.createHmac('sha256', String(key)).update(JSON.stringify(entries)).digest('hex').slice(0, 32);
+}
+export function signFrame(frame, key) {
+  if (!frame || typeof frame !== 'object' || !key) return frame;
+  return { ...frame, mac: frameMac(frame, key) };
+}
+export function verifyFrame(frame, key) {
+  if (!frame || typeof frame !== 'object') return false;
+  if (!key) return true;                                 // no key → tolerate unsigned
+  if (typeof frame.mac !== 'string' || !frame.mac) return false;
+  const expected = Buffer.from(frameMac(frame, key));
+  const presented = Buffer.from(String(frame.mac));
+  return presented.length === expected.length && crypto.timingSafeEqual(presented, expected);
+}
+
 // ── The transport seam ───────────────────────────────────────────────────────
 // The desktop relay calls exactly these two functions around its Realtime
 // channel; the conformance harness calls them around a mock. Consent is
@@ -214,6 +241,7 @@ export function relayOutbound({
   sinceTs = 0,
   now = Date.now(),
   send,
+  key = null,
 } = {}) {
   if (!presenceConsentAllows(consent)) return { sent: 0, reason: 'no-consent', maxMessageTs: sinceTs };
   if (typeof send !== 'function') return { sent: 0, reason: 'no-channel', maxMessageTs: sinceTs };
@@ -222,22 +250,23 @@ export function relayOutbound({
   for (const session of Array.isArray(sessions) ? sessions : []) {
     const frame = buildPresenceFrame(session, { machineId, hostLabel, root, now });
     if (!frame) continue;
-    send(frame);
+    send(signFrame(frame, key));
     sent++;
   }
   for (const message of selectOutboundMessages(messages, { sinceTs })) {
     const frame = buildMessageFrame(message, { machineId, now });
     if (!frame) continue;
-    send(frame);
+    send(signFrame(frame, key));
     sent++;
     maxMessageTs = Math.max(maxMessageTs, Number(message.ts || 0));
   }
   return { sent, reason: null, maxMessageTs };
 }
 
-export function relayInbound(frame, { consent = null, machineId, now = Date.now() } = {}) {
+export function relayInbound(frame, { consent = null, machineId, now = Date.now(), key = null } = {}) {
   if (!presenceConsentAllows(consent)) return null;   // symmetric: no consent ⇒ no receive-display
   if (!frame || typeof frame !== 'object') return null;
+  if (!verifyFrame(frame, key)) return null;          // key configured → unsigned/mis-signed frames drop
   if (frame.kind === 'presence') {
     const row = acceptPresenceFrame(frame, { machineId, now });
     return row ? { type: 'presence', row } : null;

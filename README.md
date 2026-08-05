@@ -550,7 +550,9 @@ keep lazy first-use indexing instead.
 - **The optional semantic model runs on device.** Enabling it (or upgrading its model) can fetch
   model weights from Hugging Face; retrieval inference and brain data stay local.
 - **Coordination state is local files.** The brain is a file in your repo; the presence lane is a
-  file under your home directory. Nothing is uploaded.
+  file under your home directory. Nothing is uploaded — with one explicit, default-OFF exception:
+  the cross-PC presence relay, which (only after per-brain consent in the KLYPIX desktop app)
+  shares metadata-only presence frames over that brain's cloud channel. No consent, no frames.
 - **`install` writes to your home directory:** `~/.claude/project-brain` (engine + runtime),
   `~/.claude/settings.json` (four hooks — written even if Claude Code is not installed),
   `~/.codex/AGENTS.md` (guidance block), and with `--codex-hooks`, `~/.codex/hooks.json`. It also

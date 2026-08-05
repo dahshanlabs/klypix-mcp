@@ -307,6 +307,30 @@ const SESSIONS_DIR = path.join(os.homedir(), '.claude', 'project-brain', 'sessio
 const laneCanon = (p) => { try { return fs.realpathSync.native(p); } catch { return path.resolve(p); } };
 const SESSIONS_FILE = path.join(SESSIONS_DIR, `${sha(normBrainPath(laneCanon(BRAIN)))}.json`); // one lane-file per PROJECT (shared by its concurrent sessions)
 const SESSIONS_LOCK = SESSIONS_FILE + '.lock';
+// tmp+rename: lock-free readers must never parse a torn lane as an empty one.
+function writeLaneAtomic(payload) { const tmp = SESSIONS_FILE + '.tmp-' + process.pid; fs.writeFileSync(tmp, payload); fs.renameSync(tmp, SESSIONS_FILE); }
+// Pending-captures queue: when the BRAIN lock cannot be acquired, the batch is
+// queued here durably instead of written from a stale base (a best-effort write
+// could erase a peer's or the desktop app's just-merged cards — the exact lost
+// update this lock exists to prevent). Drained under the lock by the NEXT
+// capture in this project, from any session. Ids let a re-refused capture
+// replace only what it drained, so a batch a peer queued meanwhile survives.
+const PENDING_CAPTURES_FILE = path.join(os.homedir(), '.claude', 'project-brain', 'pending', `${sha(normBrainPath(laneCanon(BRAIN)))}.captures.json`);
+const PENDING_CAPTURES_LOCK = PENDING_CAPTURES_FILE + '.lock';
+function readPendingCaptures() {
+    try { const d = JSON.parse(fs.readFileSync(PENDING_CAPTURES_FILE, 'utf8')); return Array.isArray(d) ? d : []; } catch { return []; }
+}
+function updatePendingCaptures(mutate) {
+    const got = acquireLock(PENDING_CAPTURES_LOCK, { tries: 20, waitMs: 25 });
+    try {
+        const next = mutate(readPendingCaptures());
+        fs.mkdirSync(path.dirname(PENDING_CAPTURES_FILE), { recursive: true });
+        const tmp = PENDING_CAPTURES_FILE + '.tmp';
+        fs.writeFileSync(tmp, JSON.stringify(next));
+        fs.renameSync(tmp, PENDING_CAPTURES_FILE);
+    } catch { /* never break the session; the transcript markers remain the fallback */ }
+    finally { if (got) releaseLock(PENDING_CAPTURES_LOCK); }
+}
 const SESSION_FRESH_MS = 10 * 60 * 1000;   // a lane unseen for 10min is treated as ended
 const MCP_SESSION_FRESH_MS = 3 * 60 * 1000; // an mcp-channel heartbeat is dead after 3min (matches agent-presence)
 // The host CLI's pid (Claude Code exports CLAUDE_PID to every child, including
@@ -438,7 +462,7 @@ function touchSession(sid, patch = {}) {
             // MCP-written rows on every heartbeat). Message eviction prefers
             // delivered notes (capMsgs) so an unseen note is never silently lost.
             const keptMsgs = capMsgs((Array.isArray(data0.messages) ? data0.messages : []).filter(m => m && (now - (m.ts || 0) < MSG_FRESH_MS)));
-            fs.writeFileSync(SESSIONS_FILE, JSON.stringify({ ...data0, sessions: list.slice(-40), messages: keptMsgs }));
+            writeLaneAtomic(JSON.stringify({ ...data0, sessions: list.slice(-40), messages: keptMsgs }));
             // Hostmap: host-pid → CURRENT session id, re-read by the MCP server on
             // every touch so its lane row follows /clear + resume id rotation. The
             // file is per-PROJECT (all host pids write it), so its read-modify-write
@@ -456,7 +480,7 @@ function touchSession(sid, patch = {}) {
                     fs.renameSync(tmp, HOSTMAP_FILE);
                 } catch { /* best-effort */ }
             }
-        } finally { releaseLock(SESSIONS_LOCK); }
+        } finally { if (got) releaseLock(SESSIONS_LOCK); }
     } catch { /* coordination is best-effort */ }
 }
 // Other live lanes in THIS project (exclude me by session id, pid, AND host pid).
@@ -570,7 +594,7 @@ function postMessages(msgs) {
             kept.push(m);
         }
         fs.mkdirSync(SESSIONS_DIR, { recursive: true });
-        fs.writeFileSync(SESSIONS_FILE, JSON.stringify({ ...data, sessions, messages: capMsgs(kept) }));
+        writeLaneAtomic(JSON.stringify({ ...data, sessions, messages: capMsgs(kept) }));
     } catch { /* best-effort */ } finally { if (got) releaseLock(SESSIONS_LOCK); }
 }
 // to==='all'/'' → everyone; else the hint must appear in my id-prefix / branch / intent.
@@ -690,14 +714,18 @@ function messageFooter(sid, tp, lib) {
                 if (!Array.isArray(m.seen)) m.seen = [];
                 if (!m.seen.includes(sid)) m.seen.push(sid);
             }
-            fs.writeFileSync(SESSIONS_FILE, JSON.stringify(d2));
-        } catch { /* */ } finally { releaseLock(SESSIONS_LOCK); }
+            writeLaneAtomic(JSON.stringify(d2));
+        } catch { /* */ } finally { if (got) releaseLock(SESSIONS_LOCK); }
     }
     if (!delivered.length) return '';
     const ago = (ts) => { const mm = Math.max(0, Math.round((now - (ts || now)) / 60000)); return mm <= 0 ? 'just now' : `${mm}m ago`; };
     const out = ['', '## 📨 Message(s) from another session in this project (delivered once — act on or reply to them)'];
+    // Neutralize glyph-keyword adjacency in delivered text (🧠·BRAIN can't match
+    // the capture regex): a forged lane row must never plant a harvestable marker
+    // in this session's prompt. Mirrors agent-presence.neutralizeMarkers.
+    const neutral = (s) => String(s).replace(/🧠(\s*)(BRAIN|MSG)/gi, '🧠·$2');
     for (const m of delivered) {
-        out.push(`- from ${String(m.from || '?').slice(0, 8)} · ${ago(m.ts)}: ${String(m.text).replace(/\s+/g, ' ').trim().slice(0, 400)}`);
+        out.push(`- from ${String(m.from || '?').slice(0, 8)} · ${ago(m.ts)}: ${neutral(String(m.text)).replace(/\s+/g, ' ').trim().slice(0, 400)}`);
         // Engine-emitted LAST-KNOWN stamp — its own line, after the 400-char slice.
         const stamp = decayStampForMessage(m.text, m.ts, now, lib);
         if (stamp) out.push(`  ${stamp}`);
@@ -1267,7 +1295,7 @@ const readRuleDrafts = () => { try { const d = JSON.parse(fs.readFileSync(RULE_D
 // pending finding and vice versa. Both writers now read the file first and
 // replace only their own key. Adding a third list is safe by the same rule.
 const readSidecar = () => { try { const d = JSON.parse(fs.readFileSync(RULE_DRAFTS, 'utf8')); return d && typeof d === 'object' && !Array.isArray(d) ? d : {}; } catch { return {}; } };
-const writeSidecar = (patch) => { try { fs.mkdirSync(path.dirname(RULE_DRAFTS), { recursive: true }); fs.writeFileSync(RULE_DRAFTS, JSON.stringify({ ...readSidecar(), ...patch }, null, 2)); } catch { /* best-effort */ } };
+const writeSidecar = (patch) => { try { fs.mkdirSync(path.dirname(RULE_DRAFTS), { recursive: true }); const tmp = `${RULE_DRAFTS}.tmp-${process.pid}`; fs.writeFileSync(tmp, JSON.stringify({ ...readSidecar(), ...patch }, null, 2)); fs.renameSync(tmp, RULE_DRAFTS); } catch { /* best-effort */ } };
 const writeRuleDrafts = (drafts) => writeSidecar({ drafts: (drafts || []).slice(-RULE_DRAFTS_MAX) });
 const draftKey = (area, text) => sha(((area || '') + '|' + String(text)).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim());
 // Token overlap: is a draft seed substantially covered by a (skill) card's text?
@@ -1300,6 +1328,7 @@ function sessionVerified(shellCmds, errorIds, hadFixCommit) {
 // sidecar in an adopter project, and identical rewrites cause no churn.
 function persistDrafts(mutate) {
     const got = acquireLock(RULE_DRAFTS_LOCK, { tries: 20, waitMs: 25 });
+    if (!got) return;   // lock timeout → SKIP: an unlocked RMW clobbers the other key's writer; a dropped bump re-detects next Stop
     try {
         const now = Date.now();
         const raw = readRuleDrafts();
@@ -1447,6 +1476,7 @@ const readFindings = () => { const d = readSidecar(); return Array.isArray(d.fin
 // that keeps an adopter project from growing an empty sidecar.
 function persistFindings(mutate) {
     const got = acquireLock(RULE_DRAFTS_LOCK, { tries: 20, waitMs: 25 });
+    if (!got) return;   // lock timeout → SKIP (mirrors persistDrafts): never RMW the shared sidecar unlocked
     try {
         const now = Date.now();
         const raw = readFindings();
@@ -1764,7 +1794,10 @@ async function capture(lib) {
         // is this turn's real touch-set — the other half of "own scope".
         await draftFindingsFromCards(cards, verified, sid, recentPaths);
     }
-    if (!cards.length && !resolutions.length && !updates.length) {
+    // A queued batch from a prior lock-refused capture counts as work to do —
+    // the authoritative drain happens INSIDE the brain lock (doCapture), so two
+    // concurrent sessions can never both land the same queued batch.
+    if (!cards.length && !resolutions.length && !updates.length && !readPendingCaptures().length) {
         // Record the commit baseline / advance even with nothing to capture, so
         // the next run doesn't re-scan the same commits.
         if (newLastCommit && newLastCommit !== prevCommit) writeLastCommit(newLastCommit);
@@ -1782,30 +1815,68 @@ async function capture(lib) {
     // and UNION the dedup state (don't clobber a peer's seen-set). captureInto-
     // Brain supersedes heavily-overlapping old cards, applies ✓/~, routes new
     // cards into [Area] containers, and wires [[wikilink]] connections.
-    const gotLock = acquireLock(LOCK);
-    let stats;
-    try {
+    const doCapture = async (locked) => {
         const merged = readState(); for (const k of seen) merged.add(k);
+        if (!locked) {
+            // REFUSED: never write from a stale base. The batch is queued durably
+            // (same home as the dedup state) and drained by the next capture in
+            // this project — deferred-but-safe beats immediate-but-clobbering.
+            if (cards.length || resolutions.length || updates.length) {
+                updatePendingCaptures((current) => [
+                    ...current,
+                    { id: `${Date.now()}-${process.pid}-${Math.random().toString(36).slice(2)}`, ts: nowIso(), cards, resolutions, updates },
+                ]);
+            }
+            writeState(merged);
+            writeLastCommit(newLastCommit); // safe: the batch itself is durably queued
+            if (drainedShips && typeof lib.clearPendingShips === 'function') lib.clearPendingShips(CWD);
+            advanceShipBaseline(lib);
+            appendJsonl(HEALTH, { ts: nowIso(), project: path.basename(CWD), mode: 'capture', ok: false, err: 'lock-timeout — batch QUEUED for the next capture; brain untouched' }, 500);
+            process.stderr.write('[brain] capture deferred: the brain lock is held (desktop save or peer capture) — batch queued durably, nothing lost\n');
+            return null;
+        }
+        // Drain the queue UNDER the lock: read, land, clear-by-id — a peer's
+        // batch queued after this read survives, and no batch lands twice.
+        const pendingBatches = readPendingCaptures();
+        const drainedPendingIds = new Set(pendingBatches.map(b => b && b.id).filter(Boolean));
+        for (const b of pendingBatches) {
+            if (!b || typeof b !== 'object') continue;
+            for (const c of (Array.isArray(b.cards) ? b.cards : [])) cards.push(c);
+            for (const r of (Array.isArray(b.resolutions) ? b.resolutions : [])) resolutions.push(r);
+            for (const u of (Array.isArray(b.updates) ? b.updates : [])) updates.push(u);
+        }
+        if (!cards.length && !resolutions.length && !updates.length) return null;
         const res = await lib.captureIntoBrain(fs.readFileSync(BRAIN), {
             cards: cards.map(c => ({ text: c.text, color: '#e8e8ed', borderColor: c.borderColor, area: c.area, createdVia: c.createdVia || 'claude-code', ...(c.closes ? { closes: c.closes } : {}), ...(c.evidence ? { evidence: c.evidence } : {}), ...(c.verify ? { verify: c.verify } : {}) })),
             resolutions,
             updates,
         });
-        stats = res.stats;
         // Re-pack the whole grid so a container that grew never overlaps its neighbor.
         let out = res.buffer; try { out = (await lib.tidyBrain(res.buffer)).buffer; } catch { /* keep append result if tidy fails */ }
         await lib.atomicWrite(BRAIN, out);
         writeState(merged);
         writeLastCommit(newLastCommit); // advance the commit baseline only after a successful write
+        if (drainedPendingIds.size) updatePendingCaptures((current) => current.filter(b => b && !drainedPendingIds.has(b.id)));
         // Same discipline for the two ship channels: the queue is consumed and
         // the observation baseline advances ONLY now that the cards are durable.
         if (drainedShips && typeof lib.clearPendingShips === 'function') lib.clearPendingShips(CWD);
         advanceShipBaseline(lib);
         try { await refreshAgentsBrief(lib, out); } catch { /* AGENTS.md refresh is best-effort */ }
-    } finally {
-        if (gotLock) releaseLock(LOCK);
+        return res.stats;
+    };
+    // Canonical cross-process lock (heartbeat + token-checked release, shared
+    // with the MCP engine and the desktop app). Stale bundles missing the module
+    // fall back to the local lock — but ALWAYS refuse-and-queue on timeout.
+    let lockLib = null;
+    try { lockLib = await import(new URL('./brain-write-lock.mjs', import.meta.url).href); } catch { /* stale deployment */ }
+    let stats;
+    if (lockLib && typeof lockLib.withAdvisoryWriteLock === 'function') {
+        stats = await lockLib.withAdvisoryWriteLock(lockLib.brainCaptureLockPath(BRAIN), doCapture, { tries: 100, waitMs: 60 });
+    } else {
+        const gotLock = acquireLock(LOCK);
+        try { stats = await doCapture(gotLock); } finally { if (gotLock) releaseLock(LOCK); }
     }
-    if (!gotLock) appendJsonl(HEALTH, { ts: nowIso(), project: path.basename(CWD), mode: 'capture', ok: false, err: 'lock-timeout — wrote best-effort' }, 500);
+    if (!stats) return;
     const bits = [`${stats.added} added`];
     if (stats.resolved) bits.push(`${stats.resolved} resolved`);
     if (stats.updated) bits.push(`${stats.updated} updated`);

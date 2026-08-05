@@ -34,7 +34,7 @@ import {
   isFastDecayCard, DECAY_STALE_MS, formatDecayAge,
   readPendingShips, clearPendingShips, pendingShipCards, formatCaptureReceipts,
 } from './klypix-format.mjs';
-import { capMessages, findProjectBrain } from './agent-presence.mjs';
+import { capMessages, findProjectBrain, neutralizeMarkers } from './agent-presence.mjs';
 import { brainCaptureLockPath, vaultCreateLockPath, withAdvisoryWriteLock } from './brain-write-lock.mjs';
 import {
   dot, embedTexts, getEmbedder, getEmbedderForUse, withRerankerForUse,
@@ -288,7 +288,10 @@ export async function opSearchAllBrains({ vault, query, as_of, log = () => {} })
   const asOfTs = as_of ? Date.parse(as_of) : null;
   if (as_of && Number.isNaN(asOfTs)) return err(`Bad as_of date: "${as_of}" — use YYYY-MM-DD.`);
 
-  const pipe = await getEmbedderForUse(log, 20_000);
+  // Queue saturation (KLYPIX_SEMANTIC_QUEUE_FULL) must degrade to lexical, not
+  // error — this tool's own description promises "degrades cleanly".
+  let pipe = null;
+  try { pipe = await getEmbedderForUse(log, 20_000); } catch { /* saturated/unavailable → lexical only */ }
   let qv = null;
   if (pipe) { try { [qv] = await embedTexts(pipe, [q], { kind: 'query' }); } catch { /* lexical only */ } }
 
@@ -895,7 +898,9 @@ export async function opBrainConnect({ vault, canvas, apply = false, max = 24, t
     : (normalizedScope === 'orphans' ? 0.55 : 0.45);
   let edges = [];
   let mode = 'structural (shared tags + [[mentions]])';
-  const pipe = await getEmbedderForUse(log, 20_000);
+  // Queue saturation must degrade to the structural mode, never a hard error.
+  let pipe = null;
+  try { pipe = await getEmbedderForUse(log, 20_000); } catch { /* saturated/unavailable → structural */ }
   if (pipe) {
     try {
       const vecs = await vectorsForBrain(pipe, file, struct.cards);
@@ -1132,9 +1137,15 @@ export async function opBrainMessage({ vault, canvas, text: msgText, to, via }) 
     // cap + collapse the target hint too — an oversized `to` would bloat the lane
     // file every hook of every session re-reads for 24h (and matches no one anyway)
     to: String(to || 'all').replace(/\s+/g, ' ').trim().slice(0, 64) || 'all',
-    text: txt.slice(0, 400), ts: now, seen: [],
+    // Neutralized at post (delivery surfaces neutralize again for forged rows):
+    // a message must never carry a HARVESTABLE capture marker into a peer's prompt.
+    text: neutralizeMarkers(txt.slice(0, 400)), ts: now, seen: [],
   };
   const got = laneLock(lock);
+  // Lock timeout → REFUSE, never write: an unlocked read-modify-write of the
+  // whole lane can permanently erase a peer's just-posted undelivered message
+  // (the exact loss class touchSession already refuses). Retry is cheap.
+  if (!got) return err('brain_message deferred: the coordination lane is busy (another session is writing). Nothing was posted — retry in a moment.');
   let live = 0;
   try {
     let data = {}; try { data = JSON.parse(fs.readFileSync(laneFile, 'utf8')); } catch { /* fresh lane */ }
@@ -1146,10 +1157,13 @@ export async function opBrainMessage({ vault, canvas, text: msgText, to, via }) 
     // Delivered-first eviction + ...data spread — the other two lane writers were
     // converted in the 2026-07-29 overhaul; a flat slice here still destroyed the
     // oldest UNDELIVERED note at cap (review-caught).
-    fs.writeFileSync(laneFile, JSON.stringify({ ...data, sessions, messages: capMessages(kept, 30) }));
+    // tmp+rename so lock-free readers can never parse a torn lane as "no messages".
+    const tmp = `${laneFile}.tmp-${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify({ ...data, sessions, messages: capMessages(kept, 30) }));
+    fs.renameSync(tmp, laneFile);
   } catch (e) {
     return err(`brain_message failed: ${e.message}`);
-  } finally { if (got) { try { fs.unlinkSync(lock); } catch { /* */ } } }
+  } finally { try { fs.unlinkSync(lock); } catch { /* */ } }
   return { blocks: [text(`📨 posted to this project's coordination lane (to: ${msg.to}) — ${live} active presence-wired session(s) right now; each receives it once through its lifecycle adapter or next brain_sync / KLYPIX tool call. Ephemeral (24h), not a brain card — use brain_note for durable decisions.`)] };
 }
 

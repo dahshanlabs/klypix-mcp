@@ -204,6 +204,90 @@ try {
 } finally {
   await client.close().catch(() => {});
 }
+
+// ── RAM Phase 2: idle worker hibernation ─────────────────────────────────────
+// A second, isolated connection with a 1s idle threshold: the worker half must
+// retire while idle, the pair must survive, and the next call must wake it
+// transparently (no error, no reconnect) with the task scope replayed.
+{
+  activate(v3, '1.2.0');   // same fixture runtime the main connection used
+  const hibStateDir = path.join(root, 'state-hibernation');
+  fs.mkdirSync(hibStateDir, { recursive: true });
+  const hibClient = new Client({ name: 'klypix-hibernation-test', version: '1.0.0' }, { capabilities: {} });
+  const hibTransport = new StdioClientTransport({
+    command: process.execPath,
+    args: [BIN],
+    cwd: root,
+    env: {
+      ...process.env,
+      KLYPIX_MCP_RUNTIME_MANIFEST: manifestPath,
+      KLYPIX_MCP_STATE_DIR: hibStateDir,
+      KLYPIX_MCP_SUPERVISOR_POLL_MS: '10000',
+      KLYPIX_AUTO_UPDATE: '0',
+      KLYPIX_WORKER_HIBERNATE_MS: '1000',
+    },
+    stderr: 'pipe',
+  });
+  const hibStates = () => fs.readdirSync(hibStateDir).filter(n => n.endsWith('.json'))
+    .map(n => { try { return JSON.parse(fs.readFileSync(path.join(hibStateDir, n), 'utf8')); } catch { return null; } })
+    .filter(Boolean);
+  try {
+    await hibClient.connect(hibTransport);
+    ok(textOf(await hibClient.callTool({ name: 'version', arguments: {} })) === '1.2.0', 'hibernation: worker serves normally before idling');
+    await hibClient.callTool({
+      name: 'brain_sync',
+      arguments: { phase: 'start', intent: 'hibernation continuity', files: ['src/hib.ts'] },
+    });
+    const busyPid = hibStates()[0]?.active?.pid || null;
+    await waitFor(async () => hibStates().some(s => s.status === 'hibernated'), 20000);
+    const sleeping = hibStates().find(s => s.status === 'hibernated');
+    ok(Boolean(sleeping) && sleeping.active === null, 'hibernation: an idle worker retires and the state file says so');
+    ok(sleeping?.hibernation?.hibernated === true && sleeping.hibernation.count >= 1, 'hibernation: the receipt carries idle policy + count for diagnostics');
+    if (busyPid) {
+      await waitFor(async () => !isAlive(busyPid), 15000);
+      ok(!isAlive(busyPid), 'hibernation: the worker PROCESS is actually gone (the RAM is returned)');
+    }
+    ok(textOf(await hibClient.callTool({ name: 'version', arguments: {} })) === '1.2.0', 'hibernation: the next call wakes the worker transparently — no error, no reconnect');
+    const wokenScope = JSON.parse(textOf(await hibClient.callTool({ name: 'scope', arguments: {} })));
+    ok(wokenScope?.intent === 'hibernation continuity' && wokenScope?.files?.[0] === 'src/hib.ts', 'hibernation: the declared task scope survives the wake (peers still see this session correctly)');
+  } finally {
+    await hibClient.close().catch(() => {});
+  }
+
+  // Rollback gate: KLYPIX_WORKER_HIBERNATE_MS=0 must restore today's behavior
+  // exactly — an idle worker stays resident. This is the instant-rollback path
+  // the Phase-2 ship criteria require.
+  const offStateDir = path.join(root, 'state-hibernation-off');
+  fs.mkdirSync(offStateDir, { recursive: true });
+  const offClient = new Client({ name: 'klypix-hibernation-off-test', version: '1.0.0' }, { capabilities: {} });
+  const offTransport = new StdioClientTransport({
+    command: process.execPath,
+    args: [BIN],
+    cwd: root,
+    env: {
+      ...process.env,
+      KLYPIX_MCP_RUNTIME_MANIFEST: manifestPath,
+      KLYPIX_MCP_STATE_DIR: offStateDir,
+      KLYPIX_MCP_SUPERVISOR_POLL_MS: '10000',
+      KLYPIX_AUTO_UPDATE: '0',
+      KLYPIX_WORKER_HIBERNATE_MS: '0',
+    },
+    stderr: 'pipe',
+  });
+  try {
+    await offClient.connect(offTransport);
+    await offClient.callTool({ name: 'version', arguments: {} });
+    const idleStart = Date.now();
+    while (Date.now() - idleStart < 4000) await new Promise(r => setTimeout(r, 200));
+    const offStates = fs.readdirSync(offStateDir).filter(n => n.endsWith('.json'))
+      .map(n => { try { return JSON.parse(fs.readFileSync(path.join(offStateDir, n), 'utf8')); } catch { return null; } })
+      .filter(Boolean);
+    ok(offStates.length > 0 && offStates.every(s => s.status !== 'hibernated' && s.active?.pid),
+      'hibernation OFF (=0): an idle worker stays resident — instant rollback to pre-Phase-2 behavior');
+  } finally {
+    await offClient.close().catch(() => {});
+  }
+}
 if (lastActivePid) {
   await waitFor(async () => !isAlive(lastActivePid));
   ok(!isAlive(lastActivePid), 'closing the host connection terminates the supervised worker (no orphan session)');

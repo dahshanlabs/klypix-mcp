@@ -286,6 +286,20 @@ class Supervisor {
     this.recoveryAttempts = 0;
     this.recoveryTimer = null;
     this.lastFailedSignature = null;
+    // RAM Phase 2 — idle worker hibernation. An idle connection pays for a
+    // whole worker process it is not using (measured: 11 idle pairs = 1,445 MB
+    // with ZERO models resident, so this is process baseline, not semantics).
+    // After this much host silence the worker half is retired; the next host
+    // message wakes it through the SAME queue → candidate → commit → flush path
+    // recovery already uses, with the task scope replayed. Set 0 to disable
+    // (instant rollback to today's behavior; no data/format/protocol change).
+    const hibernateEnv = Number(process.env.KLYPIX_WORKER_HIBERNATE_MS);
+    this.hibernateIdleMs = Number.isFinite(hibernateEnv) ? Math.max(0, hibernateEnv) : 600_000;
+    this.hibernatedTarget = null;
+    this.hibernatedAt = null;
+    this.hibernations = 0;
+    this.hibernateProbeInFlight = false;
+    this.hibernateSkipReason = null;
   }
 
   writeState(extra = {}) {
@@ -297,6 +311,13 @@ class Supervisor {
         parentPid: this.parentPid,
         vault: this.vaultArg ? this.vaultArg.replace(/\\/g, '/') : null,
         defaultRoot: this.defaultRoot,
+        hibernation: {
+          idleMs: this.hibernateIdleMs,
+          hibernated: this.status === 'hibernated',
+          since: this.status === 'hibernated' ? this.hibernatedAt : null,
+          count: this.hibernations,
+          skipReason: this.hibernateSkipReason || null,
+        },
         cwd: process.cwd().replace(/\\/g, '/'),
         bootedAt: this.bootedAt,
         updatedAt: new Date().toISOString(),
@@ -325,6 +346,65 @@ class Supervisor {
         ...extra,
       });
     } catch { /* diagnostics must never break the transport */ }
+  }
+
+  // Retire the worker half of an idle pair. Deliberately conservative: only a
+  // settled, fully-handshaked, request-free connection hibernates, and only
+  // when we can prove we are able to wake it (the host's initialize is what a
+  // respawned worker replays).
+  async maybeHibernate() {
+    if (this.closed || !this.hibernateIdleMs || this.hibernateProbeInFlight) return;
+    if (!this.active || this.candidate || this.standby) return;
+    if (this.status !== 'ready') return;
+    if (this.hostRequests.size || this.workerRequests.size || this.hostQueue.length) return;
+    if (!this.initializeRequest || !this.hostInitialized) return;
+    const last = Date.parse(this.lastHostMessageAt || this.bootedAt);
+    if (!Number.isFinite(last) || Date.now() - last < this.hibernateIdleMs) return;
+
+    // PRESENCE IS NON-NEGOTIABLE. A worker's graceful stop calls removeSession,
+    // so hibernating a connection that owns a presence row would delete a LIVE
+    // session from every peer's view — coordination regressing to buy RAM. Ask
+    // the worker first: only a connection with no presence row (no project
+    // brain resolved for it) may hibernate. Scoped connections keep their
+    // worker until supervisor-side heartbeat takeover ships.
+    this.hibernateProbeInFlight = true;
+    let ownsPresence = true;
+    try {
+      const probe = await this.sendInternal(this.active, 'tools/call', {
+        name: 'brain_sync',
+        arguments: { phase: 'checkpoint', include_context: false },
+      }, 4000);
+      const structured = probe?.structuredContent || null;
+      ownsPresence = Boolean(structured && structured.reason !== 'no-project-brain');
+    } catch {
+      ownsPresence = true;   // unknown → never hibernate
+    } finally {
+      this.hibernateProbeInFlight = false;
+    }
+    // Conditions can change across the await — re-verify before retiring.
+    if (this.closed || !this.active || this.candidate || this.standby) return;
+    if (this.hostRequests.size || this.workerRequests.size || this.hostQueue.length) return;
+    if (ownsPresence) {
+      this.hibernateSkipReason = 'presence-row-live';
+      return;
+    }
+    this.hibernateSkipReason = null;
+    const worker = this.active;
+    this.hibernatedTarget = worker.target;
+    this.hibernatedAt = new Date().toISOString();
+    this.hibernations++;
+    this.active = null;
+    this.status = 'hibernated';
+    this.retireWorker(worker, 350);   // grace so the worker's presence cleanup runs
+    this.writeState();
+    log(`worker hibernated after ${Math.round((Date.now() - last) / 1000)}s idle — wakes on the next request`);
+  }
+
+  wake() {
+    if (this.closed || this.active || this.candidate) return;
+    const target = this.hibernatedTarget || this.selectInitialTarget();
+    log('waking hibernated worker');
+    this.startCandidate(target, { recovery: true });
   }
 
   selectInitialTarget() {
@@ -591,6 +671,10 @@ class Supervisor {
         return;
       }
       this.hostQueue.push(message);
+      // A hibernated pair wakes on demand: the queued message flushes to the
+      // new worker the moment the candidate commits, so the host sees latency,
+      // never an error, and never a reconnect.
+      if (this.status === 'hibernated') this.wake();
       return;
     }
     if (message?.method === 'initialize' && Object.prototype.hasOwnProperty.call(message, 'id')) {
@@ -908,6 +992,11 @@ class Supervisor {
     );
     this.autoUpdatePoller.unref?.();
 
+    if (this.hibernateIdleMs) {
+      this.hibernationTimer = setInterval(() => { this.maybeHibernate().catch(() => {}); }, Math.max(1_000, Math.min(60_000, this.hibernateIdleMs)));
+      this.hibernationTimer.unref?.();
+    }
+
     // Host watchdog: shutdown is otherwise 100% stdin-EOF-dependent, and a
     // host that dies holding pipes open (or a wedged IDE) pinned this pair —
     // supervisor AND worker — indefinitely. The parent pid is a cheap,
@@ -936,6 +1025,7 @@ class Supervisor {
     this.closed = true;
     clearInterval(this.poller);
     clearInterval(this.parentWatchdog);
+    clearInterval(this.hibernationTimer);
     clearTimeout(this.autoUpdateStarter);
     clearInterval(this.autoUpdatePoller);
     if (this.recoveryTimer) { clearTimeout(this.recoveryTimer); this.recoveryTimer = null; }

@@ -393,6 +393,43 @@ jobs:
           fi
           echo "publishing version $VERSION (gate-cleared)"
 
+      # A provenance read-back can outlive the registry's indexing window even
+      # after npm publish succeeds. Make a failed job safe to re-run: an exact
+      # immutable version may skip `npm publish` only when its registry tarball
+      # integrity matches the tarball produced from this checkout. A mismatch is
+      # a hard stop, never a reason to trust the existing version.
+      - name: Inspect immutable registry version
+        id: registry
+        env:
+          GATE_VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          NAME="$(node -p "require('./package.json').name")"
+          META="$(npm view "$NAME@$GATE_VERSION" --json 2>/dev/null || true)"
+          if ! printf '%s' "$META" | node -e '
+            try {
+              const meta = JSON.parse(require("fs").readFileSync(0, "utf8") || "null");
+              process.exit(meta?.name === process.argv[1] && meta?.version === process.argv[2] ? 0 : 1);
+            } catch { process.exit(1); }
+          ' "$NAME" "$GATE_VERSION"; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "$NAME@$GATE_VERSION is not published yet"
+            exit 0
+          fi
+
+          REMOTE_INTEGRITY="$(printf '%s' "$META" | node -p '
+            JSON.parse(require("fs").readFileSync(0, "utf8")).dist?.integrity || ""
+          ')"
+          LOCAL_INTEGRITY="$(npm pack --dry-run --json | node -p '
+            JSON.parse(require("fs").readFileSync(0, "utf8"))[0]?.integrity || ""
+          ')"
+          if [ -z "$REMOTE_INTEGRITY" ] || [ -z "$LOCAL_INTEGRITY" ] || [ "$REMOTE_INTEGRITY" != "$LOCAL_INTEGRITY" ]; then
+            echo "::error::$NAME@$GATE_VERSION already exists but its integrity does not match this checkout. Refusing to publish or waive the mismatch."
+            exit 1
+          fi
+          echo "exists=true" >> "$GITHUB_OUTPUT"
+          echo "$NAME@$GATE_VERSION already exists with the exact gate-cleared integrity; skipping immutable republish"
+
       # Tokenless: do NOT set NODE_AUTH_TOKEN / NPM_TOKEN. setup-node writes an
       # empty-token .npmrc line which npm >= 11.5.1 ignores under OIDC. Provenance
       # is generated AUTOMATICALLY (public repo + public package); no flag needed.
@@ -402,6 +439,7 @@ jobs:
       # `--provenance` — this path already produces it, and the step below fails
       # the run if a future change ever silently drops it.
       - name: Publish (OIDC, auto-provenance)
+        if: steps.registry.outputs.exists != 'true'
         run: npm publish --access public
 
       - name: Verify the published artifact carries provenance

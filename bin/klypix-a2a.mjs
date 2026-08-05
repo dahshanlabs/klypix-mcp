@@ -26,6 +26,7 @@
 
 import http from 'http';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
@@ -61,6 +62,44 @@ const isLoopbackHostname = (value) => ['127.0.0.1', 'localhost', '::1'].includes
 if (!isLoopbackHostname(HOST)) {
   console.error('[klypix-a2a] Refusing non-loopback --host. A2A is local-only until auth, TLS, and cross-process write locking ship together.');
   process.exit(2);
+}
+
+// ── OS-user auth boundary ────────────────────────────────────────────────────
+// Loopback TCP is MACHINE-local, not OS-user-local: on a shared machine any
+// other local user (or sandboxed process) can reach this port — and POST /
+// includes brain WRITES, which land in every future session's context. A
+// per-start bearer token stored under ~/.claude/project-brain (the SAME
+// user-ACL boundary that already protects the coordination lane) restores the
+// stated boundary: only a process that can read this user's home can mutate.
+// KLYPIX_A2A_TOKEN overrides for shared-secret setups; --no-auth opts out
+// explicitly (never silently).
+const NO_AUTH = process.argv.includes('--no-auth') || process.env.KLYPIX_A2A_NO_AUTH === '1';
+const TOKEN_FILE = path.join(os.homedir(), '.claude', 'project-brain', `.a2a-token-${PORT}`);
+const TOKEN = (() => {
+  if (NO_AUTH) return null;
+  const fromEnv = String(process.env.KLYPIX_A2A_TOKEN || '').trim();
+  if (fromEnv) return fromEnv;
+  const token = crypto.randomBytes(32).toString('hex');
+  try {
+    fs.mkdirSync(path.dirname(TOKEN_FILE), { recursive: true });
+    fs.writeFileSync(TOKEN_FILE, token, { mode: 0o600 });
+  } catch (e) {
+    console.error(`[klypix-a2a] Could not write the auth token file (${e?.message || e}); refusing to start UNAUTHENTICATED. Set KLYPIX_A2A_TOKEN or pass --no-auth explicitly.`);
+    process.exit(2);
+  }
+  return token;
+})();
+// Fingerprint (never the token) served on /health: a client verifies the server
+// actually holds the token from THIS user's token file BEFORE sending it — so a
+// port-squatting impostor can neither pass verification nor harvest the token.
+const TOKEN_FINGERPRINT = TOKEN ? crypto.createHash('sha256').update(TOKEN).digest('hex').slice(0, 16) : null;
+function authorized(req) {
+  if (!TOKEN) return true;
+  const m = /^Bearer\s+(.+)$/i.exec(String(req.headers.authorization || '').trim());
+  if (!m) return false;
+  const presented = Buffer.from(m[1].trim());
+  const expected = Buffer.from(TOKEN);
+  return presented.length === expected.length && crypto.timingSafeEqual(presented, expected);
 }
 
 const KLYPIX_MIME = 'application/vnd.klypix+zip';
@@ -615,10 +654,18 @@ const server = http.createServer((req, res) => {
     return sendJson(res, 200, agentCard(publicUrl));
   }
   if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/health')) {
-    return sendJson(res, 200, { name: 'klypix-a2a', version: PKG.version, agentCard: `${publicUrl}.well-known/agent-card.json` });
+    return sendJson(res, 200, {
+      name: 'klypix-a2a', version: PKG.version, agentCard: `${publicUrl}.well-known/agent-card.json`,
+      auth: TOKEN
+        ? { scheme: 'bearer', tokenFile: TOKEN_FILE, tokenFingerprint: TOKEN_FINGERPRINT }
+        : { scheme: 'none' },
+    });
   }
 
   if (req.method === 'POST') {
+    if (!authorized(req)) {
+      return sendJson(res, 401, rpcErr(null, -32001, `Unauthorized. Read the bearer token (same OS user) from ${TOKEN_FILE} and send "Authorization: Bearer <token>"; verify the server first via GET /health tokenFingerprint.`));
+    }
     const contentType = String(req.headers['content-type'] || '').split(';', 1)[0].trim().toLowerCase();
     if (contentType !== 'application/json') {
       return sendJson(res, 415, rpcErr(null, -32600, 'Content-Type must be application/json.'));
@@ -657,6 +704,7 @@ server.maxConnections = 16;
 
 server.listen(PORT, HOST, () => {
   log(`ready · vault=${VAULT}`);
+  log(TOKEN ? `auth: bearer (token file ${TOKEN_FILE} · fingerprint ${TOKEN_FINGERPRINT})` : 'auth: NONE (--no-auth) — any local process, including other OS users, can write');
   log(`agent card: http://${HOST}:${PORT}/.well-known/agent-card.json`);
   log(`A2A endpoint (JSON-RPC): http://${HOST}:${PORT}/`);
   // Bounded mode is lazy; legacy mode is the exact eager-prewarm rollback path.

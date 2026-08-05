@@ -34,7 +34,7 @@ import {
   isFastDecayCard, DECAY_STALE_MS, formatDecayAge,
   readPendingShips, clearPendingShips, pendingShipCards, formatCaptureReceipts,
 } from './klypix-format.mjs';
-import { capMessages, findProjectBrain } from './agent-presence.mjs';
+import { capMessages, findProjectBrain, neutralizeMarkers } from './agent-presence.mjs';
 import { brainCaptureLockPath, vaultCreateLockPath, withAdvisoryWriteLock } from './brain-write-lock.mjs';
 import {
   dot, embedTexts, getEmbedder, getEmbedderForUse, withRerankerForUse,
@@ -1132,7 +1132,9 @@ export async function opBrainMessage({ vault, canvas, text: msgText, to, via }) 
     // cap + collapse the target hint too — an oversized `to` would bloat the lane
     // file every hook of every session re-reads for 24h (and matches no one anyway)
     to: String(to || 'all').replace(/\s+/g, ' ').trim().slice(0, 64) || 'all',
-    text: txt.slice(0, 400), ts: now, seen: [],
+    // Neutralized at post (delivery surfaces neutralize again for forged rows):
+    // a message must never carry a HARVESTABLE capture marker into a peer's prompt.
+    text: neutralizeMarkers(txt.slice(0, 400)), ts: now, seen: [],
   };
   const got = laneLock(lock);
   // Lock timeout → REFUSE, never write: an unlocked read-modify-write of the

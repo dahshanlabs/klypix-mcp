@@ -243,6 +243,27 @@ ok(deadOut.sent === 0 && deadOut.reason === 'no-channel'
   && listActiveSessions({ brainPath: brainA, home: homeA, now: now + 1300 }).length === 1,
 'a dead/unreachable channel degrades to local-only presence with no throw (P1)');
 
+// Frame authenticity (optional per-brain MAC): signed frames verify; forged /
+// unsigned / tampered frames DROP when the receiver holds the key; no key
+// configured keeps today's behavior byte-identical.
+{
+  const KEY = 'per-brain-shared-key';
+  const signedOut = [];
+  relayOutbound({ sessions: aRows, consent: GRANT, machineId: 'mach-a', root: repoA, now, send: (f) => signedOut.push(f), key: KEY });
+  ok(signedOut.length > 0 && signedOut.every((f) => typeof f.mac === 'string' && f.mac.length === 32),
+    'with a key, every outbound frame carries a MAC');
+  const good = relayInbound(signedOut[0], { consent: GRANT, machineId: 'mach-b', now, key: KEY });
+  ok(good !== null, 'a correctly signed frame verifies and renders');
+  const tampered = { ...signedOut[0], sid: 'forged-session-id' };
+  ok(relayInbound(tampered, { consent: GRANT, machineId: 'mach-b', now, key: KEY }) === null,
+    'a tampered field invalidates the MAC — the frame drops');
+  const unsigned = { ...signedOut[0] }; delete unsigned.mac;
+  ok(relayInbound(unsigned, { consent: GRANT, machineId: 'mach-b', now, key: KEY }) === null,
+    'a keyed receiver drops unsigned frames (spoofed sid/machine cannot enter the lane)');
+  ok(relayInbound(unsigned, { consent: GRANT, machineId: 'mach-b', now }) !== null,
+    'no key configured → unsigned frames still accepted (compat path unchanged)');
+}
+
 fs.rmSync(tempRoot, { recursive: true, force: true });
 
 console.log(failures ? `\n[x] ${failures} presence-relay assertion(s) failed` : '\n[ok] presence-relay: all assertions passed');

@@ -720,8 +720,12 @@ function messageFooter(sid, tp, lib) {
     if (!delivered.length) return '';
     const ago = (ts) => { const mm = Math.max(0, Math.round((now - (ts || now)) / 60000)); return mm <= 0 ? 'just now' : `${mm}m ago`; };
     const out = ['', '## 📨 Message(s) from another session in this project (delivered once — act on or reply to them)'];
+    // Neutralize glyph-keyword adjacency in delivered text (🧠·BRAIN can't match
+    // the capture regex): a forged lane row must never plant a harvestable marker
+    // in this session's prompt. Mirrors agent-presence.neutralizeMarkers.
+    const neutral = (s) => String(s).replace(/🧠(\s*)(BRAIN|MSG)/gi, '🧠·$2');
     for (const m of delivered) {
-        out.push(`- from ${String(m.from || '?').slice(0, 8)} · ${ago(m.ts)}: ${String(m.text).replace(/\s+/g, ' ').trim().slice(0, 400)}`);
+        out.push(`- from ${String(m.from || '?').slice(0, 8)} · ${ago(m.ts)}: ${neutral(String(m.text)).replace(/\s+/g, ' ').trim().slice(0, 400)}`);
         // Engine-emitted LAST-KNOWN stamp — its own line, after the 400-char slice.
         const stamp = decayStampForMessage(m.text, m.ts, now, lib);
         if (stamp) out.push(`  ${stamp}`);

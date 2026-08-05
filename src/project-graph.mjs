@@ -7,7 +7,7 @@
 import fs from 'fs';
 import path from 'path';
 
-export const PROJECT_GRAPH_SCHEMA_VERSION = 1;
+export const PROJECT_GRAPH_SCHEMA_VERSION = 2;
 export const DEFAULT_PROJECT_GRAPH = 'graphify-out/graph.json';
 export const DEFAULT_PROJECT_GRAPH_HTML = 'graphify-out/graph.html';
 export const DEFAULT_PROJECT_GRAPH_REPORT = 'graphify-out/GRAPH_REPORT.md';
@@ -148,6 +148,11 @@ function normalizeGraph(raw, projectRoot, artifact) {
   return {
     schemaVersion: PROJECT_GRAPH_SCHEMA_VERSION,
     provider: 'graphify',
+    format: {
+      family: 'networkx-node-link',
+      sourceSchemaVersion: shortString(raw.schema_version ?? raw.schemaVersion, 80) || null,
+      providerVersion: shortString(raw?.metadata?.version ?? raw?.meta?.version ?? raw.generator_version, 80) || null,
+    },
     artifact,
     nodes,
     edges,
@@ -294,6 +299,7 @@ export function queryProjectGraph({ project, graphPath, query = '', depth = 1, m
   return {
     schemaVersion: PROJECT_GRAPH_SCHEMA_VERSION,
     provider: graph.provider,
+    format: graph.format,
     status: 'ready',
     query: String(query || ''),
     depth: hopLimit,
@@ -311,23 +317,52 @@ export function queryProjectGraph({ project, graphPath, query = '', depth = 1, m
   };
 }
 
+function edgeIdentity(edge) {
+  return `${edge.source}\u0000${edge.relation}\u0000${edge.target}\u0000${edge.confidence}`;
+}
+
+/**
+ * Compare two already-bounded query results. Artifact totals are exact; named
+ * node/edge changes describe only the returned neighborhoods and say so.
+ */
+export function compareProjectGraphResults(current, previous) {
+  if (!current || !previous || current.status !== 'ready' || previous.status !== 'ready') return null;
+  const oldNodes = new Map(previous.nodes.map(node => [node.id, node]));
+  const newNodes = new Map(current.nodes.map(node => [node.id, node]));
+  const oldEdges = new Map(previous.edges.map(edge => [edgeIdentity(edge), edge]));
+  const newEdges = new Map(current.edges.map(edge => [edgeIdentity(edge), edge]));
+  return {
+    graphNodesDelta: current.counts.graphNodes - previous.counts.graphNodes,
+    graphEdgesDelta: current.counts.graphEdges - previous.counts.graphEdges,
+    addedNodes: current.nodes.filter(node => !oldNodes.has(node.id)).slice(0, 80),
+    removedNodes: previous.nodes.filter(node => !newNodes.has(node.id)).slice(0, 80),
+    addedEdges: current.edges.filter(edge => !oldEdges.has(edgeIdentity(edge))).slice(0, 160),
+    removedEdges: previous.edges.filter(edge => !newEdges.has(edgeIdentity(edge))).slice(0, 160),
+    coverage: 'bounded-query-neighborhoods',
+    comparedArtifact: previous.artifact?.graphJson || null,
+  };
+}
+
 export function projectGraphContextMarkdown(result) {
   if (result.status === 'missing') {
     return `# Project Map\n\nNo supported project graph was found at \`${result.artifact.graphJson}\`. KLYPIX did not install or run a provider. Generate the artifact with Graphify, then retry.`;
   }
   const lines = result.nodes.map(node => {
-    const where = node.sourceFile ? ` â€” \`${node.sourceFile}${node.sourceLocation ? `:${node.sourceLocation}` : ''}\`` : '';
-    return `- **${node.label || node.id}** (${node.kind || 'symbol'})${where} Â· id \`${node.id}\``;
+    const where = node.sourceFile ? ` in \`${node.sourceFile}${node.sourceLocation ? `:${node.sourceLocation}` : ''}\`` : '';
+    return `- **${node.label || node.id}** (${node.kind || 'symbol'})${where}; id \`${node.id}\``;
   });
   const edgeLines = result.edges.slice(0, 80).map(edge =>
-    `- \`${edge.source}\` â€”${edge.relation}â†’ \`${edge.target}\` [${edge.confidence}]`);
+    `- \`${edge.source}\` --${edge.relation}--> \`${edge.target}\` [${edge.confidence}]`);
   const warnings = [];
   if (result.diagnostics?.unsafeSourcePaths) warnings.push(`${result.diagnostics.unsafeSourcePaths} unsafe/out-of-root source path(s) were withheld`);
   if (result.diagnostics?.danglingEdges) warnings.push(`${result.diagnostics.danglingEdges} dangling edge(s) were ignored`);
   return [
-    '# Project Map â€” code evidence',
-    `Provider artifact: \`${result.artifact.graphJson}\` Â· ${result.counts.graphNodes.toLocaleString()} nodes Â· ${result.counts.graphEdges.toLocaleString()} edges Â· query \`${result.query || '(overview)'}\`.`,
+    '# Project Map: code evidence',
+    `Provider artifact: \`${result.artifact.graphJson}\`; ${result.counts.graphNodes.toLocaleString()} nodes; ${result.counts.graphEdges.toLocaleString()} edges; query \`${result.query || '(overview)'}\`.`,
     warnings.length ? `Safety note: ${warnings.join('; ')}.` : '',
+    result.change ? `## Change from \`${result.change.comparedArtifact || 'comparison artifact'}\`\nExact total deltas: ${result.change.graphNodesDelta >= 0 ? '+' : ''}${result.change.graphNodesDelta} nodes; ${result.change.graphEdgesDelta >= 0 ? '+' : ''}${result.change.graphEdgesDelta} edges. Named additions and removals are limited to the two bounded query neighborhoods.` : '',
+    result.change?.addedNodes?.length ? `Added in bounded result: ${result.change.addedNodes.slice(0, 20).map(node => `\`${node.label || node.id}\``).join(', ')}.` : '',
+    result.change?.removedNodes?.length ? `Removed from bounded result: ${result.change.removedNodes.slice(0, 20).map(node => `\`${node.label || node.id}\``).join(', ')}.` : '',
     '## Relevant code nodes',
     lines.join('\n') || '_No matching code nodes._',
     edgeLines.length ? '## Relationships\n' + edgeLines.join('\n') : '',

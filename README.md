@@ -193,6 +193,27 @@ excludes the owning IDE/chat application's RAM, redacts command-line secrets, an
 brain or terminates a process. Multiple processes under one host are reported as parallel sessions,
 not called duplicates without an authoritative logical-session receipt.
 
+### Project Map: current structure beside project understanding
+
+If the project contains a compatible NetworkX node-link `graph.json`, agents can ask for bounded
+code-structure evidence and current brain context in one read-only call:
+
+```jsonc
+project_map_context {
+  "question": "what owns refresh-token rotation?",
+  "graph_path": "graphify-out/graph.json"
+}
+```
+
+Use `compare_to` with another project-relative graph artifact to add exact total node/edge deltas
+and additions/removals from the two bounded query neighborhoods. Both paths are confined to the
+declared project root; unsafe source paths are withheld; large or unsupported artifacts are
+rejected. The tool never writes graph facts into `brain.klypix`.
+
+Graphify is the first compatible producer. KLYPIX reads artifacts that users generate separately;
+it does not bundle, install, or run Graphify and does not imply a partnership. A compatible generic
+`graph.json` works through the same provider-neutral boundary.
+
 ---
 
 ## Supported hosts and their integration level

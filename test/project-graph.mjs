@@ -7,6 +7,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { buildKlypixMap } from '../src/klypix-format.mjs';
 import {
   clearProjectGraphCache,
+  compareProjectGraphResults,
   discoverProjectGraph,
   loadProjectGraph,
   projectGraphContextMarkdown,
@@ -64,6 +65,18 @@ try {
   ok(cached.cache === 'hit', 'small graphs are cached briefly for responsive repeated queries');
   clearProjectGraphCache();
 
+  const previousOut = path.join(root, 'previous');
+  fs.mkdirSync(previousOut);
+  fs.writeFileSync(path.join(previousOut, 'graph.json'), JSON.stringify({
+    nodes: graph.nodes.filter(node => node.id !== 'db'),
+    edges: graph.edges.filter(edge => edge.target !== 'db'),
+  }));
+  const previous = queryProjectGraph({ project: root, graphPath: 'previous/graph.json', query: 'login auth', depth: 1, maxNodes: 3 });
+  result.change = compareProjectGraphResults(result, previous);
+  ok(result.change.graphNodesDelta === 1 && result.change.graphEdgesDelta === 1, 'comparison reports exact artifact total deltas');
+  ok(result.change.coverage === 'bounded-query-neighborhoods', 'comparison labels named changes as bounded evidence');
+  ok(projectGraphContextMarkdown(result).includes('Exact total deltas'), 'human output explains comparison precision');
+
   const client = new Client({ name: 'project-map-test', version: '1.0.0' }, { capabilities: {} });
   const serverBin = fileURLToPath(new URL('../bin/klypix-mcp.mjs', import.meta.url));
   const testHome = path.join(root, '.test-home');
@@ -86,11 +99,12 @@ try {
     ok(tools.includes('project_map_context'), 'the published MCP surface exposes the combined Project Map tool');
     const combined = await client.callTool({
       name: 'project_map_context',
-      arguments: { question: 'where is login validation?', project: root, max_nodes: 5, k: 3 },
+      arguments: { question: 'where is login validation?', project: root, compare_to: 'previous/graph.json', max_nodes: 5, k: 3 },
     });
     const combinedText = (combined.content || []).filter(block => block.type === 'text').map(block => block.text).join('\n');
     ok(combinedText.includes('AuthService') && combinedText.includes('API routes must stay transport-only'), 'combined context returns current code evidence beside brain rationale');
     ok(combined.structuredContent?.projectGraph?.counts?.returnedNodes > 0, 'combined context includes a machine-readable bounded subgraph');
+    ok(combined.structuredContent?.projectGraph?.change?.graphNodesDelta === 1, 'combined context exposes the safe graph comparison');
   } finally {
     await client.close().catch(() => {});
   }

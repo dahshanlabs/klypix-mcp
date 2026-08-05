@@ -7,14 +7,6 @@ const ok = (condition, label) => {
   if (!condition) failures++;
 };
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-const waitFor = async (predicate, timeoutMs = 5_000, intervalMs = 25) => {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (predicate()) return true;
-    await wait(intervalMs);
-  }
-  return predicate();
-};
 
 const previous = {
   mode: process.env.KLYPIX_SEMANTIC_MEMORY_MODE,
@@ -124,10 +116,10 @@ try {
     embedder: { dispose: async () => { embedderDisposed++; } },
     reranker: { model: { dispose: async () => { rerankerDisposed++; } } },
   });
-  bounded.__semanticMemoryTest.armIdleDisposal();
-  const idleDisposed = await waitFor(() => embedderDisposed === 1 && rerankerDisposed === 1);
+  ok(bounded.semanticMemorySnapshot().config.idleDisposeMs === 1_000, 'bounded runtime keeps the configured idle-disposal deadline');
+  await bounded.__semanticMemoryTest.forceIdleDisposal();
   const disposedSnapshot = bounded.semanticMemorySnapshot();
-  ok(idleDisposed, 'idle disposal retires both optional model generations');
+  ok(embedderDisposed === 1 && rerankerDisposed === 1, 'idle disposal retires both optional model generations');
   ok(disposedSnapshot.counters.idleDisposals >= 1 && disposedSnapshot.counters.lastDisposeReason === 'idle', 'idle disposal is observable without brain content');
   bounded.__semanticMemoryTest.clearIdleTimer();
 

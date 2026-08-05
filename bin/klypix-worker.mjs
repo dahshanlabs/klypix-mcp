@@ -30,7 +30,7 @@ import {
   opBrainInsights, opBrainConnect, opBrainReconcile, opBrainGarden, opCreateCanvas, opAddToCanvas, opBrainNote, opBrainMessage, opBrainAsk, opBrainChallenge, opCanvasView, opBrainLens,
   opBrainTaskContext,
 } from '../src/klypix-core.mjs';
-import { compareProjectGraphResults, projectGraphContextMarkdown, queryProjectGraph } from '../src/project-graph.mjs';
+import { compareProjectGraphResults, projectGraphContextMarkdown, queryProjectGraph, suggestProjectGraphBrainLinks } from '../src/project-graph.mjs';
 import { auditProject, compactAgentsBrief, linkProject, mcpServerEntry } from '../src/agent-rules.mjs';
 import { createMcpPresence, KLYPIX_MCP_INSTRUCTIONS } from '../src/mcp-presence.mjs';
 import {
@@ -309,10 +309,14 @@ server.registerTool('project_map_context', {
     .filter(block => block.kind === 'text')
     .map(block => block.text)
     .join('\n\n');
+  const evidenceLinkProposals = suggestProjectGraphBrainLinks(graphResult, brainResult.context);
+  const proposalMarkdown = evidenceLinkProposals.length
+    ? `\n\n## Exact-path evidence link proposals\n\n${evidenceLinkProposals.slice(0, 12).map(proposal => `- Review brain card \`${proposal.brainCardId}\` beside **${proposal.nodeLabel}** in \`${proposal.sourceFile}\`.`).join('\n')}\n\n_These are review proposals based only on an exact source-path mention. Nothing was written to the brain._`
+    : '';
   return toContent({
-    blocks: [{ kind: 'text', text: `${graphMarkdown}\n\n---\n\n# Project Brain - ${deep_history ? 'decisions and history' : 'current decisions and corrections'}\n\n${brainMarkdown}` }],
+    blocks: [{ kind: 'text', text: `${graphMarkdown}\n\n---\n\n# Project Brain - ${deep_history ? 'decisions and history' : 'current decisions and corrections'}\n\n${brainMarkdown}${proposalMarkdown}` }],
     isError: brainResult.isError,
-    structured: { projectGraph: graphResult, brainContext: brainResult.context || null, deepHistory: deep_history === true },
+    structured: { projectGraph: graphResult, brainContext: brainResult.context || null, evidenceLinkProposals, deepHistory: deep_history === true },
   });
 });
 

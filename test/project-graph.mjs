@@ -12,6 +12,7 @@ import {
   loadProjectGraph,
   projectGraphContextMarkdown,
   queryProjectGraph,
+  suggestProjectGraphBrainLinks,
 } from '../src/project-graph.mjs';
 
 let failures = 0;
@@ -43,7 +44,7 @@ fs.writeFileSync(path.join(out, 'graph.html'), '<!doctype html><title>Graph</tit
 fs.writeFileSync(path.join(out, 'GRAPH_REPORT.md'), '# Graph');
 fs.writeFileSync(path.join(root, 'brain.klypix'), await buildKlypixMap({
   title: 'brain',
-  areas: [{ title: 'Architecture', cards: [{ text: 'AuthService owns login validation because API routes must stay transport-only.' }] }],
+  areas: [{ title: 'Architecture', cards: [{ text: 'AuthService in src/auth.ts owns login validation because API routes must stay transport-only.' }] }],
 }));
 
 try {
@@ -60,6 +61,8 @@ try {
   ok(result.nodes.some(node => node.id === 'login') && result.nodes.some(node => node.id === 'auth'), 'query returns lexical seeds plus a bounded graph neighborhood');
   ok(result.edges.some(edge => edge.source === 'login' && edge.target === 'auth'), 'query preserves evidence relationships');
   ok(projectGraphContextMarkdown(result).includes('Graph evidence describes the current generated artifact'), 'human output states the graph/brain truth boundary');
+  const proposals = suggestProjectGraphBrainLinks(result, { hits: [{ id: 'brain-auth', area: 'Architecture', text: 'Decision anchored to `src/auth.ts`.' }, { id: 'near-match', area: 'Notes', text: 'auth.ts is interesting' }] });
+  ok(proposals.length === 1 && proposals[0].brainCardId === 'brain-auth' && proposals[0].status === 'review-proposal', 'link proposals require an exact project-relative source path and remain proposals');
 
   const cached = loadProjectGraph({ project: root });
   ok(cached.cache === 'hit', 'small graphs are cached briefly for responsive repeated queries');
@@ -105,6 +108,8 @@ try {
     ok(combinedText.includes('AuthService') && combinedText.includes('API routes must stay transport-only'), 'combined context returns current code evidence beside brain rationale');
     ok(combined.structuredContent?.projectGraph?.counts?.returnedNodes > 0, 'combined context includes a machine-readable bounded subgraph');
     ok(combined.structuredContent?.projectGraph?.change?.graphNodesDelta === 1, 'combined context exposes the safe graph comparison');
+    ok(combined.structuredContent?.evidenceLinkProposals?.some(proposal => proposal.sourceFile === 'src/auth.ts'), 'combined context proposes exact-path brain evidence links without writing them');
+    ok(combinedText.includes('Nothing was written to the brain'), 'human output states the proposal and write boundary');
   } finally {
     await client.close().catch(() => {});
   }

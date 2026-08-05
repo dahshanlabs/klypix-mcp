@@ -1135,6 +1135,10 @@ export async function opBrainMessage({ vault, canvas, text: msgText, to, via }) 
     text: txt.slice(0, 400), ts: now, seen: [],
   };
   const got = laneLock(lock);
+  // Lock timeout → REFUSE, never write: an unlocked read-modify-write of the
+  // whole lane can permanently erase a peer's just-posted undelivered message
+  // (the exact loss class touchSession already refuses). Retry is cheap.
+  if (!got) return err('brain_message deferred: the coordination lane is busy (another session is writing). Nothing was posted — retry in a moment.');
   let live = 0;
   try {
     let data = {}; try { data = JSON.parse(fs.readFileSync(laneFile, 'utf8')); } catch { /* fresh lane */ }
@@ -1146,10 +1150,13 @@ export async function opBrainMessage({ vault, canvas, text: msgText, to, via }) 
     // Delivered-first eviction + ...data spread — the other two lane writers were
     // converted in the 2026-07-29 overhaul; a flat slice here still destroyed the
     // oldest UNDELIVERED note at cap (review-caught).
-    fs.writeFileSync(laneFile, JSON.stringify({ ...data, sessions, messages: capMessages(kept, 30) }));
+    // tmp+rename so lock-free readers can never parse a torn lane as "no messages".
+    const tmp = `${laneFile}.tmp-${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify({ ...data, sessions, messages: capMessages(kept, 30) }));
+    fs.renameSync(tmp, laneFile);
   } catch (e) {
     return err(`brain_message failed: ${e.message}`);
-  } finally { if (got) { try { fs.unlinkSync(lock); } catch { /* */ } } }
+  } finally { try { fs.unlinkSync(lock); } catch { /* */ } }
   return { blocks: [text(`📨 posted to this project's coordination lane (to: ${msg.to}) — ${live} active presence-wired session(s) right now; each receives it once through its lifecycle adapter or next brain_sync / KLYPIX tool call. Ephemeral (24h), not a brain card — use brain_note for durable decisions.`)] };
 }
 

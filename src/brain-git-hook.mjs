@@ -31,26 +31,11 @@ import { execSync } from 'child_process';
 const CWD = process.argv[2] || process.cwd();
 const BRAIN = path.resolve(CWD, 'brain.klypix');
 const STATE = path.resolve(CWD, '.claude', 'brain-last-commit-git');
-const LOCK = path.resolve(CWD, '.claude', 'brain-capture.lock'); // SAME lock the Claude-Code Stop hook uses
-
-// Advisory lockfile (mirrors global-brain-hook.mjs): O_EXCL create wins; a held
-// lock is waited on (sync sleep, no busy-spin); a STALE lock is stolen so a
-// crashed writer can't wedge the brain. Best-effort — write anyway past budget.
-const LOCK_STALE_MS = 15000;
-const sleepSync = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* */ } };
-function acquireLock(lockPath, { tries = 60, waitMs = 60 } = {}) {
-    try { fs.mkdirSync(path.dirname(lockPath), { recursive: true }); } catch { /* */ }
-    for (let i = 0; i < tries; i++) {
-        try { const fd = fs.openSync(lockPath, 'wx'); fs.writeSync(fd, String(process.pid)); fs.closeSync(fd); return true; }
-        catch (e) {
-            if (e && e.code !== 'EEXIST') return false;
-            try { if (Date.now() - fs.statSync(lockPath).mtimeMs > LOCK_STALE_MS) { fs.unlinkSync(lockPath); continue; } } catch { /* lost a race on the stale file — retry */ }
-            sleepSync(waitMs);
-        }
-    }
-    return false;
-}
-function releaseLock(lockPath) { try { fs.unlinkSync(lockPath); } catch { /* */ } }
+// The SAME cross-process lock the Stop hook, MCP engine, and desktop app use —
+// imported from brain-write-lock.mjs (heartbeat + token-checked release), so
+// there is exactly ONE lock implementation. On timeout this hook REFUSES to
+// write and leaves its commit baseline untouched, so the same commits re-scan
+// on the next commit instead of clobbering a peer's just-merged cards.
 
 const git = (a) => execSync(`git ${a}`, { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 4000 }).trim();
 const slug = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
@@ -94,12 +79,24 @@ async function main() {
     if (!candidates.length) { writePrev(head); return; }
 
     const lib = await import('./klypix-format.mjs');               // lazy: only when there's something to write
+    let lockLib = null;
+    try { lockLib = await import('./brain-write-lock.mjs'); } catch { /* stale bundle without the module */ }
+    if (!lockLib || typeof lockLib.withAdvisoryWriteLock !== 'function') {
+        // Fail SAFE: without the shared lock we must not read-modify-write at
+        // all. The baseline stays, so these commits re-scan next commit, and the
+        // Stop hook (which dedups by #commit-hash) records them meanwhile.
+        try { process.stderr.write('[klypix-brain] git capture skipped: shared lock module unavailable (stale bundle) — commits re-scan on the next commit\n'); } catch { /* */ }
+        return;
+    }
     // Read-modify-write UNDER the shared lock so a concurrent Claude-Code Stop
-    // hook can't clobber this batch (or vice-versa). Inside the lock, dedup
-    // against commits ALREADY in the brain so neither a re-run nor the Stop hook
-    // double-records the same commit.
-    const gotLock = acquireLock(LOCK);
-    try {
+    // hook or desktop save can't clobber this batch (or vice-versa). Inside the
+    // lock, dedup against commits ALREADY in the brain so neither a re-run nor
+    // the Stop hook double-records the same commit.
+    await lockLib.withAdvisoryWriteLock(lockLib.brainCaptureLockPath(BRAIN), async (locked) => {
+        if (!locked) {
+            try { process.stderr.write('[klypix-brain] git capture deferred: the brain lock is held — commits re-scan on the next commit\n'); } catch { /* */ }
+            return;
+        }
         const buf = fs.readFileSync(BRAIN);
         const already = new Set();
         try {
@@ -116,8 +113,6 @@ async function main() {
         await lib.atomicWrite(BRAIN, out);
         writePrev(head);
         try { process.stderr.write(`[klypix-brain] git capture: ${res.stats?.added ?? cards.length} commit card(s) → brain.klypix\n`); } catch { /* */ }
-    } finally {
-        if (gotLock) releaseLock(LOCK);
-    }
+    }, { tries: 100, waitMs: 60 });
 }
 main().catch(() => { /* never break a commit */ }).finally(() => process.exit(0));

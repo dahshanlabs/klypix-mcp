@@ -19,6 +19,7 @@
 
 import fs from 'fs';
 import { appendToKlypix, atomicWrite } from '../src/klypix-format.mjs';
+import { brainCaptureLockPath, withAdvisoryWriteLock } from '../src/brain-write-lock.mjs';
 
 const args = process.argv.slice(2);
 const file = args.find(a => !a.startsWith('--'));
@@ -32,12 +33,21 @@ try {
     addition = JSON.parse(raw);
 } catch (e) { console.error('Addition is not valid JSON:', e.message); process.exit(2); }
 
-let buf;
-try {
-    buf = await appendToKlypix(fs.readFileSync(file), addition);
-} catch (e) { console.error(e.message); process.exit(1); }
-
-await atomicWrite(file, buf);
+// Read-modify-write under the SAME cross-process lock as the MCP engine, hooks,
+// and desktop app; racing them unlocked is silent last-writer-wins loss.
+const wrote = await withAdvisoryWriteLock(brainCaptureLockPath(file), async (locked) => {
+    if (!locked) return false;
+    let buf;
+    try {
+        buf = await appendToKlypix(fs.readFileSync(file), addition);
+    } catch (e) { console.error(e.message); process.exit(1); }
+    await atomicWrite(file, buf);
+    return true;
+}, { tries: 100, waitMs: 60 });
+if (!wrote) {
+    console.error('append-klypix refused (file unchanged): the write lock is held by another writer — retry in a moment.');
+    process.exit(1);
+}
 const cardCount = Array.isArray(addition.cards) ? addition.cards.length : 0;
 const connCount = Array.isArray(addition.connections) ? addition.connections.length : 0;
 console.log(`Appended ${cardCount} card(s), ${connCount} connection(s) to ${file}.`);

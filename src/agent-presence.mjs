@@ -107,6 +107,15 @@ function releaseLock(lockFile) {
   catch { /* best effort */ }
 }
 
+// tmp+rename so lock-free readers (readLane, messageFooter, peers' status
+// lines) can never parse a torn lane as an authoritative "0 peers / no
+// messages", and a crash mid-write can never destroy undelivered messages.
+function writeLaneFileAtomic(laneFile, payload) {
+  const tmp = `${laneFile}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+  fs.writeFileSync(tmp, payload);
+  fs.renameSync(tmp, laneFile);
+}
+
 function freshChannelSeen(channelSeen, now) {
   if (!channelSeen || typeof channelSeen !== 'object' || Array.isArray(channelSeen)) return {};
   return Object.fromEntries(Object.entries(channelSeen)
@@ -266,7 +275,7 @@ export function upsertSession({
     const kept = sessions.filter((session) => session.id !== id);
     kept.push(next);
     fs.mkdirSync(path.dirname(laneFile), { recursive: true });
-    fs.writeFileSync(laneFile, JSON.stringify({
+    writeLaneFileAtomic(laneFile, JSON.stringify({
       ...data,
       sessions: kept.slice(-40),
       messages: capMessages(pruneMessages(data.messages, now), 30),
@@ -323,7 +332,7 @@ export function upsertRemoteSessions({ brainPath, rows, machineId = MACHINE_ID, 
       else sessions.push(next);
     }
     fs.mkdirSync(path.dirname(laneFile), { recursive: true });
-    fs.writeFileSync(laneFile, JSON.stringify({
+    writeLaneFileAtomic(laneFile, JSON.stringify({
       ...data,
       sessions: sessions.slice(-40),
       messages: capMessages(pruneMessages(data.messages, now), 30),
@@ -347,7 +356,7 @@ export function purgeRemoteSessions({ brainPath, home, now = Date.now() }) {
     const data = readLane(laneFile);
     const sessions = pruneSessions(data.sessions, now).filter((session) => session.via !== 'cloud');
     fs.mkdirSync(path.dirname(laneFile), { recursive: true });
-    fs.writeFileSync(laneFile, JSON.stringify({
+    writeLaneFileAtomic(laneFile, JSON.stringify({
       ...data,
       sessions,
       messages: capMessages(pruneMessages(data.messages, now), 30),
@@ -385,7 +394,7 @@ export function removeSession({ brainPath, id, channel = null, home, now = Date.
       });
     }
     fs.mkdirSync(path.dirname(laneFile), { recursive: true });
-    fs.writeFileSync(laneFile, JSON.stringify({
+    writeLaneFileAtomic(laneFile, JSON.stringify({
       ...data,
       sessions,
       messages: capMessages(pruneMessages(data.messages, now), 30),
@@ -469,7 +478,7 @@ export function receiveMessages({
         if (!Array.isArray(message.seen)) message.seen = [];
         if (!message.seen.includes(sessionId)) message.seen.push(sessionId);
       }
-      fs.writeFileSync(laneFile, JSON.stringify({ ...data, sessions, messages }));
+      writeLaneFileAtomic(laneFile, JSON.stringify({ ...data, sessions, messages }));
     }
     return delivered;
   } finally {
@@ -558,7 +567,7 @@ export function postPresenceMessage({
     };
     messages.push(message);
     fs.mkdirSync(path.dirname(laneFile), { recursive: true });
-    fs.writeFileSync(laneFile, JSON.stringify({
+    writeLaneFileAtomic(laneFile, JSON.stringify({
       ...data,
       sessions,
       messages: capMessages(messages, 30),

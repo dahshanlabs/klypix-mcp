@@ -28,8 +28,22 @@ async function acquire(lockPath, { tries, waitMs, staleMs }) {
     } catch (error) {
       if (error?.code !== 'EEXIST') return null;
       try {
+        // Stale steal via rename, not stat→unlink: rename atomically claims the
+        // REMOVAL (a second stealer gets ENOENT and just retries), and the token
+        // check below detects the losing race — a FRESH successor lock that
+        // slipped in between our stat and our rename is put back, never deleted.
+        const observed = fs.readFileSync(lockPath, 'utf8');
         if (Date.now() - fs.statSync(lockPath).mtimeMs > staleMs) {
-          fs.unlinkSync(lockPath);
+          const graveyard = `${lockPath}.stale-${process.pid}-${Math.random().toString(36).slice(2)}`;
+          fs.renameSync(lockPath, graveyard);
+          let stolen = null;
+          try { stolen = fs.readFileSync(graveyard, 'utf8'); } catch { /* already gone */ }
+          if (stolen !== null && stolen !== observed) {
+            // We displaced a fresh owner. Restore its token if the slot is still
+            // free ('wx' never overwrites); if not, its own token checks refuse.
+            try { fs.writeFileSync(lockPath, stolen, { flag: 'wx' }); } catch { /* slot re-taken */ }
+          }
+          try { fs.unlinkSync(graveyard); } catch { /* our unique file; best-effort */ }
           continue;
         }
       } catch { /* another process changed the lock; retry normally */ }

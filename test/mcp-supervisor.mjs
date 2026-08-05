@@ -9,7 +9,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 
@@ -42,6 +42,23 @@ function workerSource(version, { extraTool = false, removeVersion = false, prese
 import readline from 'readline';
 const VERSION = ${JSON.stringify(version)};
 const PRESENCE = ${JSON.stringify(presence)};
+// A presence-owning fixture must behave like the REAL worker: it registers its
+// lane row and REMOVES it on shutdown. Without the removal, a supervisor that
+// fails to hold the row still looks correct — exactly how the first takeover
+// implementation passed its test and lost the row against the real worker.
+let PRES = null;
+if (PRESENCE) {
+  PRES = await import(${JSON.stringify(pathToFileURL(path.join(HERE, '..', 'src', 'agent-presence.mjs')).href)});
+  const id = process.env.KLYPIX_SESSION_ID || PRESENCE.id;
+  PRES.upsertSession({ brainPath: PRESENCE.brain, id, client: 'stub-client', surface: 'stub', branch: 'main', channel: 'mcp' });
+  const bye = () => {
+    try { PRES.removeSession({ brainPath: PRESENCE.brain, id, channel: 'mcp' }); } catch {}
+    process.exit(0);
+  };
+  process.stdin.on('end', bye);
+  process.stdin.on('close', bye);
+  process.on('SIGTERM', bye);
+}
 const TOOLS = ${JSON.stringify(toolNames)}.map(name => ({
   name,
   description: name,

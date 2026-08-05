@@ -415,7 +415,9 @@ class Supervisor {
     this.hibernations++;
     this.active = null;
     this.status = 'hibernated';
-    this.retireWorker(worker, 350);   // grace so the worker's own cleanup runs
+    // A connection that owns a row must NOT let the worker remove it on the way
+    // out; one without a row retires gracefully as usual.
+    this.retireWorker(worker, 350, { preservePresence: Boolean(this.presenceIdentity) });
     this.startPresenceHeartbeat();
     this.writeState();
     log(`worker hibernated after ${Math.round((Date.now() - last) / 1000)}s idle — wakes on the next request${this.presenceIdentity ? ' (presence held by the supervisor)' : ''}`);
@@ -443,7 +445,17 @@ class Supervisor {
         });
       } catch { /* presence upkeep is best-effort; TTL is the backstop */ }
     };
+    // ORDER MATTERS (caught by real-worker measurement, not by the fixture):
+    // the retiring worker calls removeSession during its shutdown grace, so a
+    // single beat fired now is immediately UNDONE and the row would stay gone
+    // until the 60s tick — i.e. the session disappears from every peer for a
+    // minute. Re-assert across the whole grace window, then settle into the
+    // normal cadence.
     beat();
+    for (const delay of [500, 1_200, 2_500, 5_000]) {
+      const t = setTimeout(() => { if (this.presenceHeartbeat) beat(); }, delay);
+      t.unref?.();
+    }
     this.presenceHeartbeat = setInterval(beat, 60_000);
     this.presenceHeartbeat.unref?.();
   }
@@ -943,9 +955,18 @@ class Supervisor {
     }
   }
 
-  retireWorker(worker, graceMs = 250) {
+  retireWorker(worker, graceMs = 250, { preservePresence = false } = {}) {
     if (!worker || worker.exited) return;
     worker.retiring = true;
+    if (preservePresence) {
+      // HIBERNATION ONLY. stdin EOF triggers the worker's graceful stop, which
+      // REMOVES its presence row — correct when the connection is ending, wrong
+      // when it is merely sleeping (the supervisor is about to hold that row).
+      // Signal-terminate instead so the row is never removed and peers observe
+      // no gap at all, not even a sub-second one.
+      try { worker.child.kill('SIGTERM'); } catch { /* */ }
+      return;
+    }
     try { worker.child.stdin.end(); } catch { /* */ }
     if (graceMs <= 0) {
       try { worker.child.kill('SIGTERM'); } catch { /* */ }

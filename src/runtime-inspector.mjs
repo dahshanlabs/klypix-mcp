@@ -181,6 +181,10 @@ export function buildRuntimeReport({
     if (launchers.length) flags.push('npx-launcher-chain');
     if (!requestedVault || requestedVault === '.') flags.push('default-root');
     if (!host) flags.push('host-unattributed');
+    // Phase 2 visibility: a hibernated pair is a supervisor with NO worker by
+    // design — without this flag it reads like a missing/crashed worker.
+    const hibernating = state?.status === 'hibernated';
+    if (hibernating) flags.push('worker-hibernated');
     connections.push({
       id: state?.connectionId || `pid-${supervisor?.pid || worker?.pid}`,
       client: state?.clientInfo?.name || (host ? classifyHostProcess(host) : 'unknown'),
@@ -206,6 +210,9 @@ export function buildRuntimeReport({
       vault,
       requestedVault,
       rssMb: roundMb(rssBytes),
+      hibernation: state?.hibernation
+        ? { hibernated: hibernating, idleMs: state.hibernation.idleMs ?? null, since: state.hibernation.since || null, count: state.hibernation.count || 0 }
+        : null,
       flags,
       processIds,
     });
@@ -242,13 +249,30 @@ export function buildRuntimeReport({
     .map(([key, connectionIds]) => ({ key, connectionIds, verdict: 'parallel-not-proven-duplicate' }));
 
   const totalMb = Math.round((roleTotals.workersMb + roleTotals.supervisorsMb + roleTotals.launchersMb) * 10) / 10;
+  // Measured, not modelled: the mean resident worker is what a hibernated pair
+  // is NOT paying. Reported only when at least one worker is resident, so the
+  // number is always derived from this machine rather than a guess.
+  const residentWorkers = connections.filter((item) => item.worker);
+  const hibernated = connections.filter((item) => item.hibernation?.hibernated);
+  const avgWorkerMb = residentWorkers.length
+    ? Math.round((residentWorkers.reduce((sum, item) => sum + number(item.worker.rssMb), 0) / residentWorkers.length) * 10) / 10
+    : null;
   return {
     schemaVersion: 1,
     sampledAt: new Date(sampledAt).toISOString(),
     platform,
     passive: true,
     mutated: false,
-    totals: { connections: connections.length, ...roleTotals, totalMb },
+    totals: {
+      connections: connections.length,
+      ...roleTotals,
+      totalMb,
+      hibernatedConnections: hibernated.length,
+      avgResidentWorkerMb: avgWorkerMb,
+      estimatedHibernationSavingsMb: avgWorkerMb !== null && hibernated.length
+        ? Math.round(avgWorkerMb * hibernated.length * 10) / 10
+        : 0,
+    },
     connections: connections.sort((a, b) => b.rssMb - a.rssMb),
     parallelConnectionGroups,
     safety: {
@@ -276,8 +300,11 @@ export function formatRuntimeReport(report) {
   const lines = [
     `KLYPIX RUNTIME V2 — PASSIVE — ${report?.sampledAt || ''}`,
     `Connections ${t.connections || 0} · workers ${t.workersMb || 0} MB · supervisors ${t.supervisorsMb || 0} MB · launchers ${t.launchersMb || 0} MB · total ${t.totalMb || 0} MB`,
+    t.hibernatedConnections
+      ? `Hibernated ${t.hibernatedConnections} connection(s) — about ${t.estimatedHibernationSavingsMb} MB not resident (mean resident worker ${t.avgResidentWorkerMb} MB); each wakes on its next request.`
+      : '',
     '',
-  ];
+  ].filter((line, index) => line !== '' || index > 1);
   for (const item of report?.connections || []) {
     const host = item.host ? `${item.host.kind}:${item.host.pid}` : 'host:unknown';
     const processBits = [

@@ -3,3 +3,4 @@ node_modules/
 .claude/brain-capture-log.jsonl
 .claude/brain-last-commit*
 .claude/brain-rule-drafts.json
+.claude/brain-pending-ships.jsonl

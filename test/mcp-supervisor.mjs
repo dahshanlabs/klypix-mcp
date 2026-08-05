@@ -106,7 +106,7 @@ function activate(worker, version) {
 }
 
 const textOf = result => result?.content?.find(block => block.type === 'text')?.text;
-const waitFor = async (fn, timeout = 6000) => {
+const waitFor = async (fn, timeout = 15000) => {   // generous: crash→respawn→handshake under a loaded machine legitimately exceeds 6s
   const end = Date.now() + timeout;
   let last;
   while (Date.now() < end) {

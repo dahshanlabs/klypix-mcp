@@ -251,6 +251,13 @@ class Supervisor {
     this.stateFile = path.join(this.stateDir, `${process.pid}.json`);
     this.connectionId = String(options.connectionId || crypto.randomUUID());
     this.parentPid = Number(process.ppid) || null;
+    // Default-root detection: IDE hosts often launch from their install dir
+    // with no --vault/KLYPIX_VAULT, so the pair boots against ~/Documents and
+    // idles there. Flagging it in the state file lets doctor/runtime name these
+    // pairs explicitly instead of them hiding inside the aggregate RAM number.
+    const vaultFlagAt = this.workerArgs ? this.workerArgs.indexOf('--vault') : -1;
+    this.vaultArg = vaultFlagAt >= 0 ? String(this.workerArgs[vaultFlagAt + 1] || '') : null;
+    this.defaultRoot = !this.vaultArg && !process.env.KLYPIX_VAULT;
     this.clientInfo = null;
     this.lastHostMessageAt = null;
     this.lastActivityStateWriteAt = 0;
@@ -288,6 +295,8 @@ class Supervisor {
         pid: process.pid,
         connectionId: this.connectionId,
         parentPid: this.parentPid,
+        vault: this.vaultArg ? this.vaultArg.replace(/\\/g, '/') : null,
+        defaultRoot: this.defaultRoot,
         cwd: process.cwd().replace(/\\/g, '/'),
         bootedAt: this.bootedAt,
         updatedAt: new Date().toISOString(),
@@ -502,11 +511,24 @@ class Supervisor {
   }
 
   failInflight(message) {
-    for (const id of this.hostRequests.values()) {
+    for (const { id } of this.hostRequests.values()) {
       this.sendHost({ jsonrpc: '2.0', id, error: { code: -32603, message } });
     }
     this.hostRequests.clear();
     this.workerRequests.clear();
+  }
+
+  // A host request the worker never answers must not pin active+candidate
+  // workers (2× RAM) forever: past the deadline we answer the host with an
+  // error (its own client timeout has long fired) and stop counting it against
+  // candidate commit.
+  expireAbandonedRequests(maxAgeMs = 120_000) {
+    const cutoff = Date.now() - maxAgeMs;
+    for (const [key, entry] of this.hostRequests) {
+      if ((entry?.ts || 0) >= cutoff) continue;
+      this.hostRequests.delete(key);
+      this.sendHost({ jsonrpc: '2.0', id: entry.id, error: { code: -32603, message: 'KLYPIX worker did not answer this request within 120s; it was abandoned so a pending worker swap can proceed.' } });
+    }
   }
 
   captureTaskScope(message) {
@@ -581,7 +603,7 @@ class Supervisor {
     this.captureTaskScope(message);
 
     if (message?.method && Object.prototype.hasOwnProperty.call(message, 'id')) {
-      this.hostRequests.set(idKey(message.id), message.id);
+      this.hostRequests.set(idKey(message.id), { id: message.id, ts: Date.now() });
     } else if (!message?.method && Object.prototype.hasOwnProperty.call(message, 'id')) {
       this.workerRequests.delete(idKey(message.id));
     }
@@ -731,6 +753,7 @@ class Supervisor {
 
   maybeCommitCandidate() {
     if (!this.candidate?.ready) return;
+    this.expireAbandonedRequests();
     if (this.hostRequests.size || this.workerRequests.size) return;
     const next = this.candidate;
     const previous = this.active;
@@ -885,6 +908,20 @@ class Supervisor {
     );
     this.autoUpdatePoller.unref?.();
 
+    // Host watchdog: shutdown is otherwise 100% stdin-EOF-dependent, and a
+    // host that dies holding pipes open (or a wedged IDE) pinned this pair —
+    // supervisor AND worker — indefinitely. The parent pid is a cheap,
+    // platform-neutral liveness signal; EPERM still means alive.
+    if (this.parentPid && this.parentPid > 1) {
+      this.parentWatchdog = setInterval(() => {
+        try { process.kill(this.parentPid, 0); }
+        catch (error) {
+          if (error?.code !== 'EPERM') { log('host process is gone — closing the connection pair'); this.close(); }
+        }
+      }, 30_000);
+      this.parentWatchdog.unref?.();
+    }
+
     await new Promise(resolve => {
       this.resolveRun = resolve;
       process.stdin.once('end', () => this.close());
@@ -898,12 +935,22 @@ class Supervisor {
     if (this.closed) return;
     this.closed = true;
     clearInterval(this.poller);
+    clearInterval(this.parentWatchdog);
     clearTimeout(this.autoUpdateStarter);
     clearInterval(this.autoUpdatePoller);
     if (this.recoveryTimer) { clearTimeout(this.recoveryTimer); this.recoveryTimer = null; }
-    for (const worker of [this.active, this.candidate, this.standby]) this.retireWorker(worker, 0);
+    // Real shutdown grace: stdin EOF lets the worker run its own presence
+    // cleanup (stopRuntimePresence/removeSession). An instant SIGTERM is
+    // TerminateProcess on Windows — the cleanup never runs and every normally
+    // closed session leaves a ghost "live" lane row for the TTL window (the
+    // "cleans up automatically" claim was false on exactly this path). SIGTERM
+    // stays as the 350ms backstop; the deliberately NOT-unref'd exit delay
+    // holds this process open just long enough to deliver it.
+    const workers = [this.active, this.candidate, this.standby].filter(w => w && !w.exited);
+    for (const worker of workers) this.retireWorker(worker, 350);
     try { fs.unlinkSync(this.stateFile); } catch { /* */ }
-    this.resolveRun?.();
+    if (workers.length) setTimeout(() => this.resolveRun?.(), 400);
+    else this.resolveRun?.();
   }
 }
 

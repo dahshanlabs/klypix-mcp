@@ -474,7 +474,22 @@ export function createMcpPresence({
       files: details.files,
       replaceFiles: details.replaceFiles === true,
     });
-    timer = setIntervalFn(() => touch(), Math.max(5_000, Number(heartbeatMs) || MCP_HEARTBEAT_MS));
+    // Consume the write verdict (1.52.0 plumbed it; nothing read it): a
+    // contended lane skips the write, and ~3 skipped heartbeats in a row used
+    // to make a LIVE session read as dead to every peer, silently. One
+    // immediate same-tick retry clears transient contention; persistent
+    // failure is surfaced through the server's logging channel.
+    let missedLaneWrites = 0;
+    timer = setIntervalFn(() => {
+      let beat = touch();
+      if (beat?.laneWriteOk === false) beat = touch();   // one quick retry
+      if (beat?.laneWriteOk !== false) { missedLaneWrites = 0; return; }
+      missedLaneWrites++;
+      if (missedLaneWrites >= 3) {
+        try { server?.server?.sendLoggingMessage?.({ level: 'warning', data: `KLYPIX presence heartbeat skipped ${missedLaneWrites}× (lane contended) — peers may briefly see this session as idle.` }); } catch { /* logging is best-effort */ }
+        missedLaneWrites = 0;
+      }
+    }, Math.max(5_000, Number(heartbeatMs) || MCP_HEARTBEAT_MS));
     inboxTimer = setIntervalFn(
       () => pollInbox(),
       Math.max(250, effectiveInboxPollMs),

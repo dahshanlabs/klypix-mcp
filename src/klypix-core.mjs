@@ -288,7 +288,10 @@ export async function opSearchAllBrains({ vault, query, as_of, log = () => {} })
   const asOfTs = as_of ? Date.parse(as_of) : null;
   if (as_of && Number.isNaN(asOfTs)) return err(`Bad as_of date: "${as_of}" — use YYYY-MM-DD.`);
 
-  const pipe = await getEmbedderForUse(log, 20_000);
+  // Queue saturation (KLYPIX_SEMANTIC_QUEUE_FULL) must degrade to lexical, not
+  // error — this tool's own description promises "degrades cleanly".
+  let pipe = null;
+  try { pipe = await getEmbedderForUse(log, 20_000); } catch { /* saturated/unavailable → lexical only */ }
   let qv = null;
   if (pipe) { try { [qv] = await embedTexts(pipe, [q], { kind: 'query' }); } catch { /* lexical only */ } }
 
@@ -895,7 +898,9 @@ export async function opBrainConnect({ vault, canvas, apply = false, max = 24, t
     : (normalizedScope === 'orphans' ? 0.55 : 0.45);
   let edges = [];
   let mode = 'structural (shared tags + [[mentions]])';
-  const pipe = await getEmbedderForUse(log, 20_000);
+  // Queue saturation must degrade to the structural mode, never a hard error.
+  let pipe = null;
+  try { pipe = await getEmbedderForUse(log, 20_000); } catch { /* saturated/unavailable → structural */ }
   if (pipe) {
     try {
       const vecs = await vectorsForBrain(pipe, file, struct.cards);

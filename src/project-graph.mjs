@@ -343,6 +343,47 @@ export function compareProjectGraphResults(current, previous) {
   };
 }
 
+function textContainsExactSourcePath(text, sourceFile) {
+  const haystack = String(text || '').replace(/\\/g, '/').toLocaleLowerCase('en-US');
+  const needle = String(sourceFile || '').replace(/\\/g, '/').toLocaleLowerCase('en-US');
+  if (!needle || !haystack.includes(needle)) return false;
+  const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(^|[\\s\`'"([{<])${escaped}($|[\\s\`'"\\])}>.,;:#])`, 'i').test(haystack);
+}
+
+/**
+ * Deterministic proposals only. These are never persisted and never imply
+ * causality: an exact project-relative source path must appear in the brain
+ * card text before KLYPIX will suggest reviewing the pair.
+ */
+export function suggestProjectGraphBrainLinks(graphResult, brainContext, limit = 40) {
+  if (graphResult?.status !== 'ready' || !Array.isArray(graphResult.nodes)) return [];
+  const hits = Array.isArray(brainContext?.hits) ? brainContext.hits : [];
+  const proposals = [];
+  const seen = new Set();
+  for (const node of graphResult.nodes) {
+    if (!node?.sourceFile) continue;
+    for (const hit of hits) {
+      const texts = [hit?.text, hit?.correctedBy].filter(Boolean);
+      if (!texts.some(text => textContainsExactSourcePath(text, node.sourceFile))) continue;
+      const key = `${hit.id}\u0000${node.id}\u0000${node.sourceFile}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      proposals.push({
+        brainCardId: hit.id,
+        brainArea: hit.area || 'Notes',
+        nodeId: node.id,
+        nodeLabel: node.label || node.id,
+        sourceFile: node.sourceFile,
+        basis: 'exact-source-path',
+        status: 'review-proposal',
+      });
+      if (proposals.length >= Math.max(1, Math.min(100, Number(limit) || 40))) return proposals;
+    }
+  }
+  return proposals;
+}
+
 export function projectGraphContextMarkdown(result) {
   if (result.status === 'missing') {
     return `# Project Map\n\nNo supported project graph was found at \`${result.artifact.graphJson}\`. KLYPIX did not install or run a provider. Generate the artifact with Graphify, then retry.`;

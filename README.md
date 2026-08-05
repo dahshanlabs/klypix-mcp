@@ -208,11 +208,25 @@ project_map_context {
 Use `compare_to` with another project-relative graph artifact to add exact total node/edge deltas
 and additions/removals from the two bounded query neighborhoods. Both paths are confined to the
 declared project root; unsafe source paths are withheld; large or unsupported artifacts are
-rejected. The tool never writes graph facts into `brain.klypix`.
+rejected. When a returned brain card names an exact mapped source path, the structured response
+also includes a review-only evidence-link proposal. It never promotes similarity into truth and
+never writes graph facts or links into `brain.klypix`.
 
 Graphify is the first compatible producer. KLYPIX reads artifacts that users generate separately;
 it does not bundle, install, or run Graphify and does not imply a partnership. A compatible generic
 `graph.json` works through the same provider-neutral boundary.
+
+For a reproducible map artifact on every pull request and main-branch push, install the shipped
+read-only workflow into a Git checkout:
+
+```bash
+npx klypix-project-map setup-github /path/to/project
+```
+
+The command refuses to overwrite an existing workflow unless `--force` is explicit. The installed
+workflow has `contents: read`, pins every action by commit SHA, pins `graphifyy==0.9.33`, validates
+the graph contract, and uploads `graphify-out/` as a 14-day build artifact. This is opt-in CI code:
+the local MCP tool still never installs or launches Graphify.
 
 ---
 
@@ -419,7 +433,7 @@ The MCP verbs below are what agents call. These are what **you** call:
 | `brain_message` | Session-to-session coordination notes (24h TTL, never written into the brain) |
 | `brain_sync` | Context Gateway: task capsule, active-task peers, exact-file overlap, one-time alerts, timing |
 | `brain_connect` | Find and draw related-but-unlinked cards |
-| `project_map_context` | Read-only, bounded code-graph evidence beside correction-aware brain context; Graphify artifacts are supported but never installed or run |
+| `project_map_context` | Read-only, bounded code-graph evidence beside correction-aware brain context, with exact-path review proposals; Graphify artifacts are supported but never installed or run locally |
 | `canvas_view` | Returns the board as a structured render spec plus a text summary, and declares an MCP Apps (SEP-1865) UI resource |
 | `read_canvas` | A canvas as markdown (cards, connection graph, `[[links]]`, `#tags`) |
 | `search_canvases` | Search across canvases by name and content |

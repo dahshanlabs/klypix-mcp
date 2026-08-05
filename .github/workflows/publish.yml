@@ -72,13 +72,13 @@ jobs:
       # fetch-depth 0 + tags: the version gate below verifies that a manual
       # dispatch is standing on the tag it claims to be publishing.
       - name: Checkout (clean, full history + tags)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
@@ -353,12 +353,12 @@ jobs:
           esac
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           persist-credentials: false
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
@@ -414,7 +414,11 @@ jobs:
           # and attestation are indexed. Do not treat merely non-empty JSON as a
           # finished read-back; wait for this exact name/version + provenance.
           META=""
-          for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+          # npm's provenance index lag exceeded two minutes for v1.54.0 even
+          # though the package manifest itself was already live. Keep polling
+          # the exact immutable version for up to five minutes before asking a
+          # human to verify it; never republish or silently waive provenance.
+          for attempt in {1..30}; do
             CANDIDATE="$(npm view "$NAME@$GATE_VERSION" --json 2>/dev/null || true)"
             if printf '%s' "$CANDIDATE" | node -e '
               try {
@@ -431,7 +435,7 @@ jobs:
             sleep 10
           done
           if [ -z "$META" ]; then
-            echo "::error::Could not read complete provenance metadata for $NAME@$GATE_VERSION after 120 seconds. The publish step succeeded; verify manually with 'npm view $NAME@$GATE_VERSION --json'."
+            echo "::error::Could not read complete provenance metadata for $NAME@$GATE_VERSION after 300 seconds. The publish step succeeded; verify manually with 'npm view $NAME@$GATE_VERSION --json'."
             exit 1
           fi
           printf '%s' "$META" | node -e '

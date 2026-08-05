@@ -1,6 +1,6 @@
 {
   "name": "klypix-mcp",
-  "version": "1.53.0",
+  "version": "1.54.0",
   "description": "Shared project brain and MCP coordination server for multi-agent coding.",
   "type": "module",
   "license": "Apache-2.0",

@@ -30,7 +30,7 @@ import {
   opBrainInsights, opBrainConnect, opBrainReconcile, opBrainGarden, opCreateCanvas, opAddToCanvas, opBrainNote, opBrainMessage, opBrainAsk, opBrainChallenge, opCanvasView, opBrainLens,
   opBrainTaskContext,
 } from '../src/klypix-core.mjs';
-import { projectGraphContextMarkdown, queryProjectGraph } from '../src/project-graph.mjs';
+import { compareProjectGraphResults, projectGraphContextMarkdown, queryProjectGraph } from '../src/project-graph.mjs';
 import { auditProject, compactAgentsBrief, linkProject, mcpServerEntry } from '../src/agent-rules.mjs';
 import { createMcpPresence, KLYPIX_MCP_INSTRUCTIONS } from '../src/mcp-presence.mjs';
 import {
@@ -256,12 +256,13 @@ server.registerTool('project_map_context', {
     question: z.string().min(1).describe('Question or code concept to ground in both current structure and project memory.'),
     project: z.string().optional().describe('Absolute project root. Defaults to this MCP connection\'s configured project/vault.'),
     graph_path: z.string().optional().describe('Optional project-relative graph JSON path. Defaults to graphify-out/graph.json and may not escape the project root.'),
+    compare_to: z.string().optional().describe('Optional project-relative prior graph JSON path. Adds exact total deltas plus bounded query-neighborhood changes; it may not escape the project root.'),
     depth: z.number().optional().describe('Relationship hops around the best code matches (0-3, default 1).'),
     max_nodes: z.number().optional().describe('Maximum code nodes returned (default 60, capped 200).'),
     k: z.number().optional().describe('Maximum brain cards returned (default 8; fast mode caps 8, deep history caps 20).'),
     deep_history: z.boolean().optional().describe('false (default) uses the sub-second lexical-fast correction-aware path; true opts into whole-brain semantic/history retrieval, which may cold-load the local model.'),
   },
-}, async ({ question, project, graph_path, depth, max_nodes, k, deep_history }) => {
+}, async ({ question, project, graph_path, compare_to, depth, max_nodes, k, deep_history }) => {
   let graphResult;
   let graphMarkdown;
   try {
@@ -272,9 +273,19 @@ server.registerTool('project_map_context', {
       depth,
       maxNodes: max_nodes,
     });
+    if (compare_to) {
+      const previousGraphResult = queryProjectGraph({
+        project: project || mcpPresence.vault,
+        graphPath: compare_to,
+        query: question,
+        depth,
+        maxNodes: max_nodes,
+      });
+      graphResult.change = compareProjectGraphResults(graphResult, previousGraphResult);
+    }
     graphMarkdown = projectGraphContextMarkdown(graphResult);
   } catch (error) {
-    graphResult = { schemaVersion: 1, status: 'invalid', error: error?.message || String(error) };
+    graphResult = { schemaVersion: 2, status: 'invalid', error: error?.message || String(error) };
     graphMarkdown = `# Project Map\n\nThe generated graph could not be read safely: ${graphResult.error}`;
   }
   const graphFiles = Array.isArray(graphResult?.nodes)

@@ -79,7 +79,7 @@ npx klypix-mcp conformance
 
 It runs in a temporary fixture and touches nothing else. It checks tool discovery, task memory,
 truthful peer reporting, overlap surfacing, proactive logging, and in-band delivery of a peer note.
-It verifies 12 required coordination behaviours — not the 19 tools, and not the retrieval engine.
+It verifies 12 required coordination behaviours — not the 21 tools, and not the retrieval engine.
 
 ---
 
@@ -437,7 +437,7 @@ The MCP verbs below are what agents call. These are what **you** call:
 
 ---
 
-## The 19 verbs
+## The 21 verbs
 
 | Tool | What it does |
 |---|---|

@@ -124,6 +124,39 @@ jobs:
       - name: Runtime dependency audit (development model stack excluded)
         run: npm audit --omit=dev --audit-level=high
 
+      # Closes the only hole the provenance-lag warning opens: a version whose
+      # attestation never appears must not stay unnoticed. The previously
+      # published version is re-verified here, long after any indexing lag, and
+      # a permanently unattested release fails THIS run loudly.
+      - name: Re-verify the previous release's provenance (lag safety net)
+        run: |
+          set -euo pipefail
+          NAME="$(node -p "require('./package.json').name")"
+          PREV="$(npm view "$NAME" version 2>/dev/null || true)"
+          if [ -z "$PREV" ]; then
+            echo "no previously published version — nothing to re-verify"
+            exit 0
+          fi
+          META="$(npm view "$NAME@$PREV" --json 2>/dev/null || true)"
+          printf '%s' "$META" | node -e '
+            const name = process.argv[1], version = process.argv[2];
+            let s = "";
+            process.stdin.on("data", d => { s += d; }).on("end", () => {
+              let meta = null;
+              try { meta = JSON.parse(s || "null"); } catch { /* handled below */ }
+              if (!meta || meta.version !== version) {
+                console.log(`::warning::could not read ${name}@${version} for provenance re-verification; skipping (not a release blocker)`);
+                process.exit(0);
+              }
+              if (meta?.dist?.attestations?.provenance) {
+                console.log(`previous release ${name}@${version} carries provenance (${meta.dist.attestations.provenance.predicateType})`);
+                process.exit(0);
+              }
+              console.error(`::error::${name}@${version} is published WITHOUT a provenance attestation. Indexing lag has long passed, so the trusted-publishing path is broken. Fix it before publishing another version.`);
+              process.exit(1);
+            });
+          ' "$NAME" "$PREV"
+
       - name: Version validation (the tag must match package.json)
         id: version
         env:
@@ -473,8 +506,36 @@ jobs:
             sleep 10
           done
           if [ -z "$META" ]; then
-            echo "::error::Could not read complete provenance metadata for $NAME@$GATE_VERSION after 300 seconds. The publish step succeeded; verify manually with 'npm view $NAME@$GATE_VERSION --json'."
-            exit 1
+            # Three different outcomes were previously collapsed into one hard
+            # failure, and the harmless one fires most often — so a GREEN publish
+            # reported FAILURE (v1.56.0) and a real failure would look identical.
+            # Alarm fatigue is itself a release-integrity defect. Separate them:
+            #   (a) the version is not on the registry  -> the publish FAILED, hard stop;
+            #   (b) it IS live and was published by the OIDC identity -> provenance
+            #       indexing lag, warn and let the next run's gate re-verify;
+            #   (c) it IS live but published by something else -> provenance was
+            #       genuinely not produced, hard stop.
+            LIVE="$(npm view "$NAME@$GATE_VERSION" --json 2>/dev/null || true)"
+            VERDICT="$(printf '%s' "$LIVE" | node -e '
+              try {
+                const meta = JSON.parse(require("fs").readFileSync(0, "utf8") || "null");
+                if (!meta || meta.name !== process.argv[1] || meta.version !== process.argv[2]) { console.log("absent"); process.exit(0); }
+                const who = `${meta._npmUser?.name || ""} ${meta._npmUser?.email || ""}`.toLowerCase();
+                console.log(who.includes("github actions") || who.includes("npm-oidc-no-reply") ? "lag" : "foreign");
+              } catch { console.log("absent"); }
+            ' "$NAME" "$GATE_VERSION")"
+            case "$VERDICT" in
+              absent)
+                echo "::error::$NAME@$GATE_VERSION is NOT on the registry — the publish did not land. This is a real failure."
+                exit 1 ;;
+              foreign)
+                echo "::error::$NAME@$GATE_VERSION is live but was not published by the OIDC identity and carries no provenance. The trusted-publishing path is broken — investigate before the next release."
+                exit 1 ;;
+              *)
+                echo "::warning::$NAME@$GATE_VERSION published via OIDC, but npm had not indexed its provenance after 300s. The artifact is live; the next release run re-verifies this version and fails if the attestation never appears. Manual check: npm view $NAME@$GATE_VERSION --json"
+                echo "- ⚠️ $NAME@$GATE_VERSION published; provenance indexing lagged past 300s (re-verified on the next release)." >> "$GITHUB_STEP_SUMMARY"
+                exit 0 ;;
+            esac
           fi
           printf '%s' "$META" | node -e '
             let s = "";

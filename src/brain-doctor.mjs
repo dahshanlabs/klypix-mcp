@@ -211,12 +211,23 @@ function inspectSupervisors(brainDir, baked) {
       hotReloads: Number(state.hotReloads || 0),
       lastSwapAt: state.lastSwapAt || null,
       lastError: state.lastError || null,
+      // A worker hot-swaps behind a live connection; the SUPERVISOR cannot
+      // replace its own process under the host's stdio, so supervisor-level
+      // features arrive only on the next reconnect. Without this the doctor
+      // reported "aligned" (true of workers) while a shipped supervisor
+      // feature was silently inactive — the same class as rendering a
+      // truncated list as a complete one.
+      supervisorGeneration: state.hibernation ? 'current' : 'pre-1.57',
+      hibernation: state.hibernation || null,
     });
   }
+  const pendingReconnect = live.filter(state => state.supervisorGeneration !== 'current');
   return {
     active: live.length > 0,
     count: live.length,
     live,
+    pendingReconnect,
+    hibernated: live.filter(state => state.status === 'hibernated'),
     impaired: live.filter(state => state.impaired),
     matchesInstalled: live.length && baked
       ? live.every(state => state.activeVersion && cmpSemver(state.activeVersion, baked) === 0)
@@ -513,6 +524,17 @@ export function render(r, opts = {}) {
     for (const state of r.supervisors.live) {
       if (state.impaired) L.push(`        ${c.red}· pid ${state.pid} ${state.status}${state.lastError ? `: ${state.lastError}` : ''} — /mcp reconnect${c.rst}`);
       else if (state.lastError) L.push(`        ${c.yel}· pid ${state.pid} ${state.status}: ${state.lastError}${c.rst}`);
+    }
+    // Workers hot-swap; a SUPERVISOR cannot replace its own process under the
+    // host's stdio. Say so explicitly — otherwise "aligned" reads as "every
+    // shipped improvement is live", and a supervisor-level feature (today:
+    // idle-worker hibernation and its RAM saving) is silently inactive.
+    const pending = r.supervisors.pendingReconnect || [];
+    const sleeping = r.supervisors.hibernated || [];
+    if (pending.length) {
+      L.push(`        ${c.yel}· ${pending.length} of ${r.supervisors.count} connection(s) still run a PRE-1.57 supervisor — their workers are current, but supervisor-level features (idle-worker hibernation / RAM release) start at each one's next reconnect${c.rst}`);
+    } else if (r.supervisors.count) {
+      L.push(`        ${c.dim}· all supervisors current${sleeping.length ? ` · ${sleeping.length} hibernated (worker released, presence held, wakes on the next request)` : ''}${c.rst}`);
     }
   } else if (r.version.supervisorCapable) {
     L.push(`${warn} ${c.bold}SUPERVISOR${c.rst}  installed but this is a legacy direct-worker session · reconnect once to activate`);

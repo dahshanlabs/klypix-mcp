@@ -201,6 +201,12 @@ const fresh = (extra = {}) => ({ lastSeen: NOW - 30_000, startedAt: NOW - 600_00
   ok(a === b, '6.1: punctuation/whitespace/case variants hash to the SAME finding');
   ok(a !== c, '6.2: the same text about a different path is a DIFFERENT finding');
   ok(a === d, '6.2b: the area prefix and tag line are not part of the finding identity');
+  // The same defect cited with and without a line number is ONE finding for the
+  // peer who must act on it; including the line minted two drafts telling the
+  // same story twice.
+  const withLine = findingKey({ path: 'CLAUDE.md', text: 'names a GENERATED file as source of truth', line: 135 });
+  const otherLine = findingKey({ path: 'CLAUDE.md', text: 'names a GENERATED file as source of truth', line: 900 });
+  ok(a === withLine && withLine === otherLine, '6.2c: the line number is evidence, not identity — same claim + path = one draft');
 
   const first = [{ id: a, path: 'CLAUDE.md', text: 't', firstSeen: NOW, lastSeen: NOW, seenCount: 1, verdict: 'routed', confidence: 1, targets: [], reason: 'r' }];
   const again = mergeFindingDrafts(first, [{ ...first[0], firstSeen: NOW + 1000, lastSeen: NOW + 1000, seenCount: 1 }], { now: NOW + 1000 });

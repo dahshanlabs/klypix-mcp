@@ -319,7 +319,12 @@ export function findingKey({ path, text, claim, line = null, root = null } = {})
   // ("…names a GENERATED file" vs "…points at a generated file") must bump the
   // existing draft, not mint a second note for the peer.
   const t = String(claim ?? findingClaim(text)).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
-  return sha16(`${p}|${line ?? ''}|${t}`);
+  // The LINE NUMBER is deliberately excluded from identity. The same defect
+  // cited once as `file.ts` and once as `file.ts:135` is one finding for the
+  // peer who must act on it; including the line minted two drafts telling the
+  // same story twice — the exact duplication the claim-hash above prevents for
+  // re-wordings. Line still rides the draft as evidence, it just is not identity.
+  return sha16(`${p}|${t}`);
 }
 
 // ── Draft construction ──────────────────────────────────────────────────────
@@ -455,7 +460,8 @@ export function renderFindingDrafts(drafts, { limit = 3, total = null } = {}) {
     '## 📬 Finding(s) you verified that belong to SOMEONE ELSE\'S lane — approve to send',
     'You verified something about a file outside your declared scope. The lane knows who declared it; nothing has been sent. '
     + 'Check the “why this session” line — if it is not theirs, skip it (a wrong note costs a peer their whole turn). '
-    + 'This is a DRAFT: nothing was written to the brain and no message exists yet.'];
+    + 'This is a DRAFT: nothing was written to the brain and no message exists yet.',
+    'To send, emit the marker on ITS OWN line WITHOUT the surrounding backticks — a backticked marker is read as a documentation example and is deliberately never sent, so a verbatim paste of the line below does nothing.'];
   for (const draft of list) {
     const where = draft.line ? `${draft.path}:${draft.line}` : draft.path;
     const rec = (draft.seenCount || 1) >= 2 ? `  ⭐ seen ${draft.seenCount}× — still unsent` : '';

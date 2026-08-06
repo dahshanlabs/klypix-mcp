@@ -30,7 +30,7 @@ import {
   opBrainInsights, opBrainConnect, opBrainReconcile, opBrainGarden, opCreateCanvas, opAddToCanvas, opBrainNote, opBrainMessage, opBrainAsk, opBrainChallenge, opCanvasView, opBrainLens,
   opBrainTaskContext,
 } from '../src/klypix-core.mjs';
-import { compareProjectGraphResults, projectGraphContextMarkdown, queryProjectGraph, suggestProjectGraphBrainLinks } from '../src/project-graph.mjs';
+import { compareProjectGraphResults, projectGraphContextMarkdown, queryProjectGraph, suggestProjectGraphBrainLinks, scanNativeProjectMap, checkBrainDrift, brainDriftMarkdown } from '../src/project-graph.mjs';
 import { auditProject, compactAgentsBrief, linkProject, mcpServerEntry } from '../src/agent-rules.mjs';
 import { createMcpPresence, KLYPIX_MCP_INSTRUCTIONS } from '../src/mcp-presence.mjs';
 import {
@@ -345,6 +345,39 @@ server.registerTool('project_map_context', {
     blocks: [{ kind: 'text', text: `${graphMarkdown}\n\n---\n\n# Project Brain - ${deep_history ? 'decisions and history' : 'current decisions and corrections'}\n\n${brainMarkdown}${proposalMarkdown}` }],
     isError: brainResult.isError,
     structured: { projectGraph: graphResult, brainContext: brainResult.context || null, evidenceLinkProposals, deepHistory: deep_history === true },
+  });
+});
+
+server.registerTool('project_map_scan', {
+  title: 'Scan the project natively - no-install file inventory + import map',
+  description: 'KLYPIX\'s own zero-install scanner: walks the repo (gitignore-aware, junk dirs like browser profiles and build output excluded), extracts FILE-LEVEL import edges for the JS/TS family (relative, tsconfig-alias, and monorepo-workspace imports resolved), and writes klypix-map/graph.json inside the project — the only thing it ever writes. The artifact then serves project_map_context automatically when no Graphify artifact exists. It deliberately does not build a per-symbol AST graph; deeper external artifacts remain importable through the same door.',
+  annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  inputSchema: {
+    project: z.string().optional().describe('Absolute project root. Defaults to this MCP connection\'s configured project/vault.'),
+  },
+}, async ({ project }) => {
+  const root = typeof project === 'string' && project.trim() ? path.resolve(project.trim()) : path.resolve(mcpPresence.vault);
+  const result = scanNativeProjectMap({ project: root });
+  return toContent({
+    blocks: [{ kind: 'text', text: `Native project map written to \`${result.artifactRelative}\` (${result.viaGit ? 'gitignore-aware' : 'walk fallback'}${result.truncated ? '; TRUNCATED at the file cap' : ''}).\nFiles: ${result.counts.files.toLocaleString()}; parsed code files: ${result.counts.parsedCodeFiles.toLocaleString()}; import edges: ${result.counts.importEdges.toLocaleString()}; workspace packages: ${result.counts.workspacePackages}; minified skipped: ${result.counts.skippedMinified}.` }],
+    structured: result,
+  });
+});
+
+server.registerTool('project_map_drift', {
+  title: 'Check brain cards against the repo\'s real files (drift report)',
+  description: 'Read-only drift check: every brain card that references THIS project\'s files is verified against the working tree. Reports cards whose referenced files are gone or moved (with rename candidates by unique basename), and headlines when the checkout itself is behind its origin default branch — in that state a "missing" file may simply not be in this checkout. Slash-joined name enumerations and other-project paths are recognized and skipped, not reported as drift. Nothing is written; fix cards with a CORRECTION marker or by editing them in KLYPIX.',
+  annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  inputSchema: {
+    project: z.string().optional().describe('Absolute project root. Defaults to this MCP connection\'s configured project/vault.'),
+    brain: z.string().optional().describe('Optional brain filename/path inside the project. Defaults to brain.klypix / brain.any.'),
+  },
+}, async ({ project, brain }) => {
+  const root = typeof project === 'string' && project.trim() ? path.resolve(project.trim()) : path.resolve(mcpPresence.vault);
+  const result = await checkBrainDrift({ project: root, brain });
+  return toContent({
+    blocks: [{ kind: 'text', text: brainDriftMarkdown(result) }],
+    structured: result,
   });
 });
 

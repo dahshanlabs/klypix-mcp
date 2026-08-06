@@ -170,5 +170,62 @@ try {
   fs.rmSync(root, { recursive: true, force: true });
 }
 
+// ── Native scanner + brain drift ─────────────────────────────────────────────
+const { scanNativeProjectMap, checkBrainDrift, brainDriftMarkdown, NATIVE_MAP_ARTIFACT } = await import('../src/project-graph.mjs');
+const nativeRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-native-map-'));
+try {
+  const write = (rel, content) => {
+    const file = path.join(nativeRoot, ...rel.split('/'));
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, content);
+  };
+  // Monorepo package with its own tsconfig alias + a workspace package.
+  write('packages/app/tsconfig.json', JSON.stringify({ compilerOptions: { paths: { '@/*': ['./src/*'] } } }));
+  write('packages/app/package.json', JSON.stringify({ name: '@fixture/app' }));
+  write('packages/app/src/lib/utils.ts', 'export const cn = () => 1;');
+  write('packages/app/src/Button.tsx', "import { cn } from '@/lib/utils';\nexport const B = cn;");
+  write('packages/core/package.json', JSON.stringify({ name: '@fixture/core' }));
+  write('packages/core/src/index.ts', 'export const core = 1;');
+  write('main.ts', "import { core } from '@fixture/core';\nimport './helper';\nexport const run = core;");
+  write('helper.ts', 'export const helper = 2;');
+  write('big-minified.js', `var x=1;${'a'.repeat(60_000)}`);
+  write('.codex-artifacts/junk/messages.json', '{"junk":true}');
+
+  const scan = scanNativeProjectMap({ project: nativeRoot });
+  const artifact = JSON.parse(fs.readFileSync(path.join(nativeRoot, ...NATIVE_MAP_ARTIFACT.split('/')), 'utf8'));
+  const edge = (source, target) => artifact.links.some(l => l.source === source && l.target === target);
+  ok(scan.status === 'ready' && fs.existsSync(path.join(nativeRoot, 'klypix-map', 'graph.json')), 'native scan writes its own artifact');
+  ok(edge('main.ts', 'helper.ts'), 'relative import resolves with extension inference');
+  ok(edge('packages/app/src/Button.tsx', 'packages/app/src/lib/utils.ts'), 'per-package tsconfig alias resolves inside its own scope');
+  ok(edge('main.ts', 'packages/core/src/index.ts'), 'workspace package import resolves to the package entry');
+  ok(!artifact.nodes.some(n => n.source_file.includes('.codex-artifacts')), 'junk directories are excluded even when not gitignored');
+  ok(scan.counts.skippedMinified >= 1, 'minified files are detected and skipped for parsing');
+
+  clearProjectGraphCache();
+  const discovered = discoverProjectGraph({ project: nativeRoot });
+  ok(discovered.status === 'ready' && discovered.artifact.graphJson === NATIVE_MAP_ARTIFACT, 'discovery falls back to the native artifact when graphify-out is absent');
+
+  fs.writeFileSync(path.join(nativeRoot, 'brain.klypix'), await buildKlypixMap({
+    title: 'brain',
+    areas: [{
+      title: 'Product',
+      cards: [
+        { text: 'Decision: helper logic lives in helper.ts at the root.' },
+        { text: 'Shipped the button work in packages/app/src/OldButton.tsx before the rename.' },
+        { text: 'Config projection covers AGENTS.md/.cursor/.windsurf enumeration styles.' },
+      ],
+    }],
+  }));
+  const drift = await checkBrainDrift({ project: nativeRoot });
+  ok(drift.status === 'ready' && drift.summary.cards >= 3, 'drift parses the brain and counts cards');
+  const oldButton = drift.cards.find(card => card.findings.some(f => f.ref.includes('OldButton')));
+  ok(!!oldButton && oldButton.findings[0].status === 'missing', 'a card referencing a gone file is reported as drifted');
+  ok(drift.cards.every(card => !card.findings.some(f => f.ref.includes('AGENTS.md/'))), 'slash-joined enumerations are never reported as drift');
+  const markdown = brainDriftMarkdown(drift);
+  ok(markdown.includes('OldButton'), 'drift markdown names the drifted reference');
+} finally {
+  fs.rmSync(nativeRoot, { recursive: true, force: true });
+}
+
 console.log(failures ? `\nâœ— ${failures} project-graph assertion(s) failed` : '\nâœ“ project-graph: all assertions passed');
 process.exit(failures ? 1 : 0);

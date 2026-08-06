@@ -2,7 +2,7 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { discoverProjectGraph } from '../src/project-graph.mjs';
+import { discoverProjectGraph, scanNativeProjectMap, checkBrainDrift, brainDriftMarkdown } from '../src/project-graph.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const template = path.resolve(here, '..', 'examples', 'github', 'klypix-project-map.yml');
@@ -22,8 +22,11 @@ function usage() {
     'KLYPIX Project Map',
     '',
     '  klypix-project-map status [project]',
+    '  klypix-project-map scan [project]      native no-install map: file inventory + import edges -> klypix-map/graph.json',
+    '  klypix-project-map drift [project]     check brain cards\' file references against the repo\'s real files (read-only)',
     '  klypix-project-map setup-github [project] [--force]',
     '',
+    'scan writes only its own artifact (klypix-map/graph.json) inside the project; drift writes nothing.',
     'setup-github installs a read-only, pinned GitHub Actions workflow. It never installs or runs a provider on your computer.',
   ].join('\n'));
 }
@@ -41,6 +44,19 @@ try {
     console.log(`Graph artifact: ${graph.status === 'ready' ? `ready (${graph.artifact.graphJson})` : `missing (${graph.artifact.graphJson})`}`);
     console.log(`GitHub workflow: ${fs.existsSync(workflow) ? 'installed' : 'not installed'}`);
     process.exit(0);
+  }
+  if (command === 'scan') {
+    const result = scanNativeProjectMap({ project: root });
+    console.log(`Project: ${result.projectRoot}`);
+    console.log(`Artifact: ${result.artifactRelative} (${result.viaGit ? 'gitignore-aware' : 'walk fallback'}${result.truncated ? ', TRUNCATED at file cap' : ''})`);
+    console.log(`Files: ${result.counts.files.toLocaleString()} | parsed code files: ${result.counts.parsedCodeFiles.toLocaleString()} | import edges: ${result.counts.importEdges.toLocaleString()}`);
+    console.log(`Workspace packages: ${result.counts.workspacePackages} | external packages: ${result.counts.externalPackages} | minified skipped: ${result.counts.skippedMinified}`);
+    process.exit(0);
+  }
+  if (command === 'drift') {
+    const result = await checkBrainDrift({ project: root });
+    console.log(brainDriftMarkdown(result));
+    process.exit(result.status === 'ready' ? 0 : 1);
   }
   if (command !== 'setup-github') {
     usage();

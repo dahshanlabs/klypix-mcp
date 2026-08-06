@@ -452,7 +452,9 @@ The MCP verbs below are what agents call. These are what **you** call:
 | `brain_message` | Session-to-session coordination notes (24h TTL, never written into the brain) |
 | `brain_sync` | Context Gateway: task capsule, active-task peers, exact-file overlap, one-time alerts, timing |
 | `brain_connect` | Find and draw related-but-unlinked cards |
-| `project_map_context` | Read-only, bounded code-graph evidence beside correction-aware brain context, with exact-path review proposals; Graphify artifacts are supported but never installed or run locally |
+| `project_map_context` | Read-only, bounded code-graph evidence beside correction-aware brain context, with exact-path review proposals; external artifacts (e.g. Graphify) are supported but never installed or run locally |
+| `project_map_scan` | KLYPIX's own zero-install scanner: gitignore-aware file inventory + file-level import edges (relative, tsconfig-alias, and monorepo-workspace imports resolved) written to `klypix-map/graph.json` — which then serves `project_map_context` automatically |
+| `project_map_drift` | Read-only drift report: brain cards whose referenced files are gone or moved (with rename candidates), plus a headline when the checkout itself is behind its origin default branch |
 | `canvas_view` | Returns the board as a structured render spec plus a text summary, and declares an MCP Apps (SEP-1865) UI resource |
 | `read_canvas` | A canvas as markdown (cards, connection graph, `[[links]]`, `#tags`) |
 | `search_canvases` | Search across canvases by name and content |

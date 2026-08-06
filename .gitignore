@@ -4,3 +4,4 @@ node_modules/
 .claude/brain-last-commit*
 .claude/brain-rule-drafts.json
 .claude/brain-pending-ships.jsonl
+klypix-map/

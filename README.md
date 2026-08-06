@@ -351,6 +351,25 @@ The app is a separate, proprietary Windows product. The format, this server and 
 Apache-2.0 and work with no app installed. The app's interface is available in English and Arabic
 (some newer panels are still English-only).
 
+## Measure it yourself
+
+Claims about a shared brain — "nothing is lost", "it stays fast" — are unfalsifiable until a
+stranger can re-run them, so the benchmark ships in the box:
+
+```bash
+npx klypix-mcp bench            # ~25s, or --quick for a smaller run
+```
+
+It measures concurrent-write safety across real OS processes, coordination latency, a 1,000-query
+soak with drift, and crash safety under SIGKILL — then prints the machine it ran on.
+
+**It runs a negative control first.** Writers that bypass the lock go in before the real ones,
+because a "0 lost" number means nothing unless the same harness can *see* a loss. On the reference
+machine those unlocked writers lost 17 of 22 cards; the same contention through the lock protocol
+lost 0 of 46. If the control ever loses nothing, the run reports **inconclusive** instead of a pass.
+
+Latest results, with hardware and date: [BENCHMARKS.md](BENCHMARKS.md).
+
 ## Git and concurrency
 
 One file in your repo, committed with your code — versioned, branchable, portable. So two

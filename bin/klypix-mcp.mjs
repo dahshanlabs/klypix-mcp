@@ -19,7 +19,7 @@ const PKG_VERSION = (() => {
   }
 })();
 
-const DIRECT = new Set(['install', 'link', 'doctor', 'runtime', 'conformance', 'garden-code', 'init', 'git-driver', 'diff', 'pr-brief', 'uninstall']);
+const DIRECT = new Set(['install', 'link', 'doctor', 'runtime', 'conformance', 'garden-code', 'init', 'git-driver', 'diff', 'pr-brief', 'uninstall', 'bench']);
 
 const USAGE = [
   `klypix-mcp ${PKG_VERSION} — shared project brain + MCP coordination server.`,
@@ -30,6 +30,7 @@ const USAGE = [
   '  doctor [--npm] [--all] [--json]     read-only self-check; exits 1 on drift',
   '  runtime [--json] [--watch seconds]  passive MCP process/RAM attribution; never terminates a process',
   '  conformance [--json]                launch two real MCP clients against this build',
+  '  bench [--quick] [--json] [--out F]  reproducible benchmark: concurrent-write safety, latency, soak, crash',
   '  init                                seed a starter ./brain.klypix + print an MCP config',
   '  garden-code [brain]                 print the human approval code for brain_garden',
   '  uninstall [--check|--yes|unlink]    remove this install from the machine (--check inventories first; never deletes a .klypix)',
@@ -55,7 +56,20 @@ if (verb && !verb.startsWith('-') && !DIRECT.has(verb)) {
   process.exit(2);
 }
 
-if (verb === 'runtime') {
+if (verb === 'bench') {
+  const { runBenchmark, formatBenchmark } = await import('../src/bench.mjs');
+  const quick = process.argv.includes('--quick');
+  const report = await runBenchmark({ quick });
+  const outIdx = process.argv.indexOf('--out');
+  const markdown = formatBenchmark(report);
+  if (outIdx >= 0 && process.argv[outIdx + 1]) {
+    const { writeFileSync } = await import('node:fs');
+    writeFileSync(process.argv[outIdx + 1], `${markdown}\n`);
+  }
+  console.log(process.argv.includes('--json') ? JSON.stringify(report, null, 2) : markdown);
+  const c = report.scenarios?.concurrentWriters;
+  process.exit(c?.verdict === 'no-loss' ? 0 : 1);
+} else if (verb === 'runtime') {
   process.argv.splice(2, 1);
   await import('./klypix-runtime.mjs');
 } else if (DIRECT.has(verb)) {

@@ -307,8 +307,15 @@ try {
         KLYPIX_MCP_INSTALL_DIR: brainDir,
       },
       encoding: 'utf8',
-      timeout: 120_000,
+      // This spawns the REAL installer, which copies the engine plus ~106
+      // dependency packages: measured at 71s on the reference machine, so a
+      // 120s ceiling left under 50s of headroom and turned any busy machine
+      // into a red suite. The failure was also silent-by-shape — `result` was
+      // never inspected, so a timeout surfaced as an ENOENT on the manifest
+      // read below instead of "the installer did not finish".
+      timeout: 300_000,
     });
+    ok(result.status === 0, `real runtime-only installer exits 0 (status ${result.status}${result.error ? `, ${result.error.message}` : ''})`);
     const runtime = JSON.parse(fs.readFileSync(path.join(brainDir, '.mcp-runtime.json'), 'utf8'));
     const flatWorker = fs.readFileSync(path.join(brainDir, 'klypix-mcp-worker.mjs'), 'utf8');
     ok(result.status === 0 && fs.existsSync(path.join(brainDir, 'mcp-auto-update.mjs')), 'real runtime-only installer stages the updater and managed runtime atomically');

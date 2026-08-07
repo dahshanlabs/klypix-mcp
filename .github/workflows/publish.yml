@@ -98,25 +98,76 @@ jobs:
       # The gate is only as good as the chain it runs. These two files are the
       # ones a future edit is most likely to drop: conformance is slow, and
       # cli-args is new. Assert they are still wired before trusting `npm test`.
+      # A `run:` block with broken shell quoting fails the gate for a reason
+      # that has nothing to do with the release, and reads exactly like a real
+      # red. That happened: an apostrophe inside `node -e '…'` (see the next
+      # step) exited 126 on every tag. `bash -n` parses each block without
+      # executing it and names the offending line instead.
+      - name: Lint every run block for shell syntax errors
+        run: |
+          set -euo pipefail
+          cat > "${RUNNER_TEMP}/lint-run-blocks.cjs" <<'JS'
+          const fs = require("fs");
+          const lines = fs.readFileSync(".github/workflows/publish.yml", "utf8").replace(/\r/g, "").split("\n");
+          const out = [];
+          for (let i = 0; i < lines.length;) {
+            const m = /^(\s*)(- )?run: \|\s*$/.exec(lines[i]);
+            if (!m) { i++; continue; }
+            const base = (m[1] + (m[2] || "")).length;
+            const body = [];
+            let j = i + 1;
+            for (; j < lines.length; j++) {
+              const l = lines[j];
+              if (!l.trim()) { body.push(""); continue; }
+              if (l.match(/^\s*/)[0].length <= base) break;
+              body.push(l);
+            }
+            const keep = body.filter((b) => b.trim());
+            const min = keep.length ? Math.min(...keep.map((b) => b.match(/^\s*/)[0].length)) : 0;
+            out.push({ line: i + 1, text: body.map((b) => b.slice(min)).join("\n") });
+            i = j;
+          }
+          fs.mkdirSync(process.argv[2], { recursive: true });
+          out.forEach((b, k) => fs.writeFileSync(`${process.argv[2]}/block-${k}-line-${b.line}.sh`, `${b.text}\n`));
+          console.log(`extracted ${out.length} run block(s)`);
+          JS
+          node "${RUNNER_TEMP}/lint-run-blocks.cjs" "${RUNNER_TEMP}/runblocks"
+          rc=0
+          for f in "${RUNNER_TEMP}"/runblocks/*.sh; do
+            if ! err="$(bash -n "$f" 2>&1)"; then
+              echo "::error::Shell syntax error in the run block starting at publish.yml $(basename "$f" | sed 's/.*line-\([0-9]*\)\.sh/line \1/'): ${err}"
+              rc=1
+            fi
+          done
+          [ "$rc" -eq 0 ] && echo "every run block parses"
+          exit "$rc"
+
       - name: Assert the test chain still contains the load-bearing suites
         run: |
           set -euo pipefail
-          node -e '
-            const fs = require("fs");
-            const script = JSON.parse(fs.readFileSync("package.json", "utf8")).scripts?.test || "";
-            // publish-verdict.mjs guards THIS workflow's own post-publish
-            // classifier, which misreported a perfect v1.61.0 publish as a
-            // broken trusted-publishing path. A release gate that stops
-            // checking its own alarm logic is how that returns.
-            const required = ["test/project-graph.mjs", "test/conformance.mjs", "test/cli-args.mjs", "test/publish-verdict.mjs"];
-            const missing = required.filter((f) => !script.includes(f));
-            if (!script.trim()) { console.error("::error::package.json has no test script — the gate would prove nothing."); process.exit(1); }
-            if (missing.length) {
-              console.error(`::error::The npm test chain no longer runs: ${missing.join(", ")}. Re-add them or move them to their own gate step deliberately.`);
-              process.exit(1);
-            }
-            console.log(`npm test chain: ${script.split("&&").length} suite(s), including ${required.join(" + ")}`);
-          '
+          # QUOTED HEREDOC, not `node -e '...'`: inside <<'JS' the shell
+          # interprets nothing, so an apostrophe in a comment cannot terminate
+          # the script. It did exactly that ("workflow's" on the old comment
+          # line), which made this gate exit 126 on EVERY release — the first
+          # tag after it landed, v1.62.0, never reached npm. A gate that fails
+          # closed on its own syntax is indistinguishable from a real red.
+          cat > "${RUNNER_TEMP}/assert-test-chain.cjs" <<'JS'
+          const fs = require("fs");
+          const script = JSON.parse(fs.readFileSync("package.json", "utf8")).scripts?.test || "";
+          // publish-verdict.mjs guards the post-publish classifier belonging to
+          // this workflow, which misreported a perfect v1.61.0 publish as a
+          // broken trusted-publishing path. A release gate that stops checking
+          // its own alarm logic is how that returns.
+          const required = ["test/project-graph.mjs", "test/conformance.mjs", "test/cli-args.mjs", "test/publish-verdict.mjs"];
+          const missing = required.filter((f) => !script.includes(f));
+          if (!script.trim()) { console.error("::error::package.json has no test script — the gate would prove nothing."); process.exit(1); }
+          if (missing.length) {
+            console.error(`::error::The npm test chain no longer runs: ${missing.join(", ")}. Re-add them or move them to their own gate step deliberately.`);
+            process.exit(1);
+          }
+          console.log(`npm test chain: ${script.split("&&").length} suite(s), including ${required.join(" + ")}`);
+          JS
+          node "${RUNNER_TEMP}/assert-test-chain.cjs"
 
       # Full suite. The conformance suite runs INSIDE this chain
       # (test/conformance.mjs spawns `klypix-mcp conformance --json` and asserts

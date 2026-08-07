@@ -19,7 +19,7 @@ const PKG_VERSION = (() => {
   }
 })();
 
-const DIRECT = new Set(['install', 'link', 'doctor', 'runtime', 'conformance', 'garden-code', 'init', 'git-driver', 'git-hook', 'diff', 'pr-brief', 'uninstall', 'bench']);
+const DIRECT = new Set(['install', 'link', 'doctor', 'runtime', 'conformance', 'garden-code', 'init', 'git-driver', 'git-hook', 'brain-history', 'diff', 'pr-brief', 'uninstall', 'bench']);
 
 const USAGE = [
   `klypix-mcp ${PKG_VERSION} — shared project brain + MCP coordination server.`,
@@ -36,6 +36,7 @@ const USAGE = [
   '  uninstall [--check|--yes|unlink]    remove this install from the machine (--check inventories first; never deletes a .klypix)',
   '  git-driver [install|status] [repo]  register the lossless .klypix merge driver for a repo (zero-command teams)',
   '  git-hook [install|remove|status]    wire the agent-neutral commit-capture hook (any agent/branch/worktree → brain cards)',
+  '  brain-history [list|restore <id>]   restore points for this brain — undo an accidental delete, edit, or overwrite',
   '  diff [ref] [--brain <path>]         readable brain diff vs a git ref (default HEAD) — markdown to stdout',
   '  pr-brief [baseRef] [--brain <path>] brain decisions touching the files changed since baseRef — PR-comment markdown',
   '',

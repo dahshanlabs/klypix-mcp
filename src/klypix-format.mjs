@@ -148,9 +148,74 @@ export const shard = (id) => id.replace(/^[a-z]+[_:]/i, '').toLowerCase().slice(
  * write leaves the previous good file intact. Use this for ALL brain writes
  * instead of fs.writeFileSync.
  */
-export async function atomicWrite(filePath, buf) {
+// Restore points (2026-08-07). Every agent-side brain write funnels through
+// atomicWrite, so this is the one place that can keep the PREVIOUS bytes before
+// they are replaced — the only thing that makes an accidental card deletion,
+// a destructive edit, or a stale overwrite recoverable at all. Dynamic +
+// guarded: a bundle that predates brain-history.mjs must keep writing normally,
+// and a snapshot failure (full disk, locked dir) must NEVER block a save.
+let _historyLib;
+async function loadHistoryLib() {
+    if (_historyLib !== undefined) return _historyLib;
+    try { _historyLib = await import(new URL('./brain-history.mjs', import.meta.url).href); }
+    catch { _historyLib = null; }
+    return _historyLib;
+}
+// Only brains get restore points: they are co-owned and written unattended (see
+// brain-history.mjs). A normal canvas is one human's observed work.
+const looksLikeBrain = (p) => /^brain\.(klypix|any)$/i.test(path.basename(p || ''));
+
+// How many cards an archive actually HOLDS, read from canvas.json's `order`
+// alone — one small inflate, no per-item reads: ~40ms on a 1.7 MB / 2000-card
+// brain against ~380ms for a full parse.
+//
+// Two wrong answers were tried first, and both let a real 400-card deletion
+// through during verification:
+//   • byte size — re-zipping at a different compression level can make a
+//     SMALLER brain into a BIGGER file;
+//   • item-file count — `order` is what decides which cards exist, so a write
+//     that drops ids from `order` loses them even while their item files linger
+//     in the archive as orphans.
+// `order` is the definition of the card set, so it is the only honest signal.
+async function countCardsCheap(buf) {
+    const zip = await JSZip.loadAsync(buf);
+    const raw = await (zip.file('canvas.json')?.async('string') ?? Promise.resolve(null));
+    if (!raw) throw new Error('no canvas.json');
+    const canvas = JSON.parse(raw);
+    if (Array.isArray(canvas.order)) return canvas.order.length;          // v4
+    if (Array.isArray(canvas.items)) return canvas.items.length;          // legacy v1–v3
+    throw new Error('unrecognised canvas shape');
+}
+
+export async function atomicWrite(filePath, buf, opts = {}) {
     try { await parseKlypix(buf); }
     catch (e) { throw new Error('refusing to write an unparseable .klypix (' + path.basename(filePath) + '): ' + (e?.message || e)); }
+    if (opts.snapshot !== false && (opts.isBrain ?? looksLikeBrain(filePath))) {
+        try {
+            const hist = await loadHistoryLib();
+            if (hist?.snapshotBrain) {
+                // Does this write REMOVE cards? Computed only when a recent
+                // restore point would otherwise throttle this one — so the
+                // common path pays nothing, and the one write that must never
+                // be skipped is never skipped.
+                let removesCards = false;
+                if (hist.wouldThrottle?.(filePath)) {
+                    try {
+                        const [prev, next] = await Promise.all([
+                            countCardsCheap(fs.readFileSync(filePath)),
+                            countCardsCheap(buf),
+                        ]);
+                        removesCards = next < prev;
+                    } catch { removesCards = true; }   // can't tell → snapshot; being wrong costs one file
+                }
+                hist.snapshotBrain(filePath, {
+                    reason: opts.reason || 'write',
+                    nextBytes: buf.length,
+                    force: removesCards,
+                });
+            }
+        } catch { /* best-effort by contract — a restore point is never worth a lost save */ }
+    }
     const tmp = filePath + '.tmp-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
     fs.writeFileSync(tmp, buf);
     try { fs.renameSync(tmp, filePath); }    // Node uses MoveFileEx(REPLACE_EXISTING) on Windows → overwrites atomically

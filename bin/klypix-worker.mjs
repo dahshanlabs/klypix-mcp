@@ -121,6 +121,10 @@ await runVerb('git-driver', './klypix-git-driver.mjs');
 // commits with rationale bodies card into the brain from ANY agent, branch, or
 // worktree at commit time (the Stop hook alone is blind to other worktrees).
 await runVerb('git-hook', './klypix-git-hook.mjs');
+// `npx klypix-mcp brain-history` — list/restore the automatic restore points
+// written before every brain write. The recovery path for an accidental card
+// deletion, a destructive edit, a stale overwrite, or a deleted brain file.
+await runVerb('brain-history', './klypix-brain-history.mjs');
 await runVerb('diff', './klypix-diff.mjs');
 await runVerb('pr-brief', './klypix-pr-brief.mjs');
 

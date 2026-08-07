@@ -41,6 +41,8 @@ let fmtLib = null;
 try { fmtLib = await import('./klypix-format.mjs'); } catch { fmtLib = null; }
 let gitCaptureLib = null;
 try { gitCaptureLib = await import('./git-capture-install.mjs'); } catch { gitCaptureLib = null; }
+let historyLib = null;
+try { historyLib = await import('./brain-history.mjs'); } catch { historyLib = null; }
 
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -383,6 +385,15 @@ export function inspect(opts = {}) {
   if (hasBrain && gitCaptureLib && typeof gitCaptureLib.gitCaptureHookStatus === 'function') {
     try { gitCapture = gitCaptureLib.gitCaptureHookStatus(projectDir, { home }); } catch { gitCapture = { state: 'error', hooks: {} }; }
   }
+  // Restore points (2026-08-07). Informational: their absence on a brand-new
+  // brain is normal, and a missing history must never read as machine drift.
+  let history = { available: false, count: 0, newestAt: null };
+  if (hasBrain && historyLib && typeof historyLib.listBrainHistory === 'function') {
+    try {
+      const points = historyLib.listBrainHistory(brainPath, { home });
+      history = { available: true, count: points.length, newestAt: points[0]?.ts || null };
+    } catch { history = { available: true, count: 0, newestAt: null }; }
+  }
   const tools = inspectTools(brainDir, PKG_ROOT);
   const env = opts.env || process.env;
   // MCP passes the adopted live id explicitly. The CLI can inherit a host id,
@@ -477,7 +488,7 @@ export function inspect(opts = {}) {
     }
   }
 
-  return { verdict, layers, drifted, readinessWarnings, version, running, supervisors, autoUpdate, hooks, codexSmart, codexHooks, gitCapture, tools, peers, sessions: peers, receipts: peers.receipts, receiptSessionId, harness, npm, decayGuard, project: { dir: projectDir, brainPath, hasBrain }, brainDir, actions };
+  return { verdict, layers, drifted, readinessWarnings, version, running, supervisors, autoUpdate, hooks, codexSmart, codexHooks, gitCapture, history, tools, peers, sessions: peers, receipts: peers.receipts, receiptSessionId, harness, npm, decayGuard, project: { dir: projectDir, brainPath, hasBrain }, brainDir, actions };
 }
 
 // One-line drift summary (empty when clean) — for a footer / status line.
@@ -610,6 +621,12 @@ export function render(r, opts = {}) {
           : gc.state === 'no-git' ? `${c.dim}not a git repo${c.rst}`
             : `${c.dim}${gc.state} — installs automatically at the next session start${c.rst}`;
     L.push(`${gmark} ${c.bold}GIT-CAP${c.rst}  ${detail}`);
+  }
+  // Restore points — say the count and the age, because "you can undo an
+  // accidental delete" is only believable if the machine can show the receipts.
+  if (r.history?.available) {
+    const age = r.history.newestAt ? `${Math.max(0, Math.round((Date.now() - r.history.newestAt) / 60000))}m ago` : 'none yet';
+    L.push(`${ok} ${c.bold}HISTORY${c.rst}  ${r.history.count} restore point(s) · newest ${age} ${c.dim}(npx klypix-mcp brain-history list)${c.rst}`);
   }
 
   // TOOLS

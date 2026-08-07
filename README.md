@@ -416,6 +416,32 @@ rename, so a crash mid-write leaves the previous good file intact. The lock is a
 sustained contention can still lose an update. That is a deliberate trade — dropping the markers
 was judged worse — but it is a real limit, not a guarantee.
 
+### Restore points
+
+Merging, tidying and gardening are lossless by contract. What none of them can undo is a
+*deliberate-looking* deletion: you select a dozen cards, delete them, and save. That is not a bug
+to prevent — a brain has to stay correctable, and an uncorrectable memory is worse than none — but
+it deserves a way back, because the brain is **co-owned**: hooks, the MCP server, commit capture
+and peers on other machines all write to it while nobody is watching, so you can destroy work you
+never saw arrive.
+
+So every brain write takes a restore point of the previous bytes first:
+
+```bash
+npx klypix-mcp brain-history list          # age, card count, delta against the brain now
+npx klypix-mcp brain-history restore <id>  # and this is itself undoable
+```
+
+They live under `~/.claude/project-brain/history/`, never beside the brain — nothing lands in git,
+in the merge driver's path, or in your diffs, and they survive deletion of the `.klypix` file
+itself. Routine writes are deduped and throttled to one a minute; a write that **removes cards** is
+never throttled, because that is the case they exist for. Retention is the newest 20 plus one per
+day for 14 days, so a slow-burn mistake is still recoverable without unbounded growth. A snapshot
+that cannot be written is logged and skipped — it never blocks your save.
+
+Normal canvases deliberately get none of this. One human made every mark and saw every change; the
+brain is the file where that is not true.
+
 ---
 
 ## The command line
@@ -432,6 +458,7 @@ The MCP verbs below are what agents call. These are what **you** call:
 | `npx klypix-mcp conformance` | Launch two real MCP clients against this build and verify coordination behaviour |
 | `npx klypix-mcp git-driver` | Register the lossless `.klypix` merge driver for a repo (`status` to check) |
 | `npx klypix-mcp git-hook` | Wire the agent-neutral commit-capture hook: rationale-bearing `feat`/`fix`/`perf` commits from any agent, branch, or worktree card into the brain at commit time (`install`/`remove`/`status`; sessions auto-install it where the hook slots are free) |
+| `npx klypix-mcp brain-history` | Restore points for this brain — `list` them, `restore <id>` one. Written automatically before every brain write, kept machine-local, and never throttled away for a write that removes cards |
 | `npx klypix-mcp diff [ref]` | Card-level brain diff against a git ref, as markdown |
 | `npx klypix-mcp pr-brief [ref]` | Brain cards referencing the files changed since a ref, as markdown |
 | `npx klypix-mcp garden-code` | Print the human approval code `brain_garden` requires |

@@ -106,8 +106,17 @@ async function loadSide(buf) {
     if (p.startsWith('assets/') && !zip.files[p].dir) assets[p] = await zip.file(p).async('nodebuffer');
   }
   const titleById = new Map(struct.cards.map(c => [c.id, c.title || '']));
+  // Graveyard: deleted-but-recoverable cards. Carried verbatim so a merge never
+  // empties another machine's bin, and so the bytes a tombstone removes from
+  // `order` are preserved rather than destroyed.
+  const graveyard = {};             // id -> { meta, json }
+  for (const e of (struct.graveyard || [])) {
+    const f = zip.file(`graveyard/${shard(e.id)}/${e.id}.json`);
+    const { id, ...meta } = e;
+    graveyard[e.id] = { meta, json: f ? await f.async('string') : null };
+  }
   return {
-    order, positions, items, assets, manifest,
+    order, positions, items, assets, manifest, graveyard,
     connections: Array.isArray(canvas.connections) ? canvas.connections : [],
     lines: Array.isArray(canvas.lines) ? canvas.lines : [],
     strokes: Array.isArray(canvas.strokes) ? canvas.strokes : [],
@@ -152,6 +161,39 @@ export async function mergeBrains({ base = null, ours, theirs, deletedIds = [] }
   const conflicts = [];
   const delta = { added: [], updated: [], archived: [], removed: [] };
 
+  // ── Graveyard (2026-08-07) ───────────────────────────────────────────────
+  // An honored tombstone still REMOVES the card from the brain — `order`,
+  // `positions` and `struct.cards` are unchanged, so every read surface, the
+  // renderer and the no-loss invariant keep their exact current semantics. What
+  // changes is that the BYTES are moved to `graveyard/` instead of destroyed,
+  // making the delete recoverable. Deliberately NOT the Archive container:
+  // archived cards are only re-parented, so they still sit in `order` and still
+  // render — a deleted card put there would visibly reappear in place.
+  const graveyard = {};
+  for (const src of [T, O]) if (src?.graveyard) for (const [gid, g] of Object.entries(src.graveyard)) {
+    // Union, never prune: one machine emptying its bin must not empty another's.
+    if (!graveyard[gid] || Number(g.meta?.deletedAt || 0) > Number(graveyard[gid].meta?.deletedAt || 0)) graveyard[gid] = g;
+  }
+  const buryCard = (id) => {
+    if (graveyard[id]) return;                       // already buried — keep the original stamp
+    const json = O.items[id] ?? T.items[id] ?? null;
+    if (json == null) return;                        // nothing to preserve
+    const pos = O.positions[id] || T.positions[id] || null;
+    let preview = '';
+    try { preview = String(JSON.parse(json)?.content || '').replace(/\s+/g, ' ').trim().slice(0, 140); } catch { /* media card */ }
+    graveyard[id] = {
+      meta: {
+        deletedAt: Date.now(),       // `now` below is declared later in this scope
+        deletedBy: 'human',
+        area: (O.titleById.get(pos?.parentId) || T.titleById.get(pos?.parentId) || null),
+        parentId: pos?.parentId ?? null,
+        pos: pos ? { x: pos.x, y: pos.y, w: pos.w ?? null, h: pos.h ?? null } : null,
+        preview,
+      },
+      json,
+    };
+  };
+
   for (const id of allIds) {
     const inO = O.items[id] != null, inT = T.items[id] != null;
     const inB = baseItem(id) != null;
@@ -169,10 +211,35 @@ export async function mergeBrains({ base = null, ours, theirs, deletedIds = [] }
         conflicts.push({ id, kind: 'delete-vs-edit', kept: 'theirs' });
         // fall through to keep from theirs below
       } else {
+        buryCard(id);                // keep the bytes; the card still leaves the brain
         delta.removed.push(id);
         continue;                    // honored delete
       }
     }
+    // ── The bin is a DURABLE tombstone (2026-08-07) ────────────────────────
+    // Before it existed, `deletedIds` was a per-call argument that was consumed
+    // and thrown away, so a delete could not cross machines: sync with a peer
+    // who still had the card and it came straight back, because "absent from
+    // ours" alone is deliberately never a delete. A graveyard entry is not mere
+    // absence — it is a recorded human deletion — so it is honored here.
+    //
+    // The delete-vs-edit rule is unchanged and still wins: if the other side
+    // EDITED the card after our deletion, their information is newer than our
+    // intent, so the card comes back live and leaves the bin. Without a base we
+    // cannot prove an edit, so the deletion stands (conservative: a resurrected
+    // card is visible and re-deletable; a lost one is not).
+    if (graveyard[id] && !inO) {
+      const theirsChangedSinceBase = inT && inB && !sameMeaning(T.items[id], baseItem(id));
+      if (inT && theirsChangedSinceBase) {
+        conflicts.push({ id, kind: 'delete-vs-edit', kept: 'theirs' });
+        delete graveyard[id];        // resurrected — never in the brain AND the bin
+      } else {
+        delta.removed.push(id);      // the deletion propagates
+        continue;
+      }
+    }
+    // Live on our side ⇒ not deleted. Covers a restore and a re-add.
+    if (graveyard[id] && inO) delete graveyard[id];
 
     if (!inO && !inT) continue;
 
@@ -293,6 +360,20 @@ export async function mergeBrains({ base = null, ours, theirs, deletedIds = [] }
   const now = Date.now();
   for (const id of order) zip.file(`items/${shard(id)}/${id}.json`, merged.get(id).json);
   for (const [p, bytes] of Object.entries(assets)) zip.file(p, bytes);
+
+  // Graveyard: card bytes under graveyard/, metadata in one index. Written only
+  // when non-empty so a brain that has never had a delete keeps a byte-identical
+  // shape. Nothing here is reachable from `order`, so nothing here can render,
+  // be searched, be embedded, or be counted.
+  const graveyardEntries = {};
+  for (const [gid, g] of Object.entries(graveyard)) {
+    if (g?.json == null) continue;
+    zip.file(`graveyard/${shard(gid)}/${gid}.json`, g.json);
+    graveyardEntries[gid] = g.meta || {};
+  }
+  if (Object.keys(graveyardEntries).length) {
+    zip.file('graveyard.json', JSON.stringify({ version: 1, entries: graveyardEntries }));
+  }
 
   const positions = {};
   for (const id of order) positions[id] = merged.get(id).pos;

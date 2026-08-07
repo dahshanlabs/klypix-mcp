@@ -296,6 +296,28 @@ export async function parseKlypix(buffer) {
         for (const it of canvas.items) items[it.id] = it;
     }
 
+    // ── Graveyard: cards a human deleted, kept recoverable ───────────────────
+    // Read from `graveyard.json`, and DELIBERATELY not merged into `items`,
+    // `cards`, `order` or `positions`. That single choice is the whole safety
+    // argument: a deleted card cannot render (the renderer only ever walks
+    // `order`), cannot leak through read_canvas / search_canvases (which walk
+    // `struct.cards`), cannot be embedded or ranked into an answer, and cannot
+    // skew a count — with zero edits to any of those call sites. Contrast the
+    // Archive container, which is containment-only: its 275 cards in this
+    // repo's own brain DO render, and would have reappeared in place.
+    let graveyard = [];
+    try {
+        const gRaw = await readText('graveyard.json');
+        if (gRaw) {
+            const parsed = JSON.parse(gRaw);
+            const entries = parsed && typeof parsed === 'object' ? (parsed.entries || {}) : {};
+            graveyard = Object.entries(entries)
+                .map(([id, e]) => ({ id, ...(e && typeof e === 'object' ? e : {}) }))
+                .filter(e => e.id)
+                .sort((a, b) => Number(b.deletedAt || 0) - Number(a.deletedAt || 0));
+        }
+    } catch { /* a corrupt index must never fail the whole parse */ }
+
     const connections = Array.isArray(canvas.connections) ? canvas.connections : [];
     const titleOf = (id) => cardTitle(items[id]) || (items[id]?.type ? `${items[id].type} ${String(id).slice(0, 8)}` : String(id).slice(0, 8));
     const assetPaths = Object.keys(zip.files).filter(p => p.startsWith('assets/') && !zip.files[p].dir);
@@ -341,6 +363,9 @@ export async function parseKlypix(buffer) {
             relationship: c.relationship || null, label: c.label || null,
         })),
         assets: assetPaths.map(p => path.basename(p)),
+        // Recoverable deletions, newest first. Never counted in counts.cards —
+        // a deleted card is not part of the brain, it is part of its bin.
+        graveyard,
     };
     return { struct, zip, assetPaths, isV4, canvas, manifest };
 }

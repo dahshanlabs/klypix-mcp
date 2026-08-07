@@ -125,6 +125,10 @@ await runVerb('git-hook', './klypix-git-hook.mjs');
 // written before every brain write. The recovery path for an accidental card
 // deletion, a destructive edit, a stale overwrite, or a deleted brain file.
 await runVerb('brain-history', './klypix-brain-history.mjs');
+// `npx klypix-mcp brain-deleted` — the brain's recycle bin. A human delete moves
+// the card's bytes to graveyard/ instead of destroying them; this lists, restores
+// and (permanently) purges them.
+await runVerb('brain-deleted', './klypix-brain-deleted.mjs');
 await runVerb('diff', './klypix-diff.mjs');
 await runVerb('pr-brief', './klypix-pr-brief.mjs');
 

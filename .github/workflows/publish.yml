@@ -536,16 +536,24 @@ jobs:
         run: |
           set -euo pipefail
           NAME="$(node -p "require('./package.json').name")"
-          # A fresh publish can briefly return `{}` before its complete manifest
-          # and attestation are indexed. Do not treat merely non-empty JSON as a
-          # finished read-back; wait for this exact name/version + provenance.
+          # READ BACK OVER PLAIN HTTPS, NOT `npm view` (2026-08-07). This job
+          # deliberately carries no NODE_AUTH_TOKEN, and setup-node still writes
+          # an .npmrc auth line for the registry — under which `npm view` returns
+          # nothing here. Every poll therefore reported "not indexed", the loop
+          # exhausted, and the classifier read an empty body as "absent": a
+          # PERFECT publish (OIDC identity, SLSA attestation, `latest` tag) was
+          # announced as "the publish did not land". v1.58.0 through v1.62.0 all
+          # show red beside working publishes for this reason. The anonymous
+          # registry document carries name, version, dist.attestations.provenance
+          # and _npmUser — everything this gate needs, with no auth surface.
+          # `|| true` on curl only swallows transport failure; the classifier
+          # still decides, and the raw body is printed on a hard failure so the
+          # next person is never left guessing like this.
           META=""
-          # npm's provenance index lag exceeded two minutes for v1.54.0 even
-          # though the package manifest itself was already live. Keep polling
-          # the exact immutable version for up to five minutes before asking a
-          # human to verify it; never republish or silently waive provenance.
+          LAST_BODY=""
           for attempt in {1..30}; do
-            CANDIDATE="$(npm view "$NAME@$GATE_VERSION" --json 2>/dev/null || true)"
+            CANDIDATE="$(curl -sSL --max-time 20 "https://registry.npmjs.org/${NAME}/${GATE_VERSION}" 2>/dev/null || true)"
+            LAST_BODY="$CANDIDATE"
             if printf '%s' "$CANDIDATE" | node -e '
               try {
                 const meta = JSON.parse(require("fs").readFileSync(0, "utf8") || "null");
@@ -570,7 +578,7 @@ jobs:
             #       indexing lag, warn and let the next run's gate re-verify;
             #   (c) it IS live but published by something else -> provenance was
             #       genuinely not produced, hard stop.
-            LIVE="$(npm view "$NAME@$GATE_VERSION" --json 2>/dev/null || true)"
+            LIVE="$(curl -sSL --max-time 20 "https://registry.npmjs.org/${NAME}/${GATE_VERSION}" 2>/dev/null || true)"
             VERDICT="$(printf '%s' "$LIVE" | node -e '
               try {
                 const meta = JSON.parse(require("fs").readFileSync(0, "utf8") || "null");
@@ -597,13 +605,20 @@ jobs:
                 echo "$NAME@$GATE_VERSION is live and its provenance attestation is indexed (it landed after the poll window)."
                 exit 0 ;;
               absent)
+                # Say WHY it looks absent. The previous version of this branch
+                # printed only the verdict, so a read-back that was itself
+                # broken was indistinguishable from a failed publish.
                 echo "::error::$NAME@$GATE_VERSION is NOT on the registry — the publish did not land. This is a real failure."
+                echo "registry read-back (first 400 chars of the last response):"
+                printf '%s\n' "${LAST_BODY:-<empty>}" | head -c 400
+                echo ""
+                echo "cross-check by hand: curl -sSL https://registry.npmjs.org/${NAME}/${GATE_VERSION}"
                 exit 1 ;;
               foreign)
                 echo "::error::$NAME@$GATE_VERSION is live but was not published by the OIDC identity and carries no provenance. The trusted-publishing path is broken — investigate before the next release."
                 exit 1 ;;
               *)
-                echo "::warning::$NAME@$GATE_VERSION published via OIDC, but npm had not indexed its provenance after 300s. The artifact is live; the next release run re-verifies this version and fails if the attestation never appears. Manual check: npm view $NAME@$GATE_VERSION --json"
+                echo "::warning::$NAME@$GATE_VERSION published via OIDC, but npm had not indexed its provenance after 300s. The artifact is live; the next release run re-verifies this version and fails if the attestation never appears. Manual check: curl -sSL https://registry.npmjs.org/${NAME}/${GATE_VERSION}"
                 echo "- ⚠️ $NAME@$GATE_VERSION published; provenance indexing lagged past 300s (re-verified on the next release)." >> "$GITHUB_STEP_SUMMARY"
                 exit 0 ;;
             esac

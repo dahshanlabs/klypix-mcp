@@ -20,7 +20,10 @@ import { execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const workflow = fs.readFileSync(path.join(root, '.github', 'workflows', 'publish.yml'), 'utf8');
+// Strip CR: a CRLF working copy (git autocrlf on Windows) makes every
+// `\)\n`-style pattern below silently miss, so the assertions would pass or
+// fail for reasons unrelated to the workflow's content.
+const workflow = fs.readFileSync(path.join(root, '.github', 'workflows', 'publish.yml'), 'utf8').replace(/\r/g, '');
 
 let failures = 0;
 const ok = (condition, label) => {
@@ -79,11 +82,41 @@ ok(classify({
 ok(classify({ name: 'klypix-mcp', version: '1.60.0' }) === 'absent', 'a different version on the registry means the publish did not land');
 ok(classify({}) === 'absent', 'empty metadata means absent');
 
-// The three fatal/benign outcomes must each still be wired to the right exit.
-ok(/indexed\)\s*\n\s*echo[^\n]*\n\s*exit 0/.test(workflow), 'indexed exits 0');
-ok(/absent\)\s*\n\s*echo "::error[^\n]*\n\s*exit 1/.test(workflow), 'absent exits 1');
-ok(/foreign\)\s*\n\s*echo "::error[^\n]*\n\s*exit 1/.test(workflow), 'foreign exits 1');
+// The four outcomes must each still be wired to the right exit. Match the WHOLE
+// branch (label → `;;`) and assert what it does, not how many lines it takes:
+// the previous line-counting regexes failed the moment the absent branch gained
+// the diagnostic echo that explains WHY a read-back looked absent, which is a
+// test punishing an improvement it should have been indifferent to.
+const branch = (label) => {
+    const m = new RegExp(`\\n\\s*${label}\\)\\n([\\s\\S]*?);;`).exec(workflow);
+    return m ? m[1] : null;
+};
+const exitsWith = (label, code) => {
+    const body = branch(label);
+    return Boolean(body) && new RegExp(`exit ${code}\\s*$`).test(body.trimEnd());
+};
+ok(exitsWith('indexed', 0), 'indexed exits 0');
+ok(exitsWith('absent', 1) && /::error/.test(branch('absent')), 'absent errors and exits 1');
+ok(exitsWith('foreign', 1) && /::error/.test(branch('foreign')), 'foreign errors and exits 1');
 ok(/::warning::.*provenance/.test(workflow) && /exit 0 ;;/.test(workflow), 'lag warns and exits 0');
+
+// The read-back must not depend on npm auth state (2026-08-07): this job carries
+// no NODE_AUTH_TOKEN, `npm view` returned nothing under setup-node's .npmrc, and
+// five releases in a row reported "the publish did not land" over a perfect
+// artifact. The anonymous registry document is the auth-free source of truth.
+const verifyStep = /Verify the published artifact carries provenance[\s\S]*?(?=\n      - name:|\n  [a-z-]+:|$)/.exec(workflow)?.[0] || '';
+ok(/registry\.npmjs\.org\/\$\{NAME\}\/\$\{GATE_VERSION\}/.test(verifyStep),
+    'the read-back queries the anonymous registry document');
+// Comment lines are stripped first — the step deliberately NAMES `npm view` in
+// prose to explain why it is not used, and an assertion that cannot tell code
+// from commentary would force the explanation to be deleted.
+// Both comment syntaxes: shell `#` and the `//` of the node scripts embedded in
+// this step (one of which explains the `npm view --json` shape bug by name).
+const verifyCode = verifyStep.split('\n').filter((l) => !/^\s*(#|\/\/)/.test(l)).join('\n');
+ok(!/npm view/.test(verifyCode),
+    'the read-back never routes through `npm view` (its auth state broke this gate for five releases)');
+ok(/LAST_BODY/.test(verifyStep),
+    'a hard failure prints the raw read-back so a broken reader is distinguishable from a failed publish');
 
 console.log(failures ? `\n[FAIL] ${failures} publish-verdict assertion(s) failed` : '\n[ok] publish-verdict: all assertions passed');
 process.exit(failures ? 1 : 0);

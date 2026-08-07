@@ -326,7 +326,20 @@ export async function parseKlypix(buffer) {
     const struct = {
         title: manifest?.title || canvas.title || 'Untitled',
         format: isV4 ? 'klypix-v4' : `legacy-v${canvas.version ?? '?'}`,
-        counts: { cards: cards.length, connections: connections.length, assets: assetPaths.length },
+        // `cards` counts EVERY item in `order` — containers and archived cards
+        // included — and several headers print it raw, so a brain whose brief
+        // describes 1,574 live cards announced "1981 cards". Keeping it (readers
+        // depend on it) and adding the honest breakdown beside it, so a surface
+        // that means "how much is live here" can say so.
+        counts: {
+            cards: cards.length,
+            connections: connections.length,
+            assets: assetPaths.length,
+            containers: cards.filter(c => c?.type === 'container').length,
+            archived: cards.filter(c => c?.type !== 'container' && /^archive$/i.test(
+                (c?.parentId ? cardTitle(items[c.parentId]) : '') || '')).length,
+            get live() { return this.cards - this.containers - this.archived; },
+        },
         cards: cards.map(it => ({
             id: it.id, type: it.type,
             title: cardTitle(it),
@@ -5130,12 +5143,22 @@ export function lensToMarkdown(d, view = 'all') {
 
 /** Render a parsed struct to the markdown brief (shared by read-klypix + MCP). */
 export function structToMarkdown(struct, { assetsDir } = {}) {
+    // Archived cards were rendered here IDENTICALLY to live ones — no marker, and
+    // `area` was never printed at all — so read_canvas served superseded,
+    // consolidated and deleted-then-archived decisions as current fact. This is
+    // the surface an agent reads to learn a project, which makes it the worst
+    // place for that. They stay in the output (this is a whole-canvas dump, and
+    // history is legitimately part of it) but they are now labelled.
+    const isArchived = (c) => /^archive$/i.test(c.area || '');
     const L = [];
+    const n = struct.counts;
     L.push(`# ${struct.title}`);
-    L.push(`*${struct.format} · ${struct.counts.cards} cards · ${struct.counts.connections} connections · ${struct.counts.assets} assets*\n`);
+    L.push(`*${struct.format} · ${n.live ?? n.cards} live cards${n.archived ? ` · ${n.archived} archived` : ''}${n.containers ? ` · ${n.containers} containers` : ''} · ${n.connections} connections · ${n.assets} assets*\n`);
+    if (n.archived) L.push(`> ⛔ ${n.archived} card(s) below are marked archived — superseded, consolidated or retired. Read them as history, not as the current state.\n`);
     L.push(`## Cards`);
     for (const c of struct.cards) {
-        L.push(`### ${c.title || `(${c.type})`}  \`${c.type}\``);
+        const archived = isArchived(c);
+        L.push(`### ${c.title || `(${c.type})`}  \`${c.type}\`${archived ? '  ⛔ archived' : ''}${c.area && !archived ? `  _[${c.area}]_` : ''}`);
         if (c.text) L.push(c.type === 'text' ? String(c.text).trim() : `→ ${c.text}`);
         const meta = [];
         if (c.links?.length) meta.push(`links: ${c.links.map(t => `[[${t}]]`).join(', ')}`);

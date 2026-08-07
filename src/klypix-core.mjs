@@ -264,11 +264,17 @@ export async function opSearchCanvases({ vault, query }) {
       hit(c.text) ||
       (c.tags || []).some(t => hit('#' + t)));
     if (nameMatch || matched.length) {
-      const head = `## ${rel} — "${struct.title}" · ${struct.counts.cards} cards, ${struct.counts.connections} connections${nameMatch && !matched.length ? '  (name/title match)' : ''}`;
+      // Matching stays recall-first (an archived card CAN be the right answer to
+      // "what did we try?"), but an archived hit is now labelled. Unlabelled, a
+      // superseded or retired decision read exactly like a current one.
+      const isArchived = (c) => /^archive$/i.test(c.area || '');
+      const n = struct.counts;
+      const head = `## ${rel} — "${struct.title}" · ${n.live ?? n.cards} live cards${n.archived ? `, ${n.archived} archived` : ''}, ${n.connections} connections${nameMatch && !matched.length ? '  (name/title match)' : ''}`;
       const body = matched.slice(0, 8).map(c => {
         const pos = (c.pos && c.pos.x != null) ? ` @(${Math.round(c.pos.x)},${Math.round(c.pos.y)})` : '';
         const tags = (c.tags && c.tags.length) ? ' ' + c.tags.map(t => '#' + t).join(' ') : '';
-        return `- [${c.type}] "${c.title || '(card)'}" (${c.id})${pos}${tags}\n    ${String(c.text || '').replace(/\s+/g, ' ').slice(0, 240)}`;
+        const arch = isArchived(c) ? ' ⛔ archived' : '';
+        return `- [${c.type}] "${c.title || '(card)'}" (${c.id})${pos}${tags}${arch}\n    ${String(c.text || '').replace(/\s+/g, ' ').slice(0, 240)}`;
       }).join('\n');
       hits.push(matched.length ? `${head}\n${body}` : head);
     }

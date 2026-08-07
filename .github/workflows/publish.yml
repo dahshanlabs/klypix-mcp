@@ -104,7 +104,11 @@ jobs:
           node -e '
             const fs = require("fs");
             const script = JSON.parse(fs.readFileSync("package.json", "utf8")).scripts?.test || "";
-            const required = ["test/project-graph.mjs", "test/conformance.mjs", "test/cli-args.mjs"];
+            // publish-verdict.mjs guards THIS workflow's own post-publish
+            // classifier, which misreported a perfect v1.61.0 publish as a
+            // broken trusted-publishing path. A release gate that stops
+            // checking its own alarm logic is how that returns.
+            const required = ["test/project-graph.mjs", "test/conformance.mjs", "test/cli-args.mjs", "test/publish-verdict.mjs"];
             const missing = required.filter((f) => !script.includes(f));
             if (!script.trim()) { console.error("::error::package.json has no test script — the gate would prove nothing."); process.exit(1); }
             if (missing.length) {
@@ -520,11 +524,27 @@ jobs:
               try {
                 const meta = JSON.parse(require("fs").readFileSync(0, "utf8") || "null");
                 if (!meta || meta.name !== process.argv[1] || meta.version !== process.argv[2]) { console.log("absent"); process.exit(0); }
-                const who = `${meta._npmUser?.name || ""} ${meta._npmUser?.email || ""}`.toLowerCase();
+                // The provenance may have finished indexing between the poll
+                // loop giving up and this read. That is a success, not a lag.
+                if (meta?.dist?.attestations?.provenance) { console.log("indexed"); process.exit(0); }
+                // _npmUser comes back in TWO shapes and this branch only ever
+                // handled one: `npm view --json` renders an OIDC publish as the
+                // STRING "GitHub Actions <npm-oidc-no-reply@github.com>", while
+                // the object form {name,email} appears elsewhere. Reading .name
+                // off the string yielded undefined, so every indexing lag was
+                // classified "foreign" and hard-failed with "the trusted
+                // publishing path is broken" — on v1.61.0, whose provenance was
+                // in fact perfect. The lag branch this file added in 1.58.0 was
+                // therefore unreachable. Normalise both shapes before matching.
+                const raw = meta._npmUser;
+                const who = (typeof raw === "string" ? raw : `${raw?.name || ""} ${raw?.email || ""}`).toLowerCase();
                 console.log(who.includes("github actions") || who.includes("npm-oidc-no-reply") ? "lag" : "foreign");
               } catch { console.log("absent"); }
             ' "$NAME" "$GATE_VERSION")"
             case "$VERDICT" in
+              indexed)
+                echo "$NAME@$GATE_VERSION is live and its provenance attestation is indexed (it landed after the poll window)."
+                exit 0 ;;
               absent)
                 echo "::error::$NAME@$GATE_VERSION is NOT on the registry — the publish did not land. This is a real failure."
                 exit 1 ;;

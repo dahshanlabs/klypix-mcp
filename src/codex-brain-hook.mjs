@@ -5,6 +5,7 @@ import { execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import {
+  deriveIntentFromPrompt,
   findProjectBrain,
   formatPresenceMessage,
   formatReceivedMessages,
@@ -239,10 +240,18 @@ async function main() {
   }
 
   const projectDir = path.dirname(brainPath);
-  const prompt = input.prompt || input.user_prompt || input.userPrompt;
+  const rawPrompt = input.prompt || input.user_prompt || input.userPrompt;
+  // Machine-turn guard: a harness-injected "user" prompt (task notification,
+  // system reminder) must not become the session's declared intent — derive the
+  // human text, and on a machine turn keep the previous intent (undefined).
+  const prompt = rawPrompt === undefined ? undefined : (deriveIntentFromPrompt(rawPrompt) ?? undefined);
+  // A HUMAN prompt is a task boundary: reset the declared file scope. A machine
+  // turn is mid-task plumbing — it must keep the files exactly as it keeps the
+  // intent (review-caught: the guard preserved intent but wiped files[]).
+  const humanTurn = event === 'UserPromptSubmit' && prompt !== undefined;
   const files = event === 'PreToolUse' || event === 'PostToolUse'
     ? touchedFiles(input, projectDir)
-    : (event === 'UserPromptSubmit' ? [] : undefined);
+    : (humanTurn ? [] : undefined);
   const sessions = upsertSession({
     brainPath,
     id: sessionId,
@@ -253,7 +262,7 @@ async function main() {
     branch: gitBranch(cwd),
     intent: prompt === undefined ? undefined : prompt,
     files,
-    replaceFiles: event === 'UserPromptSubmit',
+    replaceFiles: humanTurn,
     event,
     channel: 'lifecycle',
     cwd,
@@ -275,6 +284,15 @@ async function main() {
     });
   }
   if (event === 'SessionStart') {
+    // Commit-capture completeness (2026-08-07): wire the agent-neutral git
+    // post-commit/post-merge hook when the slots are absent or already ours —
+    // never a foreign hook. Dynamic + guarded so a stale bundle no-ops.
+    const gitHookNotice = await (async () => {
+      try {
+        const ghl = await import(new URL('./git-capture-install.mjs', import.meta.url).href);
+        return typeof ghl.ensureGitCaptureHook === 'function' ? (ghl.ensureGitCaptureHook(projectDir).notice || '') : '';
+      } catch { return ''; }
+    })();
     emitSystemMessage([
       formatPresenceMessage(sessions, sessionId, { includeSolo: true }),
       // Class-C ship observation — the engine's, not a Claude-hook-local copy.
@@ -282,6 +300,7 @@ async function main() {
       // is exactly where the incident class bites hardest (2026-07-29 review).
       // The queue drains at the next brain write from any host.
       observeShipDrift(projectDir),
+      gitHookNotice.trim(),
       stampReceivedMessages(messages),
     ]);
     return;

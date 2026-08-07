@@ -431,6 +431,7 @@ The MCP verbs below are what agents call. These are what **you** call:
 | `npx klypix-mcp runtime` | Passive per-connection process/RAM attribution (`--json`, optional `--watch seconds`); never kills or deduplicates |
 | `npx klypix-mcp conformance` | Launch two real MCP clients against this build and verify coordination behaviour |
 | `npx klypix-mcp git-driver` | Register the lossless `.klypix` merge driver for a repo (`status` to check) |
+| `npx klypix-mcp git-hook` | Wire the agent-neutral commit-capture hook: rationale-bearing `feat`/`fix`/`perf` commits from any agent, branch, or worktree card into the brain at commit time (`install`/`remove`/`status`; sessions auto-install it where the hook slots are free) |
 | `npx klypix-mcp diff [ref]` | Card-level brain diff against a git ref, as markdown |
 | `npx klypix-mcp pr-brief [ref]` | Brain cards referencing the files changed since a ref, as markdown |
 | `npx klypix-mcp garden-code` | Print the human approval code `brain_garden` requires |

@@ -39,6 +39,8 @@ import { renderReceiptSummary, summarizeReceipts } from './finding-routing.mjs';
 // inspect() synchronous for its existing callers.
 let fmtLib = null;
 try { fmtLib = await import('./klypix-format.mjs'); } catch { fmtLib = null; }
+let gitCaptureLib = null;
+try { gitCaptureLib = await import('./git-capture-install.mjs'); } catch { gitCaptureLib = null; }
 
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -372,6 +374,15 @@ export function inspect(opts = {}) {
     mcpInstructions: true,
     globalInstructions: codexGlobalInstructionsInstalled(home),
   };
+  // Commit-capture git hook (2026-08-07): informational, never a drift layer —
+  // SessionStart auto-installs it where safe; doctor reports the cases it can't
+  // (foreign hook in the slot, core.hooksPath set, brain nested below the repo
+  // top). Guarded dynamic import: on a half-updated bundle that lacks the
+  // module, doctor must keep working, not crash at load (review-caught).
+  let gitCapture = { state: 'n/a', hooks: {} };
+  if (hasBrain && gitCaptureLib && typeof gitCaptureLib.gitCaptureHookStatus === 'function') {
+    try { gitCapture = gitCaptureLib.gitCaptureHookStatus(projectDir, { home }); } catch { gitCapture = { state: 'error', hooks: {} }; }
+  }
   const tools = inspectTools(brainDir, PKG_ROOT);
   const env = opts.env || process.env;
   // MCP passes the adopted live id explicitly. The CLI can inherit a host id,
@@ -418,6 +429,9 @@ export function inspect(opts = {}) {
       : (!codexHooks.installed
         ? 'optional'
         : (codexHooks.executionStatus === 'observed' ? 'ok' : 'warning')),
+    // Informational only — a repo the auto-installer can't wire (foreign hook,
+    // custom hooksPath) must never flip the machine verdict to DRIFTED.
+    gitCapture: gitCapture.state === 'installed' ? 'ok' : (gitCapture.state === 'n/a' ? 'n/a' : 'optional'),
     harness: hasBrain ? (harness.ok ? 'ok' : 'drift') : 'n/a',
     // DECAY-GUARD drifts when the protection is provably missing: the loaded
     // engine lacks classifyDecay, its renderer left the synthetic stale claim
@@ -456,9 +470,14 @@ export function inspect(opts = {}) {
     if (layers.decayGuard === 'drift') actions.push('npx klypix-mcp install   # decay-aware status guard missing/stale — stale build/deploy claims can render as CURRENT state');
     for (const s of supervisors.impaired || []) actions.push(`/mcp reconnect   # supervisor pid ${s.pid} is ${s.status} with no live worker — its tool calls hang until reconnected`);
     if (peers.twinGroups && peers.twinGroups.length) actions.push(`/mcp reconnect   # ${peers.twinGroups.length} session(s) split across twin lane rows (channel merge not occurring) — reconnect adopts the merged id`);
+    if (hasBrain && (gitCapture.state === 'foreign' || Object.values(gitCapture.hooks || {}).some(s => s === 'foreign' || s === 'foreign-sh'))) {
+      actions.push('npx klypix-mcp git-hook install   # a pre-existing git hook occupies post-commit/post-merge — this chains the commit-capture block after it (auto-install never edits a foreign hook)');
+    } else if (hasBrain && gitCapture.state === 'custom-hookspath') {
+      actions.push('git config core.hooksPath is set   # commit-capture hook not auto-installable — add the managed block to that hooks dir or unset the config, then `npx klypix-mcp git-hook install`');
+    }
   }
 
-  return { verdict, layers, drifted, readinessWarnings, version, running, supervisors, autoUpdate, hooks, codexSmart, codexHooks, tools, peers, sessions: peers, receipts: peers.receipts, receiptSessionId, harness, npm, decayGuard, project: { dir: projectDir, brainPath, hasBrain }, brainDir, actions };
+  return { verdict, layers, drifted, readinessWarnings, version, running, supervisors, autoUpdate, hooks, codexSmart, codexHooks, gitCapture, tools, peers, sessions: peers, receipts: peers.receipts, receiptSessionId, harness, npm, decayGuard, project: { dir: projectDir, brainPath, hasBrain }, brainDir, actions };
 }
 
 // One-line drift summary (empty when clean) — for a footer / status line.
@@ -579,6 +598,18 @@ export function render(r, opts = {}) {
     L.push(`        ${c.dim}Context Gateway memory/coordination already works. Once trusted, native hooks auto-inject task memory and warn before exact overlapping edits.${c.rst}`);
   } else {
     L.push(`${chmark} ${c.bold}CODEX${c.rst}    automatic MCP presence + ${smart} · native auto-context + pre-edit guard active ${c.dim}(last observed ${r.codexHooks.lastExecutedAt})${c.rst}`);
+  }
+  // Commit-capture git hook — per-repo, informational (auto-installed at
+  // session start where safe; foreign hooks are never edited automatically).
+  if (r.gitCapture && r.gitCapture.state !== 'n/a') {
+    const gc = r.gitCapture;
+    const gmark = gc.state === 'installed' ? ok : warn;
+    const detail = gc.state === 'installed' ? 'post-commit/post-merge wired — any agent/branch/worktree cards its rationale-bearing commits'
+      : gc.state === 'custom-hookspath' ? `${c.yel}core.hooksPath set — not auto-installable (see actions)${c.rst}`
+        : gc.state === 'foreign' ? `${c.yel}foreign hook in the slot — run \`npx klypix-mcp git-hook install\` to chain it deliberately${c.rst}`
+          : gc.state === 'no-git' ? `${c.dim}not a git repo${c.rst}`
+            : `${c.dim}${gc.state} — installs automatically at the next session start${c.rst}`;
+    L.push(`${gmark} ${c.bold}GIT-CAP${c.rst}  ${detail}`);
   }
 
   // TOOLS

@@ -119,13 +119,88 @@ export function neutralizeMarkers(text) {
   return String(text || '').replace(/🧠(\s*)(BRAIN|MSG)/gi, '🧠·$2');
 }
 
+// ── Machine-turn intent guard ───────────────────────────────────────────────
+// UserPromptSubmit does not only carry human-typed text: harnesses inject task
+// notifications, system reminders and slash-command wrappers as "user" prompts.
+// One of those stored verbatim became a session's declared intent
+// ("<task-notification> <task-id>…" — 2026-08-07 AgentLit field incident), so
+// every peer surface showed tool-plumbing instead of what the session was doing.
+// deriveIntentFromPrompt() extracts the human intent from a raw prompt, or
+// returns null when the whole turn is machine-generated — callers must then KEEP
+// the previous intent (and may still stamp activity), never store the junk and
+// never clear a good intent because a background task happened to complete.
+const MACHINE_TAGS = 'task-notification|system-reminder|system-warning|local-command-caveat'
+  + '|command-name|command-message|command-args|command-contents|local-command-stdout|local-command-stderr'
+  + '|ide_selection|ide_opened_file|ide_diagnostics|persisted-output|tool-use-error'
+  + '|session-start-hook|user-prompt-submit-hook|post-tool-use-hook|hook-[a-z0-9-]+';
+const MACHINE_BLOCK_RE = new RegExp(
+  '^(?:<(' + MACHINE_TAGS + ')\\b[^>]*>[\\s\\S]*?(?:</\\1>|$)|\\[SYSTEM NOTIFICATION[^\\]]*\\])\\s*', 'i');
+// Tag-shaped start AFTER stripping known blocks: an unrecognized harness tag is
+// far more likely than a human opening a prompt with raw XML, and the cost of
+// failing closed is only "previous intent kept" — never data loss.
+const TAG_SHAPED_RE = /^<[a-z][\w.:-]*(?:\s|\/?>)/i;
+
+export function deriveIntentFromPrompt(raw) {
+  let text = String(raw || '').replace(/\s+/g, ' ').trim();
+  if (!text) return null;
+  // A "[SYSTEM NOTIFICATION …]"-led turn is machine end to end — the prose
+  // after the bracket header is harness narration, never the user's intent.
+  if (/^\[SYSTEM NOTIFICATION/i.test(text)) return null;
+  for (let hops = 0; hops < 12; hops++) {
+    const m = MACHINE_BLOCK_RE.exec(text);
+    if (!m) break;
+    text = text.slice(m[0].length).trim();
+  }
+  if (!text || TAG_SHAPED_RE.test(text)) return null;
+  return text;
+}
+
+// True when a non-empty prompt/intent value is machine-generated end to end.
+// Empty strings are NOT machine turns — brain_sync phase "complete" clears
+// intent with '' deliberately, and that semantic must keep working.
+export function looksMachineTurn(text) {
+  const t = String(text || '').trim();
+  return Boolean(t) && deriveIntentFromPrompt(t) === null;
+}
+
 // tmp+rename so lock-free readers (readLane, messageFooter, peers' status
 // lines) can never parse a torn lane as an authoritative "0 peers / no
 // messages", and a crash mid-write can never destroy undelivered messages.
+// On Windows, renaming over a destination a reader/AV momentarily holds open
+// throws EPERM — one immediate retry wins that race, and on final failure the
+// tmp is REMOVED before rethrowing (the field found dozens of orphaned
+// `.tmp-<pid>-<rand>` files littering the sessions dir, 2026-08-07).
 function writeLaneFileAtomic(laneFile, payload) {
   const tmp = `${laneFile}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
   fs.writeFileSync(tmp, payload);
-  fs.renameSync(tmp, laneFile);
+  try {
+    fs.renameSync(tmp, laneFile);
+  } catch (err) {
+    try { fs.renameSync(tmp, laneFile); }
+    catch { try { fs.unlinkSync(tmp); } catch { /* best-effort */ } throw err; }
+  }
+  sweepStaleTmpFiles(path.dirname(laneFile));
+}
+
+// Opportunistic janitor for tmp orphans left by crashes or the pre-fix rename
+// path. Throttled to once per process per 10 minutes; only files matching our
+// own tmp naming and older than 15 minutes are touched, so an in-flight write
+// (millisecond lifetime) can never be swept.
+let lastTmpSweep = 0;
+export function sweepStaleTmpFiles(dir, { now = Date.now(), maxAgeMs = 15 * 60 * 1000, force = false } = {}) {
+  if (!force && now - lastTmpSweep < 10 * 60 * 1000) return 0;
+  lastTmpSweep = now;
+  let swept = 0;
+  try {
+    for (const name of fs.readdirSync(dir)) {
+      if (!/\.tmp-\d+(?:-[a-z0-9]+)?$|\.\d+\.tmp$/.test(name)) continue;
+      const full = path.join(dir, name);
+      try {
+        if (now - fs.statSync(full).mtimeMs > maxAgeMs) { fs.unlinkSync(full); swept++; }
+      } catch { /* raced or locked — next sweep */ }
+    }
+  } catch { /* dir unreadable — best-effort */ }
+  return swept;
 }
 
 function freshChannelSeen(channelSeen, now) {
@@ -242,10 +317,14 @@ export function upsertSession({
     // that never touch intent, so without intentAt a 100-minute-old intent renders
     // under "active just now" (2026-07-29 audit). Stamped only when the intent
     // VALUE actually changes; additive — old rows/readers are unaffected.
-    const nextIntent = intent !== undefined
-      ? String(intent || '').replace(/\s+/g, ' ').trim().slice(0, 160)
+    // Defense-in-depth: a machine-generated value (harness notification, raw
+    // XML tag) is treated as "no update" — the derivation layer in the hooks
+    // is the primary guard, this catches any writer that skipped it.
+    const effectiveIntent = intent !== undefined && looksMachineTurn(intent) ? undefined : intent;
+    const nextIntent = effectiveIntent !== undefined
+      ? String(effectiveIntent || '').replace(/\s+/g, ' ').trim().slice(0, 160)
       : (previous.intent || '');
-    const intentChanged = intent !== undefined && nextIntent !== (previous.intent || '');
+    const intentChanged = effectiveIntent !== undefined && nextIntent !== (previous.intent || '');
     // A connection heartbeat proves transport liveness, not that a task is in
     // progress. Stamp only events that carry real user/tool work so doctor can
     // distinguish an idle connected host from an active sync-silent session.
@@ -330,7 +409,9 @@ export function upsertRemoteSessions({ brainPath, rows, machineId = MACHINE_ID, 
         client: String(row.client || previous.client || 'unknown'),
         surface: row.surface ?? previous.surface ?? null,
         branch: row.branch ?? previous.branch ?? null,
-        intent: String(row.intent || '').slice(0, 160),
+        // Same machine-turn guard as the local writer: a peer machine running a
+        // pre-guard build can relay junk intent — never mirror it verbatim.
+        intent: looksMachineTurn(row.intent) ? String(previous.intent || '') : String(row.intent || '').slice(0, 160),
         files: normalizeFiles(row.files),
         machine: String(row.machine),
         host: row.host ?? previous.host ?? null,

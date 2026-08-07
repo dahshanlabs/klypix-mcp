@@ -6,6 +6,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
+import { sweepStaleTmpFiles } from './agent-presence.mjs';
 
 export const CODEX_PRESENCE_EVENTS = [
   'SessionStart',
@@ -88,7 +89,8 @@ function writeHooks(file, raw, data) {
     const temp = file + '.klypix-tmp';
     fs.writeFileSync(temp, JSON.stringify(data, null, 2) + '\n', 'utf8');
     JSON.parse(fs.readFileSync(temp, 'utf8'));
-    fs.renameSync(temp, file);
+    try { fs.renameSync(temp, file); }
+    catch (err) { try { fs.unlinkSync(temp); } catch { /* */ } throw err; }
     return { ok: true, backup };
   } catch (error) {
     return { ok: false, error: `Couldn't write ${file}: ${error?.message || error}` };
@@ -166,7 +168,16 @@ export function recordCodexHookExecution({
     fs.mkdirSync(path.dirname(status.receiptPath), { recursive: true });
     const temp = status.receiptPath + `.${process.pid}.tmp`;
     fs.writeFileSync(temp, JSON.stringify(receipt, null, 2), 'utf8');
-    fs.renameSync(temp, status.receiptPath);
+    // Windows rename-over-open-destination throws EPERM (concurrent hook
+    // processes race on this receipt constantly): retry once, and never leave
+    // the tmp behind — the field found ~35 orphans from this exact line
+    // (2026-08-07). A losing racer's receipt is disposable; the winner's stands.
+    try { fs.renameSync(temp, status.receiptPath); }
+    catch {
+      try { fs.renameSync(temp, status.receiptPath); }
+      catch { try { fs.unlinkSync(temp); } catch { /* */ } return { ok: false, reason: 'rename-raced' }; }
+    }
+    sweepStaleTmpFiles(path.dirname(status.receiptPath));
     return { ok: true, path: status.receiptPath };
   } catch {
     return { ok: false, reason: 'write-failed' };

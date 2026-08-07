@@ -60,7 +60,15 @@ function parseLog(raw) {
         return { hash: (p[0] || '').trim(), subject: (p[1] || '').trim(), body: (p[2] || '').trim() };
     }).filter(c => c.hash && c.subject);
 }
-const readPrev = () => { try { return fs.readFileSync(STATE, 'utf8').trim() || null; } catch { return null; } };
+// The baseline is repo-writable and gets interpolated into git commands — accept
+// ONLY a bare sha, or a malicious checkout gains shell execution at commit time
+// (review-caught 2026-08-07). An invalid file re-baselines like a missing one.
+const readPrev = () => {
+    try {
+        const s = fs.readFileSync(STATE, 'utf8').trim();
+        return /^[0-9a-f]{4,64}$/i.test(s) ? s : null;
+    } catch { return null; }
+};
 const writePrev = (s) => { try { fs.mkdirSync(path.dirname(STATE), { recursive: true }); fs.writeFileSync(STATE, String(s || '')); } catch { /* best-effort */ } };
 
 async function main() {

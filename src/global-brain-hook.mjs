@@ -308,7 +308,37 @@ const laneCanon = (p) => { try { return fs.realpathSync.native(p); } catch { ret
 const SESSIONS_FILE = path.join(SESSIONS_DIR, `${sha(normBrainPath(laneCanon(BRAIN)))}.json`); // one lane-file per PROJECT (shared by its concurrent sessions)
 const SESSIONS_LOCK = SESSIONS_FILE + '.lock';
 // tmp+rename: lock-free readers must never parse a torn lane as an empty one.
-function writeLaneAtomic(payload) { const tmp = SESSIONS_FILE + '.tmp-' + process.pid; fs.writeFileSync(tmp, payload); fs.renameSync(tmp, SESSIONS_FILE); }
+// Windows rename-over-open-destination throws EPERM (AV / a concurrent reader):
+// one immediate retry wins the race; on final failure the tmp is removed before
+// rethrowing so failures can't litter the sessions dir (field: dozens of
+// orphaned tmp files, 2026-08-07). A throttled janitor sweeps pre-fix orphans.
+function writeLaneAtomic(payload) {
+    const tmp = SESSIONS_FILE + '.tmp-' + process.pid + '-' + Math.random().toString(36).slice(2, 8);
+    fs.writeFileSync(tmp, payload);
+    try { fs.renameSync(tmp, SESSIONS_FILE); }
+    catch (err) {
+        try { fs.renameSync(tmp, SESSIONS_FILE); }
+        catch { try { fs.unlinkSync(tmp); } catch { /* best-effort */ } throw err; }
+    }
+    sweepStaleTmp(SESSIONS_DIR);
+}
+// PARITY: same throttle/age/pattern contract as agent-presence.mjs
+// sweepStaleTmpFiles() — duplicated because this hook stays free of sibling
+// static imports by design (a broken sibling must never kill the brief).
+let lastTmpSweep = 0;
+function sweepStaleTmp(dir) {
+    const now = Date.now();
+    if (now - lastTmpSweep < 10 * 60 * 1000) return;
+    lastTmpSweep = now;
+    try {
+        for (const name of fs.readdirSync(dir)) {
+            if (!/\.tmp-\d+(?:-[a-z0-9]+)?$|\.\d+\.tmp$/.test(name)) continue;
+            const full = path.join(dir, name);
+            try { if (now - fs.statSync(full).mtimeMs > 15 * 60 * 1000) fs.unlinkSync(full); }
+            catch { /* raced or locked — next sweep */ }
+        }
+    } catch { /* dir unreadable — best-effort */ }
+}
 // Pending-captures queue: when the BRAIN lock cannot be acquired, the batch is
 // queued here durably instead of written from a stale base (a best-effort write
 // could erase a peer's or the desktop app's just-merged cards — the exact lost
@@ -387,6 +417,38 @@ const pruneSessions = (list, now) => {
 // SCHEMA PARITY: this writer and agent-presence.mjs upsertSession() write the
 // SAME row shape (client/surface/cwd/hostPid/channelSeen/intentAt/intentSource) —
 // `...prev` first so either writer's fields survive the other's touch (T8 class).
+
+// ── Machine-turn intent guard (BEHAVIOR PARITY with agent-presence.mjs
+// deriveIntentFromPrompt — duplicated because this hook stays free of sibling
+// static imports; test/intent-guard.mjs asserts both stay identical) ─────────
+// UserPromptSubmit is not only human-typed text: harnesses inject task
+// notifications, system reminders and slash-command wrappers as "user" prompts,
+// and one stored verbatim became a session's declared intent
+// ("<task-notification> <task-id>…" — 2026-08-07 AgentLit field incident).
+// null ⇒ the turn is machine-generated: KEEP the previous intent (still stamp
+// activity), never store the junk, never clear a good intent.
+const MACHINE_TAGS = 'task-notification|system-reminder|system-warning|local-command-caveat'
+    + '|command-name|command-message|command-args|command-contents|local-command-stdout|local-command-stderr'
+    + '|ide_selection|ide_opened_file|ide_diagnostics|persisted-output|tool-use-error'
+    + '|session-start-hook|user-prompt-submit-hook|post-tool-use-hook|hook-[a-z0-9-]+';
+const MACHINE_BLOCK_RE = new RegExp(
+    '^(?:<(' + MACHINE_TAGS + ')\\b[^>]*>[\\s\\S]*?(?:</\\1>|$)|\\[SYSTEM NOTIFICATION[^\\]]*\\])\\s*', 'i');
+const TAG_SHAPED_RE = /^<[a-z][\w.:-]*(?:\s|\/?>)/i;
+function deriveIntentFromPrompt(raw) {
+    let text = String(raw || '').replace(/\s+/g, ' ').trim();
+    if (!text) return null;
+    // A "[SYSTEM NOTIFICATION …]"-led turn is machine end to end — the prose
+    // after the bracket header is harness narration, never the user's intent.
+    if (/^\[SYSTEM NOTIFICATION/i.test(text)) return null;
+    for (let hops = 0; hops < 12; hops++) {
+        const m = MACHINE_BLOCK_RE.exec(text);
+        if (!m) break;
+        text = text.slice(m[0].length).trim();
+    }
+    if (!text || TAG_SHAPED_RE.test(text)) return null;
+    return text;
+}
+
 function touchSession(sid, patch = {}) {
     if (!sid) return;
     try {
@@ -414,10 +476,15 @@ function touchSession(sid, patch = {}) {
             const wantsIntent = patch.intent !== undefined && !declaredFresh;
             const nextIntent = wantsIntent ? patch.intent : (prev.intent ?? '');
             const intentChanged = wantsIntent && nextIntent !== (prev.intent ?? '');
+            // `activity: true` records a work-shaped turn WITHOUT an intent
+            // update — a machine-generated prompt (task notification landing in
+            // a working session) proves the session is active, but its text
+            // must never become the declared intent.
             const recordsActivity = patch.intent !== undefined
                 || patch.addFiles !== undefined
                 || patch.files !== undefined
-                || patch.ships !== undefined;
+                || patch.ships !== undefined
+                || patch.activity === true;
             list.push({
                 ...prev,   // unknown/foreign keys (an MCP writer's, a future field) survive this touch
                 id: sid, pid: process.pid, project: path.basename(CWD),
@@ -477,7 +544,8 @@ function touchSession(sid, patch = {}) {
                     kept[String(HOST_PID)] = { sessionId: sid, ts: now };
                     const tmp = HOSTMAP_FILE + '.' + process.pid + '.tmp';
                     fs.writeFileSync(tmp, JSON.stringify(kept));
-                    fs.renameSync(tmp, HOSTMAP_FILE);
+                    try { fs.renameSync(tmp, HOSTMAP_FILE); }
+                    catch (err) { try { fs.unlinkSync(tmp); } catch { /* */ } throw err; }
                 } catch { /* best-effort */ }
             }
         } finally { if (got) releaseLock(SESSIONS_LOCK); }
@@ -839,7 +907,15 @@ function fileTagsFor(p) {
 // re-baselines if history was rewritten (rebase/reset) so a non-ancestor range
 // can never dump the whole history.
 const COMMIT_STATE = path.resolve(CWD, '.claude', 'brain-last-commit');
-const readLastCommit = () => { try { return fs.readFileSync(COMMIT_STATE, 'utf8').trim() || null; } catch { return null; } };
+// The baseline is repo-writable and gets interpolated into git commands — accept
+// ONLY a bare sha, or a malicious checkout gains shell execution (review-caught
+// 2026-08-07). An invalid file re-baselines exactly like a missing one.
+const readLastCommit = () => {
+    try {
+        const s = fs.readFileSync(COMMIT_STATE, 'utf8').trim();
+        return /^[0-9a-f]{4,64}$/i.test(s) ? s : null;
+    } catch { return null; }
+};
 const writeLastCommit = (s) => { try { fs.mkdirSync(path.dirname(COMMIT_STATE), { recursive: true }); fs.writeFileSync(COMMIT_STATE, String(s || '')); } catch { /* best-effort */ } };
 const git = (args) => execSync(`git ${args}`, { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 4000 }).trim();
 
@@ -1846,8 +1922,46 @@ async function capture(lib) {
             for (const u of (Array.isArray(b.updates) ? b.updates : [])) updates.push(u);
         }
         if (!cards.length && !resolutions.length && !updates.length) return null;
-        const res = await lib.captureIntoBrain(fs.readFileSync(BRAIN), {
-            cards: cards.map(c => ({ text: c.text, color: '#e8e8ed', borderColor: c.borderColor, area: c.area, createdVia: c.createdVia || 'claude-code', ...(c.closes ? { closes: c.closes } : {}), ...(c.evidence ? { evidence: c.evidence } : {}), ...(c.verify ? { verify: c.verify } : {}) })),
+        const brainBuf = fs.readFileSync(BRAIN);
+        // Dual-channel commit dedup (2026-08-07): the auto-installed git
+        // post-commit hook cards commits AT COMMIT TIME with a #commit-<7> tag,
+        // deduping against the brain before it writes. This side must honor the
+        // same contract — without it every rationale-bearing commit in a hooked
+        // repo carded twice (feat → duplicate 🏁 cards; fix/perf → the git
+        // hook's minutes-old card got supersede-archived by its own clone).
+        // Scoped to createdVia==='commit' — cards from THIS channel only. A
+        // human marker that merely cites "#commit-abc1234" must never be
+        // swallowed by the auto-card that shares its hash (self-review catch:
+        // filtering on the tag alone is a silent-loss bug, and silent loss is
+        // the one thing the brain may never do).
+        const isCommitCard = (c) => c && c.createdVia === 'commit' && /#commit-[0-9a-f]{7}/i.test(String(c.text || ''));
+        let landedCards = cards;
+        try {
+            if (cards.some(isCommitCard)) {
+                const { struct: cur } = await lib.parseKlypix(brainBuf);
+                const already = new Set();
+                for (const c of (cur.cards || []))
+                    for (const m of String(c.text || '').matchAll(/#commit-([0-9a-f]{7})/gi)) already.add(m[1].toLowerCase());
+                landedCards = cards.filter(c => {
+                    if (!isCommitCard(c)) return true;
+                    const m = /#commit-([0-9a-f]{7})/i.exec(String(c.text || ''));
+                    return !already.has(m[1].toLowerCase());
+                });
+            }
+        } catch { /* parse failed → land unfiltered; the supersede pass copes */ }
+        if (!landedCards.length && !resolutions.length && !updates.length) {
+            // Everything gathered was already in the brain (the git hook carded
+            // it first). Advance every baseline exactly like a successful write —
+            // the commits ARE durable — so the same range never re-scans.
+            writeState(merged);
+            writeLastCommit(newLastCommit);
+            if (drainedPendingIds.size) updatePendingCaptures((current) => current.filter(b => b && !drainedPendingIds.has(b.id)));
+            if (drainedShips && typeof lib.clearPendingShips === 'function') lib.clearPendingShips(CWD);
+            advanceShipBaseline(lib);
+            return null;
+        }
+        const res = await lib.captureIntoBrain(brainBuf, {
+            cards: landedCards.map(c => ({ text: c.text, color: '#e8e8ed', borderColor: c.borderColor, area: c.area, createdVia: c.createdVia || 'claude-code', ...(c.closes ? { closes: c.closes } : {}), ...(c.evidence ? { evidence: c.evidence } : {}), ...(c.verify ? { verify: c.verify } : {}) })),
             resolutions,
             updates,
         });
@@ -1995,6 +2109,11 @@ async function promptRetrieve(lib) {
     const input = readHookInput();
     const sid = input.session_id;
     const prompt = input.prompt || input.user_prompt || input.userPrompt || '';
+    // Machine-turn guard: a harness-injected "user" prompt (task notification,
+    // system reminder, slash-command wrapper) carries NO human intent — it must
+    // neither become the lane's intent nor drive retrieval (it used to do both:
+    // junk intent for peers, garbage tokens against the brain). null ⇒ machine.
+    const humanText = deriveIntentFromPrompt(prompt);
     // Status-vocab quarantine (2026-07-23): "what is remaining?" must not
     // lexically retrieve the stale cards that SAY "remaining:" — status words
     // describe the question's shape, not its subject, and are anti-correlated
@@ -2004,10 +2123,10 @@ async function promptRetrieve(lib) {
     // #file- tag hits re-serve the exact corpse the quarantine removed
     // (adversarial review traced the side door). The brief's computed "Area
     // status" section carries the current-state answer instead.
-    let ptoks = lib.queryTokens(prompt);
+    let ptoks = lib.queryTokens(humanText || '');
     let statusShaped = false, statusStrong = false;
     if (typeof lib.splitQueryTokens === 'function') {
-        const sp = lib.splitQueryTokens(prompt);
+        const sp = lib.splitQueryTokens(humanText || '');
         ptoks = sp.content;
         statusShaped = sp.statusShaped;
         // strong = the prompt IS a status question (phrase shape / nothing but
@@ -2028,8 +2147,15 @@ async function promptRetrieve(lib) {
     // OWN edits (set at Stop). Here we just refresh INTENT + branch + the heartbeat.
     const changedPaths = gitChangedPaths();
     const branch = gitBranch();
-    touchSession(sid, { intent: String(prompt).replace(/\s+/g, ' ').trim().slice(0, 80), branch });
-    const fileToks = (ptoks.length < 2 && !statusShaped) ? changedPaths.flatMap(fileQueryTokens) : [];
+    // Human turn → latest prompt becomes the intent (80 chars). Machine turn →
+    // keep the previous intent, but still stamp activity: a notification landing
+    // here proves the session is mid-work, not idle.
+    touchSession(sid, humanText !== null
+        ? { intent: humanText.slice(0, 80), branch }
+        : { activity: true, branch });
+    // The git-diff fallback exists for TERSE HUMAN prompts ("go on") — a machine
+    // turn must not fall through to it and retrieve against the whole diff.
+    const fileToks = (ptoks.length < 2 && !statusShaped && humanText !== null) ? changedPaths.flatMap(fileQueryTokens) : [];
     const tokens = [...new Set(ptoks.concat(fileToks))];
     // Other live sessions in THIS repo — surfaced even when the prompt retrieves
     // nothing (a peer's presence/ship is itself the signal). Empty string when solo.
@@ -2043,7 +2169,7 @@ async function promptRetrieve(lib) {
         // only on a do/build request, only completed-work cards, only high confidence.
         // Matched on the PROMPT's stated intent (ptoks), not the git-diff fallback. A
         // false nudge erodes trust, so it's strict; the loose recall list still shows.
-        if (looksLikeWorkRequest(prompt) && typeof lib.detectRepeatWork === 'function') {
+        if (looksLikeWorkRequest(humanText || '') && typeof lib.detectRepeatWork === 'function') {
             try { repeats = lib.detectRepeatWork(struct, ptoks, { topK: 2 }); } catch { /* best-effort */ }
         }
     }
@@ -2061,7 +2187,10 @@ async function promptRetrieve(lib) {
         try {
             const semlib = await import(new URL('./brain-semantic.mjs', import.meta.url).href);
             if (typeof semlib.semanticVecs === 'function') {
-                const sem = await semlib.semanticVecs(BRAIN, struct, prompt, { timeoutMs: 1500 });
+                // Embed the DERIVED human text, never the raw prompt — a mixed
+                // turn's stripped machine block must not re-contaminate the
+                // semantic query (parity with the lexical path above).
+                const sem = await semlib.semanticVecs(BRAIN, struct, humanText || '', { timeoutMs: 1500 });
                 if (!sem) semMode = 'sem-unavailable';
                 else {
                     const fresh = Date.now() - 30 * 86_400_000;
@@ -2593,6 +2722,17 @@ async function read(lib) {
     // watching (tag/version drift vs the per-project sidecar) and queue them
     // for the Stop capture. The line rides BOTH emit tiers.
     const shipObsLine = observeOutOfSessionShips(lib);
+    // Commit-capture completeness (2026-08-07): the Stop hook's commit walk is
+    // blind to commits authored in OTHER worktrees/branches and to non-hooked
+    // agents. Ensure the agent-neutral git post-commit/post-merge hook is wired
+    // — writes only files we fully own (absent or marker-fenced ours), never a
+    // foreign hook. Dynamic + guarded so a stale bundle degrades to a no-op.
+    const gitHookNotice = await (async () => {
+        try {
+            const ghl = await import(new URL('./git-capture-install.mjs', import.meta.url).href);
+            return typeof ghl.ensureGitCaptureHook === 'function' ? (ghl.ensureGitCaptureHook(CWD).notice || '') : '';
+        } catch { return ''; }
+    })();
     const { struct } = await lib.parseKlypix(fs.readFileSync(BRAIN));
     const { freshness, drifted } = computeFreshness(struct);
     // The FULL brief: tiered brief + every self-heal/health footer. Messages are
@@ -2603,7 +2743,7 @@ async function read(lib) {
         + ruleDraftsFooter(input.session_id, struct, { markShown: false })
         + receiptLine + selfCheckFooter() + doctorFooter() + versionCurrencyFooter() + legendFooter() + memoryFooter();
     const emitFull = () => {
-        process.stdout.write(full + presenceLine + shipObsLine + messageFooter(input.session_id || '', input.transcript_path, lib));
+        process.stdout.write(full + presenceLine + shipObsLine + gitHookNotice + messageFooter(input.session_id || '', input.transcript_path, lib));
         appendJsonl(HEALTH, { ts: nowIso(), project: path.basename(CWD), mode: 'read', ok: true, briefBytes: Buffer.byteLength(full), cards: struct?.counts?.cards ?? null }, 500);
     };
     // --full = everything to stdout (manual runs); also the fallback when the
@@ -2644,7 +2784,7 @@ async function read(lib) {
     // go right after the ultra brief, at the top of the visible window, never
     // after a stack of footers that could push them past a preview cut.
     const messages = messageFooter(input.session_id || '', input.transcript_path, lib);
-    const out = ultra + messages + presenceLine + shipObsLine + healLine + draftLine
+    const out = ultra + messages + presenceLine + shipObsLine + gitHookNotice + healLine + draftLine
         + receiptLine
         + inflightFooter(input.session_id, struct)
         + selfCheckFooter() + doctorFooter() + versionCurrencyFooter();

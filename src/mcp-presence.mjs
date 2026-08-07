@@ -516,7 +516,14 @@ export function createMcpPresence({
       includePresence: true,
       includeSolo: true,
       deliverMessages: true,
-      intent: completing ? '' : intent,
+      // Intent semantics by phase (2026-08-07 — a checkpoint sync carrying an
+      // empty intent used to DECLARE that emptiness, masking the session as
+      // sync-silent for every peer): 'complete' clears deliberately; 'start' is
+      // a task boundary, so a missing intent clears the OLD task's intent
+      // rather than inheriting it; 'checkpoint' with a missing/empty intent
+      // keeps the previous declaration — it is a progress ping, not a recant.
+      intent: completing ? ''
+        : (compact(intent) ? intent : (nextPhase === 'start' ? '' : undefined)),
       files: completing ? [] : files,
       replaceFiles: completing || nextPhase === 'start',
     };

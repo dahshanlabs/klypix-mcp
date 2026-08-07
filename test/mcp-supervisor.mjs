@@ -131,7 +131,18 @@ function activate(worker, version) {
   };
   const tmp = `${manifestPath}.tmp`;
   fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
-  fs.renameSync(tmp, manifestPath);
+  // Windows: a live supervisor polls this manifest, so rename-over-destination
+  // intermittently throws EPERM while a reader holds it open — the same race the
+  // production writers now retry through. Without this the whole suite aborts
+  // mid-run on an unrelated OS timing artifact (seen 2026-08-07).
+  for (let attempt = 0; ; attempt++) {
+    try { fs.renameSync(tmp, manifestPath); return; }
+    catch (err) {
+      if (attempt >= 20) { try { fs.unlinkSync(tmp); } catch { /* */ } throw err; }
+      const until = Date.now() + 25;
+      while (Date.now() < until) { /* brief spin — this helper is sync by contract */ }
+    }
+  }
 }
 
 const textOf = result => result?.content?.find(block => block.type === 'text')?.text;

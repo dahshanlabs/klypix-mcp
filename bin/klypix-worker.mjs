@@ -523,7 +523,7 @@ server.registerTool('brain_message', {
 
 server.registerTool('brain_sync', {
   title: 'KLYPIX Context Gateway — synchronize task, peers, conflicts, and relevant memory',
-  description: 'APPROVAL-FREE task gateway over the authorized MCP connection. Call FIRST with a concise intent and expected files, again when scope changes, and with phase:"complete" before the final response. One bounded response returns compact task-relevant brain context, active TASK peers (idle connections hidden), one-time messages, structured exact-file conflicts, and late-arrival overlap alerts. Works on any MCP host — it needs only the authorized MCP connection, so native lifecycle hooks are optional. LIMITS: conflict matching is EXACT-PATH and both sessions must have declared their files, coordination is machine-local and OS-user-local (a teammate on another machine is invisible), and overlap is ADVISORY — nothing is blocked.',
+  description: 'APPROVAL-FREE task gateway over the authorized MCP connection. Call FIRST with a concise intent and expected files, again when scope changes, and with phase:"complete" before the final response. One bounded response returns compact task-relevant brain context, active TASK peers (idle connections hidden), one-time messages, structured exact-file conflicts, and late-arrival overlap alerts. A completion that supplies machine-checkable result manifests is fail-closed: invalid, conflicting, or incomparable evidence returns needs-reconciliation and retains task scope. Works on any MCP host — it needs only the authorized MCP connection, so native lifecycle hooks are optional. LIMITS: conflict matching is EXACT-PATH and both sessions must have declared their files, coordination/result reconciliation is machine-local and OS-user-local (a teammate on another machine is invisible), and file overlap remains ADVISORY.',
   annotations: {
     destructiveHint: false,
     idempotentHint: true,
@@ -535,10 +535,38 @@ server.registerTool('brain_sync', {
     files: z.array(z.string()).max(20).optional().describe('Project-relative files you expect to touch or have touched. Exact overlaps with peers are flagged.'),
     phase: z.enum(['start', 'checkpoint', 'complete']).optional().describe('start replaces prior task scope; checkpoint merges changed scope; complete clears task intent/files. Default: checkpoint.'),
     include_context: z.boolean().optional().describe('Include fast task-relevant brain cards in the same response. Defaults true; ignored for phase complete.'),
+    results: z.array(z.object({
+      schemaVersion: z.literal(1),
+      claimKey: z.string().min(3).max(160),
+      report: z.object({
+        path: z.string(),
+        sha256: z.string().length(64),
+      }),
+      provenance: z.object({
+        producer: z.string().min(1).max(160),
+        runId: z.string().min(1).max(160),
+        gitCommit: z.string().min(7).max(64),
+        dirtyDigest: z.string().length(64),
+      }),
+      input: z.object({
+        fingerprint: z.string().length(64),
+        details: z.record(z.string(), z.unknown()),
+      }),
+      configuration: z.object({
+        fingerprint: z.string().length(64),
+        details: z.record(z.string(), z.unknown()),
+      }),
+      metrics: z.record(z.string(), z.object({
+        value: z.number(),
+        count: z.number().int().positive(),
+        tolerance: z.number().nonnegative(),
+        numerator: z.number().int().nonnegative().optional(),
+      })),
+    }).strict()).max(8).optional().describe('On phase complete, 1-8 validated result manifests for stable claim keys. Report hashes and input/configuration fingerprints are verified; conflicting or incomparable recent peer results block completion.'),
   },
-}, async ({ project, intent, files, phase, include_context }) => {
+}, async ({ project, intent, files, phase, include_context, results }) => {
   const totalStartedAt = Date.now();
-  const report = mcpPresence.sync({ project, intent, files, phase });
+  const report = mcpPresence.sync({ project, intent, files, phase, results });
   // Zero-manual harness convergence: brain_sync is the one project-aware
   // gateway every MCP host can call. Register MCP-only projects here (Claude's
   // lifecycle hook is no longer the sole registry writer), then reconcile only
@@ -624,6 +652,7 @@ server.registerTool('brain_sync', {
       text: [report.text, harnessText, shipNotice, contextText, timingText].filter(Boolean).join('\n\n'),
     }],
     structuredContent,
+    ...(report.isError ? { isError: true } : {}),
   };
 });
 

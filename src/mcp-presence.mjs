@@ -27,6 +27,7 @@ import {
 // canonical copy lives in the pure module because that one is import-restricted
 // (crypto only), so it can never grow a dependency this file would inherit.
 import { normalizeFileKey } from './finding-routing.mjs';
+import { recordResultManifests } from './result-reconcile.mjs';
 
 export const MCP_HEARTBEAT_MS = 60_000;
 export const MCP_INBOX_POLL_MS = 3_000;
@@ -41,6 +42,7 @@ export const KLYPIX_MCP_INSTRUCTIONS = [
   'A session that never calls brain_sync appears to every peer as a connection with no declared scope — sync early so concurrent sessions can coordinate with you.',
   'Use its active-task, message, and file-overlap report to coordinate concurrent work.',
   'Call brain_sync again when your file scope materially changes, and with phase "complete" before your final response.',
+  'When a task publishes a quantified or otherwise machine-checkable claim, include its validated result manifest in the completion sync; conflicting or incomparable peer results retain the task scope until reconciled.',
   'Do not read the full brain brief unless brain_sync says its compact context is insufficient or the task asks for broad history/status; use brain_ask for deeper retrieval.',
   'Capture only durable decisions or milestones with brain_note.',
   'Never hand-edit brain.klypix. If the current project has no brain.klypix, ignore this workflow.',
@@ -307,6 +309,7 @@ export function createMcpPresence({
   let started = false;
   let lastPeers = '';
   let taskStartedAt = 0;
+  let resultClaimsPending = false;
   let syncNudgeShown = false;
   const sentTexts = new Set();
   const notifiedConflicts = new Set();
@@ -499,20 +502,66 @@ export function createMcpPresence({
     return first;
   };
 
-  const sync = ({ project, intent, files, phase = 'checkpoint' } = {}) => {
+  const sync = ({ project, intent, files, phase = 'checkpoint', results } = {}) => {
     const syncStartedAt = Date.now();
     const nextPhase = ['start', 'checkpoint', 'complete'].includes(phase) ? phase : 'checkpoint';
     const completing = nextPhase === 'complete';
     if (nextPhase === 'start') {
       taskStartedAt = now();
+      resultClaimsPending = false;
       notifiedConflicts.clear();
     } else if (!taskStartedAt && !completing) {
       taskStartedAt = now();
-    } else if (completing) {
-      notifiedConflicts.clear();
     }
+    // Some IDE extension hosts launch a project-scoped MCP server from the
+    // IDE's own installation directory. `project` is the host-independent
+    // Context Gateway binding: one explicit workspace root selects exactly one
+    // brain/presence lane for this connection. Omitting it preserves the
+    // configured launch vault for backwards compatibility.
+    const requestedVault = compact(project) ? path.resolve(project) : vault;
+    const hasResultSubmission = completing && results !== undefined
+      && (!Array.isArray(results) || results.length > 0);
+    let resultReconciliation = null;
+    let completionBlocked = false;
+    if (hasResultSubmission) {
+      resultClaimsPending = true;
+      // Reconcile BEFORE the completion touch. That touch deliberately clears
+      // task intent/files; doing it first would make an invalid or conflicting
+      // result look complete even if the later evidence check failed.
+      const resultBrainPath = started && requestedVault === vault
+        ? brainPath
+        : findProjectBrain(requestedVault);
+      resultReconciliation = recordResultManifests({
+        brainPath: resultBrainPath,
+        projectRoot: resultBrainPath ? path.dirname(resultBrainPath) : requestedVault,
+        sessionId,
+        results,
+        home,
+        now: now(),
+      });
+      completionBlocked = resultReconciliation?.ok !== true;
+    } else if (completing && resultClaimsPending) {
+      // Once this task has declared a result claim, omitting evidence on a retry
+      // cannot bypass a prior conflict or failed lane write. A fresh `start` is
+      // the explicit boundary that returns to the legacy no-result contract.
+      resultReconciliation = {
+        ok: false,
+        status: 'needs-reconciliation',
+        ledgerWriteOk: null,
+        claims: [],
+        conflicts: [{
+          kind: 'result-manifest-required',
+          severity: 'blocking',
+          reason: 'this task previously submitted a result claim; resubmit corrected evidence',
+        }],
+      };
+      completionBlocked = true;
+    }
+    const clearCompletionScope = completing && !completionBlocked;
     const details = {
-      event: completing ? 'McpTaskComplete' : (nextPhase === 'start' ? 'McpTaskStart' : 'McpTaskCheckpoint'),
+      event: clearCompletionScope
+        ? 'McpTaskComplete'
+        : (nextPhase === 'start' ? 'McpTaskStart' : 'McpTaskCheckpoint'),
       includePresence: true,
       includeSolo: true,
       deliverMessages: true,
@@ -522,32 +571,56 @@ export function createMcpPresence({
       // a task boundary, so a missing intent clears the OLD task's intent
       // rather than inheriting it; 'checkpoint' with a missing/empty intent
       // keeps the previous declaration — it is a progress ping, not a recant.
-      intent: completing ? ''
-        : (compact(intent) ? intent : (nextPhase === 'start' ? '' : undefined)),
-      files: completing ? [] : files,
-      replaceFiles: completing || nextPhase === 'start',
+      intent: clearCompletionScope ? ''
+        : (completing ? undefined
+          : (compact(intent) ? intent : (nextPhase === 'start' ? '' : undefined))),
+      files: clearCompletionScope ? [] : (completing ? undefined : files),
+      replaceFiles: clearCompletionScope || nextPhase === 'start',
     };
-    // Some IDE extension hosts launch a project-scoped MCP server from the
-    // IDE's own installation directory. `project` is the host-independent
-    // Context Gateway binding: one explicit workspace root selects exactly one
-    // brain/presence lane for this connection. Omitting it preserves the
-    // configured launch vault for backwards compatibility.
-    const requestedVault = compact(project) ? path.resolve(project) : vault;
     const report = started && requestedVault === vault
       ? touch(details)
       : start(requestedVault, details);
+    const resultConflicts = [...(resultReconciliation?.conflicts || [])];
+    // A completion write that did not land is not completion. The old scope is
+    // still authoritative in the lane, so retain it and say so explicitly.
+    if (completing && report?.laneWriteOk === false) {
+      completionBlocked = true;
+      resultConflicts.push({
+        kind: 'presence-lane-write-failed',
+        severity: 'blocking',
+        reason: report.laneWriteSkippedReason || 'presence lane write did not land',
+      });
+    }
+    if (completing && !completionBlocked) {
+      notifiedConflicts.clear();
+      resultClaimsPending = false;
+    }
     if (!brainPath) {
+      const blocked = completing && completionBlocked;
       return {
         ...report,
         conflicts: [],
+        resultConflicts,
+        isError: blocked,
         structured: {
           schemaVersion: 1,
-          status: 'idle',
+          status: blocked ? 'needs-reconciliation' : 'idle',
           phase: nextPhase,
           reason: 'no-project-brain',
           requestedProject: requestedVault,
+          ...(resultReconciliation ? { resultReconciliation: {
+            status: resultReconciliation.status,
+            claims: resultReconciliation.claims || [],
+            ledgerWriteOk: resultReconciliation.ledgerWriteOk ?? null,
+            machineLocal: true,
+            ...(resultReconciliation.receipt ? { receipt: resultReconciliation.receipt } : {}),
+            ...(resultReconciliation.receiptHash ? { receiptHash: resultReconciliation.receiptHash } : {}),
+          } } : {}),
+          ...(resultConflicts.length ? { resultConflicts } : {}),
         },
-        text: `KLYPIX Context Gateway is idle: no brain.klypix was found at or above ${requestedVault}.`,
+        text: blocked
+          ? `KLYPIX completion needs reconciliation: no writable project brain/result lane was available at ${requestedVault}. The task scope was not cleared.`
+          : `KLYPIX Context Gateway is idle: no brain.klypix was found at or above ${requestedVault}.`,
       };
     }
 
@@ -593,7 +666,7 @@ export function createMcpPresence({
     const messagesText = formatReceivedMessages(report.messages, stamp, decay);
     const structured = {
       schemaVersion: 1,
-      status: completing ? 'complete' : 'active',
+      status: completing ? (completionBlocked ? 'needs-reconciliation' : 'complete') : 'active',
       phase: nextPhase,
       project: path.dirname(brainPath),
       brain: brainPath,
@@ -619,6 +692,16 @@ export function createMcpPresence({
         };
       }),
       alertsQueued,
+      ...(resultReconciliation ? { resultReconciliation: {
+        status: resultReconciliation.status,
+        claims: resultReconciliation.claims || [],
+        ledgerWriteOk: resultReconciliation.ledgerWriteOk ?? null,
+        ledgerFreshMs: resultReconciliation.ledgerFreshMs || null,
+        machineLocal: true,
+        ...(resultReconciliation.receipt ? { receipt: resultReconciliation.receipt } : {}),
+        ...(resultReconciliation.receiptHash ? { receiptHash: resultReconciliation.receiptHash } : {}),
+      } } : {}),
+      ...(resultConflicts.length ? { resultConflicts } : {}),
       delivery: {
         proactive: 'mcp-logging-best-effort',
         // Honest scope: in-band delivery is guaranteed only while the message
@@ -628,13 +711,34 @@ export function createMcpPresence({
       },
       timingMs: { coordination: durationMs },
     };
+    const resultText = completing && completionBlocked
+      ? [
+        'KLYPIX completion needs reconciliation; the task intent/files remain active.',
+        ...resultConflicts.slice(0, 8).map((conflict) => {
+          const where = [conflict.claimKey, conflict.metric].filter(Boolean).join(' / ');
+          return `- ${conflict.kind}${where ? ` (${where})` : ''}${conflict.reason ? `: ${conflict.reason}` : ''}`;
+        }),
+      ].join('\n')
+      : completing && resultReconciliation
+        ? `KLYPIX result reconciliation: ${resultReconciliation.status}; completion evidence was recorded in the machine-local project ledger.`
+        : '';
     const text = [
       `KLYPIX Context Gateway: session ${sessionId} · phase ${nextPhase} · coordination ${durationMs}ms.`,
+      resultText,
       formatTaskPresence(snapshot, stamp),
       messagesText,
       conflictText,
     ].filter(Boolean).join('\n\n');
-    return { ...report, snapshot, conflicts, alertsQueued, structured, text };
+    return {
+      ...report,
+      snapshot,
+      conflicts,
+      resultConflicts,
+      alertsQueued,
+      structured,
+      text,
+      isError: completing && completionBlocked,
+    };
   };
 
   const decorateToolResult = (result) => {

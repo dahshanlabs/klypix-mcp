@@ -393,4 +393,7 @@ ok(!listActiveSessions({ brainPath, home }).some((session) => session.id === 'co
 
 for (const dir of [home, project]) fs.rmSync(dir, { recursive: true, force: true });
 console.log(failures ? `\n[x] ${failures} assertion(s) failed` : '\n[ok] agent-presence: all assertions passed');
-process.exit(failures ? 1 : 0);
+if (failures) process.exit(1);
+// Keep the completion/result gate in the existing npm-test path without adding
+// a second package.json owner: this test is the integration home for brain_sync.
+await import('./result-reconcile.mjs');

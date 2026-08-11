@@ -225,6 +225,8 @@ const DAY = 86_400_000;
     lane.messages = [
         { id: 'm1', from: 'peerAAAA', to: 'all', text: DUP, ts: Date.now(), seen: [] },
         { id: 'm2', from: 'peerBBBB', to: 'all', text: DUP, ts: Date.now(), seen: [] },
+        { id: 'm3', from: 'peerCCCC', to: 'all', text: 'Edit src/API.ts before release', ts: Date.now(), seen: [] },
+        { id: 'm4', from: 'peerDDDD', to: 'all', text: 'Edit src/api.ts before release', ts: Date.now(), seen: [] },
     ];
     fs.writeFileSync(laneFile, JSON.stringify(lane));
 
@@ -233,6 +235,10 @@ const DAY = 86_400_000;
     ok(/already shown this session/.test(run2), 'F5a run 2: the big card renders as a "(already shown this session)" headline');
     const dupCount = run2.split(DUP).length - 1;
     ok(dupCount === 1, `F5b: a duplicate peer message text appears exactly once in one injection (saw ${dupCount})`);
+    ok(run2.includes('peerAAAA') && run2.includes('peerBBBB'),
+      'F5b: the one grouped instruction preserves attribution to both sending sessions');
+    ok(run2.includes('Edit src/API.ts before release') && run2.includes('Edit src/api.ts before release'),
+      'F5b: the real hook preserves case-distinct path instructions while grouping exact duplicates');
 
     for (const d of [home, proj]) fs.rmSync(d, { recursive: true, force: true });
 }

@@ -855,6 +855,7 @@ function messageFooter(sid, tp, lib) {
     const got = acquireLock(SESSIONS_LOCK, { tries: 15, waitMs: 25 });
     if (!got) return '';
     let delivered = [];
+    let deliveryGroups = new Map();
     let overflow = 0;
     try {
         let data = {}; try { data = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8')); } catch { return ''; }
@@ -869,8 +870,15 @@ function messageFooter(sid, tp, lib) {
         // real note forever. A pre-v2 generic-sender self-echo is safer than a
         // false delivery receipt for somebody else's message.
         const show = due;
-        const norm = (m) => String(m.text || '').replace(/\s+/g, ' ').trim().toLowerCase();
-        const deliveryKey = (m) => `${msgRecipientKey(m?.from)}\u0000${norm(m)}`;
+        // Whitespace-only normalization: case can carry file/env/command
+        // identity on case-sensitive systems, so never fold it for grouping.
+        const norm = (m) => String(m.text || '').replace(/\s+/g, ' ').trim();
+        // Render identical note bodies once, but keep every sender and advance
+        // every underlying receipt. Grouping by sender+text showed the same
+        // instruction twice when two peers independently sent it; grouping by
+        // text alone used to hide attribution. The group metadata below keeps
+        // both truths: one model instruction, all contributing sessions.
+        const deliveryKey = (m) => norm(m);
         const seenText = new Set(); const dupes = new Map(); const unique = [];
         for (const m of show) {
             const key = deliveryKey(m);
@@ -879,6 +887,7 @@ function messageFooter(sid, tp, lib) {
             seenText.add(key); unique.push(m);
         }
         delivered = unique.slice(0, 6);
+        deliveryGroups = new Map(delivered.map(m => [m.id, [m, ...(dupes.get(deliveryKey(m)) || [])]]));
         overflow = unique.length - delivered.length;
         const advance = new Set();
         for (const m of delivered) {
@@ -902,8 +911,12 @@ function messageFooter(sid, tp, lib) {
     const out = ['', '## 📨 Message(s) from another session in this project (replayed until a later action acknowledges model-context delivery)'];
     const neutral = (s) => String(s).replace(/🧠(\s*)(BRAIN|MSG)/gi, '🧠·$2');
     for (const m of delivered) {
-        out.push(`- from ${String(m.from || '?').slice(0, 8)} · ${ago(m.ts)}: ${neutral(String(m.text)).replace(/\s+/g, ' ').trim().slice(0, 400)}`);
-        const stamp = decayStampForMessage(m.text, m.ts, now, lib);
+        const group = deliveryGroups.get(m.id) || [m];
+        const senders = [...new Set(group.map(item => String(item.from || '?').slice(0, 8)))];
+        const senderLabel = senders.length <= 3 ? senders.join(', ') : `${senders.slice(0, 3).join(', ')} +${senders.length - 3}`;
+        const oldestTs = Math.min(...group.map(item => Number(item.ts) || now));
+        out.push(`- from ${senderLabel} · ${ago(oldestTs)}: ${neutral(String(m.text)).replace(/\s+/g, ' ').trim().slice(0, 400)}`);
+        const stamp = decayStampForMessage(m.text, oldestTs, now, lib);
         if (stamp) out.push(`  ${stamp}`);
     }
     if (overflow > 0) out.push(`- …${overflow} more message(s) waiting — acknowledged/replayed messages clear first.`);
@@ -2130,8 +2143,16 @@ async function capture(lib) {
     if (stats.merged) bits.push(`${stats.merged} merged`);
     if (stats.closed) bits.push(`${stats.closed} closed`);
     if (stats.superseded) bits.push(`${stats.superseded} superseded`);
+    if (stats.reAdopted) bits.push(`${stats.reAdopted} re-adopted`);
     if (stats.linked) bits.push(`${stats.linked} linked`);
     process.stderr.write(`[brain] capture: ${bits.join(' · ')} → brain.klypix\n`);
+    // Keep the immediate re-adoption receipt identical across MCP, CLI and the
+    // Stop hook. maxEach:0 selects the lifecycle receipt without duplicating
+    // the hook's richer fulfillment/skill diagnostics below.
+    const reAdoptionReceipts = typeof lib.formatCaptureReceipts === 'function'
+        ? lib.formatCaptureReceipts(stats, { maxEach: 0 })
+        : (stats.reAdopted ? [`↪ re-adoption recorded: ${stats.reAdopted} returning decision(s) now carry a dated read-alone receipt and provenance edge to the earlier stance.`] : []);
+    for (const line of reAdoptionReceipts) process.stderr.write(`[brain] ${line}\n`);
     // Receipt for correction-driven (cross-area / low-bar) supersedes — the
     // confirmation channel: say WHAT was archived and how to undo a wrong grab.
     if (Array.isArray(stats.corrections) && stats.corrections.length) {

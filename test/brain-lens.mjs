@@ -101,11 +101,15 @@ console.log('\nL3 end-to-end via MCP client (brain_lens registered + returns):')
     try {
         const tools = await client.listTools();
         ok(tools.tools.some(t => t.name === 'brain_lens'), 'brain_lens listed');
-        const res = await client.callTool({ name: 'brain_lens', arguments: { view: 'all' } });
+        // The canonical default intentionally prefers the current project
+        // ancestor's brain. This fixture vault lives inside another brain repo,
+        // so pin the fixture explicitly instead of testing the host cwd.
+        const res = await client.callTool({ name: 'brain_lens', arguments: { canvas: 'brain', view: 'all' } });
         const body = (res.content || []).map(c => c.text || '').join('\n');
+        if (!/Brain lens — lens-fixture/.test(body)) console.log(`  diagnostic body: ${JSON.stringify(body.slice(0, 800))}`);
         ok(/Brain lens — lens-fixture/.test(body), 'markdown header present');
         ok(/## Unresolved/.test(body) && /Should replay pace/.test(body), 'unresolved section rendered end-to-end');
-        const resT = await client.callTool({ name: 'brain_lens', arguments: { view: 'timeline' } });
+        const resT = await client.callTool({ name: 'brain_lens', arguments: { canvas: 'brain', view: 'timeline' } });
         const bodyT = (resT.content || []).map(c => c.text || '').join('\n');
         ok(/## Timeline/.test(bodyT), 'timeline view renders');
     } finally {

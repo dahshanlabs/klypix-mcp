@@ -27,6 +27,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import {
   capMessages,
+  formatReceivedMessages,
   formatPresenceMessage,
   laneFileFor,
   MESSAGE_FRESH_MS,
@@ -101,6 +102,17 @@ const twoSendersAck = receiveMessages({ brainPath, sessionId: 'rx', home, now: n
 ok(twoSendersOffer.length === 2 && new Set(twoSendersOffer.map(message => message.from)).size === 2
   && twoSendersAck.length === 2,
 'V2: identical text from different senders keeps both attributions and advances each receipt honestly');
+const groupedTwoSenders = formatReceivedMessages(twoSendersOffer, now + 520);
+ok(groupedTwoSenders.split('same coordination text').length - 1 === 1
+  && groupedTwoSenders.includes('tx-a') && groupedTwoSenders.includes('tx-b'),
+  'V2: model-facing rendering groups identical instructions once while naming both senders');
+const caseDistinctPaths = formatReceivedMessages([
+  { id: 'case-a', from: 'tx-a', text: 'Edit src/API.ts before release', ts: now + 521 },
+  { id: 'case-b', from: 'tx-b', text: 'Edit src/api.ts before release', ts: now + 522 },
+], now + 523);
+ok(caseDistinctPaths.includes('Edit src/API.ts before release')
+  && caseDistinctPaths.includes('Edit src/api.ts before release'),
+  'V2: case-distinct paths remain two instructions; grouping never destroys case-sensitive identity');
 postPresenceMessage({ brainPath, home, now: now + 540, from: 'peer-copy', to: 'rx', text: 'same as my just-sent note' });
 ok(receiveMessages({
   brainPath, sessionId: 'rx', home, now: now + 550, ignoreTexts: ['same as my just-sent note'],

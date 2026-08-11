@@ -63,7 +63,7 @@ console.log('\n— git-driver install (stranger repo, empty runtime) —');
   const cfg = git('config', '--get', 'merge.klypix.driver');
   ok(cfg.includes('klypix-merge-driver.mjs') && cfg.includes(FAKE_BRAIN_DIR.replace(/\\/g, '/')), 'git config points at the installed runtime');
   ok(/merge=klypix/.test(fs.readFileSync(path.join(REPO, '.gitattributes'), 'utf8')), '.gitattributes rule written');
-  for (const f of ['klypix-merge-driver.mjs', 'merge-brains.mjs', 'klypix-format.mjs']) {
+  for (const f of ['klypix-merge-driver.mjs', 'merge-brains.mjs', 'klypix-format.mjs', 'brain-graveyard.mjs']) {
     ok(fs.existsSync(path.join(FAKE_BRAIN_DIR, f)), `runtime has ${f}`);
   }
   ok(fs.existsSync(path.join(FAKE_BRAIN_DIR, 'node_modules', 'jszip')), 'runtime has jszip dep');

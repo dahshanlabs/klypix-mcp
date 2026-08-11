@@ -76,7 +76,9 @@ try {
     }
     const s = res.stats || {};
     const bits = [`${s.added || 0} added`];
-    for (const k of ['resolved', 'updated', 'closed', 'superseded', 'linked']) if (s[k]) bits.push(`${s[k]} ${k}`);
+    for (const k of ['resolved', 'updated', 'closed', 'superseded']) if (s[k]) bits.push(`${s[k]} ${k}`);
+    if (s.reAdopted) bits.push(`${s.reAdopted} re-adopted`);
+    if (s.linked) bits.push(`${s.linked} linked`);
     console.error(`✓ brain-note → ${path.basename(file)} (${bits.join(' · ')})`);
     for (const line of formatCaptureReceipts(s)) console.error(`  ${line}`);
 } catch (e) {

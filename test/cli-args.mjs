@@ -164,14 +164,29 @@ const run = (args, { cwd = REPO, home = HOME_ROOT, timeout = 60_000 } = {}) => {
     'E: doctor reports the same verdict and exit code from both shapes');
 }
 
-// ── F — conformance honours --json from the standalone bin ────────────────────
-// (test/conformance.mjs already covers the dispatcher shape; this covers the bin.)
+// ── F — conformance honours --json from source and the installed bundle ──────
+// test/conformance.mjs covers the dispatcher shape. The installed-copy assertion
+// also pins the flatten + staged-file closure used by the published flat bundle.
 {
   const r = run([CONFORMANCE, '--json'], { timeout: 120_000 });
   let report = null;
   try { report = JSON.parse(r.out); } catch { /* reported below */ }
   ok(report !== null, 'F: `klypix-conformance --json` honours --json (stdout parses as JSON)');
   ok(report?.ok === true, 'F: the standalone conformance run passes');
+
+  const project = tmp('f-installed-project');
+  const home = tmp('f-installed-home');
+  const install = run([INSTALL, '--runtime-only'], { cwd: project, home, timeout: 180_000 });
+  const installedBin = path.join(home, 'bundle', 'klypix-conformance.mjs');
+  ok(install.code === 0 && fs.existsSync(installedBin),
+    'F: runtime-only install stages the flat-bundle conformance command');
+  const installed = run([installedBin, '--json'], { cwd: project, home, timeout: 120_000 });
+  let installedReport = null;
+  try { installedReport = JSON.parse(installed.out); } catch { /* reported below */ }
+  ok(installedReport !== null,
+    'F: installed `klypix-conformance --json` stdout parses as JSON');
+  ok(installed.code === 0 && installedReport?.ok === true,
+    'F: installed flat-bundle conformance run passes');
 }
 
 // ── G — install honours its flags from BOTH shapes (runtime-only: no host writes) ──
@@ -190,10 +205,30 @@ const run = (args, { cwd = REPO, home = HOME_ROOT, timeout = 60_000 } = {}) => {
   };
   ok(list(homeA) && list(homeA) === list(homeB), 'G: both shapes stage the same bundle scripts');
 
+  const bundleDir = path.join(homeA, 'bundle');
+  const unresolvedSrcImports = fs.readdirSync(bundleDir)
+    .filter((file) => file.endsWith('.mjs'))
+    .flatMap((file) => {
+      const executable = fs.readFileSync(path.join(bundleDir, file), 'utf8')
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .replace(/\/\/.*$/gm, '');
+      return [...executable.matchAll(/['"](\.\.\/src\/[^'"]+\.mjs)['"]/g)]
+        .map((match) => `${file}: ${match[1]}`);
+    });
+  ok(unresolvedSrcImports.length === 0,
+    'G: installed executable modules contain no unresolved ../src/*.mjs imports');
+
   // The flat bundle stages the worker but NOT the link/doctor/install bins, so its
   // dispatch used to die with a raw ERR_MODULE_NOT_FOUND stack trace.
   const bundleServer = path.join(homeA, 'bundle', 'klypix-mcp-server.mjs');
   if (fs.existsSync(bundleServer)) {
+    const bundleBench = run([bundleServer, 'bench', '--quick', '--json'], {
+      cwd: project, home: homeA, timeout: 180_000,
+    });
+    let benchReport = null;
+    try { benchReport = JSON.parse(bundleBench.out); } catch { /* reported below */ }
+    ok(benchReport?.mode === 'quick' && benchReport?.scenarios?.concurrentWriters,
+      'G: installed dispatcher resolves the lazy bench import and runs the quick benchmark');
     const bundleLink = run([bundleServer, 'link', '--check'], { cwd: project, home: homeA });
     ok(bundleLink.code === 2 && /not available in this installed bundle/.test(bundleLink.err),
       'G: a verb absent from the flat bundle fails with a real message and exit 2, not a stack trace');

@@ -17,7 +17,7 @@
 import {
     buildKlypixMap, parseKlypix, captureIntoBrain, correctionOverlaysFor,
     detectRepeatWork, detectContradictions, scoreCardsAgainstQuery,
-    selectGardenCandidates, queryTokens,
+    selectGardenCandidates, queryTokens, rankForQuestion, formatCaptureReceipts,
 } from '../src/klypix-format.mjs';
 
 let failures = 0;
@@ -106,6 +106,263 @@ const archived = (struct) => struct.cards.filter(c => c.type !== 'container' && 
     ok(ov?.by?.id === postgres.id, 'P1 recall: an explicit correction chain resolves to its latest successor');
 }
 
+// A→B→C round trip: cue-less C is a near-identical return to A, so it earns a
+// read-alone receipt + A→C provenance edge while the lifecycle remains A→B→C.
+{
+    const realNow = Date.now;
+    const T_A = Date.parse('2026-08-01T00:00:00Z');
+    const T_B = Date.parse('2026-08-02T00:00:00Z');
+    const T_C = Date.parse('2026-08-03T00:00:00Z');
+    const A = 'Auth: session state uses Redis with sliding expiration and regional replication.\n#auth';
+    const B = 'Auth: session state uses SQLite with fixed expiration and local snapshots.\n#auth';
+    try {
+        Date.now = () => T_A;
+        let buf = await buildKlypixMap({ title: 'brain', areas: [{ title: 'Auth', cards: [{ text: A }] }] });
+        Date.now = () => T_B;
+        const bWrite = await captureIntoBrain(buf, { cards: [{ text: B, area: 'Auth' }] });
+        ok(bWrite.stats.superseded === 1 && bWrite.stats.reAdopted === 0, 'round trip setup: B supersedes A without a re-adoption');
+        Date.now = () => T_C;
+        const cWrite = await captureIntoBrain(bWrite.buffer, { cards: [{ text: A, area: 'Auth' }] });
+        const { struct } = await parseKlypix(cWrite.buffer);
+        const a = struct.cards.find(c => c.createdAt === T_A && /uses\s+Redis/.test(c.text || ''));
+        const b = struct.cards.find(c => c.createdAt === T_B && /uses\s+SQLite/.test(c.text || ''));
+        const c = struct.cards.find(c => c.createdAt === T_C && /uses\s+Redis/.test(c.text || ''));
+        ok(cWrite.stats.superseded === 1 && cWrite.stats.reAdopted === 1, 'round trip: cue-less C is recognized as a high-confidence re-adoption of A');
+        ok(formatCaptureReceipts(cWrite.stats, { maxEach: 0 }).some(line => /1 returning decision[^\n]+dated read-alone receipt[^\n]+provenance edge/.test(line)),
+            'round trip: the host-neutral capture receipt reports re-adoption immediately');
+        ok(/↪ re-adopts 2026-08-03: Auth: session state uses Redis/.test(String(c?.text || '').replace(/\s+/g, ' ')), 'round trip: C carries a read-alone dated re-adoption receipt naming A');
+        ok(struct.connections.some(e => e.fromId === a?.id && e.toId === b?.id && e.label === 'superseded by')
+            && struct.connections.some(e => e.fromId === b?.id && e.toId === c?.id && e.label === 'superseded by'),
+        'round trip: the original A→B→C supersession chain is preserved');
+        ok(struct.connections.some(e => e.fromId === a?.id && e.toId === c?.id && e.label === 're-adopts'), 'round trip: a separate A→C re-adopts edge is persisted');
+        ok(correctionOverlaysFor(struct, [a]).get(a?.id)?.by?.id === c?.id, 'round trip: present-time recall still resolves A through A→B→C to C');
+        const atA = rankForQuestion(struct, 'redis sliding expiration regional replication', { as_of: '2026-08-01', now: T_C, k: 5 });
+        const atB = rankForQuestion(struct, 'sqlite fixed expiration local snapshots', { as_of: '2026-08-02', now: T_C, k: 5 });
+        const atC = rankForQuestion(struct, 'redis sliding expiration regional replication', { as_of: '2026-08-03', now: T_C, k: 5 });
+        ok(atA.hits.some(h => h.card.id === a?.id) && !atA.hits.some(h => h.card.id === b?.id || h.card.id === c?.id), 'round trip: as_of A still returns only A');
+        ok(atB.hits.some(h => h.card.id === b?.id) && !atB.hits.some(h => h.card.id === a?.id || h.card.id === c?.id), 'round trip: as_of B still returns only B');
+        ok(atC.hits.some(h => h.card.id === c?.id) && !atC.hits.some(h => h.card.id === a?.id || h.card.id === b?.id), 'round trip: as_of C returns the restored C stance');
+    } finally {
+        Date.now = realNow;
+    }
+}
+
+// Numeric stance values are evidence, not stopwords. The engine-authored death
+// date is stripped, while a 30-day→7-day→30-day return remains distinguishable.
+{
+    const A = 'Config: session expiration is 30 days with sliding renewal and audit retention.\n#config';
+    const B = 'Config: session expiration is 7 days with sliding renewal and audit retention.\n#config';
+    let buf = await buildKlypixMap({ title: 'brain', areas: [{ title: 'Config', cards: [{ text: A }] }] });
+    const bWrite = await captureIntoBrain(buf, { cards: [{ text: B, area: 'Config' }] });
+    const cWrite = await captureIntoBrain(bWrite.buffer, { cards: [{ text: A, area: 'Config' }] });
+    const { struct } = await parseKlypix(cWrite.buffer);
+    const a = struct.cards.find(c => /expiration\s+is\s+30/.test(c.text || '') && /^archive$/i.test(c.area || ''));
+    const c = liveCards(struct).find(c => /expiration\s+is\s+30/.test(c.text || ''));
+    ok(bWrite.stats.superseded === 1 && cWrite.stats.reAdopted === 1, 'numeric round trip: 30→7→30 is recognized as a cue-less re-adoption');
+    ok(struct.connections.some(e => e.fromId === a?.id && e.toId === c?.id && e.label === 're-adopts'), 'numeric round trip: the restored 30-day stance gets an A→C re-adopts edge');
+}
+
+// Lifecycle identity is Unicode-aware even though the fast English retrieval
+// tokenizer is ASCII-scoped. Both Cyrillic and Arabic round trips retain C→A
+// provenance rather than silently degrading to ordinary supersession.
+for (const fixture of [
+    {
+        name: 'Cyrillic', area: 'Память',
+        A: 'Авторизация: состояние пользовательской сессии хранится через кластер Redis согласно общей политике истечения, аудита и региональной репликации.',
+        B: 'Авторизация: состояние пользовательской сессии хранится через локальную базу SQLite согласно общей политике истечения, аудита и региональной репликации.',
+    },
+    {
+        name: 'Arabic', area: 'الذاكرة',
+        A: 'المصادقة: حالة جلسة المستخدم تحفظ دائما عبر مجموعة ريديس وفق سياسة موحدة للانتهاء والتدقيق والنسخ الإقليمي.',
+        B: 'المصادقة: حالة جلسة المستخدم تحفظ دائما عبر قاعدة سكولايت وفق سياسة موحدة للانتهاء والتدقيق والنسخ الإقليمي.',
+    },
+]) {
+    let buf = await buildKlypixMap({ title: 'brain', areas: [{ title: fixture.area, cards: [{ text: fixture.A }] }] });
+    const bWrite = await captureIntoBrain(buf, { cards: [{ text: fixture.B, area: fixture.area }] });
+    const cWrite = await captureIntoBrain(bWrite.buffer, { cards: [{ text: fixture.A, area: fixture.area }] });
+    ok(bWrite.stats.superseded === 1 && cWrite.stats.reAdopted === 1, `${fixture.name} round trip: A→B→A receives an explicit re-adoption receipt`);
+}
+
+// Full-lineage traversal: C can re-adopt A through A→B→D→C, not just through
+// the immediate predecessor. The provenance edge must point to the stance source A.
+{
+    const A = 'Cache: project state serializer pipeline stores payload snapshots using JSON format with deterministic key ordering.\n#cache';
+    const B = 'Cache: project state serializer pipeline stores payload snapshots using MessagePack format with compact binary key encoding.\n#cache';
+    const D = 'Cache: project state serializer pipeline stores payload snapshots using CBOR format with tagged binary key encoding.\n#cache';
+    const C = 'Cache: CORRECTION: restore project state serializer pipeline payload snapshots to JSON format with deterministic key ordering; CBOR was WRONG.\n#cache';
+    let buf = await buildKlypixMap({ title: 'brain', areas: [{ title: 'Cache', cards: [{ text: A }] }] });
+    ({ buffer: buf } = await captureIntoBrain(buf, { cards: [{ text: B, area: 'Cache' }] }));
+    const dWrite = await captureIntoBrain(buf, { cards: [{ text: D, area: 'Cache' }] });
+    const cWrite = await captureIntoBrain(dWrite.buffer, { cards: [{ text: C, area: 'Cache' }] });
+    const { struct } = await parseKlypix(cWrite.buffer);
+    const a = struct.cards.find(c => /using\s+JSON/.test(c.text || ''));
+    const c = struct.cards.find(c => /CORRECTION:[\s\S]*restore[\s\S]*JSON/.test(c.text || ''));
+    ok(dWrite.stats.reAdopted === 0, 'deep round trip setup: novel D gets no re-adoption label');
+    ok(cWrite.stats.reAdopted === 1 && struct.connections.some(e => e.fromId === a?.id && e.toId === c?.id && e.label === 're-adopts'),
+        'deep round trip: explicit C traverses A→B→D and re-adopts A');
+}
+
+// Precision negative: a novel D on the same subject can supersede B, but it is
+// neither near-identical to A nor explicitly restoring A's stance.
+{
+    const A = 'Auth: session state uses Redis with sliding expiration and regional replication.\n#auth';
+    const B = 'Auth: session state uses SQLite with fixed expiration and local snapshots.\n#auth';
+    const D = 'Auth: session state uses Postgres with adaptive expiration and global replication.\n#auth';
+    let buf = await buildKlypixMap({ title: 'brain', areas: [{ title: 'Auth', cards: [{ text: A }] }] });
+    ({ buffer: buf } = await captureIntoBrain(buf, { cards: [{ text: B, area: 'Auth' }] }));
+    const dWrite = await captureIntoBrain(buf, { cards: [{ text: D, area: 'Auth' }] });
+    const { struct } = await parseKlypix(dWrite.buffer);
+    const d = struct.cards.find(c => /uses\s+Postgres/.test(c.text || ''));
+    ok(dWrite.stats.superseded === 1 && dWrite.stats.reAdopted === 0, 're-adoption precision: novel D still supersedes B but is not labeled as restoring A');
+    ok(!/re-adopts/.test(d?.text || '') && !struct.connections.some(e => e.toId === d?.id && e.label === 're-adopts'), 're-adoption precision: novel D gets neither stamp nor re-adopts edge');
+}
+
+// Precision negative: cue-less similarity must be symmetric. A long novel C
+// that contains every A token is not "near-identical" merely because A⊂C.
+{
+    const A = 'Cache: project state serializer pipeline stores payload snapshots using JSON format with deterministic key ordering.\n#cache';
+    const B = 'Cache: project state serializer pipeline stores payload snapshots using MessagePack format with compact binary key encoding.\n#cache';
+    const C = 'Cache: project state serializer pipeline stores payload snapshots using JSON format with deterministic key ordering plus encrypted remote mirroring, tenant quotas, schema migration, offline compaction, integrity scans, and geographic failover.\n#cache';
+    let buf = await buildKlypixMap({ title: 'brain', areas: [{ title: 'Cache', cards: [{ text: A }] }] });
+    ({ buffer: buf } = await captureIntoBrain(buf, { cards: [{ text: B, area: 'Cache' }] }));
+    const cWrite = await captureIntoBrain(buf, { cards: [{ text: C, area: 'Cache' }] });
+    const { struct } = await parseKlypix(cWrite.buffer);
+    const c = liveCards(struct).find(card => /encrypted remote mirroring/.test(card.text || ''));
+    ok(cWrite.stats.superseded === 1 && cWrite.stats.reAdopted === 0, 're-adoption precision: an A-containing but substantially expanded C is not mislabeled as a cue-less return');
+    ok(!/re-adopts/.test(c?.text || '') && !struct.connections.some(e => e.toId === c?.id && e.label === 're-adopts'), 're-adoption precision: asymmetric subset similarity creates no receipt or edge');
+}
+
+// Precision negative: the engine's lightweight stems are not identity keys.
+// state↔stats is a documented collision and cannot supply stance evidence.
+{
+    const A = 'Planner: routing ledger state uses durable checkpoints across parallel worker sessions.\n#planner';
+    const B = 'Planner: routing ledger mode uses durable checkpoints across parallel worker sessions.\n#planner';
+    const C = 'Planner: routing ledger stats uses durable checkpoints across parallel worker sessions.\n#planner';
+    let buf = await buildKlypixMap({ title: 'brain', areas: [{ title: 'Planner', cards: [{ text: A }] }] });
+    ({ buffer: buf } = await captureIntoBrain(buf, { cards: [{ text: B, area: 'Planner' }] }));
+    const cWrite = await captureIntoBrain(buf, { cards: [{ text: C, area: 'Planner' }] });
+    ok(cWrite.stats.superseded === 1 && cWrite.stats.reAdopted === 0, 're-adoption precision: state→mode→stats is not a round trip through an unsafe stem collision');
+}
+
+// Precision negative: an explicit negation wins even if the text repeats A
+// while explaining why B remains current.
+{
+    const A = 'Auth: session state uses Redis with sliding expiration and regional replication.\n#auth';
+    const B = 'Auth: session state uses SQLite with fixed expiration and local snapshots.\n#auth';
+    const C = 'Auth: do not restore Redis with sliding expiration and regional replication; session state continues using SQLite with fixed expiration and local snapshots.\n#auth';
+    let buf = await buildKlypixMap({ title: 'brain', areas: [{ title: 'Auth', cards: [{ text: A }] }] });
+    ({ buffer: buf } = await captureIntoBrain(buf, { cards: [{ text: B, area: 'Auth' }] }));
+    const cWrite = await captureIntoBrain(buf, { cards: [{ text: C, area: 'Auth' }] });
+    ok(cWrite.stats.superseded === 1 && cWrite.stats.reAdopted === 0, 're-adoption precision: do-not-restore prose cannot produce a re-adoption receipt');
+}
+
+// Negation binds to the return phrase through nearby adverbs/helpers, while a
+// separate earlier negation must not suppress a later affirmative return.
+for (const [name, C] of [
+    ['not-ever-return', 'Cache: project session store must not ever return to Redis with sliding expiration and regional replication; SQLite remains active.'],
+    ['never-go-back', 'Cache: project session store must never go back to Redis with sliding expiration and regional replication; SQLite remains active.'],
+    ['must-not-switch-back', 'Cache: project session store must not switch back to Redis with sliding expiration and regional replication; SQLite remains active.'],
+]) {
+    const A = 'Cache: project session store uses Redis with sliding expiration and regional replication.';
+    const B = 'Cache: project session store uses SQLite with fixed expiration and local snapshots.';
+    let buf = await buildKlypixMap({ title: 'brain', areas: [{ title: 'Cache', cards: [{ text: A }] }] });
+    ({ buffer: buf } = await captureIntoBrain(buf, { cards: [{ text: B, area: 'Cache' }] }));
+    const cWrite = await captureIntoBrain(buf, { cards: [{ text: C, area: 'Cache' }] });
+    ok(cWrite.stats.superseded === 1 && cWrite.stats.reAdopted === 0,
+        `re-adoption precision: ${name} cannot create the opposite lineage receipt`);
+}
+{
+    const A = 'Cache: project session store uses Redis with sliding expiration and regional replication.';
+    const B = 'Cache: project session store uses SQLite with fixed expiration and local snapshots.';
+    const C = 'Cache: project session store must not use SQLite; return to Redis with sliding expiration and regional replication.';
+    let buf = await buildKlypixMap({ title: 'brain', areas: [{ title: 'Cache', cards: [{ text: A }] }] });
+    ({ buffer: buf } = await captureIntoBrain(buf, { cards: [{ text: B, area: 'Cache' }] }));
+    const cWrite = await captureIntoBrain(buf, { cards: [{ text: C, area: 'Cache' }] });
+    ok(cWrite.stats.superseded === 1 && cWrite.stats.reAdopted === 1,
+        're-adoption protect: “do not use B; return to A” keeps its affirmative return receipt');
+}
+
+// Precision negative: "restore" is also an ordinary domain verb. Restoring a
+// backup while explicitly retaining B cannot be mistaken for restoring A.
+{
+    const A = 'Auth: session state uses Redis with sliding expiration and regional replication.\n#auth';
+    const B = 'Auth: session state uses SQLite with fixed expiration and local snapshots.\n#auth';
+    const C = 'Auth: restore backup verification to healthy operation; session state uses SQLite with fixed expiration and local snapshots, not Redis sliding expiration regional replication.\n#auth';
+    let buf = await buildKlypixMap({ title: 'brain', areas: [{ title: 'Auth', cards: [{ text: A }] }] });
+    ({ buffer: buf } = await captureIntoBrain(buf, { cards: [{ text: B, area: 'Auth' }] }));
+    const cWrite = await captureIntoBrain(buf, { cards: [{ text: C, area: 'Auth' }] });
+    ok(cWrite.stats.superseded === 1 && cWrite.stats.reAdopted === 0, 're-adoption precision: a domain restore operation that keeps B creates no A→C lineage');
+}
+
+// Precision negative: one target token can satisfy at most one source token.
+// pack/packed/packs must not triple-count C's single "pack" token.
+{
+    const A = 'Build: artifact pipeline pack packed packs releases with signed hashes and verified manifests.\n#build';
+    const B = 'Build: artifact pipeline stage staged stages releases with signed hashes and verified manifests.\n#build';
+    const C = 'Build: artifact pipeline pack releases with signed hashes and verified manifests.\n#build';
+    let buf = await buildKlypixMap({ title: 'brain', areas: [{ title: 'Build', cards: [{ text: A }] }] });
+    ({ buffer: buf } = await captureIntoBrain(buf, { cards: [{ text: B, area: 'Build' }] }));
+    const cWrite = await captureIntoBrain(buf, { cards: [{ text: C, area: 'Build' }] });
+    ok(cWrite.stats.superseded === 1 && cWrite.stats.reAdopted === 0, 're-adoption precision: inflection variants are matched one-to-one, not many-to-one');
+}
+
+// Every write caller sees the receipt immediately; none must reopen/read C to
+// learn that capture recognized a re-adoption.
+{
+    const fs = await import('fs');
+    const os = await import('os');
+    const path = await import('path');
+    const { spawnSync } = await import('child_process');
+    const { fileURLToPath } = await import('url');
+    const { opBrainNote } = await import('../src/klypix-core.mjs');
+    const vault = path.join(os.tmpdir(), `klypix-readopt-receipt-${process.pid}`);
+    const file = path.join(vault, 'brain.klypix');
+    fs.rmSync(vault, { recursive: true, force: true });
+    fs.mkdirSync(vault, { recursive: true });
+    const A = 'Auth: session state uses Redis with sliding expiration and regional replication.\n#auth';
+    const B = 'Auth: session state uses SQLite with fixed expiration and local snapshots.\n#auth';
+    let buf = await buildKlypixMap({ title: 'brain', areas: [{ title: 'Auth', cards: [{ text: A }] }] });
+    ({ buffer: buf } = await captureIntoBrain(buf, { cards: [{ text: B, area: 'Auth' }] }));
+    fs.writeFileSync(file, buf);
+    const result = await opBrainNote({ vault, canvas: file, text: 'session state uses Redis with sliding expiration and regional replication.', area: 'Auth', via: 'test' });
+    const receipt = (result.blocks || []).map(b => b.text || '').join('\n');
+    ok(/1 re-adopted/.test(receipt), 'brain_note receipt: caller immediately sees that one prior stance was re-adopted');
+
+    const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+    const returning = 'session state uses Redis with sliding expiration and regional replication.';
+    const cliVault = path.join(vault, 'cli');
+    fs.mkdirSync(cliVault, { recursive: true });
+    fs.writeFileSync(path.join(cliVault, 'brain.klypix'), buf);
+    const cli = spawnSync(process.execPath, [path.join(root, 'src', 'brain-note.mjs'), returning, '--area', 'Auth'], {
+        cwd: cliVault, encoding: 'utf8',
+    });
+    const cliReceipt = `${cli.stdout || ''}${cli.stderr || ''}`;
+    ok(cli.status === 0 && /1 re-adopted/.test(cliReceipt) && /re-adoption recorded:[^\n]+dated read-alone receipt/.test(cliReceipt),
+        'brain-note CLI receipt: summary and explicit re-adoption provenance are immediate');
+
+    const hookVault = path.join(vault, 'hook');
+    const hookHome = path.join(vault, 'hook-home');
+    const hookBrainHome = path.join(hookHome, '.claude', 'project-brain');
+    fs.mkdirSync(hookVault, { recursive: true });
+    fs.mkdirSync(hookBrainHome, { recursive: true });
+    fs.writeFileSync(path.join(hookVault, 'brain.klypix'), buf);
+    fs.writeFileSync(path.join(hookBrainHome, '.npm-currency.json'), JSON.stringify({ pkg: 'klypix-mcp', latest: 'test', checkedAt: Date.now() }));
+    const transcript = path.join(hookHome, 'transcript.jsonl');
+    fs.writeFileSync(transcript, JSON.stringify({ message: { role: 'assistant', content: `\u{1F9E0} BRAIN [Auth]: ${returning}` } }) + '\n');
+    const hookEnv = { ...process.env, HOME: hookHome, USERPROFILE: hookHome };
+    delete hookEnv.KLYPIX_BRAIN_NO_MAIN;
+    const hook = spawnSync(process.execPath, [path.join(root, 'src', 'global-brain-hook.mjs'), '--capture'], {
+        cwd: hookVault,
+        env: hookEnv,
+        encoding: 'utf8',
+        input: JSON.stringify({ session_id: 'readopt-receipt-test', transcript_path: transcript }),
+    });
+    const hookReceipt = `${hook.stdout || ''}${hook.stderr || ''}`;
+    ok(hook.status === 0 && /1 re-adopted/.test(hookReceipt) && /re-adoption recorded:[^\n]+dated read-alone receipt/.test(hookReceipt),
+        'Stop-hook receipt: summary and explicit re-adoption provenance are immediate');
+    fs.rmSync(vault, { recursive: true, force: true });
+}
+
 // ── P4a: closes: resolves ALL covered twins ───────────────────────────────────
 {
     const buf = await buildKlypixMap({
@@ -130,6 +387,51 @@ const archived = (struct) => struct.cards.filter(c => c.type !== 'container' && 
     ok(stats.closed === 1, 'protect: single-target closes: fires once');
     ok(struct.connections.some(c => c.label === 'closed by'), 'protect: closed-by arrow drawn');
     ok(archived(struct).some(c => /github draft/.test(c.text) && /✅/.test(c.text)), 'protect: closed card stamped ✅ + archived');
+}
+
+// ✓ precision: the exact field incident had only 0.174 lexical overlap, but the
+// old +0.15 ❓ bonus raised it above the 0.3 admission threshold and archived the
+// unrelated lineage gap. A question preference may rank eligible matches only.
+{
+    const LINEAGE_GAP = `Brain: ❓ GAP surfaced by an external researcher on Reddit (2026-08-10), confirmed against code: when a reversal is itself reversed (A superseded by B, then C restores A's position), the graph correctly grows A→B→C — C supersedes B only, since liveTextCards() excludes archived cards from the supersede candidate set — and recall/as_of both resolve correctly through the chain. BUT C is a fresh card dated today carrying NO marker that it re-adopts A. The re-adoption lineage exists only as a graph walk; reading C alone shows no history. brain_challenge surfaces it at query time (tier-2 "you tried this and reversed it") but nothing is written on the card. Worth considering: a "re-adopts" edge or stamp when a new card's subject tokens match an ALREADY-archived card beyond its live successor, so a returning decision carries its own round-trip receipt. #brain`;
+    const PRESENCE_RESOLUTION = `The two silent presence bugs (isSuspectedTwin comparing hostPid ALONE; normalizeFileKey never matching an absolute path against a relative one) are FIXED and must stop being scheduled — klypix-mcp commit ab10688, 2026-07-30, "fix(cli): --check no longer writes, and two silent presence bugs". src/mcp-presence.mjs:87-92 now requires THREE conditions — matching hostPid AND sameMachine AND compatibleClient — so a coincidental pid collision no longer suppresses an unrelated peer's overlap warning, and the mixed absolute/relative overlap warning fires today. 🛠️ WHY THIS CARD SURVIVED SO LONG: the open claim text was near-verbatim the BUG DESCRIPTION from the very commit that fixed it, so every phrasing-matched recall surfaced the defect and never the fix — the same class as a 🛠️ card encoding a since-fixed limitation. When capturing a fix, never restate the bug as the card's headline.`;
+    const buf = await buildKlypixMap({ title: 'brain', areas: [{ title: 'Brain', cards: [{ text: LINEAGE_GAP }] }] });
+    const { buffer, stats } = await captureIntoBrain(buf, { resolutions: [{ area: '', text: PRESENCE_RESOLUTION }] });
+    const { struct } = await parseKlypix(buffer);
+    const gap = liveCards(struct).find(c => /GAP surfaced by an external researcher/.test(c.text || ''));
+    ok(stats.resolved === 0 && !!gap && !/✅/.test(gap.text || ''), '✓ precision: unrelated presence resolution cannot archive the long re-adoption gap via the ❓ bonus');
+    ok(stats.added === 1 && liveCards(struct).some(c => /🏁/.test(c.text || '') && /isSuspectedTwin/.test(c.text || '')), '✓ precision: unmatched resolution is preserved as a fallback milestone');
+}
+
+// Protect legitimate terse resolution: a short marker contained by a richer
+// open question has strong lexical identity and still clears the real 0.3 floor.
+{
+    const buf = await buildKlypixMap({ title: 'brain', areas: [{ title: 'Auth', cards: [{ text: 'Auth: ❓ Refresh tokens must rotate through the session store after every login while preserving revocation history and audit receipts.\n#auth' }] }] });
+    const { buffer, stats } = await captureIntoBrain(buf, { resolutions: [{ area: 'Auth', text: 'refresh tokens session store rotation shipped' }] });
+    const { struct } = await parseKlypix(buffer);
+    ok(stats.resolved === 1 && archived(struct).some(c => /Refresh tokens/.test(c.text || '') && /✅/.test(c.text || '')), '✓ protect: a legitimate terse resolution still archives its richer open target');
+}
+
+// ✓ precision: high overlap is insufficient when every shared token is generic
+// lifecycle/project scaffolding rather than an identity anchor.
+{
+    const buf = await buildKlypixMap({ title: 'brain', areas: [{ title: 'Workflow', cards: [{ text: 'Workflow: ❓ The project card current state must be reconciled with workflow ownership before release approval and durable audit logging.\n#workflow' }] }] });
+    const { buffer, stats } = await captureIntoBrain(buf, { resolutions: [{ area: '', text: 'project card current state shipped' }] });
+    const { struct } = await parseKlypix(buffer);
+    ok(stats.resolved === 0 && liveCards(struct).some(c => /workflow ownership/.test(c.text || '')), '✓ precision: a generic short subset cannot archive an unrelated richer open card');
+    ok(stats.added === 1 && liveCards(struct).some(c => /🏁/.test(c.text || '') && /project card current state shipped/.test(c.text || '')), '✓ precision: the unmatched generic note is preserved visibly as a milestone');
+}
+
+// Protect ✓ near-twins (distinct from the closes: test above): the ranking bonus
+// and best±0.1 sweep still retire genuinely equivalent open duplicates together.
+{
+    const buf = await buildKlypixMap({ title: 'brain', areas: [{ title: 'Agent', cards: [
+        { text: 'Agent: ❓ Agent status dead field should be wired across worker events and session reports.\n#agent' },
+        { text: 'Agent: ❓ Agent status is a dead field; wire it across worker events and session reports.\n#agent' },
+    ] }] });
+    const { buffer, stats } = await captureIntoBrain(buf, { resolutions: [{ area: 'Agent', text: 'agent status dead field wired across worker events and session reports' }] });
+    const { struct } = await parseKlypix(buffer);
+    ok(stats.resolved === 2 && archived(struct).filter(c => /Agent status/.test(c.text || '') && /✅/.test(c.text || '')).length === 2, '✓ protect: a genuine near-twin pair still resolves together');
 }
 
 // ── P4b: rephrased duplicate ❓ merges instead of stacking ────────────────────

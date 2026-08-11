@@ -31,7 +31,7 @@ import {
   brainLensData, lensToMarkdown, deathDateOfCard,
   statusContextToMarkdown, findFulfillmentCandidates,
   splitQueryTokens, scoreCardsAgainstQuery, correctionOverlaysFor,
-  isFastDecayCard, DECAY_STALE_MS, formatDecayAge,
+  isFastDecayCard, isUnresolvedOpenCard, DECAY_STALE_MS, formatDecayAge,
   readPendingShips, clearPendingShips, pendingShipCards, formatCaptureReceipts,
 } from './klypix-format.mjs';
 import { findProjectBrain, postPresenceMessage } from './agent-presence.mjs';
@@ -407,10 +407,35 @@ export async function opBrainTaskContext({
   });
   const split = splitQueryTokens(`${task} ${fileTerms.join(' ')}`);
   const tokens = [...new Set(split.content)];
-  const hits = scoreCardsAgainstQuery(struct, tokens, {
-    topK: Math.max(1, Math.min(8, Number(k) || 5)),
+  const hitLimit = Math.max(1, Math.min(8, Number(k) || 5));
+  // Score a wider pool once so a newly captured, relevant open gap cannot be
+  // crowded out by older high-frequency area vocabulary. This exact failure
+  // made the founder repeat yesterday's A→B→C researcher finding: after its
+  // false closure was repaired, generic historical "Brain" cards still filled
+  // the top five. A fresh open is promoted only when it already clears a real
+  // lexical floor; recency never turns an unrelated card into a match.
+  // The ranker already scores/sorts the whole live set. Keep every qualifying
+  // candidate for the recency guard; truncating to 64 here recreated the exact
+  // crowd-out bug whenever 64 historical cards scored above a fresh open gap.
+  const candidatePool = scoreCardsAgainstQuery(struct, tokens, {
+    topK: Math.max(64, struct.cards?.length || 0),
     minScore: 2,
   });
+  const recentOpenCutoff = Date.now() - 3 * 86_400_000;
+  const recentOpen = candidatePool
+    .filter((hit) => hit.score >= 3
+      && isUnresolvedOpenCard(hit.card)
+      && Number(hit.card.createdAt || 0) >= recentOpenCutoff)
+    .slice(0, 2);
+  const hits = [];
+  const hitIds = new Set();
+  for (const hit of [...recentOpen, ...candidatePool]) {
+    if (!hit?.card?.id || hitIds.has(hit.card.id)) continue;
+    hitIds.add(hit.card.id);
+    hits.push(hit);
+    if (hits.length >= hitLimit) break;
+  }
+  const recentOpenIds = new Set(recentOpen.map((hit) => hit.card.id));
   let overlays = new Map();
   try { overlays = correctionOverlaysFor(struct, hits.map((hit) => hit.card)); }
   catch { /* context remains useful without overlays */ }
@@ -439,6 +464,7 @@ export async function opBrainTaskContext({
       text: clip(hit.card.text, 420),
       score: Number(hit.score.toFixed(2)),
       correctedBy: correction ? clip(correction.text, 420) : null,
+      ...(recentOpenIds.has(hit.card.id) ? { recentOpen: true } : {}),
       ...(decayAge ? { lastKnown: true, age: decayAge } : {}),
     };
   });
@@ -455,7 +481,8 @@ export async function opBrainTaskContext({
       // a line's tail, and the warning must never be the part that gets cut
       // (v1.32.0 law — a claim may truncate, its warning may not).
       const stamp = entry.lastKnown ? ` ⏱️ LAST KNOWN (${entry.age} old — verify live before reporting):` : '';
-      lines.push(`- [${entry.area}]${entry.correctedBy ? ' superseded context:' : ''}${stamp} ${entry.text}`);
+      const openStamp = entry.recentOpen ? ' ❓ RECENT OPEN:' : '';
+      lines.push(`- [${entry.area}]${entry.correctedBy ? ' superseded context:' : ''}${openStamp}${stamp} ${entry.text}`);
       if (lines.join('\n').length >= maxChars) break;
     }
     lines.push('This is a bounded start-of-task capsule, not the whole brain; use brain_ask for broad status/history questions.');
@@ -1076,7 +1103,9 @@ export async function opBrainNote({ vault, canvas, text: noteText, area, marker 
     if (pendingShips.length) clearPendingShips(projectDir);   // durable now — safe to consume
     const s = res.stats || {};
     const bits = [`${s.added || 0} added`];
-    for (const k of ['resolved', 'updated', 'merged', 'closed', 'superseded', 'linked']) if (s[k]) bits.push(`${s[k]} ${k}`);
+    for (const k of ['resolved', 'updated', 'merged', 'closed', 'superseded']) if (s[k]) bits.push(`${s[k]} ${k}`);
+    if (s.reAdopted) bits.push(`${s.reAdopted} re-adopted`);
+    if (s.linked) bits.push(`${s.linked} linked`);
     // Correction receipt — a correction-cue note superseded a card cross-area /
     // below the plain 0.6 bar; say WHAT was archived and how to undo, so the
     // widened match is always confirmable rather than silent.

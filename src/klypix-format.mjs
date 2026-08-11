@@ -2965,6 +2965,26 @@ const overlapScore = (a, b) => {
     let hit = 0; for (const w of a) if (b.has(w)) hit++;
     return hit / Math.min(a.size, b.size);
 };
+// A ✓ note is allowed to be terse, but lifecycle/status scaffolding is not a
+// card identity. Requiring two matched subject anchors prevents generic subsets
+// such as "project card current state shipped" from closing an unrelated rich
+// question merely because overlapScore divides by the smaller set. Deliberate
+// short targets still have the exact `closes:` mechanism.
+const RESOLUTION_GENERIC = new Set([
+    'project', 'projects', 'card', 'cards', 'current', 'state', 'status', 'item', 'items',
+    'task', 'tasks', 'work', 'issue', 'issues', 'thing', 'things', 'change', 'changes',
+    'update', 'updated', 'feature', 'features', 'support', 'supported', 'core', 'system',
+    'systems', 'shipped', 'shipping', 'fixed', 'fixing', 'done', 'complete', 'completed',
+    'resolved', 'resolving', 'closed', 'closing', 'implemented', 'implementing', 'added',
+    'adding', 'ready', 'final',
+]);
+const hasResolutionIdentity = (source, target) => {
+    const anchors = [...source].filter(token => !RESOLUTION_GENERIC.has(token));
+    if (anchors.length < 2) return false;
+    let matched = 0;
+    for (const token of anchors) if (target.has(token) && ++matched >= 2) return true;
+    return false;
+};
 // Fraction of the TARGET set present in `hay` — the right metric for "is this the
 // card the user named in `closes:`?". Unlike overlapScore it has NO ≥4-token
 // floor, because a close-target is a deliberate, often-short title/phrase (a
@@ -3012,6 +3032,140 @@ const cueMatch = (a, b, bar) => {
     let inter = 0; for (const w of a) if (b.has(w)) inter++;
     const coef = inter / Math.min(a.size, b.size);
     return (coef >= bar || (inter >= CUE_STRONG_SHARED && coef >= CUE_RELAXED_COEF)) ? coef : 0;
+};
+
+// A correction chain can make a full round trip: A→B→C, where C deliberately
+// restores A's stance. The ordinary supersede path correctly preserves A→B→C,
+// but C used to carry no read-alone receipt of that history. Detect only the
+// high-confidence shape: B has an explicit superseded ancestor A, and C strongly
+// matches A INCLUDING stance tokens that distinguish A from B. An intentional
+// restore/revert cue permits a lower (still evidence-bearing) threshold; cue-less
+// returns fire only when C is near-identical to A and clearly closer to A than B.
+// That last condition keeps a novel D on the same subject from being mislabeled.
+// Cues name a DECISION return, not merely a domain operation. Bare "restore"
+// is intentionally absent: "restore backup verification; keep SQLite" must
+// not claim that the Redis decision returned. `restore … to` remains available
+// for explicit prose, and the similarity gap below still has to favor A over B.
+const READOPT_ACTION = String.raw`(?:re-?adopt(?:s|ed|ing)?|reinstat(?:e|es|ed|ing)|revert(?:s|ed|ing)?\s+(?:back\s+)?to|return(?:s|ed|ing)?\s+(?:back\s+)?to|roll(?:s|ed|ing)?\s+back(?:\s+to)?|switch(?:es|ed|ing)?\s+back(?:\s+to)?|back\s+to|once\s+again|restor(?:e|es|ed|ing)\b(?:\s+[\p{L}\p{N}_-]+){0,12}\s+to)`;
+const READOPT_CUE_RE = new RegExp(`\\b${READOPT_ACTION}\\b`, 'iu');
+// Negation must bind to the return action itself. A small whitelist of nearby
+// adverbs/helpers catches “not ever return”, “never go back”, and “must not
+// switch back” without letting a distant negation cross subject prose or
+// punctuation: “do not use B; return to A” is an affirmative re-adoption.
+const READOPT_NEGATION_FILLER = String.raw`(?:ever|again|once|now|currently|actually|really|simply|merely|explicitly|deliberately|intentionally|immediately|directly|go|going|to)`;
+const NEGATED_READOPT_CUE_RE = new RegExp(
+    `\\b(?:do\\s+not|don'?t|never|avoid|without|not)\\s+(?:${READOPT_NEGATION_FILLER}\\s+){0,3}${READOPT_ACTION}\\b`,
+    'iu',
+);
+const READOPT_META = new Set([
+    'correction', 'corrections', 'obsolete', 'stale', 'note', 'notes', 'resolved', 'wrong',
+    'supersede', 'superseded', 'supersedes', 're-adopt', 're-adopts', 'readopt', 'readopts',
+    'reinstate', 'reinstates', 'reinstated', 'restore', 'restores', 'restored', 'restoring',
+    'revert', 'reverts', 'reverted', 'reverting', 'return', 'returns', 'returned', 'returning',
+    'reversal', 'reversed', 'again', 'back', 'earlier', 'original', 'prior', 'previous',
+    'position', 'stance', 'decision', 'decisions', 'archive', 'archived', 'card', 'cards',
+    'marker', 'history', 'lineage', 'graph', 'edge', 'stamp', 'today', 'dated',
+]);
+const readoptTokens = (text) => {
+    const cleaned = String(text || '')
+        // Strip engine-authored lineage dates, not authored config values: a
+        // 30-day→7-day→30-day return is stance evidence just like Redis→SQLite.
+        .replace(/^↩︎?\s*superseded\s+\d{4}-\d{2}-\d{2}\s*/iu, ' ')
+        .replace(/\n\s*↪\s*re-adopts\s+\d{4}-\d{2}-\d{2}:[\s\S]*$/iu, ' ');
+    // Unlike the general lexical gateway (currently English/ASCII), lifecycle
+    // identity must survive decisions written in Arabic, Cyrillic, and other
+    // scripts. Keep the same three-character floor and English stopword policy,
+    // but tokenize letters/numbers with Unicode properties.
+    const words = cleaned.toLowerCase().match(/[\p{L}\p{N}][\p{L}\p{N}_-]{2,}/gu) || [];
+    const numeric = cleaned.match(/\b\d+(?:\.\d+)*\b/g) || [];
+    return new Set([...words, ...numeric].filter(t => !STOPWORDS.has(t) && !READOPT_META.has(t)));
+};
+// Keep the raw tokens. `stemLight()` is intentionally unsafe as a bare set key
+// (state↔stats is one known collision); every suffix-tolerant comparison must
+// pass through `matchesStem`, which verifies that one raw form actually strips
+// onto the other. Use symmetric Dice similarity for "near-identical": the old
+// overlap coefficient treated A plus an arbitrarily large novel suffix as 1.0.
+const safelyMatches = (token, set) => {
+    for (const candidate of set) if (matchesStem(token, candidate)) return true;
+    return false;
+};
+// Maximum bipartite matching makes the score one-to-one. Without it, several
+// variants (pack/packed/packs) could all consume the same token and inflate a
+// Dice score or the ancestor-specific evidence count.
+const matchedTokenCount = (a, b) => {
+    const left = [...a], right = [...b];
+    const rightOwner = new Array(right.length).fill(-1);
+    const claim = (leftIndex, seen) => {
+        for (let rightIndex = 0; rightIndex < right.length; rightIndex++) {
+            if (seen.has(rightIndex) || !matchesStem(left[leftIndex], right[rightIndex])) continue;
+            seen.add(rightIndex);
+            if (rightOwner[rightIndex] === -1 || claim(rightOwner[rightIndex], seen)) {
+                rightOwner[rightIndex] = leftIndex;
+                return true;
+            }
+        }
+        return false;
+    };
+    let hit = 0;
+    for (let leftIndex = 0; leftIndex < left.length; leftIndex++) {
+        if (claim(leftIndex, new Set())) hit++;
+    }
+    return hit;
+};
+const setSimilarity = (a, b) => {
+    if (!a.size || !b.size) return 0;
+    return (2 * matchedTokenCount(a, b)) / (a.size + b.size);
+};
+const findReadoptedAncestor = (struct, replaced, newText) => {
+    const text = String(newText || '');
+    if (NEGATED_READOPT_CUE_RE.test(text)) return null;
+    const hasCue = READOPT_CUE_RE.test(text);
+    const byId = new Map((struct.cards || []).map(c => [c.id, c]));
+    const next = readoptTokens(text);
+    const current = readoptTokens(replaced?.text);
+    if (next.size < 3 || current.size < 3) return null;
+    const currentSimilarity = setSimilarity(next, current);
+    const incoming = new Map();
+    for (const cn of struct.connections || []) {
+        if (cn.label !== 'superseded by' || !cn.fromId || !cn.toId) continue;
+        if (!incoming.has(cn.toId)) incoming.set(cn.toId, []);
+        incoming.get(cn.toId).push(cn.fromId);
+    }
+    const candidates = [];
+    const queue = (incoming.get(replaced?.id) || []).map(id => ({ id, depth: 1 }));
+    const seen = new Set([replaced?.id]);
+    while (queue.length) {
+        const { id, depth } = queue.shift();
+        if (!id || seen.has(id) || depth > 12) continue;
+        seen.add(id);
+        const prior = byId.get(id);
+        if (!prior || !/^archive$/i.test(prior.area || '') || !/↩/.test(prior.text || '')) continue;
+        const before = readoptTokens(prior.text);
+        if (before.size >= 3) {
+            const similarity = setSimilarity(next, before);
+            const priorOnly = new Set([...before].filter(t => !safelyMatches(t, current)));
+            const distinctHits = matchedTokenCount(priorOnly, next);
+            const gap = similarity - currentSimilarity;
+            // Even explicit language must describe a return TOWARD A, not an
+            // unrelated restore/revert operation in prose that otherwise keeps B.
+            const explicit = hasCue && similarity >= 0.6 && gap >= 0.08
+                && distinctHits >= 1 && (distinctHits >= 2 || similarity >= 0.7);
+            const implicit = !hasCue && similarity >= 0.9 && gap >= 0.1
+                && (distinctHits >= 2 || (distinctHits >= 1 && similarity >= 0.98));
+            if (explicit || implicit) candidates.push({ prior, similarity, distinctHits, depth });
+        }
+        for (const predecessor of incoming.get(id) || []) queue.push({ id: predecessor, depth: depth + 1 });
+    }
+    candidates.sort((a, b) => b.similarity - a.similarity || b.distinctHits - a.distinctHits || a.depth - b.depth);
+    return candidates[0]?.prior || null;
+};
+const reAdoptionReceipt = (prior, today) => {
+    const headline = String(prior?.text || '')
+        .replace(/^↩︎?\s*superseded\s+\d{4}-\d{2}-\d{2}\s*/iu, '')
+        .replace(/\n\s*↪\s*re-adopts\s+\d{4}-\d{2}-\d{2}:[\s\S]*$/iu, '')
+        .replace(/(?:^|\s)#[\w-]+/g, ' ')
+        .replace(/\s+/g, ' ').trim().slice(0, 140);
+    return `↪ re-adopts ${today}: ${headline || 'an earlier superseded decision'}`;
 };
 
 // Recall-side truth guard: label a card stale ONLY when the graph contains an
@@ -3413,7 +3567,7 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
     // corrections[] lists cross-area/low-bar supersedes driven by a correction
     // cue, so the surface (brain_note result / capture stderr) can say WHAT was
     // archived and how to undo — the confirmation channel for the widened match.
-    const stats = { added: 0, superseded: 0, resolved: 0, linked: 0, updated: 0, closed: 0, merged: 0, corrections: [], fulfillCandidates: [], skillStale: [] };
+    const stats = { added: 0, superseded: 0, reAdopted: 0, resolved: 0, linked: 0, updated: 0, closed: 0, merged: 0, corrections: [], fulfillCandidates: [], skillStale: [] };
 
     // Pass 1 — resolutions + supersede marking operate on EXISTING cards.
     if (resolutions.length || cards.length || updates.length) {
@@ -3504,7 +3658,9 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
         // twins: a rephrased duplicate ❓ scores within a hair of its sibling, and
         // resolving only the first left the twin open forever (it kept surfacing
         // in every brief as still-to-do). Precision-kept: the set is the best
-        // match ± 0.1, never everything above the loose 0.3 floor. ❓ preferred.
+        // match ± 0.1, never everything above the loose 0.3 floor. ❓ preferred
+        // for RANKING only — its bonus must never admit a lexically ineligible
+        // card (the 2026-08-11 false-close incident was 0.174 + 0.15 = 0.324).
         const milestonesFallback = [];
         for (const r of resolutions) {
             const rTok = tokenSet(r.text);
@@ -3518,8 +3674,12 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                 // too (review-traced). 🏁 cards that CARRY an open clause stay
                 // eligible — they resolve via the partial path below.
                 if (/🏁/.test(c.text) && !extractOpenClauses(c.text).length) continue;
-                const s = overlapScore(rTok, tokenSet(c.text)) + (/❓|🎯/.test(c.text) ? 0.15 : 0);
-                if (s > 0) cands.push({ c, s });
+                const cardTokens = tokenSet(c.text);
+                const lexical = overlapScore(rTok, cardTokens);
+                if (lexical < RESOLVE_AT) continue;
+                if (!hasResolutionIdentity(rTok, cardTokens)) continue;
+                const s = lexical + (/❓|🎯/.test(c.text) ? 0.15 : 0);
+                cands.push({ c, s });
             }
             cands.sort((a, b) => b.s - a.s);
             const bestScore = cands.length ? cands[0].s : 0;
@@ -3678,6 +3838,10 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                 if (s > bestScore) { bestScore = s; best = c; }
             }
             if (best && (isCorrection ? bestScore > 0 : bestScore >= SUPERSEDE_AT)) {
+                // Detect the round-trip BEFORE mutating B. The normal lifecycle
+                // remains A→B→C; this adds a separate A→C provenance receipt and
+                // a read-alone stamp without changing recall/as_of successor truth.
+                const readopted = findReadoptedAncestor(struct, best, card.text);
                 await rewriteCard(best.id, j => {
                     j.content = `↩︎ superseded ${today}\n${j.content}`;
                     j.borderColor = 'rgba(120,120,135,0.5)';
@@ -3686,6 +3850,11 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                 const wasCross = isCorrection && (bestScore < SUPERSEDE_AT || (area && (best.area || '').toLowerCase() !== area));
                 best.text = `↩︎ ${best.text}`;
                 card.__supersedes = best.id;
+                if (readopted) {
+                    card.__reAdopts = readopted.id;
+                    card.text = `${String(card.text || '').trimEnd()}\n${reAdoptionReceipt(readopted, today)}`;
+                    stats.reAdopted++;
+                }
                 stats.superseded++;
                 // Surface the widened match for confirmation: the caller tells the
                 // agent what was archived and how to undo (restore from Archive /
@@ -3858,6 +4027,7 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
             if (!created) continue;
             newIds.add(created.id);
             if (card.__supersedes) addConn(card.__supersedes, created.id, 'superseded by', undefined);
+            if (card.__reAdopts) addConn(card.__reAdopts, created.id, 're-adopts', undefined);
             for (const cid of (card.__closesIds || [])) addConn(cid, created.id, 'closed by', undefined);
             // Dashed, muted hint — a suggestion must never render pixel-identical
             // to a confirmed 'closed by' verdict edge on the human's canvas.
@@ -4602,6 +4772,10 @@ export function findSkillObsolescenceCandidates(struct, milestones, { coverAt = 
 export function formatCaptureReceipts(stats, { maxEach = 3 } = {}) {
     const s = stats || {};
     const lines = [];
+    const reAdopted = Math.max(0, Number(s.reAdopted) || 0);
+    if (reAdopted) {
+        lines.push(`↪ re-adoption recorded: ${reAdopted} returning decision${reAdopted === 1 ? '' : 's'} now ${reAdopted === 1 ? 'carries' : 'carry'} a dated read-alone receipt and provenance edge to the earlier stance.`);
+    }
     for (const f of (Array.isArray(s.fulfillCandidates) ? s.fulfillCandidates : []).slice(0, maxEach)) {
         const rest = f.uncovered && f.uncovered.length ? ` · does NOT cover: ${f.uncovered.map(u => `"${String(u).slice(0, 50)}"`).join(', ')}` : '';
         const act = f.marker

@@ -12,7 +12,7 @@
 //   • ONE merge engine — the driver rides src/merge-brains.mjs verbatim.
 //   • The registered driver path is the INSTALLED runtime
 //     (~/.claude/project-brain) — stable across npx cache evictions; this
-//     module self-provisions the three engine files + their two deps there
+//     module self-provisions the four engine files + their two deps there
 //     when missing, without running the full hook installer.
 //   • A truncated list must NEVER render as complete: every capped section
 //     emits its "…and N more" through an unguarded push.
@@ -85,11 +85,11 @@ async function loadEngine() {
 
 // ── git-driver ──────────────────────────────────────────────────────────────
 
-const ENGINE_FILES = ['klypix-merge-driver.mjs', 'merge-brains.mjs', 'klypix-format.mjs'];
+const ENGINE_FILES = ['klypix-merge-driver.mjs', 'merge-brains.mjs', 'klypix-format.mjs', 'brain-graveyard.mjs'];
 const ENGINE_DEPS = ['jszip', 'fractional-indexing'];
 
-// Make sure the INSTALLED runtime can actually run the driver: the three
-// engine files plus their two (dependency-free) deps. This is deliberately a
+// Make sure the INSTALLED runtime can actually run the driver: the four
+// engine files plus their two runtime deps. This is deliberately a
 // light provision — it never touches hooks or servers; the full installer
 // remains `npx klypix-mcp install`.
 function ensureDriverRuntime() {

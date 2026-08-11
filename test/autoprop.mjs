@@ -191,7 +191,7 @@ function runInstall(home, projectCwd, args = []) {
   fs.writeFileSync(path.join(proj, '.mcp.json'), JSON.stringify({ mcpServers: { 'klypix-canvas': { command: 'npx', args: ['-y', 'klypix-mcp', '--vault', '.'] } } }, null, 2));
   runInstall(home, proj);
   const bd = path.join(home, '.claude', 'project-brain');
-  for (const f of ['global-brain-hook.mjs', 'klypix-format.mjs', 'klypix-core.mjs', 'semantic-memory.mjs', 'brain-write-lock.mjs', 'klypix-mcp-server.mjs', 'klypix-mcp-worker.mjs', 'mcp-supervisor.mjs', 'mcp-auto-update.mjs', 'klypix-conformance.mjs', 'klypix-runtime.mjs', 'klypix-semantic-warm.mjs', 'runtime-inspector.mjs', 'agent-rules.mjs', 'brain-doctor.mjs', 'agent-presence.mjs', 'mcp-presence.mjs', 'codex-brain-hook.mjs', 'codex-hooks.mjs']) {
+  for (const f of ['global-brain-hook.mjs', 'klypix-format.mjs', 'klypix-core.mjs', 'semantic-memory.mjs', 'brain-write-lock.mjs', 'klypix-mcp-server.mjs', 'klypix-mcp-worker.mjs', 'mcp-supervisor.mjs', 'mcp-auto-update.mjs', 'klypix-conformance.mjs', 'klypix-runtime.mjs', 'klypix-semantic-warm.mjs', 'runtime-inspector.mjs', 'agent-rules.mjs', 'brain-doctor.mjs', 'agent-presence.mjs', 'mcp-presence.mjs', 'result-reconcile.mjs', 'presence-relay.mjs', 'codex-brain-hook.mjs', 'codex-hooks.mjs']) {
     ok(fs.existsSync(path.join(bd, f)), `D: installed ${f}`);
   }
   ok(fs.existsSync(path.join(bd, 'node_modules', 'jszip')), 'D: runtime deps (jszip) copied');

@@ -1054,10 +1054,24 @@ export function messageDecayInfo(message, now = Date.now(), decay = {}) {
 export function formatReceivedMessages(messages, now = Date.now(), decay = {}) {
   if (!Array.isArray(messages) || !messages.length) return '';
   const lines = ['KLYPIX message(s) from another active session:'];
+  const groups = new Map();
   for (const message of messages) {
-    const ageMin = Math.max(0, Math.round((now - Number(message.ts || now)) / 60_000));
-    lines.push(`- from ${String(message.from || '?').slice(0, 12)} (${ageMin}m ago): ${neutralizeMarkers(String(message.text || '').replace(/\s+/g, ' ').trim().slice(0, 400))}`);
-    const info = messageDecayInfo(message, now, decay);
+    // Whitespace-only normalization: case can carry file/env/command identity
+    // on case-sensitive systems (`src/API.ts` and `src/api.ts` are not the same
+    // instruction), so grouping must never case-fold message bodies.
+    const normalized = String(message?.text || '').replace(/\s+/g, ' ').trim();
+    const key = normalized || `id:${String(message?.id || '')}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(message);
+  }
+  for (const group of groups.values()) {
+    const message = group[0];
+    const senders = [...new Set(group.map(item => String(item?.from || '?').slice(0, 12)))];
+    const senderLabel = senders.length <= 3 ? senders.join(', ') : `${senders.slice(0, 3).join(', ')} +${senders.length - 3}`;
+    const oldestTs = Math.min(...group.map(item => Number(item?.ts) || now));
+    const ageMin = Math.max(0, Math.round((now - oldestTs) / 60_000));
+    lines.push(`- from ${senderLabel} (${ageMin}m ago): ${neutralizeMarkers(String(message.text || '').replace(/\s+/g, ' ').trim().slice(0, 400))}`);
+    const info = messageDecayInfo({ ...message, ts: oldestTs }, now, decay);
     if (info) lines.push(`  ${info.stampText}`);
   }
   return lines.join('\n');

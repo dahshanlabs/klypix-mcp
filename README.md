@@ -150,7 +150,9 @@ not a filing convention.
 
 - **Decisions have a lifecycle.** A new decision that contradicts an old one supersedes it. The
   stale card is archived with an arrow and a date, never deleted, and later answers surface the
-  correction rather than the corpse.
+  correction rather than the corpse. If a later decision returns to an earlier superseded stance,
+  high-confidence lineage leaves a dated `re-adopts` stamp on the new card plus an earlier→current
+  edge; the original A→B→C history remains intact.
 - **Corrections are explicit, not guessed.** Supersession fires on an UPPERCASE correction cue or
   an explicit edge. `brain_reconcile` only *proposes* stale-vs-correction pairs for a human to
   confirm.
@@ -274,7 +276,9 @@ the full brief written to disk for when broad history or status work needs it.
 
 Every other host gets a bounded ~2.8KB task capsule from one `brain_sync` call, plus a compact
 always-loaded `AGENTS.md` block that tells the agent to make that call at task start, when scope
-changes, and on completion. The gateway capsule is lexical-fast by design.
+changes, and on completion. The gateway capsule is lexical-fast by design. A newly captured open
+gap can claim a labeled `RECENT OPEN` slot only after clearing the normal lexical-relevance floor,
+so fresh relevant findings are not crowded out by older area vocabulary.
 
 Briefs are **not** injected automatically on Cursor, Cline, Copilot, Gemini CLI or Antigravity —
 there are no lifecycle hooks on those hosts.
@@ -285,9 +289,12 @@ On Claude Code, decisions are captured automatically at turn end from inline `�
 markers in the transcript, deduped, under a capture lock.
 
 On every other host, capture is explicit: `brain_note` runs the same capture engine as the hooks —
-dedup, supersession, `✓` resolve, `~` update in place, `+` skill, `closes:` — and stamps which
-agent wrote the card. (If you install the git commit hook from the KLYPIX app, commit messages also
-capture automatically, for any agent. That hook has no CLI installer.)
+dedup, supersession, round-trip re-adoption receipts, `✓` resolve, `~` update in place, `+` skill,
+`closes:` — and stamps which agent wrote the card. A `✓` question preference ranks only candidates
+that already clear raw lexical overlap and two subject-identity anchors; generic lifecycle wording
+cannot turn weak overlap into a closure.
+(If you install the git commit hook from the KLYPIX app, commit messages also capture automatically,
+for any agent. That hook has no CLI installer.)
 
 `brain_challenge` is the other direction: propose a decision and the brain answers with receipts —
 prior decisions that deterministically contradict it, standing rules that dispute it, and
@@ -487,7 +494,7 @@ The MCP verbs below are what agents call. These are what **you** call:
 |---|---|
 | `brain_ask` | Whole-brain question answering — correction-aware, `as_of` time travel |
 | `brain_challenge` | The brain argues back: contradictions with receipts, tried-and-reversed chains, standing rules, other-agent provenance flags |
-| `brain_note` | Capture with the full lifecycle — supersede / ✓ resolve / ~ update / 🛠 skill / `closes:` |
+| `brain_note` | Capture with the full lifecycle — supersede / re-adopt / ✓ resolve / ~ update / 🛠 skill / `closes:` |
 | `brain_reconcile` | Proposes stale-vs-correction pairs and unrecorded migrations for a human to confirm |
 | `brain_insights` | Hubs, orphaned decisions, stale questions, area sizes |
 | `brain_lens` | Machine-readable freshness, provenance, activity, timeline, orrery and unresolved views |
@@ -507,7 +514,7 @@ The MCP verbs below are what agents call. These are what **you** call:
 | `add_to_canvas` | Append cards/connections (positions preserved) |
 | `list_canvases` | List every `.klypix` in the vault |
 
-Exactly 19, machine-verifiable with `npx klypix-mcp doctor`.
+Exactly 21, machine-verifiable with `npx klypix-mcp doctor`.
 
 > **`canvas_view`:** no MCP Apps host has been observed rendering the UI resource yet — there is no
 > screenshot and no host-level test. Hosts without the extension get clean text, which is the path

@@ -106,22 +106,32 @@ try {
   const tools = await a.client.listTools();
   checks.brainSyncDiscoverable = tools.tools?.some((tool) => tool.name === 'brain_sync') === true;
 
-  const aStart = await a.client.callTool({
-    name: 'brain_sync',
-    arguments: {
-      phase: 'start',
-      intent: 'Validate automatic Codex Context Gateway coordination',
-      files: ['src/conformance-overlap.ts'],
-    },
-  });
-  const bStart = await b.client.callTool({
-    name: 'brain_sync',
-    arguments: {
-      phase: 'start',
-      intent: 'Validate proactive overlap delivery from a second session',
-      files: ['src/conformance-overlap.ts'],
-    },
-  });
+  const syncStart = async (client, intent, expectedTasks) => {
+    let response;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      response = await client.callTool({
+        name: 'brain_sync',
+        arguments: {
+          phase: 'start',
+          intent,
+          files: ['src/conformance-overlap.ts'],
+        },
+      });
+      const structured = response.structuredContent || {};
+      if (Number.isFinite(structured.timingMs?.total)
+        && structured.counts?.activeTasks === expectedTasks) return { response, attempt };
+      await wait(75);
+    }
+    return { response, attempt: 3 };
+  };
+  // The lane is deliberately lock-protected and the two real clients heartbeat
+  // concurrently. A bounded retry proves convergence without turning one
+  // transient lock collision into a false product failure.
+  const aStarted = await syncStart(a.client, 'Validate automatic Codex Context Gateway coordination', 1);
+  const bStarted = await syncStart(b.client, 'Validate proactive overlap delivery from a second session', 2);
+  const aStart = aStarted.response;
+  const bStart = bStarted.response;
+  metrics.startAttempts = { first: aStarted.attempt, second: bStarted.attempt };
   const aStructured = aStart.structuredContent || {};
   const bStructured = bStart.structuredContent || {};
   checks.taskMemory = Array.isArray(aStructured.context?.hits) && aStructured.context.hits.length > 0;
@@ -144,15 +154,24 @@ try {
   metrics.firstClientLogCount = a.logs.length;
   if (!checks.proactiveLogging && a.logs.length) metrics.firstClientLogs = a.logs.slice(-4);
 
-  const aCheckpoint = await a.client.callTool({
-    name: 'brain_sync',
-    arguments: {
-      phase: 'checkpoint',
-      intent: 'Validate automatic Codex Context Gateway coordination',
-      files: ['src/conformance-overlap.ts'],
-    },
-  });
-  const checkpointStructured = aCheckpoint.structuredContent || {};
+  let checkpointStructured = {};
+  let inBandAttempts = 0;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    inBandAttempts = attempt;
+    const aCheckpoint = await a.client.callTool({
+      name: 'brain_sync',
+      arguments: {
+        phase: 'checkpoint',
+        intent: 'Validate automatic Codex Context Gateway coordination',
+        files: ['src/conformance-overlap.ts'],
+      },
+    });
+    checkpointStructured = aCheckpoint.structuredContent || {};
+    if (checkpointStructured.messages?.some((message) =>
+      String(message.text).includes('Automatic KLYPIX overlap alert'))) break;
+    await wait(75);
+  }
+  metrics.inBandAttempts = inBandAttempts;
   checks.durableInBandOffer = checkpointStructured.messages?.some((message) =>
     String(message.text).includes('Automatic KLYPIX overlap alert')) === true;
 

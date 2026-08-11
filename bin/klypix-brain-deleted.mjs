@@ -37,8 +37,13 @@ if (action === 'list') {
   console.log(`${entries.length} deleted card(s) in ${path.basename(brainPath)} — newest first\n`);
   for (const e of entries) {
     const full = ids.includes(e.id) ? await readGraveyardCard(buf, e.id) : null;
-    console.log(`  ${e.id}   ${ago(e.deletedAt).padEnd(9)} ${e.area ? `[${e.area}] ` : ''}${e.preview || '(no text)'}`);
+    const label = e.summary?.label || e.preview || `(${e.summary?.type || 'unknown'} item)`;
+    const audit = e.deletion?.confidence === 'legacy'
+      ? 'legacy source unverified'
+      : `${e.deletion?.initiator || 'unknown'} via ${e.deletion?.cause || 'unclassified'}`;
+    console.log(`  ${e.id}   ${ago(e.deletedAt).padEnd(9)} ${e.area ? `[${e.area}] ` : ''}${label}   <${audit}>`);
     if (full?.content) console.log(`\n${String(full.content).split('\n').map((l) => `      ${l}`).join('\n')}\n`);
+    else if (full) console.log(`\n      ${JSON.stringify(e.summary || { type: full.type || 'unknown' })}\n`);
   }
   console.log(`\nFull text:  npx klypix-mcp brain-deleted list <id> --brain "${brainPath}"`);
   console.log(`Restore:    npx klypix-mcp brain-deleted restore <id>`);

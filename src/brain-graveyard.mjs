@@ -1,4 +1,4 @@
-// brain-graveyard — the recoverable bin for cards a human deleted from a brain.
+// brain-graveyard — the recoverable bin for items deleted from a brain.
 //
 // WHY THIS AND NOT THE ARCHIVE CONTAINER. "Archived" in a KLYPIX brain is a
 // containment fact: the card's parent is a container titled "Archive". Those
@@ -24,10 +24,59 @@ import { parseKlypix, shard } from './klypix-format.mjs';
 
 export const DEFAULT_RETENTION_DAYS = 30;
 
+const compact = (value, max = 140) => String(value || '').replace(/\s+/g, ' ').trim().slice(0, max);
+
+/** A bounded, type-aware description safe to show without restoring the item. */
+export function summarizeGraveyardCard(card) {
+  if (!card || typeof card !== 'object') return null;
+  const type = compact(card.type, 32) || 'unknown';
+  const text = compact(card.content || card.code || card.description || card.details);
+  const title = compact(card.title || card.fileName || card.question || card.siteName || card.url, 180);
+  const label = title || text;
+  return {
+    type,
+    label,
+    preview: text,
+    ...(Number.isFinite(card.fileSize) ? { fileSize: Number(card.fileSize) } : {}),
+    ...(card.extension ? { extension: compact(card.extension, 20) } : {}),
+    ...(Number.isFinite(card.originalWidth) ? { width: Number(card.originalWidth) } : {}),
+    ...(Number.isFinite(card.originalHeight) ? { height: Number(card.originalHeight) } : {}),
+    ...(card.language ? { language: compact(card.language, 30) } : {}),
+    ...(card.url ? { url: compact(card.url, 500) } : {}),
+    ...(card.projectGraph?.counts ? {
+      projectGraph: {
+        nodes: Number(card.projectGraph.counts.nodes) || 0,
+        edges: Number(card.projectGraph.counts.edges) || 0,
+      },
+    } : {}),
+  };
+}
+
 /** Deleted cards, newest first. */
 export async function listGraveyard(buf) {
-  const { struct } = await parseKlypix(buf);
-  return struct.graveyard || [];
+  const { struct, zip } = await parseKlypix(buf);
+  const result = [];
+  for (const entry of (struct.graveyard || [])) {
+    let card = null;
+    let summary = entry.summary && typeof entry.summary === 'object' ? entry.summary : null;
+    if (!summary) {
+      try {
+        const file = zip.file(`graveyard/${shard(entry.id)}/${entry.id}.json`);
+        if (file) card = JSON.parse(await file.async('string'));
+        summary = summarizeGraveyardCard(card);
+      } catch { /* one damaged deleted item must not hide the rest of the bin */ }
+    }
+    result.push({
+      ...entry,
+      // Pre-audit entries only carried deletedBy:"human". That was a generic
+      // merge stamp, not proof, so expose them honestly as legacy/unverified.
+      deletion: entry.deletion && typeof entry.deletion === 'object'
+        ? entry.deletion
+        : { initiator: 'unknown', cause: 'legacy', source: 'legacy', confidence: 'legacy' },
+      summary,
+    });
+  }
+  return result;
 }
 
 async function readIndex(zip) {

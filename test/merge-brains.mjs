@@ -2,6 +2,7 @@
 // Pure buffers only: no real brain, filesystem, network, or clock state.
 import { buildKlypix, parseKlypix, shard } from '../src/klypix-format.mjs';
 import { mergeBrains } from '../src/merge-brains.mjs';
+import { listGraveyard } from '../src/brain-graveyard.mjs';
 
 let failures = 0;
 const ok = (condition, label) => {
@@ -68,6 +69,39 @@ const removeItem = async (buffer, id) => {
     'G3: the delete receipt reports one honored delete');
   ok(result.conflicts.length === 0 && result.stats.removed === 1,
     'G3: no bogus conflict twin or negative delete accounting');
+}
+
+// G4: deletion provenance and type-aware previews survive the merge and are
+// available before restore. Unknown callers stay unknown rather than being
+// mislabeled as human.
+{
+  const ours = await removeItem(base, 'txt_B');
+  const result = await mergeBrains({
+    base,
+    ours,
+    theirs: base,
+    deletedIds: ['txt_B'],
+    deletedMeta: {
+      txt_B: { initiator: 'user', cause: 'keyboard-delete', source: 'desktop', confidence: 'explicit' },
+    },
+  });
+  const entries = await listGraveyard(result.buffer);
+  const deleted = entries.find((entry) => entry.id === 'txt_B');
+
+  ok(deleted?.deletion?.initiator === 'user' && deleted?.deletion?.cause === 'keyboard-delete',
+    'G4: explicit deletion receipt persists with the buried item');
+  ok(deleted?.summary?.type === 'text' && deleted?.summary?.label?.includes('delete target'),
+    'G4: deleted item is type-aware and previewable before restore');
+  const { struct: buriedStruct } = await parseKlypix(result.buffer);
+  const indexed = buriedStruct.graveyard.find((entry) => entry.id === 'txt_B');
+  ok(indexed?.summary?.type === 'text',
+    'G4: preview summary is indexed so listing does not reopen every deleted item');
+
+  const inferredResult = await mergeBrains({ base, ours, theirs: base, deletedIds: ['txt_B'] });
+  const inferredEntries = await listGraveyard(inferredResult.buffer);
+  const inferred = inferredEntries.find((entry) => entry.id === 'txt_B');
+  ok(inferred?.deletion?.initiator === 'unknown' && inferred?.deletion?.confidence === 'inferred',
+    'G4: missing provenance stays unknown instead of being guessed as human');
 }
 
 console.log(failures ? `\n[x] ${failures} assertion(s) failed` : '\n[ok] merge-brains: all assertions passed');

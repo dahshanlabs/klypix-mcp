@@ -34,11 +34,38 @@
 
 import JSZip from 'jszip';
 import { parseKlypix, shard } from './klypix-format.mjs';
+import { summarizeGraveyardCard } from './brain-graveyard.mjs';
 import { generateKeyBetween } from 'fractional-indexing';
 
 const isValidZKey = (k) => { try { generateKeyBetween(k, null); return true; } catch { return false; } };
 const rand = () => Math.random().toString(36).slice(2, 10);
 const ARCHIVE = /^archive$/i;
+
+const DELETION_INITIATORS = new Set(['user', 'agent', 'system', 'peer', 'unknown']);
+const DELETION_CONFIDENCE = new Set(['explicit', 'inferred', 'legacy']);
+const boundedToken = (value, fallback, max = 64) => {
+  const clean = String(value || '').trim().toLowerCase().replace(/[^a-z0-9_-]/g, '-').replace(/-+/g, '-');
+  return clean ? clean.slice(0, max) : fallback;
+};
+
+// Deletion receipts cross renderer, IPC, merge, git and cloud boundaries. Keep
+// the persisted shape deliberately small and vocabulary-like: enough to answer
+// "who/what removed this?", never an unbounded action payload or device secret.
+function sanitizeDeletionReceipt(raw) {
+  const r = raw && typeof raw === 'object' ? raw : {};
+  const initiator = DELETION_INITIATORS.has(r.initiator) ? r.initiator : 'unknown';
+  const confidence = DELETION_CONFIDENCE.has(r.confidence) ? r.confidence : 'inferred';
+  const cause = boundedToken(r.cause, 'unclassified');
+  const source = boundedToken(r.source, 'merge', 40);
+  const triggerCause = r.triggerCause ? boundedToken(r.triggerCause, '', 64) : '';
+  return {
+    initiator,
+    cause,
+    source,
+    confidence,
+    ...(triggerCause ? { triggerCause } : {}),
+  };
+}
 
 // ── Semantic item comparison (2026-08-01 field fix) ─────────────────────────
 // A raw byte compare of item JSON was the change detector, on the assumption
@@ -134,14 +161,15 @@ const sameParent = (a, b) => (a?.parentId ?? null) === (b?.parentId ?? null);
 
 /**
  * mergeBrains — 3-way union of two brains sharing ancestor `base`.
- * @param {{base?:Buffer|null, ours:Buffer, theirs:Buffer, deletedIds?:string[]}} args
+ * @param {{base?:Buffer|null, ours:Buffer, theirs:Buffer, deletedIds?:string[], deletedMeta?:Record<string,object>}} args
  *   base      = on-disk struct snapshotted when the app opened (null → pure union).
  *   ours      = the app's in-memory brain (what the human is saving).
  *   theirs    = the current on-disk brain, re-read INSIDE the lock (has hook captures).
- *   deletedIds= ids the HUMAN explicitly deleted (tombstones). ONLY these can drop.
+ *   deletedIds= explicit tombstones. ONLY these can drop a live card.
+ *   deletedMeta= bounded per-id audit receipts (initiator/cause/source/confidence).
  * @returns {Promise<{buffer:Buffer, delta:{added:string[],updated:string[],archived:string[],removed:string[]}, conflicts:object[], stats:object}>}
  */
-export async function mergeBrains({ base = null, ours, theirs, deletedIds = [] }) {
+export async function mergeBrains({ base = null, ours, theirs, deletedIds = [], deletedMeta = {} }) {
   if (!ours || !theirs) throw new Error('mergeBrains needs both ours and theirs buffers');
   const B = await loadSide(base);
   const O = await loadSide(ours);
@@ -179,16 +207,21 @@ export async function mergeBrains({ base = null, ours, theirs, deletedIds = [] }
     const json = O.items[id] ?? T.items[id] ?? null;
     if (json == null) return;                        // nothing to preserve
     const pos = O.positions[id] || T.positions[id] || null;
-    let preview = '';
-    try { preview = String(JSON.parse(json)?.content || '').replace(/\s+/g, ' ').trim().slice(0, 140); } catch { /* media card */ }
+    let summary = null;
+    try { summary = summarizeGraveyardCard(JSON.parse(json)); } catch { /* damaged item remains restorable */ }
+    const preview = summary?.preview || '';
+    const deletion = sanitizeDeletionReceipt(deletedMeta?.[id]);
     graveyard[id] = {
       meta: {
         deletedAt: Date.now(),       // `now` below is declared later in this scope
-        deletedBy: 'human',
+        // Flat field retained for older readers; `deletion` is authoritative.
+        deletedBy: deletion.initiator,
+        deletion,
         area: (O.titleById.get(pos?.parentId) || T.titleById.get(pos?.parentId) || null),
         parentId: pos?.parentId ?? null,
         pos: pos ? { x: pos.x, y: pos.y, w: pos.w ?? null, h: pos.h ?? null } : null,
         preview,
+        ...(summary ? { summary } : {}),
       },
       json,
     };

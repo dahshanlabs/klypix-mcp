@@ -8,6 +8,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
+import { createRequire } from 'module';
 
 const PB_DIR = path.join(os.homedir(), '.claude', 'project-brain');
 const EMB_DIR = path.join(PB_DIR, 'embeddings');
@@ -246,6 +247,53 @@ async function loadTransformers() {
     }
     throw lastErr;
   }
+}
+
+// Is the on-device runtime INSTALLED at all?
+//
+// A caller that gets no embedder cannot otherwise tell "warming up / queue
+// saturated" (retry works) from "never installed" (retrying forever will not
+// help). Those need opposite advice, and conflating them is why a lexical-only
+// install can look like a slow one indefinitely — measured 2026-08-10, the
+// lexical-only ranker scores recall@5 = 0% on the frozen human question set
+// against ~30% with the runtime present, so this is not a cosmetic difference.
+//
+// Cheap on purpose: resolves the specifier and stats the fallback path. It
+// never imports the library and never loads a model, so it is safe to call on
+// every query. Mirrors loadTransformers()'s own resolution order — keep the two
+// in step.
+let runtimeInstalledCache = null;
+export function semanticRuntimeInstalled() {
+  if (runtimeInstalledCache !== null) return runtimeInstalledCache;
+  let found = false;
+  try {
+    createRequire(import.meta.url).resolve('@huggingface/transformers');
+    found = true;
+  } catch {
+    const base = path.join(PB_DIR, 'semantic', 'node_modules', '@huggingface', 'transformers', 'dist');
+    found = ['transformers.node.mjs', 'transformers.mjs'].some(f => {
+      try { return fs.existsSync(path.join(base, f)); } catch { return false; }
+    });
+  }
+  runtimeInstalledCache = found;
+  return found;
+}
+
+// One honest sentence for a caller that fell back to lexical-only ranking.
+// Returns null when semantic ranking actually ran, so callers can append it
+// unconditionally.
+export function semanticFallbackNotice(hadSemantic) {
+  if (hadSemantic) return null;
+  if (semanticRuntimeInstalled()) {
+    return 'lexical only — the on-device semantic model is still warming or the queue is saturated; retry shortly for semantic ranking';
+  }
+  // Deliberately names no install command: there is no `--semantic` flag, and
+  // bin/klypix-install.mjs skips @huggingface/transformers on purpose ("optional,
+  // huge"). Inventing a command here would ship a wrong instruction to every
+  // MCP host. State the fact and the location; let the caller decide.
+  return 'LEXICAL ONLY — @huggingface/transformers is not present, so these are keyword matches with no semantic ranking. '
+    + 'Measured on a real 2,377-card brain: recall@5 0% lexical vs ~30% with the runtime. Retrying will not help. '
+    + `Semantic ranking activates once the runtime resolves, or is placed at ${path.join(PB_DIR, 'semantic', 'node_modules', '@huggingface', 'transformers')}.`;
 }
 
 export function getEmbedder(log = () => {}) {

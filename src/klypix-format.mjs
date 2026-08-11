@@ -1895,7 +1895,7 @@ export const deathDateOfCard = (card) => {
     const m = /(?:↩︎ superseded|↩ superseded|✅|⤵ consolidated) (\d{4}-\d{2}-\d{2})/.exec(String(c.text || ''));
     return m ? Date.parse(m[1]) : null;
 };
-export function rankForQuestion(struct, question, { semantic = null, k = 10, as_of = null, now = Date.now(), semFloor = 0.30, recentDays = 30, pairSim = null } = {}) {
+export function rankForQuestion(struct, question, { semantic = null, k = 10, as_of = null, now = Date.now(), recentDays = 30, pairSim = null } = {}) {
     // Status-shaped questions score by their CONTENT tokens only — "remaining"
     // must never lexically select the stale cards that say "remaining:".
     const { content: tokens, statusShaped, strong: statusStrong } = splitQueryTokens(question);
@@ -1959,6 +1959,16 @@ export function rankForQuestion(struct, question, { semantic = null, k = 10, as_
         // clusters around 0.7–1.0), so `sem*10 + lex` can let lexical noise erase
         // a much better model. Reciprocal-rank fusion uses the ORDER from each
         // independent retriever and remains calibrated across model upgrades.
+        //
+        // The same reasoning retired the absolute-cosine admission floor that used
+        // to ride here as a `semFloor = 0.30` option: a fixed cutoff is exactly the
+        // cross-model-incompatible arithmetic RRF exists to avoid. It had already
+        // been dead for some time — destructured and never read — which is worse
+        // than absent, because it reads as a safety control while doing nothing.
+        // Measured 2026-08-10 on the real brain, a floor is not currently viable
+        // in ANY form: true answers score as low as 0.498 while out-of-domain
+        // top-1 reaches 0.683, so no threshold separates them. Before re-adding
+        // one, build a negative/unanswerable set and an abstain metric.
         const semRank = new Map(scored
             .filter(hit => Number.isFinite(hit.sem))
             .sort((a, b) => b.sem - a.sem)

@@ -38,7 +38,8 @@ import { capMessages, findProjectBrain, neutralizeMarkers } from './agent-presen
 import { brainCaptureLockPath, vaultCreateLockPath, withAdvisoryWriteLock } from './brain-write-lock.mjs';
 import {
   dot, embedTexts, getEmbedder, getEmbedderForUse, withRerankerForUse,
-  rerankHits, semanticMemorySnapshot, shouldPrewarmSemantic, vectorsForBrain,
+  rerankHits, semanticFallbackNotice, semanticMemorySnapshot,
+  semanticRuntimeInstalled, shouldPrewarmSemantic, vectorsForBrain,
 } from './semantic-memory.mjs';
 
 // The MCP and A2A faces prewarm through this protocol-neutral module. Bounded
@@ -347,7 +348,10 @@ export async function opSearchAllBrains({ vault, query, as_of, log = () => {} })
     const when = h.c.createdAt ? new Date(h.c.createdAt).toISOString().slice(0, 10) : '';
     return `- ${h.cur ? '★ ' : ''}[${h.project}${h.area ? ' › ' + h.area : ''}] ${when} ${String(h.c.text || '').replace(/\s+/g, ' ').slice(0, 240)}`;
   });
-  const mode = qv ? 'semantic+lexical (on-device)' : 'lexical (semantic model warming — retry for semantic ranking)';
+  // Never say "warming — retry" to someone who simply has not installed the
+  // runtime: for them that advice is wrong forever, and their results are the
+  // measured recall@5 = 0% lexical path rather than a slow good one.
+  const mode = qv ? 'semantic+lexical (on-device)' : semanticFallbackNotice(false);
   const asOfNote = asOfTs != null ? ` · as of ${as_of}` : '';
   return { blocks: [text(`# Cross-project matches for "${query}" (${scored.length} hits in ${brains.length} brains, top ${top.length} · ${mode}${asOfNote})\n\n${lines.join('\n')}`)] };
 }

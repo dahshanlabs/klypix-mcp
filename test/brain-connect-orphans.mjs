@@ -41,12 +41,14 @@ try {
   ok(brainInsights(struct).orphans.length === 2, 'orphan fixture starts with exactly two isolated decisions');
 
   // threshold=1 forces the deterministic structural fallback in this fixture.
-  const dry = await opBrainConnect({ vault, scope: 'orphans', threshold: 1, max: 1 });
+  // Project-first routing is intentional; pin this temporary fixture so a test
+  // launched inside a real brain repository cannot garden that project brain.
+  const dry = await opBrainConnect({ vault, canvas: 'brain', scope: 'orphans', threshold: 1, max: 1 });
   const dryText = blockText(dry);
   ok(/Orphan receipt: 2 now → 1 projected/.test(dryText), 'dry run reports measured before→projected orphan counts');
   ok(/Additive only: no cards are archived or rewritten/.test(dryText), 'dry run states the reversible, non-archival contract');
 
-  const applied = await opBrainConnect({ vault, scope: 'orphans', threshold: 1, max: 1, apply: true });
+  const applied = await opBrainConnect({ vault, canvas: 'brain', scope: 'orphans', threshold: 1, max: 1, apply: true });
   const appliedText = blockText(applied);
   const after = (await parseKlypix(fs.readFileSync(file))).struct;
   ok(brainInsights(after).orphans.length === 1, 'apply repairs one reviewed orphan and leaves the unrelated orphan alone');

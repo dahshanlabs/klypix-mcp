@@ -11,7 +11,9 @@ import {
   laneFileFor,
   listActiveSessions,
   postPresenceMessage,
+  purgeRemotePresence,
   purgeRemoteSessions,
+  REMOTE_MESSAGE_DEDUPE_PREFIX,
   receiveMessages,
   upsertRemoteSessions,
   upsertSession,
@@ -45,6 +47,9 @@ const ok = (condition, label) => {
   console.log(`${condition ? '[ok]' : '[x]'} ${label}`);
   if (!condition) failures++;
 };
+
+ok(REMOTE_MESSAGE_DEDUPE_PREFIX === XPC_DEDUPE_PREFIX,
+  'the IO lane and pure relay share one cross-computer message marker contract');
 
 const GRANT = {
   version: PRESENCE_CONSENT_VERSION,
@@ -282,12 +287,30 @@ const afterTtl = listActiveSessions({ brainPath: brainB, home: homeB, now: now +
 ok(!afterTtl.some((session) => session.id === 'dev-a-session'),
   'a remote session with no fresh heartbeat is pruned by the existing TTL — never "active" on a stale claim (P3)');
 
-// P9: revoke purges receive-display while local presence is untouched.
+// P9: revoke purges receive-display while local presence/messages are untouched.
 upsertRemoteSessions({ brainPath: brainB, rows: inboundRows, machineId: 'mach-b', home: homeB, now: now + 1100 });
-const purged = purgeRemoteSessions({ brainPath: brainB, home: homeB, now: now + 1200 });
-ok(!purged.some((session) => session.via === 'cloud')
-  && purged.some((session) => session.id === 'dev-b-session'),
-'consent revoke purges cloud rows and leaves local presence exactly as today (P9 symmetric)');
+postPresenceMessage({ brainPath: brainB, from: 'dev-b-session', text: 'local note must survive revoke', dedupeKey: 'local:revoke-control', home: homeB, now: now + 1150 });
+const purgeReceipt = purgeRemotePresence({ brainPath: brainB, home: homeB, now: now + 1200 });
+const afterPurgeLane = JSON.parse(fs.readFileSync(laneFileFor(brainB, homeB), 'utf8'));
+ok(purgeReceipt.laneWriteOk === true
+  && purgeReceipt.purgedSessions >= 1
+  && purgeReceipt.purgedMessages >= 1
+  && !purgeReceipt.sessions.some((session) => session.via === 'cloud')
+  && purgeReceipt.sessions.some((session) => session.id === 'dev-b-session'),
+'consent revoke atomically purges cloud rows and reports the durable lane write');
+ok(!afterPurgeLane.messages.some((message) => String(message.dedupeKey || '').startsWith(XPC_DEDUPE_PREFIX))
+  && afterPurgeLane.messages.some((message) => message.dedupeKey === 'local:revoke-control'),
+'consent revoke removes received cross-computer notes while preserving local coordination notes');
+
+// Compatibility caller gets the same semantics and an inspectable write verdict.
+upsertRemoteSessions({ brainPath: brainB, rows: inboundRows, machineId: 'mach-b', home: homeB, now: now + 1210 });
+postPresenceMessage({ brainPath: brainB, from: 'dev-a-session', text: 'second remote note', dedupeKey: `${XPC_DEDUPE_PREFIX}second`, home: homeB, now: now + 1210 });
+const purged = purgeRemoteSessions({ brainPath: brainB, home: homeB, now: now + 1220 });
+const afterLegacyPurge = JSON.parse(fs.readFileSync(laneFileFor(brainB, homeB), 'utf8'));
+ok(purged.laneWriteOk === true
+  && !purged.some((session) => session.via === 'cloud')
+  && !afterLegacyPurge.messages.some((message) => String(message.dedupeKey || '').startsWith(XPC_DEDUPE_PREFIX)),
+'legacy purgeRemoteSessions inherits cross-computer note purge without changing its array API');
 
 // P1: a dead channel degrades silently — outbound reports, local reads still work.
 const deadOut = relayOutbound({ sessions: aRows, consent: GRANT, machineId: 'mach-a', root: repoA, now, send: undefined });

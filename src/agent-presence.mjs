@@ -16,6 +16,11 @@ export const MESSAGE_RECEIPT_FRESH_MS = 7 * 24 * 60 * 60 * 1000;
 export const MESSAGE_DELIVERY_VERSION = 2;
 export const MESSAGE_LANE_CAP = 30;
 export const MESSAGE_RECEIPT_CAP = 100;
+// Marker shared by the pure relay seam. A message carrying this prefix was
+// received from another computer, rather than authored on this local lane.
+// Revoking cross-computer presence must remove these notes as well as cloud
+// session rows while leaving local coordination history untouched.
+export const REMOTE_MESSAGE_DEDUPE_PREFIX = 'xpc:';
 
 const sha16 = (value) => crypto.createHash('sha1').update(String(value)).digest('hex').slice(0, 16);
 const normBrainPath = (value) => String(value).replace(/\\/g, '/').replace(/^[a-zA-Z]:/, (m) => m.toLowerCase());
@@ -623,27 +628,60 @@ export function upsertRemoteSessions({ brainPath, rows, machineId = MACHINE_ID, 
 }
 
 // Consent revoked, or the channel deliberately left: receive-display stops too
-// (symmetric consent, P9). Removes ONLY cloud-sourced rows — local presence is
-// untouched, so degradation lands exactly on today's local-only behavior.
-export function purgeRemoteSessions({ brainPath, home, now = Date.now() }) {
-  if (!brainPath) return [];
+// (symmetric consent, P9). This is the serializable result contract used by the
+// desktop bridge: cloud-sourced session rows AND cross-computer notes are purged
+// under one lane lock. Local sessions/messages are preserved byte-for-byte apart
+// from normal expiry maintenance. A lock failure is explicit so the caller can
+// retry instead of falsely reporting that revocation completed.
+export function purgeRemotePresence({ brainPath, home, now = Date.now() }) {
+  if (!brainPath) return {
+    laneWriteOk: false,
+    reason: 'no-brain',
+    sessions: [],
+    purgedSessions: 0,
+    purgedMessages: 0,
+  };
   const laneFile = laneFileFor(brainPath, home);
   const lockFile = laneFile + '.lock';
   const gotLock = acquireLock(lockFile);
-  if (!gotLock) return listActiveSessions({ brainPath, home, now });
+  if (!gotLock) return {
+    laneWriteOk: false,
+    reason: 'lane-locked',
+    sessions: listActiveSessions({ brainPath, home, now }),
+    purgedSessions: 0,
+    purgedMessages: 0,
+  };
   try {
     const data = readLane(laneFile);
-    const sessions = pruneSessions(data.sessions, now).filter((session) => session.via !== 'cloud');
+    const maintainedSessions = pruneSessions(data.sessions, now);
+    const sessions = maintainedSessions.filter((session) => session.via !== 'cloud');
+    const maintainedMessages = maintainMessages(data.messages, now);
+    const messages = maintainedMessages.filter((message) =>
+      !String(message?.dedupeKey || '').startsWith(REMOTE_MESSAGE_DEDUPE_PREFIX));
     fs.mkdirSync(path.dirname(laneFile), { recursive: true });
     writeLaneFileAtomic(laneFile, JSON.stringify({
       ...data,
       sessions,
-      messages: maintainMessages(data.messages, now),
+      messages,
     }));
-    return sessions;
+    return {
+      laneWriteOk: true,
+      reason: null,
+      sessions,
+      purgedSessions: maintainedSessions.length - sessions.length,
+      purgedMessages: maintainedMessages.length - messages.length,
+    };
   } finally {
     if (gotLock) releaseLock(lockFile);
   }
+}
+
+// Backward-compatible array API retained for existing local callers. It now
+// inherits the stronger purge semantics; new IPC callers should prefer the
+// explicit, serializable purgeRemotePresence() receipt above.
+export function purgeRemoteSessions(args) {
+  const result = purgeRemotePresence(args);
+  return withWriteVerdict(result.sessions, result.laneWriteOk, result.reason);
 }
 
 export function removeSession({

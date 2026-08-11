@@ -71,7 +71,13 @@ ok(afterStruct.cards.filter(c => /keep me/.test(String(c.text || ''))).length ==
 // ── but the bytes are recoverable ────────────────────────────────────────────
 const bin = await listGraveyard(after);
 ok(bin.length === 1 && bin[0].id === victim.id, 'the deleted card is in the bin, exactly once');
-ok(Number(bin[0].deletedAt) > 0 && bin[0].deletedBy === 'human', 'with a deletedAt stamp and an author');
+ok(Number(bin[0].deletedAt) > 0
+  && bin[0].deletedBy === 'unknown'
+  && bin[0].deletion?.initiator === 'unknown'
+  && bin[0].deletion?.cause === 'unclassified'
+  && bin[0].deletion?.source === 'merge'
+  && bin[0].deletion?.confidence === 'inferred',
+'with a deletedAt stamp and an honest unknown/inferred audit receipt when no author evidence was supplied');
 ok(String(bin[0].preview || '').includes('oops pasted'), 'and a preview so a human can identify it');
 const full = await readGraveyardCard(after, victim.id);
 ok(String(full?.content || '').includes(SECRET), 'the full text is retrievable for review before restore/purge');

@@ -29,6 +29,8 @@ import {
     codexPresenceHookStatus,
     mergeCodexPresenceHooks,
 } from '../src/codex-hooks.mjs';
+import { brainInstallDecision } from '../src/install-version.mjs';
+import { acquireInstallLockSync, releaseInstallLockSync } from '../src/install-lock.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PKG_ROOT = path.resolve(__dirname, '..');
@@ -147,45 +149,10 @@ function reportCodex(result) {
     console.error('  Claude Code installation is intact. Fix the Codex warning, then re-run this command.');
 }
 
-// ── Never-downgrade gate ─────────────────────────────────────────────────────
-// The brain version is a UNIFIED namespace = the klypix-mcp version, stamped by BOTH
-// the npm install (here) and the desktop bundle, so the two channels compare cleanly.
-// A dev deploy ({dev:true}) is authoritative; a strictly-newer install is not
-// downgraded. --force overrides both.
-const cmpSemver = (a, b) => { const pa = String(a || '').split('.').map(n => parseInt(n, 10) || 0), pb = String(b || '').split('.').map(n => parseInt(n, 10) || 0); for (let i = 0; i < 3; i++) { if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) - (pb[i] || 0); } return 0; };
-const cur = (() => { try { return JSON.parse(fs.readFileSync(path.join(BRAIN_DIR, '.brain-version.json'), 'utf8')); } catch { return null; } })();
-if (!FORCE && cur) {
-    if (cur.dev === true) {
-        console.log(`• A dev deploy owns ${BRAIN_DIR} (dev:true) — leaving it untouched. Re-run with --force to override.`);
-        if (!RUNTIME_ONLY) reportCodex(wireCodex());
-        process.exit(0);
-    }
-    if (cur.brainVersion && cmpSemver(cur.brainVersion, VERSION) > 0) {
-        console.log(`• Installed brain v${cur.brainVersion} is newer than this package v${VERSION} — not downgrading. Re-run with --force to override.`);
-        if (!RUNTIME_ONLY) reportCodex(wireCodex());
-        process.exit(0);
-    }
-}
-
 // ── Install lock (auto-propagation, part D — concurrency) ─────────────────────
-// Two sessions can self-update at the same moment; serialize so their writes never
-// tear. O_EXCL create wins; a lock older than 60s (a sub-second install should never
-// take that) is stolen so a crashed installer can't wedge every future update.
-const LOCK = path.join(BRAIN_DIR, '.install.lock');
-const sleepSync = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* */ } };
-function acquireLock() {
-    try { fs.mkdirSync(BRAIN_DIR, { recursive: true }); } catch { /* */ }
-    for (let i = 0; i < 120; i++) {
-        try { const fd = fs.openSync(LOCK, 'wx'); fs.writeSync(fd, String(process.pid)); fs.closeSync(fd); return true; }
-        catch (e) {
-            if (e && e.code !== 'EEXIST') return false;
-            try { if (Date.now() - fs.statSync(LOCK).mtimeMs > 60000) { fs.unlinkSync(LOCK); continue; } } catch { /* raced on the stale file — retry */ }
-            sleepSync(50);
-        }
-    }
-    return false;
-}
-const releaseLock = () => { try { fs.unlinkSync(LOCK); } catch { /* */ } };
+// npm and desktop use this exact token-owned lock. The version decision is made
+// only AFTER acquisition, so an older queued installer re-reads and preserves a
+// newer runtime that committed while it waited.
 
 // Migrate THIS project's .mcp.json klypix-canvas entry off `npx` onto the local
 // bundle now that it's installed — the desync fix for EXISTING configs (the self-
@@ -230,12 +197,33 @@ const flatten = (code) => code
     .replace(/klypix-worker\.mjs/g, 'klypix-mcp-worker.mjs')
     .replace(/const PKG_VERSION = \(\(\) => \{[\s\S]*?\}\)\(\);/, `const PKG_VERSION = '${VERSION}'; // baked at install (flat layout has no package.json)`);
 
-const gotLock = acquireLock();
-if (!gotLock) {
-    console.error(`✗ another KLYPIX install still owns ${LOCK}; no files were changed`);
+const installLock = acquireInstallLockSync(BRAIN_DIR);
+if (!installLock) {
+    console.error(`✗ another KLYPIX install still owns ${path.join(BRAIN_DIR, '.install.lock')}; no files were changed`);
     process.exit(1);
 }
 try {
+    // Never-downgrade gate: Brain Core semver is the unified payload identity.
+    // Read both receipts under the shared lock and conservatively keep the
+    // highest valid committed/recorded version. appVersion is provenance only.
+    const stamp = (() => { try { return JSON.parse(fs.readFileSync(path.join(BRAIN_DIR, '.brain-version.json'), 'utf8')); } catch { return null; } })();
+    const runtimeReceipt = (() => { try { return JSON.parse(fs.readFileSync(path.join(BRAIN_DIR, '.mcp-runtime.json'), 'utf8')); } catch { return null; } })();
+    const decision = brainInstallDecision({ candidateVersion: VERSION, stamp, runtime: runtimeReceipt, force: FORCE });
+    if (decision.action === 'refuse') {
+        releaseInstallLockSync(installLock);
+        console.error(`✗ package Brain Core version ${JSON.stringify(VERSION)} is invalid; refusing to install unidentified runtime files`);
+        process.exit(1);
+    }
+    if (decision.action === 'preserve') {
+        releaseInstallLockSync(installLock);
+        if (decision.reason === 'dev-owned') {
+            console.log(`• A dev deploy owns ${BRAIN_DIR} (dev:true) — leaving it untouched. Re-run with --force to override.`);
+        } else {
+            console.log(`• Installed brain v${decision.installedVersion} is newer than this package v${VERSION} — not downgrading. Re-run with --force to override.`);
+        }
+        if (!RUNTIME_ONLY) reportCodex(wireCodex());
+        process.exit(0);
+    }
     fs.mkdirSync(BRAIN_DIR, { recursive: true });
     // 1) runtime dependency CLOSURE (jszip+fractional-indexing for the hook/engine,
     //    @modelcontextprotocol/sdk+zod for the local MCP server). Resolve each via
@@ -280,7 +268,7 @@ try {
         if (!exists(path.join(destMods, name))) { copyDir(dir, path.join(destMods, name)); deps++; }
         try { const pj = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')); for (const d of Object.keys(pj?.dependencies || {})) queue.push({ name: d, fromDir: dir }); } catch { /* no readable package.json */ }
     }
-    if (missing.length) { if (gotLock) releaseLock(); console.error(`✗ could not resolve required dep(s): ${missing.join(', ')} — aborting (the brain hook needs them).`); process.exit(1); }
+    if (missing.length) { releaseInstallLockSync(installLock); console.error(`✗ could not resolve required dep(s): ${missing.join(', ')} — aborting (the brain hook needs them).`); process.exit(1); }
 
     // 2) STAGE the scripts (engine + hook + flattened servers), write each to
     //    `<name>.klypix-new`, back up the current copy to .prev/, then atomically
@@ -337,7 +325,7 @@ try {
         rawSettings = fs.readFileSync(SETTINGS, 'utf8');
         if (rawSettings.trim()) {
             try { settings = JSON.parse(rawSettings); }
-            catch (e) { if (gotLock) releaseLock(); console.error(`✗ ${SETTINGS} is invalid JSON (${e.message}). Fix it and re-run — refusing to overwrite a broken config.`); process.exit(1); }
+            catch (e) { releaseInstallLockSync(installLock); console.error(`✗ ${SETTINGS} is invalid JSON (${e.message}). Fix it and re-run — refusing to overwrite a broken config.`); process.exit(1); }
         }
     }
     if (!RUNTIME_ONLY) {
@@ -351,12 +339,11 @@ try {
         fs.renameSync(tmp, SETTINGS);
     }
 
-    // 6) stamp the install (unified brain version → never-downgrade across channels)
+    // 6) Commit the runtime pointer and version receipt atomically while the
+    // shared cross-channel lock is still held. The runtime receipt goes first;
+    // a crash between receipts remains recoverable because the next installer
+    // compares both and keeps the highest valid Brain Core version.
     const installedAt = new Date().toISOString();
-    fs.writeFileSync(path.join(BRAIN_DIR, '.brain-version.json'), JSON.stringify({ brainVersion: VERSION, via: 'npm', dirty: false, installedAt }, null, 2));
-    // Commit the runtime pointer LAST. A running supervisor watches only this
-    // atomic file, validates every staged hash, and keeps the old worker if the
-    // candidate is incomplete or incompatible.
     const runtime = {
         protocol: 1,
         version: VERSION,
@@ -368,6 +355,9 @@ try {
     const runtimePath = path.join(BRAIN_DIR, '.mcp-runtime.json');
     fs.writeFileSync(runtimePath + '.klypix-new', JSON.stringify(runtime, null, 2) + '\n', 'utf8');
     fs.renameSync(runtimePath + '.klypix-new', runtimePath);
+    const versionPath = path.join(BRAIN_DIR, '.brain-version.json');
+    fs.writeFileSync(versionPath + '.klypix-new', JSON.stringify({ brainVersion: VERSION, via: 'npm', dirty: false, installedAt }, null, 2), 'utf8');
+    fs.renameSync(versionPath + '.klypix-new', versionPath);
 
     // 7) migrate THIS project's .mcp.json off npx onto the now-installed local bundle
     //    (heals an existing stale config so the next MCP server spawn runs current).
@@ -383,7 +373,7 @@ try {
     const wiredFor = (evt) => Array.isArray(verify?.hooks?.[evt]) && verify.hooks[evt].some(g => Array.isArray(g?.hooks) && g.hooks.some(h => typeof h?.command === 'string' && h.command.includes(HOOK_MARK)));
     const notWired = ['SessionStart', 'UserPromptSubmit', 'Stop', 'PostToolUse'].filter(e => !wiredFor(e));
 
-    if (gotLock) releaseLock();
+    releaseInstallLockSync(installLock);
     // Users who already enabled the optional local semantic runtime should not
     // pay a multi-minute first question after a model/cache contract upgrade.
     // Migrate registered brains once in a detached process after the atomic
@@ -419,7 +409,7 @@ try {
     console.log('  Compatible brain-core updates hot-swap behind the same MCP connection. Only the one-time legacy→supervisor migration, a supervisor change, or an intentionally breaking tool/protocol change needs reconnect.');
     console.log('  Verify anytime: `npx klypix-mcp doctor`; prove two-client behavior with `npx klypix-mcp conformance`.');
 } catch (e) {
-    if (gotLock) releaseLock();
+    releaseInstallLockSync(installLock);
     console.error(`✗ install failed: ${e?.message || e}`);
     process.exit(1);
 }

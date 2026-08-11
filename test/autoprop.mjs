@@ -270,8 +270,20 @@ function runInstall(home, projectCwd, args = []) {
     },
   }, null, 2));
 
-  // re-install → .prev backup of the prior scripts is created
-  runInstall(home, proj);
+  // The real CLI reads BOTH receipts after acquiring the shared lock. A newer
+  // committed runtime wins even when an unrelated appVersion points the other
+  // way; --force remains the explicit recovery escape hatch.
+  fs.writeFileSync(path.join(bd, '.brain-version.json'), JSON.stringify({
+    brainVersion: '1.0.0', appVersion: '99.0.0', via: 'app', dirty: false,
+  }));
+  fs.writeFileSync(path.join(bd, '.mcp-runtime.json'), JSON.stringify({ ...runtime, version: '99.0.0' }));
+  const preserved = runInstall(home, proj);
+  ok(/Installed brain v99\.0\.0 is newer/.test(preserved)
+    && JSON.parse(fs.readFileSync(path.join(bd, '.mcp-runtime.json'), 'utf8')).version === '99.0.0',
+  'D: the real installer preserves the highest Core receipt and ignores appVersion ordering');
+
+  // forced re-install → .prev backup of the prior scripts is created
+  runInstall(home, proj, ['--force']);
   ok(fs.existsSync(path.join(bd, '.prev', 'global-brain-hook.mjs')), 'D: re-install snapshots the prior scripts to .prev/ (rollback)');
   ok(JSON.parse(fs.readFileSync(path.join(proj, '.mcp.json'), 'utf8')).mcpServers['klypix-canvas'].args[0] === 'scripts/klypix-mcp-server.mjs',
     'D: reinstall preserves a portable project-owned node server');

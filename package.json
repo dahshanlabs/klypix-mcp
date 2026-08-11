@@ -1,6 +1,6 @@
 {
   "name": "klypix-mcp",
-  "version": "1.65.1",
+  "version": "1.66.0",
   "description": "Shared project brain and MCP coordination server for multi-agent coding.",
   "type": "module",
   "license": "Apache-2.0",
@@ -53,6 +53,7 @@
     "./core": "./src/klypix-core.mjs",
     "./presence": "./src/agent-presence.mjs",
     "./mcp-presence": "./src/mcp-presence.mjs",
+    "./result-reconcile": "./src/result-reconcile.mjs",
     "./presence-relay": "./src/presence-relay.mjs",
     "./supervisor": "./src/mcp-supervisor.mjs",
     "./runtime-inspector": "./src/runtime-inspector.mjs",

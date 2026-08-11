@@ -1,6 +1,7 @@
 // Cross-PC presence relay — unit tests against the failure matrix
 // (docs/prompts/CROSS_PC_PRESENCE_SESSION_PROMPT.md P1–P9) plus the structural
-// guarantees: metadata-only whitelist, loop prevention, symmetric consent, and
+// guarantees: whitelisted presence metadata + explicit coordination-note text,
+// loop prevention, symmetric versioned consent, and
 // "presence writes NOTHING to the brain" (asserted on the module source).
 import fs from 'fs';
 import os from 'os';
@@ -114,9 +115,10 @@ ok(JSON.stringify(once) === JSON.stringify(twice),
 // ── Consent: default OFF, versioned, symmetric ───────────────────────────────
 ok(!presenceConsentAllows(null) && !presenceConsentAllows({})
   && !presenceConsentAllows({ ...GRANT, decision: 'denied' })
+  && !presenceConsentAllows({ ...GRANT, version: 1, scope: 'metadata-only' })
   && !presenceConsentAllows({ ...GRANT, version: PRESENCE_CONSENT_VERSION + 1 })
   && presenceConsentAllows(GRANT),
-'consent is default-off, versioned, and only an explicit current-version grant allows');
+'consent is default-off, versioned, invalidates the old metadata-only grant, and only an explicit current-scope grant allows');
 
 let sendCount = 0;
 const outNoConsent = relayOutbound({

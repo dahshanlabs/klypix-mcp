@@ -79,7 +79,7 @@ npx klypix-mcp conformance
 
 It runs in a temporary fixture and touches nothing else. It checks tool discovery, task memory,
 truthful peer reporting, overlap surfacing, proactive logging, and in-band delivery of a peer note.
-It verifies 12 required coordination behaviours — not the 21 tools, and not the retrieval engine.
+It verifies 15 required coordination behaviours — not the 21 tools, and not the retrieval engine.
 
 ---
 
@@ -323,13 +323,29 @@ have to have declared their files for the overlap to be visible at all.
 
 ## Handoffs and messages
 
-`brain_message` leaves one-time coordination notes for other sessions. They arrive on the peer's
-next KLYPIX action, expire after 24 hours, and are never written into the brain. Delivery is
-best-effort-proactive through MCP logging (which some hosts hide) and in-band on the peer's next
-action. A peer that stays offline past the TTL misses the note.
+`brain_message` leaves one-time coordination notes for other sessions. A supported KLYPIX action
+offers the note in model-visible context; the next independent supported action replays it and
+records an acknowledgement. That acknowledgement proves only that a later action followed the
+offer — never that a person read it or that an agent acted on it. Pending and offered notes survive
+reconnects. Expiry or bounded-capacity eviction records a failed per-recipient receipt instead of
+silently looking delivered. The core lane is machine-local, notes expire after 24 hours, and they
+are never written into the brain.
 
 Durable handoffs go in the brain itself — decisions, findings, open questions and skills captured
 as cards, each stamped with the agent that wrote it.
+
+## Evidence-gated completion
+
+When a task publishes a quantified or otherwise machine-checkable claim, it can attach one or more
+versioned result manifests to `brain_sync { phase: "complete" }`. Each manifest binds the claim to a
+report hash, producer/run provenance, the exact input and configuration fingerprints, and named
+metrics with counts and tolerances. Matching peer evidence is recorded as corroboration; conflicting
+or incomparable evidence returns `needs-reconciliation` and keeps the task scope active.
+
+The gate fails closed. Once a task submits result evidence, it cannot bypass an invalid or
+conflicting result by retrying completion without the manifest, and that obligation survives worker
+restart, hibernation, and transparent hot-swap. A fresh `phase: "start"` is the explicit boundary for
+a new task. The strict schema and reusable validator are exported as `klypix-mcp/result-reconcile`.
 
 ## Human control in Klypix
 
@@ -477,8 +493,8 @@ The MCP verbs below are what agents call. These are what **you** call:
 | `brain_lens` | Machine-readable freshness, provenance, activity, timeline, orrery and unresolved views |
 | `brain_garden` | Maintenance pass — proposes first, and cannot apply without an approval code the human generates |
 | `brain_doctor` | Self-diagnosis: version, core/enhanced host adapters, active sessions, tool count, projection drift |
-| `brain_message` | Session-to-session coordination notes (24h TTL, never written into the brain) |
-| `brain_sync` | Context Gateway: task capsule, active-task peers, exact-file overlap, one-time alerts, timing |
+| `brain_message` | Session-to-session coordination notes with per-recipient offer / later-action acknowledgement / failure receipts (24h TTL, never written into the brain) |
+| `brain_sync` | Context Gateway: task capsule, active-task peers, exact-file overlap, one-time alerts, timing, and optional result-manifest reconciliation |
 | `brain_connect` | Find and draw related-but-unlinked cards |
 | `project_map_context` | Read-only, bounded code-graph evidence beside correction-aware brain context, with exact-path review proposals; external artifacts (e.g. Graphify) are supported but never installed or run locally |
 | `project_map_scan` | KLYPIX's own zero-install scanner: gitignore-aware file inventory + file-level import edges (relative, tsconfig-alias, and monorepo-workspace imports resolved) written to `klypix-map/graph.json` — which then serves `project_map_context` automatically |
@@ -570,7 +586,8 @@ replaceable worker runs the brain core. A staged update is hash-verified, initia
 checked for backward-compatible tool schemas, and handed the current `brain_sync` task scope before
 the supervisor switches between requests. Added tools use the standard
 `notifications/tools/list_changed` signal. A failed or breaking candidate is rejected while the old
-worker keeps serving.
+worker keeps serving. A blocked result claim is kept in a durable per-project/session marker, so a
+worker replacement cannot turn a failed evidence check into a result-less completion.
 
 Compatible engine updates therefore activate behind the same live connection — no reconnect, no
 host restart. Three cases still require a deliberate reconnect or manual install: the one-time
@@ -601,7 +618,9 @@ keep lazy first-use indexing instead.
 - **Coordination state is local files.** The brain is a file in your repo; the presence lane is a
   file under your home directory. Nothing is uploaded — with one explicit, default-OFF exception:
   the cross-PC presence relay, which (only after per-brain consent in the KLYPIX desktop app)
-  shares metadata-only presence frames over that brain's cloud channel. No consent, no frames.
+  shares whitelisted presence metadata and the text of one-time coordination notes over that
+  brain's cloud channel. The scope is versioned: an older metadata-only grant does not authorize
+  note text and must be granted again. No current consent, no frames.
 - **`install` writes to your home directory:** `~/.claude/project-brain` (engine + runtime),
   `~/.claude/settings.json` (four hooks — written even if Claude Code is not installed),
   `~/.codex/AGENTS.md` (guidance block), and with `--codex-hooks`, `~/.codex/hooks.json`. It also
@@ -617,9 +636,10 @@ Read this section before you build on any of it.
 - **Coordination is machine-local and OS-user-local.** The presence lane is a file in your home
   directory. Two developers on two machines do not see each other's sessions, peers, overlaps or
   messages. This package ships the cross-machine presence *core* (`./presence-relay` — versioned
-  metadata-only frames, a symmetric default-off consent gate, loop prevention and message dedup),
-  but no transport: carrying frames between machines is the desktop app's job. With `klypix-mcp`
-  alone, coordination is machine-local.
+  whitelisted presence metadata plus coordination-note text, a symmetric default-off consent gate,
+  loop prevention, stable message IDs and per-recipient-machine acknowledgement primitives), but no
+  transport: carrying frames between machines is the desktop app's job. With `klypix-mcp` alone,
+  coordination is machine-local.
 - **Overlap matching is exact-path, and both sides must declare.** A session that never declares
   its expected files is invisible to overlap detection, and `src/auth/token.ts` does not match a
   rename or a parent directory.
@@ -685,7 +705,7 @@ Your `brain.klypix` is yours — it is a plain ZIP and stays readable with or wi
 Issues and pull requests: [github.com/dahshanlabs/klypix-mcp](https://github.com/dahshanlabs/klypix-mcp).
 Questions or feedback: [hello@klypix.com](mailto:hello@klypix.com).
 
-The repository carries 49 test files, 45 of them in the `npm test` chain, covering the presence
+The repository carries 59 test files, 54 of them in the `npm test` chain, covering the presence
 lane and its cross-machine relay, the Context Gateway, supervisor hot-swap, auto-update, retrieval
 quality, decay, challenge, lenses, the format guard, the git tools (including a real `git merge`
 through the merge driver), uninstall, and conformance. Run them with `npm test` from a clone — they

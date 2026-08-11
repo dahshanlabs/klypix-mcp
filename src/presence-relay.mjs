@@ -17,7 +17,9 @@
 //   2. METADATA ONLY. A frame carries at most: session id, hashed machine id,
 //      host label, client, surface, branch, the one-line declared intent,
 //      canonical repo-relative expected-file keys, and an informational send
-//      time. Never cwd, pid, card text, file contents, diffs, or screen data.
+//      time. Message frames additionally carry the explicit one-time
+//      coordination-note text. Never cwd, pid, card text, file contents, diffs,
+//      or screen data.
 //      buildPresenceFrame constructs by WHITELIST — unknown row fields cannot
 //      leak because nothing copies them.
 //   3. DEFAULT OFF, symmetric consent. presenceConsentAllows() gates BOTH
@@ -36,9 +38,9 @@ export const MESSAGE_WIRE_VERSION = 2;
 export const PRESENCE_HEARTBEAT_MS = 60_000;
 // Consent record contract (mirrors src/services/screenCloudConsent.ts in the
 // desktop app: versioned, revocable, default-off, checked at send time).
-export const PRESENCE_CONSENT_VERSION = 1;
+export const PRESENCE_CONSENT_VERSION = 2;
 export const PRESENCE_CONSENT_PURPOSE = 'session-presence';
-export const PRESENCE_CONSENT_SCOPE = 'metadata-only';
+export const PRESENCE_CONSENT_SCOPE = 'presence-metadata-and-note-text';
 // Cross-PC lane-message dedup prefix: also the marker that stops a received
 // message from being re-broadcast (loop prevention for the message lane).
 export const XPC_DEDUPE_PREFIX = 'xpc:';
@@ -241,7 +243,7 @@ export function acknowledgePersistedMessage(inbound, {
 }
 
 // Versioned, revocable, default-OFF consent — the shape the desktop stores per
-// linked brain (klypix:brainPresenceConsent:v1:<blobId>). Anything short of an
+// linked brain (klypix:brainPresenceConsent:v2:<blobId>). Anything short of an
 // explicit, current-version grant is a NO: null record (never asked), wrong
 // version (re-consent after a scope change), wrong purpose/scope, revoked.
 export function presenceConsentAllows(record) {

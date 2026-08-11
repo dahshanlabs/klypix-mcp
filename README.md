@@ -618,9 +618,11 @@ keep lazy first-use indexing instead.
 - **Coordination state is local files.** The brain is a file in your repo; the presence lane is a
   file under your home directory. Nothing is uploaded — with one explicit, default-OFF exception:
   the cross-PC presence relay, which (only after per-brain consent in the KLYPIX desktop app)
-  shares whitelisted presence metadata and the text of one-time coordination notes over that
-  brain's cloud channel. The scope is versioned: an older metadata-only grant does not authorize
-  note text and must be granted again. No current consent, no frames.
+  shares whitelisted presence fields and the text of one-time coordination notes over that
+  brain's cloud channel. KLYPIX does not automatically attach file/card contents, diffs, or screen
+  data, but a note relays whatever its sender typed (and automatic overlap alerts name the declared
+  file paths involved). The scope is versioned: an older metadata-only grant does not authorize note
+  text and must be granted again. No current consent, no frames.
 - **`install` writes to your home directory:** `~/.claude/project-brain` (engine + runtime),
   `~/.claude/settings.json` (four hooks — written even if Claude Code is not installed),
   `~/.codex/AGENTS.md` (guidance block), and with `--codex-hooks`, `~/.codex/hooks.json`. It also

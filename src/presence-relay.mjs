@@ -14,14 +14,16 @@
 //      missing or stale advisory, never corruption. This module deliberately
 //      imports only node:crypto (test/presence-relay.mjs asserts it): no fs,
 //      no network, no brain format API can even be reached from here.
-//   2. METADATA ONLY. A frame carries at most: session id, hashed machine id,
-//      host label, client, surface, branch, the one-line declared intent,
-//      canonical repo-relative expected-file keys, and an informational send
-//      time. Message frames additionally carry the explicit one-time
-//      coordination-note text. Never cwd, pid, card text, file contents, diffs,
-//      or screen data.
-//      buildPresenceFrame constructs by WHITELIST — unknown row fields cannot
-//      leak because nothing copies them.
+//   2. WHITELISTED PAYLOADS. A presence frame carries at most: session id,
+//      hashed machine id, host label, client, surface, branch, the one-line
+//      declared intent, canonical repo-relative expected-file keys, and an
+//      informational send time. Message frames additionally carry the explicit
+//      one-time coordination-note text (manual notes and automatic overlap-alert
+//      text). No cwd, pid, model, file bytes, card payload, diff, or screen data
+//      is AUTOMATICALLY attached. A sender can type sensitive material into a
+//      note, so consent/UI must never claim the arbitrary note body is metadata.
+//      buildPresenceFrame constructs presence rows by WHITELIST — unknown row
+//      fields cannot leak because nothing copies them.
 //   3. DEFAULT OFF, symmetric consent. presenceConsentAllows() gates BOTH
 //      directions at this seam (relayOutbound / relayInbound): no consent
 //      record ⇒ zero outbound frames AND no receive-display of others.
@@ -55,8 +57,8 @@ const str = (value, max) => compact(value).slice(0, max);
 // ("E:/work/repo" vs "/home/dev/repo") produce identical keys. A path that
 // cannot be placed under `root` is DROPPED from the wire (unlike the local
 // comparator, which keeps it): an absolute path outside the repo is local
-// machine structure — usernames, drive layout — and metadata-only (property 2)
-// wins over completeness for anything that leaves the machine.
+// machine structure — usernames, drive layout — and the presence-field whitelist
+// (property 2) wins over completeness for anything that leaves the machine.
 export function canonicalWireFiles(files, root) {
   const rootKey = String(root || '')
     .replace(/\\/g, '/')
@@ -87,7 +89,7 @@ export function canonicalWireFiles(files, root) {
 // One lane row → one wire frame, or null when the row must not be broadcast:
 // a row this relay itself wrote from the channel (via:'cloud') would loop, and
 // a row with no session id is unaddressable. Constructed by whitelist — this
-// is the ONLY place a frame is assembled, so the metadata-only guarantee is
+// is the ONLY place a presence frame is assembled, so that field whitelist is
 // structural, not a filter that can miss a field.
 export function buildPresenceFrame(session, { machineId, hostLabel = null, root = null, now = Date.now() } = {}) {
   if (!session || !session.id || !machineId) return null;

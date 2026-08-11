@@ -75,7 +75,7 @@ const wireFiles = canonicalWireFiles(
 ok(wireFiles.length === 2 && wireFiles[0] === 'src/app.tsx' && wireFiles[1] === 'src/other.ts',
   'wire file keys fold absolute and relative spellings onto one repo-relative key and dedupe');
 ok(!wireFiles.some((key) => key.includes('secrets')),
-  'an absolute path OUTSIDE the repo never reaches the wire (metadata-only)');
+  'an absolute path OUTSIDE the repo never reaches the whitelisted presence payload');
 
 // ── Frame whitelist: nothing beyond the declared metadata can leak ───────────
 const richRow = {

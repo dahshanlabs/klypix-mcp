@@ -28,6 +28,8 @@ import {
   buildMessageFrame,
   buildPresenceFrame,
   canonicalWireFiles,
+  LEGACY_MESSAGE_WIRE_VERSION,
+  MESSAGE_ACK_WIRE_VERSION,
   MESSAGE_WIRE_VERSION,
   messageDeliveryKey,
   PRESENCE_CONSENT_PURPOSE,
@@ -154,7 +156,7 @@ ok(outGranted.sent === 2 && sendCount === 2 && outGranted.maxMessageTs === now,
 const msgFrame = buildMessageFrame({ id: 'stable-message-1', from: 'sess-a', to: 'all', text: 'Rebase before you commit', ts: now }, { machineId: 'mach-a', now });
 const accepted1 = acceptMessageFrame(msgFrame, { machineId: 'mach-b' });
 const accepted2 = acceptMessageFrame({ ...msgFrame, sentAt: now + 5 }, { machineId: 'mach-b' });
-ok(msgFrame.v === MESSAGE_WIRE_VERSION && msgFrame.mid === 'stable-message-1'
+ok(msgFrame.v === LEGACY_MESSAGE_WIRE_VERSION && msgFrame.mid === 'stable-message-1'
   && accepted1?.messageId === 'stable-message-1'
   && accepted1.dedupeKey.startsWith(XPC_DEDUPE_PREFIX) && accepted1.dedupeKey === accepted2.dedupeKey,
   'redelivered v2 message keeps the SAME stable id and dedupe key (P5)');
@@ -167,7 +169,9 @@ ok(parsedInbound?.type === 'message' && parsedInbound.acknowledgement === null
 'parsing a wire message cannot acknowledge it before the local mailbox insert succeeds');
 const mailboxAck = acknowledgePersistedMessage(parsedInbound, { persisted: true, recipientId: 'sess-b', now: now + 7 });
 const acceptedAck = acceptMessageAckFrame(mailboxAck, { machineId: 'mach-a' });
-ok(mailboxAck?.kind === 'message-ack' && acceptedAck?.messageId === 'stable-message-1'
+ok(MESSAGE_ACK_WIRE_VERSION === LEGACY_MESSAGE_WIRE_VERSION
+  && mailboxAck?.v === MESSAGE_ACK_WIRE_VERSION
+  && mailboxAck?.kind === 'message-ack' && acceptedAck?.messageId === 'stable-message-1'
   && acceptedAck.deliveryKey === messageDeliveryKey('stable-message-1', 'mach-b'),
 'a successful durable mailbox insert mints a per-recipient-machine transport acknowledgement');
 ok(buildMessageAckFrame({
@@ -203,6 +207,101 @@ for (let attempt = 0; attempt < 2; attempt++) relayOutbound({
 });
 ok(retryFrames.length === 2 && retryFrames.every((wire) => wire.mid === durableMessage.id),
 'reconnect pumps resend the same stable message id until the outstanding destination acknowledges');
+
+// A recipient set is frozen PER MESSAGE. Realtime remains a broadcast channel,
+// so the signed wire frame also carries that allowlist and non-recipients drop
+// it before mailbox insertion. A machine discovered later cannot make old text
+// due again or persist/display a retry meant for an original destination. This
+// is not confidentiality: a broadcast-channel member can see wire payloads.
+const frozenA = { id: 'frozen-a', from: 'sess-a', to: 'all', text: 'only the original laptop', ts: now };
+const frozenB = { id: 'frozen-b', from: 'sess-a', to: 'all', text: 'only the second laptop', ts: now + 1 };
+const frozenRecipients = new Map([
+  [frozenA.id, ['mach-b']],
+  [frozenB.id, ['mach-c']],
+]);
+ok(selectOutboundMessages([frozenA, frozenB], {
+  acknowledgedDeliveries: [messageDeliveryKey(frozenA.id, 'mach-b')],
+  recipientMachineIds: ['mach-b', 'mach-c', 'mach-new'],
+  recipientMachineIdsByMessage: frozenRecipients,
+}).map((message) => message.id).join() === frozenB.id,
+'per-message recipient snapshots never expand when another machine appears later');
+const frozenFrames = [];
+const frozenOut = relayOutbound({
+  sessions: [], messages: [frozenA, frozenB], consent: GRANT, machineId: 'mach-a', now,
+  acknowledgedDeliveries: [messageDeliveryKey(frozenA.id, 'mach-b')],
+  recipientMachineIds: ['mach-b', 'mach-c', 'mach-new'],
+  recipientMachineIdsByMessage: frozenRecipients,
+  send: (wire) => frozenFrames.push(wire),
+});
+ok(frozenFrames.length === 1
+  && MESSAGE_WIRE_VERSION === 3
+  && frozenFrames[0].v === MESSAGE_WIRE_VERSION
+  && frozenFrames[0].mid === frozenB.id
+  && frozenFrames[0].recipients.join() === 'mach-c'
+  && frozenOut.pendingDeliveryKeys.join() === messageDeliveryKey(frozenB.id, 'mach-c'),
+'durable outbound frames and pending receipts use each message\'s immutable destination set');
+ok(acceptMessageFrame(frozenFrames[0], { machineId: 'mach-c' })?.messageId === frozenB.id
+  && acceptMessageFrame(frozenFrames[0], { machineId: 'mach-b' }) === null
+  && acceptMessageFrame(frozenFrames[0], { machineId: 'mach-new' }) === null,
+'broadcast-channel receivers enforce the message destination allowlist before persistence');
+const legacyV2ReceiverWouldAccept = (wire) => [PRESENCE_WIRE_VERSION, LEGACY_MESSAGE_WIRE_VERSION].includes(wire?.v);
+ok(!legacyV2ReceiverWouldAccept(frozenFrames[0]),
+'recipient-scoped v3 frames fail closed on pre-allowlist v2 receivers');
+ok(selectOutboundMessages([frozenA], {
+  acknowledgedDeliveries: [],
+  recipientMachineIds: ['mach-new'],
+  recipientMachineIdsByMessage: { [frozenA.id]: [] },
+}).length === 0
+  && buildMessageFrame(frozenA, { machineId: 'mach-a', now, recipientMachineIds: [] }) === null,
+'an explicit no-recipient snapshot cannot become a later store-forward broadcast');
+
+const selfOnlyFrames = [];
+const selfOnlyOut = relayOutbound({
+  sessions: [], messages: [frozenA], consent: GRANT, machineId: 'mach-a', now,
+  acknowledgedDeliveries: [],
+  recipientMachineIds: ['mach-a'],
+  recipientMachineIdsByMessage: new Map([[frozenA.id, ['mach-a']]]),
+  send: (wire) => selfOnlyFrames.push(wire),
+});
+ok(selfOnlyFrames.length === 0
+  && selfOnlyOut.pendingMessageIds.length === 0
+  && selfOnlyOut.pendingDeliveryKeys.length === 0,
+'the sender is removed once from snapshots, selection, frames, and pending receipt keys');
+
+const senderAndPeerFrames = [];
+const senderAndPeerOut = relayOutbound({
+  sessions: [], messages: [frozenA], consent: GRANT, machineId: 'mach-a', now,
+  acknowledgedDeliveries: [messageDeliveryKey(frozenA.id, 'mach-b')],
+  recipientMachineIds: ['mach-a', 'mach-b'],
+  recipientMachineIdsByMessage: new Map([[frozenA.id, ['mach-a', 'mach-b']]]),
+  send: (wire) => senderAndPeerFrames.push(wire),
+});
+ok(senderAndPeerFrames.length === 0
+  && senderAndPeerOut.pendingMessageIds.length === 0
+  && senderAndPeerOut.pendingDeliveryKeys.length === 0,
+'an acknowledged peer snapshot containing the sender retires without an impossible self-ACK');
+
+const snapshotOnlyFrames = [];
+relayOutbound({
+  sessions: [], messages: [frozenA], consent: GRANT, machineId: 'mach-a', now,
+  recipientMachineIdsByMessage: new Map([[frozenA.id, ['mach-b']]]),
+  send: (wire) => snapshotOnlyFrames.push(wire),
+});
+ok(snapshotOnlyFrames.length === 1
+  && snapshotOnlyFrames[0].v === MESSAGE_WIRE_VERSION
+  && snapshotOnlyFrames[0].recipients.join() === 'mach-b'
+  && acceptMessageFrame(snapshotOnlyFrames[0], { machineId: 'mach-c' }) === null,
+'a per-message snapshot scopes the wire even when no acknowledgement arrays were supplied');
+
+const incompleteRegistryFrames = [];
+relayOutbound({
+  sessions: [], messages: [frozenA], consent: GRANT, machineId: 'mach-a', now,
+  recipientMachineIds: ['mach-b'],
+  recipientMachineIdsByMessage: new Map(),
+  send: (wire) => incompleteRegistryFrames.push(wire),
+});
+ok(incompleteRegistryFrames.length === 0,
+'a supplied per-message registry fails closed when the message has no snapshot entry');
 
 // ── Lane integration: two isolated "machines", one shared logical brain ──────
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-xpc-'));

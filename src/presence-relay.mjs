@@ -36,7 +36,14 @@
 import crypto from 'crypto';
 
 export const PRESENCE_WIRE_VERSION = 1;
-export const MESSAGE_WIRE_VERSION = 2;
+// v2 is the legacy durable-message envelope. v3 adds a receiver-enforced
+// recipient-machine allowlist. A scoped frame MUST use v3 so a v2 client,
+// which does not understand the allowlist, fails closed instead of accepting
+// a retry intended for somebody else. Unscoped compatibility callers may
+// still emit v2; acknowledgement payloads retain their unchanged v2 schema.
+export const LEGACY_MESSAGE_WIRE_VERSION = 2;
+export const MESSAGE_WIRE_VERSION = 3;
+export const MESSAGE_ACK_WIRE_VERSION = 2;
 export const PRESENCE_HEARTBEAT_MS = 60_000;
 // Consent record contract (mirrors src/services/screenCloudConsent.ts in the
 // desktop app: versioned, revocable, default-off, checked at send time).
@@ -137,15 +144,53 @@ export function acceptPresenceFrame(frame, { machineId, now = Date.now() } = {})
 
 // One lane message → one wire frame, or null when it must not cross machines:
 // a message this relay injected FROM the channel (xpc: dedupe key) would loop.
-export function buildMessageFrame(message, { machineId, now = Date.now() } = {}) {
+const canonicalRecipientMachineIds = (values) => [...new Set(
+  Array.from(typeof values === 'string' ? [values] : (values || []), (value) => str(value, 40)).filter(Boolean),
+)].slice(0, 64);
+
+const eligibleRecipientMachineIds = (values, machineId) => {
+  const sender = str(machineId, 40);
+  return canonicalRecipientMachineIds(values).filter((id) => id !== sender);
+};
+
+function messageRecipientSnapshot(message, fallback, byMessage, machineId) {
+  const id = String(message?.id || '');
+  const explicit = byMessage !== undefined;
+  let values;
+  if (byMessage instanceof Map && byMessage.has(id)) {
+    values = byMessage.get(id);
+  } else if (byMessage && typeof byMessage === 'object'
+    && Object.prototype.hasOwnProperty.call(byMessage, id)) {
+    values = byMessage[id];
+  }
+  return {
+    explicit,
+    // Supplying a per-message registry makes it authoritative. A missing or
+    // malformed entry is therefore an explicit empty snapshot (fail closed),
+    // never permission to fall back to a later-expanded machine list.
+    targets: eligibleRecipientMachineIds(explicit ? values : fallback, machineId),
+  };
+}
+
+export function buildMessageFrame(message, {
+  machineId,
+  now = Date.now(),
+  recipientMachineIds,
+} = {}) {
   if (!message || !machineId) return null;
   if (String(message.dedupeKey || '').startsWith(XPC_DEDUPE_PREFIX)) return null;
   const text = str(message.text, 400);
   const from = str(message.from, 64);
   if (!text || !from) return null;
   const mid = str(message.id, 64) || sha16(`${machineId}|${from}|${text.toLowerCase()}|${Number(message.ts || now)}`);
+  const recipients = recipientMachineIds === undefined
+    ? null
+    : eligibleRecipientMachineIds(recipientMachineIds, machineId);
+  // An explicit empty snapshot means there was no eligible remote machine when
+  // this message first became due. Do not turn it into a channel-wide frame.
+  if (recipientMachineIds !== undefined && !recipients.length) return null;
   return {
-    v: MESSAGE_WIRE_VERSION,
+    v: recipients === null ? LEGACY_MESSAGE_WIRE_VERSION : MESSAGE_WIRE_VERSION,
     kind: 'message',
     mid,
     machine: str(machineId, 40),
@@ -153,6 +198,7 @@ export function buildMessageFrame(message, { machineId, now = Date.now() } = {})
     to: str(message.to, 160) || 'all',
     text,
     sentAt: Number(message.ts) || Number(now) || Date.now(),
+    ...(recipients ? { recipients } : {}),
   };
 }
 
@@ -163,19 +209,34 @@ export function buildMessageFrame(message, { machineId, now = Date.now() } = {})
 // existing dedupeKey mechanism enforces it under the lane lock.
 export function acceptMessageFrame(frame, { machineId } = {}) {
   if (!frame || typeof frame !== 'object') return null;
-  if (![PRESENCE_WIRE_VERSION, MESSAGE_WIRE_VERSION].includes(frame.v) || frame.kind !== 'message') return null;
+  if (![PRESENCE_WIRE_VERSION, LEGACY_MESSAGE_WIRE_VERSION, MESSAGE_WIRE_VERSION].includes(frame.v)
+    || frame.kind !== 'message') return null;
   const machine = str(frame.machine, 40);
   const from = str(frame.from, 64);
   const text = str(frame.text, 400);
   if (!machine || !from || !text) return null;
   if (machineId && machine === String(machineId)) return null;   // own echo
+  const hasRecipients = Object.prototype.hasOwnProperty.call(frame, 'recipients');
+  // Only v3 understands recipient scoping. Requiring the field in v3 and
+  // rejecting it on legacy envelopes makes the compatibility boundary exact.
+  if ((frame.v === MESSAGE_WIRE_VERSION) !== hasRecipients) return null;
+  if (hasRecipients) {
+    // Realtime is a broadcast transport: this allowlist prevents mailbox
+    // persistence/display by non-recipients. It is a delivery boundary, not
+    // confidentiality; channel members can still receive the wire payload.
+    if (!Array.isArray(frame.recipients) || !machineId) return null;
+    const recipients = canonicalRecipientMachineIds(frame.recipients);
+    if (!recipients.length || recipients.length !== frame.recipients.length
+      || !recipients.includes(str(machineId, 40))) return null;
+  }
   return {
     from,
     to: str(frame.to, 160) || 'all',
     text,
-    messageId: frame.v === MESSAGE_WIRE_VERSION ? str(frame.mid, 64) : null,
+    messageId: frame.v >= LEGACY_MESSAGE_WIRE_VERSION ? str(frame.mid, 64) : null,
     originMachine: machine,
-    dedupeKey: frame.v === MESSAGE_WIRE_VERSION && str(frame.mid, 64)
+    messageWireVersion: frame.v,
+    dedupeKey: frame.v >= LEGACY_MESSAGE_WIRE_VERSION && str(frame.mid, 64)
       ? `${XPC_DEDUPE_PREFIX}${machine}:${str(frame.mid, 64)}`
       : `${XPC_DEDUPE_PREFIX}${sha16(`${machine}|${from}|${text.toLowerCase()}`)}`,
   };
@@ -189,7 +250,7 @@ export function buildMessageAckFrame({ messageId, originMachine, recipientMachin
   const machine = str(recipientMachine, 40);
   if (!mid || !origin || !machine || origin === machine) return null;
   return {
-    v: MESSAGE_WIRE_VERSION,
+    v: MESSAGE_ACK_WIRE_VERSION,
     kind: 'message-ack',
     mid,
     originMachine: origin,
@@ -200,7 +261,8 @@ export function buildMessageAckFrame({ messageId, originMachine, recipientMachin
 }
 
 export function acceptMessageAckFrame(frame, { machineId } = {}) {
-  if (!frame || frame.v !== MESSAGE_WIRE_VERSION || frame.kind !== 'message-ack') return null;
+  if (!frame || ![MESSAGE_ACK_WIRE_VERSION, MESSAGE_WIRE_VERSION].includes(frame.v)
+    || frame.kind !== 'message-ack') return null;
   const messageId = str(frame.mid, 64);
   const originMachine = str(frame.originMachine, 40);
   const recipientMachine = str(frame.machine, 40);
@@ -268,10 +330,13 @@ export function selectOutboundMessages(messages, {
   sinceTs = 0,
   acknowledgedMessageIds,
   acknowledgedDeliveries,
-  recipientMachineIds = [],
+  recipientMachineIds,
+  recipientMachineIdsByMessage,
+  machineId,
 } = {}) {
-  const durable = acknowledgedMessageIds !== undefined || acknowledgedDeliveries !== undefined;
-  const targets = [...new Set(Array.from(recipientMachineIds || [], String).filter(Boolean))];
+  const scoped = recipientMachineIds !== undefined || recipientMachineIdsByMessage !== undefined;
+  const durable = acknowledgedMessageIds !== undefined || acknowledgedDeliveries !== undefined || scoped;
+  const targets = eligibleRecipientMachineIds(recipientMachineIds, machineId);
   const flat = new Set(Array.from(acknowledgedMessageIds || [], String));
   const receipts = new Set(Array.from(acknowledgedDeliveries || [], (entry) => {
     if (typeof entry === 'string') return entry;
@@ -280,9 +345,13 @@ export function selectOutboundMessages(messages, {
   const acknowledgedForAllTargets = (message) => {
     const id = String(message?.id || '');
     if (!id) return false;
-    if (!targets.length) return flat.has(id);
-    if (targets.length === 1 && flat.has(id)) return true; // legacy single-peer caller
-    return targets.every((machine) => receipts.has(messageDeliveryKey(id, machine)));
+    const snapshot = messageRecipientSnapshot(message, targets, recipientMachineIdsByMessage, machineId);
+    // An explicit empty first-send snapshot is terminal for cross-machine
+    // delivery: later device discovery must never expand it into store-forward.
+    if (scoped && !snapshot.targets.length) return true;
+    if (!snapshot.targets.length) return flat.has(id);
+    if (!snapshot.explicit && snapshot.targets.length === 1 && flat.has(id)) return true; // legacy single-peer caller
+    return snapshot.targets.every((machine) => receipts.has(messageDeliveryKey(id, machine)));
   };
   return (Array.isArray(messages) ? messages : [])
     .filter((message) => message
@@ -339,7 +408,8 @@ export function relayOutbound({
   sinceTs = 0,
   acknowledgedMessageIds,
   acknowledgedDeliveries,
-  recipientMachineIds = [],
+  recipientMachineIds,
+  recipientMachineIdsByMessage,
   acknowledgements = [],
   now = Date.now(),
   send,
@@ -351,8 +421,9 @@ export function relayOutbound({
   let maxMessageTs = Number(sinceTs || 0);
   const sentMessageIds = [];
   const failedMessageIds = [];
-  const durable = acknowledgedMessageIds !== undefined || acknowledgedDeliveries !== undefined;
-  const targetMachines = [...new Set(Array.from(recipientMachineIds || [], String).filter(Boolean))];
+  const scoped = recipientMachineIds !== undefined || recipientMachineIdsByMessage !== undefined;
+  const durable = acknowledgedMessageIds !== undefined || acknowledgedDeliveries !== undefined || scoped;
+  const targetMachines = eligibleRecipientMachineIds(recipientMachineIds, machineId);
   const flatAcknowledged = new Set(Array.from(acknowledgedMessageIds || [], String));
   const acknowledgedDeliveryKeys = new Set(Array.from(acknowledgedDeliveries || [], (entry) =>
     typeof entry === 'string' ? entry : messageDeliveryKey(entry?.messageId, entry?.recipientMachine)).filter(Boolean));
@@ -370,10 +441,20 @@ export function relayOutbound({
     if (trySend(frame)) sent++;
   }
   const pending = selectOutboundMessages(messages, {
-    sinceTs, acknowledgedMessageIds, acknowledgedDeliveries, recipientMachineIds: targetMachines,
+    sinceTs,
+    acknowledgedMessageIds,
+    acknowledgedDeliveries,
+    ...(scoped ? { recipientMachineIds: targetMachines } : {}),
+    ...(recipientMachineIdsByMessage !== undefined ? { recipientMachineIdsByMessage } : {}),
+    machineId,
   });
   for (const message of pending) {
-    const frame = buildMessageFrame(message, { machineId, now });
+    const snapshot = messageRecipientSnapshot(message, targetMachines, recipientMachineIdsByMessage, machineId);
+    const frame = buildMessageFrame(message, {
+      machineId,
+      now,
+      ...(scoped ? { recipientMachineIds: snapshot.targets } : {}),
+    });
     if (!frame) continue;
     if (trySend(frame)) {
       sent++;
@@ -396,10 +477,12 @@ export function relayOutbound({
     pendingMessageIds: pending.map((message) => String(message.id || '')),
     pendingDeliveryKeys: pending.flatMap((message) => {
       const id = String(message.id || '');
-      return targetMachines.length
-        ? targetMachines.map((machine) => messageDeliveryKey(id, machine)).filter((key) =>
-          key && !acknowledgedDeliveryKeys.has(key) && !(targetMachines.length === 1 && flatAcknowledged.has(id)))
-        : [id];
+      const snapshot = messageRecipientSnapshot(message, targetMachines, recipientMachineIdsByMessage, machineId);
+      return snapshot.targets.length
+        ? snapshot.targets.map((machine) => messageDeliveryKey(id, machine)).filter((key) =>
+          key && !acknowledgedDeliveryKeys.has(key)
+          && !(snapshot.targets.length === 1 && !snapshot.explicit && flatAcknowledged.has(id)))
+        : (scoped ? [] : [id]);
     }),
   };
 }

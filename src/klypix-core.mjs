@@ -23,7 +23,8 @@ import crypto from 'crypto';
 import { z } from 'zod';
 import {
   parseKlypix, buildKlypix, buildKlypixMap, appendToKlypix, structToMarkdown,
-  brainInsights, insightsToMarkdown, addBrainConnections, proposeStructuralConnections, atomicWrite,
+  brainInsights, insightsToMarkdown, insightsAreasToMarkdown, insightsStatusToMarkdown,
+  areaStatusDigest, addBrainConnections, proposeStructuralConnections, atomicWrite,
   findUnrecordedMigrations, captureIntoBrain, tidyBrain, noteToCaptureInput,
   selectGardenCandidates, applyGarden, detectContradictions,
   rankForQuestion, questionContextToMarkdown, findLegacyShipCards,
@@ -614,7 +615,7 @@ export async function opCanvasView({ vault, canvas }) {
 // iOS) render the same picture from the same source: freshness buckets,
 // provenance channels, 7-day activity, birth-order timeline (the Replay
 // spine), orrery neighborhood, and open-❓ triage. Read-only by construction.
-export async function opBrainLens({ vault, canvas, view = 'all', root, staleDays, limit }) {
+export async function opBrainLens({ vault, canvas, view = 'all', root, staleDays, limit, structured: wantStructured = false }) {
   const t = brainTarget(vault, canvas);
   if (t.ambiguous) return ambiguousBrainErr(t.ambiguous);
   if (!t.file) return err(`No brain found — looked for ./brain.klypix in the project, then ${vault}. Pass canvas: "<name>".`);
@@ -632,20 +633,36 @@ export async function opBrainLens({ vault, canvas, view = 'all', root, staleDays
     const structured = v === 'timeline'
       ? lens
       : { ...lens, timeline: { ...lens.timeline, events: [] } };
-    return { blocks: [text(brainStamp(t.file, struct, t.how) + lensToMarkdown(lens, v))], structured: { lens: structured, view: v } };
+    // The machine-readable payload is OPT-IN, because it was view-independent:
+    // `freshness`, whose text is 659 chars, shipped the same ~50KB object as
+    // `all`, and `timeline` shipped ~146KB — every call, to every host, whether
+    // or not anything consumed it. No tool here declares an outputSchema, so it
+    // was never contractual; a product that wants the data asks for it.
+    const out = { blocks: [text(brainStamp(t.file, struct, t.how) + lensToMarkdown(lens, v))] };
+    if (wantStructured) out.structured = { lens: structured, view: v };
+    return out;
   } catch (e) {
     return err(`Lens failed: ${e.message}`);
   }
 }
 
-export async function opBrainInsights({ vault, canvas, staleDays }) {
+export async function opBrainInsights({ vault, canvas, staleDays, view = 'full' }) {
   const t = brainTarget(vault, canvas);
   if (t.ambiguous) return ambiguousBrainErr(t.ambiguous);
   if (!t.file) return err(`No brain found — looked for ./brain.klypix in the project, then ${vault}. Pass canvas: "<name>", or run \`npx klypix-mcp init\` to create one.`);
   try {
     const { struct } = await parseKlypix(fs.readFileSync(t.file));
     const ins = brainInsights(struct, staleDays ? { staleDays } : {});
-    return { blocks: [text(brainStamp(t.file, struct, t.how) + insightsToMarkdown(ins, struct.title))] };
+    // 'areas' and 'status' are ORIENTATION views — a category map an agent reads
+    // before deciding what to retrieve. Both are a fraction of the full report,
+    // and 'status' is the first time areaStatusDigest is reachable from any MCP
+    // host rather than only through the Claude-Code prompt hook.
+    const body = view === 'areas'
+      ? insightsAreasToMarkdown(ins, struct.title)
+      : view === 'status'
+        ? insightsStatusToMarkdown(areaStatusDigest(struct), ins, struct.title)
+        : insightsToMarkdown(ins, struct.title);
+    return { blocks: [text(brainStamp(t.file, struct, t.how) + body)] };
   } catch (e) {
     return err(`Insights failed: ${e.message}`);
   }

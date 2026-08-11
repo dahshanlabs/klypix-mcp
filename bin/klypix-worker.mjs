@@ -413,8 +413,9 @@ server.registerTool('brain_insights', {
   inputSchema: {
     canvas: z.string().optional().describe('Canvas filename/path. Defaults to the project brain ("brain").'),
     staleDays: z.number().optional().describe('Open questions older than this many days count as stale (default 21).'),
+    view: z.enum(['full', 'areas', 'status']).optional().describe('"areas" = a cheap category map (what sections exist + live counts) to orient BEFORE retrieving. "status" = where each active area stands (newest milestone + open count). "full" (default) = hubs, orphans, stale questions and areas.'),
   },
-}, async ({ canvas, staleDays }) => toContent(await opBrainInsights({ vault: mcpPresence.vault, canvas, staleDays })));
+}, async ({ canvas, staleDays, view }) => toContent(await opBrainInsights({ vault: mcpPresence.vault, canvas, staleDays, view })));
 
 server.registerTool('brain_lens', {
   title: 'Brain lens — machine-readable views of a brain (freshness · provenance · activity · timeline · orrery · unresolved)',
@@ -425,8 +426,9 @@ server.registerTool('brain_lens', {
     root: z.string().optional().describe('Orrery center: a card title prefix or id. Default: the most-connected hub card.'),
     staleDays: z.number().optional().describe('Open questions older than this count as stale (default 21).'),
     limit: z.number().optional().describe('Cap for recent-activity entries (default 30).'),
+    structured: z.boolean().optional().describe('Also return the full machine-readable lens object (large — tens of KB). Default false: the markdown answers the question, and the object was previously attached to every call whether or not anything read it.'),
   },
-}, async ({ canvas, view, root, staleDays, limit }) => toContent(await opBrainLens({ vault: mcpPresence.vault, canvas, view, root, staleDays, limit })));
+}, async ({ canvas, view, root, staleDays, limit, structured }) => toContent(await opBrainLens({ vault: mcpPresence.vault, canvas, view, root, staleDays, limit, structured })));
 
 server.registerTool('brain_connect', {
   title: 'Connect related-but-unlinked brain cards (densify the graph)',

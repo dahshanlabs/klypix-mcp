@@ -2509,6 +2509,15 @@ async function promptRetrieve(lib) {
                 shownNow.add(h.card.id);
                 continue;
             }
+            // Full text, deliberately. A char cap was tried here (2026-08-11) and
+            // REVERTED: this line is already budgeted, just not by truncation.
+            // The per-session `injected` ledger pays a card's full text ONCE and
+            // renders it as a headline on every later prompt (see wasInjected
+            // above), so the steady-state cost is bounded by distinct cards seen,
+            // not by prompts. An audit that measures single prompts in isolation
+            // reads this as "uncapped" and overstates it. Clipping here also
+            // breaks the contract F5a asserts — first sight must be complete, or
+            // the one chance to deliver a long decision intact is lost.
             lines.push(`- ${flat(h.card.text)}${mergeTag(h.card.id)}`);
             shownNow.add(h.card.id);
             noteInjected(h.card);

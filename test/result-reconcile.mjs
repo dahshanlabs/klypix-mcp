@@ -2,6 +2,9 @@ import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { fileURLToPath } from 'url';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { laneFileFor, listActiveSessions } from '../src/agent-presence.mjs';
 import { createMcpPresence } from '../src/mcp-presence.mjs';
 import {
@@ -23,6 +26,7 @@ const home = path.join(fixtureRoot, 'home');
 fs.rmSync(fixtureRoot, { recursive: true, force: true });
 fs.mkdirSync(path.join(project, 'artifacts'), { recursive: true });
 const brainPath = path.join(project, 'brain.klypix');
+const workerPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'klypix-worker.mjs');
 fs.writeFileSync(brainPath, 'result reconciliation fixture');
 
 const hashFile = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
@@ -67,9 +71,18 @@ const base = makeManifest({ tag: 'base' });
 const checkedBase = validateResultManifest(base, { projectRoot: project });
 ok(checkedBase.ok, 'a complete manifest verifies report hash, provenance, and context fingerprints');
 
+const prototypeKeyDetails = JSON.parse('{"safe":1,"__proto__":{"variant":"A"}}');
+ok(sha256ResultValue(prototypeKeyDetails) !== sha256ResultValue({ safe: 1 }),
+  'canonical provenance hashing preserves __proto__ as data instead of dropping it');
+
 const unknownTopLevel = { ...base, publishable: true };
 ok(!validateResultManifest(unknownTopLevel, { projectRoot: project }).ok,
   'unknown top-level fields fail closed at the schema-version boundary');
+
+const unknownNested = structuredClone(base);
+unknownNested.configuration.shippingDefault = true;
+ok(!validateResultManifest(unknownNested, { projectRoot: project }).ok,
+  'unknown nested manifest fields fail closed instead of disappearing during normalization');
 
 const coercedMetric = structuredClone(base);
 coercedMetric.metrics.mrr.tolerance = null;
@@ -126,10 +139,10 @@ const fakeServer = (name) => ({
 });
 const timer = () => ({ unref() {} });
 const clock = 2_100_000_000_000;
-const presence = (id, offset = 0) => createMcpPresence({
+const presence = (id, offset = 0, envExtra = {}) => createMcpPresence({
   server: fakeServer('codex'),
   initialVault: project,
-  env: { KLYPIX_SESSION_ID: id },
+  env: { KLYPIX_SESSION_ID: id, ...envExtra },
   home,
   now: () => clock + offset,
   setIntervalFn: timer,
@@ -167,8 +180,16 @@ ok(omittedRetry.isError === true
   && omittedRetry.sessions.find((session) => session.id === 'result-session-b')?.files?.includes('b.txt'),
 'a task cannot bypass a prior result conflict by retrying completion without its manifest');
 
+const mcpBRestart = presence('result-session-b', 7);
+mcpBRestart.start();
+const restartRetry = mcpBRestart.sync({ phase: 'complete' });
+ok(restartRetry.isError === true
+  && restartRetry.structured.resultConflicts.some((conflict) => conflict.kind === 'result-manifest-required')
+  && restartRetry.sessions.find((session) => session.id === 'result-session-b')?.files?.includes('b.txt'),
+'the pending evidence requirement survives a replacement worker process and still retains scope');
+
 const corroborating = makeManifest({ tag: 'corroborating' });
-const resolved = mcpB.sync({ phase: 'complete', results: [corroborating] });
+const resolved = mcpBRestart.sync({ phase: 'complete', results: [corroborating] });
 const resolvedSelf = resolved.sessions.find((session) => session.id === 'result-session-b');
 ok(resolved.structured.status === 'complete'
   && resolved.structured.resultReconciliation?.status === 'corroborated'
@@ -225,6 +246,22 @@ ok(ledgerBlocked.isError === true
   && ledgerBlocked.sessions.find((session) => session.id === 'result-session-f')?.files?.includes('f.txt'),
 'a contended result ledger fails closed before scope clearing');
 
+const mcpK = presence('result-session-k', 12);
+mcpK.start();
+mcpK.sync({ phase: 'start', intent: 'persist evidence through completion-lane contention', files: ['k.txt'] });
+const validLaneManifest = { ...makeManifest({ tag: 'valid-lane-lock' }), claimKey: 'brain.retrieval.valid-lane-lock' };
+fs.writeFileSync(`${presenceLane}.lock`, 'held-by-test');
+const validLaneBlocked = mcpK.sync({ phase: 'complete', results: [validLaneManifest] });
+fs.unlinkSync(`${presenceLane}.lock`);
+const mcpKRestart = presence('result-session-k', 13);
+mcpKRestart.start();
+const validLaneRetry = mcpKRestart.sync({ phase: 'complete' });
+ok(validLaneBlocked.isError === true
+  && validLaneBlocked.structured.resultConflicts.some((conflict) => conflict.kind === 'presence-lane-write-failed')
+  && validLaneRetry.isError === true
+  && validLaneRetry.structured.resultConflicts.some((conflict) => conflict.kind === 'result-manifest-required'),
+'a valid result whose presence completion write fails still requires evidence after worker restart');
+
 const mcpE = presence('result-session-e', 4);
 mcpE.start();
 mcpE.sync({ phase: 'start', intent: 'legacy no-result task', files: ['e.txt'] });
@@ -232,7 +269,88 @@ const legacy = mcpE.sync({ phase: 'complete' });
 ok(legacy.structured.status === 'complete' && legacy.isError !== true,
   'completion without a result claim preserves the existing backward-compatible path');
 
-for (const client of [mcpA, mcpB, mcpC, mcpD, mcpE, mcpF, mcpG]) client.stop();
+const mcpH = presence('result-session-h', 8);
+mcpH.start();
+mcpH.sync({ phase: 'start', intent: 'reject an empty result envelope', files: ['h.txt'] });
+const emptyResults = mcpH.sync({ phase: 'complete', results: [] });
+const emptyRetry = mcpH.sync({ phase: 'complete' });
+ok(emptyResults.isError === true
+  && emptyResults.structured.resultConflicts.some((conflict) => conflict.kind === 'invalid-result-submission')
+  && emptyRetry.isError === true
+  && emptyRetry.structured.resultConflicts.some((conflict) => conflict.kind === 'result-manifest-required'),
+'an explicitly empty results array fails closed and cannot be retried as a legacy result-less task');
+
+const mcpI = presence('result-session-i', 9);
+mcpI.start();
+mcpI.sync({ phase: 'start', intent: 'reject evidence on a checkpoint', files: ['i.txt'] });
+const wrongPhase = mcpI.sync({ phase: 'checkpoint', results: [base] });
+const wrongPhaseRetry = mcpI.sync({ phase: 'complete' });
+ok(wrongPhase.isError === true
+  && wrongPhase.structured.resultConflicts.some((conflict) => conflict.kind === 'result-manifest-wrong-phase')
+  && wrongPhaseRetry.isError === true
+  && wrongPhaseRetry.structured.resultConflicts.some((conflict) => conflict.kind === 'result-manifest-required'),
+'results on a non-complete phase are rejected and create a durable evidence obligation');
+
+const mcpJ = presence('result-session-j-before-rotation', 10, { KLYPIX_HOST_PID: '4242' });
+mcpJ.start();
+mcpJ.sync({ phase: 'start', intent: 'retain evidence across host session rotation', files: ['j.txt'] });
+mcpJ.sync({ phase: 'complete', results: [missingProvenance] });
+const rotatedId = 'result-session-j-after-rotation';
+fs.writeFileSync(laneFileFor(brainPath, home).replace(/\.json$/, '.hostmap'), JSON.stringify({
+  4242: { sessionId: rotatedId, ts: clock + 10 },
+}));
+mcpJ.sync({ phase: 'checkpoint' });
+const mcpJRestart = presence(rotatedId, 11);
+mcpJRestart.start();
+const rotatedRetry = mcpJRestart.sync({ phase: 'complete' });
+ok(rotatedRetry.isError === true
+  && rotatedRetry.structured.resultConflicts.some((conflict) => conflict.kind === 'result-manifest-required'),
+'the durable pending marker follows hostmap session-id rotation and survives the subsequent worker restart');
+
+// Production boundary regression: the real worker's public Zod schema must let
+// unknown nested manifest fields reach the authoritative in-handler validator.
+// Before this test, the SDK returned JSON-RPC -32602 first and the next call
+// silently completed without evidence because no pending marker had been set.
+const realHome = path.join(fixtureRoot, 'real-worker-home');
+fs.mkdirSync(realHome, { recursive: true });
+const realClient = new Client({ name: 'result-real-worker-test', version: '1.0.0' }, { capabilities: {} });
+const realTransport = new StdioClientTransport({
+  command: process.execPath,
+  args: [workerPath, '--vault', project],
+  cwd: project,
+  env: {
+    ...process.env,
+    HOME: realHome,
+    USERPROFILE: realHome,
+    KLYPIX_SESSION_ID: 'result-real-worker',
+    KLYPIX_AUTO_UPDATE: '0',
+  },
+  stderr: 'pipe',
+});
+try {
+  await realClient.connect(realTransport);
+  await realClient.callTool({
+    name: 'brain_sync',
+    arguments: { project, phase: 'checkpoint', intent: 'real worker malformed evidence', files: ['real.txt'], include_context: false },
+  });
+  const realInvalid = await realClient.callTool({
+    name: 'brain_sync',
+    arguments: { project, phase: 'complete', results: [unknownNested], include_context: false },
+  });
+  const realRetry = await realClient.callTool({
+    name: 'brain_sync',
+    arguments: { project, phase: 'complete', include_context: false },
+  });
+  ok(realInvalid.isError === true
+    && realInvalid.structuredContent?.resultConflicts?.some((conflict) => conflict.kind === 'invalid-result-manifest')
+    && realRetry.isError === true
+    && realRetry.structuredContent?.resultConflicts?.some((conflict) => conflict.kind === 'result-manifest-required'),
+  'the real worker routes unknown nested fields through fail-closed validation and persists the block');
+} finally {
+  await realClient.close().catch(() => {});
+}
+
+for (const client of [mcpA, mcpB, mcpBRestart, mcpC, mcpD, mcpE, mcpF, mcpG, mcpH, mcpI, mcpJ, mcpJRestart, mcpK, mcpKRestart]) client.stop();
 fs.rmSync(fixtureRoot, { recursive: true, force: true });
 
 console.log(failures ? `\n[x] ${failures} assertion(s) failed` : '\n[ok] result-reconcile: all assertions passed');

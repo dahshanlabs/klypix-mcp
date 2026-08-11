@@ -14,11 +14,13 @@ import {
   formatPresenceMessage,
   formatReceivedMessages,
   laneFileFor,
+  listActiveSessions,
   messageDecayInfo,
   peekMessages,
   postPresenceMessage,
   receiveMessages,
   removeSession,
+  sessionDeliveryReachability,
   upsertSession,
 } from './agent-presence.mjs';
 // ONE definition of the file key. Exact-overlap detection (here) and finding
@@ -132,17 +134,27 @@ export function findPresenceConflicts(sessions, selfId, { projectRoot } = {}) {
 const isTaskSession = (session) =>
   Boolean(compact(session?.intent) || (Array.isArray(session?.files) && session.files.length));
 
-const publicSession = (session, now) => ({
-  id: String(session?.id || ''),
-  client: session?.client || 'unknown',
-  surface: session?.surface || null,
-  branch: session?.branch || null,
-  intent: session?.intent || '',
-  intentAgeMs: session?.intentAt ? Math.max(0, now - Number(session.intentAt)) : null,
-  intentSource: session?.intentSource || null,
-  files: Array.isArray(session?.files) ? session.files : [],
-  ageMs: Math.max(0, now - Number(session?.lastSeen || now)),
-});
+const publicSession = (session, now) => {
+  const transport = session?.transport && typeof session.transport === 'object'
+    ? Object.fromEntries(Object.entries(session.transport).slice(0, 4).map(([channel, value]) => [
+      String(channel).slice(0, 32),
+      { status: String(value?.status || 'unknown').slice(0, 40) },
+    ]))
+    : {};
+  return {
+    id: String(session?.id || ''),
+    client: session?.client || 'unknown',
+    surface: session?.surface || null,
+    branch: session?.branch || null,
+    intent: session?.intent || '',
+    intentAgeMs: session?.intentAt ? Math.max(0, now - Number(session.intentAt)) : null,
+    intentSource: session?.intentSource || null,
+    files: Array.isArray(session?.files) ? session.files : [],
+    ageMs: Math.max(0, now - Number(session?.lastSeen || now)),
+    deliveryReachability: session?.deliveryReachability || sessionDeliveryReachability(session),
+    transport,
+  };
+};
 
 export function buildPresenceSnapshot(sessions, selfId, { now = Date.now() } = {}) {
   const connected = Array.isArray(sessions) ? sessions : [];
@@ -181,6 +193,8 @@ function formatTaskPresence(snapshot, now = Date.now()) {
     const intentAge = intentAgeMin !== null && intentAgeMin - heartbeatMin > 3 ? ` (intent set ${intentAgeMin}m ago)` : '';
     const details = [
       peer.client,
+      peer.deliveryReachability && peer.deliveryReachability !== 'connected'
+        ? `delivery ${peer.deliveryReachability}` : null,
       peer.branch ? `branch ${peer.branch}` : null,
       peer.intent ? `"${String(peer.intent).slice(0, 90)}"${intentAge}` : null,
       peer.files.length ? peer.files.slice(0, 4).join(', ') + (peer.files.length > 4 ? ` (+${peer.files.length - 4} more)` : '') : null,
@@ -222,10 +236,75 @@ export function resolveMcpSessionId({
     'CURSOR_SESSION_ID',
     'CLINE_SESSION_ID',
     'WINDSURF_SESSION_ID',
+    // The supervisor owns one stable MCP connection while workers are replaced
+    // underneath it. Falling through to the worker pid here gave every hot-swap
+    // candidate a different logical identity, defeating both presence handoff
+    // and any durable per-session completion state.
+    'KLYPIX_MCP_CONNECTION_ID',
   ]) {
     if (compact(env?.[key])) return compact(env[key]).slice(0, 160);
   }
   return `mcp-${pid}-${nonce}`;
+}
+
+// A result submission changes the completion contract for the CURRENT logical
+// task: after malformed/conflicting evidence, a result-less retry must not be a
+// bypass. Keep that one bit outside worker memory so hot reload, crash recovery,
+// and hibernation cannot erase it. File existence is the fail-closed state; the
+// payload is diagnostic only, so even a crash during the write leaves a safe
+// marker. A fresh phase:start is the explicit boundary that clears it.
+export function resultClaimMarkerFileFor(brainPath, sessionId, home) {
+  if (!brainPath || !sessionId) return null;
+  const lane = laneFileFor(brainPath, home);
+  const sessionKey = crypto.createHash('sha256').update(String(sessionId)).digest('hex').slice(0, 24);
+  return lane.replace(/\.json$/, `.result-claim-${sessionKey}.pending`);
+}
+
+function readResultClaimPending({ brainPath, sessionId, home }) {
+  const file = resultClaimMarkerFileFor(brainPath, sessionId, home);
+  if (!file) return { ok: false, pending: true, reason: 'no-brain-or-session' };
+  try {
+    fs.statSync(file);
+    return { ok: true, pending: true, file };
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { ok: true, pending: false, file };
+    return { ok: false, pending: true, file, reason: error?.code || error?.message || 'marker-read-failed' };
+  }
+}
+
+function markResultClaimPending({ brainPath, sessionId, home, at = Date.now() }) {
+  const file = resultClaimMarkerFileFor(brainPath, sessionId, home);
+  if (!file) return { ok: false, pending: true, reason: 'no-brain-or-session' };
+  let fd = null;
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fd = fs.openSync(file, 'wx');
+    fs.writeSync(fd, JSON.stringify({ schemaVersion: 1, sessionId: String(sessionId), pendingAt: at }));
+    try { fs.fsyncSync(fd); } catch { /* existence is already fail-closed */ }
+    return { ok: true, pending: true, file };
+  } catch (error) {
+    if (error?.code === 'EEXIST') return { ok: true, pending: true, file };
+    // If creation succeeded but writing the diagnostic payload failed, the
+    // marker still carries the required semantic and is therefore a success.
+    try {
+      if (fs.statSync(file)) return { ok: true, pending: true, file };
+    } catch { /* report the original failure below */ }
+    return { ok: false, pending: true, file, reason: error?.code || error?.message || 'marker-write-failed' };
+  } finally {
+    if (fd !== null) try { fs.closeSync(fd); } catch { /* */ }
+  }
+}
+
+function clearResultClaimPending({ brainPath, sessionId, home }) {
+  const file = resultClaimMarkerFileFor(brainPath, sessionId, home);
+  if (!file) return { ok: false, pending: true, reason: 'no-brain-or-session' };
+  try {
+    fs.unlinkSync(file);
+    return { ok: true, pending: false, file };
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { ok: true, pending: false, file };
+    return { ok: false, pending: true, file, reason: error?.code || error?.message || 'marker-clear-failed' };
+  }
 }
 
 // The host-pid this server belongs to (Claude Code exports CLAUDE_PID to every
@@ -311,6 +390,7 @@ export function createMcpPresence({
   let taskStartedAt = 0;
   let resultClaimsPending = false;
   let syncNudgeShown = false;
+  let modelActionSequence = 0;
   const sentTexts = new Set();
   const notifiedConflicts = new Set();
   const announcedMessageIds = new Set();
@@ -325,12 +405,35 @@ export function createMcpPresence({
       const mapped = hostmapSessionId({ brainPath, hostPid, home, now: stamp });
       if (!mapped || mapped === sessionId) return;
       const previous = sessionId;
+      const priorClaim = readResultClaimPending({ brainPath, sessionId: previous, home });
+      if (resultClaimsPending || priorClaim.pending || !priorClaim.ok) {
+        const migrated = markResultClaimPending({ brainPath, sessionId: mapped, home, at: stamp });
+        if (migrated.ok && priorClaim.ok) {
+          clearResultClaimPending({ brainPath, sessionId: previous, home });
+        }
+      }
       sessionId = mapped;
       // The old row's mcp channel is ours — release it so the lane never holds
       // two rows for one logical session longer than a single touch interval.
-      removeSession({ brainPath, id: previous, channel: 'mcp', home, now: stamp });
+      removeSession({
+        brainPath,
+        id: previous,
+        channel: 'mcp',
+        expectedPid: process.pid,
+        home,
+        now: stamp,
+      });
       lastPeers = '';
     } catch { /* rotation is best-effort — an fs error must never kill the heartbeat */ }
+  };
+
+  // A host can rotate its logical session id (/clear, resume) before the next
+  // heartbeat. Message sending needs the current id BEFORE it snapshots target
+  // recipients, so expose a read/identity refresh that does not consume inbox
+  // messages or create a second delivery transition in the same tool action.
+  const refreshIdentity = () => {
+    adoptHostSession(now());
+    return sessionId;
   };
 
   const clientInfo = () => {
@@ -384,6 +487,7 @@ export function createMcpPresence({
     intent,
     files,
     replaceFiles = false,
+    actionId = '',
   } = {}) => {
     if (!brainPath) return { sessions: [], messages: [], notice: '', laneWriteOk: null, laneWriteSkippedReason: 'no-lane' };
     const stamp = now();
@@ -413,6 +517,7 @@ export function createMcpPresence({
         ignoreTexts: [...sentTexts],
         home,
         now: stamp,
+        actionId,
       })
       : [];
     if (deliverMessages) sentTexts.clear();
@@ -451,6 +556,7 @@ export function createMcpPresence({
       brainPath,
       id: sessionId,
       channel: 'mcp',
+      expectedPid: process.pid,
       home,
       now: now(),
     });
@@ -502,13 +608,21 @@ export function createMcpPresence({
     return first;
   };
 
-  const sync = ({ project, intent, files, phase = 'checkpoint', results } = {}) => {
+  const sync = ({
+    project,
+    intent,
+    files,
+    phase = 'checkpoint',
+    results,
+    deliverMessages = true,
+    include_context,
+    actionId = '',
+  } = {}) => {
     const syncStartedAt = Date.now();
     const nextPhase = ['start', 'checkpoint', 'complete'].includes(phase) ? phase : 'checkpoint';
     const completing = nextPhase === 'complete';
     if (nextPhase === 'start') {
       taskStartedAt = now();
-      resultClaimsPending = false;
       notifiedConflicts.clear();
     } else if (!taskStartedAt && !completing) {
       taskStartedAt = now();
@@ -519,30 +633,83 @@ export function createMcpPresence({
     // brain/presence lane for this connection. Omitting it preserves the
     // configured launch vault for backwards compatibility.
     const requestedVault = compact(project) ? path.resolve(project) : vault;
-    const hasResultSubmission = completing && results !== undefined
-      && (!Array.isArray(results) || results.length > 0);
+    const resultBrainPath = started && requestedVault === vault
+      ? brainPath
+      : findProjectBrain(requestedVault);
+    if (started && resultBrainPath && resultBrainPath === brainPath) adoptHostSession(now());
+    const hasDefinedResults = results !== undefined;
     let resultReconciliation = null;
     let completionBlocked = false;
-    if (hasResultSubmission) {
+    let resultSubmissionRejected = false;
+    const stateConflicts = [];
+
+    if (nextPhase === 'start') {
+      if (!resultBrainPath) resultClaimsPending = false;
+      else {
+        const reset = clearResultClaimPending({ brainPath: resultBrainPath, sessionId, home });
+        resultClaimsPending = reset.ok ? false : true;
+        if (!reset.ok) stateConflicts.push({
+          kind: 'result-claim-state-write-failed',
+          severity: 'blocking',
+          reason: `could not clear the prior task's durable result-claim marker (${reset.reason})`,
+        });
+      }
+    }
+
+    if (hasDefinedResults) {
       resultClaimsPending = true;
-      // Reconcile BEFORE the completion touch. That touch deliberately clears
-      // task intent/files; doing it first would make an invalid or conflicting
-      // result look complete even if the later evidence check failed.
-      const resultBrainPath = started && requestedVault === vault
-        ? brainPath
-        : findProjectBrain(requestedVault);
-      resultReconciliation = recordResultManifests({
+      const marked = markResultClaimPending({
         brainPath: resultBrainPath,
-        projectRoot: resultBrainPath ? path.dirname(resultBrainPath) : requestedVault,
         sessionId,
-        results,
         home,
-        now: now(),
+        at: now(),
       });
-      completionBlocked = resultReconciliation?.ok !== true;
-    } else if (completing && resultClaimsPending) {
+      if (!marked.ok) stateConflicts.push({
+        kind: 'result-claim-state-write-failed',
+        severity: 'blocking',
+        reason: `could not persist the pending result claim (${marked.reason})`,
+      });
+      if (!completing) {
+        resultSubmissionRejected = true;
+        resultReconciliation = {
+          ok: false,
+          status: 'needs-reconciliation',
+          ledgerWriteOk: null,
+          claims: [],
+          conflicts: [{
+            kind: 'result-manifest-wrong-phase',
+            severity: 'blocking',
+            reason: 'result manifests are accepted only with phase "complete"; resubmit them on completion',
+          }],
+        };
+      } else {
+        // Reconcile BEFORE the completion touch. That touch deliberately clears
+        // task intent/files; doing it first would make an invalid or conflicting
+        // result look complete even if the later evidence check failed.
+        resultReconciliation = recordResultManifests({
+          brainPath: resultBrainPath,
+          projectRoot: resultBrainPath ? path.dirname(resultBrainPath) : requestedVault,
+          sessionId,
+          results,
+          home,
+          now: now(),
+        });
+        completionBlocked = resultReconciliation?.ok !== true || !marked.ok;
+      }
+    } else if (completing) {
+      const durable = resultBrainPath
+        ? readResultClaimPending({ brainPath: resultBrainPath, sessionId, home })
+        : { ok: true, pending: resultClaimsPending };
+      resultClaimsPending = resultClaimsPending || durable.pending || !durable.ok;
+      if (!durable.ok) stateConflicts.push({
+        kind: 'result-claim-state-read-failed',
+        severity: 'blocking',
+        reason: `could not verify whether this task owes result evidence (${durable.reason})`,
+      });
+    }
+    if (completing && !hasDefinedResults && resultClaimsPending) {
       // Once this task has declared a result claim, omitting evidence on a retry
-      // cannot bypass a prior conflict or failed lane write. A fresh `start` is
+      // cannot bypass a prior invalid/conflicting submission. A fresh `start` is
       // the explicit boundary that returns to the legacy no-result contract.
       resultReconciliation = {
         ok: false,
@@ -558,13 +725,19 @@ export function createMcpPresence({
       completionBlocked = true;
     }
     const clearCompletionScope = completing && !completionBlocked;
+    const priorCompletionScope = clearCompletionScope && resultBrainPath
+      ? listActiveSessions({ brainPath: resultBrainPath, home, now: now() })
+        .find((session) => session.id === sessionId)
+      : null;
+    const shouldDeliverMessages = deliverMessages !== false && include_context !== false;
     const details = {
       event: clearCompletionScope
         ? 'McpTaskComplete'
         : (nextPhase === 'start' ? 'McpTaskStart' : 'McpTaskCheckpoint'),
       includePresence: true,
       includeSolo: true,
-      deliverMessages: true,
+      deliverMessages: shouldDeliverMessages,
+      actionId: actionId || `brain-sync:${process.pid}:${++modelActionSequence}`,
       // Intent semantics by phase (2026-08-07 — a checkpoint sync carrying an
       // empty intent used to DECLARE that emptiness, masking the session as
       // sync-silent for every peer): 'complete' clears deliberately; 'start' is
@@ -577,10 +750,10 @@ export function createMcpPresence({
       files: clearCompletionScope ? [] : (completing ? undefined : files),
       replaceFiles: clearCompletionScope || nextPhase === 'start',
     };
-    const report = started && requestedVault === vault
+    let report = started && requestedVault === vault
       ? touch(details)
       : start(requestedVault, details);
-    const resultConflicts = [...(resultReconciliation?.conflicts || [])];
+    const resultConflicts = [...(resultReconciliation?.conflicts || []), ...stateConflicts];
     // A completion write that did not land is not completion. The old scope is
     // still authoritative in the lane, so retain it and say so explicitly.
     if (completing && report?.laneWriteOk === false) {
@@ -591,12 +764,42 @@ export function createMcpPresence({
         reason: report.laneWriteSkippedReason || 'presence lane write did not land',
       });
     }
+    if (completing && hasDefinedResults && !completionBlocked) {
+      // The obligation ends only after BOTH evidence reconciliation and the
+      // presence completion write land. Clearing this marker earlier let a
+      // worker restart turn a contended lane write into a result-less bypass.
+      const cleared = clearResultClaimPending({ brainPath: resultBrainPath, sessionId, home });
+      if (cleared.ok) resultClaimsPending = false;
+      else {
+        completionBlocked = true;
+        resultConflicts.push({
+          kind: 'result-claim-state-write-failed',
+          severity: 'blocking',
+          reason: `validated evidence was recorded but its pending marker could not be cleared (${cleared.reason})`,
+        });
+        // The task row was already cleared one line of state earlier. Restore
+        // its exact prior declaration so the error response remains truthful.
+        report = touch({
+          event: 'McpTaskCheckpoint',
+          includePresence: true,
+          includeSolo: true,
+          deliverMessages: false,
+          intent: priorCompletionScope?.intent || '',
+          files: priorCompletionScope?.files || [],
+          replaceFiles: true,
+        });
+        if (report?.laneWriteOk === false) resultConflicts.push({
+          kind: 'presence-lane-write-failed',
+          severity: 'blocking',
+          reason: report.laneWriteSkippedReason || 'task scope restoration did not land after result-claim state failure',
+        });
+      }
+    }
     if (completing && !completionBlocked) {
       notifiedConflicts.clear();
-      resultClaimsPending = false;
     }
     if (!brainPath) {
-      const blocked = completing && completionBlocked;
+      const blocked = (completing && completionBlocked) || resultSubmissionRejected;
       return {
         ...report,
         conflicts: [],
@@ -703,11 +906,11 @@ export function createMcpPresence({
       } } : {}),
       ...(resultConflicts.length ? { resultConflicts } : {}),
       delivery: {
-        proactive: 'mcp-logging-best-effort',
-        // Honest scope: in-band delivery is guaranteed only while the message
-        // survives the lane's 24h TTL / 30-message cap (undelivered notes are
-        // preferred at eviction, but a target offline past the TTL misses it).
-        guaranteed: 'next-klypix-action (within the 24h message TTL)',
+        proactive: 'mcp-logging-best-effort-preview',
+        modelContext: shouldDeliverMessages ? 'supported-klypix-action' : 'deferred',
+        stateMachine: 'pending -> offered -> acknowledged | failed',
+        acknowledgement: 'a later independent supported action followed an offer; not proof of human reading',
+        retention: 'machine-local; 24h TTL and bounded lane capacity, with explicit failed receipts on expiry/overflow',
       },
       timingMs: { coordination: durationMs },
     };
@@ -719,6 +922,11 @@ export function createMcpPresence({
           return `- ${conflict.kind}${where ? ` (${where})` : ''}${conflict.reason ? `: ${conflict.reason}` : ''}`;
         }),
       ].join('\n')
+      : resultSubmissionRejected
+        ? [
+          'KLYPIX result submission rejected; task scope remains active.',
+          ...resultConflicts.slice(0, 8).map((conflict) => `- ${conflict.kind}${conflict.reason ? `: ${conflict.reason}` : ''}`),
+        ].join('\n')
       : completing && resultReconciliation
         ? `KLYPIX result reconciliation: ${resultReconciliation.status}; completion evidence was recorded in the machine-local project ledger.`
         : '';
@@ -737,13 +945,17 @@ export function createMcpPresence({
       alertsQueued,
       structured,
       text,
-      isError: completing && completionBlocked,
+      isError: (completing && completionBlocked) || resultSubmissionRejected,
     };
   };
 
-  const decorateToolResult = (result) => {
+  const decorateToolResult = (result, { actionId = '', deliverMessages = true } = {}) => {
     if (!started) start(vault);
-    const { sessions, notice } = touch({ event: 'McpToolUse', deliverMessages: true });
+    const { sessions, notice } = touch({
+      event: 'McpToolUse',
+      deliverMessages: deliverMessages !== false,
+      actionId: actionId || `mcp-tool:${process.pid}:${++modelActionSequence}`,
+    });
     // Mechanical brain_sync nudge (once per server session): the "call
     // brain_sync first" contract was instructions-only — zero enforcement —
     // which is why Claude sessions sat sync-silent while Codex's gateway
@@ -778,6 +990,7 @@ export function createMcpPresence({
     touch,
     pollInbox,
     sync,
+    refreshIdentity,
     noteSent,
     decorateToolResult,
     get brainPath() { return brainPath; },

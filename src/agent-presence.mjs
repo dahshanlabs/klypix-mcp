@@ -646,7 +646,18 @@ export function purgeRemoteSessions({ brainPath, home, now = Date.now() }) {
   }
 }
 
-export function removeSession({ brainPath, id, channel = null, home, now = Date.now() }) {
+export function removeSession({
+  brainPath,
+  id,
+  channel = null,
+  // Optional ownership guard for replaceable MCP workers. A retiring worker
+  // must not remove the shared logical row after a candidate process has
+  // refreshed it. Checked under the same lane lock as removal, so there is no
+  // read-then-delete race. Legacy callers omit it and retain prior behaviour.
+  expectedPid = null,
+  home,
+  now = Date.now(),
+}) {
   if (!brainPath || !id) return [];
   const laneFile = laneFileFor(brainPath, home);
   const lockFile = laneFile + '.lock';
@@ -657,6 +668,10 @@ export function removeSession({ brainPath, id, channel = null, home, now = Date.
     const sessions = [];
     for (const session of pruneSessions(data.sessions, now)) {
       if (session.id !== id) {
+        sessions.push(session);
+        continue;
+      }
+      if (expectedPid !== null && Number(session.pid) !== Number(expectedPid)) {
         sessions.push(session);
         continue;
       }

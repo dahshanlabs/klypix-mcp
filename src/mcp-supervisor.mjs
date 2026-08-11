@@ -623,6 +623,15 @@ class Supervisor {
 
     if (Object.prototype.hasOwnProperty.call(message, 'id') && !message.method) {
       const key = idKey(message.id);
+      const hostRequest = this.hostRequests.get(key);
+      // A completion request is only authoritative after the worker accepts it.
+      // Invalid/conflicting result evidence returns a tool-level isError and
+      // deliberately keeps the task live for replay after upgrade/hibernation.
+      if (hostRequest?.taskCompletion
+        && !message.error
+        && message.result?.isError !== true) {
+        this.taskScope = null;
+      }
       this.hostRequests.delete(key);
       if (this.initializeRequest && key === idKey(this.initializeRequest.id) && message.result?.serverInfo?.version) {
         worker.version = String(message.result.serverInfo.version);
@@ -746,23 +755,28 @@ class Supervisor {
   }
 
   captureTaskScope(message) {
-    if (message?.method !== 'tools/call' || message.params?.name !== 'brain_sync') return;
+    if (message?.method !== 'tools/call' || message.params?.name !== 'brain_sync') return null;
     const args = message.params?.arguments || {};
     const phase = args.phase || 'checkpoint';
     if (phase === 'complete') {
-      this.taskScope = null;
-      return;
+      if (this.taskScope && Object.prototype.hasOwnProperty.call(args, 'results')) {
+        this.taskScope.resultClaimsPending = true;
+      }
+      return { taskCompletion: true };
     }
     const nextFiles = Array.isArray(args.files) ? args.files.map(String) : [];
     if (phase === 'start' || !this.taskScope) {
       this.taskScope = {
         intent: String(args.intent || ''),
         files: [...new Set(nextFiles)],
+        resultClaimsPending: Object.prototype.hasOwnProperty.call(args, 'results'),
       };
-      return;
+      return { taskCompletion: false };
     }
     if (args.intent) this.taskScope.intent = String(args.intent);
     this.taskScope.files = [...new Set([...(this.taskScope.files || []), ...nextFiles])];
+    if (Object.prototype.hasOwnProperty.call(args, 'results')) this.taskScope.resultClaimsPending = true;
+    return { taskCompletion: false };
   }
 
   // A retryable JSON-RPC error for one host request — used instead of silent
@@ -821,10 +835,10 @@ class Supervisor {
       this.initializedNotification = JSON.parse(JSON.stringify(message));
       this.hostInitialized = true;
     }
-    this.captureTaskScope(message);
+    const taskRequest = this.captureTaskScope(message);
 
     if (message?.method && Object.prototype.hasOwnProperty.call(message, 'id')) {
-      this.hostRequests.set(idKey(message.id), { id: message.id, ts: Date.now() });
+      this.hostRequests.set(idKey(message.id), { id: message.id, ts: Date.now(), ...taskRequest });
     } else if (!message?.method && Object.prototype.hasOwnProperty.call(message, 'id')) {
       this.workerRequests.delete(idKey(message.id));
     }
@@ -865,7 +879,10 @@ class Supervisor {
     await this.sendInternal(worker, 'tools/call', {
       name: 'brain_sync',
       arguments: {
-        phase: 'start',
+        // This is transport replay, not a user task boundary. A real `start`
+        // clears the durable pending-result marker and would turn hot reload
+        // into an evidence-bypass path after a blocked completion.
+        phase: 'checkpoint',
         intent: this.taskScope.intent || 'Continue the active task after a transparent KLYPIX worker upgrade.',
         files: this.taskScope.files || [],
         include_context: false,
@@ -1006,14 +1023,13 @@ class Supervisor {
     if (previous) {
       previous.role = 'standby';
       this.standby = previous;
-      this.sendInternal(previous, 'tools/call', {
-        name: 'brain_sync',
-        arguments: { phase: 'complete', include_context: false },
-      }, 3000).catch(() => {});
       setTimeout(() => {
         if (this.standby === previous) {
           this.standby = null;
-          this.retireWorker(previous, 250);
+          // The candidate already owns the same logical presence row. stdin EOF
+          // would run the old worker's graceful mcpPresence.stop() and remove the
+          // candidate's shared scope; signal retirement skips that stale cleanup.
+          this.retireWorker(previous, 250, { preservePresence: true });
         }
       }, this.rollbackGraceMs).unref?.();
     }

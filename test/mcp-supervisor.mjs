@@ -12,6 +12,7 @@ import crypto from 'crypto';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { listActiveSessions } from '../src/agent-presence.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BIN = path.join(HERE, '..', 'bin', 'klypix-mcp.mjs');
@@ -39,6 +40,7 @@ function workerSource(version, { extraTool = false, removeVersion = false, prese
     ...(extraTool ? ['new_tool'] : []),
   ];
   return `#!/usr/bin/env node
+import fs from 'fs';
 import readline from 'readline';
 const VERSION = ${JSON.stringify(version)};
 const PRESENCE = ${JSON.stringify(presence)};
@@ -51,19 +53,22 @@ if (PRESENCE) {
   PRES = await import(${JSON.stringify(pathToFileURL(path.join(HERE, '..', 'src', 'agent-presence.mjs')).href)});
   const id = process.env.KLYPIX_SESSION_ID || PRESENCE.id;
   PRES.upsertSession({ brainPath: PRESENCE.brain, id, client: 'stub-client', surface: 'stub', branch: 'main', channel: 'mcp' });
+  let closing = false;
   const bye = () => {
-    try { PRES.removeSession({ brainPath: PRESENCE.brain, id, channel: 'mcp' }); } catch {}
+    if (closing) return;
+    closing = true;
+    try { PRES.removeSession({ brainPath: PRESENCE.brain, id, channel: 'mcp', expectedPid: process.pid }); } catch {}
+    try { if (PRESENCE.scopeFile) fs.unlinkSync(PRESENCE.scopeFile); } catch {}
     process.exit(0);
   };
   process.stdin.on('end', bye);
   process.stdin.on('close', bye);
-  process.on('SIGTERM', bye);
 }
 const TOOLS = ${JSON.stringify(toolNames)}.map(name => ({
   name,
   description: name,
   inputSchema: name === 'brain_sync'
-    ? { type: 'object', properties: { phase: { type: 'string' }, intent: { type: 'string' }, files: { type: 'array', items: { type: 'string' } }, include_context: { type: 'boolean' } } }
+    ? { type: 'object', properties: { phase: { type: 'string' }, intent: { type: 'string' }, files: { type: 'array', items: { type: 'string' } }, include_context: { type: 'boolean' }, results: {} } }
     : { type: 'object', properties: {} },
 }));
 let scope = null;
@@ -92,9 +97,39 @@ rl.on('line', async line => {
     return;
   }
   if (name === 'slow') await new Promise(resolve => setTimeout(resolve, 350));
+  let blockedCompletion = false;
   if (name === 'brain_sync') {
-    if (args.phase === 'complete') scope = null;
-    else scope = { intent: args.intent || '', files: args.files || [] };
+    blockedCompletion = args.phase === 'complete'
+      && Array.isArray(args.results)
+      && args.results.some(result => result?.forceConflict === true);
+    try {
+      if (PRESENCE?.auditFile) fs.appendFileSync(PRESENCE.auditFile, JSON.stringify({
+        pid: process.pid,
+        version: VERSION,
+        phase: args.phase || 'checkpoint',
+        internal: String(msg.id || '').startsWith('__klypix_supervisor__'),
+        blocked: blockedCompletion,
+      }) + '\\n');
+    } catch {}
+    if (!blockedCompletion) {
+      if (args.phase === 'complete') scope = null;
+      else scope = { intent: args.intent || '', files: args.files || [] };
+    }
+    if (PRESENCE && scope) {
+      PRES.upsertSession({
+        brainPath: PRESENCE.brain,
+        id: process.env.KLYPIX_SESSION_ID || PRESENCE.id,
+        client: 'stub-client',
+        surface: 'stub',
+        branch: 'main',
+        channel: 'mcp',
+        event: 'McpTaskCheckpoint',
+        intent: scope.intent,
+        files: scope.files,
+        replaceFiles: true,
+      });
+      try { if (PRESENCE.scopeFile) fs.writeFileSync(PRESENCE.scopeFile, JSON.stringify({ pid: process.pid, version: VERSION, ...scope })); } catch {}
+    }
   }
   const value = name === 'scope' ? JSON.stringify(scope) : VERSION;
   const result = { content: [{ type: 'text', text: value }] };
@@ -103,11 +138,13 @@ rl.on('line', async line => {
   // row while the worker sleeps.
   if (name === 'brain_sync' && PRESENCE) {
     result.structuredContent = {
-      status: 'active',
+      status: blockedCompletion ? 'needs-reconciliation' : (args.phase === 'complete' ? 'complete' : 'active'),
+      phase: args.phase || 'checkpoint',
       brain: PRESENCE.brain,
       self: { id: process.env.KLYPIX_SESSION_ID || PRESENCE.id, client: 'stub-client', surface: 'stub', branch: 'main' },
     };
   }
+  if (blockedCompletion) result.isError = true;
   send({ jsonrpc: '2.0', id: msg.id, result });
 });
 `;
@@ -159,8 +196,21 @@ const waitFor = async (fn, timeout = 15000) => {   // generous: crash→respawn�
   throw new Error(`timed out; last=${last}`);
 };
 
-const v1 = writeWorker('worker-v1.mjs', '1.0.0');
-const v2 = writeWorker('worker-v2.mjs', '1.1.0');
+const handoffHome = path.join(root, 'home-handoff');
+const handoffBrain = path.join(root, 'handoff-project', 'brain.klypix');
+const handoffAudit = path.join(root, 'handoff-audit.jsonl');
+const handoffScope = path.join(root, 'handoff-scope.json');
+fs.mkdirSync(path.dirname(handoffBrain), { recursive: true });
+fs.mkdirSync(handoffHome, { recursive: true });
+fs.writeFileSync(handoffBrain, 'supervisor handoff fixture');
+const handoffPresence = {
+  brain: handoffBrain.replace(/\\/g, '/'),
+  id: 'supervisor-handoff-session',
+  auditFile: handoffAudit.replace(/\\/g, '/'),
+  scopeFile: handoffScope.replace(/\\/g, '/'),
+};
+const v1 = writeWorker('worker-v1.mjs', '1.0.0', { presence: handoffPresence });
+const v2 = writeWorker('worker-v2.mjs', '1.1.0', { presence: handoffPresence });
 const v3 = writeWorker('worker-v3.mjs', '1.2.0', { extraTool: true });
 const bad = writeWorker('worker-bad.mjs', '1.3.0', { extraTool: true, removeVersion: true });
 activate(v1, '1.0.0');
@@ -193,6 +243,9 @@ const transport = new StdioClientTransport({
     KLYPIX_MCP_SUPERVISOR_POLL_MS: '50',
     KLYPIX_MCP_ROLLBACK_GRACE_MS: '500',
     KLYPIX_AUTO_UPDATE: '0',
+    KLYPIX_SESSION_ID: handoffPresence.id,
+    HOME: handoffHome,
+    USERPROFILE: handoffHome,
   },
   stderr: 'pipe',
 });
@@ -201,16 +254,48 @@ let lastActivePid = null;
 try {
   await client.connect(transport);
   ok(textOf(await client.callTool({ name: 'version', arguments: {} })) === '1.0.0', 'initial worker serves v1');
+  const currentState = () => fs.readdirSync(stateDir)
+    .filter(name => name.endsWith('.json'))
+    .map(name => { try { return JSON.parse(fs.readFileSync(path.join(stateDir, name), 'utf8')); } catch { return null; } })
+    .find(Boolean);
+  const v1Pid = await waitFor(async () => currentState()?.active?.version === '1.0.0'
+    ? currentState()?.active?.pid : null);
 
   await client.callTool({
     name: 'brain_sync',
     arguments: { phase: 'start', intent: 'supervisor continuity test', files: ['src/a.ts'] },
   });
+  const blockedCompletion = await client.callTool({
+    name: 'brain_sync',
+    arguments: { phase: 'complete', results: [{ forceConflict: true }] },
+  });
+  ok(blockedCompletion.isError === true
+    && blockedCompletion.structuredContent?.status === 'needs-reconciliation',
+  'a blocked completion is returned as an error without ending the active task');
   activate(v2, '1.1.0');
   await waitFor(async () => textOf(await client.callTool({ name: 'version', arguments: {} })) === '1.1.0');
   ok(true, 'same MCP client connection hot-swaps v1 → v2');
+  const v2Pid = await waitFor(async () => currentState()?.active?.version === '1.1.0'
+    ? currentState()?.active?.pid : null);
   const scope = JSON.parse(textOf(await client.callTool({ name: 'scope', arguments: {} })));
-  ok(scope?.intent === 'supervisor continuity test' && scope?.files?.[0] === 'src/a.ts', 'brain_sync task scope is replayed into the new worker');
+  ok(scope?.intent === 'supervisor continuity test' && scope?.files?.[0] === 'src/a.ts',
+    'a blocked completion keeps task scope for replay into the new worker');
+  await waitFor(async () => !isAlive(v1Pid));
+  const auditEvents = fs.existsSync(handoffAudit)
+    ? fs.readFileSync(handoffAudit, 'utf8').split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line))
+    : [];
+  ok(!auditEvents.some(event => event.pid === v1Pid && event.internal && event.phase === 'complete'),
+    'handoff never synthesizes phase complete through the superseded worker');
+  const handoffRow = listActiveSessions({ brainPath: handoffBrain, home: handoffHome })
+    .find(row => row.id === handoffPresence.id);
+  const handoffSentinel = fs.existsSync(handoffScope)
+    ? JSON.parse(fs.readFileSync(handoffScope, 'utf8')) : null;
+  ok(handoffRow?.pid === v2Pid
+    && handoffRow?.intent === 'supervisor continuity test'
+    && handoffRow?.files?.includes('src/a.ts')
+    && handoffSentinel?.pid === v2Pid
+    && handoffSentinel?.intent === 'supervisor continuity test',
+  'after the old worker exits, the candidate-owned shared presence row and scope still exist');
 
   const slow = client.callTool({ name: 'slow', arguments: {} });
   await new Promise(resolve => setTimeout(resolve, 60));

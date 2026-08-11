@@ -509,7 +509,7 @@ server.registerTool('brain_note', {
 
 server.registerTool('brain_message', {
   title: 'Message the other live agent sessions on this project (one-time note, not a brain card)',
-  description: 'Leave a DELIBERATE, targeted note for the OTHER active agent sessions working on this project right now ("merged the hook refactor — rebase before you commit", "don\'t touch canvasStore, mid-refactor"). Any MCP client can send and receive through the shared presence lane. Hookless MCP peers receive each note once on their next KLYPIX tool call (and may also see a host logging notification); lifecycle hooks provide more proactive delivery. Delivery is BEST-EFFORT, not guaranteed: the lane is machine-local and OS-user-local (a teammate on another machine never sees it) and a peer that takes no KLYPIX action within the 24h TTL misses the note entirely — so never tell the user a note was received. Ephemeral (expires in 24h) and NOT persisted to the brain — for a durable decision use brain_note instead.',
+  description: 'Leave a DELIBERATE, targeted note for the OTHER active agent sessions working on this project right now ("merged the hook refactor — rebase before you commit", "don\'t touch canvasStore, mid-refactor"). Any MCP client can send and receive through the shared machine-local presence lane. A supported lifecycle event or KLYPIX tool result offers the note into model-visible context; a later independent supported action acknowledges that offer. Pending/offered notes replay after reconnect, while expiry or capacity loss leaves a failed per-recipient receipt instead of silently disappearing. Acknowledged means a later action followed the offer — it is NOT proof a human read it. Delivery remains OS-user-local, machine-local, bounded by a 24h TTL, and unavailable to a peer that never takes a supported action. Ephemeral and NOT persisted to the brain — for a durable decision use brain_note instead.',
   inputSchema: {
     text: z.string().describe('The note to deliver (kept to 400 chars).'),
     to: z.string().optional().describe('Target hint — a peer session id-prefix or branch name; omit or "all" for every live session.'),
@@ -518,7 +518,18 @@ server.registerTool('brain_message', {
 }, async ({ text, to, canvas }) => {
   let via; try { via = server.server.getClientVersion()?.name; } catch { /* optional */ }
   mcpPresence.noteSent(text);
-  return toContent(await opBrainMessage({ vault: mcpPresence.vault, canvas, text, to, via }));
+  return toContent(await opBrainMessage({
+    vault: mcpPresence.vault,
+    // Bind the default message lane to the brain this worker actually joined.
+    // The worker process can be launched from an IDE/install directory that has
+    // a different ancestor brain; falling back to process.cwd() would split the
+    // sender presence and its message across two unrelated project lanes.
+    canvas: canvas || mcpPresence.brainPath,
+    text,
+    to,
+    via,
+    from: mcpPresence.refreshIdentity(),
+  }));
 });
 
 server.registerTool('brain_sync', {
@@ -534,39 +545,24 @@ server.registerTool('brain_sync', {
     intent: z.string().max(160).optional().describe('One sentence describing the current task. Supply for start/checkpoint; completion clears it.'),
     files: z.array(z.string()).max(20).optional().describe('Project-relative files you expect to touch or have touched. Exact overlaps with peers are flagged.'),
     phase: z.enum(['start', 'checkpoint', 'complete']).optional().describe('start replaces prior task scope; checkpoint merges changed scope; complete clears task intent/files. Default: checkpoint.'),
-    include_context: z.boolean().optional().describe('Include fast task-relevant brain cards in the same response. Defaults true; ignored for phase complete.'),
-    results: z.array(z.object({
-      schemaVersion: z.literal(1),
-      claimKey: z.string().min(3).max(160),
-      report: z.object({
-        path: z.string(),
-        sha256: z.string().length(64),
-      }),
-      provenance: z.object({
-        producer: z.string().min(1).max(160),
-        runId: z.string().min(1).max(160),
-        gitCommit: z.string().min(7).max(64),
-        dirtyDigest: z.string().length(64),
-      }),
-      input: z.object({
-        fingerprint: z.string().length(64),
-        details: z.record(z.string(), z.unknown()),
-      }),
-      configuration: z.object({
-        fingerprint: z.string().length(64),
-        details: z.record(z.string(), z.unknown()),
-      }),
-      metrics: z.record(z.string(), z.object({
-        value: z.number(),
-        count: z.number().int().positive(),
-        tolerance: z.number().nonnegative(),
-        numerator: z.number().int().nonnegative().optional(),
-      })),
-    }).strict()).max(8).optional().describe('On phase complete, 1-8 validated result manifests for stable claim keys. Report hashes and input/configuration fingerprints are verified; conflicting or incomparable recent peer results block completion.'),
+    include_context: z.boolean().optional().describe('Include fast task-relevant brain cards and offer queued coordination notes in the same response. Defaults true; false also defers note delivery so internal supervisor probes cannot consume model-visible messages.'),
+    // Deliberately permissive at the MCP/Zod boundary. The authoritative,
+    // versioned fail-closed validator lives in result-reconcile.mjs and must see
+    // malformed/unknown nested fields so it can persist the evidence-required
+    // marker before rejecting them. A strict transport schema rejected first,
+    // allowing a later result-less completion to bypass that state entirely.
+    results: z.unknown().optional().describe('On phase complete, 1-8 result manifests for stable claim keys. The in-handler versioned validator rejects malformed, empty, unknown-field, or incomparable evidence and retains task scope.'),
   },
 }, async ({ project, intent, files, phase, include_context, results }) => {
   const totalStartedAt = Date.now();
-  const report = mcpPresence.sync({ project, intent, files, phase, results });
+  const report = mcpPresence.sync({
+    project,
+    intent,
+    files,
+    phase,
+    results,
+    deliverMessages: include_context !== false,
+  });
   // Zero-manual harness convergence: brain_sync is the one project-aware
   // gateway every MCP host can call. Register MCP-only projects here (Claude's
   // lifecycle hook is no longer the sole registry writer), then reconcile only

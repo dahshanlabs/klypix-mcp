@@ -7,6 +7,7 @@ import {
   formatPresenceMessage,
   laneFileFor,
   listActiveSessions,
+  messageDeliveryState,
   MCP_SESSION_FRESH_MS,
   postPresenceMessage,
   removeSession,
@@ -104,6 +105,28 @@ removeSession({ brainPath, home, now: now + 1, id: 'one' });
 ok(!listActiveSessions({ brainPath, home, now: now + 1 }).some((session) => session.id === 'one'),
   'SessionEnd semantics remove a session immediately');
 
+upsertSession({ brainPath, home, now: now + 2, id: 'replacement-owned', client: 'codex', channel: 'mcp' });
+removeSession({
+  brainPath,
+  home,
+  now: now + 3,
+  id: 'replacement-owned',
+  channel: 'mcp',
+  expectedPid: process.pid + 1,
+});
+ok(listActiveSessions({ brainPath, home, now: now + 3 }).some((session) => session.id === 'replacement-owned'),
+  'a stale worker cannot remove a logical row owned by a replacement pid');
+removeSession({
+  brainPath,
+  home,
+  now: now + 4,
+  id: 'replacement-owned',
+  channel: 'mcp',
+  expectedPid: process.pid,
+});
+ok(!listActiveSessions({ brainPath, home, now: now + 4 }).some((session) => session.id === 'replacement-owned'),
+  'the current worker can still remove its own row with the ownership guard');
+
 upsertSession({ brainPath, home, now, id: 'merged', client: 'codex', channel: 'mcp' });
 upsertSession({ brainPath, home, now: now + 1, id: 'merged', client: 'codex', channel: 'lifecycle' });
 let merged = listActiveSessions({ brainPath, home, now: now + 1 }).find((session) => session.id === 'merged');
@@ -200,7 +223,7 @@ ok(mcpA.pollInbox().length === 0,
   'proactive logging is de-duplicated instead of repeating on every inbox poll');
 const decorated = mcpA.decorateToolResult({ content: [{ type: 'text', text: 'tool result' }] });
 ok(decorated.content.some((block) => block.text?.includes('Automatic KLYPIX overlap alert')),
-  'proactive preview does not consume the guaranteed next-action alert');
+  'proactive preview does not consume the durable next-action alert');
 const repeatB = mcpB.sync({
   phase: 'checkpoint',
   intent: 'review the shared runtime',
@@ -208,8 +231,58 @@ const repeatB = mcpB.sync({
 });
 ok(repeatB.alertsQueued.length === 0,
   'automatic overlap alerts are exact-once within a task instead of spamming every checkpoint');
+
+const probeQueued = postPresenceMessage({
+  brainPath,
+  from: 'mcp-a',
+  to: 'mcp-b-full-session',
+  text: 'must survive the supervisor probe',
+  home,
+  now: now + 1,
+});
+const readProbe = () => JSON.parse(fs.readFileSync(queuedLane, 'utf8')).messages
+  .find((message) => message.id === probeQueued.message?.id);
+const hiddenProbe = mcpB.sync({ phase: 'checkpoint', include_context: false, actionId: 'internal-probe' });
+ok(!hiddenProbe.text.includes('must survive the supervisor probe')
+  && hiddenProbe.structured.delivery.modelContext === 'deferred'
+  && messageDeliveryState(readProbe(), 'mcp-b-full-session') === 'pending',
+'an include_context:false supervisor probe neither returns nor advances a queued note');
+const visibleOffer = mcpB.sync({ phase: 'checkpoint', actionId: 'host-action-1' });
+ok(visibleOffer.text.includes('must survive the supervisor probe')
+  && messageDeliveryState(readProbe(), 'mcp-b-full-session') === 'offered',
+'the first independent model-visible action offers the queued note exactly once');
+const sameActionDecoration = mcpB.decorateToolResult(
+  { content: [{ type: 'text', text: 'same host action' }] },
+  { actionId: 'host-action-1' },
+);
+ok(!sameActionDecoration.content.some((block) => block.text?.includes('must survive the supervisor probe'))
+  && messageDeliveryState(readProbe(), 'mcp-b-full-session') === 'offered',
+'a second adapter surface in the same action cannot turn the offer into a false acknowledgement');
+const laterAction = mcpB.decorateToolResult(
+  { content: [{ type: 'text', text: 'later host action' }] },
+  { actionId: 'host-action-2' },
+);
+ok(laterAction.content.some((block) => block.text?.includes('must survive the supervisor probe'))
+  && messageDeliveryState(readProbe(), 'mcp-b-full-session') === 'acknowledged',
+'a later independent model-visible action replays and acknowledges the prior offer');
+upsertSession({
+  brainPath,
+  id: 'mcp-a',
+  client: 'codex',
+  channel: 'mcp',
+  event: 'McpHibernated',
+  transportStatus: 'pull-only',
+  home,
+  now: now + 1,
+});
+const pullOnlyPeer = mcpB.sync({ phase: 'checkpoint', deliverMessages: false });
+ok(pullOnlyPeer.structured.peers.find((peer) => peer.id === 'mcp-a')?.deliveryReachability === 'pull-only'
+  && pullOnlyPeer.text.includes('delivery pull-only'),
+'brain_sync exposes a hibernated peer as pull-only in structured and model-facing output');
+mcpA.touch({ event: 'McpToolUse' });
 const snapshot = buildPresenceSnapshot(repeatB.sessions, 'mcp-b-full-session', { now: now + 1 });
-ok(snapshot.activeTaskCount === 2 && snapshot.peers.length === 1 && snapshot.backgroundConnectionCount === 0,
+ok(snapshot.activeTaskCount === 2 && snapshot.peers.length === 1 && snapshot.backgroundConnectionCount === 0
+  && snapshot.self?.deliveryReachability === 'connected',
   'task presence is structurally separated from raw connection presence');
 const completed = mcpB.sync({ phase: 'complete' });
 const completedSession = completed.sessions.find((session) => session.id === 'mcp-b-full-session');

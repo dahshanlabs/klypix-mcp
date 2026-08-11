@@ -70,6 +70,8 @@ ok(resolveMcpSessionId({ env: { CLAUDE_CODE_SESSION_ID: 'abc-123' }, pid: 1, non
   'V1: CLAUDE_CODE_SESSION_ID (the real Claude Code export) resolves the session id');
 ok(resolveMcpSessionId({ env: { KLYPIX_SESSION_ID: 'k-1', CLAUDE_CODE_SESSION_ID: 'abc' }, pid: 1, nonce: 'x' }) === 'k-1',
   'V1: explicit KLYPIX_SESSION_ID still wins over host vars');
+ok(resolveMcpSessionId({ env: { KLYPIX_MCP_CONNECTION_ID: 'supervisor-connection' }, pid: 7, nonce: 'aaaa' }) === 'supervisor-connection',
+  'V1: supervised replacement workers share the stable MCP connection identity');
 ok(resolveMcpSessionId({ env: {}, pid: 7, nonce: 'aaaa' }) === 'mcp-7-aaaa',
   'V1: no env → pid-nonce fallback unchanged');
 
@@ -338,7 +340,7 @@ ok(aging.intentAt === now + 6 * 60 * 1000, 'V4: a CHANGED intent re-stamps inten
   }));
   const report = doctorInspect({ home: docHome, projectDir: docProj });
   ok(report.layers.supervisor === 'drift', 'V10: a recovery-failed supervisor is DRIFT, not healthy');
-  ok(report.actions.some(a => /supervisor pid \d+ is recovery-failed/.test(a)),
+  ok(report.actions.some(a => /supervisor pid \d+ has no live worker; tool calls cannot complete/.test(a)),
     'V10: the reconcile block names the impaired supervisor');
   ok(report.sessions.syncedCount === 1 && report.sessions.count === 3,
     `V10: sync-silent sessions are counted distinctly (${report.sessions.syncedCount}/${report.sessions.count} declared scope)`);

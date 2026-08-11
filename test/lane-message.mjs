@@ -1,13 +1,14 @@
 // E2E for brain_message (1.16.0) — the MCP twin of the hook's 🧠 MSG lane.
 // THE contract under test: a message posted by the MCP op (opBrainMessage, used by
-// hookless clients like Cursor/Cline) is READ by the real Claude Code hook — i.e.
+// hookless clients like Cursor/Cline) is offered by the real Claude Code hook — i.e.
 // the two independent lane implementations (klypix-core vs global-brain-hook)
 // resolve the SAME lane file and speak the same message shape. If they drift,
 // this fails — that's the point.
 //
 //   1. post a note via opBrainMessage (in-process, temp HOME + project)
 //   2. run the REAL hook (--prompt) as a receiving session → note IS delivered
-//   3. run it again, same session → note is NOT re-delivered (seen-ack)
+//   3. run it again, same session → note is replayed and acknowledged
+//   4. run it a third time → the acknowledged note stays quiet
 //
 // Run:  node test/lane-message.mjs        (exit 0 = pass, 1 = fail)
 import fs from 'fs';
@@ -16,6 +17,7 @@ import path from 'path';
 import { execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { buildKlypixMap } from '../src/klypix-format.mjs';
+import { laneFileFor } from '../src/agent-presence.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const HOOK = path.join(__dirname, '..', 'src', 'global-brain-hook.mjs');
@@ -42,7 +44,9 @@ try {
   process.env.HOME = home; process.env.USERPROFILE = home;
   process.chdir(proj);
   const { opBrainMessage } = await import('../src/klypix-core.mjs');
-  const res = await opBrainMessage({ vault: proj, text: NOTE, to: 'all', via: 'cursor' });
+  const res = await opBrainMessage({
+    vault: proj, text: NOTE, to: 'all', via: 'cursor', from: 'sender-session', sessionId: 'sender-session',
+  });
   sendText = (res.blocks || []).map(b => b.text || '').join('\n');
   ok(res.isError !== true, 'opBrainMessage succeeds');
   ok(/📨/.test(sendText), 'send confirmation is the 📨 lane receipt');
@@ -63,11 +67,18 @@ const runHook = (sid, tp) => {
 const first = runHook('sess-recv');
 ok(/📨/.test(first), 'receiving hook surfaces the 📨 message block');
 ok(first.includes(NOTE), 'the note text reaches the peer session verbatim');
-ok(/from cursor/.test(first), 'the sender label (MCP client name) is shown');
+ok(/from sender-s/.test(first), 'the sender label is the stable logical session id');
 
-// ── 3. Delivered ONCE: a second prompt of the same session stays quiet ──────
+// ── 3. Two-step receipt: replay once, then stay quiet ───────────────────────
 const second = runHook('sess-recv');
-ok(!second.includes(NOTE), 'same session, next prompt → note NOT re-delivered (seen-ack)');
+ok(second.includes(NOTE), 'same session, next prompt → note replays before later-action acknowledgement');
+const third = runHook('sess-recv');
+ok(!third.includes(NOTE), 'same session, third prompt → acknowledged note stays quiet');
+const laneAfterAck = JSON.parse(fs.readFileSync(laneFileFor(path.join(proj, 'brain.klypix'), home), 'utf8'));
+const firstMessage = laneAfterAck.messages.find((message) => message.text === NOTE);
+ok(firstMessage?.deliveryVersion === 2
+  && firstMessage.deliveries?.find((delivery) => delivery.recipientId === 'sess-recv')?.state === 'acknowledged',
+'the shared lane persists the pending → offered → acknowledged receipt');
 
 // ── 4. Self-echo guard: the SENDER (whose transcript holds the brain_message
 //      tool_use) never gets its own note back; a third session still does ────
@@ -76,7 +87,9 @@ try {
   process.env.HOME = home; process.env.USERPROFILE = home;
   process.chdir(proj);
   const { opBrainMessage } = await import('../src/klypix-core.mjs');
-  await opBrainMessage({ vault: proj, text: NOTE2, to: 'all', via: 'claude-code' });
+  await opBrainMessage({
+    vault: proj, text: NOTE2, to: 'all', via: 'claude-code', from: 'sess-sender', sessionId: 'sess-sender',
+  });
 } finally {
   process.chdir(prevCwd);
   process.env.HOME = prevEnv.HOME; process.env.USERPROFILE = prevEnv.USERPROFILE;
@@ -89,6 +102,73 @@ const senderView = runHook('sess-sender', senderTranscript);
 ok(!senderView.includes(NOTE2), 'sender (transcript holds the tool_use) does NOT get its own note back');
 const thirdView = runHook('sess-third');
 ok(thirdView.includes(NOTE2), 'a different session still receives the note');
+
+// ── 5. Incident migration: legacy seen[] is only an OFFER, never an ack ────
+const legacyText = 'legacy seen was stamped before stdout reached the model';
+const laneFile = laneFileFor(path.join(proj, 'brain.klypix'), home);
+const legacyLane = JSON.parse(fs.readFileSync(laneFile, 'utf8'));
+legacyLane.messages.push({
+  id: 'legacy-false-positive', from: 'legacy-sender', to: 'all', text: legacyText,
+  ts: Date.now(), candidateIds: ['sess-legacy'], seen: ['sess-legacy'],
+});
+fs.writeFileSync(laneFile, JSON.stringify(legacyLane), 'utf8');
+const legacyReplay = runHook('sess-legacy');
+ok(legacyReplay.includes(legacyText), 'legacy seen[] row replays once instead of being trusted as acknowledged');
+const legacyQuiet = runHook('sess-legacy');
+ok(!legacyQuiet.includes(legacyText), 'legacy row stays quiet after the replay records a later-action acknowledgement');
+
+// ── 6. Stop retry: a busy lane stages durably, then another hook drains it ──
+const lockTarget = 'sess-lock-target-full-123';
+runHook(lockTarget); // make the full-id target live before the send-time snapshot
+const lockNote = 'this marker must survive a lane-lock timeout';
+const lockTranscript = path.join(home, 'lock-message-transcript.jsonl');
+fs.writeFileSync(lockTranscript, JSON.stringify({
+  uuid: 'assistant-event-stable-1',
+  timestamp: '2026-08-11T12:00:00.000Z',
+  message: { role: 'assistant', content: [{ type: 'text', text: `🧠 MSG [${lockTarget}]: ${lockNote}` }] },
+}) + '\n');
+const runCapture = () => execFileSync(process.execPath, [HOOK, '--capture'], {
+  cwd: proj,
+  env: { ...process.env, HOME: home, USERPROFILE: home },
+  encoding: 'utf8',
+  input: JSON.stringify({ session_id: 'sess-lock-sender', transcript_path: lockTranscript }),
+});
+const lockedLane = laneFileFor(path.join(proj, 'brain.klypix'), home);
+fs.writeFileSync(`${lockedLane}.lock`, JSON.stringify({ pid: process.pid, at: Date.now() }), 'utf8');
+runCapture();
+let afterRefusedWrite = JSON.parse(fs.readFileSync(lockedLane, 'utf8'));
+ok(!afterRefusedWrite.messages.some((message) => message.text === lockNote),
+  'a forced lane-lock timeout does not race an unsafe direct write');
+fs.unlinkSync(`${lockedLane}.lock`);
+const drainedOffer = runHook(lockTarget);
+ok(drainedOffer.includes(lockNote),
+  'a later hook drains the durable outbox and offers the full-session-id-directed note');
+ok(runHook(lockTarget).includes(lockNote) && !runHook(lockTarget).includes(lockNote),
+  'the recovered note follows the same offer → replay/ack → quiet lifecycle');
+runCapture(); // the real Stop hook re-scans the entire transcript
+afterRefusedWrite = JSON.parse(fs.readFileSync(lockedLane, 'utf8'));
+ok(afterRefusedWrite.messages.filter((message) => message.text === lockNote).length === 1,
+  'stable marker ids make repeated Stop scans idempotent instead of reposting an acknowledged note');
+
+const peerSameText = 'a real peer may repeat text from my old brain_message call';
+try {
+  process.env.HOME = home; process.env.USERPROFILE = home;
+  process.chdir(proj);
+  const { opBrainMessage } = await import('../src/klypix-core.mjs');
+  await opBrainMessage({ vault: proj, text: peerSameText, to: 'sess-identical-text', from: 'peer-stable-id', via: 'cursor' });
+} finally {
+  process.chdir(prevCwd);
+  process.env.HOME = prevEnv.HOME; process.env.USERPROFILE = prevEnv.USERPROFILE;
+}
+const identicalTranscript = path.join(home, 'identical-text-transcript.jsonl');
+fs.writeFileSync(identicalTranscript, JSON.stringify({
+  message: { role: 'assistant', content: [{
+    type: 'tool_use', name: 'mcp__klypix-canvas__brain_message', id: 'same-text-tool',
+    input: { text: peerSameText, to: 'all' },
+  }] },
+}) + '\n');
+ok(runHook('sess-identical-text', identicalTranscript).includes(peerSameText),
+  'whole-transcript self-echo compatibility never suppresses identical text from a stable peer sender');
 
 for (const d of [home, proj]) fs.rmSync(d, { recursive: true, force: true });
 console.log(failures ? `\n✗ ${failures} assertion(s) failed` : '\n✓ lane-message: all assertions passed');

@@ -174,9 +174,9 @@ const peerLane = (tag) => ([
   P.cleanup();
 }
 
-// ── H7: the receipt has a REAL, non-repeating human-visible surface ───────
+// ── H7: the receipt has a REAL, non-repeating audit surface ───────────────
 // Acceptance gate 3: SessionStart shows one compact line; UserPromptSubmit does
-// not repeat it on every turn. `seen` means rendered-to, never read-by-human.
+// not repeat it on every turn. Only v2 later-action acknowledgement counts.
 {
   const P = await makeProject('h7');
   const sessions = [
@@ -185,11 +185,12 @@ const peerLane = (tag) => ([
   ];
   P.seedLane(sessions, [{
     id: 'msg-h7', from: 'self-h7', to: 'all', text: 'verified note',
-    ts: Date.now() - 60_000, candidateIds: ['docowner-1', 'peer-two'], seen: ['docowner-1'],
+    ts: Date.now() - 60_000, candidateIds: ['docowner-1', 'peer-two'], deliveryVersion: 2,
+    deliveries: [{ recipientId: 'docowner-1', state: 'acknowledged', acknowledgedAt: Date.now() - 30_000 }],
   }]);
   const start = P.run('--read', { sessionId: 'self-h7' });
-  ok(/Your last note \(1m ago\): shown to 1 of 2 peers · pending peer-two\./.test(start),
-    'H7.1: SessionStart renders the live message receipt with an honest denominator and pending id');
+  ok(/Your last note \(1m ago\): acknowledged 1 of 2 · unresolved peer-two\./.test(start),
+    'H7.1: SessionStart renders the live message receipt with an honest denominator and unresolved id');
   const prompt = P.run('--prompt', { sessionId: 'self-h7', prompt: 'continue' });
   ok(!/Your last note/.test(prompt),
     'H7.2: the receipt does not repeat in the per-prompt path');
@@ -207,11 +208,12 @@ const peerLane = (tag) => ([
   const message = data.messages?.find((m) => m.text === 'verified cross-lane note');
   ok(message?.candidateIds?.join() === 'docowner-1',
     'H8.1: the Claude marker writer snapshots the live recipient id at send time');
-  message.seen = ['docowner-1'];
+  message.deliveryVersion = 2;
+  message.deliveries = [{ recipientId: 'docowner-1', state: 'acknowledged', acknowledgedAt: Date.now() }];
   data.sessions = data.sessions.filter((s) => s.id === 'self-h8');
   P.writeLane(data);
   const start = P.run('--read', { sessionId: 'self-h8' });
-  ok(/Your last note .*shown to all 1 peer\(s\) that were live\./.test(start),
+  ok(/Your last note .*model-context delivery acknowledged by all 1 target peer\(s\).*not human-read\)\./.test(start),
     'H8.2: the receipt denominator survives after that recipient exits');
   P.cleanup();
 }

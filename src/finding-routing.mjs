@@ -489,17 +489,37 @@ export function sendBody(draft) {
 }
 
 // ── The receipt (decision 4) ────────────────────────────────────────────────
-// message.seen[] is already recorded and NOTHING renders it. This is the whole
-// surface: for this session's own sent notes, how many peers were SHOWN them.
+// v2 delivery records distinguish offered from later-action acknowledgement.
+// Legacy seen[] is untrusted offer evidence and never inflates acknowledgement.
 //
 // Honesty rules baked in, because each is a way to lie:
 //  • the denominator is the peers that were live AT SEND TIME and are still
 //    within the message TTL — a peer that started afterwards was never a
 //    candidate and must not inflate "pending";
-//  • `seen` means RENDERED-TO, not read-by-a-human — the wording says so;
+//  • acknowledgement means a later supported action confirmed an earlier
+//    model-context offer, not that a human read or acted on it;
 //  • a message with no live peer at send time reports "nobody was live",
 //    never "0 of 0 read", which reads as a delivery failure.
-export function summarizeReceipts({ messages, sessions, selfId, now = Date.now(), ttlMs = 24 * 60 * 60 * 1000 } = {}) {
+const receiptRecordMap = (message) => {
+  const records = new Map();
+  for (const raw of Array.isArray(message?.deliveries) ? message.deliveries : []) {
+    const id = String(raw?.recipientId || raw?.id || '').trim();
+    if (!id) continue;
+    records.set(id, {
+      state: ['offered', 'acknowledged', 'failed'].includes(raw?.state) ? raw.state : 'offered',
+      reason: raw?.reason ? String(raw.reason) : null,
+    });
+  }
+  // Historical `seen` was stamped before output transport/model injection. It
+  // is intentionally only OFFERED during migration, never acknowledged.
+  for (const legacyId of Array.isArray(message?.seen) ? message.seen : []) {
+    const id = String(legacyId || '').trim();
+    if (id && !records.has(id)) records.set(id, { state: 'offered', reason: 'legacy-seen-unverified' });
+  }
+  return records;
+};
+
+export function summarizeReceipts({ messages, sessions, selfId, now = Date.now(), ttlMs = 7 * 24 * 60 * 60 * 1000 } = {}) {
   const mine = (Array.isArray(messages) ? messages : [])
     .filter((m) => m?.id && m.from === selfId && now - Number(m.ts || 0) < ttlMs)
     .sort((a, b) => Number(b.ts || 0) - Number(a.ts || 0));
@@ -511,7 +531,7 @@ export function summarizeReceipts({ messages, sessions, selfId, now = Date.now()
     // New messages snapshot the actual live audience at SEND time. Older rows
     // reconstruct it from surviving session rows for backward compatibility.
     // The numerator is intersected with that same audience: a later-arriving
-    // session may see a broadcast, but must never produce "shown to 3 of 2".
+    // session may see a broadcast, but must never produce "acknowledged 3 of 2".
     const reconstructed = rows.filter((s) => s?.id
       && s.id !== selfId
       && Number(s.startedAt || 0) <= Number(m.ts || 0)
@@ -520,11 +540,13 @@ export function summarizeReceipts({ messages, sessions, selfId, now = Date.now()
       .map((s) => String(s.id));
     const candidateIds = [...new Set((Array.isArray(m.candidateIds) ? m.candidateIds : reconstructed)
       .filter((id) => id && id !== selfId).map(String))];
-    const candidateSet = new Set(candidateIds);
-    const seen = [...new Set((Array.isArray(m.seen) ? m.seen : [])
-      .filter((id) => id && id !== selfId).map(String))];
-    const shown = seen.filter((id) => candidateSet.has(id));
-    const pending = candidateIds.filter((id) => !shown.includes(id)).map((id) => String(id).slice(0, 8));
+    const records = receiptRecordMap(m);
+    const stateIds = (state) => candidateIds.filter((id) => records.get(id)?.state === state);
+    const acknowledged = stateIds('acknowledged');
+    const offered = stateIds('offered');
+    const failed = stateIds('failed');
+    const pending = candidateIds.filter((id) => !records.has(id));
+    const unresolved = [...pending, ...offered].map((id) => String(id).slice(0, 8));
     return {
       id: m.id,
       to: m.to || 'all',
@@ -532,9 +554,17 @@ export function summarizeReceipts({ messages, sessions, selfId, now = Date.now()
       ts: m.ts,
       ageMs: Math.max(0, now - Number(m.ts || 0)),
       text: String(m.text || '').slice(0, 120),
-      read: shown.length,
+      acknowledged: acknowledged.length,
+      // Compatibility alias for programmatic consumers. It now means a later
+      // model-context acknowledgement, never `seen` and never human-read.
+      read: acknowledged.length,
+      offered: offered.length,
+      failed: failed.length,
       candidates: candidateIds.length,
-      pendingIds: pending,
+      pendingIds: unresolved,
+      offeredIds: offered.map((id) => String(id).slice(0, 8)),
+      failedIds: failed.map((id) => String(id).slice(0, 8)),
+      deadLetterReason: m.deadLetter?.reason ? String(m.deadLetter.reason) : null,
     };
   });
   return { sent: receipts.length, receipts };
@@ -546,15 +576,19 @@ export function renderReceipt(receipt) {
   if (!receipt) return '';
   const age = receipt.ageMs < 60_000 ? 'just now' : `${Math.round(receipt.ageMs / 60_000)}m ago`;
   const who = receipt.directed ? `to ${receipt.to}` : 'broadcast';
+  const failure = receipt.deadLetterReason ? receipt.deadLetterReason.replace(/-/g, ' ') : null;
   if (!receipt.candidates) {
-    return `- ${who}, ${age}: no other session was live when you sent it — it waits in the lane (24h TTL) for whoever connects next. “${receipt.text}”`;
+    if (failure) return `- ${who}, ${age}: delivery failed (${failure}); no target acknowledged it. “${receipt.text}”`;
+    return `- ${who}, ${age}: queued with no live target snapshot; still pending for a matching supported session. “${receipt.text}”`;
   }
-  if (!receipt.pendingIds.length) {
-    return `- ${who}, ${age}: shown to all ${receipt.candidates} peer(s) that were live. “${receipt.text}”`;
+  if (receipt.acknowledged === receipt.candidates && !receipt.failed) {
+    return `- ${who}, ${age}: model-context delivery acknowledged by all ${receipt.candidates} target peer(s) on a later action (not human-read). “${receipt.text}”`;
   }
-  const shown = receipt.pendingIds.slice(0, 4).join(', ');
+  const pending = receipt.pendingIds.slice(0, 4).join(', ');
   const more = receipt.pendingIds.length > 4 ? ` +${receipt.pendingIds.length - 4} more` : '';
-  return `- ${who}, ${age}: shown to ${receipt.read} of ${receipt.candidates} · pending ${shown}${more}. “${receipt.text}”`;
+  const offered = receipt.offered ? ` · offered ${receipt.offered}, awaiting later-action ack` : '';
+  const failed = receipt.failed ? ` · failed ${receipt.failed}${failure ? ` (${failure})` : ''}` : '';
+  return `- ${who}, ${age}: acknowledged ${receipt.acknowledged} of ${receipt.candidates}${offered}${failed}${pending ? ` · unresolved ${pending}${more}` : ''}. “${receipt.text}”`;
 }
 
 // Compact, text-free receipt for surfaces that must stay cheap (SessionStart
@@ -565,20 +599,25 @@ export function renderReceiptSummary(summary) {
   if (!receipt) return '';
   const age = receipt.ageMs < 60_000 ? 'just now' : `${Math.round(receipt.ageMs / 60_000)}m ago`;
   const target = receipt.directed ? ` to ${receipt.to}` : '';
+  const failure = receipt.deadLetterReason ? receipt.deadLetterReason.replace(/-/g, ' ') : null;
   if (!receipt.candidates) {
-    return `📬 Your last note${target} (${age}): no other session was live when you sent it · waiting in the lane (24h TTL).`;
+    return failure
+      ? `📬 Your last note${target} (${age}): delivery failed (${failure}); no target acknowledged it.`
+      : `📬 Your last note${target} (${age}): queued with no live target snapshot · pending.`;
   }
-  if (!receipt.pendingIds.length) {
-    return `📬 Your last note${target} (${age}): shown to all ${receipt.candidates} peer(s) that were live.`;
+  if (receipt.acknowledged === receipt.candidates && !receipt.failed) {
+    return `📬 Your last note${target} (${age}): model-context delivery acknowledged by all ${receipt.candidates} target peer(s) on a later action (not human-read).`;
   }
   const pending = receipt.pendingIds.slice(0, 4).join(', ');
   const more = receipt.pendingIds.length > 4 ? ` +${receipt.pendingIds.length - 4} more` : '';
-  return `📬 Your last note${target} (${age}): shown to ${receipt.read} of ${receipt.candidates} peers · pending ${pending}${more}.`;
+  const offered = receipt.offered ? ` · offered ${receipt.offered}, awaiting ack` : '';
+  const failed = receipt.failed ? ` · failed ${receipt.failed}${failure ? ` (${failure})` : ''}` : '';
+  return `📬 Your last note${target} (${age}): acknowledged ${receipt.acknowledged} of ${receipt.candidates}${offered}${failed}${pending ? ` · unresolved ${pending}${more}` : ''}.`;
 }
 
 export function renderReceipts(summary, { limit = 3 } = {}) {
   if (!summary?.sent) return '';
-  const lines = ['📬 Your notes to other sessions (“shown to” = rendered into their context, not read by a human):'];
+  const lines = ['📬 Your notes to other sessions (acknowledged = model-context offer confirmed by a later supported action, not read by a human):'];
   for (const receipt of summary.receipts.slice(0, limit)) lines.push(renderReceipt(receipt));
   if (summary.sent > limit) lines.push(`- …and ${summary.sent - limit} more sent note(s).`);
   return lines.join('\n');

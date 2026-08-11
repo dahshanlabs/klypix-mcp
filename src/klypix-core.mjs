@@ -34,7 +34,7 @@ import {
   isFastDecayCard, DECAY_STALE_MS, formatDecayAge,
   readPendingShips, clearPendingShips, pendingShipCards, formatCaptureReceipts,
 } from './klypix-format.mjs';
-import { capMessages, findProjectBrain, neutralizeMarkers } from './agent-presence.mjs';
+import { findProjectBrain, postPresenceMessage } from './agent-presence.mjs';
 import { brainCaptureLockPath, vaultCreateLockPath, withAdvisoryWriteLock } from './brain-write-lock.mjs';
 import {
   dot, embedTexts, getEmbedder, getEmbedderForUse, withRerankerForUse,
@@ -1097,84 +1097,33 @@ export async function opBrainNote({ vault, canvas, text: noteText, area, marker 
   }, { brain: true });
 }
 
-// ── brain_message — the MCP twin of the hook's 🧠 MSG marker ─────────────────
-// A DELIBERATE one-time note to the OTHER live agent sessions on this project
-// ("merged the hook refactor — rebase before you commit"), delivered once to each
-// peer through its host lifecycle adapter and the per-project coordination lane.
-// Claude hook agents can also send by emitting `🧠 MSG [to]: text`; this op gives
-// every MCP client the same send path. Ephemeral (24h), NOT a brain card — durable
-// decisions go through brain_note.
-//
-// The lane primitives below MUST byte-match src/global-brain-hook.mjs (sha-16 of
-// normBrainPath(brain), sessions/<key>.json layout, MSG_FRESH_MS, the wx-lockfile) —
-// the hook is the READER of what we post. test/lane-message.mjs drives the REAL
-// hook over a message posted by this op; if the two implementations drift, it fails.
-const laneSha16 = (s) => crypto.createHash('sha1').update(String(s)).digest('hex').slice(0, 16);
-const laneNormBrainPath = (p) => String(p).replace(/\\/g, '/').replace(/^[a-zA-Z]:/, (m) => m.toLowerCase());
-const LANE_MSG_FRESH_MS = 24 * 60 * 60 * 1000;   // messages expire after a day
-const LANE_SESSION_FRESH_MS = 10 * 60 * 1000;    // a lane unseen for 10min is treated as ended
-// Canonicalize (on-disk casing + symlinks) before hashing — the hook does the same,
-// so a brain resolved via a differently-cased cwd/KLYPIX_BRAIN still lands in the
-// hook's lane file instead of a silently-unread sibling.
-const laneCanon = (p) => { try { return fs.realpathSync.native(p); } catch { return path.resolve(p); } };
-const laneFileFor = (brainAbs) => path.join(os.homedir(), '.claude', 'project-brain', 'sessions', `${laneSha16(laneNormBrainPath(laneCanon(brainAbs)))}.json`);
-const laneSleep = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* */ } };
-function laneLock(lockPath, tries = 20, waitMs = 25) {
-  try { fs.mkdirSync(path.dirname(lockPath), { recursive: true }); } catch { /* */ }
-  for (let i = 0; i < tries; i++) {
-    try { const fd = fs.openSync(lockPath, 'wx'); fs.writeSync(fd, String(process.pid)); fs.closeSync(fd); return true; }
-    catch (e) {
-      if (e && e.code !== 'EEXIST') return false;
-      try { if (Date.now() - fs.statSync(lockPath).mtimeMs > 15000) { fs.unlinkSync(lockPath); continue; } } catch { /* lost a race — retry */ }
-      laneSleep(waitMs);
-    }
-  }
-  return false;   // contended → write best-effort (same contract as the hook)
-}
-
-export async function opBrainMessage({ vault, canvas, text: msgText, to, via }) {
+export async function opBrainMessage({ vault, canvas, text: msgText, to, via, from, sessionId }) {
   const t = brainTarget(vault, canvas);
   if (t.ambiguous) return ambiguousBrainErr(t.ambiguous);
   if (!t.file) return err(`No brain found — looked for ./brain.klypix in the project, then ${vault}. Pass canvas: "<name>".`);
-  const txt = String(msgText || '').trim();
-  if (!txt) return err('brain_message needs a non-empty text.');
-  const laneFile = laneFileFor(t.file);
-  const lock = laneFile + '.lock';
-  const now = Date.now();
-  const msg = {
-    id: laneSha16('mcp|' + txt + '|' + now + '|' + Math.random()),
-    from: via ? String(via).replace(/\s+/g, '-').slice(0, 24) : 'mcp',
-    // cap + collapse the target hint too — an oversized `to` would bloat the lane
-    // file every hook of every session re-reads for 24h (and matches no one anyway)
-    to: String(to || 'all').replace(/\s+/g, ' ').trim().slice(0, 64) || 'all',
-    // Neutralized at post (delivery surfaces neutralize again for forged rows):
-    // a message must never carry a HARVESTABLE capture marker into a peer's prompt.
-    text: neutralizeMarkers(txt.slice(0, 400)), ts: now, seen: [],
+  const body = String(msgText || '').trim();
+  if (!body) return err('brain_message needs a non-empty text.');
+
+  // The worker supplies its logical presence id. Older protocol faces that only
+  // know a client label receive a deterministic compatibility identity rather
+  // than minting a different sender on every call.
+  const logicalSender = String(from || sessionId || '').trim().slice(0, 160)
+    || `legacy-${crypto.createHash('sha1').update(`${t.file}|${String(via || 'mcp').toLowerCase()}`).digest('hex').slice(0, 16)}`;
+  const result = postPresenceMessage({
+    brainPath: t.file,
+    from: logicalSender,
+    to: String(to || 'all'),
+    text: body,
+  });
+  if (!result.posted || !result.message) {
+    return err('brain_message deferred: the coordination lane is busy. Nothing was posted — retry in a moment.');
+  }
+  const message = result.message;
+  const candidates = Array.isArray(message.candidateIds) ? message.candidateIds.length : 0;
+  return {
+    blocks: [text(`📨 queued in this project's coordination lane (to: ${message.to}; id: ${message.id}) — ${candidates} live target session(s) were snapshotted. Delivery is pending until a supported lifecycle/MCP action offers it into model-visible context and a later action acknowledges it; unacknowledged notes replay after reconnect. This is a coordination receipt, not proof a human read it and not a brain card — use brain_note for durable project decisions.`)],
+    message,
   };
-  const got = laneLock(lock);
-  // Lock timeout → REFUSE, never write: an unlocked read-modify-write of the
-  // whole lane can permanently erase a peer's just-posted undelivered message
-  // (the exact loss class touchSession already refuses). Retry is cheap.
-  if (!got) return err('brain_message deferred: the coordination lane is busy (another session is writing). Nothing was posted — retry in a moment.');
-  let live = 0;
-  try {
-    let data = {}; try { data = JSON.parse(fs.readFileSync(laneFile, 'utf8')); } catch { /* fresh lane */ }
-    const sessions = Array.isArray(data.sessions) ? data.sessions : [];
-    live = sessions.filter(s => s && s.id && now - (s.lastSeen || 0) < LANE_SESSION_FRESH_MS).length;
-    const kept = (Array.isArray(data.messages) ? data.messages : []).filter(m => m && now - (m.ts || 0) < LANE_MSG_FRESH_MS);
-    kept.push(msg);
-    fs.mkdirSync(path.dirname(laneFile), { recursive: true });
-    // Delivered-first eviction + ...data spread — the other two lane writers were
-    // converted in the 2026-07-29 overhaul; a flat slice here still destroyed the
-    // oldest UNDELIVERED note at cap (review-caught).
-    // tmp+rename so lock-free readers can never parse a torn lane as "no messages".
-    const tmp = `${laneFile}.tmp-${process.pid}`;
-    fs.writeFileSync(tmp, JSON.stringify({ ...data, sessions, messages: capMessages(kept, 30) }));
-    fs.renameSync(tmp, laneFile);
-  } catch (e) {
-    return err(`brain_message failed: ${e.message}`);
-  } finally { try { fs.unlinkSync(lock); } catch { /* */ } }
-  return { blocks: [text(`📨 posted to this project's coordination lane (to: ${msg.to}) — ${live} active presence-wired session(s) right now; each receives it once through its lifecycle adapter or next brain_sync / KLYPIX tool call. Ephemeral (24h), not a brain card — use brain_note for durable decisions.`)] };
 }
 
 // Re-export the format helpers the bins need for non-op work (init onboarding).

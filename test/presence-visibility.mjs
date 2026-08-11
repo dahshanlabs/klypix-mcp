@@ -29,6 +29,8 @@ import {
   capMessages,
   formatPresenceMessage,
   laneFileFor,
+  MESSAGE_FRESH_MS,
+  messageDeliveryState,
   postPresenceMessage,
   receiveMessages,
   upsertSession,
@@ -78,11 +80,40 @@ for (let i = 0; i < 8; i++) {
 }
 const firstBatch = receiveMessages({ brainPath, sessionId: 'rx', home, now: now + 100 });
 ok(firstBatch.length === 6, `V2: first receive delivers the 6-cap (got ${firstBatch.length})`);
-const secondBatch = receiveMessages({ brainPath, sessionId: 'rx', home, now: now + 200 });
-ok(secondBatch.length === 2 && secondBatch.every(m => !firstBatch.some(f => f.id === m.id)),
-  `V2: the 2 overflow messages arrive on the NEXT receive instead of being acked-unseen (got ${secondBatch.length})`);
-ok(receiveMessages({ brainPath, sessionId: 'rx', home, now: now + 300 }).length === 0,
-  'V2: nothing re-delivers after everything was actually shown');
+const replayBatch = receiveMessages({ brainPath, sessionId: 'rx', home, now: now + 200 });
+ok(replayBatch.length === 6 && replayBatch.every(m => firstBatch.some(f => f.id === m.id)),
+  'V2: the first six replay once on a later in-band action before acknowledgement');
+const overflowOffer = receiveMessages({ brainPath, sessionId: 'rx', home, now: now + 300 });
+ok(overflowOffer.length === 2 && overflowOffer.every(m => !firstBatch.some(f => f.id === m.id)),
+  `V2: overflow remains pending until acknowledged messages clear (got ${overflowOffer.length})`);
+const overflowAck = receiveMessages({ brainPath, sessionId: 'rx', home, now: now + 400 });
+ok(overflowAck.length === 2 && overflowAck.every(m => overflowOffer.some(f => f.id === m.id)),
+  'V2: overflow also replays once before its later-action acknowledgement');
+ok(receiveMessages({ brainPath, sessionId: 'rx', home, now: now + 500 }).length === 0,
+  'V2: nothing re-delivers after every offer has a later-action acknowledgement');
+
+postPresenceMessage({ brainPath, home, now: now + 510, from: 'tx-a', to: 'all', text: 'same coordination text' });
+postPresenceMessage({ brainPath, home, now: now + 511, from: 'tx-b', to: 'all', text: 'same coordination text' });
+const twoSendersOffer = receiveMessages({ brainPath, sessionId: 'rx', home, now: now + 520 });
+const twoSendersAck = receiveMessages({ brainPath, sessionId: 'rx', home, now: now + 530 });
+ok(twoSendersOffer.length === 2 && new Set(twoSendersOffer.map(message => message.from)).size === 2
+  && twoSendersAck.length === 2,
+'V2: identical text from different senders keeps both attributions and advances each receipt honestly');
+postPresenceMessage({ brainPath, home, now: now + 540, from: 'peer-copy', to: 'rx', text: 'same as my just-sent note' });
+ok(receiveMessages({
+  brainPath, sessionId: 'rx', home, now: now + 550, ignoreTexts: ['same as my just-sent note'],
+}).length === 0,
+'V2: transcript self-echo compatibility suppresses matching text for only the current response');
+const peerCopy = receiveMessages({ brainPath, sessionId: 'rx', home, now: now + 560 });
+ok(peerCopy.length === 1 && peerCopy[0].from === 'peer-copy',
+  'V2: a genuine peer note identical to my text remains pending and reaches the next model-context action');
+receiveMessages({ brainPath, sessionId: 'rx', home, now: now + 565 });
+postPresenceMessage({ brainPath, home, now: now + 570, from: 'tx-action', to: 'rx', text: 'do not ack inside one tool action' });
+const preToolOffer = receiveMessages({ brainPath, sessionId: 'rx', home, now: now + 580, actionId: 'tool:tool-1' });
+const sameToolPost = receiveMessages({ brainPath, sessionId: 'rx', home, now: now + 590, actionId: 'tool:tool-1' });
+const laterActionAck = receiveMessages({ brainPath, sessionId: 'rx', home, now: now + 600, actionId: 'turn:prompt-2' });
+ok(preToolOffer.length === 1 && sameToolPost.length === 0 && laterActionAck.length === 1,
+  'V2: PreToolUse/PostToolUse for one tool cannot self-ack; only a distinct later action acknowledges the offer');
 
 // ── V3: cap prefers evicting delivered messages ──────────────────────────────
 {
@@ -92,9 +123,40 @@ ok(receiveMessages({ brainPath, sessionId: 'rx', home, now: now + 300 }).length 
     { id: 'seen-new', ts: 3, seen: ['someone'] },
     { id: 'unseen-new', ts: 4, seen: [] },
   ];
-  const capped = capMessages(msgs, 2);
-  ok(capped.length === 2 && capped.every(m => m.seen.length === 0),
-    'V3: eviction removes delivered messages first — undelivered notes survive the cap');
+  const capped = capMessages(msgs, 2, now);
+  const active = capped.filter(m => !m.deadLetter && !m.retiredAt);
+  const failed = capped.filter(m => m.deadLetter?.reason === 'lane-capacity-overflow');
+  ok(active.length === 2 && failed.length === 2,
+    'V3: the cap bounds active work and retains sender-visible failed receipts instead of deleting notes');
+  ok(messageDeliveryState(capped.find(m => m.id === 'seen-old'), 'someone') === 'failed',
+    'V3: legacy seen is never trusted as acknowledgement when an overflow is dead-lettered');
+
+  const laneFile = laneFileFor(brainPath, home);
+  const lane = JSON.parse(fs.readFileSync(laneFile, 'utf8'));
+  lane.messages.push({
+    id: 'expired-pending', from: 'tx', to: 'rx', text: 'must not disappear',
+    ts: now - MESSAGE_FRESH_MS - 1, candidateIds: ['rx'], seen: [],
+  });
+  fs.writeFileSync(laneFile, JSON.stringify(lane));
+  upsertSession({ brainPath, home, now, id: 'rx', client: 'codex' });
+  const expired = JSON.parse(fs.readFileSync(laneFile, 'utf8')).messages.find(m => m.id === 'expired-pending');
+  ok(expired?.deadLetter?.reason === 'expired-before-acknowledgement'
+    && messageDeliveryState(expired, 'rx') === 'failed',
+    'V3: TTL expiry leaves a sender-visible failed receipt instead of silently pruning pending work');
+
+  const acknowledgedRows = Array.from({ length: 30 }, (_, index) => ({
+    id: `acked-${index}`, from: 'tx', to: 'rx', text: `done ${index}`, ts: now + index + 1,
+    candidateIds: index % 2 ? ['rx'] : [], deliveryVersion: 2,
+    deliveries: [{ recipientId: 'rx', state: 'acknowledged', acknowledgedAt: now + index + 1 }],
+  }));
+  const pendingBeforeAcked = {
+    id: 'oldest-still-pending', from: 'tx', to: 'rx', text: 'must survive ack receipts', ts: now,
+    candidateIds: ['rx'], deliveryVersion: 2, deliveries: [],
+  };
+  const receiptCapped = capMessages([pendingBeforeAcked, ...acknowledgedRows], 30, now + 100);
+  ok(!receiptCapped.find(m => m.id === pendingBeforeAcked.id)?.deadLetter
+    && receiptCapped.filter(m => m.retiredAt).length === 30,
+  'V3: fully acknowledged snapshot and late-recipient receipts retire before cap selection and cannot evict pending work');
 }
 
 // ── V4: intentAt semantics ───────────────────────────────────────────────────
@@ -212,9 +274,16 @@ ok(aging.intentAt === now + 6 * 60 * 1000, 'V4: a CHANGED intent re-stamps inten
   fs.writeFileSync(laneFile, JSON.stringify(lane));
   const out1 = runHook(['--prompt'], { session_id: 'sess-v8', prompt: 'deliver my messages' });
   ok(/2 more message\(s\) waiting/.test(out1), 'V8: the 6-cap renders an explicit overflow notice');
-  const out2 = runHook(['--prompt'], { session_id: 'sess-v8', prompt: 'deliver the rest' });
-  ok(/unique payload 6/.test(out2) && /unique payload 7/.test(out2),
-    'V8: the overflow messages ARRIVE next prompt instead of being destroyed');
+  const out2 = runHook(['--prompt'], { session_id: 'sess-v8', prompt: 'confirm first offers' });
+  ok(/unique payload 0/.test(out2) && !/unique payload 6/.test(out2),
+    'V8: the real hook replays its first model-context offer before acknowledging it');
+  const out3 = runHook(['--prompt'], { session_id: 'sess-v8', prompt: 'deliver the rest' });
+  ok(/unique payload 6/.test(out3) && /unique payload 7/.test(out3),
+    'V8: overflow survives until acknowledged messages clear, then reaches model context');
+  const out4 = runHook(['--prompt'], { session_id: 'sess-v8', prompt: 'confirm overflow' });
+  const out5 = runHook(['--prompt'], { session_id: 'sess-v8', prompt: 'quiet now' });
+  ok(/unique payload 6/.test(out4) && !/unique payload/.test(out5),
+    'V8: overflow replays once, then a later prompt acknowledges and silences it');
   fs.rmSync(hookHome, { recursive: true, force: true });
   fs.rmSync(hookProj, { recursive: true, force: true });
 }

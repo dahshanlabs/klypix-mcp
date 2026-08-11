@@ -9,6 +9,7 @@ import {
   findProjectBrain,
   formatPresenceMessage,
   formatReceivedMessages,
+  peekMessages,
   postPresenceMessage,
   receiveMessages,
   removeSession,
@@ -101,10 +102,34 @@ function ownBrainMessageText(input) {
   return typeof text === 'string' && text.trim() ? [text] : [];
 }
 
-function emitSystemMessage(parts) {
+const MODEL_CONTEXT_EVENTS = new Set(['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse']);
+
+function hookActionId(input, event) {
+  const explicit = input?.turn_id || input?.turnId || input?.tool_use_id || input?.toolUseId || input?.action_id;
+  return explicit ? `${event === 'PreToolUse' || event === 'PostToolUse' ? 'tool' : 'turn'}:${String(explicit).slice(0, 150)}` : '';
+}
+
+export function buildCodexHookOutput(parts, event) {
   const systemMessage = parts.filter(Boolean).join('\n\n').trim();
-  if (!systemMessage) return;
-  process.stdout.write(JSON.stringify({ continue: true, systemMessage }));
+  if (!systemMessage) return null;
+  return {
+    // Preserve the legacy common hook field for installed Codex builds while
+    // adding the event-specific model-context envelope below.
+    continue: true,
+    systemMessage,
+    ...(MODEL_CONTEXT_EVENTS.has(event) ? {
+      hookSpecificOutput: {
+        hookEventName: event,
+        additionalContext: systemMessage,
+      },
+    } : {}),
+  };
+}
+
+function emitSystemMessage(parts, event) {
+  const output = buildCodexHookOutput(parts, event);
+  if (!output) return;
+  process.stdout.write(JSON.stringify(output));
 }
 
 // ── Decay-aware LAST-KNOWN stamps (2026-07-28 post-mortem, class B) ──────────
@@ -269,7 +294,12 @@ async function main() {
   });
 
   const ignored = event === 'PostToolUse' ? ownBrainMessageText(input) : [];
-  const messages = receiveMessages({ brainPath, sessionId, ignoreTexts: ignored });
+  // Stop can show a UI warning but cannot add model context. Never advance a
+  // durable delivery receipt on that event; the next context-capable action
+  // still replays the note. Context-capable events advance one v2 delivery step.
+  const messages = MODEL_CONTEXT_EVENTS.has(event)
+    ? receiveMessages({ brainPath, sessionId, ignoreTexts: ignored, actionId: hookActionId(input, event) })
+    : peekMessages({ brainPath, sessionId, ignoreTexts: ignored });
   const conflicts = (event === 'PreToolUse' || event === 'PostToolUse')
     ? findPresenceConflicts(sessions, sessionId)
     : [];
@@ -302,7 +332,7 @@ async function main() {
       observeShipDrift(projectDir),
       gitHookNotice.trim(),
       stampReceivedMessages(messages),
-    ]);
+    ], event);
     return;
   }
   if (event === 'UserPromptSubmit') {
@@ -312,17 +342,17 @@ async function main() {
       context,
       formatPresenceMessage(sessions, sessionId),
       stampReceivedMessages(messages),
-    ]);
+    ], event);
     return;
   }
   if (event === 'PreToolUse' || event === 'PostToolUse') {
     emitSystemMessage([
       formatConflictWarning(conflicts, event),
       stampReceivedMessages(messages),
-    ]);
+    ], event);
     return;
   }
-  if (messages.length) emitSystemMessage([stampReceivedMessages(messages)]);
+  if (messages.length) emitSystemMessage([stampReceivedMessages(messages)], event);
 }
 
 // Run as the hook by default. The ONLY skip is the explicit opt-out flag a

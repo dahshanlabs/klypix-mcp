@@ -32,6 +32,7 @@
 import crypto from 'crypto';
 
 export const PRESENCE_WIRE_VERSION = 1;
+export const MESSAGE_WIRE_VERSION = 2;
 export const PRESENCE_HEARTBEAT_MS = 60_000;
 // Consent record contract (mirrors src/services/screenCloudConsent.ts in the
 // desktop app: versioned, revocable, default-off, checked at send time).
@@ -138,9 +139,11 @@ export function buildMessageFrame(message, { machineId, now = Date.now() } = {})
   const text = str(message.text, 400);
   const from = str(message.from, 64);
   if (!text || !from) return null;
+  const mid = str(message.id, 64) || sha16(`${machineId}|${from}|${text.toLowerCase()}|${Number(message.ts || now)}`);
   return {
-    v: PRESENCE_WIRE_VERSION,
+    v: MESSAGE_WIRE_VERSION,
     kind: 'message',
+    mid,
     machine: str(machineId, 40),
     from,
     to: str(message.to, 160) || 'all',
@@ -156,7 +159,7 @@ export function buildMessageFrame(message, { machineId, now = Date.now() } = {})
 // existing dedupeKey mechanism enforces it under the lane lock.
 export function acceptMessageFrame(frame, { machineId } = {}) {
   if (!frame || typeof frame !== 'object') return null;
-  if (frame.v !== PRESENCE_WIRE_VERSION || frame.kind !== 'message') return null;
+  if (![PRESENCE_WIRE_VERSION, MESSAGE_WIRE_VERSION].includes(frame.v) || frame.kind !== 'message') return null;
   const machine = str(frame.machine, 40);
   const from = str(frame.from, 64);
   const text = str(frame.text, 400);
@@ -166,8 +169,75 @@ export function acceptMessageFrame(frame, { machineId } = {}) {
     from,
     to: str(frame.to, 160) || 'all',
     text,
-    dedupeKey: `${XPC_DEDUPE_PREFIX}${sha16(`${machine}|${from}|${text.toLowerCase()}`)}`,
+    messageId: frame.v === MESSAGE_WIRE_VERSION ? str(frame.mid, 64) : null,
+    originMachine: machine,
+    dedupeKey: frame.v === MESSAGE_WIRE_VERSION && str(frame.mid, 64)
+      ? `${XPC_DEDUPE_PREFIX}${machine}:${str(frame.mid, 64)}`
+      : `${XPC_DEDUPE_PREFIX}${sha16(`${machine}|${from}|${text.toLowerCase()}`)}`,
   };
+}
+
+// Relay acknowledgements confirm durable acceptance by the remote machine's
+// mailbox. They are transport receipts, not model-context or human-read receipts.
+export function buildMessageAckFrame({ messageId, originMachine, recipientMachine, recipientId = null, now = Date.now() } = {}) {
+  const mid = str(messageId, 64);
+  const origin = str(originMachine, 40);
+  const machine = str(recipientMachine, 40);
+  if (!mid || !origin || !machine || origin === machine) return null;
+  return {
+    v: MESSAGE_WIRE_VERSION,
+    kind: 'message-ack',
+    mid,
+    originMachine: origin,
+    machine,
+    recipientId: recipientId ? str(recipientId, 64) : null,
+    acceptedAt: Number(now) || Date.now(),
+  };
+}
+
+export function acceptMessageAckFrame(frame, { machineId } = {}) {
+  if (!frame || frame.v !== MESSAGE_WIRE_VERSION || frame.kind !== 'message-ack') return null;
+  const messageId = str(frame.mid, 64);
+  const originMachine = str(frame.originMachine, 40);
+  const recipientMachine = str(frame.machine, 40);
+  if (!messageId || !originMachine || !recipientMachine) return null;
+  if (machineId && originMachine !== String(machineId)) return null;
+  if (originMachine === recipientMachine) return null;
+  return {
+    messageId,
+    originMachine,
+    recipientMachine,
+    deliveryKey: messageDeliveryKey(messageId, recipientMachine),
+    recipientId: frame.recipientId ? str(frame.recipientId, 64) : null,
+    acceptedAt: Number(frame.acceptedAt || 0),
+  };
+}
+
+// A transport acknowledgement is scoped to one destination machine. Treating
+// a message id alone as complete lets the first remote machine suppress retry
+// to every other machine on the channel.
+export function messageDeliveryKey(messageId, recipientMachine) {
+  const mid = str(messageId, 64);
+  const machine = str(recipientMachine, 40);
+  return mid && machine ? `${mid}@${machine}` : '';
+}
+
+// The receiver must call this only AFTER its local lane insert/dedupe completed
+// durably. relayInbound deliberately cannot mint an ack: parsing a valid frame
+// is not proof that the mailbox lock/write succeeded.
+export function acknowledgePersistedMessage(inbound, {
+  persisted = false,
+  recipientId = null,
+  now = Date.now(),
+} = {}) {
+  if (!persisted || inbound?.type !== 'message' || !inbound.message?.messageId) return null;
+  return buildMessageAckFrame({
+    messageId: inbound.message.messageId,
+    originMachine: inbound.message.originMachine,
+    recipientMachine: inbound.recipientMachine,
+    recipientId,
+    now,
+  });
 }
 
 // Versioned, revocable, default-OFF consent — the shape the desktop stores per
@@ -185,15 +255,39 @@ export function presenceConsentAllows(record) {
   );
 }
 
-// Which lane messages are due for broadcast: authored on this machine (never
-// xpc:-injected), newer than the caller's cursor. The caller advances the
-// cursor to the max ts it sent — re-pumps then skip already-sent content, and
-// even a re-send is harmless (receiver dedup, P5).
-export function selectOutboundMessages(messages, { sinceTs = 0 } = {}) {
+// Which lane messages are due for broadcast. The durable mode keys receipts by
+// BOTH message and destination machine, so one remote acceptance cannot silence
+// retry for another machine. The flat acknowledgedMessageIds form remains a
+// one-recipient compatibility shim; with multiple targets it is intentionally
+// not trusted as a global acknowledgement.
+export function selectOutboundMessages(messages, {
+  sinceTs = 0,
+  acknowledgedMessageIds,
+  acknowledgedDeliveries,
+  recipientMachineIds = [],
+} = {}) {
+  const durable = acknowledgedMessageIds !== undefined || acknowledgedDeliveries !== undefined;
+  const targets = [...new Set(Array.from(recipientMachineIds || [], String).filter(Boolean))];
+  const flat = new Set(Array.from(acknowledgedMessageIds || [], String));
+  const receipts = new Set(Array.from(acknowledgedDeliveries || [], (entry) => {
+    if (typeof entry === 'string') return entry;
+    return messageDeliveryKey(entry?.messageId, entry?.recipientMachine);
+  }).filter(Boolean));
+  const acknowledgedForAllTargets = (message) => {
+    const id = String(message?.id || '');
+    if (!id) return false;
+    if (!targets.length) return flat.has(id);
+    if (targets.length === 1 && flat.has(id)) return true; // legacy single-peer caller
+    return targets.every((machine) => receipts.has(messageDeliveryKey(id, machine)));
+  };
   return (Array.isArray(messages) ? messages : [])
     .filter((message) => message
-      && Number(message.ts || 0) > Number(sinceTs || 0)
-      && !String(message.dedupeKey || '').startsWith(XPC_DEDUPE_PREFIX));
+      && !message.deadLetter
+      && !message.retiredAt
+      && !String(message.dedupeKey || '').startsWith(XPC_DEDUPE_PREFIX)
+      && (durable
+        ? !acknowledgedForAllTargets(message)
+        : Number(message.ts || 0) > Number(sinceTs || 0)));
 }
 
 // ── Frame authenticity (optional per-brain MAC) ─────────────────────────────
@@ -239,28 +333,71 @@ export function relayOutbound({
   hostLabel = null,
   root = null,
   sinceTs = 0,
+  acknowledgedMessageIds,
+  acknowledgedDeliveries,
+  recipientMachineIds = [],
+  acknowledgements = [],
   now = Date.now(),
   send,
   key = null,
 } = {}) {
-  if (!presenceConsentAllows(consent)) return { sent: 0, reason: 'no-consent', maxMessageTs: sinceTs };
-  if (typeof send !== 'function') return { sent: 0, reason: 'no-channel', maxMessageTs: sinceTs };
+  if (!presenceConsentAllows(consent)) return { sent: 0, reason: 'no-consent', maxMessageTs: sinceTs, sentMessageIds: [], pendingMessageIds: [] };
+  if (typeof send !== 'function') return { sent: 0, reason: 'no-channel', maxMessageTs: sinceTs, sentMessageIds: [], pendingMessageIds: [] };
   let sent = 0;
   let maxMessageTs = Number(sinceTs || 0);
+  const sentMessageIds = [];
+  const failedMessageIds = [];
+  const durable = acknowledgedMessageIds !== undefined || acknowledgedDeliveries !== undefined;
+  const targetMachines = [...new Set(Array.from(recipientMachineIds || [], String).filter(Boolean))];
+  const flatAcknowledged = new Set(Array.from(acknowledgedMessageIds || [], String));
+  const acknowledgedDeliveryKeys = new Set(Array.from(acknowledgedDeliveries || [], (entry) =>
+    typeof entry === 'string' ? entry : messageDeliveryKey(entry?.messageId, entry?.recipientMachine)).filter(Boolean));
+  const trySend = (frame) => {
+    try {
+      // Synchronous false/throw is a failed attempt. Promise-based transports
+      // should await their own send and call this pump again until an ack frame
+      // is persisted; receiver dedupe makes retries harmless.
+      return send(signFrame(frame, key)) !== false;
+    } catch { return false; }
+  };
   for (const session of Array.isArray(sessions) ? sessions : []) {
     const frame = buildPresenceFrame(session, { machineId, hostLabel, root, now });
     if (!frame) continue;
-    send(signFrame(frame, key));
-    sent++;
+    if (trySend(frame)) sent++;
   }
-  for (const message of selectOutboundMessages(messages, { sinceTs })) {
+  const pending = selectOutboundMessages(messages, {
+    sinceTs, acknowledgedMessageIds, acknowledgedDeliveries, recipientMachineIds: targetMachines,
+  });
+  for (const message of pending) {
     const frame = buildMessageFrame(message, { machineId, now });
     if (!frame) continue;
-    send(signFrame(frame, key));
-    sent++;
-    maxMessageTs = Math.max(maxMessageTs, Number(message.ts || 0));
+    if (trySend(frame)) {
+      sent++;
+      sentMessageIds.push(String(message.id || frame.mid));
+      if (!durable) maxMessageTs = Math.max(maxMessageTs, Number(message.ts || 0));
+    } else failedMessageIds.push(String(message.id || frame.mid));
   }
-  return { sent, reason: null, maxMessageTs };
+  for (const receipt of Array.isArray(acknowledgements) ? acknowledgements : []) {
+    const frame = receipt?.kind === 'message-ack'
+      ? receipt
+      : buildMessageAckFrame({ ...receipt, recipientMachine: receipt?.recipientMachine || machineId, now });
+    if (frame && trySend(frame)) sent++;
+  }
+  return {
+    sent,
+    reason: failedMessageIds.length ? 'partial-send-failure' : null,
+    maxMessageTs,
+    sentMessageIds,
+    failedMessageIds,
+    pendingMessageIds: pending.map((message) => String(message.id || '')),
+    pendingDeliveryKeys: pending.flatMap((message) => {
+      const id = String(message.id || '');
+      return targetMachines.length
+        ? targetMachines.map((machine) => messageDeliveryKey(id, machine)).filter((key) =>
+          key && !acknowledgedDeliveryKeys.has(key) && !(targetMachines.length === 1 && flatAcknowledged.has(id)))
+        : [id];
+    }),
+  };
 }
 
 export function relayInbound(frame, { consent = null, machineId, now = Date.now(), key = null } = {}) {
@@ -273,7 +410,18 @@ export function relayInbound(frame, { consent = null, machineId, now = Date.now(
   }
   if (frame.kind === 'message') {
     const message = acceptMessageFrame(frame, { machineId });
-    return message ? { type: 'message', message } : null;
+    return message ? {
+      type: 'message',
+      message,
+      recipientMachine: String(machineId || ''),
+      // Deliberately null until acknowledgePersistedMessage() receives the
+      // caller's successful mailbox-insert receipt.
+      acknowledgement: null,
+    } : null;
+  }
+  if (frame.kind === 'message-ack') {
+    const acknowledgement = acceptMessageAckFrame(frame, { machineId });
+    return acknowledgement ? { type: 'message-ack', acknowledgement } : null;
   }
   return null;   // unknown kind — a future schema this build doesn't know (P7)
 }

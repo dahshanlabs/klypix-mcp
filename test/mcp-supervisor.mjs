@@ -326,7 +326,11 @@ try {
       },
       stderr: 'pipe',
     });
-    const { laneFileFor: laneOf } = await import('../src/agent-presence.mjs');
+    const {
+      laneFileFor: laneOf,
+      messageDeliveryState,
+      postPresenceMessage: postLaneMessage,
+    } = await import('../src/agent-presence.mjs');
     const lane = laneOf(presBrain, presHome);
     const rows = () => { try { return JSON.parse(fs.readFileSync(lane, 'utf8')).sessions || []; } catch { return []; } };
     const presStates = () => fs.readdirSync(presStateDir).filter(n => n.endsWith('.json'))
@@ -340,14 +344,39 @@ try {
       const sleeping = rows();
       ok(sleeping.length === 1 && sleeping[0].id === 'scoped-session-1',
         'presence takeover: the sleeping session STILL has exactly one live lane row (peers keep seeing it)');
+      ok(sleeping[0]?.deliveryReachability === 'pull-only'
+        && sleeping[0]?.transport?.mcp?.status === 'pull-only',
+      'presence takeover: hibernation advertises honest pull-only delivery reachability');
+      const sleepingState = presStates().find(s => s.status === 'hibernated');
+      ok(sleepingState?.transport?.delivery === 'pull-only',
+        'presence takeover: the supervisor diagnostic reports pull-only instead of connected delivery');
+      ok(sleepingState?.hibernation?.target?.version === '1.4.0'
+        && /worker-presence\.mjs$/.test(sleepingState?.hibernation?.target?.path || ''),
+      'presence takeover: state retains the sleeping runtime identity for version-alignment diagnostics');
       const heldAt = sleeping[0].lastSeen;
       ok(Number.isFinite(heldAt) && Date.now() - heldAt < 90_000,
         'presence takeover: the supervisor keeps that row FRESH while the worker is gone');
+      const queued = postLaneMessage({
+        brainPath: presBrain,
+        from: 'peer-during-sleep',
+        to: 'scoped-session-1',
+        text: 'queued while the MCP worker is hibernated',
+        home: presHome,
+      });
+      // The supervisor schedules re-assertions at 500ms and 1200ms. Wait past
+      // both so this proves its preview/heartbeat path is non-consuming.
+      await new Promise(resolve => setTimeout(resolve, 1500));
+      const sleepingMessage = JSON.parse(fs.readFileSync(lane, 'utf8')).messages
+        ?.find(m => m.id === queued.message?.id);
+      ok(messageDeliveryState(sleepingMessage, 'scoped-session-1') === 'pending',
+        'presence takeover: best-effort hibernation notification does not consume or acknowledge the durable note');
       await presClient.callTool({ name: 'version', arguments: {} });
       await waitFor(async () => presStates().some(s => s.status === 'ready' && s.active?.pid), 15000);
       const awake = rows();
       ok(awake.length === 1 && awake[0].id === 'scoped-session-1',
         'presence takeover: the wake ADOPTS the same row — no ghost twin, no duplicate peer');
+      ok(awake[0]?.deliveryReachability === 'connected' && awake[0]?.transport?.mcp?.status === 'connected',
+        'presence takeover: wake restores connected delivery reachability on the same row');
       const keptScope = JSON.parse(textOf(await presClient.callTool({ name: 'scope', arguments: {} })));
       ok(keptScope?.intent === 'scoped work' && keptScope?.files?.[0] === 'src/x.ts',
         'presence takeover: the declared file scope survives — overlap warnings stay correct');

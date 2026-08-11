@@ -26,7 +26,7 @@ import {
   inspectAutoUpdate,
   spawnAutoUpdateHelper,
 } from './mcp-auto-update.mjs';
-import { removeSession, upsertSession } from './agent-presence.mjs';
+import { formatReceivedMessages, peekMessages, removeSession, upsertSession } from './agent-presence.mjs';
 
 const INTERNAL_PREFIX = '__klypix_supervisor__';
 const DEFAULT_POLL_MS = 1000;
@@ -306,6 +306,10 @@ class Supervisor {
     // saw before — hibernation buys RAM without spending coordination.
     this.presenceIdentity = null;
     this.presenceHeartbeat = null;
+    this.hibernatedAnnouncements = new Set();
+    this.hostTransportState = 'starting';
+    this.lastHostWriteError = null;
+    this.hostBackpressuredAt = null;
   }
 
   writeState(extra = {}) {
@@ -323,11 +327,24 @@ class Supervisor {
           since: this.status === 'hibernated' ? this.hibernatedAt : null,
           count: this.hibernations,
           skipReason: this.hibernateSkipReason || null,
+          target: this.status === 'hibernated' && this.hibernatedTarget ? {
+            version: this.hibernatedTarget.version || null,
+            path: this.hibernatedTarget.path?.replace(/\\/g, '/') || null,
+            source: this.hibernatedTarget.source || null,
+          } : null,
         },
         cwd: process.cwd().replace(/\\/g, '/'),
         bootedAt: this.bootedAt,
         updatedAt: new Date().toISOString(),
         lastHostMessageAt: this.lastHostMessageAt,
+        transport: {
+          host: this.hostTransportState,
+          delivery: ['impaired', 'backpressured'].includes(this.hostTransportState)
+            ? this.hostTransportState
+            : (this.status === 'hibernated' ? 'pull-only' : (this.active ? 'connected' : 'impaired')),
+          lastWriteError: this.lastHostWriteError,
+          backpressuredAt: this.hostBackpressuredAt,
+        },
         clientInfo: this.clientInfo,
         status: this.status,
         hotReloads: this.hotReloads,
@@ -441,8 +458,25 @@ class Supervisor {
           branch: who.branch,
           channel: 'mcp',
           event: 'McpHibernated',
+          transportStatus: 'pull-only',
           hostPid: this.parentPid,
         });
+        // Hibernation intentionally has no model-context consumer. Peek only:
+        // a best-effort UI warning may wake the human, but the durable note stays
+        // pending/offered until the next host request wakes the worker.
+        const pending = peekMessages({ brainPath: who.brainPath, sessionId: who.id });
+        const fresh = pending.filter((message) => !this.hibernatedAnnouncements.has(message.id));
+        if (fresh.length && this.sendHost({
+          jsonrpc: '2.0',
+          method: 'notifications/message',
+          params: {
+            level: 'warning',
+            logger: 'klypix-supervisor',
+            data: `${formatReceivedMessages(fresh)}\nThe worker is hibernated; this is a UI preview only. The note remains queued for the next KLYPIX action.`,
+          },
+        })) {
+          for (const message of fresh) this.hibernatedAnnouncements.add(message.id);
+        }
       } catch { /* presence upkeep is best-effort; TTL is the backstop */ }
     };
     // ORDER MATTERS (caught by real-worker measurement, not by the fixture):
@@ -523,7 +557,37 @@ class Supervisor {
   }
 
   sendHost(message) {
-    if (!this.closed) process.stdout.write(`${JSON.stringify(message)}\n`);
+    if (this.closed) return false;
+    if (process.stdout.destroyed || !process.stdout.writable) {
+      this.hostTransportState = 'impaired';
+      this.lastHostWriteError = 'host stdout is unavailable';
+      this.writeState();
+      return false;
+    }
+    try {
+      const accepted = process.stdout.write(`${JSON.stringify(message)}\n`, (error) => {
+        if (!error || this.closed) return;
+        this.hostTransportState = 'impaired';
+        this.lastHostWriteError = String(error.message || error).slice(0, 240);
+        this.writeState();
+      });
+      if (!accepted) {
+        this.hostTransportState = 'backpressured';
+        this.hostBackpressuredAt = new Date().toISOString();
+        this.writeState();
+      } else if (this.hostTransportState !== 'connected') {
+        this.hostTransportState = 'connected';
+        this.hostBackpressuredAt = null;
+        this.lastHostWriteError = null;
+        this.writeState();
+      }
+      return true;
+    } catch (error) {
+      this.hostTransportState = 'impaired';
+      this.lastHostWriteError = String(error?.message || error).slice(0, 240);
+      this.writeState();
+      return false;
+    }
   }
 
   sendInternal(worker, method, params = {}, timeoutMs = this.timeoutMs) {
@@ -711,6 +775,9 @@ class Supervisor {
   onHostMessage(message) {
     if (this.closed) return;
     this.lastHostMessageAt = new Date().toISOString();
+    // An inbound request proves stdin is alive, not that the response pipe
+    // recovered. Keep outbound impairment until write/drain proves it cleared.
+    if (this.hostTransportState === 'starting') this.hostTransportState = 'connected';
     // MCP initialization is the one host-neutral source of client identity.
     // Persist only bounded name/version metadata; never capabilities, prompts,
     // environment variables, or request content.
@@ -892,6 +959,17 @@ class Supervisor {
       }
       // Final failure: stop pretending. Blacklist the signature, fail everything
       // queued with a retryable error, and tell the host via MCP logging.
+      this.stopPresenceHeartbeat();
+      if (this.presenceIdentity) {
+        const who = this.presenceIdentity;
+        try {
+          upsertSession({
+            brainPath: who.brainPath, id: who.id, client: who.client,
+            surface: who.surface, branch: who.branch, channel: 'mcp',
+            event: 'McpRecoveryFailed', transportStatus: 'impaired', hostPid: this.parentPid,
+          });
+        } catch { /* TTL remains the backstop */ }
+      }
       this.rejectedSignature = candidate.target.signature;
       const detail = `KLYPIX worker unavailable (recovery failed after ${RECOVERY_MAX_ATTEMPTS} attempts: ${reason}) — /mcp reconnect to restart.`;
       for (const queued of this.hostQueue.splice(0)) this.failHostRequest(queued, detail);
@@ -1053,6 +1131,24 @@ class Supervisor {
     this.writeState();
     this.flushHostQueue();
 
+    process.stdout.on('error', (error) => {
+      if (this.closed) return;
+      this.hostTransportState = 'impaired';
+      this.lastHostWriteError = String(error?.message || error).slice(0, 240);
+      this.writeState();
+      // A broken response pipe cannot deliver MCP results or receipts. Closing
+      // removes the misleading live row; unacknowledged lane messages remain on
+      // disk and replay when the supported session reconnects.
+      if (['EPIPE', 'ERR_STREAM_DESTROYED'].includes(error?.code)) this.close();
+    });
+    process.stdout.on('drain', () => {
+      if (this.closed || this.hostTransportState !== 'backpressured') return;
+      this.hostTransportState = 'connected';
+      this.hostBackpressuredAt = null;
+      this.lastHostWriteError = null;
+      this.writeState();
+    });
+
     process.stdin.on('data', createLineReader(
       message => this.onHostMessage(message),
       (error, raw) => {
@@ -1111,7 +1207,7 @@ class Supervisor {
     // The connection is ending: stop holding its row and remove it, so a
     // hibernated-then-closed session never lingers as a ghost peer.
     this.stopPresenceHeartbeat();
-    if (this.status === 'hibernated' && this.presenceIdentity) {
+    if (!this.active && this.presenceIdentity) {
       const who = this.presenceIdentity;
       this.presenceIdentity = null;
       // Same removal the worker performs on its own graceful stop.

@@ -285,8 +285,11 @@ const startOutput = runHook({
   model: 'gpt-test',
 });
 const startJson = JSON.parse(startOutput);
-ok(startJson.continue === true && /1 active session/.test(startJson.systemMessage),
-  'real Codex SessionStart hook publishes and returns truthful awareness');
+ok(startJson.continue === true
+  && /1 active session/.test(startJson.systemMessage)
+  && startJson.hookSpecificOutput?.hookEventName === 'SessionStart'
+  && /1 active session/.test(startJson.hookSpecificOutput?.additionalContext || ''),
+  'real Codex SessionStart hook publishes truthful awareness as model-visible additionalContext');
 
 runHook({
   session_id: 'codex-real-a',
@@ -306,8 +309,9 @@ const promptJson = JSON.parse(promptOutput);
 ok(/2 active sessions/.test(promptJson.systemMessage) && /codex-r/.test(promptJson.systemMessage),
   'a second real Codex hook sees the first active session');
 ok(/Compact task context/.test(promptJson.systemMessage)
-  && /load the compact task context/.test(promptJson.systemMessage),
-  'UserPromptSubmit automatically injects bounded task-ranked brain memory');
+  && /load the compact task context/.test(promptJson.systemMessage)
+  && /load the compact task context/.test(promptJson.hookSpecificOutput?.additionalContext || ''),
+  'UserPromptSubmit injects bounded task-ranked brain memory into model-visible additionalContext');
 
 const preToolOutput = runHook({
   session_id: 'codex-real-b',
@@ -319,8 +323,9 @@ const preToolOutput = runHook({
 });
 const preToolJson = JSON.parse(preToolOutput);
 ok(/BLOCKING exact-file overlap/.test(preToolJson.systemMessage)
-  && /src\/example\.mjs/.test(preToolJson.systemMessage),
-  'PreToolUse warns the later Codex session before an exact overlapping edit');
+  && /src\/example\.mjs/.test(preToolJson.systemMessage)
+  && /BLOCKING exact-file overlap/.test(preToolJson.hookSpecificOutput?.additionalContext || ''),
+  'PreToolUse warns the later Codex session in model-visible context before an exact overlapping edit');
 
 runHook({
   session_id: 'codex-real-b',
@@ -341,6 +346,8 @@ const peerAlertOutput = runHook({
 const peerAlertJson = JSON.parse(peerAlertOutput);
 ok(/Automatic KLYPIX pre-edit overlap alert/.test(peerAlertJson.systemMessage),
   'the pre-edit hook automatically alerts the earlier peer through its lifecycle channel');
+ok(!peerAlertJson.hookSpecificOutput,
+  'Stop emits only a UI warning and never claims model-context delivery');
 
 runHook({
   session_id: 'codex-real-a',

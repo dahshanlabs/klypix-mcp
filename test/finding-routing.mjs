@@ -268,7 +268,7 @@ const fresh = (extra = {}) => ({ lastSeen: NOW - 30_000, startedAt: NOW - 600_00
   ok(!/auto-?sen/i.test(out), '9.5: the surface never implies anything was sent automatically');
 }
 
-// ── 10. The receipt — message.seen finally rendered (acceptance gate 3) ────
+// ── 10. Durable delivery receipts (acceptance gate 3) ──────────────────────
 {
   const sessions = [
     { id: 'me-0000', ...fresh() },
@@ -277,29 +277,39 @@ const fresh = (extra = {}) => ({ lastSeen: NOW - 30_000, startedAt: NOW - 600_00
     { id: 'later-cc', ...fresh({ startedAt: NOW - 10_000 }) },   // started AFTER the send
   ];
   const messages = [
-    { id: 'm1', from: 'me-0000', to: 'all', text: 'broadcast note', ts: NOW - 600_000, seen: ['peer-aaa'] },
+    {
+      id: 'm1', from: 'me-0000', to: 'all', text: 'broadcast note', ts: NOW - 600_000,
+      candidateIds: ['peer-aaa', 'peer-bbb'], deliveryVersion: 2,
+      deliveries: [{ recipientId: 'peer-aaa', state: 'acknowledged', offeredAt: NOW - 590_000, acknowledgedAt: NOW - 580_000 }],
+    },
     { id: 'm2', from: 'peer-aaa', to: 'all', text: 'not mine', ts: NOW - 500_000, seen: [] },
   ];
   const s = summarizeReceipts({ messages, sessions, selfId: 'me-0000', now: NOW });
   ok(s.sent === 1, '10.1: only THIS session\'s own sent notes get a receipt');
   const r = s.receipts[0];
-  ok(r.read === 1 && r.candidates === 2, '10.2: the denominator is peers that were live AT SEND TIME (a later arrival is not "pending")');
+  ok(r.acknowledged === 1 && r.read === 1 && r.candidates === 2,
+    '10.2: only later-action acknowledgement counts; the compatibility read alias means the same thing');
   ok(r.pendingIds.join() === 'peer-bbb', '10.3: pending peers are named by id-prefix — a name you can chase');
-  ok(/shown to 1 of 2 · pending peer-bbb/.test(renderReceipt(r)), '10.4: the rendered receipt is exact and honest');
+  ok(/acknowledged 1 of 2 · unresolved peer-bbb/.test(renderReceipt(r)), '10.4: the rendered receipt is exact and honest');
 
-  const allRead = summarizeReceipts({ messages: [{ id: 'm', from: 'me-0000', to: 'all', text: 't', ts: NOW - 60_000, seen: ['peer-aaa', 'peer-bbb'] }], sessions, selfId: 'me-0000', now: NOW });
-  ok(/shown to all 2 peer\(s\)/.test(renderReceipt(allRead.receipts[0])), '10.5: the all-read line does not overclaim ("shown to", not "read by")');
+  const allRead = summarizeReceipts({ messages: [{
+    id: 'm', from: 'me-0000', to: 'all', text: 't', ts: NOW - 60_000,
+    candidateIds: ['peer-aaa', 'peer-bbb'], deliveryVersion: 2,
+    deliveries: ['peer-aaa', 'peer-bbb'].map((recipientId) => ({ recipientId, state: 'acknowledged', acknowledgedAt: NOW - 30_000 })),
+  }], sessions, selfId: 'me-0000', now: NOW });
+  ok(/model-context delivery acknowledged by all 2 target peer\(s\).*not human-read/.test(renderReceipt(allRead.receipts[0])),
+    '10.5: all-target wording names model-context acknowledgement and disclaims human reading');
 
   const alone = summarizeReceipts({ messages: [{ id: 'm', from: 'me-0000', to: 'all', text: 't', ts: NOW - 60_000, seen: [] }], sessions: [{ id: 'me-0000', ...fresh() }], selfId: 'me-0000', now: NOW });
-  ok(/no other session was live when you sent it/.test(renderReceipt(alone.receipts[0])),
-    '10.6: with no live peer it says so — never "0 of 0 read", which reads as failure');
+  ok(/queued with no live target snapshot/.test(renderReceipt(alone.receipts[0])),
+    '10.6: with no live peer it reports a targetless pending queue, never a false acknowledgement');
 
   const directed = summarizeReceipts({ messages: [{ id: 'm', from: 'me-0000', to: 'peer-bbb', text: 't', ts: NOW - 60_000, seen: [] }], sessions, selfId: 'me-0000', now: NOW });
   ok(directed.receipts[0].candidates === 1 && directed.receipts[0].pendingIds.join() === 'peer-bbb',
     '10.7: a DIRECTED note has a denominator of its target, not of everyone');
-  ok(/pending peer-bbb/.test(renderReceipt(directed.receipts[0])) && !/shown to all/.test(renderReceipt(directed.receipts[0])),
+  ok(/acknowledged 0 of 1.*unresolved peer-bbb/.test(renderReceipt(directed.receipts[0])) && !/acknowledged by all/.test(renderReceipt(directed.receipts[0])),
     '10.8: an undelivered directed note never implies delivery (R3)');
-  ok(/Your last note \(10m ago\): shown to 1 of 2 peers · pending peer-bbb\./.test(renderReceiptSummary(s)),
+  ok(/Your last note \(10m ago\): acknowledged 1 of 2 · unresolved peer-bbb\./.test(renderReceiptSummary(s)),
     '10.9: the compact receipt is one honest, text-free line for SessionStart and brain_doctor');
   ok(!renderReceiptSummary({ sent: 0, receipts: [] }),
     '10.10: no sent note produces no automatic receipt noise');
@@ -307,12 +317,34 @@ const fresh = (extra = {}) => ({ lastSeen: NOW - 30_000, startedAt: NOW - 600_00
   const snapshotted = summarizeReceipts({
     messages: [{
       id: 'm-snapshot', from: 'me-0000', to: 'all', text: 't', ts: NOW - 60_000,
-      candidateIds: ['peer-aaa', 'gone-xyz'], seen: ['peer-aaa', 'later-cc'],
+      candidateIds: ['peer-aaa', 'gone-xyz'], seen: ['later-cc'], deliveryVersion: 2,
+      deliveries: [{ recipientId: 'peer-aaa', state: 'acknowledged', acknowledgedAt: NOW - 30_000 }],
     }],
     sessions, selfId: 'me-0000', now: NOW,
   }).receipts[0];
   ok(snapshotted.candidates === 2 && snapshotted.read === 1 && snapshotted.pendingIds.join() === 'gone-xyz',
     '10.11: send-time audience survives peer exit and later viewers never inflate the numerator');
+
+  const legacy = summarizeReceipts({
+    messages: [{
+      id: 'm-legacy', from: 'me-0000', to: 'peer-aaa', text: 'legacy', ts: NOW - 60_000,
+      candidateIds: ['peer-aaa'], seen: ['peer-aaa'],
+    }],
+    sessions, selfId: 'me-0000', now: NOW,
+  }).receipts[0];
+  ok(legacy.acknowledged === 0 && legacy.offered === 1
+    && /offered 1, awaiting later-action ack.*unresolved peer-aaa/.test(renderReceipt(legacy)),
+  '10.12: historical seen[] migrates to offered and never becomes a false acknowledgement');
+
+  const deadLetter = summarizeReceipts({
+    messages: [{
+      id: 'm-dead', from: 'me-0000', to: 'all', text: 'expired', ts: NOW - 60_000,
+      candidateIds: [], deadLetter: { state: 'failed', reason: 'expired-before-acknowledgement', at: NOW },
+    }],
+    sessions, selfId: 'me-0000', now: NOW,
+  }).receipts[0];
+  ok(/delivery failed \(expired before acknowledgement\)/.test(renderReceipt(deadLetter)),
+    '10.13: TTL/cap terminalization stays visible as a dead-letter reason');
 }
 
 // ── 11. End-to-end draft construction from captured cards ─────────────────

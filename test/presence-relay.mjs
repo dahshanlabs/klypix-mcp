@@ -17,11 +17,16 @@ import {
 } from '../src/agent-presence.mjs';
 import { findPresenceConflicts } from '../src/mcp-presence.mjs';
 import {
+  acknowledgePersistedMessage,
+  acceptMessageAckFrame,
   acceptMessageFrame,
   acceptPresenceFrame,
+  buildMessageAckFrame,
   buildMessageFrame,
   buildPresenceFrame,
   canonicalWireFiles,
+  MESSAGE_WIRE_VERSION,
+  messageDeliveryKey,
   PRESENCE_CONSENT_PURPOSE,
   PRESENCE_CONSENT_SCOPE,
   PRESENCE_CONSENT_VERSION,
@@ -139,13 +144,58 @@ ok(outGranted.sent === 2 && sendCount === 2 && outGranted.maxMessageTs === now,
   'granted consent broadcasts local rows + fresh local messages only (cloud rows, xpc-injected and pre-cursor messages skipped)');
 
 // ── P5: message double-delivery renders once ─────────────────────────────────
-const msgFrame = buildMessageFrame({ from: 'sess-a', to: 'all', text: 'Rebase before you commit', ts: now }, { machineId: 'mach-a', now });
+const msgFrame = buildMessageFrame({ id: 'stable-message-1', from: 'sess-a', to: 'all', text: 'Rebase before you commit', ts: now }, { machineId: 'mach-a', now });
 const accepted1 = acceptMessageFrame(msgFrame, { machineId: 'mach-b' });
 const accepted2 = acceptMessageFrame({ ...msgFrame, sentAt: now + 5 }, { machineId: 'mach-b' });
-ok(accepted1 && accepted1.dedupeKey.startsWith(XPC_DEDUPE_PREFIX) && accepted1.dedupeKey === accepted2.dedupeKey,
-  'redelivered message content yields the SAME dedupe key (session id + content hash, P5)');
+ok(msgFrame.v === MESSAGE_WIRE_VERSION && msgFrame.mid === 'stable-message-1'
+  && accepted1?.messageId === 'stable-message-1'
+  && accepted1.dedupeKey.startsWith(XPC_DEDUPE_PREFIX) && accepted1.dedupeKey === accepted2.dedupeKey,
+  'redelivered v2 message keeps the SAME stable id and dedupe key (P5)');
 ok(selectOutboundMessages([{ from: 'x', text: 'y', ts: now, dedupeKey: accepted1.dedupeKey }]).length === 0,
   'an injected cross-PC message is never re-broadcast (message loop prevention)');
+
+const parsedInbound = relayInbound(msgFrame, { consent: GRANT, machineId: 'mach-b', now: now + 5 });
+ok(parsedInbound?.type === 'message' && parsedInbound.acknowledgement === null
+  && acknowledgePersistedMessage(parsedInbound, { persisted: false, now: now + 6 }) === null,
+'parsing a wire message cannot acknowledge it before the local mailbox insert succeeds');
+const mailboxAck = acknowledgePersistedMessage(parsedInbound, { persisted: true, recipientId: 'sess-b', now: now + 7 });
+const acceptedAck = acceptMessageAckFrame(mailboxAck, { machineId: 'mach-a' });
+ok(mailboxAck?.kind === 'message-ack' && acceptedAck?.messageId === 'stable-message-1'
+  && acceptedAck.deliveryKey === messageDeliveryKey('stable-message-1', 'mach-b'),
+'a successful durable mailbox insert mints a per-recipient-machine transport acknowledgement');
+ok(buildMessageAckFrame({
+  messageId: 'stable-message-1', originMachine: 'mach-a', recipientMachine: 'mach-a', now,
+}) === null,
+'an own-machine acknowledgement is rejected as an invalid loop');
+
+const durableMessage = { id: 'durable-two-targets', from: 'sess-a', to: 'all', text: 'deliver everywhere', ts: now };
+const targets = ['mach-b', 'mach-c'];
+const ackB = messageDeliveryKey(durableMessage.id, 'mach-b');
+const ackC = messageDeliveryKey(durableMessage.id, 'mach-c');
+ok(selectOutboundMessages([durableMessage], {
+  acknowledgedDeliveries: [ackB], recipientMachineIds: targets,
+}).length === 1,
+'one machine acceptance does not suppress retry to a second destination machine');
+ok(selectOutboundMessages([durableMessage], {
+  acknowledgedDeliveries: [ackB, ackC], recipientMachineIds: targets,
+}).length === 0,
+'a message retires from durable relay only after every snapshotted machine acknowledges it');
+const failedDurable = relayOutbound({
+  sessions: [], messages: [durableMessage], consent: GRANT, machineId: 'mach-a', now,
+  acknowledgedDeliveries: [ackB], recipientMachineIds: targets, sinceTs: now - 1,
+  send: () => false,
+});
+ok(failedDurable.sent === 0 && failedDurable.failedMessageIds.join() === durableMessage.id
+  && failedDurable.maxMessageTs === now - 1 && failedDurable.pendingDeliveryKeys.join() === ackC,
+'a synchronous transport failure preserves the durable retry set and never advances the timestamp cursor');
+const retryFrames = [];
+for (let attempt = 0; attempt < 2; attempt++) relayOutbound({
+  sessions: [], messages: [durableMessage], consent: GRANT, machineId: 'mach-a', now: now + attempt,
+  acknowledgedDeliveries: [ackB], recipientMachineIds: targets,
+  send: (wire) => retryFrames.push(wire),
+});
+ok(retryFrames.length === 2 && retryFrames.every((wire) => wire.mid === durableMessage.id),
+'reconnect pumps resend the same stable message id until the outstanding destination acknowledges');
 
 // ── Lane integration: two isolated "machines", one shared logical brain ──────
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-xpc-'));

@@ -12,6 +12,10 @@ import path from 'path';
 export const SESSION_FRESH_MS = 10 * 60 * 1000;
 export const MCP_SESSION_FRESH_MS = 3 * 60 * 1000;
 export const MESSAGE_FRESH_MS = 24 * 60 * 60 * 1000;
+export const MESSAGE_RECEIPT_FRESH_MS = 7 * 24 * 60 * 60 * 1000;
+export const MESSAGE_DELIVERY_VERSION = 2;
+export const MESSAGE_LANE_CAP = 30;
+export const MESSAGE_RECEIPT_CAP = 100;
 
 const sha16 = (value) => crypto.createHash('sha1').update(String(value)).digest('hex').slice(0, 16);
 const normBrainPath = (value) => String(value).replace(/\\/g, '/').replace(/^[a-zA-Z]:/, (m) => m.toLowerCase());
@@ -210,6 +214,33 @@ function freshChannelSeen(channelSeen, now) {
       && now - Number(seen || 0) < (channel === 'mcp' ? MCP_SESSION_FRESH_MS : SESSION_FRESH_MS)));
 }
 
+const normalizeTransport = (transport, channelSeen) => {
+  const source = transport && typeof transport === 'object' && !Array.isArray(transport) ? transport : {};
+  const out = {};
+  for (const channel of Object.keys(channelSeen || {})) {
+    const record = source[channel];
+    if (!record || typeof record !== 'object' || Array.isArray(record)) continue;
+    out[channel] = {
+      status: String(record.status || 'connected').slice(0, 40),
+      at: Number(record.at || channelSeen[channel] || 0),
+    };
+  }
+  return out;
+};
+
+export function sessionDeliveryReachability(session) {
+  const channels = new Set(Array.isArray(session?.channels) ? session.channels.map(String) : []);
+  const transport = session?.transport && typeof session.transport === 'object' ? session.transport : {};
+  if (channels.has('lifecycle')) return 'connected';
+  if (channels.has('mcp')) {
+    const status = String(transport.mcp?.status || 'connected');
+    if (['pull-only', 'impaired', 'backpressured'].includes(status)) return status;
+    return 'connected';
+  }
+  if (channels.has('cloud')) return 'relay-best-effort';
+  return 'unknown';
+}
+
 function pruneSessions(sessions, now) {
   const out = [];
   for (const session of (Array.isArray(sessions) ? sessions : [])) {
@@ -219,45 +250,186 @@ function pruneSessions(sessions, now) {
       && !Array.isArray(session.channelSeen)
       && Object.keys(session.channelSeen).length > 0;
     const channelSeen = freshChannelSeen(session.channelSeen, now);
+    const transport = normalizeTransport(session.transport, channelSeen);
     const seenValues = Object.values(channelSeen).map(Number).filter(Number.isFinite);
     const lastSeen = seenValues.length ? Math.max(...seenValues) : Number(session.lastSeen || 0);
     if ((hadChannels && !seenValues.length) || now - lastSeen >= SESSION_FRESH_MS) continue;
     out.push({
       ...session,
       ...(hadChannels ? { channelSeen, channels: Object.keys(channelSeen) } : {}),
+      ...(hadChannels ? {
+        transport,
+        deliveryReachability: sessionDeliveryReachability({
+          ...session,
+          channelSeen,
+          channels: Object.keys(channelSeen),
+          transport,
+        }),
+      } : {}),
       lastSeen,
     });
   }
   return out;
 }
 
-function pruneMessages(messages, now) {
-  return (Array.isArray(messages) ? messages : [])
-    .filter((message) => message?.id && now - Number(message.ts || 0) < MESSAGE_FRESH_MS);
+const DELIVERY_STATES = new Set(['offered', 'acknowledged', 'failed']);
+const recipientKey = (value) => String(value || '').trim().slice(0, 160);
+
+function normalizeDeliveryRecord(record) {
+  const recipientId = recipientKey(record?.recipientId || record?.id);
+  if (!recipientId) return null;
+  const state = DELIVERY_STATES.has(record?.state) ? record.state : 'offered';
+  return {
+    recipientId,
+    state,
+    attempts: Math.max(0, Number(record?.attempts || 0)),
+    ...(record?.offeredAt ? { offeredAt: Number(record.offeredAt) } : {}),
+    ...(record?.acknowledgedAt ? { acknowledgedAt: Number(record.acknowledgedAt) } : {}),
+    ...(record?.failedAt ? { failedAt: Number(record.failedAt) } : {}),
+    ...(record?.offeredActionId ? { offeredActionId: String(record.offeredActionId).slice(0, 160) } : {}),
+    ...(record?.acknowledgedActionId ? { acknowledgedActionId: String(record.acknowledgedActionId).slice(0, 160) } : {}),
+    ...(record?.reason ? { reason: String(record.reason).slice(0, 120) } : {}),
+    ...(record?.legacySeen ? { legacySeen: true } : {}),
+  };
 }
 
-// Cap the message lane WITHOUT silently destroying undelivered notes: the old
-// flat `.slice(-30)` evicted the OLDEST rows first regardless of delivery, so a
-// burst of >30 messages could destroy a note nobody had seen yet. Evict
-// delivered (seen-by-someone) messages first, oldest first; only then the
-// oldest undelivered ones. Order of survivors is preserved.
-export function capMessages(messages, cap = 30) {
-  const list = Array.isArray(messages) ? messages : [];
-  if (list.length <= cap) return list;
-  let excess = list.length - cap;
-  const dropped = new Set();
-  const evict = (predicate) => {
-    for (const message of list) {
-      if (!excess) return;
-      if (dropped.has(message) || !predicate(message)) continue;
-      dropped.add(message);
-      excess--;
-    }
-  };
-  evict((m) => Array.isArray(m?.seen) && m.seen.length > 0);   // delivered at least once
-  evict(() => true);                                            // still over cap → oldest of the rest
-  return list.filter((message) => !dropped.has(message));
+// Legacy `seen[]` was written before hook/tool output reached model context.
+// Migration therefore treats it as OFFERED only. The v2 receiver replays that
+// note once, and only the later in-band action can acknowledge it.
+export function normalizeMessageDelivery(message, now = Date.now()) {
+  if (!message || !message.id) return null;
+  const next = { ...message };
+  const byRecipient = new Map();
+  for (const raw of Array.isArray(message.deliveries) ? message.deliveries : []) {
+    const record = normalizeDeliveryRecord(raw);
+    if (record) byRecipient.set(record.recipientId, record);
+  }
+  for (const legacyId of Array.isArray(message.seen) ? message.seen : []) {
+    const recipientId = recipientKey(legacyId);
+    if (!recipientId || byRecipient.has(recipientId)) continue;
+    byRecipient.set(recipientId, {
+      recipientId,
+      state: 'offered',
+      attempts: 1,
+      offeredAt: Number(message.ts || now),
+      legacySeen: true,
+    });
+  }
+  next.deliveryVersion = MESSAGE_DELIVERY_VERSION;
+  next.deliveries = [...byRecipient.values()];
+  if (!Array.isArray(next.seen)) next.seen = [];
+  return next;
 }
+
+export function messageDeliveryState(message, sessionId) {
+  const recipientId = recipientKey(sessionId);
+  if (!recipientId) return 'pending';
+  const record = (Array.isArray(message?.deliveries) ? message.deliveries : [])
+    .find((entry) => recipientKey(entry?.recipientId || entry?.id) === recipientId);
+  if (record && DELIVERY_STATES.has(record.state)) return record.state;
+  if (Array.isArray(message?.seen) && message.seen.map(recipientKey).includes(recipientId)) return 'offered';
+  return 'pending';
+}
+
+const messageDeliveryRecord = (message, sessionId) => {
+  const recipientId = recipientKey(sessionId);
+  return (Array.isArray(message?.deliveries) ? message.deliveries : [])
+    .find((entry) => recipientKey(entry?.recipientId || entry?.id) === recipientId) || null;
+};
+
+function setDeliveryState(message, sessionId, state, now, reason = null, actionId = '') {
+  const recipientId = recipientKey(sessionId);
+  if (!recipientId) return;
+  if (!Array.isArray(message.deliveries)) message.deliveries = [];
+  let record = message.deliveries.find((entry) => recipientKey(entry?.recipientId || entry?.id) === recipientId);
+  if (!record) {
+    record = { recipientId, state: 'offered', attempts: 0 };
+    message.deliveries.push(record);
+  }
+  record.recipientId = recipientId;
+  record.state = state;
+  if (state === 'offered') {
+    record.attempts = Math.max(0, Number(record.attempts || 0)) + 1;
+    record.offeredAt = now;
+    if (actionId) record.offeredActionId = String(actionId).slice(0, 160);
+    delete record.acknowledgedAt;
+    delete record.failedAt;
+    delete record.reason;
+  } else if (state === 'acknowledged') {
+    record.acknowledgedAt = now;
+    if (actionId) record.acknowledgedActionId = String(actionId).slice(0, 160);
+    delete record.failedAt;
+    delete record.reason;
+    if (!Array.isArray(message.seen)) message.seen = [];
+    if (!message.seen.includes(recipientId)) message.seen.push(recipientId);
+  } else if (state === 'failed') {
+    record.failedAt = now;
+    record.reason = String(reason || 'delivery-failed').slice(0, 120);
+  }
+}
+
+function terminalizeMessage(message, now, reason) {
+  const next = normalizeMessageDelivery(message, now);
+  const known = new Set([
+    ...(Array.isArray(next.candidateIds) ? next.candidateIds : []),
+    ...next.deliveries.map((entry) => entry.recipientId),
+  ].map(recipientKey).filter(Boolean));
+  let unacknowledged = known.size === 0;
+  for (const recipientId of known) {
+    if (messageDeliveryState(next, recipientId) === 'acknowledged') continue;
+    unacknowledged = true;
+    setDeliveryState(next, recipientId, 'failed', now, reason);
+  }
+  if (unacknowledged) next.deadLetter = { state: 'failed', reason, at: now };
+  else next.retiredAt = now;
+  return next;
+}
+
+const isTerminalMessage = (message) => Boolean(message?.deadLetter || message?.retiredAt);
+
+function retireFullyAcknowledged(message, now) {
+  if (!message || isTerminalMessage(message)) return message;
+  const candidates = [...new Set([
+    ...(Array.isArray(message.candidateIds) ? message.candidateIds : []),
+    ...(Array.isArray(message.deliveries) ? message.deliveries.map((entry) => entry?.recipientId || entry?.id) : []),
+  ].map(recipientKey).filter(Boolean))];
+  if (candidates.length && candidates.every((id) => messageDeliveryState(message, id) === 'acknowledged')) {
+    message.retiredAt = now;
+  }
+  return message;
+}
+
+function pruneMessages(messages, now) {
+  const out = [];
+  for (const raw of Array.isArray(messages) ? messages : []) {
+    let message = normalizeMessageDelivery(raw, now);
+    if (!message) continue;
+    const terminalAt = Number(message.deadLetter?.at || message.retiredAt || 0);
+    if (terminalAt && now - terminalAt >= MESSAGE_RECEIPT_FRESH_MS) continue;
+    if (!terminalAt && now - Number(message.ts || 0) >= MESSAGE_FRESH_MS) {
+      message = terminalizeMessage(message, now, 'expired-before-acknowledgement');
+    }
+    out.push(message);
+  }
+  return out;
+}
+
+export function capMessages(messages, cap = MESSAGE_LANE_CAP, now = Date.now()) {
+  const list = (Array.isArray(messages) ? messages : [])
+    .map((message) => retireFullyAcknowledged(normalizeMessageDelivery(message, now), now))
+    .filter(Boolean);
+  const active = list.filter((message) => !isTerminalMessage(message));
+  const excess = Math.max(0, active.length - Math.max(0, Number(cap) || 0));
+  const overflow = new Set(active.slice(0, excess).map((message) => message.id));
+  const terminalized = list.map((message) => overflow.has(message.id)
+    ? terminalizeMessage(message, now, 'lane-capacity-overflow')
+    : message);
+  const terminal = terminalized.filter(isTerminalMessage);
+  const keepTerminal = new Set(terminal.slice(-MESSAGE_RECEIPT_CAP).map((message) => message.id));
+  return terminalized.filter((message) => !isTerminalMessage(message) || keepTerminal.has(message.id));
+}
+
+const maintainMessages = (messages, now) => capMessages(pruneMessages(messages, now), MESSAGE_LANE_CAP, now);
 
 function normalizeFiles(files) {
   const seen = new Set();
@@ -291,6 +463,7 @@ export function upsertSession({
   replaceFiles = false,
   event = null,
   channel = null,
+  transportStatus = null,
   cwd = null,
   hostPid = null,
   home,
@@ -310,6 +483,12 @@ export function upsertSession({
     const previous = sessions.find((session) => session.id === id) || {};
     const channelSeen = freshChannelSeen(previous.channelSeen, now);
     if (channel) channelSeen[String(channel)] = now;
+    const transport = normalizeTransport(previous.transport, channelSeen);
+    if (channel) {
+      const status = transportStatus
+        || (String(channel) === 'mcp' && String(event || '') === 'McpHibernated' ? 'pull-only' : 'connected');
+      transport[String(channel)] = { status: String(status).slice(0, 40), at: now };
+    }
     const mergedFiles = files === undefined
       ? normalizeFiles(previous.files)
       : normalizeFiles(replaceFiles ? files : [...(previous.files || []), ...(files || [])]);
@@ -350,7 +529,12 @@ export function upsertSession({
         ? { activityAt: now, activityKind: activityEvent }
         : (previous.activityAt ? { activityAt: previous.activityAt, activityKind: previous.activityKind || null } : {})),
       ...(Object.keys(channelSeen).length
-        ? { channels: Object.keys(channelSeen), channelSeen }
+        ? {
+          channels: Object.keys(channelSeen),
+          channelSeen,
+          transport,
+          deliveryReachability: sessionDeliveryReachability({ channels: Object.keys(channelSeen), transport }),
+        }
         : {}),
       cwd: cwd ? path.resolve(cwd) : (previous.cwd || path.dirname(brainPath)),
       // Host-process correlation (e.g. Claude Code exports CLAUDE_PID to every
@@ -369,7 +553,7 @@ export function upsertSession({
     writeLaneFileAtomic(laneFile, JSON.stringify({
       ...data,
       sessions: kept.slice(-40),
-      messages: capMessages(pruneMessages(data.messages, now), 30),
+      messages: maintainMessages(data.messages, now),
     }));
     return withWriteVerdict(kept.sort((a, b) => Number(b.lastSeen || 0) - Number(a.lastSeen || 0)), true);
   } finally {
@@ -417,6 +601,8 @@ export function upsertRemoteSessions({ brainPath, rows, machineId = MACHINE_ID, 
         host: row.host ?? previous.host ?? null,
         via: 'cloud',
         channels: ['cloud'],
+        transport: { cloud: { status: 'relay-best-effort', at: now } },
+        deliveryReachability: 'relay-best-effort',
         channelSeen: { cloud: now },   // receiver clock (P4) — frame time never decides freshness
         startedAt: previous.startedAt || now,
         lastSeen: now,
@@ -428,7 +614,7 @@ export function upsertRemoteSessions({ brainPath, rows, machineId = MACHINE_ID, 
     writeLaneFileAtomic(laneFile, JSON.stringify({
       ...data,
       sessions: sessions.slice(-40),
-      messages: capMessages(pruneMessages(data.messages, now), 30),
+      messages: maintainMessages(data.messages, now),
     }));
     return withWriteVerdict(sessions.sort((a, b) => Number(b.lastSeen || 0) - Number(a.lastSeen || 0)), true);
   } finally {
@@ -452,7 +638,7 @@ export function purgeRemoteSessions({ brainPath, home, now = Date.now() }) {
     writeLaneFileAtomic(laneFile, JSON.stringify({
       ...data,
       sessions,
-      messages: capMessages(pruneMessages(data.messages, now), 30),
+      messages: maintainMessages(data.messages, now),
     }));
     return sessions;
   } finally {
@@ -477,12 +663,15 @@ export function removeSession({ brainPath, id, channel = null, home, now = Date.
       if (!channel || !session.channelSeen || typeof session.channelSeen !== 'object') continue;
       const channelSeen = freshChannelSeen(session.channelSeen, now);
       delete channelSeen[String(channel)];
+      const transport = normalizeTransport(session.transport, channelSeen);
       const seenValues = Object.values(channelSeen).map(Number).filter(Number.isFinite);
       if (!seenValues.length) continue;
       sessions.push({
         ...session,
         channels: Object.keys(channelSeen),
         channelSeen,
+        transport,
+        deliveryReachability: sessionDeliveryReachability({ channels: Object.keys(channelSeen), transport }),
         lastSeen: Math.max(...seenValues),
       });
     }
@@ -490,7 +679,7 @@ export function removeSession({ brainPath, id, channel = null, home, now = Date.
     writeLaneFileAtomic(laneFile, JSON.stringify({
       ...data,
       sessions,
-      messages: capMessages(pruneMessages(data.messages, now), 30),
+      messages: maintainMessages(data.messages, now),
     }));
     return sessions;
   } finally {
@@ -512,12 +701,17 @@ function messageTargetsSession(message, session, sessionId) {
   return searchable.includes(target);
 }
 
+// One in-band action advances one step. A pending note is OFFERED; an already
+// offered note is replayed on the later action and then ACKNOWLEDGED. This
+// deliberate second injection is the recovery window for a closed response
+// transport and is what makes legacy false-positive `seen` rows safe to migrate.
 export function receiveMessages({
   brainPath,
   sessionId,
   ignoreTexts = [],
   home,
   now = Date.now(),
+  actionId = '',
 }) {
   if (!brainPath || !sessionId) return [];
   const laneFile = laneFileFor(brainPath, home);
@@ -527,30 +721,31 @@ export function receiveMessages({
   try {
     const data = readLane(laneFile);
     const sessions = pruneSessions(data.sessions, now);
-    const messages = pruneMessages(data.messages, now);
+    const messages = maintainMessages(data.messages, now);
     const me = sessions.find((session) => session.id === sessionId);
-    const unseen = messages.filter((message) =>
-      message.from !== sessionId
-      && !(Array.isArray(message.seen) && message.seen.includes(sessionId))
-      && messageTargetsSession(message, me, sessionId));
-    if (!unseen.length) return [];
+    const due = messages.filter((message) => {
+      const state = messageDeliveryState(message, sessionId);
+      const record = messageDeliveryRecord(message, sessionId);
+      return !isTerminalMessage(message)
+        && message.from !== sessionId
+        && (state === 'pending' || state === 'offered')
+        && !(state === 'offered' && actionId && record?.offeredActionId === String(actionId))
+        && messageTargetsSession(message, me, sessionId);
+    });
 
-    // Deliver-then-ack, never ack-then-truncate: the old path acked EVERY unseen
-    // message under lock but returned only the first 6 — anything past the cap
-    // was marked seen without ever being shown, permanently lost under the
-    // delivered-once contract (2026-07-29 audit). Ack exactly: the delivered 6,
-    // plus self-ignored texts and text-duplicates OF a delivered message (their
-    // content was shown once via the twin). Overflow stays unacked and arrives
-    // on the next call.
     const normText = (message) => String(message.text || '').replace(/\s+/g, ' ').trim().toLowerCase();
     const ignored = new Set(ignoreTexts.map((text) => String(text || '').replace(/\s+/g, ' ').trim().toLowerCase()));
+    const deliveryKey = (message) => `${recipientKey(message?.from)}\u0000${normText(message)}`;
     const shown = [];
-    const dropped = [];   // ignored (own sends) — content intentionally never shown
     const seenText = new Set();
     const dupesByText = new Map();
-    for (const message of unseen) {
-      const key = normText(message);
-      if (!key || ignored.has(key)) { dropped.push(message); continue; }
+    for (const message of due) {
+      const textKey = normText(message);
+      const key = deliveryKey(message);
+      // Text-only transcript compatibility can suppress this ONE response, but
+      // cannot truthfully fail/ack a message: a peer may have sent identical
+      // text. Stable sender ids handle real self-echoes via message.from above.
+      if (!textKey || ignored.has(textKey)) continue;
       if (seenText.has(key)) {
         if (!dupesByText.has(key)) dupesByText.set(key, []);
         dupesByText.get(key).push(message);
@@ -559,31 +754,63 @@ export function receiveMessages({
       seenText.add(key);
       shown.push(message);
     }
+
     const delivered = shown.slice(0, 6);
-    const ackIds = new Set(delivered.map((message) => message.id));
-    for (const message of dropped) ackIds.add(message.id);
+    const advance = new Set();
     for (const message of delivered) {
-      for (const dupe of dupesByText.get(normText(message)) || []) ackIds.add(dupe.id);
+      advance.add(message.id);
+      for (const dupe of dupesByText.get(deliveryKey(message)) || []) advance.add(dupe.id);
     }
-    if (ackIds.size) {
-      for (const message of messages) {
-        if (!ackIds.has(message.id)) continue;
-        if (!Array.isArray(message.seen)) message.seen = [];
-        if (!message.seen.includes(sessionId)) message.seen.push(sessionId);
-      }
-      writeLaneFileAtomic(laneFile, JSON.stringify({ ...data, sessions, messages }));
+    for (const message of messages) {
+      if (!advance.has(message.id)) continue;
+      const previous = messageDeliveryState(message, sessionId);
+      if (previous === 'offered') setDeliveryState(message, sessionId, 'acknowledged', now, null, actionId);
+      else if (previous === 'pending') setDeliveryState(message, sessionId, 'offered', now, null, actionId);
+      retireFullyAcknowledged(message, now);
     }
+    // Persist migration/expiry/dead-letter changes even when the inbox is empty.
+    fs.mkdirSync(path.dirname(laneFile), { recursive: true });
+    writeLaneFileAtomic(laneFile, JSON.stringify({ ...data, sessions, messages }));
     return delivered;
   } finally {
-    if (gotLock) releaseLock(lockFile);
+    releaseLock(lockFile);
+  }
+}
+
+// Explicit receipt path for adapters that can carry prior offer ids on a later
+// inbound action. Pending ids are refused: an adapter cannot acknowledge a note
+// it never offered into its model-visible response.
+export function acknowledgeMessages({ brainPath, sessionId, messageIds = [], home, now = Date.now(), actionId = '' }) {
+  if (!brainPath || !sessionId || !Array.isArray(messageIds) || !messageIds.length) return [];
+  const laneFile = laneFileFor(brainPath, home);
+  const lockFile = laneFile + '.lock';
+  const gotLock = acquireLock(lockFile);
+  if (!gotLock) return [];
+  try {
+    const data = readLane(laneFile);
+    const sessions = pruneSessions(data.sessions, now);
+    const messages = maintainMessages(data.messages, now);
+    const wanted = new Set(messageIds.map(String));
+    const acknowledged = [];
+    for (const message of messages) {
+      const record = messageDeliveryRecord(message, sessionId);
+      if (!wanted.has(String(message.id)) || messageDeliveryState(message, sessionId) !== 'offered'
+        || (actionId && record?.offeredActionId === String(actionId))) continue;
+      setDeliveryState(message, sessionId, 'acknowledged', now, null, actionId);
+      retireFullyAcknowledged(message, now);
+      acknowledged.push(message.id);
+    }
+    writeLaneFileAtomic(laneFile, JSON.stringify({ ...data, sessions, messages }));
+    return acknowledged;
+  } finally {
+    releaseLock(lockFile);
   }
 }
 
 // Non-destructive inbox preview for MCP logging notifications. Unlike
-// receiveMessages(), this NEVER appends the session id to message.seen, so a
-// host that ignores notifications cannot make a coordination warning vanish.
-// The next KLYPIX tool result or lifecycle hook still receives + acknowledges
-// the same message through the guaranteed in-band path.
+// receiveMessages(), this never advances a v2 delivery state, so a host that
+// ignores notifications cannot make a coordination warning vanish. The next
+// supported model-context action can still offer/replay it within lane TTL/cap.
 export function peekMessages({
   brainPath,
   sessionId,
@@ -594,15 +821,17 @@ export function peekMessages({
   if (!brainPath || !sessionId) return [];
   const data = readLane(laneFileFor(brainPath, home));
   const sessions = pruneSessions(data.sessions, now);
-  const messages = pruneMessages(data.messages, now);
+  const messages = maintainMessages(data.messages, now);
   const me = sessions.find((session) => session.id === sessionId);
   const ignored = new Set(ignoreTexts.map((value) =>
     String(value || '').replace(/\s+/g, ' ').trim().toLowerCase()));
   const shown = [];
   const seenText = new Set();
   for (const message of messages) {
-    if (message.from === sessionId
-      || (Array.isArray(message.seen) && message.seen.includes(sessionId))
+    const state = messageDeliveryState(message, sessionId);
+    if (isTerminalMessage(message)
+      || message.from === sessionId
+      || (state !== 'pending' && state !== 'offered')
       || !messageTargetsSession(message, me, sessionId)) continue;
     const key = String(message.text || '').replace(/\s+/g, ' ').trim().toLowerCase();
     if (!key || ignored.has(key) || seenText.has(key)) continue;
@@ -612,7 +841,7 @@ export function peekMessages({
   return shown.slice(0, 6);
 }
 
-// Queue a one-time coordination message directly on the shared presence lane.
+// Queue a durable-within-policy coordination message on the shared presence lane.
 // `dedupeKey` makes machine-generated alerts (for example, exact file overlap)
 // idempotent without weakening deliberate brain_message notes.
 export function postPresenceMessage({
@@ -633,7 +862,7 @@ export function postPresenceMessage({
   try {
     const data = readLane(laneFile);
     const sessions = pruneSessions(data.sessions, now);
-    const messages = pruneMessages(data.messages, now);
+    const messages = maintainMessages(data.messages, now);
     const key = String(dedupeKey || '').replace(/\s+/g, ' ').trim().slice(0, 240);
     if (key) {
       const existing = messages.find((message) => message?.dedupeKey === key);
@@ -655,6 +884,8 @@ export function postPresenceMessage({
       text: body,
       ts: now,
       seen: [],
+      deliveryVersion: MESSAGE_DELIVERY_VERSION,
+      deliveries: [],
       candidateIds,
       ...(key ? { dedupeKey: key } : {}),
     };
@@ -663,7 +894,7 @@ export function postPresenceMessage({
     writeLaneFileAtomic(laneFile, JSON.stringify({
       ...data,
       sessions,
-      messages: capMessages(messages, 30),
+      messages: capMessages(messages, MESSAGE_LANE_CAP, now),
     }));
     return { posted: true, message };
   } finally {

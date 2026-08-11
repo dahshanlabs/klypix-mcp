@@ -348,11 +348,14 @@ const archived = (struct) => struct.cards.filter(c => c.type !== 'container' && 
             { title: 'Runtime', cards: [{ text: CORRECTION }] },
         ],
     }));
-    const r = await opBrainReconcile({ vault, mode: 'contradictions' });
+    // The project brain intentionally outranks the vault default when the test
+    // is launched from a repository. Pin this fixture explicitly so the tool
+    // assertion cannot accidentally inspect the repository's real brain.
+    const r = await opBrainReconcile({ vault, canvas: 'brain', mode: 'contradictions' });
     const txt = (r.blocks || []).map(b => b.text || '').join('\n');
     ok(/⚔️ 1 contradiction candidate/.test(txt), 'P8 tool: brain_reconcile mode=contradictions surfaces the pair');
     ok(/likely STALE\s+\[Strategy\]/.test(txt) && /likely CURRENT\s+\[Runtime\]/.test(txt), 'P8 tool: stale/current sides labeled with their areas');
-    const rAll = await opBrainReconcile({ vault, mode: 'all' });
+    const rAll = await opBrainReconcile({ vault, canvas: 'brain', mode: 'all' });
     const txtAll = (rAll.blocks || []).map(b => b.text || '').join('\n');
     ok(/⚔️/.test(txtAll), 'P8 tool: default mode=all includes the contradictions pass');
     ok(!/<ISERROR>/.test(txtAll) && !rAll.isError, 'P8 tool: mode=all with no migrations dir is not an error');

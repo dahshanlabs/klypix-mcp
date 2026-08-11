@@ -153,7 +153,7 @@ try {
     },
   });
   const checkpointStructured = aCheckpoint.structuredContent || {};
-  checks.guaranteedInBandDelivery = checkpointStructured.messages?.some((message) =>
+  checks.durableInBandOffer = checkpointStructured.messages?.some((message) =>
     String(message.text).includes('Automatic KLYPIX overlap alert')) === true;
 
   await Promise.all([
@@ -188,10 +188,26 @@ try {
       && /no live session declared docs\/unowned\.md/.test(nobody.reason);
 
     const receipt = summarizeReceipts({
-      messages: [{ id: 'finding-note', from: 'finding-sender', to: 'all', text: 'verified note', ts: now - 1_000, candidateIds: ['finding-owner'], seen: ['finding-owner'] }],
+      messages: [{
+        id: 'finding-note',
+        from: 'finding-sender',
+        to: 'all',
+        text: 'verified note',
+        ts: now - 1_000,
+        candidateIds: ['finding-owner'],
+        deliveryVersion: 2,
+        deliveries: [{
+          recipientId: 'finding-owner',
+          state: 'acknowledged',
+          attempts: 1,
+          offeredAt: now - 900,
+          acknowledgedAt: now - 500,
+        }],
+        seen: ['finding-owner'],
+      }],
       sessions: lane, selfId: 'finding-sender', now,
     });
-    checks.findingReceiptRendered = /shown to all 1 peer\(s\) that were live/.test(renderReceiptSummary(receipt));
+    checks.findingReceiptRendered = /model-context delivery acknowledged by all 1 target peer\(s\) on a later action \(not human-read\)/.test(renderReceiptSummary(receipt));
   }
 
   // ── Cross-PC presence: simulated two-machine scenario ─────────────────────
@@ -305,7 +321,7 @@ const required = [
   'exactBlockingOverlap',
   'alertQueued',
   'proactiveLogging',
-  'guaranteedInBandDelivery',
+  'durableInBandOffer',
   'findingRouteOwnerReason',
   'findingRouteNobodyReason',
   'findingReceiptRendered',
@@ -323,7 +339,8 @@ const result = {
   metrics,
   contract: {
     proactive: 'best-effort MCP logging notification',
-    guaranteed: 'same alert on the next KLYPIX action',
+    inBand: 'a retained machine-local note is offered on a supported model-context KLYPIX action, then acknowledged only by a later independent action; expiry/overflow are failed receipts',
+    crossMachine: 'relay primitives require caller-confirmed durable insertion and a per-recipient-machine acknowledgement; app bridge wiring is a separate conformance boundary',
   },
 };
 
@@ -336,6 +353,6 @@ if (jsonMode) {
   }
   if (checks.error) console.log(`  error: ${checks.error}`);
   console.log(`  memory/coordination: ${metrics.firstClientMs ?? '?'}ms / ${metrics.secondClientMs ?? '?'}ms`);
-  console.log('  proactive notifications are best-effort; next-action delivery is guaranteed.');
+  console.log('  proactive notifications are best-effort; retained notes use offer → later-action acknowledgement, with explicit failure receipts.');
 }
 process.exit(ok ? 0 : 1);

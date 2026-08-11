@@ -814,31 +814,6 @@ function msgTargetsMe(m, me, sid) {
     return [String(sid || ''), String(sid || '').slice(0, 8), me?.branch || '', me?.intent || '', me?.client || '', me?.surface || '']
         .join(' ').toLowerCase().includes(to);
 }
-// Compatibility self-echo guard for pre-v2 MCP notes that carried only a client
-// label as `from`. New notes carry a stable session id and are excluded by id.
-// A text match is applied only to known legacy sender labels and only suppresses
-// one response; it never acknowledges or fails the row.
-function ownMcpSendTexts(tp) {
-    try {
-        if (!tp || !fs.existsSync(tp)) return new Set();
-        const buf = fs.readFileSync(tp);
-        const s = buf.length > 2_000_000 ? buf.toString('utf8', buf.length - 2_000_000) : buf.toString('utf8');
-        if (!s.includes('brain_message')) return new Set();
-        const out = new Set();
-        for (const ln of s.split('\n')) {
-            if (!ln.includes('brain_message')) continue;
-            let e; try { e = JSON.parse(ln); } catch { continue; }
-            const c = e?.message?.content;
-            if (!Array.isArray(c)) continue;
-            for (const b of c) {
-                if (b?.type === 'tool_use' && /brain_message$/.test(String(b.name || '')) && b.input?.text) {
-                    out.add(String(b.input.text).trim().slice(0, 400));
-                }
-            }
-        }
-        return out;
-    } catch { return new Set(); }
-}
 // ── Decay-aware message stamps (2026-07-28 post-mortem, class B) ─────────────
 // A delivered inter-session message is MEMORY, not a SENSOR: a peer's "no
 // TestFlight upload triggered yet" relayed ~12h later read as CURRENT state and
@@ -888,11 +863,12 @@ function messageFooter(sid, tp, lib) {
         const me = sessions.find(s => s.id === sid);
         const due = messages.filter(m => m && !msgTerminal(m) && m.from !== sid
             && ['pending', 'offered'].includes(msgDeliveryState(m, sid)) && msgTargetsMe(m, me, sid));
-        const own = ownMcpSendTexts(tp);
-        const legacySelfSender = (m) => /^(?:legacy-|mcp$|claude-code$|cursor$|cline$|windsurf$)/i.test(String(m?.from || ''));
-        const show = own.size
-            ? due.filter(m => !(legacySelfSender(m) && own.has(String(m.text || '').trim().slice(0, 400))))
-            : due;
+        // Stable v2 sender ids make self-exclusion exact (`m.from !== sid`). Do
+        // not infer identity from transcript text: two sessions can send the
+        // same words, and the old whole-transcript filter suppressed the peer's
+        // real note forever. A pre-v2 generic-sender self-echo is safer than a
+        // false delivery receipt for somebody else's message.
+        const show = due;
         const norm = (m) => String(m.text || '').replace(/\s+/g, ' ').trim().toLowerCase();
         const deliveryKey = (m) => `${msgRecipientKey(m?.from)}\u0000${norm(m)}`;
         const seenText = new Set(); const dupes = new Map(); const unique = [];

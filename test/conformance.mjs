@@ -21,7 +21,7 @@ const required = [
   'exactBlockingOverlap',
   'alertQueued',
   'proactiveLogging',
-  'guaranteedInBandDelivery',
+  'durableInBandOffer',
   'findingRouteOwnerReason',
   'findingRouteNobodyReason',
   'findingReceiptRendered',
@@ -40,8 +40,11 @@ const ok = (condition, label) => {
 ok(result.ok === true, 'public conformance command returns PASS');
 for (const name of required) ok(result.checks?.[name] === true, `conformance: ${name}`);
 ok(result.contract?.proactive?.includes('best-effort')
-  && result.contract?.guaranteed?.includes('next KLYPIX action'),
-'conformance report distinguishes proactive best-effort from guaranteed delivery');
+  && result.contract?.inBand?.includes('later independent action')
+  && result.contract?.inBand?.includes('failed receipts')
+  && result.contract?.crossMachine?.includes('app bridge wiring is a separate conformance boundary')
+  && !Object.hasOwn(result.contract || {}, 'guaranteed'),
+'conformance reports the bounded offer/ack/failure contract without a false delivery guarantee');
 
 console.log(failures
   ? `\n[x] ${failures} conformance assertion(s) failed`

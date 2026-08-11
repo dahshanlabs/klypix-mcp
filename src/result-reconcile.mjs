@@ -25,6 +25,12 @@ const isPlainObject = (value) => Boolean(
   && (Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null),
 );
 
+function rejectUnknownKeys(raw, allowed, label, errors) {
+  if (!isPlainObject(raw)) return;
+  const unknown = Object.keys(raw).filter((key) => !allowed.has(key)).sort();
+  if (unknown.length) errors.push(`unknown ${label} field(s): ${unknown.join(', ')}`);
+}
+
 function canonicalValue(value, seen = new Set()) {
   if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
   if (typeof value === 'number') {
@@ -41,7 +47,10 @@ function canonicalValue(value, seen = new Set()) {
   if (isPlainObject(value)) {
     if (seen.has(value)) throw new TypeError('cyclic result provenance is not supported');
     seen.add(value);
-    const out = {};
+    // A null-prototype accumulator makes every JSON key data. Assigning an
+    // untrusted `__proto__` key to a normal object invokes its legacy setter,
+    // silently dropping provenance from the canonical hash.
+    const out = Object.create(null);
     for (const key of Object.keys(value).sort()) {
       if (value[key] === undefined) throw new TypeError(`undefined value at ${key}`);
       out[key] = canonicalValue(value[key], seen);
@@ -95,6 +104,7 @@ function validateContextBlock(raw, label, errors) {
     errors.push(`${label} must be an object with details and fingerprint`);
     return null;
   }
+  rejectUnknownKeys(raw, new Set(['details', 'fingerprint']), label, errors);
   if (!isPlainObject(raw.details) || Object.keys(raw.details).length === 0) {
     errors.push(`${label}.details must be a non-empty object`);
     return null;
@@ -130,6 +140,7 @@ function validateMetrics(raw, errors) {
       errors.push(`metrics.${name} must be an object`);
       continue;
     }
+    rejectUnknownKeys(metric, new Set(['value', 'count', 'tolerance', 'numerator']), `metrics.${name}`, errors);
     const value = metric.value;
     const count = metric.count;
     const tolerance = metric.tolerance;
@@ -183,6 +194,7 @@ export function validateResultManifest(raw, { projectRoot, verifyReport = true }
   if (!isPlainObject(raw.report)) {
     errors.push('report must be an object with project-relative path and sha256');
   } else {
+    rejectUnknownKeys(raw.report, new Set(['path', 'sha256']), 'report', errors);
     const declaredHash = normalizedSha(raw.report.sha256);
     if (typeof raw.report.path !== 'string') errors.push('report.path must be a string');
     if (typeof raw.report.sha256 !== 'string' || !SHA256_RE.test(declaredHash)) {
@@ -211,6 +223,7 @@ export function validateResultManifest(raw, { projectRoot, verifyReport = true }
   if (!isPlainObject(raw.provenance)) {
     errors.push('provenance must be an object');
   } else {
+    rejectUnknownKeys(raw.provenance, new Set(['producer', 'runId', 'gitCommit', 'dirtyDigest']), 'provenance', errors);
     const producer = typeof raw.provenance.producer === 'string' ? raw.provenance.producer.trim() : '';
     const runId = typeof raw.provenance.runId === 'string' ? raw.provenance.runId.trim() : '';
     const gitCommit = typeof raw.provenance.gitCommit === 'string'

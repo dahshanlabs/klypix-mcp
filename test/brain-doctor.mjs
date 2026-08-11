@@ -23,7 +23,7 @@ import {
   linkProject,
   safeReadCodexConfig,
 } from '../src/agent-rules.mjs';
-import { inspect } from '../src/brain-doctor.mjs';
+import { inspect, render } from '../src/brain-doctor.mjs';
 import { laneFileFor } from '../src/agent-presence.mjs';
 import { makeVault, seedBrain } from './_harness.mjs';
 
@@ -181,6 +181,78 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
   fs.rmSync(proj, { recursive: true, force: true });
 }
 
+// A deliberately hibernated supervisor has released its worker but still owns
+// a healthy pull-only connection. Doctor must use the sleeping target for
+// version alignment and must not call the expected worker absence an outage.
+{
+  const home = path.join(os.tmpdir(), `klypix-doctor-hibernation-${process.pid}`);
+  const project = path.join(home, 'project');
+  const brainDir = path.join(home, '.claude', 'project-brain');
+  const supervisorsDir = path.join(brainDir, '.supervisors');
+  fs.rmSync(home, { recursive: true, force: true });
+  fs.mkdirSync(project, { recursive: true });
+  fs.mkdirSync(supervisorsDir, { recursive: true });
+  fs.writeFileSync(path.join(brainDir, 'klypix-mcp-server.mjs'), "const PKG_VERSION = '1.65.0';\nrunMcpSupervisor();\n");
+  fs.writeFileSync(path.join(brainDir, 'mcp-supervisor.mjs'), '// supervisor fixture');
+  const stateFile = path.join(supervisorsDir, `${process.pid}.json`);
+  fs.writeFileSync(stateFile, JSON.stringify({
+    pid: process.pid,
+    status: 'hibernated',
+    active: null,
+    hibernation: {
+      hibernated: true,
+      target: { version: '1.65.0', path: 'C:/runtime/klypix-mcp-worker.mjs', source: 'managed' },
+    },
+    transport: { host: 'connected', delivery: 'pull-only' },
+  }));
+  const sleeping = inspect({ home, projectDir: project, fmtLib: null });
+  const sleepingText = render(sleeping, { color: false });
+  ok(sleeping.layers.supervisor === 'ok'
+    && sleeping.supervisors.impaired.length === 0
+    && sleeping.supervisors.matchesInstalled === true
+    && sleeping.supervisors.live[0]?.activeVersion === '1.65.0'
+    && /hibernated \(worker released, presence held, wakes on the next request\)/.test(sleepingText),
+  'doctor treats intentional pull-only hibernation as healthy and version-aligned');
+
+  fs.writeFileSync(stateFile, JSON.stringify({
+    pid: process.pid,
+    status: 'recovery-failed',
+    active: null,
+    hibernation: { hibernated: false, target: null },
+    transport: { host: 'impaired', delivery: 'impaired' },
+    lastError: 'worker could not restart',
+  }));
+  const failed = inspect({ home, projectDir: project, fmtLib: null });
+  ok(failed.layers.supervisor === 'drift'
+    && failed.supervisors.impaired.length === 1
+    && failed.supervisors.impaired[0].workerImpaired === true,
+  'doctor still marks a terminal worker/transport failure as impaired');
+
+  fs.writeFileSync(stateFile, JSON.stringify({
+    pid: process.pid,
+    status: 'ready',
+    active: { pid: process.pid, path: 'C:/runtime/klypix-mcp-worker.mjs' },
+    transport: { host: 'connected', delivery: 'connected' },
+  }));
+  const unversioned = inspect({ home, projectDir: project, fmtLib: null });
+  ok(unversioned.layers.supervisor === 'drift'
+    && unversioned.supervisors.matchesInstalled === false,
+  'doctor does not call a live worker healthy when its deployed version is unknown');
+
+  fs.writeFileSync(stateFile, JSON.stringify({
+    pid: process.pid,
+    status: 'ready',
+    active: { pid: process.pid, version: '1.65.0', path: 'C:/runtime/klypix-mcp-worker.mjs' },
+    transport: { host: 'connected', delivery: 'backpressured' },
+  }));
+  const backpressured = inspect({ home, projectDir: project, fmtLib: null });
+  const backpressuredText = render(backpressured, { color: false });
+  ok(backpressured.layers.supervisor === 'drift'
+    && /0 healthy .* 1 delivery-backpressured/.test(backpressuredText),
+  'doctor excludes a backpressured transport from the healthy supervisor count');
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
 // ── PART B — brain_doctor as a real MCP verb ─────────────────────────────────
 {
   const vault = makeVault();
@@ -222,7 +294,17 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
   });
   laneData.messages.push({
     id: 'doctor-receipt', from: self.id, to: 'all', text: 'verified doctor receipt',
-    ts: receiptNow - 1_000, candidateIds: ['doctor-peer'], seen: ['doctor-peer'],
+    ts: receiptNow - 1_000,
+    candidateIds: ['doctor-peer'],
+    deliveryVersion: 2,
+    deliveries: [{
+      recipientId: 'doctor-peer',
+      state: 'acknowledged',
+      attempts: 1,
+      offeredAt: receiptNow - 900,
+      acknowledgedAt: receiptNow - 500,
+    }],
+    seen: ['doctor-peer'],
   });
   fs.writeFileSync(lane, JSON.stringify(laneData, null, 2));
 
@@ -233,8 +315,8 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
     && /CODEX/.test(text) && /SESSIONS/.test(text),
   'brain_doctor returns the host-neutral layered verdict');
   ok(/2 active/.test(text), 'the MCP connection and synthetic live peer are counted without hooks');
-  ok(/your last note \(just now\): shown to all 1 peer\(s\) that were live\./.test(text),
-    'brain_doctor renders this session\'s real seen receipt without claiming a human read it');
+  ok(/your last note \(just now\): model-context delivery acknowledged by all 1 target peer\(s\) on a later action \(not human-read\)\./.test(text),
+    'brain_doctor renders a real later-action receipt without claiming a human read it');
 
   const synced = await client.callTool({
     name: 'brain_sync',

@@ -202,6 +202,14 @@ function inspectSupervisors(brainDir, baked) {
     const state = readJson(path.join(dir, name), null);
     if (!state?.pid || !isAlivePid(state.pid)) continue;
     const status = state.status || 'unknown';
+    const intentionallyHibernated = status === 'hibernated'
+      && state.hibernation?.hibernated === true;
+    const sleepingTarget = intentionallyHibernated ? state.hibernation?.target : null;
+    const deliveryStatus = state.transport?.delivery
+      || (intentionallyHibernated ? 'pull-only' : (state.active ? 'connected' : 'unknown'));
+    const workerImpaired = !state.active && !intentionallyHibernated
+      && status !== 'starting' && status !== 'awaiting-initialize';
+    const deliveryImpaired = deliveryStatus === 'impaired' || state.transport?.host === 'impaired';
     live.push({
       pid: state.pid,
       status,
@@ -209,9 +217,15 @@ function inspectSupervisors(brainDir, baked) {
       // hang/fail. 'restart-required' with a live active worker is DEGRADED
       // (an update was rejected, the old worker keeps serving) — flagging that
       // red as "tool calls hang" would be factually wrong (review-caught).
-      impaired: !state.active && status !== 'starting' && status !== 'awaiting-initialize',
+      impaired: workerImpaired || deliveryImpaired,
+      workerImpaired,
+      deliveryImpaired,
+      degraded: deliveryStatus === 'backpressured' || state.transport?.host === 'backpressured',
+      deliveryStatus,
+      transport: state.transport || null,
       activePid: state.active?.pid || null,
-      activeVersion: state.active?.version || null,
+      activeVersion: state.active?.version || sleepingTarget?.version || null,
+      activePath: state.active?.path || sleepingTarget?.path || null,
       hotReloads: Number(state.hotReloads || 0),
       lastSwapAt: state.lastSwapAt || null,
       lastError: state.lastError || null,
@@ -427,7 +441,9 @@ export function inspect(opts = {}) {
     // hang), not health — pid-alive alone must never render it ok. A stale
     // active-worker version is the same class of drift RUNNING reports.
     supervisor: supervisors.active
-      ? (supervisors.impaired.length ? 'drift' : (supervisors.matchesInstalled === false ? 'drift' : 'ok'))
+      ? (supervisors.impaired.length || supervisors.live.some(state => state.degraded)
+        ? 'drift'
+        : (supervisors.matchesInstalled === false ? 'drift' : 'ok'))
       : (version.supervisorCapable ? 'pending-reconnect' : 'legacy'),
     autoUpdate: !autoUpdate.enabled
       ? 'off'
@@ -479,7 +495,13 @@ export function inspect(opts = {}) {
     if (hooks.missing.length) actions.push(`npx klypix-mcp install   # half-wired: hooks not active — ${hooks.missing.join(', ')}`);
     if (hasBrain && !harness.ok) actions.push('automatic harness repair pending   # retried at the next brain_sync/update check; no manual link command required');
     if (layers.decayGuard === 'drift') actions.push('npx klypix-mcp install   # decay-aware status guard missing/stale — stale build/deploy claims can render as CURRENT state');
-    for (const s of supervisors.impaired || []) actions.push(`/mcp reconnect   # supervisor pid ${s.pid} is ${s.status} with no live worker — its tool calls hang until reconnected`);
+    for (const s of supervisors.impaired || []) {
+      const why = s.workerImpaired ? 'has no live worker; tool calls cannot complete' : `cannot confirm host delivery (${s.deliveryStatus})`;
+      actions.push(`/mcp reconnect   # supervisor pid ${s.pid} ${why}`);
+    }
+    for (const s of supervisors.live.filter(state => state.degraded)) {
+      actions.push(`/mcp reconnect if backpressure persists   # supervisor pid ${s.pid} has queued host output awaiting drain`);
+    }
     if (peers.twinGroups && peers.twinGroups.length) actions.push(`/mcp reconnect   # ${peers.twinGroups.length} session(s) split across twin lane rows (channel merge not occurring) — reconnect adopts the merged id`);
     if (hasBrain && (gitCapture.state === 'foreign' || Object.values(gitCapture.hooks || {}).some(s => s === 'foreign' || s === 'foreign-sh'))) {
       actions.push('npx klypix-mcp git-hook install   # a pre-existing git hook occupies post-commit/post-merge — this chains the commit-capture block after it (auto-install never edits a foreign hook)');
@@ -500,7 +522,13 @@ export function driftLine(r) {
   if (r.version.dirty) bits.push('dirty deploy');
   if (r.npm && r.npm.matches === false) bits.push(`v${r.version.baked}<${r.npm.latest}`);
   if (r.running && r.running.matchesInstalled === false) bits.push(`live server v${r.running.version}≠installed v${r.version.baked} (/mcp reconnect)`);
-  if (r.supervisors?.impaired?.length) bits.push(`${r.supervisors.impaired.length} supervisor(s) IMPAIRED — tool calls hang (/mcp reconnect)`);
+  if (r.supervisors?.impaired?.length) {
+    const workerless = r.supervisors.impaired.filter(state => state.workerImpaired).length;
+    const transport = r.supervisors.impaired.length - workerless;
+    if (workerless) bits.push(`${workerless} supervisor(s) have no live worker — tool calls cannot complete (/mcp reconnect)`);
+    if (transport) bits.push(`${transport} supervisor transport(s) cannot confirm host delivery (/mcp reconnect)`);
+  }
+  if (r.supervisors?.live?.some(state => state.degraded)) bits.push('supervisor host delivery backpressured');
   if (r.hooks.missing.length) bits.push(`${r.hooks.missing.length} hook(s) unwired`);
   if (r.project.hasBrain && !r.harness.ok) bits.push(`${r.harness.drift.length} harness file(s) drifted`);
   if (r.layers?.decayGuard === 'drift') bits.push('decay-guard stale (fast-decay status claims unstamped)');
@@ -548,11 +576,18 @@ export function render(r, opts = {}) {
   if (r.supervisors?.active) {
     const totalReloads = r.supervisors.live.reduce((sum, state) => sum + state.hotReloads, 0);
     const impaired = r.supervisors.impaired || [];
-    const smark = impaired.length ? warn : ok;
-    const healthy = r.supervisors.count - impaired.length;
-    L.push(`${smark} ${c.bold}SUPERVISOR${c.rst}  ${healthy} healthy${impaired.length ? ` · ${c.red}${impaired.length} IMPAIRED (no live worker — its tool calls hang)${c.rst}` : ' · zero-restart core activation ready'}${totalReloads ? ` · ${totalReloads} hot-swap${totalReloads === 1 ? '' : 's'}` : ''}`);
+    const degraded = r.supervisors.live.filter(state => state.degraded);
+    const smark = impaired.length || degraded.length ? warn : ok;
+    const healthy = r.supervisors.count - impaired.length - degraded.length;
+    L.push(`${smark} ${c.bold}SUPERVISOR${c.rst}  ${healthy} healthy${impaired.length ? ` · ${c.red}${impaired.length} IMPAIRED${c.rst}` : ' · zero-restart core activation ready'}${degraded.length ? ` · ${c.yel}${degraded.length} delivery-backpressured${c.rst}` : ''}${totalReloads ? ` · ${totalReloads} hot-swap${totalReloads === 1 ? '' : 's'}` : ''}`);
     for (const state of r.supervisors.live) {
-      if (state.impaired) L.push(`        ${c.red}· pid ${state.pid} ${state.status}${state.lastError ? `: ${state.lastError}` : ''} — /mcp reconnect${c.rst}`);
+      if (state.impaired) {
+        const reason = state.workerImpaired
+          ? 'no live worker; tool calls cannot complete'
+          : `host delivery ${state.deliveryStatus}`;
+        L.push(`        ${c.red}· pid ${state.pid} ${state.status}: ${reason}${state.lastError ? `; ${state.lastError}` : ''} — /mcp reconnect${c.rst}`);
+      }
+      else if (state.degraded) L.push(`        ${c.yel}· pid ${state.pid} ${state.status}: host delivery is backpressured; queued output is awaiting drain${c.rst}`);
       else if (state.lastError) L.push(`        ${c.yel}· pid ${state.pid} ${state.status}: ${state.lastError}${c.rst}`);
     }
     // Workers hot-swap; a SUPERVISOR cannot replace its own process under the

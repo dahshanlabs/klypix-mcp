@@ -16,11 +16,19 @@ import os from 'os';
 import path from 'path';
 import { execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { buildKlypixMap } from '../src/klypix-format.mjs';
-import { laneFileFor } from '../src/agent-presence.mjs';
+import {
+  laneFileFor,
+  messageDeliveryState,
+  postPresenceMessage,
+  upsertSession,
+} from '../src/agent-presence.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const HOOK = path.join(__dirname, '..', 'src', 'global-brain-hook.mjs');
+const WORKER = path.join(__dirname, '..', 'bin', 'klypix-worker.mjs');
 
 let failures = 0;
 const ok = (cond, label) => { console.log(`${cond ? '✓' : '✗'} ${label}`); if (!cond) failures++; };
@@ -168,7 +176,80 @@ fs.writeFileSync(identicalTranscript, JSON.stringify({
   }] },
 }) + '\n');
 ok(runHook('sess-identical-text', identicalTranscript).includes(peerSameText),
-  'whole-transcript self-echo compatibility never suppresses identical text from a stable peer sender');
+  'transcript text never suppresses identical text from a stable peer sender');
+
+// ── 7. Production MCP tool path: refresh a /clear-rotated host id BEFORE the
+// send snapshots recipients. This catches the worker-wiring defect a direct
+// opBrainMessage test cannot see.
+const registeredHome = path.join(os.tmpdir(), `klypix-lane-registered-${process.pid}`);
+fs.rmSync(registeredHome, { recursive: true, force: true });
+fs.mkdirSync(registeredHome, { recursive: true });
+const registeredClient = new Client({ name: 'codex-registered-message-test', version: '1.0.0' }, { capabilities: {} });
+const registeredTransport = new StdioClientTransport({
+  command: process.execPath,
+  args: [WORKER, '--vault', proj],
+  env: {
+    ...process.env,
+    HOME: registeredHome,
+    USERPROFILE: registeredHome,
+    KLYPIX_SESSION_ID: 'pre-clear-sender',
+    KLYPIX_HOST_PID: '424242',
+    CLAUDE_PID: '',
+    KLYPIX_AUTO_UPDATE: '0',
+  },
+});
+await registeredClient.connect(registeredTransport);
+const registeredBrain = path.join(proj, 'brain.klypix');
+const registeredLane = laneFileFor(registeredBrain, registeredHome);
+upsertSession({
+  brainPath: registeredBrain,
+  id: 'registered-receiver',
+  client: 'cursor',
+  channel: 'mcp',
+  intent: 'receive registered tool message',
+  home: registeredHome,
+});
+fs.writeFileSync(registeredLane.replace(/\.json$/, '.hostmap'), JSON.stringify({
+  424242: { sessionId: 'post-clear-sender', ts: Date.now() },
+}));
+const registeredResult = await registeredClient.callTool({
+  name: 'brain_message',
+  arguments: { text: 'registered tool identity refresh', to: 'all' },
+});
+const registeredData = JSON.parse(fs.readFileSync(registeredLane, 'utf8'));
+const registeredMessage = registeredData.messages.find((message) => message.text === 'registered tool identity refresh');
+ok(registeredResult.isError !== true
+  && registeredMessage?.from === 'post-clear-sender'
+  && registeredMessage.candidateIds?.includes('registered-receiver')
+  && !registeredMessage.candidateIds?.includes('post-clear-sender')
+  && !registeredMessage.candidateIds?.includes('pre-clear-sender'),
+'the registered brain_message tool refreshes a rotated sender id before recipient snapshotting');
+
+const probeMessage = postPresenceMessage({
+  brainPath: registeredBrain,
+  from: 'registered-receiver',
+  to: 'post-clear-sender',
+  text: 'registered hidden probe must not consume this',
+  home: registeredHome,
+});
+const registeredProbeState = () => {
+  const data = JSON.parse(fs.readFileSync(registeredLane, 'utf8'));
+  return messageDeliveryState(data.messages.find((message) => message.id === probeMessage.message?.id), 'post-clear-sender');
+};
+await registeredClient.callTool({ name: 'brain_sync', arguments: { phase: 'checkpoint', include_context: false } });
+await registeredClient.callTool({ name: 'brain_sync', arguments: { phase: 'checkpoint', include_context: false } });
+ok(registeredProbeState() === 'pending',
+  'the registered brain_sync path leaves messages pending across discarded include_context:false probes');
+const registeredOffer = await registeredClient.callTool({ name: 'list_canvases', arguments: {} });
+ok(registeredProbeState() === 'offered'
+  && registeredOffer.content?.some((block) => block.text?.includes('registered hidden probe must not consume this')),
+'the next supported registered-tool result offers the probe message into model context');
+const registeredAck = await registeredClient.callTool({ name: 'list_canvases', arguments: {} });
+ok(registeredProbeState() === 'acknowledged'
+  && registeredAck.content?.some((block) => block.text?.includes('registered hidden probe must not consume this')),
+'a later registered-tool action replays and acknowledges the offer');
+await registeredClient.close();
+fs.rmSync(registeredHome, { recursive: true, force: true });
 
 for (const d of [home, proj]) fs.rmSync(d, { recursive: true, force: true });
 console.log(failures ? `\n✗ ${failures} assertion(s) failed` : '\n✓ lane-message: all assertions passed');

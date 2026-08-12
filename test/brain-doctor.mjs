@@ -279,7 +279,10 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
   ok(names.includes('brain_lens'), 'brain_lens is a registered MCP tool');
   ok(names.includes('project_map_scan'), 'project_map_scan is a registered MCP tool');
   ok(names.includes('project_map_drift'), 'project_map_drift is a registered MCP tool');
-  ok(names.length === 21, `tool manifest is 21 verbs (got ${names.length})`);
+  ok(names.length === 25, `tool manifest is 25 verbs (got ${names.length})`);
+  for (const remoteTool of ['remote_status', 'remote_sessions', 'remote_actions', 'remote_command']) {
+    ok(names.includes(remoteTool), `${remoteTool} is a registered MCP tool`);
+  }
 
   // Seed one real lane receipt for THIS MCP session. The doctor must use the
   // adopted session id passed by the running worker, not guess a sender.

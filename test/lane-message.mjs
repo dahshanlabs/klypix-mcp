@@ -132,7 +132,7 @@ const lockNote = 'this marker must survive a lane-lock timeout';
 const lockTranscript = path.join(home, 'lock-message-transcript.jsonl');
 fs.writeFileSync(lockTranscript, JSON.stringify({
   uuid: 'assistant-event-stable-1',
-  timestamp: '2026-08-11T12:00:00.000Z',
+  timestamp: new Date().toISOString(),
   message: { role: 'assistant', content: [{ type: 'text', text: `🧠 MSG [${lockTarget}]: ${lockNote}` }] },
 }) + '\n');
 const runCapture = () => execFileSync(process.execPath, [HOOK, '--capture'], {

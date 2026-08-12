@@ -1162,12 +1162,18 @@ export async function opBrainMessage({ vault, canvas, text: msgText, to, via, fr
     text: body,
   });
   if (!result.posted || !result.message) {
-    return err('brain_message deferred: the coordination lane is busy. Nothing was posted — retry in a moment.');
+    if (result.reason === 'target-not-unique') {
+      return err('brain_message refused: the target did not identify exactly one other live session. Use its full id, a unique prefix of at least 8 characters, an exact unique branch, or "all". Nothing was posted.');
+    }
+    if (result.reason === 'duplicate' && result.message) {
+      return err(`brain_message already queued as ${result.message.id}; the duplicate was not posted again.`);
+    }
+    return err(`brain_message deferred: ${result.reason || 'the coordination lane is busy'}. Nothing was posted — retry in a moment.`);
   }
   const message = result.message;
   const candidates = Array.isArray(message.candidateIds) ? message.candidateIds.length : 0;
   return {
-    blocks: [text(`📨 queued in this project's coordination lane (to: ${message.to}; id: ${message.id}) — ${candidates} live target session(s) were snapshotted. Delivery is pending until a supported lifecycle/MCP action offers it into model-visible context and a later action acknowledges it; unacknowledged notes replay after reconnect. This is a coordination receipt, not proof a human read it and not a brain card — use brain_note for durable project decisions.`)],
+    blocks: [text(`📨 queued in this project's coordination lane (to: ${message.to}; id: ${message.id}) — ${candidates} live target session(s) were snapshotted. Delivery is pending until a supported lifecycle/MCP action offers it into model-visible context; it replays through acknowledgement until the receiver explicitly records consumption with brain_message_receipt. This is a coordination receipt, not proof a human read it and not a brain card — use brain_note for durable project decisions.`)],
     message,
   };
 }

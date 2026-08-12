@@ -76,9 +76,11 @@ const CODEX_GLOBAL_BODY = [
   '',
   'When the current project contains `./brain.klypix`, treat it as the authoritative shared project memory.',
   'At task start, call `brain_sync` with the current project root in `project`, a one-sentence intent,',
-  'and expected files before editing. This explicit root prevents cross-project routing in IDE hosts.',
+  'and expected files before editing. In `files`, use exact project-relative FILE paths only—never',
+  'directories, glob patterns, or filename slugs. This explicit root prevents cross-project routing in IDE hosts.',
   'It returns compact task-relevant memory plus active-task/message/file-overlap coordination.',
-  'Update it when scope changes and call `brain_sync` with phase `"complete"` before the final response.',
+  'Call phase `"checkpoint"` only when material file scope changes, and phase `"complete"` only when',
+  'the task work genuinely ends.',
   'Read `.claude/brain-brief.md` only when `brain_sync` says context is insufficient or the task asks',
   'for broad history/status; otherwise use `brain_ask` for deeper targeted retrieval.',
   'Capture durable decisions and milestones with `brain_note`. Never hand-edit `brain.klypix`.',
@@ -432,11 +434,13 @@ survives across sessions, agents, and context resets.
 
 **At the start of a task — read it** so you know the project's state and past decisions:
 - first call \`brain_sync\` with this project's absolute root path in \`project\`, a one-sentence task
-  intent, and the files you expect to touch. The explicit root keeps each repository on its own brain
-  even when an IDE launches MCP servers from the IDE installation directory.
+  intent, and the files you expect to touch. In \`files\`, use exact project-relative FILE paths only—
+  never directories, glob patterns, or filename slugs. The explicit root keeps each repository on its
+  own brain even when an IDE launches MCP servers from the IDE installation directory.
   It returns a compact task-relevant memory capsule, meaningful active-task peers, one-time messages,
   exact file-overlap warnings, and automatic late-arrival alerts without host hooks.
-  Call it again when your file scope materially changes, and with phase \`"complete"\` before your final response.
+  Call phase \`"checkpoint"\` only when material file scope changes, and phase \`"complete"\` only when
+  the task work genuinely ends.
 - do NOT automatically read the full \`.claude/brain-brief.md\`; open it only when \`brain_sync\`
   says its compact context is insufficient or the task asks for broad project history/status.
 - with the \`klypix-canvas\` MCP server: to **answer a question** from the brain ("what did we decide about X?", "where did Y land?"), call \`brain_ask\` — it ranks the whole brain, includes superseded history, and surfaces the current truth for any corrected card. Use \`search_canvases\` for a raw keyword lookup, \`read_canvas\` (canvas: \`"brain"\`) for the whole thing, or \`brain_insights\` for the load-bearing cards.
@@ -672,6 +676,10 @@ function targets(projectDir) {
       // app already writes it (projectBrainConnect.ts), this adds CLI audit coverage.
       // kind:'merge' so the fenced block coexists with any existing content.
       { tool: 'Antigravity', file: j('.agents', 'AGENTS.md'), kind: 'merge' },
+      // Intentionally NO project CLAUDE.md target. Claude receives the same task
+      // contract mechanically through lifecycle hooks + MCP tool instructions;
+      // the desktop legacy connector still owns CLAUDE.md, so a second Core
+      // writer here would create duelling managed blocks and update churn.
     ],
     mcp: [
       { tool: 'Codex', file: j('.codex', 'config.toml'), format: 'toml' },

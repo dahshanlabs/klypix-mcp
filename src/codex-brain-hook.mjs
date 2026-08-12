@@ -5,14 +5,15 @@ import { execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import {
+  codexToolActionId,
   deriveIntentFromPrompt,
+  endSession,
   findProjectBrain,
   formatPresenceMessage,
   formatReceivedMessages,
   peekMessages,
   postPresenceMessage,
   receiveMessages,
-  removeSession,
   upsertSession,
 } from './agent-presence.mjs';
 import { recordCodexHookExecution } from './codex-hooks.mjs';
@@ -104,9 +105,18 @@ function ownBrainMessageText(input) {
 
 const MODEL_CONTEXT_EVENTS = new Set(['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'PostToolUse']);
 
-function hookActionId(input, event) {
-  const explicit = input?.turn_id || input?.turnId || input?.tool_use_id || input?.toolUseId || input?.action_id;
-  return explicit ? `${event === 'PreToolUse' || event === 'PostToolUse' ? 'tool' : 'turn'}:${String(explicit).slice(0, 150)}` : '';
+export function hookActionId(input, event) {
+  const turnId = input?.turn_id || input?.turnId;
+  if (event === 'PreToolUse' || event === 'PostToolUse') {
+    return codexToolActionId({
+      turnId,
+      toolUseId: input?.tool_use_id || input?.toolUseId,
+      toolName: toolName(input),
+      toolInput: toolInput(input),
+    });
+  }
+  const explicit = turnId || input?.action_id;
+  return explicit ? `codex-turn:${String(explicit).slice(0, 144)}` : '';
 }
 
 export function buildCodexHookOutput(parts, event) {
@@ -152,7 +162,8 @@ const MSG_DECAY_STAMP_MS = 6 * 60 * 60 * 1000;
 const isFastDecayResult = (r) => r === true || r === 'fast'
   || (!!r && typeof r === 'object' && (r.fast === true || r.fastDecay === true || r.decay === 'fast' || r.class === 'fast' || r.kind === 'fast'));
 export function stampReceivedMessages(messages, now = Date.now(),
-  classifier = (typeof brainFormat.classifyDecay === 'function' ? brainFormat.classifyDecay : null)) {
+  classifier = (typeof brainFormat.classifyDecay === 'function' ? brainFormat.classifyDecay : null),
+  sessionId = '') {
   const list = Array.isArray(messages) ? messages : [];
   // Thread the full engine surface through — the shared renderer stamps each
   // qualifying message internally (agent-presence stays builtin-only, so the
@@ -163,8 +174,8 @@ export function stampReceivedMessages(messages, now = Date.now(),
       decayStaleMs: brainFormat.DECAY_STALE_MS,
       decayMessageStamp: typeof brainFormat.decayMessageStamp === 'function' ? brainFormat.decayMessageStamp : undefined,
       formatDecayAge: typeof brainFormat.formatDecayAge === 'function' ? brainFormat.formatDecayAge : undefined,
-    })
-    : formatReceivedMessages(list, now);
+    }, sessionId)
+    : formatReceivedMessages(list, now, {}, sessionId);
   if (!base || !classifier) return base;
   const staleMs = Number(brainFormat.DECAY_STALE_MS) > 0 ? Number(brainFormat.DECAY_STALE_MS) : MSG_DECAY_STAMP_MS;   // threshold single-sourced in the engine
   const stamps = list.map((m) => {
@@ -260,7 +271,10 @@ async function main() {
   if (!event || !sessionId || !brainPath) return;
 
   if (event === 'SessionEnd') {
-    removeSession({ brainPath, id: sessionId, channel: 'lifecycle' });
+    // SessionEnd is the logical conversation boundary, not merely a lifecycle
+    // transport disconnect. Remove every channel and tombstone the identity so
+    // a late MCP heartbeat/hibernation write cannot resurrect a closed thread.
+    endSession({ brainPath, id: sessionId });
     return;
   }
 
@@ -290,6 +304,8 @@ async function main() {
     replaceFiles: humanTurn,
     event,
     channel: 'lifecycle',
+    logicalSessionId: sessionId,
+    identitySource: 'codex-lifecycle',
     cwd,
   });
 
@@ -331,7 +347,7 @@ async function main() {
       // The queue drains at the next brain write from any host.
       observeShipDrift(projectDir),
       gitHookNotice.trim(),
-      stampReceivedMessages(messages),
+      stampReceivedMessages(messages, Date.now(), undefined, sessionId),
     ], event);
     return;
   }
@@ -341,18 +357,18 @@ async function main() {
     emitSystemMessage([
       context,
       formatPresenceMessage(sessions, sessionId),
-      stampReceivedMessages(messages),
+      stampReceivedMessages(messages, Date.now(), undefined, sessionId),
     ], event);
     return;
   }
   if (event === 'PreToolUse' || event === 'PostToolUse') {
     emitSystemMessage([
       formatConflictWarning(conflicts, event),
-      stampReceivedMessages(messages),
+      stampReceivedMessages(messages, Date.now(), undefined, sessionId),
     ], event);
     return;
   }
-  if (messages.length) emitSystemMessage([stampReceivedMessages(messages)], event);
+  if (messages.length) emitSystemMessage([stampReceivedMessages(messages, Date.now(), undefined, sessionId)], event);
 }
 
 // Run as the hook by default. The ONLY skip is the explicit opt-out flag a

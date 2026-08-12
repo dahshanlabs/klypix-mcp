@@ -176,7 +176,8 @@ const peerLane = (tag) => ([
 
 // ── H7: the receipt has a REAL, non-repeating audit surface ───────────────
 // Acceptance gate 3: SessionStart shows one compact line; UserPromptSubmit does
-// not repeat it on every turn. Only v2 later-action acknowledgement counts.
+// not repeat it on every turn. V3 keeps acknowledgement distinct from explicit
+// agent consumption.
 {
   const P = await makeProject('h7');
   const sessions = [
@@ -185,11 +186,11 @@ const peerLane = (tag) => ([
   ];
   P.seedLane(sessions, [{
     id: 'msg-h7', from: 'self-h7', to: 'all', text: 'verified note',
-    ts: Date.now() - 60_000, candidateIds: ['docowner-1', 'peer-two'], deliveryVersion: 2,
+    ts: Date.now() - 60_000, candidateIds: ['docowner-1', 'peer-two'], deliveryVersion: 3,
     deliveries: [{ recipientId: 'docowner-1', state: 'acknowledged', acknowledgedAt: Date.now() - 30_000 }],
   }]);
   const start = P.run('--read', { sessionId: 'self-h7' });
-  ok(/Your last note \(1m ago\): acknowledged 1 of 2 · unresolved peer-two\./.test(start),
+  ok(/Your last note \(1m ago\): consumed 0 of 2 · acknowledged 1, awaiting explicit consumption · unresolved peer-two, docowner\./.test(start),
     'H7.1: SessionStart renders the live message receipt with an honest denominator and unresolved id');
   const prompt = P.run('--prompt', { sessionId: 'self-h7', prompt: 'continue' });
   ok(!/Your last note/.test(prompt),
@@ -208,13 +209,117 @@ const peerLane = (tag) => ([
   const message = data.messages?.find((m) => m.text === 'verified cross-lane note');
   ok(message?.candidateIds?.join() === 'docowner-1',
     'H8.1: the Claude marker writer snapshots the live recipient id at send time');
-  message.deliveryVersion = 2;
-  message.deliveries = [{ recipientId: 'docowner-1', state: 'acknowledged', acknowledgedAt: Date.now() }];
+  message.deliveryVersion = 3;
+  message.deliveries = [{ recipientId: 'docowner-1', state: 'consumed', acknowledgedAt: Date.now(), consumedAt: Date.now() }];
   data.sessions = data.sessions.filter((s) => s.id === 'self-h8');
   P.writeLane(data);
   const start = P.run('--read', { sessionId: 'self-h8' });
-  ok(/Your last note .*model-context delivery acknowledged by all 1 target peer\(s\).*not human-read\)\./.test(start),
+  ok(/Your last note .*explicitly consumed by all 1 target peer\(s\).*not human-read\)\./.test(start),
     'H8.2: the receipt denominator survives after that recipient exits');
+  P.cleanup();
+}
+
+// H9: terminal audience lookup failures are handled exactly once. Re-scanning
+// the same append-only marker after its target later appears must NOT deliver an
+// old instruction; only a genuinely new assistant event gets a new stable id.
+{
+  const P = await makeProject('h9');
+  const self = peerLane('h9')[0];
+  P.seedLane([self]);
+
+  const unresolved = [{ ...TXT('\u{1F9E0} MSG [future-peer-0001]: retry when the intended peer exists'), uuid: 'h9-old-event' }];
+  P.run('--capture', { transcript: unresolved });
+  ok(!P.laneData().messages?.some((m) => m.text === 'retry when the intended peer exists'),
+    'H9.1: an unresolved targeted marker is not posted');
+
+  const withFuture = P.laneData();
+  withFuture.sessions.push({
+    id: 'future-peer-0001', client: 'codex', branch: 'future-work', intent: 'future work', files: [],
+    lastSeen: Date.now(), startedAt: Date.now(), channelSeen: {},
+  });
+  P.writeLane(withFuture);
+  P.run('--capture', { transcript: unresolved });
+  ok(!P.laneData().messages?.some((m) => m.text === 'retry when the intended peer exists'),
+    'H9.2: the same terminally rejected marker stays handled after its target later appears');
+
+  const freshEvent = [{ ...TXT('\u{1F9E0} MSG [future-peer-0001]: retry when the intended peer exists'), uuid: 'h9-new-event' }];
+  P.run('--capture', { transcript: freshEvent });
+  const retried = P.laneData().messages?.find((m) => m.text === 'retry when the intended peer exists');
+  ok(retried?.candidateIds?.join() === 'future-peer-0001',
+    'H9.3: a genuinely new marker event may send once its target is uniquely live');
+
+  const ambiguousLane = P.laneData();
+  ambiguousLane.messages = ambiguousLane.messages.filter((m) => m !== retried);
+  ambiguousLane.sessions.push(
+    { id: 'release-peer-0002', client: 'codex', branch: 'release-lane', intent: '', files: [], lastSeen: Date.now(), startedAt: Date.now(), channelSeen: {} },
+    { id: 'release-peer-0003', client: 'claude-code', branch: 'release-lane', intent: '', files: [], lastSeen: Date.now(), startedAt: Date.now(), channelSeen: {} },
+  );
+  P.writeLane(ambiguousLane);
+  const ambiguous = [{ ...TXT('\u{1F9E0} MSG [release-lane]: exactly one release owner only'), uuid: 'h9-ambiguous-event' }];
+  P.run('--capture', { transcript: ambiguous });
+  ok(!P.laneData().messages?.some((m) => m.text === 'exactly one release owner only'),
+    'H9.4: an ambiguous exact branch target is not posted');
+
+  const resolvedLane = P.laneData();
+  resolvedLane.sessions = resolvedLane.sessions.filter((session) => session.id !== 'release-peer-0003');
+  P.writeLane(resolvedLane);
+  P.run('--capture', { transcript: ambiguous });
+  ok(!P.laneData().messages?.some((m) => m.text === 'exactly one release owner only'),
+    'H9.5: resolving ambiguity later cannot resurrect the old rejected marker');
+
+  P.run('--capture', { transcript: [TXT('\u{1F9E0} MSG [self-h9]: never report a self-send as posted')] });
+  ok(!P.laneData().messages?.some((m) => m.text === 'never report a self-send as posted'),
+    'H9.6: a targeted self-send is not posted');
+  P.cleanup();
+}
+
+// H10: a zero-recipient broadcast is terminal for that marker id. A peer that
+// joins later never inherits it; a new event can deliberately send fresh text.
+{
+  const P = await makeProject('h10');
+  const self = peerLane('h10')[0];
+  P.seedLane([self]);
+  const oldBroadcast = [{ ...TXT('\u{1F9E0} MSG [all]: do not inherit this old broadcast'), uuid: 'h10-old-event' }];
+  P.run('--capture', { transcript: oldBroadcast });
+  ok(!P.laneData().messages?.some((m) => m.text === 'do not inherit this old broadcast'),
+    'H10.1: a zero-recipient broadcast is not queued or posted');
+
+  const joined = P.laneData();
+  joined.sessions.push({
+    id: 'later-peer-h10', client: 'codex', branch: 'later', intent: '', files: [],
+    lastSeen: Date.now(), startedAt: Date.now(), channelSeen: {},
+  });
+  P.writeLane(joined);
+  P.run('--capture', { transcript: oldBroadcast });
+  ok(!P.laneData().messages?.some((m) => m.text === 'do not inherit this old broadcast'),
+    'H10.2: a later peer never receives the old terminally rejected broadcast');
+
+  const freshBroadcast = [{ ...TXT('\u{1F9E0} MSG [all]: do not inherit this old broadcast'), uuid: 'h10-new-event' }];
+  P.run('--capture', { transcript: freshBroadcast });
+  const fresh = P.laneData().messages?.find((m) => m.text === 'do not inherit this old broadcast');
+  ok(fresh?.candidateIds?.join() === 'later-peer-h10',
+    'H10.3: a new marker event can deliberately broadcast to the now-live peer');
+  P.cleanup();
+}
+
+// H11: transient lane contention remains retryable for the SAME stable marker.
+// It is durably staged, then delivered after the lock clears, exactly once.
+{
+  const P = await makeProject('h11');
+  P.seedLane(peerLane('h11'));
+  const transient = [{ ...TXT('\u{1F9E0} MSG [docowner-1]: retry this transient write'), uuid: 'h11-stable-event' }];
+  fs.writeFileSync(P.lane + '.lock', 'held-by-test');
+  P.run('--capture', { transcript: transient });
+  ok(!P.laneData().messages?.some((m) => m.text === 'retry this transient write'),
+    'H11.1: lane contention does not falsely claim the message was posted');
+  fs.unlinkSync(P.lane + '.lock');
+  P.run('--capture', { transcript: transient });
+  const delivered = (P.laneData().messages || []).filter((m) => m.text === 'retry this transient write');
+  ok(delivered.length === 1 && delivered[0]?.candidateIds?.join() === 'docowner-1',
+    'H11.2: the same stable marker retries after transient contention and posts once');
+  P.run('--capture', { transcript: transient });
+  ok((P.laneData().messages || []).filter((m) => m.text === 'retry this transient write').length === 1,
+    'H11.3: successful retry becomes handled and later Stop scans stay idempotent');
   P.cleanup();
 }
 

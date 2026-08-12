@@ -444,17 +444,16 @@ ok(!listActiveSessions({ brainPath, home }).some((session) => session.id === 'co
   ok(hits.length === 1 && hits[0].id === 'rel',
     'absolute vs repo-relative declarations of one file conflict when a root is known');
 
-  // (2) A recycled/collided pid must NOT twin-suppress unrelated sessions:
-  // different machines, or two specifically-known different clients, un-twin.
-  const me = { id: 'a', hostPid: 500, machine: 'pc-one', client: 'claude-code' };
+  // (2) hostPid is never identity; only an explicit logical id can merge rows.
+  const me = { id: 'a', hostPid: 500, machine: 'pc-one', client: 'claude-code', logicalSessionId: 'thread-a' };
   ok(!isSuspectedTwin({ id: 'b', hostPid: 500, machine: 'pc-two', client: 'claude-code' }, me),
     'same pid on a DIFFERENT machine is not a twin (overlap warnings survive)');
   ok(!isSuspectedTwin({ id: 'c', hostPid: 500, machine: 'pc-one', client: 'codex' }, me),
     'same pid + same machine but two specifically-known clients is not a twin');
-  ok(isSuspectedTwin({ id: 'd', hostPid: 500, machine: 'pc-one', client: 'mcp' }, me),
-    'generic client on one side still degrades to twin (genuine twins stay suppressed)');
-  ok(isSuspectedTwin({ id: 'e', hostPid: 500, client: 'claude-code' }, me),
-    'missing machine field degrades to twin (older lane rows stay compatible)');
+  ok(!isSuspectedTwin({ id: 'd', hostPid: 500, machine: 'pc-one', client: 'mcp' }, me),
+    'a generic client and shared pid do not hide an identity-unknown peer');
+  ok(isSuspectedTwin({ id: 'e', hostPid: 999, logicalSessionId: 'thread-a' }, me),
+    'matching explicit logical ids suppress the duplicate transport row');
 }
 
 // Marker neutralization: a delivered message can never carry a HARVESTABLE

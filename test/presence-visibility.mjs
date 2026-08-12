@@ -8,8 +8,8 @@
 //   V4 — intentAt stamps when the intent VALUE changes and survives heartbeats,
 //        so renderers can age intents independently of lastSeen.
 //   V5 — formatPresenceMessage: overflow line past 8 peers + intent-age suffix.
-//   V6 — twin suppression: same-hostPid rows never raise a conflict against
-//        their own session; different hosts still do.
+//   V6 — logical-session suppression uses explicit identity only; a shared
+//        hostPid never hides independent Codex work.
 //   V7 — hostmapSessionId follows the hook-written host-pid → session-id map.
 //   V8 — the REAL hook stamps client/channel/hostPid on its lane row, observes
 //        write-tool file scope live (--live) in PATH form, and its message
@@ -17,7 +17,7 @@
 //   V9 — CRLF conversion of a projected harness file classifies as healable
 //        (stale/ok), never hand-edited; hand-edited rewrites leave a .klypix-bak.
 //   V10 — brain_doctor: a recovery-failed supervisor is DRIFT, not healthy;
-//        sync-silent sessions and twin rows are called out.
+//        sync-silent and connection-scoped identity gaps are called out.
 //   V11 — otherwise-healthy multi-session state with a sync-silent peer is
 //        PARTIAL, never the misleading ALIGNED all-clear.
 import { execFileSync } from 'child_process';
@@ -27,11 +27,13 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import {
   capMessages,
+  consumeMessageReceipt,
   formatReceivedMessages,
   formatPresenceMessage,
   laneFileFor,
   MESSAGE_FRESH_MS,
   messageDeliveryState,
+  messageDeliveryReceipt,
   postPresenceMessage,
   receiveMessages,
   upsertSession,
@@ -81,24 +83,33 @@ upsertSession({ brainPath, home, now, id: 'rx', client: 'codex' });
 for (let i = 0; i < 8; i++) {
   postPresenceMessage({ brainPath, home, now: now + i, from: 'tx', to: 'all', text: `note number ${i}` });
 }
-const firstBatch = receiveMessages({ brainPath, sessionId: 'rx', home, now: now + 100 });
+const firstBatch = receiveMessages({ brainPath, sessionId: 'rx', home, now: now + 100, actionId: 'batch-1' });
 ok(firstBatch.length === 6, `V2: first receive delivers the 6-cap (got ${firstBatch.length})`);
-const replayBatch = receiveMessages({ brainPath, sessionId: 'rx', home, now: now + 200 });
-ok(replayBatch.length === 6 && replayBatch.every(m => firstBatch.some(f => f.id === m.id)),
-  'V2: the first six replay once on a later in-band action before acknowledgement');
-const overflowOffer = receiveMessages({ brainPath, sessionId: 'rx', home, now: now + 300 });
-ok(overflowOffer.length === 2 && overflowOffer.every(m => !firstBatch.some(f => f.id === m.id)),
-  `V2: overflow remains pending until acknowledged messages clear (got ${overflowOffer.length})`);
-const overflowAck = receiveMessages({ brainPath, sessionId: 'rx', home, now: now + 400 });
-ok(overflowAck.length === 2 && overflowAck.every(m => overflowOffer.some(f => f.id === m.id)),
-  'V2: overflow also replays once before its later-action acknowledgement');
-ok(receiveMessages({ brainPath, sessionId: 'rx', home, now: now + 500 }).length === 0,
-  'V2: nothing re-delivers after every offer has a later-action acknowledgement');
+const replayAndOverflow = receiveMessages({ brainPath, sessionId: 'rx', home, now: now + 200, actionId: 'batch-2' });
+ok(replayAndOverflow.length === 6
+  && replayAndOverflow.filter(m => !firstBatch.some(f => f.id === m.id)).length === 2,
+  'V2: pending overflow is prioritized ahead of acknowledged replays and cannot starve');
+const finishAcknowledgement = receiveMessages({ brainPath, sessionId: 'rx', home, now: now + 300, actionId: 'batch-3' });
+ok(finishAcknowledgement.length === 6,
+  'V2: remaining offers replay on a later in-band action and become acknowledged');
+let deliveryLane = JSON.parse(fs.readFileSync(laneFileFor(brainPath, home), 'utf8'));
+const initialEight = deliveryLane.messages.filter((message) => /^note number /.test(message.text));
+ok(initialEight.length === 8 && initialEight.every((message) => messageDeliveryState(message, 'rx') === 'acknowledged'),
+  'V2: every overflowed note reaches acknowledgement without silent loss');
+for (const message of initialEight) {
+  const receipt = messageDeliveryReceipt(message, 'rx');
+  consumeMessageReceipt({
+    brainPath, sessionId: 'rx', messageId: message.id, offerToken: receipt.offerToken,
+    home, now: now + 400, actionId: `consume-${message.id}`,
+  });
+}
+ok(receiveMessages({ brainPath, sessionId: 'rx', home, now: now + 500, actionId: 'batch-4' }).length === 0,
+  'V2: explicit consumption retires every note; acknowledgement alone never claimed consumption');
 
 postPresenceMessage({ brainPath, home, now: now + 510, from: 'tx-a', to: 'all', text: 'same coordination text' });
 postPresenceMessage({ brainPath, home, now: now + 511, from: 'tx-b', to: 'all', text: 'same coordination text' });
-const twoSendersOffer = receiveMessages({ brainPath, sessionId: 'rx', home, now: now + 520 });
-const twoSendersAck = receiveMessages({ brainPath, sessionId: 'rx', home, now: now + 530 });
+const twoSendersOffer = receiveMessages({ brainPath, sessionId: 'rx', home, now: now + 520, actionId: 'senders-1' });
+const twoSendersAck = receiveMessages({ brainPath, sessionId: 'rx', home, now: now + 530, actionId: 'senders-2' });
 ok(twoSendersOffer.length === 2 && new Set(twoSendersOffer.map(message => message.from)).size === 2
   && twoSendersAck.length === 2,
 'V2: identical text from different senders keeps both attributions and advances each receipt honestly');
@@ -106,6 +117,11 @@ const groupedTwoSenders = formatReceivedMessages(twoSendersOffer, now + 520);
 ok(groupedTwoSenders.split('same coordination text').length - 1 === 1
   && groupedTwoSenders.includes('tx-a') && groupedTwoSenders.includes('tx-b'),
   'V2: model-facing rendering groups identical instructions once while naming both senders');
+for (const message of twoSendersAck) {
+  const receipt = messageDeliveryReceipt(message, 'rx');
+  consumeMessageReceipt({ brainPath, sessionId: 'rx', messageId: message.id,
+    offerToken: receipt.offerToken, home, now: now + 535, actionId: `senders-consume-${message.id}` });
+}
 const caseDistinctPaths = formatReceivedMessages([
   { id: 'case-a', from: 'tx-a', text: 'Edit src/API.ts before release', ts: now + 521 },
   { id: 'case-b', from: 'tx-b', text: 'Edit src/api.ts before release', ts: now + 522 },
@@ -121,13 +137,19 @@ ok(receiveMessages({
 const peerCopy = receiveMessages({ brainPath, sessionId: 'rx', home, now: now + 560 });
 ok(peerCopy.length === 1 && peerCopy[0].from === 'peer-copy',
   'V2: a genuine peer note identical to my text remains pending and reaches the next model-context action');
-receiveMessages({ brainPath, sessionId: 'rx', home, now: now + 565 });
+const peerCopyAck = receiveMessages({ brainPath, sessionId: 'rx', home, now: now + 565, actionId: 'peer-copy-ack' });
+const peerCopyReceipt = messageDeliveryReceipt(peerCopyAck[0], 'rx');
+consumeMessageReceipt({ brainPath, sessionId: 'rx', messageId: peerCopyAck[0].id,
+  offerToken: peerCopyReceipt.offerToken, home, now: now + 566, actionId: 'peer-copy-consume' });
 postPresenceMessage({ brainPath, home, now: now + 570, from: 'tx-action', to: 'rx', text: 'do not ack inside one tool action' });
 const preToolOffer = receiveMessages({ brainPath, sessionId: 'rx', home, now: now + 580, actionId: 'tool:tool-1' });
 const sameToolPost = receiveMessages({ brainPath, sessionId: 'rx', home, now: now + 590, actionId: 'tool:tool-1' });
 const laterActionAck = receiveMessages({ brainPath, sessionId: 'rx', home, now: now + 600, actionId: 'turn:prompt-2' });
 ok(preToolOffer.length === 1 && sameToolPost.length === 0 && laterActionAck.length === 1,
   'V2: PreToolUse/PostToolUse for one tool cannot self-ack; only a distinct later action acknowledges the offer');
+const laterReceipt = messageDeliveryReceipt(laterActionAck[0], 'rx');
+consumeMessageReceipt({ brainPath, sessionId: 'rx', messageId: laterActionAck[0].id,
+  offerToken: laterReceipt.offerToken, home, now: now + 601, actionId: 'turn:consume-2' });
 
 // ── V3: cap prefers evicting delivered messages ──────────────────────────────
 {
@@ -154,23 +176,23 @@ ok(preToolOffer.length === 1 && sameToolPost.length === 0 && laterActionAck.leng
   fs.writeFileSync(laneFile, JSON.stringify(lane));
   upsertSession({ brainPath, home, now, id: 'rx', client: 'codex' });
   const expired = JSON.parse(fs.readFileSync(laneFile, 'utf8')).messages.find(m => m.id === 'expired-pending');
-  ok(expired?.deadLetter?.reason === 'expired-before-acknowledgement'
+  ok(expired?.deadLetter?.reason === 'expired-before-consumption'
     && messageDeliveryState(expired, 'rx') === 'failed',
     'V3: TTL expiry leaves a sender-visible failed receipt instead of silently pruning pending work');
 
   const acknowledgedRows = Array.from({ length: 30 }, (_, index) => ({
     id: `acked-${index}`, from: 'tx', to: 'rx', text: `done ${index}`, ts: now + index + 1,
-    candidateIds: index % 2 ? ['rx'] : [], deliveryVersion: 2,
+    candidateIds: index % 2 ? ['rx'] : [], deliveryVersion: 3,
     deliveries: [{ recipientId: 'rx', state: 'acknowledged', acknowledgedAt: now + index + 1 }],
   }));
   const pendingBeforeAcked = {
     id: 'oldest-still-pending', from: 'tx', to: 'rx', text: 'must survive ack receipts', ts: now,
-    candidateIds: ['rx'], deliveryVersion: 2, deliveries: [],
+    candidateIds: ['rx'], deliveryVersion: 3, deliveries: [],
   };
   const receiptCapped = capMessages([pendingBeforeAcked, ...acknowledgedRows], 30, now + 100);
   ok(!receiptCapped.find(m => m.id === pendingBeforeAcked.id)?.deadLetter
-    && receiptCapped.filter(m => m.retiredAt).length === 30,
-  'V3: fully acknowledged snapshot and late-recipient receipts retire before cap selection and cannot evict pending work');
+    && receiptCapped.filter(m => m.deadLetter?.reason === 'lane-capacity-overflow').length === 1,
+  'V3: capacity fails an acknowledged replay before unseen pending work and retains a visible dead letter');
 }
 
 // ── V4: intentAt semantics ───────────────────────────────────────────────────
@@ -197,19 +219,22 @@ ok(aging.intentAt === now + 6 * 60 * 1000, 'V4: a CHANGED intent re-stamps inten
     'V5: an intent much older than the heartbeat carries its own age');
 }
 
-// ── V6: twin suppression by hostPid ──────────────────────────────────────────
+// ── V6: explicit logical identity only ───────────────────────────────────────
 {
   const lane = [
-    { id: 'me-mcp', hostPid: 111, files: ['src/a.ts'], lastSeen: now },
-    { id: 'me-lifecycle', hostPid: 111, files: ['src/a.ts'], lastSeen: now },
+    { id: 'me-mcp', hostPid: 111, logicalSessionId: 'logical-me', files: ['src/a.ts'], lastSeen: now },
+    { id: 'me-lifecycle', hostPid: 111, logicalSessionId: 'logical-me', files: ['src/a.ts'], lastSeen: now },
+    { id: 'same-pid-real-peer', hostPid: 111, files: ['src/a.ts'], lastSeen: now },
     { id: 'real-peer', hostPid: 222, files: ['src/a.ts'], lastSeen: now },
   ];
   const conflicts = findPresenceConflicts(lane, 'me-mcp');
-  ok(conflicts.length === 1 && conflicts[0].id === 'real-peer',
-    'V6: a same-hostPid twin row never raises a conflict against its own session; a real peer still does');
+  ok(conflicts.length === 2 && conflicts.some((row) => row.id === 'same-pid-real-peer')
+    && conflicts.some((row) => row.id === 'real-peer'),
+  'V6: only the explicitly identical logical row is suppressed; a same-pid real peer still conflicts');
   const snap = buildPresenceSnapshot(lane, 'me-mcp', { now });
-  ok(snap.suspectedTwinCount === 1 && !snap.peers.some(p => p.id === 'me-lifecycle'),
-    'V6: the snapshot counts the twin explicitly instead of listing it as a peer');
+  ok(snap.suspectedTwinCount === 1 && !snap.peers.some(p => p.id === 'me-lifecycle')
+    && snap.peers.some(p => p.id === 'same-pid-real-peer'),
+  'V6: the snapshot merges only an explicit logical identity and keeps same-pid peers visible');
 }
 
 // ── V7: hostmap rotation source ──────────────────────────────────────────────
@@ -289,15 +314,25 @@ ok(aging.intentAt === now + 6 * 60 * 1000, 'V4: a CHANGED intent re-stamps inten
   const out1 = runHook(['--prompt'], { session_id: 'sess-v8', prompt: 'deliver my messages' });
   ok(/2 more message\(s\) waiting/.test(out1), 'V8: the 6-cap renders an explicit overflow notice');
   const out2 = runHook(['--prompt'], { session_id: 'sess-v8', prompt: 'confirm first offers' });
-  ok(/unique payload 0/.test(out2) && !/unique payload 6/.test(out2),
-    'V8: the real hook replays its first model-context offer before acknowledging it');
+  ok(/unique payload 6/.test(out2) && /unique payload 7/.test(out2),
+    'V8: unseen overflow is prioritized ahead of acknowledged replay traffic');
   const out3 = runHook(['--prompt'], { session_id: 'sess-v8', prompt: 'deliver the rest' });
-  ok(/unique payload 6/.test(out3) && /unique payload 7/.test(out3),
-    'V8: overflow survives until acknowledged messages clear, then reaches model context');
-  const out4 = runHook(['--prompt'], { session_id: 'sess-v8', prompt: 'confirm overflow' });
-  const out5 = runHook(['--prompt'], { session_id: 'sess-v8', prompt: 'quiet now' });
-  ok(/unique payload 6/.test(out4) && !/unique payload/.test(out5),
-    'V8: overflow replays once, then a later prompt acknowledges and silences it');
+  ok(/unique payload/.test(out3),
+    'V8: offered and acknowledged notes remain model-visible until explicit consumption');
+  lane = JSON.parse(fs.readFileSync(laneFile, 'utf8'));
+  const inbox = lane.messages.filter((message) => /^mm-/.test(message.id));
+  ok(inbox.length === 8 && inbox.every((message) =>
+    ['offered', 'acknowledged'].includes(messageDeliveryState(message, 'sess-v8'))),
+  'V8: every overflowed note reached a token-bearing non-terminal delivery state');
+  for (const message of inbox) {
+    const receipt = message.deliveries?.find((delivery) => delivery.recipientId === 'sess-v8');
+    consumeMessageReceipt({ brainPath: path.join(hookProj, 'brain.klypix'), sessionId: 'sess-v8',
+      messageId: message.id, offerToken: receipt?.offerToken, home: hookHome,
+      actionId: `v8-consume-${message.id}` });
+  }
+  const out4 = runHook(['--prompt'], { session_id: 'sess-v8', prompt: 'quiet after consumption' });
+  ok(!/unique payload/.test(out4),
+    'V8: only explicit token-bound consumption silences acknowledged notes');
   fs.rmSync(hookHome, { recursive: true, force: true });
   fs.rmSync(hookProj, { recursive: true, force: true });
 }
@@ -323,7 +358,7 @@ ok(aging.intentAt === now + 6 * 60 * 1000, 'V4: a CHANGED intent re-stamps inten
   fs.rmSync(linkProj, { recursive: true, force: true });
 }
 
-// ── V10: doctor — impaired supervisor + sync-silent/twin session flags ───────
+// ── V10: doctor — impaired supervisor + honest logical/connection counts ─────
 {
   const docHome = path.join(os.tmpdir(), 'klypix-presvis-dochome');
   const docProj = path.join(os.tmpdir(), 'klypix-presvis-docproj');
@@ -345,8 +380,8 @@ ok(aging.intentAt === now + 6 * 60 * 1000, 'V4: a CHANGED intent re-stamps inten
   fs.writeFileSync(laneKey, JSON.stringify({
     sessions: [
       { id: 'silent-one', client: 'claude-code', lastSeen: Date.now(), files: [], intent: '' },
-      { id: 'twin-a', client: 'claude-code', hostPid: 777, lastSeen: Date.now(), intent: 'working' },
-      { id: 'twin-b', client: 'claude-code', hostPid: 777, lastSeen: Date.now(), intent: '' },
+      { id: 'same-pid-a', client: 'codex', hostPid: 777, lastSeen: Date.now(), intent: 'working' },
+      { id: 'same-pid-b', client: 'codex', hostPid: 777, lastSeen: Date.now(), intent: '' },
     ],
     messages: [],
   }));
@@ -356,8 +391,10 @@ ok(aging.intentAt === now + 6 * 60 * 1000, 'V4: a CHANGED intent re-stamps inten
     'V10: the reconcile block names the impaired supervisor');
   ok(report.sessions.syncedCount === 1 && report.sessions.count === 3,
     `V10: sync-silent sessions are counted distinctly (${report.sessions.syncedCount}/${report.sessions.count} declared scope)`);
-  ok((report.sessions.twinGroups || []).some(g => g.hostPid === 777),
-    'V10: twin lane rows sharing one host pid are surfaced as a merge failure');
+  ok(report.sessions.connectionCount === 3 && report.sessions.logicalSessionCount === 3
+    && report.sessions.activeCodexConnectionScopedCount === 1
+    && (report.sessions.twinGroups || []).length === 0,
+  'V10: same-pid Codex rows remain distinct and active connection-scoped identity is surfaced');
   fs.rmSync(docHome, { recursive: true, force: true });
   fs.rmSync(docProj, { recursive: true, force: true });
 }
@@ -378,7 +415,8 @@ ok(aging.intentAt === now + 6 * 60 * 1000, 'V4: a CHANGED intent re-stamps inten
   fs.mkdirSync(path.dirname(laneKey), { recursive: true });
   fs.writeFileSync(laneKey, JSON.stringify({
     sessions: [
-      { id: 'scoped', client: 'codex', lastSeen: Date.now(), intent: 'editing one file', files: ['src/a.mjs'] },
+      { id: 'scoped', logicalSessionId: 'scoped', identitySource: 'codex-lifecycle',
+        client: 'codex', lastSeen: Date.now(), intent: 'editing one file', files: ['src/a.mjs'] },
       { id: 'silent', client: 'other-host', lastSeen: Date.now(), activityAt: Date.now(), activityKind: 'McpToolUse', intent: '', files: [] },
     ],
     messages: [],
@@ -408,7 +446,8 @@ ok(aging.intentAt === now + 6 * 60 * 1000, 'V4: a CHANGED intent re-stamps inten
   fs.mkdirSync(path.dirname(laneKey), { recursive: true });
   fs.writeFileSync(laneKey, JSON.stringify({
     sessions: [
-      { id: 'scoped', client: 'codex', lastSeen: Date.now(), intent: 'editing one file', files: ['src/a.mjs'] },
+      { id: 'scoped', logicalSessionId: 'scoped', identitySource: 'codex-lifecycle',
+        client: 'codex', lastSeen: Date.now(), intent: 'editing one file', files: ['src/a.mjs'] },
       { id: 'idle', client: 'other-host', lastSeen: Date.now(), intent: '', files: [] },
     ],
     messages: [],

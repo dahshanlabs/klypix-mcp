@@ -13,9 +13,12 @@ export const SESSION_FRESH_MS = 10 * 60 * 1000;
 export const MCP_SESSION_FRESH_MS = 3 * 60 * 1000;
 export const MESSAGE_FRESH_MS = 24 * 60 * 60 * 1000;
 export const MESSAGE_RECEIPT_FRESH_MS = 7 * 24 * 60 * 60 * 1000;
-export const MESSAGE_DELIVERY_VERSION = 2;
+export const MESSAGE_DELIVERY_VERSION = 3;
 export const MESSAGE_LANE_CAP = 30;
 export const MESSAGE_RECEIPT_CAP = 100;
+export const SESSION_ALIAS_CAP = 8;
+export const ENDED_SESSION_CAP = 80;
+export const ENDED_SESSION_FRESH_MS = 24 * 60 * 60 * 1000;
 // Marker shared by the pure relay seam. A message carrying this prefix was
 // received from another computer, rather than authored on this local lane.
 // Revoking cross-computer presence must remove these notes as well as cloud
@@ -60,6 +63,80 @@ const withWriteVerdict = (sessions, ok, reason = null) => {
   return sessions;
 };
 
+// Codex invokes one MCP tool through three independently running adapters:
+// PreToolUse, the MCP worker, and PostToolUse. Request ids and tool_use_id are
+// not present on every side, so they cannot be the shared action boundary. The
+// host-authored turn id plus canonical tool name and a bounded canonical input
+// digest are present on both sides and make the three observations converge.
+const canonicalCodexToolName = (value) => {
+  const raw = String(value || '').trim().toLowerCase();
+  if (!raw) return '';
+  const mcpTail = raw.match(/^mcp(?:__|:)[^:]+?(?:__|:)(.+)$/);
+  return String(mcpTail?.[1] || raw)
+    .replace(/[^a-z0-9._:-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48);
+};
+
+const canonicalActionInput = (value, state = { chars: 0 }, depth = 0) => {
+  if (state.chars >= 16_384) return '[truncated]';
+  if (depth > 8) return '[depth]';
+  if (value === null) return null;
+  if (typeof value === 'string') {
+    const remaining = Math.max(0, 16_384 - state.chars);
+    const text = value.slice(0, remaining);
+    state.chars += text.length;
+    return value.length > text.length ? `${text}[+${value.length - text.length}]` : text;
+  }
+  if (typeof value === 'number') return Number.isFinite(value) ? value : String(value);
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'bigint') return `${value}n`;
+  if (Array.isArray(value)) {
+    const items = value.slice(0, 128).map((item) => canonicalActionInput(item, state, depth + 1));
+    if (value.length > items.length) items.push(`[+${value.length - items.length}]`);
+    return items;
+  }
+  if (value && typeof value === 'object') {
+    const out = {};
+    const keys = Object.keys(value).sort().slice(0, 128);
+    for (const key of keys) out[key.slice(0, 160)] = canonicalActionInput(value[key], state, depth + 1);
+    if (Object.keys(value).length > keys.length) out['[truncated-keys]'] = Object.keys(value).length - keys.length;
+    return out;
+  }
+  return String(value);
+};
+
+export function codexToolActionId({ turnId, toolUseId, toolName, toolInput } = {}) {
+  const turn = String(turnId || '').trim().slice(0, 72);
+  const tool = canonicalCodexToolName(toolName);
+  if (turn && tool) {
+    let encoded = '';
+    try { encoded = JSON.stringify(canonicalActionInput(toolInput)); }
+    catch { encoded = '[unserializable]'; }
+    const digest = crypto.createHash('sha256').update(encoded).digest('hex').slice(0, 20);
+    return `codex-tool:${turn}:${tool}:${digest}`.slice(0, 160);
+  }
+  // tool_use_id is still valuable inside lifecycle-only operation, where it
+  // keeps Pre/Post paired. It is deliberately only a fallback: including it
+  // when a turn is available would split the MCP observation from its hooks.
+  const use = String(toolUseId || '').trim().slice(0, 120);
+  if (use) return `codex-tool-use:${use}`.slice(0, 160);
+  return turn ? `codex-turn:${turn}` : '';
+}
+
+// Inbox APIs historically returned a bare array. Keep that contract while
+// making lock/write failure observable: `[]` can now truthfully mean an empty
+// inbox instead of also masquerading as a dropped receipt write.
+const withDeliveryWriteVerdict = (items, ok, reason = null) => {
+  try {
+    const verdict = Object.freeze({ ok: Boolean(ok), reason: reason || null });
+    Object.defineProperty(items, 'deliveryWriteOk', { value: Boolean(ok), enumerable: false, configurable: true });
+    Object.defineProperty(items, 'deliveryWriteSkippedReason', { value: reason || null, enumerable: false, configurable: true });
+    Object.defineProperty(items, 'deliveryWriteVerdict', { value: verdict, enumerable: false, configurable: true });
+  } catch { /* best-effort metadata on a backward-compatible Array */ }
+  return items;
+};
+
 export function findProjectBrain(cwd = process.cwd()) {
   let dir = path.resolve(cwd);
   for (;;) {
@@ -79,14 +156,46 @@ export function laneFileFor(brainPath, home = os.homedir()) {
   return path.join(home, '.claude', 'project-brain', 'sessions', `${key}.json`);
 }
 
-function readLane(file) {
+// Missing is a valid first-use lane. Every other read failure is materially
+// different: treating corrupt/unreadable bytes as `{}` lets the next mutator
+// atomically replace the only copy of peer scope and unconsumed messages. Keep
+// a permissive reader for read-only status surfaces, but require mutators to
+// consume the checked result and fail closed.
+function readLaneChecked(file) {
+  let raw;
   try {
-    const data = JSON.parse(fs.readFileSync(file, 'utf8'));
-    return data && typeof data === 'object' ? data : {};
-  } catch {
-    return {};
+    raw = fs.readFileSync(file, 'utf8');
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { ok: true, missing: true, data: {} };
+    return {
+      ok: false,
+      missing: false,
+      data: null,
+      reason: `lane-unreadable:${String(error?.code || error?.message || 'unknown').slice(0, 80)}`,
+    };
+  }
+  try {
+    const data = JSON.parse(raw);
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+      return { ok: false, missing: false, data: null, reason: 'lane-corrupt:root-not-object' };
+    }
+    return { ok: true, missing: false, data };
+  } catch (error) {
+    return {
+      ok: false,
+      missing: false,
+      data: null,
+      reason: `lane-corrupt:${String(error?.message || 'invalid-json').slice(0, 80)}`,
+    };
   }
 }
+
+function readLane(file) {
+  const result = readLaneChecked(file);
+  return result.ok ? result.data : {};
+}
+
+const readMutableLane = (file) => readLaneChecked(file);
 
 function acquireLock(lockFile, { tries = 30, waitMs = 20, staleMs = 30_000 } = {}) {
   try { fs.mkdirSync(path.dirname(lockFile), { recursive: true }); }
@@ -233,6 +342,35 @@ const normalizeTransport = (transport, channelSeen) => {
   return out;
 };
 
+const normalizeChannelOwners = (owners, channelSeen) => {
+  const source = owners && typeof owners === 'object' && !Array.isArray(owners) ? owners : {};
+  const out = {};
+  for (const channel of Object.keys(channelSeen || {})) {
+    const pid = Number(source[channel]);
+    if (Number.isInteger(pid) && pid > 0) out[channel] = pid;
+  }
+  return out;
+};
+
+const normalizeAliases = (aliases, exclude = '') => [...new Set((Array.isArray(aliases) ? aliases : [])
+  .map((value) => recipientKey(value))
+  .filter((value) => value && value !== recipientKey(exclude)))]
+  .slice(-SESSION_ALIAS_CAP);
+
+const pruneEndedSessions = (rows, now) => (Array.isArray(rows) ? rows : [])
+  .filter((row) => row?.id && now - Number(row.endedAt || 0) < ENDED_SESSION_FRESH_MS)
+  .map((row) => ({
+    id: recipientKey(row.id),
+    endedAt: Number(row.endedAt),
+    aliases: normalizeAliases(row.aliases, row.id),
+  }))
+  .slice(-ENDED_SESSION_CAP);
+
+const endedMatches = (row, id) => {
+  const key = recipientKey(id);
+  return key && (recipientKey(row?.id) === key || normalizeAliases(row?.aliases).includes(key));
+};
+
 export function sessionDeliveryReachability(session) {
   const channels = new Set(Array.isArray(session?.channels) ? session.channels.map(String) : []);
   const transport = session?.transport && typeof session.transport === 'object' ? session.transport : {};
@@ -256,6 +394,7 @@ function pruneSessions(sessions, now) {
       && Object.keys(session.channelSeen).length > 0;
     const channelSeen = freshChannelSeen(session.channelSeen, now);
     const transport = normalizeTransport(session.transport, channelSeen);
+    const channelOwners = normalizeChannelOwners(session.channelOwners, channelSeen);
     const seenValues = Object.values(channelSeen).map(Number).filter(Number.isFinite);
     const lastSeen = seenValues.length ? Math.max(...seenValues) : Number(session.lastSeen || 0);
     if ((hadChannels && !seenValues.length) || now - lastSeen >= SESSION_FRESH_MS) continue;
@@ -264,6 +403,7 @@ function pruneSessions(sessions, now) {
       ...(hadChannels ? { channelSeen, channels: Object.keys(channelSeen) } : {}),
       ...(hadChannels ? {
         transport,
+        channelOwners,
         deliveryReachability: sessionDeliveryReachability({
           ...session,
           channelSeen,
@@ -277,8 +417,9 @@ function pruneSessions(sessions, now) {
   return out;
 }
 
-const DELIVERY_STATES = new Set(['offered', 'acknowledged', 'failed']);
+const DELIVERY_STATES = new Set(['pending', 'offered', 'acknowledged', 'consumed', 'failed']);
 const recipientKey = (value) => String(value || '').trim().slice(0, 160);
+const makeOfferToken = () => crypto.randomBytes(18).toString('base64url');
 
 function normalizeDeliveryRecord(record) {
   const recipientId = recipientKey(record?.recipientId || record?.id);
@@ -290,9 +431,12 @@ function normalizeDeliveryRecord(record) {
     attempts: Math.max(0, Number(record?.attempts || 0)),
     ...(record?.offeredAt ? { offeredAt: Number(record.offeredAt) } : {}),
     ...(record?.acknowledgedAt ? { acknowledgedAt: Number(record.acknowledgedAt) } : {}),
+    ...(record?.consumedAt ? { consumedAt: Number(record.consumedAt) } : {}),
     ...(record?.failedAt ? { failedAt: Number(record.failedAt) } : {}),
     ...(record?.offeredActionId ? { offeredActionId: String(record.offeredActionId).slice(0, 160) } : {}),
     ...(record?.acknowledgedActionId ? { acknowledgedActionId: String(record.acknowledgedActionId).slice(0, 160) } : {}),
+    ...(record?.consumedActionId ? { consumedActionId: String(record.consumedActionId).slice(0, 160) } : {}),
+    ...(record?.offerToken ? { offerToken: String(record.offerToken).slice(0, 160) } : {}),
     ...(record?.reason ? { reason: String(record.reason).slice(0, 120) } : {}),
     ...(record?.legacySeen ? { legacySeen: true } : {}),
   };
@@ -304,6 +448,7 @@ function normalizeDeliveryRecord(record) {
 export function normalizeMessageDelivery(message, now = Date.now()) {
   if (!message || !message.id) return null;
   const next = { ...message };
+  const sourceVersion = Math.max(1, Number(message.deliveryVersion || 1));
   const byRecipient = new Map();
   for (const raw of Array.isArray(message.deliveries) ? message.deliveries : []) {
     const record = normalizeDeliveryRecord(raw);
@@ -323,6 +468,9 @@ export function normalizeMessageDelivery(message, now = Date.now()) {
   next.deliveryVersion = MESSAGE_DELIVERY_VERSION;
   next.deliveries = [...byRecipient.values()];
   if (!Array.isArray(next.seen)) next.seen = [];
+  // v2 retired on acknowledgement, which proved only model-context injection.
+  // v3 must conservatively replay it until a token-bound consume receipt lands.
+  if (sourceVersion < MESSAGE_DELIVERY_VERSION && next.retiredAt && !next.deadLetter) delete next.retiredAt;
   return next;
 }
 
@@ -356,13 +504,26 @@ function setDeliveryState(message, sessionId, state, now, reason = null, actionI
   if (state === 'offered') {
     record.attempts = Math.max(0, Number(record.attempts || 0)) + 1;
     record.offeredAt = now;
+    if (!record.offerToken) record.offerToken = makeOfferToken();
     if (actionId) record.offeredActionId = String(actionId).slice(0, 160);
     delete record.acknowledgedAt;
+    delete record.consumedAt;
+    delete record.acknowledgedActionId;
+    delete record.consumedActionId;
     delete record.failedAt;
     delete record.reason;
   } else if (state === 'acknowledged') {
+    if (!record.offerToken) record.offerToken = makeOfferToken();
     record.acknowledgedAt = now;
     if (actionId) record.acknowledgedActionId = String(actionId).slice(0, 160);
+    delete record.failedAt;
+    delete record.reason;
+    if (!Array.isArray(message.seen)) message.seen = [];
+    if (!message.seen.includes(recipientId)) message.seen.push(recipientId);
+  } else if (state === 'consumed') {
+    if (!record.offerToken) record.offerToken = makeOfferToken();
+    record.consumedAt = now;
+    if (actionId) record.consumedActionId = String(actionId).slice(0, 160);
     delete record.failedAt;
     delete record.reason;
     if (!Array.isArray(message.seen)) message.seen = [];
@@ -379,26 +540,26 @@ function terminalizeMessage(message, now, reason) {
     ...(Array.isArray(next.candidateIds) ? next.candidateIds : []),
     ...next.deliveries.map((entry) => entry.recipientId),
   ].map(recipientKey).filter(Boolean));
-  let unacknowledged = known.size === 0;
+  let unconsumed = known.size === 0;
   for (const recipientId of known) {
-    if (messageDeliveryState(next, recipientId) === 'acknowledged') continue;
-    unacknowledged = true;
+    if (messageDeliveryState(next, recipientId) === 'consumed') continue;
+    unconsumed = true;
     setDeliveryState(next, recipientId, 'failed', now, reason);
   }
-  if (unacknowledged) next.deadLetter = { state: 'failed', reason, at: now };
+  if (unconsumed) next.deadLetter = { state: 'failed', reason, at: now };
   else next.retiredAt = now;
   return next;
 }
 
 const isTerminalMessage = (message) => Boolean(message?.deadLetter || message?.retiredAt);
 
-function retireFullyAcknowledged(message, now) {
+function retireFullyConsumed(message, now) {
   if (!message || isTerminalMessage(message)) return message;
   const candidates = [...new Set([
     ...(Array.isArray(message.candidateIds) ? message.candidateIds : []),
     ...(Array.isArray(message.deliveries) ? message.deliveries.map((entry) => entry?.recipientId || entry?.id) : []),
   ].map(recipientKey).filter(Boolean))];
-  if (candidates.length && candidates.every((id) => messageDeliveryState(message, id) === 'acknowledged')) {
+  if (candidates.length && candidates.every((id) => messageDeliveryState(message, id) === 'consumed')) {
     message.retiredAt = now;
   }
   return message;
@@ -412,7 +573,7 @@ function pruneMessages(messages, now) {
     const terminalAt = Number(message.deadLetter?.at || message.retiredAt || 0);
     if (terminalAt && now - terminalAt >= MESSAGE_RECEIPT_FRESH_MS) continue;
     if (!terminalAt && now - Number(message.ts || 0) >= MESSAGE_FRESH_MS) {
-      message = terminalizeMessage(message, now, 'expired-before-acknowledgement');
+      message = terminalizeMessage(message, now, 'expired-before-consumption');
     }
     out.push(message);
   }
@@ -421,11 +582,29 @@ function pruneMessages(messages, now) {
 
 export function capMessages(messages, cap = MESSAGE_LANE_CAP, now = Date.now()) {
   const list = (Array.isArray(messages) ? messages : [])
-    .map((message) => retireFullyAcknowledged(normalizeMessageDelivery(message, now), now))
+    .map((message) => retireFullyConsumed(normalizeMessageDelivery(message, now), now))
     .filter(Boolean);
   const active = list.filter((message) => !isTerminalMessage(message));
   const excess = Math.max(0, active.length - Math.max(0, Number(cap) || 0));
-  const overflow = new Set(active.slice(0, excess).map((message) => message.id));
+  // Under bounded capacity, preserve messages that have made the least
+  // delivery progress: an acknowledged replay has already reached the model,
+  // while a pending note has not. Every eviction is still a visible failed
+  // receipt—this ordering prevents a replay from starving unseen work.
+  const progressRank = (message) => {
+    const recipients = [...new Set([
+      ...(message.candidateIds || []),
+      ...(message.deliveries || []).map((entry) => entry?.recipientId || entry?.id),
+    ].map(recipientKey).filter(Boolean))];
+    const states = recipients.map((id) => messageDeliveryState(message, id));
+    if (states.includes('pending')) return 2;
+    if (states.includes('offered')) return 1;
+    return states.includes('acknowledged') ? 0 : 2;
+  };
+  const overflow = new Set([...active]
+    .sort((left, right) => progressRank(left) - progressRank(right)
+      || Number(left.ts || 0) - Number(right.ts || 0))
+    .slice(0, excess)
+    .map((message) => message.id));
   const terminalized = list.map((message) => overflow.has(message.id)
     ? terminalizeMessage(message, now, 'lane-capacity-overflow')
     : message);
@@ -471,6 +650,9 @@ export function upsertSession({
   transportStatus = null,
   cwd = null,
   hostPid = null,
+  logicalSessionId = null,
+  identitySource = null,
+  aliases,
   home,
   now = Date.now(),
 }) {
@@ -483,16 +665,27 @@ export function upsertSession({
   // include this touch.
   if (!gotLock) return withWriteVerdict(listActiveSessions({ brainPath, home, now }), false, 'lane-locked');
   try {
-    const data = readLane(laneFile);
+    const laneRead = readMutableLane(laneFile);
+    if (!laneRead.ok) return withWriteVerdict([], false, laneRead.reason);
+    const data = laneRead.data;
+    let endedSessions = pruneEndedSessions(data.endedSessions, now);
+    const ended = endedSessions.find((row) => endedMatches(row, id));
+    const explicitRevival = /^(?:SessionStart|UserPromptSubmit|McpTaskStart)$/i.test(String(event || ''));
+    if (ended && !explicitRevival) {
+      return withWriteVerdict(pruneSessions(data.sessions, now), false, 'session-ended');
+    }
+    if (ended && explicitRevival) endedSessions = endedSessions.filter((row) => !endedMatches(row, id));
     const sessions = pruneSessions(data.sessions, now);
     const previous = sessions.find((session) => session.id === id) || {};
     const channelSeen = freshChannelSeen(previous.channelSeen, now);
     if (channel) channelSeen[String(channel)] = now;
     const transport = normalizeTransport(previous.transport, channelSeen);
+    const channelOwners = normalizeChannelOwners(previous.channelOwners, channelSeen);
     if (channel) {
       const status = transportStatus
         || (String(channel) === 'mcp' && String(event || '') === 'McpHibernated' ? 'pull-only' : 'connected');
       transport[String(channel)] = { status: String(status).slice(0, 40), at: now };
+      channelOwners[String(channel)] = process.pid;
     }
     const mergedFiles = files === undefined
       ? normalizeFiles(previous.files)
@@ -509,6 +702,8 @@ export function upsertSession({
       ? String(effectiveIntent || '').replace(/\s+/g, ' ').trim().slice(0, 160)
       : (previous.intent || '');
     const intentChanged = effectiveIntent !== undefined && nextIntent !== (previous.intent || '');
+    const taskStarted = /^McpTaskStart$/i.test(String(event || ''));
+    const taskCompleted = /^McpTaskComplete$/i.test(String(event || ''));
     // A connection heartbeat proves transport liveness, not that a task is in
     // progress. Stamp only events that carry real user/tool work so doctor can
     // distinguish an idle connected host from an active sync-silent session.
@@ -538,18 +733,30 @@ export function upsertSession({
           channels: Object.keys(channelSeen),
           channelSeen,
           transport,
+          channelOwners,
           deliveryReachability: sessionDeliveryReachability({ channels: Object.keys(channelSeen), transport }),
         }
         : {}),
       cwd: cwd ? path.resolve(cwd) : (previous.cwd || path.dirname(brainPath)),
-      // Host-process correlation (e.g. Claude Code exports CLAUDE_PID to every
-      // child): lets readers recognize one logical session's lifecycle row and
-      // MCP row as TWINS instead of two independent peers. `machine` scopes that
-      // pid — a pid number is unique only per machine and per moment, so twin
-      // recognition needs both (mcp-presence.mjs isSuspectedTwin).
+      // Host-process correlation is diagnostic topology only. A desktop parent
+      // can own many chats, so hostPid must never imply identity or deduping.
       hostPid: Number(hostPid) || previous.hostPid || null,
+      logicalSessionId: recipientKey(logicalSessionId || previous.logicalSessionId || '') || null,
+      identitySource: String(identitySource || previous.identitySource || 'provisional').slice(0, 80),
+      aliases: normalizeAliases(aliases === undefined ? previous.aliases : [...(previous.aliases || []), ...(aliases || [])], id),
       machine: MACHINE_ID,
       startedAt: previous.startedAt || now,
+      ...(taskStarted
+        ? {
+          scopeGeneration: Math.max(0, Number(previous.scopeGeneration || 0)) + 1,
+          scopeStartedAt: now,
+          completedAt: null,
+        }
+        : {
+          ...(previous.scopeGeneration ? { scopeGeneration: previous.scopeGeneration } : {}),
+          ...(previous.scopeStartedAt ? { scopeStartedAt: previous.scopeStartedAt } : {}),
+          ...(taskCompleted ? { completedAt: now } : (previous.completedAt ? { completedAt: previous.completedAt } : {})),
+        }),
       lastSeen: now,
     };
     const kept = sessions.filter((session) => session.id !== id);
@@ -559,6 +766,7 @@ export function upsertSession({
       ...data,
       sessions: kept.slice(-40),
       messages: maintainMessages(data.messages, now),
+      endedSessions,
     }));
     return withWriteVerdict(kept.sort((a, b) => Number(b.lastSeen || 0) - Number(a.lastSeen || 0)), true);
   } finally {
@@ -583,7 +791,9 @@ export function upsertRemoteSessions({ brainPath, rows, machineId = MACHINE_ID, 
   const gotLock = acquireLock(lockFile);
   if (!gotLock) return withWriteVerdict(listActiveSessions({ brainPath, home, now }), false, 'lane-locked');
   try {
-    const data = readLane(laneFile);
+    const laneRead = readMutableLane(laneFile);
+    if (!laneRead.ok) return withWriteVerdict([], false, laneRead.reason);
+    const data = laneRead.data;
     const sessions = pruneSessions(data.sessions, now);
     for (const row of rows) {
       if (!row?.id || !row.machine || row.via !== 'cloud') continue;
@@ -652,7 +862,15 @@ export function purgeRemotePresence({ brainPath, home, now = Date.now() }) {
     purgedMessages: 0,
   };
   try {
-    const data = readLane(laneFile);
+    const laneRead = readMutableLane(laneFile);
+    if (!laneRead.ok) return {
+      laneWriteOk: false,
+      reason: laneRead.reason,
+      sessions: [],
+      purgedSessions: 0,
+      purgedMessages: 0,
+    };
+    const data = laneRead.data;
     const maintainedSessions = pruneSessions(data.sessions, now);
     const sessions = maintainedSessions.filter((session) => session.via !== 'cloud');
     const maintainedMessages = maintainMessages(data.messages, now);
@@ -696,20 +914,24 @@ export function removeSession({
   home,
   now = Date.now(),
 }) {
-  if (!brainPath || !id) return [];
+  if (!brainPath || !id) return withWriteVerdict([], false, 'no-brain-or-id');
   const laneFile = laneFileFor(brainPath, home);
   const lockFile = laneFile + '.lock';
   const gotLock = acquireLock(lockFile);
-  if (!gotLock) return listActiveSessions({ brainPath, home, now });
+  if (!gotLock) return withWriteVerdict(listActiveSessions({ brainPath, home, now }), false, 'lane-locked');
   try {
-    const data = readLane(laneFile);
+    const laneRead = readMutableLane(laneFile);
+    if (!laneRead.ok) return withWriteVerdict([], false, laneRead.reason);
+    const data = laneRead.data;
     const sessions = [];
     for (const session of pruneSessions(data.sessions, now)) {
       if (session.id !== id) {
         sessions.push(session);
         continue;
       }
-      if (expectedPid !== null && Number(session.pid) !== Number(expectedPid)) {
+      const owners = normalizeChannelOwners(session.channelOwners, session.channelSeen);
+      const ownedPid = channel ? (owners[String(channel)] || session.pid) : session.pid;
+      if (expectedPid !== null && Number(ownedPid) !== Number(expectedPid)) {
         sessions.push(session);
         continue;
       }
@@ -717,6 +939,7 @@ export function removeSession({
       const channelSeen = freshChannelSeen(session.channelSeen, now);
       delete channelSeen[String(channel)];
       const transport = normalizeTransport(session.transport, channelSeen);
+      const channelOwners = normalizeChannelOwners(owners, channelSeen);
       const seenValues = Object.values(channelSeen).map(Number).filter(Number.isFinite);
       if (!seenValues.length) continue;
       sessions.push({
@@ -724,6 +947,7 @@ export function removeSession({
         channels: Object.keys(channelSeen),
         channelSeen,
         transport,
+        channelOwners,
         deliveryReachability: sessionDeliveryReachability({ channels: Object.keys(channelSeen), transport }),
         lastSeen: Math.max(...seenValues),
       });
@@ -734,30 +958,539 @@ export function removeSession({
       sessions,
       messages: maintainMessages(data.messages, now),
     }));
-    return sessions;
+    return withWriteVerdict(sessions, true);
   } finally {
     if (gotLock) releaseLock(lockFile);
   }
 }
 
-function messageTargetsSession(message, session, sessionId) {
-  const target = String(message?.to || '').trim().toLowerCase();
-  if (!target || target === 'all' || target === '*') return true;
-  const searchable = [
-    String(sessionId || ''),
-    String(sessionId || '').slice(0, 8),
-    session?.branch,
-    session?.intent,
-    session?.client,
-    session?.surface,
-  ].filter(Boolean).join(' ').toLowerCase();
-  return searchable.includes(target);
+// Authoritative lifecycle close. Unlike removeSession(channel), this removes
+// every transport for the logical session and leaves a short-lived tombstone so
+// a passive heartbeat from an old MCP worker cannot recreate a ghost row.
+export function endSession({ brainPath, id, home, now = Date.now(), expectedPid = null }) {
+  if (!brainPath || !id) return { ok: false, changed: false, reason: 'no-brain-or-id', sessions: [] };
+  const laneFile = laneFileFor(brainPath, home);
+  const lockFile = laneFile + '.lock';
+  const gotLock = acquireLock(lockFile);
+  if (!gotLock) return {
+    ok: false,
+    changed: false,
+    reason: 'lane-locked',
+    sessions: listActiveSessions({ brainPath, home, now }),
+  };
+  try {
+    const laneRead = readMutableLane(laneFile);
+    if (!laneRead.ok) return { ok: false, changed: false, reason: laneRead.reason, sessions: [] };
+    const data = laneRead.data;
+    const sessions = pruneSessions(data.sessions, now);
+    const row = sessions.find((session) => session.id === id
+      || normalizeAliases(session.aliases).includes(recipientKey(id)));
+    if (row && expectedPid !== null) {
+      const owners = normalizeChannelOwners(row.channelOwners, row.channelSeen);
+      const owner = owners.lifecycle || row.pid;
+      if (Number(owner) !== Number(expectedPid)) {
+        return { ok: false, changed: false, reason: 'owner-mismatch', sessions };
+      }
+    }
+    const identities = [...new Set([
+      recipientKey(id),
+      recipientKey(row?.id),
+      ...normalizeAliases(row?.aliases),
+    ].filter(Boolean))];
+    let endedSessions = pruneEndedSessions(data.endedSessions, now)
+      .filter((ended) => !identities.some((identity) => endedMatches(ended, identity)));
+    endedSessions.push({ id: recipientKey(row?.logicalSessionId || row?.id || id), endedAt: now,
+      aliases: normalizeAliases(identities, row?.logicalSessionId || row?.id || id) });
+    endedSessions = endedSessions.slice(-ENDED_SESSION_CAP);
+    const kept = sessions.filter((session) => !identities.includes(recipientKey(session.id))
+      && !normalizeAliases(session.aliases).some((alias) => identities.includes(alias)));
+    fs.mkdirSync(path.dirname(laneFile), { recursive: true });
+    writeLaneFileAtomic(laneFile, JSON.stringify({
+      ...data,
+      sessions: kept,
+      messages: maintainMessages(data.messages, now),
+      endedSessions,
+    }));
+    return { ok: true, changed: kept.length !== sessions.length, reason: null, sessions: kept };
+  } finally {
+    releaseLock(lockFile);
+  }
 }
 
-// One in-band action advances one step. A pending note is OFFERED; an already
-// offered note is replayed on the later action and then ACKNOWLEDGED. This
-// deliberate second injection is the recovery window for a closed response
-// transport and is what makes legacy false-positive `seen` rows safe to migrate.
+// A long-lived MCP worker can observe SessionEnd(A) and then receive the first
+// request for a brand-new Codex thread B. That is rotation, not a rekey: A's
+// tombstone, scope, message audience/receipts, and authorship must remain bound
+// to A. This operation succeeds only when A is still tombstoned and has no live
+// row, making it safe to try before the ordinary atomic provisional rekey.
+export function rotateEndedSessionIdentity({
+  brainPath,
+  fromId,
+  toId,
+  client = 'codex',
+  surface = 'mcp',
+  cwd = null,
+  hostPid = null,
+  identitySource = 'mcp-request',
+  home,
+  now = Date.now(),
+  expectedPid = process.pid,
+}) {
+  const fromKey = recipientKey(fromId);
+  const toKey = recipientKey(toId);
+  if (!brainPath || !fromKey || !toKey || fromKey === toKey) {
+    return { ok: false, changed: false, reason: 'invalid-identity-rotation' };
+  }
+  const laneFile = laneFileFor(brainPath, home);
+  const lockFile = laneFile + '.lock';
+  const gotLock = acquireLock(lockFile);
+  if (!gotLock) return { ok: false, changed: false, reason: 'lane-locked' };
+  try {
+    const laneRead = readMutableLane(laneFile);
+    if (!laneRead.ok) return { ok: false, changed: false, reason: laneRead.reason };
+    const data = laneRead.data;
+    const endedSessions = pruneEndedSessions(data.endedSessions, now);
+    if (!endedSessions.some((row) => endedMatches(row, fromKey))) {
+      return { ok: false, changed: false, reason: 'source-not-ended' };
+    }
+    if (endedSessions.some((row) => endedMatches(row, toKey))) {
+      return { ok: false, changed: false, reason: 'destination-ended' };
+    }
+    const sessions = pruneSessions(data.sessions, now);
+    const sourceStillLive = sessions.some((session) => recipientKey(session.id) === fromKey
+      || normalizeAliases(session.aliases).includes(fromKey));
+    if (sourceStillLive) return { ok: false, changed: false, reason: 'source-still-live' };
+
+    const existing = sessions.find((session) => recipientKey(session.id) === toKey
+      || normalizeAliases(session.aliases).includes(toKey)) || null;
+    if (existing?.via === 'cloud') {
+      return { ok: false, changed: false, reason: 'destination-remote-only' };
+    }
+    const channelSeen = freshChannelSeen(existing?.channelSeen, now);
+    channelSeen.mcp = now;
+    const channelOwners = normalizeChannelOwners(existing?.channelOwners, channelSeen);
+    channelOwners.mcp = Number(expectedPid) > 0 ? Number(expectedPid) : process.pid;
+    const transport = normalizeTransport(existing?.transport, channelSeen);
+    transport.mcp = { status: 'connected', at: now };
+    const next = {
+      ...(existing || {}),
+      id: toKey,
+      pid: process.pid,
+      project: path.basename(path.dirname(brainPath)),
+      client: String(existing?.client || client || 'codex'),
+      surface: existing?.surface || surface || 'mcp',
+      intent: String(existing?.intent || ''),
+      files: normalizeFiles(existing?.files),
+      event: 'McpIdentityRotate',
+      channels: Object.keys(channelSeen),
+      channelSeen,
+      channelOwners,
+      transport,
+      deliveryReachability: sessionDeliveryReachability({ channels: Object.keys(channelSeen), transport }),
+      cwd: cwd ? path.resolve(cwd) : (existing?.cwd || path.dirname(brainPath)),
+      hostPid: Number(hostPid) || existing?.hostPid || null,
+      logicalSessionId: toKey,
+      identitySource: String(identitySource || 'mcp-request').slice(0, 80),
+      // Never attach A as an alias: targeting A after its close must continue
+      // to resolve to the tombstone/history, not the new conversation B.
+      aliases: normalizeAliases(existing?.aliases, toKey),
+      machine: MACHINE_ID,
+      startedAt: existing?.startedAt || now,
+      lastSeen: now,
+    };
+    const kept = sessions.filter((session) => session !== existing
+      && recipientKey(session.id) !== toKey);
+    kept.push(next);
+    fs.mkdirSync(path.dirname(laneFile), { recursive: true });
+    writeLaneFileAtomic(laneFile, JSON.stringify({
+      ...data,
+      sessions: kept.slice(-40),
+      // Maintenance may expire old messages, but identity rotation never
+      // rewrites from/to/candidate/delivery ids from A to B.
+      messages: maintainMessages(data.messages, now),
+      endedSessions,
+    }));
+    return { ok: true, changed: true, reason: null, session: next, mode: 'fresh-after-end' };
+  } finally {
+    releaseLock(lockFile);
+  }
+}
+
+// Move one long-lived MCP transport from an already-exact logical session A
+// to a different exact request identity B without treating the change as a
+// provisional rekey. This is the ordering-safe counterpart to
+// rotateEndedSessionIdentity(): Codex can deliver B's first MCP request before
+// SessionEnd(A) reaches the lifecycle adapter. Under one lane lock we detach
+// only this worker's MCP channel from A and create/refresh B from B's own state.
+// A's scope, aliases, authorship, message audience, and receipts never flow to
+// B; a later SessionEnd(A) can still tombstone A normally.
+export function switchMcpSessionIdentity({
+  brainPath,
+  fromId,
+  toId,
+  client = 'codex',
+  surface = 'mcp',
+  cwd = null,
+  hostPid = null,
+  identitySource = 'mcp-request',
+  home,
+  now = Date.now(),
+  expectedPid = process.pid,
+}) {
+  const fromKey = recipientKey(fromId);
+  const toKey = recipientKey(toId);
+  if (!brainPath || !fromKey || !toKey || fromKey === toKey) {
+    return { ok: false, changed: false, reason: 'invalid-identity-switch' };
+  }
+  const laneFile = laneFileFor(brainPath, home);
+  const lockFile = laneFile + '.lock';
+  const gotLock = acquireLock(lockFile);
+  if (!gotLock) return { ok: false, changed: false, reason: 'lane-locked' };
+  try {
+    const laneRead = readMutableLane(laneFile);
+    if (!laneRead.ok) return { ok: false, changed: false, reason: laneRead.reason };
+    const data = laneRead.data;
+    const endedSessions = pruneEndedSessions(data.endedSessions, now);
+    // Ended A is handled by rotateEndedSessionIdentity(), which deliberately
+    // retains its tombstone. An ended B must never be revived by a passive MCP
+    // request; only an explicit task/session start may do that.
+    if (endedSessions.some((row) => endedMatches(row, fromKey))) {
+      return { ok: false, changed: false, reason: 'source-ended' };
+    }
+    if (endedSessions.some((row) => endedMatches(row, toKey))) {
+      return { ok: false, changed: false, reason: 'destination-ended' };
+    }
+
+    const sessions = pruneSessions(data.sessions, now);
+    const from = sessions.find((session) => recipientKey(session.id) === fromKey
+      || normalizeAliases(session.aliases).includes(fromKey)) || null;
+    const destinationCandidate = sessions.find((session) => recipientKey(session.id) === toKey
+      || normalizeAliases(session.aliases).includes(toKey)) || null;
+    // A stale alias on A must not turn this fresh switch back into an A→B
+    // rekey. Only an independently stored B row may contribute B's own state.
+    const existing = destinationCandidate === from ? null : destinationCandidate;
+    if (existing?.via === 'cloud') {
+      return { ok: false, changed: false, reason: 'destination-remote-only' };
+    }
+
+    let retainedFrom = null;
+    if (from && from !== existing) {
+      const fromSeen = freshChannelSeen(from.channelSeen, now);
+      const fromOwners = normalizeChannelOwners(from.channelOwners, fromSeen);
+      const ownsMcp = Object.prototype.hasOwnProperty.call(fromSeen, 'mcp');
+      const ownedPid = fromOwners.mcp || from.pid;
+      if (ownsMcp && expectedPid !== null && Number(ownedPid) !== Number(expectedPid)) {
+        return { ok: false, changed: false, reason: 'owner-mismatch' };
+      }
+      delete fromSeen.mcp;
+      const fromTransport = normalizeTransport(from.transport, fromSeen);
+      const remainingOwners = normalizeChannelOwners(fromOwners, fromSeen);
+      const remainingSeen = Object.values(fromSeen).map(Number).filter(Number.isFinite);
+      if (remainingSeen.length) {
+        retainedFrom = {
+          ...from,
+          // B is now an independent exact identity. Remove any stale B alias
+          // from A as well, otherwise exact targeting of B becomes ambiguous.
+          aliases: normalizeAliases(from.aliases, fromKey).filter((alias) => alias !== toKey),
+          channels: Object.keys(fromSeen),
+          channelSeen: fromSeen,
+          channelOwners: remainingOwners,
+          transport: fromTransport,
+          deliveryReachability: sessionDeliveryReachability({
+            ...from,
+            channels: Object.keys(fromSeen),
+            channelSeen: fromSeen,
+            transport: fromTransport,
+          }),
+          lastSeen: Math.max(...remainingSeen),
+        };
+      }
+    }
+
+    const channelSeen = freshChannelSeen(existing?.channelSeen, now);
+    channelSeen.mcp = now;
+    const channelOwners = normalizeChannelOwners(existing?.channelOwners, channelSeen);
+    channelOwners.mcp = Number(expectedPid) > 0 ? Number(expectedPid) : process.pid;
+    const transport = normalizeTransport(existing?.transport, channelSeen);
+    transport.mcp = { status: 'connected', at: now };
+    const next = {
+      ...(existing || {}),
+      id: toKey,
+      pid: process.pid,
+      project: path.basename(path.dirname(brainPath)),
+      client: String(existing?.client || client || 'codex'),
+      surface: existing?.surface || surface || 'mcp',
+      intent: String(existing?.intent || ''),
+      files: normalizeFiles(existing?.files),
+      event: 'McpIdentitySwitch',
+      channels: Object.keys(channelSeen),
+      channelSeen,
+      channelOwners,
+      transport,
+      deliveryReachability: sessionDeliveryReachability({ channels: Object.keys(channelSeen), transport }),
+      cwd: cwd ? path.resolve(cwd) : (existing?.cwd || path.dirname(brainPath)),
+      hostPid: Number(hostPid) || existing?.hostPid || null,
+      logicalSessionId: toKey,
+      identitySource: String(identitySource || 'mcp-request').slice(0, 80),
+      // Even a stale/pre-fix B row must not retain A as a targeting alias.
+      aliases: normalizeAliases(existing?.aliases, toKey).filter((alias) => alias !== fromKey),
+      machine: MACHINE_ID,
+      startedAt: existing?.startedAt || now,
+      lastSeen: now,
+    };
+
+    const kept = sessions.filter((session) => session !== from && session !== existing
+      && recipientKey(session.id) !== fromKey && recipientKey(session.id) !== toKey);
+    if (retainedFrom) kept.push(retainedFrom);
+    kept.push(next);
+    fs.mkdirSync(path.dirname(laneFile), { recursive: true });
+    writeLaneFileAtomic(laneFile, JSON.stringify({
+      ...data,
+      sessions: kept.slice(-40),
+      // This is a transport switch, never an identity rewrite. A-authored and
+      // A-targeted messages remain byte-for-byte bound to A.
+      messages: maintainMessages(data.messages, now),
+      endedSessions,
+    }));
+    return { ok: true, changed: true, reason: null, session: next, mode: 'fresh-live-switch' };
+  } finally {
+    releaseLock(lockFile);
+  }
+}
+
+const DELIVERY_STATE_RANK = Object.freeze({ failed: 0, pending: 1, offered: 2, acknowledged: 3, consumed: 4 });
+const mergeDeliveryRecords = (left, right) => {
+  if (!left) return right;
+  if (!right) return left;
+  const lRank = DELIVERY_STATE_RANK[left.state] ?? 0;
+  const rRank = DELIVERY_STATE_RANK[right.state] ?? 0;
+  const winner = rRank > lRank ? right : left;
+  const loser = winner === right ? left : right;
+  return {
+    ...loser,
+    ...winner,
+    recipientId: winner.recipientId || loser.recipientId,
+    attempts: Math.max(Number(left.attempts || 0), Number(right.attempts || 0)),
+    offeredAt: Math.max(Number(left.offeredAt || 0), Number(right.offeredAt || 0)) || undefined,
+    acknowledgedAt: Math.max(Number(left.acknowledgedAt || 0), Number(right.acknowledgedAt || 0)) || undefined,
+    consumedAt: Math.max(Number(left.consumedAt || 0), Number(right.consumedAt || 0)) || undefined,
+  };
+};
+
+export function messageDeliveryReceipt(message, sessionId = '') {
+  const requested = recipientKey(sessionId);
+  let record = requested ? messageDeliveryRecord(message, requested) : null;
+  if (!record && Array.isArray(message?.deliveries)) {
+    const offered = message.deliveries.filter((entry) => entry?.offerToken
+      && (entry.state === 'offered' || entry.state === 'acknowledged'));
+    if (offered.length === 1) record = offered[0];
+  }
+  if (!record?.offerToken) return null;
+  return {
+    messageId: recipientKey(message?.id),
+    sessionId: recipientKey(record.recipientId || record.id),
+    offerToken: String(record.offerToken),
+    deliveryState: DELIVERY_STATES.has(record.state) ? record.state : 'pending',
+  };
+}
+
+const rewriteMessageIdentity = (raw, fromId, toId, now) => {
+  const message = normalizeMessageDelivery(raw, now);
+  if (!message) return null;
+  const rewrite = (value) => recipientKey(value) === fromId ? toId : recipientKey(value);
+  message.from = rewrite(message.from);
+  if (recipientKey(message.to) === fromId) message.to = toId;
+  message.candidateIds = [...new Set((Array.isArray(message.candidateIds) ? message.candidateIds : [])
+    .map(rewrite).filter(Boolean))];
+  message.seen = [...new Set((Array.isArray(message.seen) ? message.seen : [])
+    .map(rewrite).filter(Boolean))];
+  const deliveries = new Map();
+  for (const rawRecord of message.deliveries || []) {
+    const record = normalizeDeliveryRecord(rawRecord);
+    if (!record) continue;
+    record.recipientId = rewrite(record.recipientId);
+    deliveries.set(record.recipientId, mergeDeliveryRecords(deliveries.get(record.recipientId), record));
+  }
+  message.deliveries = [...deliveries.values()];
+  return message;
+};
+
+const dedupeRekeyedMessages = (messages, fromId, toId, now) => {
+  const byId = new Map();
+  for (const raw of Array.isArray(messages) ? messages : []) {
+    const message = rewriteMessageIdentity(raw, fromId, toId, now);
+    if (!message) continue;
+    const previous = byId.get(message.id);
+    if (!previous) { byId.set(message.id, message); continue; }
+    previous.candidateIds = [...new Set([...(previous.candidateIds || []), ...(message.candidateIds || [])])];
+    previous.seen = [...new Set([...(previous.seen || []), ...(message.seen || [])])];
+    const deliveries = new Map((previous.deliveries || []).map((record) => [record.recipientId, record]));
+    for (const record of message.deliveries || []) {
+      deliveries.set(record.recipientId, mergeDeliveryRecords(deliveries.get(record.recipientId), record));
+    }
+    previous.deliveries = [...deliveries.values()];
+  }
+  return [...byId.values()];
+};
+
+// Atomically adopt a request-provided logical identity. The provisional row,
+// any already-existing lifecycle row, and every message receipt are rewritten
+// under the same lane lock, so readers never observe a half-rekeyed audience.
+export function rekeySessionIdentity({ brainPath, fromId, toId, home, now = Date.now(), expectedPid = null }) {
+  const fromKey = recipientKey(fromId);
+  const toKey = recipientKey(toId);
+  if (!brainPath || !fromKey || !toKey) return { ok: false, changed: false, reason: 'invalid-identity' };
+  if (fromKey === toKey) return { ok: true, changed: false, reason: null };
+  const laneFile = laneFileFor(brainPath, home);
+  const lockFile = laneFile + '.lock';
+  const gotLock = acquireLock(lockFile);
+  if (!gotLock) return { ok: false, changed: false, reason: 'lane-locked' };
+  try {
+    const laneRead = readMutableLane(laneFile);
+    if (!laneRead.ok) return { ok: false, changed: false, reason: laneRead.reason };
+    const data = laneRead.data;
+    const endedSessions = pruneEndedSessions(data.endedSessions, now);
+    if (endedSessions.some((row) => endedMatches(row, toKey))) {
+      return { ok: false, changed: false, reason: 'session-ended' };
+    }
+    const sessions = pruneSessions(data.sessions, now);
+    const from = sessions.find((session) => recipientKey(session.id) === fromKey);
+    if (!from) return { ok: false, changed: false, reason: 'source-not-found' };
+    if (expectedPid !== null) {
+      const owners = normalizeChannelOwners(from.channelOwners, from.channelSeen);
+      const owner = owners.mcp || from.pid;
+      if (Number(owner) !== Number(expectedPid)) return { ok: false, changed: false, reason: 'owner-mismatch' };
+    }
+    const to = sessions.find((session) => recipientKey(session.id) === toKey) || null;
+    const chooseLatest = (field, atField, fallback = null) => {
+      if (!to) return from[field] ?? fallback;
+      const fromAt = Number(from[atField] || from.lastSeen || 0);
+      const toAt = Number(to[atField] || to.lastSeen || 0);
+      return (fromAt > toAt ? from[field] : to[field]) ?? (from[field] ?? fallback);
+    };
+    const channelSeen = {};
+    const channelOwners = {};
+    const transport = {};
+    for (const channel of new Set([...Object.keys(from.channelSeen || {}), ...Object.keys(to?.channelSeen || {})])) {
+      const fromSeen = Number(from.channelSeen?.[channel] || 0);
+      const toSeen = Number(to?.channelSeen?.[channel] || 0);
+      channelSeen[channel] = Math.max(fromSeen, toSeen);
+      const source = fromSeen > toSeen ? from : to;
+      const owner = normalizeChannelOwners(source?.channelOwners, source?.channelSeen)?.[channel];
+      if (owner) channelOwners[channel] = owner;
+      const record = source?.transport?.[channel] || from.transport?.[channel] || to?.transport?.[channel];
+      if (record) transport[channel] = { ...record, at: Math.max(Number(record.at || 0), channelSeen[channel]) };
+    }
+    const aliases = normalizeAliases([
+      ...(to?.aliases || []),
+      ...(from.aliases || []),
+      fromKey,
+    ], toKey);
+    const lastSeen = Math.max(Number(from.lastSeen || 0), Number(to?.lastSeen || 0));
+    const activityAt = Math.max(Number(from.activityAt || 0), Number(to?.activityAt || 0));
+    const merged = {
+      ...from,
+      ...(to || {}),
+      id: toKey,
+      logicalSessionId: toKey,
+      identitySource: String(to?.identitySource || from.identitySource || 'rekey').slice(0, 80),
+      aliases,
+      files: normalizeFiles([...(to?.files || []), ...(from.files || [])]),
+      intent: chooseLatest('intent', 'intentAt', ''),
+      intentAt: Math.max(Number(from.intentAt || 0), Number(to?.intentAt || 0)) || undefined,
+      intentSource: chooseLatest('intentSource', 'intentAt', null),
+      event: chooseLatest('event', 'lastSeen', null),
+      activityAt: activityAt || undefined,
+      activityKind: activityAt === Number(from.activityAt || 0) ? from.activityKind : to?.activityKind,
+      channelSeen,
+      channels: Object.keys(channelSeen),
+      channelOwners,
+      transport,
+      deliveryReachability: sessionDeliveryReachability({ channels: Object.keys(channelSeen), transport }),
+      scopeGeneration: Math.max(Number(from.scopeGeneration || 0), Number(to?.scopeGeneration || 0)) || undefined,
+      scopeStartedAt: Math.max(Number(from.scopeStartedAt || 0), Number(to?.scopeStartedAt || 0)) || undefined,
+      completedAt: Math.max(Number(from.completedAt || 0), Number(to?.completedAt || 0)) || undefined,
+      startedAt: Math.min(...[Number(from.startedAt || 0), Number(to?.startedAt || 0)].filter(Boolean), now),
+      lastSeen,
+    };
+    const kept = sessions.filter((session) => ![fromKey, toKey].includes(recipientKey(session.id)));
+    kept.push(merged);
+    const messages = maintainMessages(dedupeRekeyedMessages(data.messages, fromKey, toKey, now), now);
+    fs.mkdirSync(path.dirname(laneFile), { recursive: true });
+    writeLaneFileAtomic(laneFile, JSON.stringify({ ...data, sessions: kept.slice(-40), messages, endedSessions }));
+    return { ok: true, changed: true, reason: null, session: merged };
+  } finally {
+    releaseLock(lockFile);
+  }
+}
+
+const sessionIdentityKeys = (session) => [...new Set([
+  recipientKey(session?.id),
+  recipientKey(session?.logicalSessionId),
+  ...normalizeAliases(session?.aliases),
+].filter(Boolean).map((value) => value.toLowerCase()))];
+
+// Returns the shortest prefix (never under eight characters) that identifies
+// one logical row across canonical ids and retained transport aliases.
+export function shortestUniqueSessionPrefix(sessions, sessionId, minLength = 8) {
+  const rows = Array.isArray(sessions) ? sessions : [];
+  const wanted = recipientKey(sessionId).toLowerCase();
+  const row = rows.find((candidate) => sessionIdentityKeys(candidate).includes(wanted));
+  if (!row) return '';
+  const canonical = recipientKey(row.id);
+  for (let size = Math.max(8, Number(minLength) || 8); size < canonical.length; size++) {
+    const prefix = canonical.slice(0, size).toLowerCase();
+    const matches = rows.filter((candidate) => sessionIdentityKeys(candidate)
+      .some((key) => key.startsWith(prefix)));
+    if (matches.length === 1) return canonical.slice(0, size);
+  }
+  return canonical;
+}
+
+export function resolveMessageTargetIds(message, sessions) {
+  const rows = Array.isArray(sessions) ? sessions : [];
+  const target = String(message?.to || '').trim().toLowerCase();
+  if (!target || target === 'all' || target === '*') return rows.map((row) => String(row.id));
+
+  // Full canonical ids and aliases are accepted only when they resolve to one
+  // row. This also makes a retained provisional id useful after atomic rekey.
+  const exactIdentity = rows.filter((row) => sessionIdentityKeys(row).includes(target));
+  if (exactIdentity.length === 1) return [String(exactIdentity[0].id)];
+  if (exactIdentity.length > 1) return [];
+
+  // Prefixes are intentionally fail-closed and require >=8 characters.
+  if (target.length >= 8) {
+    const prefixMatches = rows.filter((row) => sessionIdentityKeys(row)
+      .some((key) => key.startsWith(target)));
+    if (prefixMatches.length === 1) return [String(prefixMatches[0].id)];
+    if (prefixMatches.length > 1) return [];
+  }
+
+  // Human-friendly branch targeting remains, but only exact and unique. Intent,
+  // client and surface substring matching are deliberately forbidden.
+  const branchMatches = rows.filter((row) => String(row?.branch || '').trim().toLowerCase() === target);
+  return branchMatches.length === 1 ? [String(branchMatches[0].id)] : [];
+}
+
+function messageTargetsSession(message, session, sessionId, sessions = []) {
+  // New writers snapshot the live audience at send time. Treat that snapshot
+  // as authoritative so a later-joining chat never receives a stale broadcast.
+  // Legacy rows without candidateIds retain dynamic target resolution.
+  if (Array.isArray(message?.candidateIds)) {
+    const keys = new Set([
+      recipientKey(session?.id || sessionId),
+      recipientKey(session?.logicalSessionId),
+      ...normalizeAliases(session?.aliases),
+    ].filter(Boolean));
+    return message.candidateIds.map(recipientKey).some((id) => keys.has(id));
+  }
+  const targetIds = resolveMessageTargetIds(message, sessions.length ? sessions : [session].filter(Boolean));
+  return targetIds.includes(String(session?.id || sessionId));
+}
+
+// One in-band action advances at most one step. A pending note is offered; a
+// later action replays and acknowledges model-context injection. Acknowledged
+// notes remain replayable until an adapter explicitly consumes the matching
+// message+offer token. No state in this file claims that a human read a note.
 export function receiveMessages({
   brainPath,
   sessionId,
@@ -766,65 +1499,74 @@ export function receiveMessages({
   now = Date.now(),
   actionId = '',
 }) {
-  if (!brainPath || !sessionId) return [];
+  if (!brainPath || !sessionId) return withDeliveryWriteVerdict([], false, 'no-brain-or-session');
   const laneFile = laneFileFor(brainPath, home);
   const lockFile = laneFile + '.lock';
   const gotLock = acquireLock(lockFile);
-  if (!gotLock) return [];
+  if (!gotLock) return withDeliveryWriteVerdict([], false, 'lane-locked');
   try {
-    const data = readLane(laneFile);
+    const laneRead = readMutableLane(laneFile);
+    if (!laneRead.ok) return withDeliveryWriteVerdict([], false, laneRead.reason);
+    const data = laneRead.data;
     const sessions = pruneSessions(data.sessions, now);
     const messages = maintainMessages(data.messages, now);
     const me = sessions.find((session) => session.id === sessionId);
+    // Receipt state belongs to one live, exact logical row. In particular, a
+    // late Codex Pre/PostToolUse event after SessionEnd must not use a retained
+    // alias (or a missing row) to offer/acknowledge a closed session's inbox.
+    if (!me) return withDeliveryWriteVerdict([], false, 'session-not-live');
     const due = messages.filter((message) => {
       const state = messageDeliveryState(message, sessionId);
       const record = messageDeliveryRecord(message, sessionId);
       return !isTerminalMessage(message)
         && message.from !== sessionId
-        && (state === 'pending' || state === 'offered')
+        && (state === 'pending' || state === 'offered' || state === 'acknowledged')
         && !(state === 'offered' && actionId && record?.offeredActionId === String(actionId))
-        && messageTargetsSession(message, me, sessionId);
+        && !(state === 'acknowledged' && actionId && record?.acknowledgedActionId === String(actionId))
+        && messageTargetsSession(message, me, sessionId, sessions);
+    }).sort((left, right) => {
+      // Never let an acknowledged-but-not-yet-consumed replay starve a fresh
+      // pending note behind the six-message model-context budget.
+      const rank = { pending: 0, offered: 1, acknowledged: 2 };
+      return (rank[messageDeliveryState(left, sessionId)] ?? 9)
+        - (rank[messageDeliveryState(right, sessionId)] ?? 9)
+        || Number(left.ts || 0) - Number(right.ts || 0);
     });
 
-    const normText = (message) => String(message.text || '').replace(/\s+/g, ' ').trim().toLowerCase();
-    const ignored = new Set(ignoreTexts.map((text) => String(text || '').replace(/\s+/g, ' ').trim().toLowerCase()));
-    const deliveryKey = (message) => `${recipientKey(message?.from)}\u0000${normText(message)}`;
+    // Suppression is case-sensitive: case can carry file/env/command identity
+    // on case-sensitive systems. More importantly, receiveMessages returns one
+    // row for every note it advances. Presentation layers may group identical
+    // text, but only while preserving every message id + offer token.
+    const normText = (message) => String(message.text || '').replace(/\s+/g, ' ').trim();
+    const ignored = new Set(ignoreTexts.map((text) => String(text || '').replace(/\s+/g, ' ').trim()));
     const shown = [];
-    const seenText = new Set();
-    const dupesByText = new Map();
     for (const message of due) {
       const textKey = normText(message);
-      const key = deliveryKey(message);
       // Text-only transcript compatibility can suppress this ONE response, but
       // cannot truthfully fail/ack a message: a peer may have sent identical
       // text. Stable sender ids handle real self-echoes via message.from above.
       if (!textKey || ignored.has(textKey)) continue;
-      if (seenText.has(key)) {
-        if (!dupesByText.has(key)) dupesByText.set(key, []);
-        dupesByText.get(key).push(message);
-        continue;
-      }
-      seenText.add(key);
       shown.push(message);
     }
 
     const delivered = shown.slice(0, 6);
-    const advance = new Set();
-    for (const message of delivered) {
-      advance.add(message.id);
-      for (const dupe of dupesByText.get(deliveryKey(message)) || []) advance.add(dupe.id);
-    }
+    const advance = new Set(delivered.map((message) => message.id));
     for (const message of messages) {
       if (!advance.has(message.id)) continue;
       const previous = messageDeliveryState(message, sessionId);
       if (previous === 'offered') setDeliveryState(message, sessionId, 'acknowledged', now, null, actionId);
       else if (previous === 'pending') setDeliveryState(message, sessionId, 'offered', now, null, actionId);
-      retireFullyAcknowledged(message, now);
+      else if (previous === 'acknowledged' && !messageDeliveryRecord(message, sessionId)?.offerToken) {
+        setDeliveryState(message, sessionId, 'acknowledged', now, null, actionId);
+      }
     }
     // Persist migration/expiry/dead-letter changes even when the inbox is empty.
     fs.mkdirSync(path.dirname(laneFile), { recursive: true });
     writeLaneFileAtomic(laneFile, JSON.stringify({ ...data, sessions, messages }));
-    return delivered;
+    return withDeliveryWriteVerdict(delivered, true);
+  } catch (error) {
+    return withDeliveryWriteVerdict([], false,
+      `write-failed:${String(error?.code || error?.message || 'unknown').slice(0, 80)}`);
   } finally {
     releaseLock(lockFile);
   }
@@ -834,13 +1576,17 @@ export function receiveMessages({
 // inbound action. Pending ids are refused: an adapter cannot acknowledge a note
 // it never offered into its model-visible response.
 export function acknowledgeMessages({ brainPath, sessionId, messageIds = [], home, now = Date.now(), actionId = '' }) {
-  if (!brainPath || !sessionId || !Array.isArray(messageIds) || !messageIds.length) return [];
+  if (!brainPath || !sessionId || !Array.isArray(messageIds) || !messageIds.length) {
+    return withDeliveryWriteVerdict([], false, 'invalid-receipt');
+  }
   const laneFile = laneFileFor(brainPath, home);
   const lockFile = laneFile + '.lock';
   const gotLock = acquireLock(lockFile);
-  if (!gotLock) return [];
+  if (!gotLock) return withDeliveryWriteVerdict([], false, 'lane-locked');
   try {
-    const data = readLane(laneFile);
+    const laneRead = readMutableLane(laneFile);
+    if (!laneRead.ok) return withDeliveryWriteVerdict([], false, laneRead.reason);
+    const data = laneRead.data;
     const sessions = pruneSessions(data.sessions, now);
     const messages = maintainMessages(data.messages, now);
     const wanted = new Set(messageIds.map(String));
@@ -850,18 +1596,98 @@ export function acknowledgeMessages({ brainPath, sessionId, messageIds = [], hom
       if (!wanted.has(String(message.id)) || messageDeliveryState(message, sessionId) !== 'offered'
         || (actionId && record?.offeredActionId === String(actionId))) continue;
       setDeliveryState(message, sessionId, 'acknowledged', now, null, actionId);
-      retireFullyAcknowledged(message, now);
       acknowledged.push(message.id);
     }
     writeLaneFileAtomic(laneFile, JSON.stringify({ ...data, sessions, messages }));
-    return acknowledged;
+    return withDeliveryWriteVerdict(acknowledged, true);
+  } catch (error) {
+    return withDeliveryWriteVerdict([], false,
+      `write-failed:${String(error?.code || error?.message || 'unknown').slice(0, 80)}`);
+  } finally {
+    releaseLock(lockFile);
+  }
+}
+
+const receiptResult = (ok, changed, status, reason, messageId, sessionId) => ({
+  ok: Boolean(ok),
+  changed: Boolean(changed),
+  status: String(status),
+  reason: reason || null,
+  messageId: recipientKey(messageId),
+  sessionId: recipientKey(sessionId),
+});
+
+const tokensEqual = (left, right) => {
+  try {
+    const a = Buffer.from(String(left || ''));
+    const b = Buffer.from(String(right || ''));
+    return a.length > 0 && a.length === b.length && crypto.timingSafeEqual(a, b);
+  } catch { return false; }
+};
+
+// Durable explicit consumption receipt. A token is minted per recipient on the
+// first offer. Requiring both stable ids and that token prevents one session
+// from consuming another session's note or a guessed/truncated target.
+export function consumeMessageReceipt({
+  brainPath,
+  sessionId,
+  messageId,
+  offerToken,
+  home,
+  now = Date.now(),
+  actionId = '',
+}) {
+  const recipientId = recipientKey(sessionId);
+  const wantedMessageId = recipientKey(messageId);
+  if (!brainPath || !recipientId || !wantedMessageId || !offerToken) {
+    return receiptResult(false, false, 'rejected', 'invalid-receipt', wantedMessageId, recipientId);
+  }
+  const laneFile = laneFileFor(brainPath, home);
+  const lockFile = laneFile + '.lock';
+  const gotLock = acquireLock(lockFile);
+  if (!gotLock) return receiptResult(false, false, 'retry', 'lane-locked', wantedMessageId, recipientId);
+  try {
+    const laneRead = readMutableLane(laneFile);
+    if (!laneRead.ok) return receiptResult(false, false, 'retry', laneRead.reason, wantedMessageId, recipientId);
+    const data = laneRead.data;
+    const sessions = pruneSessions(data.sessions, now);
+    const messages = maintainMessages(data.messages, now);
+    const message = messages.find((candidate) => recipientKey(candidate?.id) === wantedMessageId);
+    if (!message) return receiptResult(false, false, 'rejected', 'message-not-found', wantedMessageId, recipientId);
+    const record = messageDeliveryRecord(message, recipientId);
+    const state = messageDeliveryState(message, recipientId);
+    if (!record || !tokensEqual(record.offerToken, offerToken)) {
+      return receiptResult(false, false, 'rejected', 'offer-token-mismatch', wantedMessageId, recipientId);
+    }
+    if (state === 'consumed') {
+      return receiptResult(true, false, 'consumed', null, wantedMessageId, recipientId);
+    }
+    if (state === 'offered') {
+      if (!actionId || record.offeredActionId === String(actionId)) {
+        return receiptResult(false, false, 'rejected', 'same-action-not-consumable', wantedMessageId, recipientId);
+      }
+      // One later explicit receipt call is sufficient while preserving both
+      // durable milestones: acknowledged model injection, then consumed by the
+      // receiving agent action. This still never claims a human read it.
+      setDeliveryState(message, recipientId, 'acknowledged', now, null, actionId);
+    } else if (state !== 'acknowledged') {
+      return receiptResult(false, false, 'rejected', 'delivery-not-acknowledged', wantedMessageId, recipientId);
+    }
+    setDeliveryState(message, recipientId, 'consumed', now, null, actionId);
+    retireFullyConsumed(message, now);
+    fs.mkdirSync(path.dirname(laneFile), { recursive: true });
+    writeLaneFileAtomic(laneFile, JSON.stringify({ ...data, sessions, messages }));
+    return receiptResult(true, true, 'consumed', null, wantedMessageId, recipientId);
+  } catch (error) {
+    return receiptResult(false, false, 'retry', `write-failed:${String(error?.code || error?.message || 'unknown').slice(0, 80)}`,
+      wantedMessageId, recipientId);
   } finally {
     releaseLock(lockFile);
   }
 }
 
 // Non-destructive inbox preview for MCP logging notifications. Unlike
-// receiveMessages(), this never advances a v2 delivery state, so a host that
+// receiveMessages(), this never advances a delivery state, so a host that
 // ignores notifications cannot make a coordination warning vanish. The next
 // supported model-context action can still offer/replay it within lane TTL/cap.
 export function peekMessages({
@@ -876,6 +1702,10 @@ export function peekMessages({
   const sessions = pruneSessions(data.sessions, now);
   const messages = maintainMessages(data.messages, now);
   const me = sessions.find((session) => session.id === sessionId);
+  // A long-lived shared MCP worker can outlive SessionEnd(A). Never preview
+  // A's queued notes after its live row has been removed: the next thread B
+  // must first adopt its own exact request identity and live row.
+  if (!me) return [];
   const ignored = new Set(ignoreTexts.map((value) =>
     String(value || '').replace(/\s+/g, ' ').trim().toLowerCase()));
   const shown = [];
@@ -884,8 +1714,8 @@ export function peekMessages({
     const state = messageDeliveryState(message, sessionId);
     if (isTerminalMessage(message)
       || message.from === sessionId
-      || (state !== 'pending' && state !== 'offered')
-      || !messageTargetsSession(message, me, sessionId)) continue;
+      || (state !== 'pending' && state !== 'offered' && state !== 'acknowledged')
+      || !messageTargetsSession(message, me, sessionId, sessions)) continue;
     const key = String(message.text || '').replace(/\s+/g, ' ').trim().toLowerCase();
     if (!key || ignored.has(key) || seenText.has(key)) continue;
     seenText.add(key);
@@ -907,29 +1737,44 @@ export function postPresenceMessage({
   now = Date.now(),
 }) {
   const body = neutralizeMarkers(String(text || '').replace(/\s+/g, ' ').trim().slice(0, 400));
-  if (!brainPath || !from || !body) return { posted: false, message: null };
+  if (!brainPath || !from || !body) return { posted: false, message: null, reason: 'invalid-message' };
   const laneFile = laneFileFor(brainPath, home);
   const lockFile = laneFile + '.lock';
   const gotLock = acquireLock(lockFile);
-  if (!gotLock) return { posted: false, message: null };
+  if (!gotLock) return { posted: false, message: null, reason: 'lane-locked' };
   try {
-    const data = readLane(laneFile);
+    const laneRead = readMutableLane(laneFile);
+    if (!laneRead.ok) return { posted: false, message: null, reason: laneRead.reason };
+    const data = laneRead.data;
     const sessions = pruneSessions(data.sessions, now);
     const messages = maintainMessages(data.messages, now);
     const key = String(dedupeKey || '').replace(/\s+/g, ' ').trim().slice(0, 240);
     if (key) {
       const existing = messages.find((message) => message?.dedupeKey === key);
-      if (existing) return { posted: false, message: existing };
+      if (existing) return { posted: false, message: existing, reason: 'duplicate' };
     }
     const senderId = String(from).slice(0, 160);
     const target = String(to || 'all').replace(/\s+/g, ' ').trim().slice(0, 160) || 'all';
     // Receipt truth must survive peers ending before the sender checks doctor.
     // Snapshot only recipient session ids (already lane metadata) at SEND time;
     // old messages without this additive field retain reconstruction fallback.
-    const candidateIds = sessions
-      .filter((session) => session?.id && session.id !== senderId
-        && messageTargetsSession({ to: target }, session, session.id))
-      .map((session) => String(session.id).slice(0, 160));
+    const resolvedTargets = resolveMessageTargetIds({ to: target }, sessions);
+    const candidateIds = resolvedTargets
+      .filter((id) => id && id !== senderId)
+      .map((id) => String(id).slice(0, 160));
+    const broadcast = target === 'all' || target === '*';
+    // A broadcast with no OTHER live recipient is not a successful handoff.
+    // Refuse before constructing/persisting a message so no zero-audience row
+    // can later be mistaken for queued or delivered work.
+    if (broadcast && candidateIds.length === 0) {
+      return { posted: false, message: null, reason: 'no-live-recipients' };
+    }
+    // A targeted hint that does not resolve to exactly one OTHER live row is
+    // unsafe: it may be an ambiguous UUID prefix or duplicated branch. Refuse
+    // instead of queuing a note whose visible `to` never had a recipient.
+    if (!broadcast && candidateIds.length !== 1) {
+      return { posted: false, message: null, reason: 'target-not-unique' };
+    }
     const message = {
       id: sha16(`${from}|${to}|${body}|${now}|${crypto.randomBytes(4).toString('hex')}`),
       from: senderId,
@@ -938,7 +1783,7 @@ export function postPresenceMessage({
       ts: now,
       seen: [],
       deliveryVersion: MESSAGE_DELIVERY_VERSION,
-      deliveries: [],
+      deliveries: candidateIds.map((recipientId) => ({ recipientId, state: 'pending', attempts: 0 })),
       candidateIds,
       ...(key ? { dedupeKey: key } : {}),
     };
@@ -949,7 +1794,7 @@ export function postPresenceMessage({
       sessions,
       messages: capMessages(messages, MESSAGE_LANE_CAP, now),
     }));
-    return { posted: true, message };
+    return { posted: true, message, reason: null };
   } finally {
     releaseLock(lockFile);
   }
@@ -1051,7 +1896,7 @@ export function messageDecayInfo(message, now = Date.now(), decay = {}) {
   } catch { return null; }   // stamping is best-effort — a classifier bug must never break delivery
 }
 
-export function formatReceivedMessages(messages, now = Date.now(), decay = {}) {
+export function formatReceivedMessages(messages, now = Date.now(), decay = {}, sessionId = '') {
   if (!Array.isArray(messages) || !messages.length) return '';
   const lines = ['KLYPIX message(s) from another active session:'];
   const groups = new Map();
@@ -1071,6 +1916,10 @@ export function formatReceivedMessages(messages, now = Date.now(), decay = {}) {
     const oldestTs = Math.min(...group.map(item => Number(item?.ts) || now));
     const ageMin = Math.max(0, Math.round((now - oldestTs) / 60_000));
     lines.push(`- from ${senderLabel} (${ageMin}m ago): ${neutralizeMarkers(String(message.text || '').replace(/\s+/g, ' ').trim().slice(0, 400))}`);
+    const receipts = group.map((item) => messageDeliveryReceipt(item, sessionId)).filter(Boolean);
+    if (receipts.length) {
+      lines.push(`  Receipt(s): ${receipts.map((receipt) => `${receipt.messageId}:${receipt.offerToken}`).join(', ')}. After incorporating ${receipts.length === 1 ? 'it' : 'them'}, call brain_message_receipt with each exact message_id and offer_token.`);
+    }
     const info = messageDecayInfo({ ...message, ts: oldestTs }, now, decay);
     if (info) lines.push(`  ${info.stampText}`);
   }

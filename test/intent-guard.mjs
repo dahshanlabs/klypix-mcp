@@ -173,20 +173,24 @@ const hookPath = path.join(root, 'src', 'global-brain-hook.mjs');
 const hookHome = path.join(os.tmpdir(), 'klypix-intent-guard-hookhome');
 fs.rmSync(hookHome, { recursive: true, force: true });
 fs.mkdirSync(hookHome, { recursive: true });
-const runPromptHook = (prompt, sid) => {
-  execFileSync(process.execPath, [hookPath, '--prompt'], {
+const hookEnv = {
+  ...process.env,
+  HOME: hookHome, USERPROFILE: hookHome,
+  // isolate from any real machine state
+  KLYPIX_AUTO_UPDATE: '0',
+};
+const runHook = (args, input) => execFileSync(process.execPath, [hookPath, ...args], {
     cwd: project,
-    input: JSON.stringify({ session_id: sid, prompt }),
-    env: {
-      ...process.env,
-      HOME: hookHome, USERPROFILE: hookHome,
-      // isolate from any real machine state
-      KLYPIX_AUTO_UPDATE: '0',
-    },
+    input: JSON.stringify(input),
+    env: hookEnv,
     encoding: 'utf8',
     timeout: 60_000,
   });
-};
+const runPromptHook = (prompt, sid, transcriptPath) => runHook(['--prompt'], {
+  session_id: sid,
+  prompt,
+  ...(transcriptPath ? { transcript_path: transcriptPath } : {}),
+});
 const hookLane = laneFileFor(brainPath, hookHome);
 runPromptHook('polish the exporter edge cases', 'hook-sess');
 let hookRows = JSON.parse(fs.readFileSync(hookLane, 'utf8')).sessions;
@@ -199,5 +203,82 @@ ok(hookRow?.intent === 'polish the exporter edge cases',
   'hook --prompt PARITY: the field junk never replaces the human intent');
 ok(Number(hookRow?.activityAt || 0) > 0,
   'hook --prompt: a machine turn still stamps activity (session is working, not idle)');
+
+// ── 6. Completion is a hard scope-generation boundary ──────────────────────
+// Claude Stop scans an append-only transcript. Once brain_sync completes the
+// task, that scan must not re-add historical paths; a later human prompt opens
+// a fresh generation and live write observations union only that active work.
+{
+  const sid = 'hook-scope-generation';
+  const transcript = path.join(project, 'scope-generation.jsonl');
+  fs.writeFileSync(transcript, '');
+  fs.mkdirSync(path.join(hookHome, '.claude', 'project-brain'), { recursive: true });
+  fs.writeFileSync(path.join(hookHome, '.claude', 'project-brain', '.npm-currency.json'), JSON.stringify({
+    pkg: 'klypix-mcp', latest: 'test', checkedAt: Date.now(),
+  }));
+  const editEntry = (id, file, timestamp) => JSON.stringify({
+    timestamp,
+    message: {
+      role: 'assistant',
+      content: [{ type: 'tool_use', id, name: 'Edit', input: { file_path: path.join(project, file) } }],
+    },
+  }) + '\n';
+  const liveEdit = (file) => runHook(['--live'], {
+    session_id: sid,
+    hook_event_name: 'PostToolUse',
+    tool_name: 'Edit',
+    tool_input: { file_path: path.join(project, file) },
+  });
+  const readScopeRow = () => JSON.parse(fs.readFileSync(laneFileFor(brainPath, hookHome), 'utf8'))
+    .sessions.find((row) => row.id === sid);
+
+  runPromptHook('first scoped task', sid, transcript);
+  fs.appendFileSync(transcript, editEntry('old-1', 'src/old-task.mjs', new Date().toISOString()));
+  liveEdit('src/old-task.mjs');
+  let scopeRow = readScopeRow();
+  ok(scopeRow?.files?.includes('src/old-task.mjs') && Number(scopeRow?.scopeGeneration || 0) === 1,
+    'scope boundary: first human prompt opens generation 1 and live edits populate its file union');
+  ok(Number.isInteger(scopeRow?.channelOwners?.lifecycle) && scopeRow.channelOwners.lifecycle > 0,
+    'scope parity: the duplicated Claude writer records the lifecycle channel owner PID');
+
+  const scopeMcp = createMcpPresence({
+    server: fakeServer,
+    initialVault: project,
+    env: { KLYPIX_SESSION_ID: sid },
+    home: hookHome,
+    now: () => Date.now(),
+    setIntervalFn: timer,
+    clearIntervalFn: () => {},
+  });
+  scopeMcp.start();
+  scopeMcp.sync({ phase: 'complete' });
+  scopeRow = readScopeRow();
+  const completedGeneration = scopeRow.scopeGeneration;
+  const completedAt = scopeRow.completedAt;
+  ok(Number(completedAt) > 0 && scopeRow.intent === '' && scopeRow.files.length === 0,
+    'scope boundary: brain_sync complete clears active scope and stamps completedAt');
+
+  runHook(['--capture'], { session_id: sid, transcript_path: transcript });
+  scopeRow = readScopeRow();
+  ok(scopeRow.completedAt === completedAt && scopeRow.scopeGeneration === completedGeneration
+    && scopeRow.files.length === 0,
+  'scope boundary: the later Claude Stop cannot resurrect historical transcript paths');
+
+  runPromptHook('second scoped task', sid, transcript);
+  scopeRow = readScopeRow();
+  ok(scopeRow.completedAt === null && scopeRow.scopeGeneration === completedGeneration + 1
+    && scopeRow.files.length === 0,
+  'scope boundary: the next human prompt opens a fresh generation with empty scope');
+  fs.appendFileSync(transcript, editEntry('new-1', 'src/new-a.mjs', new Date().toISOString()));
+  liveEdit('src/new-a.mjs');
+  fs.appendFileSync(transcript, editEntry('new-2', 'src/new-b.mjs', new Date().toISOString()));
+  liveEdit('src/new-b.mjs');
+  runHook(['--capture'], { session_id: sid, transcript_path: transcript });
+  scopeRow = readScopeRow();
+  ok(scopeRow.files.includes('src/new-a.mjs') && scopeRow.files.includes('src/new-b.mjs')
+    && !scopeRow.files.includes('src/old-task.mjs'),
+  'scope boundary: active-work observations union across the fresh task without historical leakage');
+  scopeMcp.stop();
+}
 
 process.exit(failures ? 1 : 0);

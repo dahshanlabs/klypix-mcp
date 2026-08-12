@@ -270,38 +270,35 @@ const run = (args, { cwd = REPO, home = HOME_ROOT, timeout = 60_000 } = {}) => {
   ok(missing.code === 2 && /File not found/.test(missing.err), 'I: klypix-read still resolves its positional argument');
 }
 
-// ── J — twin suppression needs machine + client, not a bare pid ───────────────
-// A pid number is unique only per machine and per moment. Suppressing an overlap
-// warning on hostPid ALONE means two unrelated sessions silence each other, and a
-// MISSING warning is invisible — nothing surfaces the mistake.
+// ── J — only explicit logical identity can suppress a duplicate row ──────────
+// A pid is process topology, not conversation identity. Codex can run many
+// independent threads below one desktop pid, so missing identity must fail open.
 {
   const now = Date.now();
   const row = (extra) => ({ files: ['src/App.tsx'], cwd: '/proj', lastSeen: now, ...extra });
   const lane = [
-    row({ id: 'me-mcp', hostPid: 111, machine: 'm1', client: 'claude-code' }),
-    row({ id: 'me-lifecycle', hostPid: 111, machine: 'm1', client: 'claude-code' }),
+    row({ id: 'me-mcp', hostPid: 111, machine: 'm1', client: 'codex', logicalSessionId: 'thread-me' }),
+    row({ id: 'me-lifecycle', hostPid: 111, machine: 'm1', client: 'codex', logicalSessionId: 'thread-me' }),
+    row({ id: 'same-process-peer', hostPid: 111, machine: 'm1', client: 'codex' }),
     row({ id: 'other-machine', hostPid: 111, machine: 'm2', client: 'claude-code' }),
     row({ id: 'other-tool', hostPid: 111, machine: 'm1', client: 'codex' }),
   ];
   const ids = findPresenceConflicts(lane, 'me-mcp').map((c) => c.id).sort();
-  ok(ids.join(',') === 'other-machine,other-tool',
-    'J: a same-pid row on ANOTHER machine, and a same-pid row from another TOOL, both still raise the overlap');
+  ok(ids.join(',') === 'other-machine,other-tool,same-process-peer',
+    'J: every same-pid row without matching explicit logical identity remains a visible overlap');
   ok(!findPresenceConflicts(lane, 'me-mcp').some((c) => c.id === 'me-lifecycle'),
-    'J: the session\'s own twin row is still suppressed');
+    'J: the session\'s explicitly identified lifecycle row is suppressed');
 
-  ok(isSuspectedTwin({ hostPid: 7, machine: 'm1', client: 'codex' }, { hostPid: 7, machine: 'm1', client: 'codex' }),
-    'J: same machine + same client + same pid = twin');
-  ok(!isSuspectedTwin({ hostPid: 7, machine: 'm1', client: 'codex' }, { hostPid: 7, machine: 'm2', client: 'codex' }),
-    'J: a different machine is NOT a twin, even on the same pid');
-  ok(!isSuspectedTwin({ hostPid: 7, machine: 'm1', client: 'codex' }, { hostPid: 7, machine: 'm1', client: 'claude-code' }),
-    'J: a different host tool is NOT a twin, even on the same pid');
-  // Backwards compatibility: rows written by an older build, or by the Claude Code
-  // lifecycle hook, carry no `machine` / no `client`. Unknown must degrade to the
-  // previous behaviour — never un-suppress a genuine twin.
-  ok(isSuspectedTwin({ hostPid: 7 }, { hostPid: 7 }), 'J: legacy rows (no machine, no client) still suppress as before');
-  ok(isSuspectedTwin({ hostPid: 7, machine: 'm1', client: 'claude-code' }, { hostPid: 7, client: 'mcp' }),
-    'J: a placeholder client (getClientVersion unavailable) stays compatible');
-  ok(!isSuspectedTwin({ hostPid: 7, machine: 'm1' }, { hostPid: 8, machine: 'm1' }), 'J: different pids are never twins');
+  ok(!isSuspectedTwin({ id: 'a', hostPid: 7 }, { id: 'b', hostPid: 7 }),
+    'J: even identical pids never imply one logical session');
+  ok(isSuspectedTwin(
+    { id: 'a', logicalSessionId: 'thread-123', hostPid: 7 },
+    { id: 'b', logicalSessionId: 'thread-123', hostPid: 999 }),
+  'J: matching explicit logical ids identify one session even across transport pids');
+  ok(!isSuspectedTwin(
+    { id: 'a', logicalSessionId: 'thread-a', hostPid: 7 },
+    { id: 'b', logicalSessionId: 'thread-b', hostPid: 7 }),
+  'J: different explicit logical ids remain different sessions');
 }
 
 // ── K — file keys are compared REPO-RELATIVE, so mixed declarations match ─────

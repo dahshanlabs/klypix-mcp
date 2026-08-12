@@ -279,7 +279,7 @@ const fresh = (extra = {}) => ({ lastSeen: NOW - 30_000, startedAt: NOW - 600_00
   const messages = [
     {
       id: 'm1', from: 'me-0000', to: 'all', text: 'broadcast note', ts: NOW - 600_000,
-      candidateIds: ['peer-aaa', 'peer-bbb'], deliveryVersion: 2,
+      candidateIds: ['peer-aaa', 'peer-bbb'], deliveryVersion: 3,
       deliveries: [{ recipientId: 'peer-aaa', state: 'acknowledged', offeredAt: NOW - 590_000, acknowledgedAt: NOW - 580_000 }],
     },
     { id: 'm2', from: 'peer-aaa', to: 'all', text: 'not mine', ts: NOW - 500_000, seen: [] },
@@ -287,29 +287,31 @@ const fresh = (extra = {}) => ({ lastSeen: NOW - 30_000, startedAt: NOW - 600_00
   const s = summarizeReceipts({ messages, sessions, selfId: 'me-0000', now: NOW });
   ok(s.sent === 1, '10.1: only THIS session\'s own sent notes get a receipt');
   const r = s.receipts[0];
-  ok(r.acknowledged === 1 && r.read === 1 && r.candidates === 2,
+  ok(r.acknowledged === 1 && r.consumed === 0 && r.read === 1 && r.candidates === 2,
     '10.2: only later-action acknowledgement counts; the compatibility read alias means the same thing');
-  ok(r.pendingIds.join() === 'peer-bbb', '10.3: pending peers are named by id-prefix — a name you can chase');
-  ok(/acknowledged 1 of 2 · unresolved peer-bbb/.test(renderReceipt(r)), '10.4: the rendered receipt is exact and honest');
+  ok(r.pendingIds.join() === 'peer-bbb,peer-aaa',
+    '10.3: unconsumed peers, including acknowledged ones, remain named by id-prefix');
+  ok(/consumed 0 of 2 · acknowledged 1, awaiting explicit consumption · unresolved peer-bbb, peer-aaa/.test(renderReceipt(r)),
+    '10.4: the rendered receipt keeps acknowledgement and consumption distinct');
 
-  const allRead = summarizeReceipts({ messages: [{
+  const allConsumed = summarizeReceipts({ messages: [{
     id: 'm', from: 'me-0000', to: 'all', text: 't', ts: NOW - 60_000,
-    candidateIds: ['peer-aaa', 'peer-bbb'], deliveryVersion: 2,
-    deliveries: ['peer-aaa', 'peer-bbb'].map((recipientId) => ({ recipientId, state: 'acknowledged', acknowledgedAt: NOW - 30_000 })),
+    candidateIds: ['peer-aaa', 'peer-bbb'], deliveryVersion: 3,
+    deliveries: ['peer-aaa', 'peer-bbb'].map((recipientId) => ({ recipientId, state: 'consumed', acknowledgedAt: NOW - 30_000, consumedAt: NOW - 20_000 })),
   }], sessions, selfId: 'me-0000', now: NOW });
-  ok(/model-context delivery acknowledged by all 2 target peer\(s\).*not human-read/.test(renderReceipt(allRead.receipts[0])),
-    '10.5: all-target wording names model-context acknowledgement and disclaims human reading');
+  ok(/explicitly consumed by all 2 target peer\(s\).*not human-read/.test(renderReceipt(allConsumed.receipts[0])),
+    '10.5: all-target wording names explicit agent consumption and disclaims human reading');
 
   const alone = summarizeReceipts({ messages: [{ id: 'm', from: 'me-0000', to: 'all', text: 't', ts: NOW - 60_000, seen: [] }], sessions: [{ id: 'me-0000', ...fresh() }], selfId: 'me-0000', now: NOW });
-  ok(/queued with no live target snapshot/.test(renderReceipt(alone.receipts[0])),
-    '10.6: with no live peer it reports a targetless pending queue, never a false acknowledgement');
+  ok(/queued with no live local target snapshot; no local delivery is claimed/.test(renderReceipt(alone.receipts[0])),
+    '10.6: with no live peer it reports no local delivery claim');
 
   const directed = summarizeReceipts({ messages: [{ id: 'm', from: 'me-0000', to: 'peer-bbb', text: 't', ts: NOW - 60_000, seen: [] }], sessions, selfId: 'me-0000', now: NOW });
   ok(directed.receipts[0].candidates === 1 && directed.receipts[0].pendingIds.join() === 'peer-bbb',
     '10.7: a DIRECTED note has a denominator of its target, not of everyone');
-  ok(/acknowledged 0 of 1.*unresolved peer-bbb/.test(renderReceipt(directed.receipts[0])) && !/acknowledged by all/.test(renderReceipt(directed.receipts[0])),
+  ok(/consumed 0 of 1.*unresolved peer-bbb/.test(renderReceipt(directed.receipts[0])) && !/consumed by all/.test(renderReceipt(directed.receipts[0])),
     '10.8: an undelivered directed note never implies delivery (R3)');
-  ok(/Your last note \(10m ago\): acknowledged 1 of 2 · unresolved peer-bbb\./.test(renderReceiptSummary(s)),
+  ok(/Your last note \(10m ago\): consumed 0 of 2 · acknowledged 1, awaiting explicit consumption · unresolved peer-bbb, peer-aaa\./.test(renderReceiptSummary(s)),
     '10.9: the compact receipt is one honest, text-free line for SessionStart and brain_doctor');
   ok(!renderReceiptSummary({ sent: 0, receipts: [] }),
     '10.10: no sent note produces no automatic receipt noise');
@@ -322,7 +324,8 @@ const fresh = (extra = {}) => ({ lastSeen: NOW - 30_000, startedAt: NOW - 600_00
     }],
     sessions, selfId: 'me-0000', now: NOW,
   }).receipts[0];
-  ok(snapshotted.candidates === 2 && snapshotted.read === 1 && snapshotted.pendingIds.join() === 'gone-xyz',
+  ok(snapshotted.candidates === 2 && snapshotted.read === 1
+    && snapshotted.pendingIds.join() === 'gone-xyz,peer-aaa',
     '10.11: send-time audience survives peer exit and later viewers never inflate the numerator');
 
   const legacy = summarizeReceipts({

@@ -272,6 +272,7 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
     'MCP initialize response carries the portable smart-awareness instructions');
   ok(names.includes('brain_doctor'), 'brain_doctor is a registered MCP tool');
   ok(names.includes('brain_message'), 'brain_message is a registered MCP tool');
+  ok(names.includes('brain_message_receipt'), 'brain_message_receipt is a registered MCP tool');
   ok(names.includes('brain_sync'), 'brain_sync is a registered MCP tool');
   ok(names.includes('brain_ask'), 'brain_ask is a registered MCP tool');
   ok(names.includes('brain_challenge'), 'brain_challenge is a registered MCP tool');
@@ -279,7 +280,7 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
   ok(names.includes('brain_lens'), 'brain_lens is a registered MCP tool');
   ok(names.includes('project_map_scan'), 'project_map_scan is a registered MCP tool');
   ok(names.includes('project_map_drift'), 'project_map_drift is a registered MCP tool');
-  ok(names.length === 21, `tool manifest is 21 verbs (got ${names.length})`);
+  ok(names.length === 22, `tool manifest is 22 verbs (got ${names.length})`);
 
   // Seed one real lane receipt for THIS MCP session. The doctor must use the
   // adopted session id passed by the running worker, not guess a sender.
@@ -296,13 +297,15 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
     id: 'doctor-receipt', from: self.id, to: 'all', text: 'verified doctor receipt',
     ts: receiptNow - 1_000,
     candidateIds: ['doctor-peer'],
-    deliveryVersion: 2,
+    deliveryVersion: 3,
     deliveries: [{
       recipientId: 'doctor-peer',
-      state: 'acknowledged',
+      state: 'consumed',
       attempts: 1,
       offeredAt: receiptNow - 900,
       acknowledgedAt: receiptNow - 500,
+      consumedAt: receiptNow - 250,
+      offerToken: 'doctor-test-offer-token',
     }],
     seen: ['doctor-peer'],
   });
@@ -314,9 +317,10 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
   ok(/brain_doctor/.test(text) && /VERSION/.test(text) && /CLAUDE/.test(text)
     && /CODEX/.test(text) && /SESSIONS/.test(text),
   'brain_doctor returns the host-neutral layered verdict');
-  ok(/2 active/.test(text), 'the MCP connection and synthetic live peer are counted without hooks');
-  ok(/your last note \(just now\): model-context delivery acknowledged by all 1 target peer\(s\) on a later action \(not human-read\)\./.test(text),
-    'brain_doctor renders a real later-action receipt without claiming a human read it');
+  ok(/2 logical sessions · 2 live connections/.test(text),
+    'the MCP connection and synthetic live peer are counted separately without hooks');
+  ok(/your last note \(just now\): explicitly consumed by all 1 target peer\(s\) after model-context delivery \(not human-read\)\./.test(text),
+    'brain_doctor renders a real explicit consumption receipt without claiming a human read it');
 
   const synced = await client.callTool({
     name: 'brain_sync',

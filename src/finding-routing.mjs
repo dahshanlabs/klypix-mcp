@@ -489,15 +489,17 @@ export function sendBody(draft) {
 }
 
 // ── The receipt (decision 4) ────────────────────────────────────────────────
-// v2 delivery records distinguish offered from later-action acknowledgement.
-// Legacy seen[] is untrusted offer evidence and never inflates acknowledgement.
+// v3 delivery records distinguish offered, later-action acknowledgement, and
+// explicit agent consumption. Legacy seen[] is untrusted offer evidence and
+// never inflates acknowledgement or consumption.
 //
 // Honesty rules baked in, because each is a way to lie:
 //  • the denominator is the peers that were live AT SEND TIME and are still
 //    within the message TTL — a peer that started afterwards was never a
 //    candidate and must not inflate "pending";
 //  • acknowledgement means a later supported action confirmed an earlier
-//    model-context offer, not that a human read or acted on it;
+//    model-context offer; consumption is a token-bound explicit agent receipt;
+//    neither means that a human read it;
 //  • a message with no live peer at send time reports "nobody was live",
 //    never "0 of 0 read", which reads as a delivery failure.
 const receiptRecordMap = (message) => {
@@ -506,7 +508,8 @@ const receiptRecordMap = (message) => {
     const id = String(raw?.recipientId || raw?.id || '').trim();
     if (!id) continue;
     records.set(id, {
-      state: ['offered', 'acknowledged', 'failed'].includes(raw?.state) ? raw.state : 'offered',
+      state: ['pending', 'offered', 'acknowledged', 'consumed', 'failed'].includes(raw?.state)
+        ? raw.state : 'offered',
       reason: raw?.reason ? String(raw.reason) : null,
     });
   }
@@ -543,10 +546,11 @@ export function summarizeReceipts({ messages, sessions, selfId, now = Date.now()
     const records = receiptRecordMap(m);
     const stateIds = (state) => candidateIds.filter((id) => records.get(id)?.state === state);
     const acknowledged = stateIds('acknowledged');
+    const consumed = stateIds('consumed');
     const offered = stateIds('offered');
     const failed = stateIds('failed');
-    const pending = candidateIds.filter((id) => !records.has(id));
-    const unresolved = [...pending, ...offered].map((id) => String(id).slice(0, 8));
+    const pending = candidateIds.filter((id) => !records.has(id) || records.get(id)?.state === 'pending');
+    const unresolved = [...pending, ...offered, ...acknowledged].map((id) => String(id).slice(0, 8));
     return {
       id: m.id,
       to: m.to || 'all',
@@ -555,14 +559,18 @@ export function summarizeReceipts({ messages, sessions, selfId, now = Date.now()
       ageMs: Math.max(0, now - Number(m.ts || 0)),
       text: String(m.text || '').slice(0, 120),
       acknowledged: acknowledged.length,
+      consumed: consumed.length,
       // Compatibility alias for programmatic consumers. It now means a later
-      // model-context acknowledgement, never `seen` and never human-read.
-      read: acknowledged.length,
+      // model-context acknowledgement milestone (including subsequently
+      // consumed deliveries), never `seen` and never human-read.
+      read: acknowledged.length + consumed.length,
       offered: offered.length,
       failed: failed.length,
       candidates: candidateIds.length,
       pendingIds: unresolved,
       offeredIds: offered.map((id) => String(id).slice(0, 8)),
+      acknowledgedIds: acknowledged.map((id) => String(id).slice(0, 8)),
+      consumedIds: consumed.map((id) => String(id).slice(0, 8)),
       failedIds: failed.map((id) => String(id).slice(0, 8)),
       deadLetterReason: m.deadLetter?.reason ? String(m.deadLetter.reason) : null,
     };
@@ -578,17 +586,18 @@ export function renderReceipt(receipt) {
   const who = receipt.directed ? `to ${receipt.to}` : 'broadcast';
   const failure = receipt.deadLetterReason ? receipt.deadLetterReason.replace(/-/g, ' ') : null;
   if (!receipt.candidates) {
-    if (failure) return `- ${who}, ${age}: delivery failed (${failure}); no target acknowledged it. “${receipt.text}”`;
-    return `- ${who}, ${age}: queued with no live target snapshot; still pending for a matching supported session. “${receipt.text}”`;
+    if (failure) return `- ${who}, ${age}: delivery failed (${failure}); no target consumed it. “${receipt.text}”`;
+    return `- ${who}, ${age}: queued with no live local target snapshot; no local delivery is claimed. “${receipt.text}”`;
   }
-  if (receipt.acknowledged === receipt.candidates && !receipt.failed) {
-    return `- ${who}, ${age}: model-context delivery acknowledged by all ${receipt.candidates} target peer(s) on a later action (not human-read). “${receipt.text}”`;
+  if (receipt.consumed === receipt.candidates && !receipt.failed) {
+    return `- ${who}, ${age}: explicitly consumed by all ${receipt.candidates} target peer(s) after model-context delivery (not human-read). “${receipt.text}”`;
   }
   const pending = receipt.pendingIds.slice(0, 4).join(', ');
   const more = receipt.pendingIds.length > 4 ? ` +${receipt.pendingIds.length - 4} more` : '';
   const offered = receipt.offered ? ` · offered ${receipt.offered}, awaiting later-action ack` : '';
+  const acknowledged = receipt.acknowledged ? ` · acknowledged ${receipt.acknowledged}, awaiting explicit consumption` : '';
   const failed = receipt.failed ? ` · failed ${receipt.failed}${failure ? ` (${failure})` : ''}` : '';
-  return `- ${who}, ${age}: acknowledged ${receipt.acknowledged} of ${receipt.candidates}${offered}${failed}${pending ? ` · unresolved ${pending}${more}` : ''}. “${receipt.text}”`;
+  return `- ${who}, ${age}: consumed ${receipt.consumed} of ${receipt.candidates}${offered}${acknowledged}${failed}${pending ? ` · unresolved ${pending}${more}` : ''}. “${receipt.text}”`;
 }
 
 // Compact, text-free receipt for surfaces that must stay cheap (SessionStart
@@ -602,22 +611,23 @@ export function renderReceiptSummary(summary) {
   const failure = receipt.deadLetterReason ? receipt.deadLetterReason.replace(/-/g, ' ') : null;
   if (!receipt.candidates) {
     return failure
-      ? `📬 Your last note${target} (${age}): delivery failed (${failure}); no target acknowledged it.`
-      : `📬 Your last note${target} (${age}): queued with no live target snapshot · pending.`;
+      ? `📬 Your last note${target} (${age}): delivery failed (${failure}); no target consumed it.`
+      : `📬 Your last note${target} (${age}): queued with no live local target snapshot; no local delivery claimed.`;
   }
-  if (receipt.acknowledged === receipt.candidates && !receipt.failed) {
-    return `📬 Your last note${target} (${age}): model-context delivery acknowledged by all ${receipt.candidates} target peer(s) on a later action (not human-read).`;
+  if (receipt.consumed === receipt.candidates && !receipt.failed) {
+    return `📬 Your last note${target} (${age}): explicitly consumed by all ${receipt.candidates} target peer(s) after model-context delivery (not human-read).`;
   }
   const pending = receipt.pendingIds.slice(0, 4).join(', ');
   const more = receipt.pendingIds.length > 4 ? ` +${receipt.pendingIds.length - 4} more` : '';
   const offered = receipt.offered ? ` · offered ${receipt.offered}, awaiting ack` : '';
+  const acknowledged = receipt.acknowledged ? ` · acknowledged ${receipt.acknowledged}, awaiting explicit consumption` : '';
   const failed = receipt.failed ? ` · failed ${receipt.failed}${failure ? ` (${failure})` : ''}` : '';
-  return `📬 Your last note${target} (${age}): acknowledged ${receipt.acknowledged} of ${receipt.candidates}${offered}${failed}${pending ? ` · unresolved ${pending}${more}` : ''}.`;
+  return `📬 Your last note${target} (${age}): consumed ${receipt.consumed} of ${receipt.candidates}${offered}${acknowledged}${failed}${pending ? ` · unresolved ${pending}${more}` : ''}.`;
 }
 
 export function renderReceipts(summary, { limit = 3 } = {}) {
   if (!summary?.sent) return '';
-  const lines = ['📬 Your notes to other sessions (acknowledged = model-context offer confirmed by a later supported action, not read by a human):'];
+  const lines = ['📬 Your notes to other sessions (acknowledged = later model-context action; consumed = explicit agent receipt; neither means human-read):'];
   for (const receipt of summary.receipts.slice(0, limit)) lines.push(renderReceipt(receipt));
   if (summary.sent > limit) lines.push(`- …and ${summary.sent - limit} more sent note(s).`);
   return lines.join('\n');

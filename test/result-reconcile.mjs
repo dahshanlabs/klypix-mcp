@@ -70,6 +70,8 @@ const makeManifest = ({ tag, metrics = defaultMetrics, configuration = defaultCo
 const base = makeManifest({ tag: 'base' });
 const checkedBase = validateResultManifest(base, { projectRoot: project });
 ok(checkedBase.ok, 'a complete manifest verifies report hash, provenance, and context fingerprints');
+ok(checkedBase.publicationEligible === false,
+  'legacy schema-v1 evidence remains valid for reconciliation but is explicitly non-publication-eligible');
 
 const prototypeKeyDetails = JSON.parse('{"safe":1,"__proto__":{"variant":"A"}}');
 ok(sha256ResultValue(prototypeKeyDetails) !== sha256ResultValue({ safe: 1 }),
@@ -296,16 +298,25 @@ mcpJ.start();
 mcpJ.sync({ phase: 'start', intent: 'retain evidence across host session rotation', files: ['j.txt'] });
 mcpJ.sync({ phase: 'complete', results: [missingProvenance] });
 const rotatedId = 'result-session-j-after-rotation';
-fs.writeFileSync(laneFileFor(brainPath, home).replace(/\.json$/, '.hostmap'), JSON.stringify({
-  4242: { sessionId: rotatedId, ts: clock + 10 },
-}));
+const switchedJ = mcpJ.adoptRequestIdentity({
+  _meta: {
+    threadId: rotatedId,
+    'x-codex-turn-metadata': { session_id: rotatedId, thread_id: rotatedId, turn_id: 'result-turn-j' },
+  },
+});
 mcpJ.sync({ phase: 'checkpoint' });
-const mcpJRestart = presence(rotatedId, 11);
-mcpJRestart.start();
-const rotatedRetry = mcpJRestart.sync({ phase: 'complete' });
-ok(rotatedRetry.isError === true
-  && rotatedRetry.structured.resultConflicts.some((conflict) => conflict.kind === 'result-manifest-required'),
-'the durable pending marker follows hostmap session-id rotation and survives the subsequent worker restart');
+const mcpJBRestart = presence(rotatedId, 11);
+mcpJBRestart.start();
+const freshConversationCompletion = mcpJBRestart.sync({ phase: 'complete' });
+const mcpJARestart = presence('result-session-j-before-rotation', 14);
+mcpJARestart.start();
+const priorConversationRetry = mcpJARestart.sync({ phase: 'complete' });
+ok(switchedJ.status === 'switched-live-session'
+  && freshConversationCompletion.isError !== true
+  && freshConversationCompletion.structured.status === 'complete'
+  && priorConversationRetry.isError === true
+  && priorConversationRetry.structured.resultConflicts.some((conflict) => conflict.kind === 'result-manifest-required'),
+'an exact request-id switch starts a clean conversation while the prior task evidence marker stays bound to A across restart');
 
 // Production boundary regression: the real worker's public Zod schema must let
 // unknown nested manifest fields reach the authoritative in-handler validator.
@@ -350,7 +361,7 @@ try {
   await realClient.close().catch(() => {});
 }
 
-for (const client of [mcpA, mcpB, mcpBRestart, mcpC, mcpD, mcpE, mcpF, mcpG, mcpH, mcpI, mcpJ, mcpJRestart, mcpK, mcpKRestart]) client.stop();
+for (const client of [mcpA, mcpB, mcpBRestart, mcpC, mcpD, mcpE, mcpF, mcpG, mcpH, mcpI, mcpJ, mcpJARestart, mcpJBRestart, mcpK, mcpKRestart]) client.stop();
 fs.rmSync(fixtureRoot, { recursive: true, force: true });
 
 console.log(failures ? `\n[x] ${failures} assertion(s) failed` : '\n[ok] result-reconcile: all assertions passed');

@@ -214,19 +214,21 @@ try {
         text: 'verified note',
         ts: now - 1_000,
         candidateIds: ['finding-owner'],
-        deliveryVersion: 2,
+        deliveryVersion: 3,
         deliveries: [{
           recipientId: 'finding-owner',
-          state: 'acknowledged',
+          state: 'consumed',
           attempts: 1,
+          offerToken: 'conformance-offer-token-000000',
           offeredAt: now - 900,
           acknowledgedAt: now - 500,
+          consumedAt: now - 250,
         }],
         seen: ['finding-owner'],
       }],
       sessions: lane, selfId: 'finding-sender', now,
     });
-    checks.findingReceiptRendered = /model-context delivery acknowledged by all 1 target peer\(s\) on a later action \(not human-read\)/.test(renderReceiptSummary(receipt));
+    checks.findingReceiptRendered = /explicitly consumed by all 1 target peer\(s\) after model-context delivery \(not human-read\)/.test(renderReceiptSummary(receipt));
   }
 
   // ── Cross-PC presence: simulated two-machine scenario ─────────────────────
@@ -276,6 +278,23 @@ try {
       consent: null, machineId: 'xpc-mach-a', root: repoA, now, send: () => { framesSent++; },
     });
     checks.crossMachineConsentGate = framesSent === 0 && gated.reason === 'no-consent';
+
+    // Give A a current B recipient before the message is created. Delivery v3
+    // snapshots concrete sessions at send time; a message created while A is
+    // still unaware of B is correctly rejected as a zero-audience broadcast.
+    const bToA = [];
+    relayOutbound({
+      sessions: listActiveSessions({ brainPath: brainB, home: homeB, now }),
+      consent: GRANT, machineId: 'xpc-mach-b', hostLabel: 'MACHINE-B', root: repoB, now,
+      send: (frame) => bToA.push(frame),
+    });
+    const rowsOnA = bToA
+      .map((frame) => relayInbound(frame, { consent: GRANT, machineId: 'xpc-mach-a', now: now + 250 }))
+      .filter((inbound) => inbound?.type === 'presence')
+      .map((inbound) => inbound.row);
+    if (rowsOnA.length) {
+      upsertRemoteSessions({ brainPath: brainA, rows: rowsOnA, machineId: 'xpc-mach-a', home: homeA, now: now + 250 });
+    }
 
     // Live channel: A's session and message reach B exactly once.
     const wire = [];
@@ -358,7 +377,7 @@ const result = {
   metrics,
   contract: {
     proactive: 'best-effort MCP logging notification',
-    inBand: 'a retained machine-local note is offered on a supported model-context KLYPIX action, then acknowledged only by a later independent action; expiry/overflow are failed receipts',
+    inBand: 'a retained machine-local note is offered on a supported model-context KLYPIX action, acknowledged only by a later independent action, and retired only by explicit token-bound consumption; expiry/overflow are failed receipts',
     crossMachine: 'relay primitives require caller-confirmed durable insertion and a per-recipient-machine acknowledgement; app bridge wiring is a separate conformance boundary',
   },
 };
@@ -372,6 +391,6 @@ if (jsonMode) {
   }
   if (checks.error) console.log(`  error: ${checks.error}`);
   console.log(`  memory/coordination: ${metrics.firstClientMs ?? '?'}ms / ${metrics.secondClientMs ?? '?'}ms`);
-  console.log('  proactive notifications are best-effort; retained notes use offer → later-action acknowledgement, with explicit failure receipts.');
+  console.log('  proactive notifications are best-effort; retained notes use offer → later-action acknowledgement → explicit token-bound consumption, with explicit failure receipts.');
 }
 process.exit(ok ? 0 : 1);

@@ -9,31 +9,72 @@ declares `needs: gate`, so a red gate means npm never sees a tarball.
 
 ---
 
-## 1. Before you tag (local, ~5 minutes)
+## 1. Before you tag
 
 | # | Step | Command |
 |---|------|---------|
-| 1 | Working tree clean, on the release commit | `git status --short` |
+| 1 | Working tree clean, on the source commit | `git status --short` |
 | 2 | Dependencies match the lockfile exactly | `npm ci` |
 | 3 | Full suite green | `npm test` |
-| 4 | Bump the version | edit `package.json` → commit |
-| 5 | Sanity-check what will ship | `npm pack --dry-run` |
+| 4 | Bump the version and commit all source changes | edit `package.json` → commit |
+| 5 | Record the immutable source target | `SOURCE_COMMIT=$(git rev-parse HEAD)` |
+| 6 | Add the fixed, corroborated evidence bundle in one new commit | `.release-evidence/v<version>/` only |
+| 7 | Verify that committed bundle against the source target | command below |
+| 8 | Sanity-check what will ship | `npm pack --dry-run` |
+
+The release tag does **not** point at the source commit. It points at the next,
+one-parent **evidence commit**. That commit may add only regular `100644` files under:
+
+```text
+.release-evidence/v<package-version>/
+├── expectations.json
+├── receipt.json
+└── artifacts/...
+```
+
+`expectations.json` freezes the independently reviewed `artifacts` and `publicClaims`.
+`receipt.json` must bind those expectations to validated, peer-corroborated schema-v2
+result evidence for `SOURCE_COMMIT`. A unique single-run result is not publishable.
+After committing the bundle, the working tree must be clean and this exact command
+must pass:
+
+```bash
+VERSION="$(node -p "require('./package.json').version")"
+SOURCE_COMMIT="$(git rev-parse HEAD^)"
+node scripts/verify-release-evidence.mjs \
+  --project . \
+  --receipt ".release-evidence/v${VERSION}/receipt.json" \
+  --expectations ".release-evidence/v${VERSION}/expectations.json" \
+  --package "$(node -p "require('./package.json').name")" \
+  --version "$VERSION" \
+  --git-commit "$SOURCE_COMMIT" \
+  --require-corroborated
+```
+
+The verifier rejects a dirty tree, a self-targeting receipt, an abbreviated/ref target,
+an evidence path outside the fixed bundle, a rename/delete/mode change, an untracked
+bundle file, any non-evidence change between `HEAD^` and `HEAD`, and missing or
+conflicting peer corroboration.
 
 Rules that the pipeline will enforce anyway, so save yourself a red run:
 
 - **The tag must be `v<version>`** and must match `package.json` exactly (`v1.44.0` ⇢ `1.44.0`).
+- **The tag must point at the evidence commit.** That commit must have exactly one
+  parent, and the source target is always `HEAD^`.
 - **npm versions are immutable.** A version already on the registry can never be
   republished. If you need to re-cut, bump the patch.
 - **Anything the README tells a user to open must be inside `package.json` `files`.**
   The `examples/` canvases were excluded from the tarball for several releases while the
   README instructed users to run
   `npx klypix-read node_modules/klypix-mcp/examples/showcase-brain.klypix`. That command
-  failed on every fresh install. Gate 6 now makes that impossible to ship again.
+  failed on every fresh install. The tarball gate now makes that impossible to ship again.
 
 ## 2. Cut the release
 
 ```bash
-git tag v<version>
+git status --short                     # must print nothing
+git show --stat --oneline HEAD         # evidence-only commit
+git tag v<version> HEAD
 git push origin v<version>
 gh release create v<version> --title "v<version> — <headline>" --notes "..."
 ```
@@ -46,14 +87,18 @@ Publishing the GitHub Release fires the workflow. Nothing else does — see §5.
 gh run watch          # or: gh run list --workflow=publish.yml
 ```
 
-Two jobs, in order:
+Three jobs, in order:
 
 ```
-gate  (contents: read only)          →   publish  (id-token: write)
-tests · tarball contents · CLI smoke      OIDC trusted publishing
+bind  (contents: read; no checkout/code)  →  gate  (contents: read only)  →  publish  (id-token: write)
+immutable event SHA                       evidence before dependencies      OIDC trusted publishing
+                                          tests · tarball · CLI smoke
 ```
 
-The permission split is deliberate: the gate executes third-party code (`npm ci`,
+The bind job captures canonical `github.sha` without checking out or running repository
+code. Both later jobs consume that immutable output directly, so dependency or test code
+cannot select a different SHA for publication. The permission split is deliberate: the
+gate executes third-party code (`npm ci`,
 `npm test`, installing the tarball) and is **not** given `id-token: write`, so a
 compromised dependency in the test path cannot mint an npm publishing token.
 
@@ -61,9 +106,11 @@ compromised dependency in the test path cannot mint an npm publishing token.
 
 ## 4. The gates — what each one proves, and what to do when it fails
 
-### Gate 1 · Trigger assertion
+### Gate 1 · Trigger and immutable identity binding
 **Proves** the run came from `release: published` or `workflow_dispatch` — never a
-pull request.
+pull request — and binds the canonical 40-character event SHA before checkout or any
+package/repository execution. The gate then checks out that exact SHA and proves the
+tag, checkout, evidence commit, and direct source parent before `npm ci`.
 **If it fails:** someone added a trigger to `publish.yml`. Remove it. A fork PR must
 never be able to reach the job that mints an OIDC token.
 
@@ -77,10 +124,18 @@ out of an ambient `node_modules`.
 "fix" it by switching the workflow to `npm install` — that would delete the guarantee.
 
 ### Gate 3 · Test-chain integrity
-**Proves** the `npm test` script still runs `test/conformance.mjs` and
-`test/cli-args.mjs`. These are the two most likely to be quietly dropped — conformance
-is slow, and cli-args is new.
-**If it fails:** re-add the missing suite to `scripts.test`. If you genuinely intend to
+**Proves** the `npm pretest` + `npm test` chain still runs the slow conformance suite,
+the CLI argument contract suite, the adversarial publication-evidence suites, the
+workflow security/topology regression, and the publish-verdict regression. In particular,
+`test/evidence-publication-gate.mjs` attacks forged hashes, missing/empty peer bindings,
+path and mode tricks, non-evidence diffs, and mismatched claims; `test/cli-args.mjs`
+exercises the actual CLI entry points. `test/release-evidence-cli.mjs` builds a real
+two-commit Git fixture and proves the executable verifier accepts only the closed,
+corroborated direct-parent bundle. `test/publish-workflow.mjs` pins the pre-execution
+identity binding, OIDC job's permissions, immutable action/runtime references, ordering, no-install/no-lifecycle
+policy, evidence invocation, and tarball exclusion.
+**If it fails:** re-add the missing suite to `scripts.pretest` or `scripts.test`. If you
+genuinely intend to
 move a suite to its own step, edit the required-list in the workflow in the same commit,
 deliberately.
 
@@ -93,16 +148,19 @@ guarantees it cannot silently leave the chain.
 past a red suite by dispatching manually — the manual path runs the same gate.
 
 ### Gate 5 · Version validation
-**Proves** three things:
-1. the tag matches `package.json`'s version (release event, or a tag ref);
-2. a **manual dispatch from a branch** is still standing on a real tag `v<version>` that
-   points at *this exact commit* — a dispatch can never publish untagged code;
-3. the version is not already on npm.
+**Proves** five things:
+1. both a published Release and a manual dispatch resolve to the exact tag `v<version>`;
+2. that tag matches `package.json` and points at this exact checkout;
+3. the tagged checkout is a one-parent evidence commit, never a merge commit;
+4. its sole parent (`HEAD^`) is the source target the evidence must bind;
+5. the version is not already on npm.
 
 **If it fails:**
 - *"Tag X does not match package.json version Y"* — bump the version or re-tag. Never
   publish a mismatched pair; the tarball and the git history would disagree forever.
 - *"No tag v<version> exists"* — you dispatched from a branch. Tag first.
+- *"must be one evidence commit with exactly one parent"* — rebuild the evidence-only
+  commit directly on top of the intended source commit; do not tag a merge or source commit.
 - *"already published on npm"* — bump the version. This check is stricter than the old
   behaviour on purpose: it turns an unreadable failure deep inside `npm publish` into a
   one-line message. The one case it costs you: re-dispatching a run for a version that
@@ -111,7 +169,25 @@ past a red suite by dispatching manually — the manual path runs the same gate.
 - Network flake reading the registry is **not** treated as "not published" — only a
   definitive non-empty answer blocks.
 
-### Gate 6 · Tarball contents
+### Gate 6 · Corroborated release evidence
+**Proves** the checked-out tag is exactly one evidence-only commit after the source
+target and that `.release-evidence/v<version>/` is a closed, committed bundle. The
+workflow invokes `scripts/verify-release-evidence.mjs` with the full `HEAD^` object ID,
+the exact receipt and expectations paths, the package identity/version, and
+`--require-corroborated`.
+
+The verifier re-hashes the committed receipt and artifacts, matches every public claim
+to the independently reviewed expectations, requires a distinct valid peer run, rejects
+conflicting/incomparable evidence, and fails if `HEAD^..HEAD` contains anything except
+the declared evidence files as regular `100644` additions. Evidence cannot authorize
+the same commit that contains it.
+
+**If it fails:** do not edit the receipt until it passes. Fix or rerun the underlying
+evaluation, obtain genuine peer corroboration, regenerate the expectations/receipt,
+and create a new evidence-only commit. If any source changed, that is a new source
+target: rebuild all evidence against it and bump/re-cut as appropriate.
+
+### Gate 7 · Tarball contents
 **Proves**, from `npm pack --dry-run --json` — i.e. from what will actually ship, not
 from what `package.json` intends:
 - every command in `bin` is in the tarball (otherwise `npm i -g` creates a shim pointing
@@ -122,7 +198,8 @@ from what `package.json` intends:
 - **every `examples/…` path the README names is inside the tarball** — the regression
   gate for the excluded-examples bug;
 - nothing forbidden shipped (`node_modules/`, `.git/`, `.env*`, `*.klypix-bak`,
-  `.impeccable/`).
+  `.impeccable/`, `.release-evidence/`). The evidence authorizes publication but is
+  deliberately excluded from the consumer package.
 
 **If it fails:**
 - `MISSING <path>` — add the directory or file to `package.json` `files`, or stop
@@ -134,7 +211,7 @@ from what `package.json` intends:
 - `FORBIDDEN <path>` — something private or huge is about to be published. Fix
   `files` / `.npmignore` before doing anything else.
 
-### Gate 7 · CLI smoke test
+### Gate 8 · CLI smoke test
 Everything above tests the **working tree**. This step tests what a **user receives**:
 `npm pack`, install that tarball into a throwaway directory with a throwaway `HOME`, and
 drive the installed binaries.
@@ -175,6 +252,13 @@ filename (npmjs.com → package → Settings → Trusted Publisher).
 Requirements, all already satisfied by the workflow: npm CLI ≥ 11.5.1, Node ≥ 22.14.0,
 `id-token: write`, a GitHub-hosted runner, and the Trusted Publisher configured on npm
 before the first run.
+
+The privileged job checks out the exact pre-execution-bound evidence SHA directly,
+proves that identity immediately, uses commit-pinned official checkout/setup actions with an
+exact Node toolchain and package-manager caching disabled, and asserts the bundled
+npm version is new enough. It deliberately runs no dependency install, build, test,
+or repository lifecycle script while `id-token: write` is available; all untrusted
+execution remains in the unprivileged gate job.
 
 **Provenance is generated automatically** on this path — do **not** add `--provenance`.
 Verified against the registry: the published `klypix-mcp@1.43.1` carries

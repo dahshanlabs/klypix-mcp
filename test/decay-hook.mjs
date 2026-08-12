@@ -65,7 +65,9 @@ try {
 
   const now = Date.now();
   const writeLane = () => fs.writeFileSync(laneFile, JSON.stringify({
-    sessions: [],
+    // Delivery now requires the exact recipient to be live. Keep each fixture
+    // recipient explicit instead of relying on a nonexistent-row broadcast.
+    sessions: ['sess-claude', 'sess-old-lib', 'sess-throwing', 'sess-no-lib'].map((id) => ({ id, lastSeen: now })),
     messages: [
       { id: 'm-aged-fast', from: 'peer-a', to: 'all', text: 'TestFlight build 26 uploaded — processing green', ts: now - 12 * HOUR, seen: [] },
       { id: 'm-fresh-fast', from: 'peer-a', to: 'all', text: 'v1.41.0 published to npm just now', ts: now - 1 * HOUR, seen: [] },
@@ -79,7 +81,9 @@ try {
   ok(footer.includes('build 26 uploaded'), 'messageFooter delivers the aged fast-decay message');
   const lines = footer.split('\n');
   const agedIdx = lines.findIndex(l => l.includes('build 26 uploaded'));
-  ok(agedIdx >= 0 && STAMP_RE.test(lines[agedIdx + 1] || ''), 'aged (12h) fast-decay message gets the ⏱️ LAST-KNOWN stamp on its own next line');
+  const agedStampIdx = lines.findIndex((line, index) => index > agedIdx && index <= agedIdx + 2 && STAMP_RE.test(line));
+  ok(agedIdx >= 0 && agedStampIdx > agedIdx,
+    'aged (12h) fast-decay message gets the ⏱️ LAST-KNOWN stamp on its own line after receipt metadata');
   ok((footer.match(/⏱️ This message is/g) || []).length === 1, 'exactly ONE stamp — fresh fast-decay and aged non-status messages are NOT stamped');
   ok(footer.includes('12h old'), 'the stamp renders the age in hours (12h), not raw minutes');
 

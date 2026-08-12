@@ -10,17 +10,22 @@ import fs from 'fs';
 import { execFileSync } from 'child_process';
 import path from 'path';
 import {
+  codexToolActionId,
   findProjectBrain,
   formatPresenceMessage,
   formatReceivedMessages,
   laneFileFor,
   listActiveSessions,
+  messageDeliveryReceipt,
   messageDecayInfo,
   peekMessages,
   postPresenceMessage,
   receiveMessages,
+  rekeySessionIdentity,
+  rotateEndedSessionIdentity,
   removeSession,
   sessionDeliveryReachability,
+  switchMcpSessionIdentity,
   upsertSession,
 } from './agent-presence.mjs';
 // ONE definition of the file key. Exact-overlap detection (here) and finding
@@ -43,6 +48,7 @@ export const KLYPIX_MCP_INSTRUCTIONS = [
   'At the start of each task, call brain_sync with the current project root, a one-sentence intent, and any expected files before editing; the explicit project root keeps separate repositories on separate brains even when an MCP host launches servers from its own install directory.',
   'A session that never calls brain_sync appears to every peer as a connection with no declared scope — sync early so concurrent sessions can coordinate with you.',
   'Use its active-task, message, and file-overlap report to coordinate concurrent work.',
+  'A coordination note is not consumed merely because it was offered: after a later independent KLYPIX action acknowledges the offer, call brain_message_receipt with its exact message id and offer token only when you actually incorporated it into your work.',
   'Call brain_sync again when your file scope materially changes, and with phase "complete" before your final response.',
   'When a task publishes a quantified or otherwise machine-checkable claim, include its validated result manifest in the completion sync; conflicting or incomparable peer results retain the task scope until reconciled.',
   'Do not read the full brain brief unless brain_sync says its compact context is insufficient or the task asks for broad history/status; use brain_ask for deeper retrieval.',
@@ -60,6 +66,9 @@ const compact = (value) => String(value || '').replace(/\s+/g, ' ').trim();
 // a path that cannot be placed under `root` keeps the previous (absolute,
 // lowercased) key, so an unrelated file still compares as itself and a
 // declaration is never dropped.
+
+// HISTORICAL RATIONALE BELOW IS SUPERSEDED by the explicit-ID rule that
+// follows it; hostPid is retained only as transport ownership metadata.
 
 // TWIN recognition: one logical session can (still) appear as two lane rows —
 // its lifecycle id and an mcp-<pid> id — whenever id adoption failed. Rows that
@@ -81,19 +90,21 @@ const compact = (value) => String(value || '').replace(/\s+/g, ' ').trim();
 //             placeholders (getClientVersion() is optional), so a generic value on
 //             either side stays compatible. This is what separates a codex row from
 //             a claude-code row that collided on one pid.
-const sameMachine = (a, b) => !a.machine || !b.machine || String(a.machine) === String(b.machine);
-const genericClient = (value) => !value || value === 'mcp' || value === 'unknown';
-const compatibleClient = (a, b) => {
-  const x = String(a.client || '').toLowerCase();
-  const y = String(b.client || '').toLowerCase();
-  return genericClient(x) || genericClient(y) || x === y;
-};
-export const isSuspectedTwin = (peer, me) => Boolean(
+// A host pid is a process/container fact, never a logical-session identity.
+// Codex intentionally runs independent threads below one desktop pid, so
+// pid-based twin suppression hid real peers and real conflicts. Only an
+// explicit host-provided logical id may pair otherwise-distinct rows. Missing
+// ids fail open as distinct sessions.
+export const isLogicalTwin = (peer, me) => Boolean(
   peer && me
-  && peer.hostPid && me.hostPid && peer.hostPid === me.hostPid
-  && sameMachine(peer, me)
-  && compatibleClient(peer, me),
+  && peer.id !== me.id
+  && compact(peer.logicalSessionId)
+  && compact(me.logicalSessionId)
+  && compact(peer.logicalSessionId) === compact(me.logicalSessionId),
 );
+// Compatibility export: matching hostPid/machine/client is now deliberately
+// insufficient. Consumers should migrate to isLogicalTwin.
+export const isSuspectedTwin = isLogicalTwin;
 
 export function findPresenceConflicts(sessions, selfId, { projectRoot } = {}) {
   const active = Array.isArray(sessions) ? sessions : [];
@@ -219,32 +230,145 @@ export function normalizeMcpClient(name) {
   return value.replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 32) || 'mcp';
 }
 
-export function resolveMcpSessionId({
+const LOGICAL_ID_MAX = 160;
+const LOGICAL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+
+const boundedIdentityId = (value) => {
+  if (typeof value !== 'string') return null;
+  const id = value.trim();
+  if (!id || id.length > LOGICAL_ID_MAX || !LOGICAL_ID_RE.test(id)) return null;
+  return id;
+};
+
+const requestActionId = (extra, turnMetadata, { toolName, toolInput } = {}) => {
+  // A later MCP request is an independent model action even when it belongs to
+  // the same Codex turn: the model received the prior tool result before it
+  // chose the next call. Keep the turn id for traceability, but include the
+  // request/progress id so brain_sync → brain_message_receipt can acknowledge
+  // and consume in one turn. Same-call double transitions are prevented by the
+  // worker's single decorator (brain_sync is never decorated a second time).
+  const turnId = boundedIdentityId(turnMetadata?.turn_id);
+  const sharedToolAction = codexToolActionId({
+    turnId,
+    toolUseId: turnMetadata?.tool_use_id,
+    toolName,
+    toolInput,
+  });
+  if (sharedToolAction) return sharedToolAction;
+  const rawRequestId = extra?.requestId ?? extra?._meta?.progressToken ?? extra?.progressToken;
+  const requestId = (typeof rawRequestId === 'string' || typeof rawRequestId === 'number')
+    ? String(rawRequestId).trim().slice(0, LOGICAL_ID_MAX)
+    : '';
+  if (turnId && requestId) return `codex-turn:${turnId}:request:${requestId}`;
+  if (turnId) return `codex-turn:${turnId}`;
+  return requestId ? `mcp-request:${requestId}` : '';
+};
+
+const parseCodexTurnMetadata = (value) => {
+  if (value === undefined) return { value: null, error: '' };
+  if (value && typeof value === 'object' && !Array.isArray(value)) return { value, error: '' };
+  if (typeof value !== 'string' || value.length > 16_384) {
+    return { value: null, error: 'x-codex-turn-metadata is not a bounded object' };
+  }
+  try {
+    const parsed = JSON.parse(value);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { value: null, error: 'x-codex-turn-metadata is not an object' };
+    }
+    return { value: parsed, error: '' };
+  } catch {
+    return { value: null, error: 'x-codex-turn-metadata is not valid JSON' };
+  }
+};
+
+// Resolve a logical session only from Codex's host-authored MCP metadata. A
+// turn_id/requestId identifies an ACTION, never a session. All independently
+// supplied session candidates must agree; disagreement fails closed so a
+// malformed request cannot rekey presence or consume another session's inbox.
+export function resolveRequestIdentity(extra, { client, toolName, toolInput } = {}) {
+  const normalizedClient = normalizeMcpClient(client);
+  const meta = extra?._meta && typeof extra._meta === 'object' ? extra._meta : {};
+  const parsedTurn = parseCodexTurnMetadata(meta['x-codex-turn-metadata']);
+  const actionId = requestActionId(extra, parsedTurn.value, { toolName, toolInput });
+  if (normalizedClient !== 'codex') {
+    return { ok: true, status: 'ignored-non-codex', id: null, actionId };
+  }
+  if (parsedTurn.error) {
+    return { ok: false, status: 'invalid', id: null, actionId, diagnostic: parsedTurn.error };
+  }
+
+  const rawCandidates = [];
+  if (Object.prototype.hasOwnProperty.call(meta, 'threadId')) {
+    rawCandidates.push(['threadId', meta.threadId]);
+  }
+  for (const key of ['session_id', 'thread_id']) {
+    if (parsedTurn.value && Object.prototype.hasOwnProperty.call(parsedTurn.value, key)) {
+      rawCandidates.push([`x-codex-turn-metadata.${key}`, parsedTurn.value[key]]);
+    }
+  }
+  if (!rawCandidates.length) return { ok: true, status: 'absent', id: null, actionId };
+
+  const candidates = rawCandidates.map(([source, value]) => ({
+    source,
+    id: boundedIdentityId(value),
+  }));
+  if (candidates.some((candidate) => !candidate.id)) {
+    return {
+      ok: false,
+      status: 'invalid',
+      id: null,
+      actionId,
+      diagnostic: 'Codex request identity contains an invalid or unbounded session id',
+    };
+  }
+  const ids = new Set(candidates.map((candidate) => candidate.id));
+  if (ids.size !== 1) {
+    return {
+      ok: false,
+      status: 'mismatch',
+      id: null,
+      actionId,
+      diagnostic: 'Codex request threadId/session_id/thread_id disagree',
+    };
+  }
+  return {
+    ok: true,
+    status: 'resolved',
+    id: candidates[0].id,
+    actionId,
+    source: 'mcp-request',
+  };
+}
+
+function resolveMcpSessionSeed({
   env = process.env,
   pid = process.pid,
   nonce = crypto.randomBytes(6).toString('hex'),
 } = {}) {
-  for (const key of [
+  const logicalEnvKeys = [
     'KLYPIX_SESSION_ID',
     'CODEX_THREAD_ID',
-    // Claude Code exports CLAUDE_CODE_SESSION_ID (live-verified 2026-07-29);
-    // the list only carried the speculative CLAUDE_SESSION_ID name, so every
-    // Claude MCP server fell through to mcp-<pid>-<nonce> and one logical
-    // session produced two unmerged lane rows. Both names stay, either wins.
     'CLAUDE_CODE_SESSION_ID',
     'CLAUDE_SESSION_ID',
     'CURSOR_SESSION_ID',
     'CLINE_SESSION_ID',
     'WINDSURF_SESSION_ID',
-    // The supervisor owns one stable MCP connection while workers are replaced
-    // underneath it. Falling through to the worker pid here gave every hot-swap
-    // candidate a different logical identity, defeating both presence handoff
-    // and any durable per-session completion state.
-    'KLYPIX_MCP_CONNECTION_ID',
-  ]) {
-    if (compact(env?.[key])) return compact(env[key]).slice(0, 160);
+  ];
+  for (const key of logicalEnvKeys) {
+    const id = boundedIdentityId(env?.[key]);
+    if (id) return { id, logicalSessionId: id, identitySource: 'host-env' };
   }
-  return `mcp-${pid}-${nonce}`;
+  const connectionId = boundedIdentityId(env?.KLYPIX_MCP_CONNECTION_ID);
+  if (connectionId) return { id: connectionId, logicalSessionId: null, identitySource: null };
+  return { id: `mcp-${pid}-${nonce}`, logicalSessionId: null, identitySource: null };
+}
+
+export function resolveMcpSessionId({
+  env = process.env,
+  pid = process.pid,
+  nonce = crypto.randomBytes(6).toString('hex'),
+} = {}) {
+  return resolveMcpSessionSeed({ env, pid, nonce }).id;
 }
 
 // A result submission changes the completion contract for the CURRENT logical
@@ -376,7 +500,10 @@ export function createMcpPresence({
   // partial (old bundle), delivery degrades to unstamped — never a throw.
   decay = {},
 } = {}) {
-  let sessionId = resolveMcpSessionId({ env });
+  const seedIdentity = resolveMcpSessionSeed({ env });
+  let sessionId = seedIdentity.id;
+  let logicalSessionId = seedIdentity.logicalSessionId;
+  let identitySource = seedIdentity.identitySource;
   const hostPid = resolveHostPid(env);
   const effectiveInboxPollMs = Number(env?.KLYPIX_MCP_INBOX_POLL_MS)
     || Number(inboxPollMs)
@@ -402,6 +529,9 @@ export function createMcpPresence({
   const adoptHostSession = (stamp) => {
     try {
       if (!brainPath || !hostPid) return;
+      // Codex has many logical threads below one desktop parent. Its hostmap is
+      // ambiguous by construction; only request metadata may rekey it.
+      if (clientInfo().client === 'codex') return;
       const mapped = hostmapSessionId({ brainPath, hostPid, home, now: stamp });
       if (!mapped || mapped === sessionId) return;
       const previous = sessionId;
@@ -413,6 +543,8 @@ export function createMcpPresence({
         }
       }
       sessionId = mapped;
+      logicalSessionId = mapped;
+      identitySource = 'lifecycle-hostmap';
       // The old row's mcp channel is ours — release it so the lane never holds
       // two rows for one logical session longer than a single touch interval.
       removeSession({
@@ -431,6 +563,181 @@ export function createMcpPresence({
   // heartbeat. Message sending needs the current id BEFORE it snapshots target
   // recipients, so expose a read/identity refresh that does not consume inbox
   // messages or create a second delivery transition in the same tool action.
+  const adoptRequestIdentity = (extra, { toolName, toolInput } = {}) => {
+    const stamp = now();
+    const info = clientInfo();
+    const resolved = resolveRequestIdentity(extra, {
+      client: info.client,
+      toolName,
+      toolInput,
+    });
+    if (!resolved.ok) {
+      return {
+        ...resolved,
+        sessionId,
+        diagnostic: `KLYPIX identity safety check deferred this action: ${resolved.diagnostic}. No presence identity or queued-message delivery changed.`,
+      };
+    }
+    if (!resolved.id) return { ...resolved, sessionId };
+    if (resolved.id === sessionId) {
+      logicalSessionId = resolved.id;
+      identitySource = 'mcp-request';
+      return { ...resolved, status: 'current', sessionId };
+    }
+
+    const previous = sessionId;
+    if (brainPath) {
+      let rotation;
+      try {
+        rotation = rotateEndedSessionIdentity({
+          brainPath,
+          fromId: previous,
+          toId: resolved.id,
+          client: info.client,
+          surface: info.surface,
+          cwd: path.dirname(brainPath),
+          hostPid,
+          home,
+          now: stamp,
+          expectedPid: process.pid,
+        });
+      } catch (error) {
+        rotation = { ok: false, reason: error?.message || 'identity-rotation-threw' };
+      }
+      if (rotation?.ok === true) {
+        // This is a new conversation, not a continuation of A. Leave A's
+        // durable result marker keyed to A and reset only worker-local state.
+        sessionId = resolved.id;
+        logicalSessionId = resolved.id;
+        identitySource = 'mcp-request';
+        resultClaimsPending = false;
+        taskStartedAt = 0;
+        lastPeers = '';
+        sentTexts.clear();
+        notifiedConflicts.clear();
+        announcedMessageIds.clear();
+        return { ...resolved, status: 'rotated-after-end', sessionId };
+      }
+      if (rotation?.reason !== 'source-not-ended') {
+        return {
+          ok: false,
+          status: 'rotation-failed',
+          id: null,
+          actionId: resolved.actionId,
+          sessionId,
+          diagnostic: `KLYPIX identity safety check deferred this action: ended-session rotation could not be verified (${rotation?.reason || 'unknown error'}). No presence identity or queued-message delivery changed.`,
+        };
+      }
+
+      // Once this worker already holds an exact host-authored logical id, a
+      // different exact request id is a new conversation even if lifecycle
+      // SessionEnd(A) is still in flight. Provisional rekey semantics would
+      // incorrectly move A's scope, aliases, authorship, and message audience
+      // onto B. Switch only this MCP channel under the lane lock instead.
+      const previousWasExact = logicalSessionId === previous
+        && ['mcp-request', 'host-env'].includes(String(identitySource || ''));
+      if (previousWasExact) {
+        let switched;
+        try {
+          switched = switchMcpSessionIdentity({
+            brainPath,
+            fromId: previous,
+            toId: resolved.id,
+            client: info.client,
+            surface: info.surface,
+            cwd: path.dirname(brainPath),
+            hostPid,
+            home,
+            now: stamp,
+            expectedPid: process.pid,
+          });
+        } catch (error) {
+          switched = { ok: false, reason: error?.message || 'identity-switch-threw' };
+        }
+        if (switched?.ok !== true) {
+          return {
+            ok: false,
+            status: 'switch-failed',
+            id: null,
+            actionId: resolved.actionId,
+            sessionId,
+            diagnostic: `KLYPIX identity safety check deferred this action: the live session switch could not be recorded (${switched?.reason || 'unknown error'}). No presence identity or queued-message delivery changed.`,
+          };
+        }
+        sessionId = resolved.id;
+        logicalSessionId = resolved.id;
+        identitySource = 'mcp-request';
+        resultClaimsPending = false;
+        taskStartedAt = 0;
+        lastPeers = '';
+        sentTexts.clear();
+        notifiedConflicts.clear();
+        announcedMessageIds.clear();
+        return { ...resolved, status: 'switched-live-session', sessionId };
+      }
+    }
+    const priorClaim = brainPath
+      ? readResultClaimPending({ brainPath, sessionId: previous, home })
+      : { ok: true, pending: resultClaimsPending };
+    if (brainPath && (resultClaimsPending || priorClaim.pending || !priorClaim.ok)) {
+      const marker = markResultClaimPending({
+        brainPath,
+        sessionId: resolved.id,
+        home,
+        at: stamp,
+      });
+      if (!marker.ok) {
+        return {
+          ok: false,
+          status: 'rekey-failed',
+          id: null,
+          actionId: resolved.actionId,
+          sessionId,
+          diagnostic: `KLYPIX identity safety check deferred this action: result-claim state could not be migrated (${marker.reason}). No presence identity or queued-message delivery changed.`,
+        };
+      }
+    }
+
+    if (brainPath) {
+      let rekey;
+      try {
+        rekey = rekeySessionIdentity({
+          brainPath,
+          fromId: previous,
+          toId: resolved.id,
+          home,
+          now: stamp,
+          expectedPid: process.pid,
+        });
+      } catch (error) {
+        rekey = { ok: false, reason: error?.message || 'identity-rekey-threw' };
+      }
+      if (rekey?.ok !== true) {
+        return {
+          ok: false,
+          status: 'rekey-failed',
+          id: null,
+          actionId: resolved.actionId,
+          sessionId,
+          diagnostic: `KLYPIX identity safety check deferred this action: the presence lane could not be rekeyed (${rekey?.reason || 'unknown error'}). No presence identity or queued-message delivery changed.`,
+        };
+      }
+      if ((resultClaimsPending || priorClaim.pending || !priorClaim.ok) && priorClaim.ok) {
+        // Destination was written first (fail-closed); source is removed only
+        // after the atomic lane rekey succeeds. A failed unlink leaves a safe,
+        // stale duplicate marker rather than losing the completion obligation.
+        clearResultClaimPending({ brainPath, sessionId: previous, home });
+      }
+    }
+
+    sessionId = resolved.id;
+    logicalSessionId = resolved.id;
+    identitySource = 'mcp-request';
+    lastPeers = '';
+    announcedMessageIds.clear();
+    return { ...resolved, status: 'adopted', sessionId };
+  };
+
   const refreshIdentity = () => {
     adoptHostSession(now());
     return sessionId;
@@ -470,7 +777,7 @@ export function createMcpPresence({
       now: now(),
     }).filter((message) => !announcedMessageIds.has(message.id));
     if (!pending.length) return [];
-    if (sendNotice(formatReceivedMessages(pending, now(), decay))) {
+    if (sendNotice(formatReceivedMessages(pending, now(), decay, sessionId))) {
       for (const message of pending) announcedMessageIds.add(message.id);
       while (announcedMessageIds.size > 100) {
         announcedMessageIds.delete(announcedMessageIds.values().next().value);
@@ -507,19 +814,37 @@ export function createMcpPresence({
       channel: 'mcp',
       cwd: path.dirname(brainPath),
       hostPid,
+      logicalSessionId,
+      identitySource,
       home,
       now: stamp,
     });
-    const messages = deliverMessages
-      ? receiveMessages({
-        brainPath,
-        sessionId,
-        ignoreTexts: [...sentTexts],
-        home,
-        now: stamp,
-        actionId,
-      })
-      : [];
+    let messages = [];
+    let deliveryWriteOk = null;
+    let deliveryWriteSkippedReason = null;
+    if (deliverMessages && sessions?.laneWriteOk === false) {
+      // Identity/presence mutation did not land, so do not advance a receipt in
+      // a separate lock acquisition and pretend the overall action was durable.
+      deliveryWriteOk = false;
+      deliveryWriteSkippedReason = 'presence-lane-write-failed';
+    } else if (deliverMessages) {
+      try {
+        messages = receiveMessages({
+          brainPath,
+          sessionId,
+          ignoreTexts: [...sentTexts],
+          home,
+          now: stamp,
+          actionId,
+        });
+        deliveryWriteOk = messages?.deliveryWriteOk ?? null;
+        deliveryWriteSkippedReason = messages?.deliveryWriteSkippedReason ?? null;
+      } catch (error) {
+        messages = [];
+        deliveryWriteOk = false;
+        deliveryWriteSkippedReason = `write-failed:${String(error?.code || error?.message || 'unknown').slice(0, 80)}`;
+      }
+    }
     if (deliverMessages) sentTexts.clear();
 
     const nextPeers = peerFingerprint(sessions, sessionId);
@@ -530,7 +855,7 @@ export function createMcpPresence({
       : '';
     const notice = [
       presence,
-      formatReceivedMessages(messages, stamp, decay),
+      formatReceivedMessages(messages, stamp, decay, sessionId),
     ].filter(Boolean).join('\n\n');
     if (notice) sendNotice(notice);
     // Additive, non-breaking: surface whether this touch's lane write actually
@@ -544,6 +869,8 @@ export function createMcpPresence({
       notice,
       laneWriteOk: sessions?.laneWriteOk ?? null,
       laneWriteSkippedReason: sessions?.laneWriteSkippedReason ?? null,
+      deliveryWriteOk,
+      deliveryWriteSkippedReason,
     };
   };
 
@@ -642,6 +969,14 @@ export function createMcpPresence({
     let completionBlocked = false;
     let resultSubmissionRejected = false;
     const stateConflicts = [];
+    // Capture the authoritative lane declaration before result reconciliation
+    // or completion can mutate it. Schema-v2 evidence must prove the scope the
+    // session actually declared; accepting a caller-supplied scope would let a
+    // result manifest self-attest to different files or a different intent.
+    const activeCompletionScope = completing && resultBrainPath
+      ? listActiveSessions({ brainPath: resultBrainPath, home, now: now() })
+        .find((session) => session.id === sessionId)
+      : null;
 
     if (nextPhase === 'start') {
       if (!resultBrainPath) resultClaimsPending = false;
@@ -690,6 +1025,9 @@ export function createMcpPresence({
           brainPath: resultBrainPath,
           projectRoot: resultBrainPath ? path.dirname(resultBrainPath) : requestedVault,
           sessionId,
+          declaredScope: activeCompletionScope
+            ? { intent: activeCompletionScope.intent || '', files: activeCompletionScope.files || [] }
+            : undefined,
           results,
           home,
           now: now(),
@@ -725,10 +1063,7 @@ export function createMcpPresence({
       completionBlocked = true;
     }
     const clearCompletionScope = completing && !completionBlocked;
-    const priorCompletionScope = clearCompletionScope && resultBrainPath
-      ? listActiveSessions({ brainPath: resultBrainPath, home, now: now() })
-        .find((session) => session.id === sessionId)
-      : null;
+    const priorCompletionScope = clearCompletionScope ? activeCompletionScope : null;
     const shouldDeliverMessages = deliverMessages !== false && include_context !== false;
     const details = {
       event: clearCompletionScope
@@ -747,7 +1082,10 @@ export function createMcpPresence({
       intent: clearCompletionScope ? ''
         : (completing ? undefined
           : (compact(intent) ? intent : (nextPhase === 'start' ? '' : undefined))),
-      files: clearCompletionScope ? [] : (completing ? undefined : files),
+      // A phase:start is a hard task boundary. Omitting files must clear the
+      // prior task's scope instead of accidentally inheriting it.
+      files: clearCompletionScope ? []
+        : (completing ? undefined : (nextPhase === 'start' ? (files ?? []) : files)),
       replaceFiles: clearCompletionScope || nextPhase === 'start',
     };
     let report = started && requestedVault === vault
@@ -866,7 +1204,7 @@ export function createMcpPresence({
       ].join('\n')
       : 'No exact file overlap is currently reported by another synchronized task.';
     const durationMs = Math.max(0, Date.now() - syncStartedAt);
-    const messagesText = formatReceivedMessages(report.messages, stamp, decay);
+    const messagesText = formatReceivedMessages(report.messages, stamp, decay, sessionId);
     const structured = {
       schemaVersion: 1,
       status: completing ? (completionBlocked ? 'needs-reconciliation' : 'complete') : 'active',
@@ -886,11 +1224,16 @@ export function createMcpPresence({
         // text: a consumer reading structured.messages directly must see the
         // LAST-KNOWN marking, not re-derive it (additive fields, schema 1).
         const decayInfo = messageDecayInfo(message, stamp, decay);
+        const receipt = messageDeliveryReceipt(message, sessionId);
         return {
           id: message.id,
           from: message.from,
           text: message.text,
           ts: message.ts,
+          ...(receipt ? {
+            deliveryState: receipt.deliveryState,
+            offerToken: receipt.offerToken,
+          } : {}),
           ...(decayInfo ? { lastKnown: true, age: decayInfo.age, stampText: decayInfo.stampText } : {}),
         };
       }),
@@ -908,9 +1251,11 @@ export function createMcpPresence({
       delivery: {
         proactive: 'mcp-logging-best-effort-preview',
         modelContext: shouldDeliverMessages ? 'supported-klypix-action' : 'deferred',
-        stateMachine: 'pending -> offered -> acknowledged | failed',
-        acknowledgement: 'a later independent supported action followed an offer; not proof of human reading',
+        stateMachine: 'pending -> offered -> acknowledged -> consumed | failed',
+        acknowledgement: 'a later independent supported action followed an offer; explicit token-bound brain_message_receipt records actual model consumption',
         retention: 'machine-local; 24h TTL and bounded lane capacity, with explicit failed receipts on expiry/overflow',
+        writeOk: shouldDeliverMessages ? report.deliveryWriteOk : null,
+        ...(report.deliveryWriteSkippedReason ? { writeFailure: report.deliveryWriteSkippedReason } : {}),
       },
       timingMs: { coordination: durationMs },
     };
@@ -930,11 +1275,15 @@ export function createMcpPresence({
       : completing && resultReconciliation
         ? `KLYPIX result reconciliation: ${resultReconciliation.status}; completion evidence was recorded in the machine-local project ledger.`
         : '';
+    const deliveryWarning = shouldDeliverMessages && report.deliveryWriteOk === false
+      ? `KLYPIX message delivery was deferred safely: ${report.deliveryWriteSkippedReason || 'the receipt write did not land'}. No queued note was reported as delivered; retry on the next KLYPIX action.`
+      : '';
     const text = [
       `KLYPIX Context Gateway: session ${sessionId} · phase ${nextPhase} · coordination ${durationMs}ms.`,
       resultText,
       formatTaskPresence(snapshot, stamp),
       messagesText,
+      deliveryWarning,
       conflictText,
     ].filter(Boolean).join('\n\n');
     return {
@@ -951,7 +1300,7 @@ export function createMcpPresence({
 
   const decorateToolResult = (result, { actionId = '', deliverMessages = true } = {}) => {
     if (!started) start(vault);
-    const { sessions, notice } = touch({
+    const { sessions, notice, deliveryWriteOk, deliveryWriteSkippedReason } = touch({
       event: 'McpToolUse',
       deliverMessages: deliverMessages !== false,
       actionId: actionId || `mcp-tool:${process.pid}:${++modelActionSequence}`,
@@ -970,7 +1319,10 @@ export function createMcpPresence({
         nudge = 'KLYPIX presence: this session has not declared its task — peers see it as a connection with no scope. Call brain_sync {intent, files} so concurrent sessions can coordinate with you.';
       }
     }
-    const extra = [notice, nudge].filter(Boolean).join('\n\n');
+    const deliveryWarning = deliveryWriteOk === false
+      ? `KLYPIX message delivery was deferred safely: ${deliveryWriteSkippedReason || 'the receipt write did not land'}. No queued note was reported as delivered; retry on the next KLYPIX action.`
+      : '';
+    const extra = [notice, deliveryWarning, nudge].filter(Boolean).join('\n\n');
     if (!extra || !result || !Array.isArray(result.content)) return result;
     return {
       ...result,
@@ -990,6 +1342,7 @@ export function createMcpPresence({
     touch,
     pollInbox,
     sync,
+    adoptRequestIdentity,
     refreshIdentity,
     noteSent,
     decorateToolResult,

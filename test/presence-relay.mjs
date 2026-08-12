@@ -363,6 +363,20 @@ ok(localStillWins.client === 'codex' && localStillWins.via !== 'cloud',
   'a locally-registered session id always beats a cloud frame with the same id (D3 precedence)');
 
 // P5 end-to-end: double-delivery of one message lands exactly one lane row.
+// Mirror B's live presence back to A before the send. Delivery v3 snapshots an
+// actual recipient session at send time; a one-way presence fixture would be a
+// zero-audience broadcast and must now fail instead of becoming store-forward
+// work for a peer that appears later.
+const framesFromB = [];
+relayOutbound({
+  sessions: [localStillWins], consent: GRANT, machineId: 'mach-b', hostLabel: 'DEV-PC-B',
+  root: repoB, now: now + 650, send: (frame) => framesFromB.push(frame),
+});
+const inboundOnA = framesFromB
+  .map((frame) => relayInbound(frame, { consent: GRANT, machineId: 'mach-a', now: now + 660 }))
+  .filter((result) => result?.type === 'presence')
+  .map((result) => result.row);
+upsertRemoteSessions({ brainPath: brainA, rows: inboundOnA, machineId: 'mach-a', home: homeA, now: now + 660 });
 postPresenceMessage({ brainPath: brainA, from: 'dev-a-session', text: 'Claiming src/App.tsx for an hour', home: homeA, now: now + 700 });
 const laneMsgs = JSON.parse(fs.readFileSync(laneFileFor(brainA, homeA), 'utf8')).messages;
 const outMsgFrames = [];
@@ -414,8 +428,9 @@ ok(purged.laneWriteOk === true
 // P1: a dead channel degrades silently — outbound reports, local reads still work.
 const deadOut = relayOutbound({ sessions: aRows, consent: GRANT, machineId: 'mach-a', root: repoA, now, send: undefined });
 ok(deadOut.sent === 0 && deadOut.reason === 'no-channel'
-  && listActiveSessions({ brainPath: brainA, home: homeA, now: now + 1300 }).length === 1,
-'a dead/unreachable channel degrades to local-only presence with no throw (P1)');
+  && listActiveSessions({ brainPath: brainA, home: homeA, now: now + 1300 })
+    .some((session) => session.id === 'dev-a-session' && session.via !== 'cloud'),
+  'a dead/unreachable channel degrades safely while local presence remains available (P1)');
 
 // Frame authenticity (optional per-brain MAC): signed frames verify; forged /
 // unsigned / tampered frames DROP when the receiver holds the key; no key

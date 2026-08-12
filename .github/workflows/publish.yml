@@ -6,7 +6,7 @@ name: Publish to npm
 # GitHub Release; workflow_dispatch allows manual re-runs.
 #
 # Verified requirements (official npm docs, OIDC trusted publishing GA 2025-07-31):
-#   - npm CLI >= 11.5.1   (guaranteed below by `npm install -g npm@latest`)
+#   - npm CLI >= 11.5.1   (asserted below from the pinned Node 24 toolchain)
 #   - Node.js >= 22.14.0  (node 24 ships npm 11.x and is well above the floor)
 #   - permissions id-token:write (mints the OIDC token) + contents:read
 #   - GitHub-hosted runner (self-hosted not supported)
@@ -41,8 +41,40 @@ defaults:
     shell: bash
 
 jobs:
+  bind:
+    name: Bind immutable release identity
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      evidence_commit: ${{ steps.identity.outputs.evidence_commit }}
+    steps:
+      # This job intentionally checks out nothing and runs no package or
+      # repository code. Its output is fixed directly from GitHub's event
+      # context before any dependency can mutate PATH, NODE_OPTIONS, HEAD, or
+      # later step environments in the unprivileged test job.
+      - name: Bind the event commit before untrusted execution
+        id: identity
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          case "$EVENT_NAME" in
+            release|workflow_dispatch) ;;
+            *) echo "::error::Refusing to bind a '$EVENT_NAME' event."; exit 1 ;;
+          esac
+          if [ "${#EVENT_SHA}" -ne 40 ] || [[ "$EVENT_SHA" == *[!0-9a-f]* ]]; then
+            echo "::error::GitHub supplied a non-canonical commit id: '$EVENT_SHA'."
+            exit 1
+          fi
+          echo "evidence_commit=$EVENT_SHA" >> "$GITHUB_OUTPUT"
+          echo "bound immutable event commit $EVENT_SHA"
+
   gate:
-    name: Release gate (tests · tarball contents · CLI smoke)
+    name: Release gate (tests · corroborated evidence · tarball · CLI smoke)
+    needs: bind
     if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
@@ -72,16 +104,107 @@ jobs:
       # fetch-depth 0 + tags: the version gate below verifies that a manual
       # dispatch is standing on the tag it claims to be publishing.
       - name: Checkout (clean, full history + tags)
-        uses: actions/checkout@v5
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          ref: ${{ needs.bind.outputs.evidence_commit }}
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Prove the gate checkout identity
+        env:
+          BOUND_EVIDENCE_COMMIT: ${{ needs.bind.outputs.evidence_commit }}
+        run: |
+          set -euo pipefail
+          CHECKED_OUT_SHA="$(git rev-parse HEAD)"
+          if [ "$CHECKED_OUT_SHA" != "$BOUND_EVIDENCE_COMMIT" ]; then
+            echo "::error::Gate checkout $CHECKED_OUT_SHA differs from the pre-execution binding $BOUND_EVIDENCE_COMMIT."
+            exit 1
+          fi
+          echo "gate checkout matches pre-execution binding $CHECKED_OUT_SHA"
+
       - name: Setup Node
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: '24'
+          node-version: '24.13.1'
           registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false
+
+      # Run identity and evidence verification before npm ci or any repository
+      # lifecycle/test code. Later untrusted execution cannot choose the commit
+      # consumed by the privileged job, which reads the bind job directly.
+      - name: Version validation (the tag must match package.json)
+        id: version
+        env:
+          BOUND_EVIDENCE_COMMIT: ${{ needs.bind.outputs.evidence_commit }}
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./package.json').version")"
+          NAME="$(node -p "require('./package.json').name")"
+          echo "package.json: $NAME@$VERSION"
+
+          EXPECTED_TAG="v$VERSION"
+          TAG=""
+          if [ "$EVENT_NAME" = "release" ]; then
+            TAG="$RELEASE_TAG"
+          elif [ "$REF_TYPE" = "tag" ]; then
+            TAG="$REF_NAME"
+          else
+            TAG="$EXPECTED_TAG"
+          fi
+
+          if [ "$TAG" != "$EXPECTED_TAG" ]; then
+            echo "::error::Release tag '$TAG' must be exactly '$EXPECTED_TAG'."
+            exit 1
+          fi
+          if ! git rev-parse -q --verify "refs/tags/$EXPECTED_TAG^{commit}" >/dev/null; then
+            echo "::error::No tag '$EXPECTED_TAG' exists. Both release and manual triggers require the exact version tag."
+            exit 1
+          fi
+          CHECKED_OUT_SHA="$(git rev-parse HEAD)"
+          TAGGED_SHA="$(git rev-parse "refs/tags/$EXPECTED_TAG^{commit}")"
+          if [ "$CHECKED_OUT_SHA" != "$BOUND_EVIDENCE_COMMIT" ] || [ "$TAGGED_SHA" != "$BOUND_EVIDENCE_COMMIT" ]; then
+            echo "::error::Tag, checkout, and pre-execution event binding must all equal $BOUND_EVIDENCE_COMMIT (checkout=$CHECKED_OUT_SHA tag=$TAGGED_SHA)."
+            exit 1
+          fi
+
+          read -r -a COMMIT_LINE <<< "$(git rev-list --parents -n 1 "$CHECKED_OUT_SHA")"
+          if [ "${#COMMIT_LINE[@]}" -ne 2 ]; then
+            echo "::error::The tagged release must be one evidence commit with exactly one parent; found $((${#COMMIT_LINE[@]} - 1)) parent(s)."
+            exit 1
+          fi
+          SOURCE_COMMIT="${COMMIT_LINE[1]}"
+          echo "tag '$EXPECTED_TAG' points at evidence commit $CHECKED_OUT_SHA; source target is $SOURCE_COMMIT (HEAD^)"
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "source_commit=$SOURCE_COMMIT" >> "$GITHUB_OUTPUT"
+
+      - name: Verify committed corroborated release evidence
+        env:
+          BOUND_EVIDENCE_COMMIT: ${{ needs.bind.outputs.evidence_commit }}
+          VERSION: ${{ steps.version.outputs.version }}
+          SOURCE_COMMIT: ${{ steps.version.outputs.source_commit }}
+        run: |
+          set -euo pipefail
+          NAME="$(node -p "require('./package.json').name")"
+          EVIDENCE_COMMIT="$(git rev-parse HEAD)"
+          if [ "$EVIDENCE_COMMIT" != "$BOUND_EVIDENCE_COMMIT" ] || [ "$(git rev-parse HEAD^)" != "$SOURCE_COMMIT" ]; then
+            echo "::error::Evidence identity changed after the pre-execution binding."
+            exit 1
+          fi
+          BUNDLE=".release-evidence/v${VERSION}"
+          node scripts/verify-release-evidence.mjs \
+            --project . \
+            --receipt "$BUNDLE/receipt.json" \
+            --expectations "$BUNDLE/expectations.json" \
+            --package "$NAME" \
+            --version "$VERSION" \
+            --git-commit "$SOURCE_COMMIT" \
+            --require-corroborated
+          echo "corroborated evidence bundle verified: $BUNDLE ($SOURCE_COMMIT -> $EVIDENCE_COMMIT)"
 
       # Lockfile ENFORCED. `npm ci` fails if package.json and package-lock.json
       # disagree — the whole point of gating on it rather than `npm install`.
@@ -95,9 +218,10 @@ jobs:
           npm --version
           npm ci
 
-      # The gate is only as good as the chain it runs. These two files are the
-      # ones a future edit is most likely to drop: conformance is slow, and
-      # cli-args is new. Assert they are still wired before trusting `npm test`.
+      # The gate is only as good as the chain it runs. Assert the slow
+      # conformance suite, adversarial publication-evidence suite, CLI contract
+      # suite, and the workflow's own publish classifier remain wired before
+      # trusting `npm test`.
       # A `run:` block with broken shell quoting fails the gate for a reason
       # that has nothing to do with the release, and reads exactly like a real
       # red. That happened: an apostrophe inside `node -e '…'` (see the next
@@ -153,12 +277,21 @@ jobs:
           # closed on its own syntax is indistinguishable from a real red.
           cat > "${RUNNER_TEMP}/assert-test-chain.cjs" <<'JS'
           const fs = require("fs");
-          const script = JSON.parse(fs.readFileSync("package.json", "utf8")).scripts?.test || "";
+          const scripts = JSON.parse(fs.readFileSync("package.json", "utf8")).scripts || {};
+          const script = [scripts.pretest, scripts.test].filter(Boolean).join(" && ");
           // publish-verdict.mjs guards the post-publish classifier belonging to
           // this workflow, which misreported a perfect v1.61.0 publish as a
           // broken trusted-publishing path. A release gate that stops checking
           // its own alarm logic is how that returns.
-          const required = ["test/project-graph.mjs", "test/conformance.mjs", "test/cli-args.mjs", "test/publish-verdict.mjs"];
+          const required = [
+            "test/project-graph.mjs",
+            "test/conformance.mjs",
+            "test/cli-args.mjs",
+            "test/evidence-publication-gate.mjs",
+            "test/release-evidence-cli.mjs",
+            "test/publish-workflow.mjs",
+            "test/publish-verdict.mjs",
+          ];
           const missing = required.filter((f) => !script.includes(f));
           if (!script.trim()) { console.error("::error::package.json has no test script — the gate would prove nothing."); process.exit(1); }
           if (missing.length) {
@@ -168,6 +301,84 @@ jobs:
           console.log(`npm test chain: ${script.split("&&").length} suite(s), including ${required.join(" + ")}`);
           JS
           node "${RUNNER_TEMP}/assert-test-chain.cjs"
+
+      - name: Assert evidence wiring remains ordered and fail-closed
+        run: |
+          set -euo pipefail
+          cat > "${RUNNER_TEMP}/assert-evidence-wiring.cjs" <<'JS'
+          const fs = require("fs");
+          const lines = fs.readFileSync(".github/workflows/publish.yml", "utf8").replace(/\r/g, "").split("\n");
+          const step = (name) => lines.findIndex((line) => line.trim() === `- name: ${name}`);
+          const body = (start) => {
+            const end = lines.findIndex((line, index) => index > start && /^\s+- name: /.test(line));
+            return lines.slice(start, end < 0 ? lines.length : end).join("\n");
+          };
+          const version = step("Version validation (the tag must match package.json)");
+          const evidence = step("Verify committed corroborated release evidence");
+          const install = step("Install (npm ci — lockfile enforced)");
+          const tarball = step("Tarball contents (npm pack --dry-run + assertions)");
+          const bind = lines.findIndex((line) => line === "  bind:");
+          const gate = lines.findIndex((line) => line === "  gate:");
+          const publish = lines.findIndex((line) => line === "  publish:");
+          const problems = [];
+          if (!(bind >= 0 && bind < gate && gate < version && version < evidence
+            && evidence < install && install < tarball && tarball < publish)) {
+            problems.push("required order is bind -> gate identity/evidence -> install/tests -> tarball -> publish");
+          }
+          const evidenceBody = body(evidence);
+          for (const token of [
+            '.release-evidence/v${VERSION}',
+            '--git-commit "$SOURCE_COMMIT"',
+            "--require-corroborated",
+            "receipt.json",
+            "expectations.json",
+          ]) {
+            if (!evidenceBody.includes(token)) problems.push(`evidence step is missing ${token}`);
+          }
+          if (!body(version).includes("git rev-list --parents -n 1")) problems.push("version step no longer requires one parent");
+          if (body(version).includes("npm view") || body(version).includes("already published")) {
+            problems.push("gate must leave idempotent existing-version verification to the privileged integrity check");
+          }
+          if (!body(version).includes("BOUND_EVIDENCE_COMMIT")
+            || !body(evidence).includes("BOUND_EVIDENCE_COMMIT")) {
+            problems.push("version/evidence steps no longer prove the pre-execution event binding");
+          }
+          if (!body(tarball).includes(".release-evidence")) problems.push("tarball step no longer forbids release evidence");
+          const publishBody = lines.slice(publish).join("\n");
+          if (!/^    needs: \[bind, gate\]$/m.test(publishBody)) problems.push("publish job no longer needs bind and gate");
+          const privilegedCheckout = step("Checkout the gate-cleared evidence commit");
+          const privilegedProof = step("Prove the privileged checkout identity");
+          const privilegedSetup = step("Setup pinned Node toolchain");
+          const privilegedVersion = step("Confirm the version the gate cleared");
+          const privilegedPublish = step("Publish (OIDC, auto-provenance)");
+          if (!(publish < privilegedCheckout && privilegedCheckout < privilegedProof
+            && privilegedProof < privilegedSetup && privilegedSetup < privilegedVersion
+            && privilegedVersion < privilegedPublish)) {
+            problems.push("privileged job order is checkout -> identity proof -> pinned toolchain -> version proof -> publish");
+          }
+          if (!body(privilegedCheckout).includes("needs.bind.outputs.evidence_commit")
+            || !body(privilegedProof).includes("needs.bind.outputs.evidence_commit")) {
+            problems.push("privileged checkout no longer consumes the pre-execution event binding directly");
+          }
+          if (/npm (?:ci|install|i)(?:\s|$)/m.test(publishBody)) {
+            problems.push("privileged publish job must not execute dependency install code");
+          }
+          if (!publishBody.includes('NPM_CONFIG_IGNORE_SCRIPTS: "true"')) {
+            problems.push("privileged publish job must disable repository lifecycle scripts");
+          }
+          if (body(privilegedSetup).includes("registry-url:")) {
+            problems.push("privileged setup-node must not create token-auth registry configuration that disables OIDC discovery");
+          }
+          if (/uses:\s+[^\s]+@(?![a-f0-9]{40}\b)/.test(publishBody)) {
+            problems.push("privileged publish-job actions must be pinned to full commit SHAs");
+          }
+          if (problems.length) {
+            for (const problem of problems) console.error(`::error::${problem}`);
+            process.exit(1);
+          }
+          console.log("release evidence workflow wiring: PASS");
+          JS
+          node "${RUNNER_TEMP}/assert-evidence-wiring.cjs"
 
       # Full suite. The conformance suite runs INSIDE this chain
       # (test/conformance.mjs spawns `klypix-mcp conformance --json` and asserts
@@ -211,59 +422,6 @@ jobs:
               process.exit(1);
             });
           ' "$NAME" "$PREV"
-
-      - name: Version validation (the tag must match package.json)
-        id: version
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-          REF_TYPE: ${{ github.ref_type }}
-          REF_NAME: ${{ github.ref_name }}
-          COMMIT_SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          VERSION="$(node -p "require('./package.json').version")"
-          NAME="$(node -p "require('./package.json').name")"
-          echo "package.json: $NAME@$VERSION"
-
-          TAG=""
-          if [ "$EVENT_NAME" = "release" ]; then
-            TAG="$RELEASE_TAG"
-          elif [ "$REF_TYPE" = "tag" ]; then
-            TAG="$REF_NAME"
-          fi
-
-          if [ -n "$TAG" ]; then
-            if [ "${TAG#v}" != "$VERSION" ]; then
-              echo "::error::Tag '$TAG' does not match package.json version '$VERSION'. Fix the version or re-tag; do not publish a mismatched pair."
-              exit 1
-            fi
-            echo "tag '$TAG' matches package.json version '$VERSION'"
-          else
-            # Manual dispatch from a branch: still require a real tag, pointing at
-            # exactly this commit, so a dispatch can never publish untagged code.
-            if ! git rev-parse -q --verify "refs/tags/v$VERSION^{commit}" >/dev/null; then
-              echo "::error::No tag 'v$VERSION' exists. A manual dispatch may only publish a tagged commit."
-              exit 1
-            fi
-            TAGGED_SHA="$(git rev-list -n 1 "v$VERSION")"
-            if [ "$TAGGED_SHA" != "$COMMIT_SHA" ]; then
-              echo "::error::Tag 'v$VERSION' points at $TAGGED_SHA but this run is on $COMMIT_SHA. Re-tag or dispatch from the tag."
-              exit 1
-            fi
-            echo "manual dispatch validated against tag 'v$VERSION' at $COMMIT_SHA"
-          fi
-
-          # Already on npm? Fail here with a readable message rather than deep in
-          # `npm publish`. A network error must NOT be read as "not published":
-          # only a definitive non-empty answer blocks.
-          PUBLISHED="$(npm view "$NAME@$VERSION" version 2>/dev/null || true)"
-          if [ -n "$PUBLISHED" ]; then
-            echo "::error::$NAME@$VERSION is already published on npm. Bump the version — npm versions are immutable."
-            exit 1
-          fi
-          echo "$NAME@$VERSION is not yet on npm"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Tarball contents (npm pack --dry-run + assertions)
         env:
@@ -324,6 +482,7 @@ jobs:
             // 5. Things that must never be published.
             for (const f of [...files].filter((p) => /^node_modules\//.test(p)
               || /^\.git\//.test(p)
+              || /^\.release-evidence(?:\/|$)/.test(p)
               || /(^|\/)\.env($|\.)/.test(p)
               || /\.klypix-bak$/.test(p)
               || /(^|\/)\.impeccable\//.test(p))) {
@@ -423,9 +582,13 @@ jobs:
 
   publish:
     name: Publish (OIDC trusted publishing)
-    needs: gate
+    needs: [bind, gate]
     if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    env:
+      # Publishing must never execute repository lifecycle scripts while this
+      # job can mint an npm OIDC token.
+      NPM_CONFIG_IGNORE_SCRIPTS: "true"
     permissions:
       id-token: write   # REQUIRED: lets GitHub Actions mint the OIDC token npm exchanges
       contents: read    # checkout
@@ -440,35 +603,51 @@ jobs:
             *) echo "::error::Refusing to publish from a '$EVENT_NAME' context."; exit 1 ;;
           esac
 
-      - name: Checkout
-        uses: actions/checkout@v5
+      - name: Checkout the gate-cleared evidence commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          ref: ${{ needs.bind.outputs.evidence_commit }}
           persist-credentials: false
 
-      - name: Setup Node
-        uses: actions/setup-node@v5
-        with:
-          node-version: '24'
-          registry-url: 'https://registry.npmjs.org'
-
-      # MAKE-OR-BREAK: npm must be >= 11.5.1 for OIDC trusted publishing; older npm
-      # silently falls back to token auth and fails. Upgrade + print to confirm.
-      - name: Ensure npm supports OIDC trusted publishing (>= 11.5.1)
+      # Prove the exact artifact identity before the privileged job executes any
+      # package-manager or repository-controlled code.
+      - name: Prove the privileged checkout identity
+        env:
+          GATE_EVIDENCE_COMMIT: ${{ needs.bind.outputs.evidence_commit }}
         run: |
-          npm install -g npm@latest
-          npm --version
+          set -euo pipefail
+          CHECKED_OUT_SHA="$(git rev-parse HEAD)"
+          if [ "$CHECKED_OUT_SHA" != "$GATE_EVIDENCE_COMMIT" ]; then
+            echo "::error::This checkout is $CHECKED_OUT_SHA but the gate cleared evidence commit $GATE_EVIDENCE_COMMIT."
+            exit 1
+          fi
+          echo "privileged checkout matches gate-cleared evidence commit $CHECKED_OUT_SHA"
 
-      # `npm publish` needs no development tooling (plain ESM, no build/prepublish
-      # script). The local ML stack is dev-only so the full gate can exercise the
-      # harder ambient-model case without making it part of a consumer install.
-      # The GATE job already ran `npm ci` with the full lockfile and the whole
-      # test suite against this same commit.
-      - name: Install (core deps only, deterministic)
-        run: npm ci --omit=dev --omit=optional
+      - name: Setup pinned Node toolchain
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24.13.1'
+          package-manager-cache: false
 
-      # The gate proved this exact commit; re-assert that the artifact this job is
-      # about to push is the version the gate cleared, so a `needs:` that ever
-      # stops implying "same commit" cannot slip a different version through.
+      # MAKE-OR-BREAK: npm must be >= 11.5.1 for OIDC trusted publishing. Never
+      # install a mutable npm release while this job can mint an OIDC token.
+      - name: Assert npm supports OIDC trusted publishing (>= 11.5.1)
+        run: |
+          set -euo pipefail
+          NPM_VERSION="$(npm --version)"
+          node -e '
+            const [major, minor, patch] = process.argv[1].split(".").map(Number);
+            if (![major, minor, patch].every(Number.isSafeInteger)
+              || major < 11 || (major === 11 && minor < 5)
+              || (major === 11 && minor === 5 && patch < 1)) {
+              console.error(`::error::npm ${process.argv[1]} is below the 11.5.1 OIDC floor.`);
+              process.exit(1);
+            }
+          ' "$NPM_VERSION"
+          echo "npm $NPM_VERSION supports OIDC trusted publishing"
+
+      # No dependency install or repository lifecycle script runs in this job.
+      # The unprivileged gate already tested and packed this exact commit.
       - name: Confirm the version the gate cleared
         env:
           GATE_VERSION: ${{ needs.gate.outputs.version }}
@@ -479,7 +658,8 @@ jobs:
             echo "::error::This checkout is version $VERSION but the gate cleared $GATE_VERSION."
             exit 1
           fi
-          echo "publishing version $VERSION (gate-cleared)"
+          CHECKED_OUT_SHA="$(git rev-parse HEAD)"
+          echo "publishing version $VERSION from gate-cleared evidence commit $CHECKED_OUT_SHA"
 
       # A provenance read-back can outlive the registry's indexing window even
       # after npm publish succeeds. Make a failed job safe to re-run: an exact
@@ -518,9 +698,11 @@ jobs:
           echo "exists=true" >> "$GITHUB_OUTPUT"
           echo "$NAME@$GATE_VERSION already exists with the exact gate-cleared integrity; skipping immutable republish"
 
-      # Tokenless: do NOT set NODE_AUTH_TOKEN / NPM_TOKEN. setup-node writes an
-      # empty-token .npmrc line which npm >= 11.5.1 ignores under OIDC. Provenance
-      # is generated AUTOMATICALLY (public repo + public package); no flag needed.
+      # Tokenless: do NOT set NODE_AUTH_TOKEN / NPM_TOKEN and do NOT add
+      # setup-node's registry-url input here. That input writes an auth-token
+      # stanza and exports a dummy NODE_AUTH_TOKEN, either of which can prevent
+      # npm from selecting trusted-publishing OIDC. The public registry is npm's
+      # default. Provenance is generated AUTOMATICALLY; no flag needed.
       # VERIFIED on the registry: klypix-mcp@1.43.1 carries
       # dist.attestations.provenance (predicateType slsa.dev/provenance/v1) and
       # _npmUser "GitHub Actions <npm-oidc-no-reply@github.com>". Do NOT add
@@ -537,10 +719,10 @@ jobs:
           set -euo pipefail
           NAME="$(node -p "require('./package.json').name")"
           # READ BACK OVER PLAIN HTTPS, NOT `npm view` (2026-08-07). This job
-          # deliberately carries no NODE_AUTH_TOKEN, and setup-node still writes
-          # an .npmrc auth line for the registry — under which `npm view` returns
-          # nothing here. Every poll therefore reported "not indexed", the loop
-          # exhausted, and the classifier read an empty body as "absent": a
+          # deliberately carries no NODE_AUTH_TOKEN or setup-node auth stanza.
+          # Authenticated polls previously returned nothing here and reported
+          # "not indexed" until the loop exhausted; the classifier then read
+          # an empty body as "absent": a
           # PERFECT publish (OIDC identity, SLSA attestation, `latest` tag) was
           # announced as "the publish did not land". v1.58.0 through v1.62.0 all
           # show red beside working publishes for this reason. The anonymous

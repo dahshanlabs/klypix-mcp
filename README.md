@@ -79,7 +79,7 @@ npx klypix-mcp conformance
 
 It runs in a temporary fixture and touches nothing else. It checks tool discovery, task memory,
 truthful peer reporting, overlap surfacing, proactive logging, and in-band delivery of a peer note.
-It verifies 15 required coordination behaviours — not the 21 tools, and not the retrieval engine.
+It verifies 15 required coordination behaviours — not the 22 tools, and not the retrieval engine.
 
 ---
 
@@ -333,10 +333,13 @@ have to have declared their files for the overlap to be visible at all.
 `brain_message` leaves one-time coordination notes for other sessions. A supported KLYPIX action
 offers the note in model-visible context; the next independent supported action replays it and
 records an acknowledgement. That acknowledgement proves only that a later action followed the
-offer — never that a person read it or that an agent acted on it. Pending and offered notes survive
-reconnects. Expiry or bounded-capacity eviction records a failed per-recipient receipt instead of
-silently looking delivered. The core lane is machine-local, notes expire after 24 hours, and they
-are never written into the brain.
+offer — never that a person read it or that an agent acted on it. The note keeps replaying until the
+receiving model calls `brain_message_receipt` with the exact message id and per-recipient offer
+token; only that token-bound action records `consumed`. Pending, offered, and acknowledged notes
+survive reconnects. Expiry or bounded-capacity eviction records a failed per-recipient receipt
+instead of silently looking delivered. The send-time audience is fixed, unresolved targeted sends
+fail closed, the core lane is machine-local, notes expire after 24 hours, and they are never written
+into the brain.
 
 Durable handoffs go in the brain itself — decisions, findings, open questions and skills captured
 as cards, each stamped with the agent that wrote it.
@@ -345,14 +348,18 @@ as cards, each stamped with the agent that wrote it.
 
 When a task publishes a quantified or otherwise machine-checkable claim, it can attach one or more
 versioned result manifests to `brain_sync { phase: "complete" }`. Each manifest binds the claim to a
-report hash, producer/run provenance, the exact input and configuration fingerprints, and named
-metrics with counts and tolerances. Matching peer evidence is recorded as corroboration; conflicting
-or incomparable evidence returns `needs-reconciliation` and keeps the task scope active.
+report hash, producer/run provenance, the exact declared task scope, material artifact hashes,
+evaluation outputs, public metric wording, input/configuration fingerprints, and named metrics with
+counts and tolerances. Matching peer evidence is recorded as corroboration; conflicting or
+incomparable evidence returns `needs-reconciliation` and keeps the task scope active.
 
 The gate fails closed. Once a task submits result evidence, it cannot bypass an invalid or
 conflicting result by retrying completion without the manifest, and that obligation survives worker
 restart, hibernation, and transparent hot-swap. A fresh `phase: "start"` is the explicit boundary for
 a new task. The strict schema and reusable validator are exported as `klypix-mcp/result-reconcile`.
+Schema-v2 receipts can be converted into commit-bound publication evidence and independently checked
+with `klypix-mcp/release-evidence`; legacy schema-v1 results remain usable for coordination but cannot
+authorize publication.
 
 ## Human control in Klypix
 
@@ -488,7 +495,7 @@ The MCP verbs below are what agents call. These are what **you** call:
 
 ---
 
-## The 21 verbs
+## The 22 verbs
 
 | Tool | What it does |
 |---|---|
@@ -500,7 +507,8 @@ The MCP verbs below are what agents call. These are what **you** call:
 | `brain_lens` | Machine-readable freshness, provenance, activity, timeline, orrery and unresolved views |
 | `brain_garden` | Maintenance pass — proposes first, and cannot apply without an approval code the human generates |
 | `brain_doctor` | Self-diagnosis: version, core/enhanced host adapters, active sessions, tool count, projection drift |
-| `brain_message` | Session-to-session coordination notes with per-recipient offer / later-action acknowledgement / failure receipts (24h TTL, never written into the brain) |
+| `brain_message` | Session-to-session coordination notes with a fixed send-time audience and per-recipient pending / offer / acknowledgement / consumption / failure receipts (24h TTL, never written into the brain) |
+| `brain_message_receipt` | Explicitly record model-side consumption using the exact message id and per-recipient offer token; acknowledgement alone never consumes a note |
 | `brain_sync` | Context Gateway: task capsule, active-task peers, exact-file overlap, one-time alerts, timing, and optional result-manifest reconciliation |
 | `brain_connect` | Find and draw related-but-unlinked cards |
 | `project_map_context` | Read-only, bounded code-graph evidence beside correction-aware brain context, with exact-path review proposals; external artifacts (e.g. Graphify) are supported but never installed or run locally |
@@ -514,7 +522,7 @@ The MCP verbs below are what agents call. These are what **you** call:
 | `add_to_canvas` | Append cards/connections (positions preserved) |
 | `list_canvases` | List every `.klypix` in the vault |
 
-Exactly 21, machine-verifiable with `npx klypix-mcp doctor`.
+Exactly 22, machine-verifiable with `npx klypix-mcp doctor`.
 
 > **`canvas_view`:** no MCP Apps host has been observed rendering the UI resource yet — there is no
 > screenshot and no host-level test. Hosts without the extension get clean text, which is the path

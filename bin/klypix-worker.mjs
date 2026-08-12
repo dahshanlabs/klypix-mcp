@@ -33,6 +33,7 @@ import {
 import { compareProjectGraphResults, projectGraphContextMarkdown, queryProjectGraph, suggestProjectGraphBrainLinks, scanNativeProjectMap, checkBrainDrift, brainDriftMarkdown } from '../src/project-graph.mjs';
 import { auditProject, compactAgentsBrief, linkProject, mcpServerEntry } from '../src/agent-rules.mjs';
 import { createMcpPresence, KLYPIX_MCP_INSTRUCTIONS } from '../src/mcp-presence.mjs';
+import { consumeMessageReceipt, findProjectBrain } from '../src/agent-presence.mjs';
 import {
   reconcileRegisteredProjects,
   registerProjectBrain,
@@ -215,13 +216,43 @@ const mcpPresence = createMcpPresence({
 });
 
 // Map a protocol-neutral core result → an MCP tool result.
+// Every tool call carries host request metadata in the SDK callback's second
+// argument. Adopt the logical Codex thread before ANY handler executes,
+// including MCP Apps, so operations, messages, and delivery share one session.
+// Contradictory identity fails closed: the handler does not run and no queued
+// message is offered or acknowledged.
+const registerToolRaw = server.registerTool.bind(server);
+server.registerTool = (name, config, handler) => registerToolRaw(name, config, async (args, extra) => {
+  const identity = mcpPresence.adoptRequestIdentity(extra, {
+    toolName: name,
+    toolInput: args,
+  });
+  if (!identity.ok) {
+    return {
+      content: [{ type: 'text', text: identity.diagnostic }],
+      structuredContent: {
+        schemaVersion: 1,
+        status: identity.status,
+        delivery: 'deferred',
+        identityMutation: 'deferred',
+      },
+      isError: true,
+    };
+  }
+  const result = await handler(args, { ...extra, klypixRequestIdentity: identity });
+  // brain_sync performs its own single presence/message transition. Decorating
+  // it again would acknowledge in the same call a note it had only just offered.
+  if (name === 'brain_sync') return result;
+  return mcpPresence.decorateToolResult(result, { actionId: identity.actionId });
+});
+
 const toContent = (r) => {
   const content = r.blocks.map(b => b.kind === 'image'
     ? { type: 'image', data: b.data, mimeType: b.mime }
     : { type: 'text', text: b.text });
   const result = r.isError ? { content, isError: true } : { content };
   if (r.structured && typeof r.structured === 'object') result.structuredContent = r.structured;
-  return mcpPresence.decorateToolResult(result);
+  return result;
 };
 
 server.registerTool('list_canvases', {
@@ -534,6 +565,60 @@ server.registerTool('brain_message', {
   }));
 });
 
+server.registerTool('brain_message_receipt', {
+  title: 'Confirm a KLYPIX coordination note was consumed',
+  description: 'Explicit durable receipt for a coordination note already offered into model-visible context and acknowledged by a later independent action. Call only after the note has actually been incorporated into the receiving agent\'s work. Requires the exact message id and one-time offer token returned with the offered note; identity, token, state, lock, and write mismatches fail closed and never silently mark consumption.',
+  annotations: {
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+  inputSchema: {
+    project: z.string().optional().describe('Absolute project root containing brain.klypix. Defaults to this MCP connection\'s current project.'),
+    message_id: z.string().min(1).max(160).describe('Exact coordination message id returned with the offered note.'),
+    offer_token: z.string().min(1).max(160).describe('Exact offer token returned with the offered note.'),
+  },
+}, async ({ project, message_id, offer_token }, extra) => {
+  const projectRoot = project ? path.resolve(project) : mcpPresence.vault;
+  const brainPath = findProjectBrain(projectRoot);
+  const identity = extra?.klypixRequestIdentity;
+  if (!brainPath || !identity?.sessionId) {
+    const reason = !brainPath ? 'no-project-brain' : 'no-logical-session';
+    return {
+      content: [{ type: 'text', text: `KLYPIX message receipt was not recorded: ${reason}.` }],
+      structuredContent: {
+        schemaVersion: 1,
+        ok: false,
+        changed: false,
+        status: 'failed',
+        reason,
+        messageId: message_id,
+        sessionId: identity?.sessionId || null,
+      },
+      isError: true,
+    };
+  }
+  const verdict = consumeMessageReceipt({
+    brainPath,
+    sessionId: identity.sessionId,
+    messageId: message_id,
+    offerToken: offer_token,
+    actionId: identity.actionId || '',
+  });
+  return {
+    content: [{
+      type: 'text',
+      text: verdict.ok
+        ? (verdict.changed
+          ? `KLYPIX message ${message_id} consumption recorded for session ${identity.sessionId}.`
+          : `KLYPIX message ${message_id} was already recorded as consumed for session ${identity.sessionId}.`)
+        : `KLYPIX message receipt was not recorded: ${verdict.reason || verdict.status || 'receipt-write-failed'}.`,
+    }],
+    structuredContent: { schemaVersion: 1, ...verdict },
+    ...(!verdict.ok ? { isError: true } : {}),
+  };
+});
+
 server.registerTool('brain_sync', {
   title: 'KLYPIX Context Gateway — synchronize task, peers, conflicts, and relevant memory',
   description: 'APPROVAL-FREE task gateway over the authorized MCP connection. Call FIRST with a concise intent and expected files, again when scope changes, and with phase:"complete" before the final response. One bounded response returns compact task-relevant brain context, active TASK peers (idle connections hidden), one-time messages, structured exact-file conflicts, and late-arrival overlap alerts. A completion that supplies machine-checkable result manifests is fail-closed: invalid, conflicting, or incomparable evidence returns needs-reconciliation and retains task scope. Works on any MCP host — it needs only the authorized MCP connection, so native lifecycle hooks are optional. LIMITS: conflict matching is EXACT-PATH and both sessions must have declared their files, coordination/result reconciliation is machine-local and OS-user-local (a teammate on another machine is invisible), and file overlap remains ADVISORY.',
@@ -555,7 +640,7 @@ server.registerTool('brain_sync', {
     // allowing a later result-less completion to bypass that state entirely.
     results: z.unknown().optional().describe('On phase complete, 1-8 result manifests for stable claim keys. The in-handler versioned validator rejects malformed, empty, unknown-field, or incomparable evidence and retains task scope.'),
   },
-}, async ({ project, intent, files, phase, include_context, results }) => {
+}, async ({ project, intent, files, phase, include_context, results }, extra) => {
   const totalStartedAt = Date.now();
   const report = mcpPresence.sync({
     project,
@@ -564,6 +649,7 @@ server.registerTool('brain_sync', {
     phase,
     results,
     deliverMessages: include_context !== false,
+    actionId: extra?.klypixRequestIdentity?.actionId || '',
   });
   // Zero-manual harness convergence: brain_sync is the one project-aware
   // gateway every MCP host can call. Register MCP-only projects here (Claude's
@@ -679,7 +765,7 @@ server.registerTool('brain_doctor', {
       npmLatest,
       self: { pid: process.pid, version: PKG_VERSION, id: mcpPresence.id },
     });
-    return mcpPresence.decorateToolResult({ content: [{ type: 'text', text: render(report, { color: false }) }] });
+    return { content: [{ type: 'text', text: render(report, { color: false }) }] };
   } catch (e) {
     return { content: [{ type: 'text', text: `brain_doctor unavailable: ${e?.message || e}` }], isError: true };
   }

@@ -237,6 +237,8 @@ const DAY = 86_400_000;
     ok(dupCount === 1, `F5b: a duplicate peer message text appears exactly once in one injection (saw ${dupCount})`);
     ok(run2.includes('peerAAAA') && run2.includes('peerBBBB'),
       'F5b: the one grouped instruction preserves attribution to both sending sessions');
+    ok(run2.includes('message_id `m1`') && run2.includes('message_id `m2`'),
+      'F5b: every grouped duplicate exposes its own explicitly consumable receipt id');
     ok(run2.includes('Edit src/API.ts before release') && run2.includes('Edit src/api.ts before release'),
       'F5b: the real hook preserves case-distinct path instructions while grouping exact duplicates');
 

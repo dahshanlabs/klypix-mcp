@@ -274,11 +274,11 @@ function inspectPeers(brainDir, brainPath, now, selfId = null) {
   const data = readJson(file, null);
   const sessions = Array.isArray(data?.sessions) ? data.sessions : [];
   const rawRecent = sessions.filter(s => s && now - (s.lastSeen || 0) < SESSION_FRESH_MS).length;
-  const live = sessions
+  const liveRows = sessions
     .map(s => ({ s, liveness: sessionLiveness(s, now) }))
     .filter(({ liveness }) => liveness)
     .map(({ s, liveness }) => ({
-      id: String(s.id || '').slice(0, 8),
+      rawId: String(s.id || ''),
       // 'unknown' stays 'unknown' — the old 'claude-code' fallback silently
       // relabeled client-less rows, masking the writer that forgot to stamp.
       client: s.client || 'unknown',
@@ -290,6 +290,8 @@ function inspectPeers(brainDir, brainPath, now, selfId = null) {
       files: Array.isArray(s.files) ? s.files : [],
       channels: liveness.channels,
       hostPid: s.hostPid || null,
+      logicalSessionId: s.logicalSessionId ? String(s.logicalSessionId) : null,
+      identitySource: s.identitySource || null,
       // Sync-rich vs sync-silent: has this session declared any task scope?
       synced: Boolean(String(s.intent || '').trim() || (Array.isArray(s.files) && s.files.length)),
       // Transport liveness is not task activity. Only real prompt/tool work
@@ -301,11 +303,41 @@ function inspectPeers(brainDir, brainPath, now, selfId = null) {
         && now - Number(s.activityAt) < SESSION_FRESH_MS,
       lastSeenMin: Math.round((now - liveness.lastSeen) / 60000),
     }));
-  // Twin rows = channel merge NOT occurring: >1 live row sharing one hostPid is
-  // one logical session split across ids (each twin inflates every count).
-  const byHost = new Map();
-  for (const p of live) { if (p.hostPid) byHost.set(p.hostPid, [...(byHost.get(p.hostPid) || []), p.id]); }
-  const twinGroups = [...byHost.entries()].filter(([, ids]) => ids.length > 1).map(([hostPid, ids]) => ({ hostPid, ids }));
+  // Display IDs must stay usable when time-ordered UUIDs share a long prefix.
+  // Eight characters is only the floor: grow each prefix until it is unique.
+  const ids = liveRows.map((row) => row.rawId);
+  const displayId = new Map(ids.map((id) => {
+    const lower = id.toLowerCase();
+    let width = Math.min(8, id.length);
+    while (width < id.length && ids.some((other) => other !== id
+      && other.toLowerCase().startsWith(lower.slice(0, width)))) width++;
+    return [id, id.slice(0, width)];
+  }));
+  const live = liveRows.map((row) => ({ ...row, id: displayId.get(row.rawId) || row.rawId }));
+
+  // hostPid is process topology, NOT session identity. Codex Desktop gives many
+  // independent conversations the same parent pid, so pid grouping hid real
+  // overlaps and produced a false "one session counted Nx" diagnosis. Only an
+  // explicit logicalSessionId may deduplicate rows. Rows without one remain
+  // distinct (fail open); lifecycle rows are already authoritative identities.
+  const logicalKey = (row) => row.logicalSessionId || row.rawId;
+  const logicalGroups = new Map();
+  for (const row of live) {
+    const key = logicalKey(row);
+    logicalGroups.set(key, [...(logicalGroups.get(key) || []), row]);
+  }
+  const identityMergeGaps = [...logicalGroups.entries()]
+    .filter(([key, rows]) => rows.length > 1 && rows.some((row) => row.logicalSessionId === key))
+    .map(([logicalSessionId, rows]) => ({
+      logicalSessionId,
+      ids: rows.map((row) => row.id),
+    }));
+  const connectionScopedCount = live.filter((row) => !row.logicalSessionId
+    && !row.channels.includes('lifecycle')).length;
+  const activeCodexConnectionScopedCount = live.filter((row) => row.client === 'codex'
+    && !row.logicalSessionId
+    && !row.channels.includes('lifecycle')
+    && (row.synced || row.activeUnscoped)).length;
   const receipts = selfId
     ? summarizeReceipts({
       messages: Array.isArray(data?.messages) ? data.messages : [],
@@ -317,9 +349,26 @@ function inspectPeers(brainDir, brainPath, now, selfId = null) {
   const syncedCount = live.filter(p => p.synced).length;
   const activeUnscopedCount = live.filter(p => p.activeUnscoped).length;
   return {
-    file, live, count: live.length, rawRecent, syncedCount, activeUnscopedCount,
+    file,
+    live,
+    // `count` remains the user-facing active-session count. The additive
+    // connectionCount/laneRowCount fields keep transport topology inspectable.
+    count: logicalGroups.size,
+    logicalSessionCount: logicalGroups.size,
+    connectionCount: live.length,
+    laneRowCount: live.length,
+    connectionScopedCount,
+    activeCodexConnectionScopedCount,
+    exactIdentityCount: Math.max(0, logicalGroups.size - connectionScopedCount),
+    rawRecent,
+    syncedCount,
+    activeUnscopedCount,
     idleUnscopedCount: Math.max(0, live.length - syncedCount - activeUnscopedCount),
-    twinGroups, receipts,
+    identityMergeGaps,
+    // Compatibility field for older programmatic consumers. A host-pid repeat
+    // is deliberately never classified as a twin again.
+    twinGroups: [],
+    receipts,
   };
 }
 
@@ -475,7 +524,13 @@ export function inspect(opts = {}) {
   const readinessWarnings = [];
   const activeSilentSessions = peers.activeUnscopedCount || 0;
   if (peers.count > 1 && activeSilentSessions > 0) {
-    readinessWarnings.push(`${activeSilentSessions} active session${activeSilentSessions === 1 ? '' : 's'} used KLYPIX without declared task scope (${peers.count} live connections total)`);
+    readinessWarnings.push(`${activeSilentSessions} active session${activeSilentSessions === 1 ? '' : 's'} used KLYPIX without declared task scope (${peers.logicalSessionCount} logical sessions total)`);
+  }
+  if (peers.activeCodexConnectionScopedCount > 0) {
+    readinessWarnings.push(`${peers.activeCodexConnectionScopedCount} active Codex connection${peers.activeCodexConnectionScopedCount === 1 ? '' : 's'} lack exact request-derived session identity`);
+  }
+  if (peers.identityMergeGaps?.length) {
+    readinessWarnings.push(`${peers.identityMergeGaps.length} explicit logical session${peers.identityMergeGaps.length === 1 ? '' : 's'} remain split across connection rows`);
   }
   if (Number(autoUpdate.harness?.failed || 0) > 0) {
     readinessWarnings.push(`${autoUpdate.harness.failed} automatic harness repair(s) remain partial`);
@@ -502,7 +557,8 @@ export function inspect(opts = {}) {
     for (const s of supervisors.live.filter(state => state.degraded)) {
       actions.push(`/mcp reconnect if backpressure persists   # supervisor pid ${s.pid} has queued host output awaiting drain`);
     }
-    if (peers.twinGroups && peers.twinGroups.length) actions.push(`/mcp reconnect   # ${peers.twinGroups.length} session(s) split across twin lane rows (channel merge not occurring) — reconnect adopts the merged id`);
+    if (peers.activeCodexConnectionScopedCount > 0) actions.push('/mcp reconnect   # active Codex connection lacks exact request-derived thread identity');
+    if (peers.identityMergeGaps?.length) actions.push(`/mcp reconnect   # ${peers.identityMergeGaps.length} explicitly identified logical session(s) remain split across connection rows`);
     if (hasBrain && (gitCapture.state === 'foreign' || Object.values(gitCapture.hooks || {}).some(s => s === 'foreign' || s === 'foreign-sh'))) {
       actions.push('npx klypix-mcp git-hook install   # a pre-existing git hook occupies post-commit/post-merge — this chains the commit-capture block after it (auto-install never edits a foreign hook)');
     } else if (hasBrain && gitCapture.state === 'custom-hookspath') {
@@ -684,13 +740,19 @@ export function render(r, opts = {}) {
     }
   }
 
-  // SESSIONS: this is an all-session count. A recent-chat row is not a heartbeat.
+  // SESSIONS: logical sessions are deduplicated only by explicit identity.
+  // Connection rows remain visible because guessing identity from pid/client
+  // can hide real concurrent work. A recent-chat row is not a heartbeat.
   if (!r.sessions.count) L.push(`${ok} ${c.bold}SESSIONS${c.rst}  0 active sessions ${c.dim}(saved/recent chats are history, not active)${c.rst}`);
   else {
-    const hiddenIdle = Math.max(0, (r.sessions.rawRecent || r.sessions.count) - r.sessions.count);
+    const hiddenIdle = Math.max(0,
+      (r.sessions.rawRecent || r.sessions.connectionCount || r.sessions.count)
+      - (r.sessions.connectionCount || r.sessions.count));
     const activeSilent = r.sessions.activeUnscopedCount || 0;
     const idleConnections = r.sessions.idleUnscopedCount || 0;
-    L.push(`${activeSilent ? warn : ok} ${c.bold}SESSIONS${c.rst}  ${r.sessions.count} live connection${r.sessions.count === 1 ? '' : 's'} · ${r.sessions.syncedCount ?? r.sessions.count} with declared task scope${activeSilent ? ` · ${activeSilent} active without scope` : ''}${idleConnections ? ` · ${idleConnections} idle/unscoped (not graded)` : ''} ${c.dim}(all hosts; channel-aware liveness${hiddenIdle ? `; +${hiddenIdle} row(s) with only a dead mcp channel excluded` : ''})${c.rst}`);
+    const connections = r.sessions.connectionCount ?? r.sessions.count;
+    const identityGap = r.sessions.activeCodexConnectionScopedCount || 0;
+    L.push(`${activeSilent || identityGap ? warn : ok} ${c.bold}SESSIONS${c.rst}  ${r.sessions.logicalSessionCount ?? r.sessions.count} logical session${(r.sessions.logicalSessionCount ?? r.sessions.count) === 1 ? '' : 's'} · ${connections} live connection${connections === 1 ? '' : 's'} · ${r.sessions.syncedCount ?? r.sessions.count} with declared task scope${activeSilent ? ` · ${activeSilent} active without scope` : ''}${identityGap ? ` · ${identityGap} active Codex connection${identityGap === 1 ? '' : 's'} without exact identity` : ''}${idleConnections ? ` · ${idleConnections} idle/unscoped (not graded)` : ''} ${c.dim}(all hosts; channel-aware liveness${hiddenIdle ? `; +${hiddenIdle} row(s) with only a dead mcp channel excluded` : ''})${c.rst}`);
     for (const p of r.sessions.live) {
       const intentAge = p.intentAgeMin !== null && p.intentAgeMin - p.lastSeenMin > 3 ? ` (set ${p.intentAgeMin}m ago)` : '';
       const scopeState = p.synced
@@ -700,8 +762,8 @@ export function render(r, opts = {}) {
           : ` ${c.dim}· idle connection (no task activity to grade)${c.rst}`);
       L.push(`        · ${p.client}:${p.id}${p.branch ? ' @' + p.branch : ''}${p.channels.length ? ` [${p.channels.join('+')}]` : ''}${p.intent ? ` “${p.intent.slice(0, 50)}”${intentAge}` : ''}${scopeState} ${c.dim}(${p.lastSeenMin}m ago)${c.rst}`);
     }
-    for (const g of (r.sessions.twinGroups || [])) {
-      L.push(`        ${c.yel}⚠ twin rows — channel merge NOT occurring: host pid ${g.hostPid} appears as ${g.ids.join(' + ')} (one logical session counted ${g.ids.length}×)${c.rst}`);
+    for (const g of (r.sessions.identityMergeGaps || [])) {
+      L.push(`        ${c.yel}⚠ explicit logical identity ${g.logicalSessionId} remains split across ${g.ids.join(' + ')}${c.rst}`);
     }
   }
 

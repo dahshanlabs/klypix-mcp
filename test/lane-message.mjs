@@ -8,7 +8,7 @@
 //   1. post a note via opBrainMessage (in-process, temp HOME + project)
 //   2. run the REAL hook (--prompt) as a receiving session → note IS delivered
 //   3. run it again, same session → note is replayed and acknowledged
-//   4. run it a third time → the acknowledged note stays quiet
+//   4. explicitly consume its token → only then does the note stay quiet
 //
 // Run:  node test/lane-message.mjs        (exit 0 = pass, 1 = fail)
 import fs from 'fs';
@@ -20,6 +20,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { buildKlypixMap } from '../src/klypix-format.mjs';
 import {
+  consumeMessageReceipt,
   laneFileFor,
   messageDeliveryState,
   postPresenceMessage,
@@ -40,6 +41,12 @@ fs.mkdirSync(path.join(home, '.claude', 'project-brain'), { recursive: true });
 fs.mkdirSync(proj, { recursive: true });
 fs.writeFileSync(path.join(proj, 'brain.klypix'),
   await buildKlypixMap({ title: 'brain', areas: [{ title: 'Goal', cards: [{ text: 'seed card' }] }] }));
+// Delivery v3 snapshots the live audience at send time. Make the intended
+// receiver live before the broadcast; a session that appears later must not
+// retroactively become a recipient.
+upsertSession({ brainPath: path.join(proj, 'brain.klypix'), id: 'sess-recv',
+  logicalSessionId: 'sess-recv', identitySource: 'claude-lifecycle',
+  client: 'claude-code', channel: 'lifecycle', event: 'UserPromptSubmit', home });
 
 // ── 1. Sender: the MCP op, exactly as a hookless client would drive it ──────
 // os.homedir() reads HOME/USERPROFILE at call time; point BOTH at the temp home
@@ -64,12 +71,14 @@ try {
 }
 
 // ── 2. Receiver: the REAL hook, --prompt, a different session id ────────────
+let hookActionSequence = 0;
 const runHook = (sid, tp) => {
   const env = { ...process.env, HOME: home, USERPROFILE: home };
   delete env.KLYPIX_BRAIN_NO_MAIN;   // the subprocess MUST run main()
   return execFileSync(process.execPath, [HOOK, '--prompt'], {
     cwd: proj, env, encoding: 'utf8',
-    input: JSON.stringify({ session_id: sid, prompt: 'continue the refactor', ...(tp ? { transcript_path: tp } : {}) }),
+    input: JSON.stringify({ session_id: sid, event_id: `lane-hook-action-${++hookActionSequence}`,
+      prompt: 'continue the refactor', ...(tp ? { transcript_path: tp } : {}) }),
   });
 };
 const first = runHook('sess-recv');
@@ -77,20 +86,35 @@ ok(/📨/.test(first), 'receiving hook surfaces the 📨 message block');
 ok(first.includes(NOTE), 'the note text reaches the peer session verbatim');
 ok(/from sender-s/.test(first), 'the sender label is the stable logical session id');
 
-// ── 3. Two-step receipt: replay once, then stay quiet ───────────────────────
+// ── 3. Explicit receipt: acknowledgement replays until consumption ─────────
 const second = runHook('sess-recv');
 ok(second.includes(NOTE), 'same session, next prompt → note replays before later-action acknowledgement');
 const third = runHook('sess-recv');
-ok(!third.includes(NOTE), 'same session, third prompt → acknowledged note stays quiet');
+ok(third.includes(NOTE), 'same session, third prompt → acknowledged note still replays until consumption');
 const laneAfterAck = JSON.parse(fs.readFileSync(laneFileFor(path.join(proj, 'brain.klypix'), home), 'utf8'));
 const firstMessage = laneAfterAck.messages.find((message) => message.text === NOTE);
-ok(firstMessage?.deliveryVersion === 2
+const firstDelivery = firstMessage?.deliveries?.find((delivery) => delivery.recipientId === 'sess-recv');
+ok(firstMessage?.deliveryVersion === 3
   && firstMessage.deliveries?.find((delivery) => delivery.recipientId === 'sess-recv')?.state === 'acknowledged',
 'the shared lane persists the pending → offered → acknowledged receipt');
+const consumed = consumeMessageReceipt({
+  brainPath: path.join(proj, 'brain.klypix'),
+  sessionId: 'sess-recv',
+  messageId: firstMessage?.id,
+  offerToken: firstDelivery?.offerToken,
+  actionId: 'lane-e2e-consume-main',
+  home,
+});
+ok(consumed.ok === true && consumed.status === 'consumed',
+  `an exact message id + offer token records explicit consumption (${consumed.status}/${consumed.reason || 'ok'})`);
+ok(!runHook('sess-recv').includes(NOTE), 'consumed note stays quiet on later prompts');
 
 // ── 4. Self-echo guard: the SENDER (whose transcript holds the brain_message
 //      tool_use) never gets its own note back; a third session still does ────
 const NOTE2 = 'deploying the lane fix — hold your pushes for 5 minutes';
+upsertSession({ brainPath: path.join(proj, 'brain.klypix'), id: 'sess-third',
+  logicalSessionId: 'sess-third', identitySource: 'claude-lifecycle',
+  client: 'claude-code', channel: 'lifecycle', event: 'UserPromptSubmit', home });
 try {
   process.env.HOME = home; process.env.USERPROFILE = home;
   process.chdir(proj);
@@ -122,8 +146,15 @@ legacyLane.messages.push({
 fs.writeFileSync(laneFile, JSON.stringify(legacyLane), 'utf8');
 const legacyReplay = runHook('sess-legacy');
 ok(legacyReplay.includes(legacyText), 'legacy seen[] row replays once instead of being trusted as acknowledged');
-const legacyQuiet = runHook('sess-legacy');
-ok(!legacyQuiet.includes(legacyText), 'legacy row stays quiet after the replay records a later-action acknowledgement');
+const legacyAck = runHook('sess-legacy');
+ok(legacyAck.includes(legacyText), 'legacy row remains visible after later-action acknowledgement');
+const migratedLegacy = JSON.parse(fs.readFileSync(laneFile, 'utf8')).messages
+  .find((message) => message.id === 'legacy-false-positive');
+const migratedDelivery = migratedLegacy?.deliveries?.find((delivery) => delivery.recipientId === 'sess-legacy');
+consumeMessageReceipt({ brainPath: path.join(proj, 'brain.klypix'), sessionId: 'sess-legacy',
+  messageId: migratedLegacy?.id, offerToken: migratedDelivery?.offerToken,
+  actionId: 'lane-e2e-consume-legacy', home });
+ok(!runHook('sess-legacy').includes(legacyText), 'legacy row stays quiet only after explicit consumption');
 
 // ── 6. Stop retry: a busy lane stages durably, then another hook drains it ──
 const lockTarget = 'sess-lock-target-full-123';
@@ -132,7 +163,7 @@ const lockNote = 'this marker must survive a lane-lock timeout';
 const lockTranscript = path.join(home, 'lock-message-transcript.jsonl');
 fs.writeFileSync(lockTranscript, JSON.stringify({
   uuid: 'assistant-event-stable-1',
-  timestamp: '2026-08-11T12:00:00.000Z',
+  timestamp: new Date().toISOString(),
   message: { role: 'assistant', content: [{ type: 'text', text: `🧠 MSG [${lockTarget}]: ${lockNote}` }] },
 }) + '\n');
 const runCapture = () => execFileSync(process.execPath, [HOOK, '--capture'], {
@@ -151,14 +182,26 @@ fs.unlinkSync(`${lockedLane}.lock`);
 const drainedOffer = runHook(lockTarget);
 ok(drainedOffer.includes(lockNote),
   'a later hook drains the durable outbox and offers the full-session-id-directed note');
-ok(runHook(lockTarget).includes(lockNote) && !runHook(lockTarget).includes(lockNote),
-  'the recovered note follows the same offer → replay/ack → quiet lifecycle');
+const recoveredAck = runHook(lockTarget);
+const recoveredReplay = runHook(lockTarget);
+ok(recoveredAck.includes(lockNote) && recoveredReplay.includes(lockNote),
+  'the recovered note follows the same offer → replay/ack lifecycle until consumption');
+const recoveredMessage = JSON.parse(fs.readFileSync(lockedLane, 'utf8')).messages
+  .find((message) => message.text === lockNote);
+const recoveredDelivery = recoveredMessage?.deliveries?.find((delivery) => delivery.recipientId === lockTarget);
+consumeMessageReceipt({ brainPath: path.join(proj, 'brain.klypix'), sessionId: lockTarget,
+  messageId: recoveredMessage?.id, offerToken: recoveredDelivery?.offerToken,
+  actionId: 'lane-e2e-consume-recovered', home });
+ok(!runHook(lockTarget).includes(lockNote), 'the recovered note stays quiet after explicit consumption');
 runCapture(); // the real Stop hook re-scans the entire transcript
 afterRefusedWrite = JSON.parse(fs.readFileSync(lockedLane, 'utf8'));
 ok(afterRefusedWrite.messages.filter((message) => message.text === lockNote).length === 1,
   'stable marker ids make repeated Stop scans idempotent instead of reposting an acknowledged note');
 
 const peerSameText = 'a real peer may repeat text from my old brain_message call';
+upsertSession({ brainPath: path.join(proj, 'brain.klypix'), id: 'sess-identical-text',
+  logicalSessionId: 'sess-identical-text', identitySource: 'claude-lifecycle',
+  client: 'claude-code', channel: 'lifecycle', event: 'UserPromptSubmit', home });
 try {
   process.env.HOME = home; process.env.USERPROFILE = home;
   process.chdir(proj);
@@ -184,7 +227,10 @@ ok(runHook('sess-identical-text', identicalTranscript).includes(peerSameText),
 const registeredHome = path.join(os.tmpdir(), `klypix-lane-registered-${process.pid}`);
 fs.rmSync(registeredHome, { recursive: true, force: true });
 fs.mkdirSync(registeredHome, { recursive: true });
-const registeredClient = new Client({ name: 'codex-registered-message-test', version: '1.0.0' }, { capabilities: {} });
+// This lane exercises the lifecycle hostmap used by non-Codex hosts. Codex
+// threads deliberately ignore host-pid maps and are covered by the host-authored
+// request-metadata assertions in request-identity.mjs.
+const registeredClient = new Client({ name: 'cursor-registered-message-test', version: '1.0.0' }, { capabilities: {} });
 const registeredTransport = new StdioClientTransport({
   command: process.execPath,
   args: [WORKER, '--vault', proj],
@@ -248,6 +294,19 @@ const registeredAck = await registeredClient.callTool({ name: 'list_canvases', a
 ok(registeredProbeState() === 'acknowledged'
   && registeredAck.content?.some((block) => block.text?.includes('registered hidden probe must not consume this')),
 'a later registered-tool action replays and acknowledges the offer');
+const registeredMessageAfterAck = JSON.parse(fs.readFileSync(registeredLane, 'utf8')).messages
+  .find((message) => message.id === probeMessage.message?.id);
+const registeredDelivery = registeredMessageAfterAck?.deliveries
+  ?.find((delivery) => delivery.recipientId === 'post-clear-sender');
+const registeredConsumed = await registeredClient.callTool({
+  name: 'brain_message_receipt',
+  arguments: { message_id: probeMessage.message?.id, offer_token: registeredDelivery?.offerToken },
+});
+ok(registeredConsumed.isError !== true && registeredProbeState() === 'consumed',
+  'the registered receipt tool records explicit token-bound consumption');
+const registeredQuiet = await registeredClient.callTool({ name: 'list_canvases', arguments: {} });
+ok(!registeredQuiet.content?.some((block) => block.text?.includes('registered hidden probe must not consume this')),
+  'a consumed registered-tool message stays quiet');
 await registeredClient.close();
 fs.rmSync(registeredHome, { recursive: true, force: true });
 

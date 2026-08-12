@@ -18,7 +18,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';
-import { mcpServerEntry } from '../src/agent-rules.mjs';
+import { linkProject, mcpServerEntry } from '../src/agent-rules.mjs';
 import { inspect, render } from '../src/brain-doctor.mjs';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -45,6 +45,36 @@ const tmp = (tag) => { const p = path.join(os.tmpdir(), 'klypix-autoprop-' + tag
   ok(localEntry.args.includes('/proj'), 'A: the --vault value is preserved');
   ok(mcpServerEntry({ vault: '.', withType: true, home }).type === 'stdio', 'A: withType adds the stdio type for VS Code-style configs');
   rmrf(home);
+}
+
+// ── A2 — projected task-scope contract is cross-host + idempotent ───────────
+{
+  const proj = tmp('a2-projection');
+  fs.writeFileSync(path.join(proj, 'brain.klypix'), 'fixture');
+  const first = linkProject(proj, { version: '9.9.9' });
+  const codexPath = path.join(proj, 'AGENTS.md');
+  const antigravityPath = path.join(proj, '.agents', 'AGENTS.md');
+  const codex = fs.readFileSync(codexPath, 'utf8');
+  const antigravity = fs.readFileSync(antigravityPath, 'utf8');
+  const hasScopeLaw = (text) => text.includes('exact project-relative FILE paths only')
+    && text.includes('never directories, glob patterns, or filename slugs')
+    && text.includes('phase `"checkpoint"` only when material file scope changes')
+    && text.includes('phase `"complete"` only when')
+    && text.includes('the task work genuinely ends');
+  ok(hasScopeLaw(codex) && hasScopeLaw(antigravity),
+    'A2: Codex and Antigravity receive the identical exact-file/checkpoint/completion scope law');
+  ok(first.rules.every((row) => hasScopeLaw(fs.readFileSync(path.join(proj, row.file), 'utf8'))),
+    'A2: every Core-managed agent rule projects the exact-file task-scope law');
+  ok(!fs.existsSync(path.join(proj, 'CLAUDE.md')),
+    'A2: Core does not create a competing CLAUDE.md (Claude parity rides lifecycle hooks + MCP instructions)');
+  const before = { codex, antigravity };
+  const second = linkProject(proj, { version: '9.9.9' });
+  ok(second.rules.find((row) => row.tool === 'Codex / AGENTS.md standard')?.action === 'unchanged'
+    && second.rules.find((row) => row.tool === 'Antigravity')?.action === 'unchanged'
+    && fs.readFileSync(codexPath, 'utf8') === before.codex
+    && fs.readFileSync(antigravityPath, 'utf8') === before.antigravity,
+  'A2: Codex/Antigravity projection is byte-idempotent on re-link');
+  rmrf(proj);
 }
 
 // ── B — shouldSelfUpdate pure gating (the risky lever, tested in isolation) ───

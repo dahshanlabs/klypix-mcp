@@ -2848,6 +2848,45 @@ export function brainInsights(struct, { staleDays = 21, topHubs = 6 } = {}) {
 }
 
 // Render brainInsights as a compact markdown report (used by the MCP tool).
+// The cheap catch-up surface: a category-level map, not content.
+//
+// An agent arriving cold has had two options — pay for retrieval, or read a
+// whole brain. Neither answers "what does this project even have sections
+// about". This does, for roughly the cost of one small paragraph, so an agent
+// can orient first and retrieve second.
+//
+// It exists because the two real tables-of-contents in this codebase were both
+// unreachable from a plain MCP host: the areas list was welded inside the full
+// insights report, and areaStatusDigest — the single best category view — had
+// three call sites, none of them a tool. Claude Code got it through a hook;
+// Codex, Cursor, Cline and Windsurf could not reach it at any price.
+//
+// Deliberately NOT a new verb. Every verb costs schema tokens on every session
+// for every host forever, which is the exact tax this is meant to cut.
+export function insightsAreasToMarkdown(ins, title = 'brain') {
+    const rows = ins.areas.map(a => `${a.title} (${a.count})`);
+    return [
+        `# ${title} — areas`,
+        `*${ins.totals.live} live cards · ${ins.totals.archived} archived · ${ins.areas.length} areas*`,
+        '',
+        rows.join(' · ') || '(none)',
+        '',
+        '_Category map only. Use `brain_ask` for an answer, or `brain_insights` with no view for hubs, orphans and stale questions._',
+    ].join('\n') + '\n';
+}
+
+export function insightsStatusToMarkdown(digest, ins, title = 'brain') {
+    const lines = Array.isArray(digest) ? digest : [];
+    return [
+        `# ${title} — area status`,
+        `*${ins.totals.live} live cards · newest milestone and open count per active area*`,
+        '',
+        lines.length ? lines.join('\n') : '_No area has moved recently._',
+        '',
+        '_Status map only. `brain_ask` answers a question; this says where the project stands._',
+    ].join('\n') + '\n';
+}
+
 export function insightsToMarkdown(ins, title = 'brain') {
     const out = [`# ${title} — insights`, `*${ins.totals.live} live cards · ${ins.totals.archived} archived · ${ins.totals.connections} connections*`];
     if (ins.hubs.length) { out.push('', '## 🪢 Hubs (most-connected — the load-bearing cards)'); for (const h of ins.hubs) out.push(`- (${h.degree}) [${h.area || '?'}] ${h.headline}`); }

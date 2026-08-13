@@ -1589,6 +1589,11 @@ export function createMcpPresence({
       hostIdentityPrepared: details.hostIdentityPrepared === true,
       clientInfoPrepared: details.clientInfoPrepared || null,
       branchPrepared: details.branchPrepared,
+      // Forward the action identity (2026-08-14 review): without it, every
+      // server instance's FIRST sync advanced delivery receipts with
+      // actionId '' — records got no offered/acknowledgedActionId, breaking
+      // same-action dedupe and the lease's third-action evidence.
+      actionId: details.actionId || '',
     });
     // Consume the write verdict (1.52.0 plumbed it; nothing read it): a
     // contended lane skips the write, and ~3 skipped heartbeats in a row used

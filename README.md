@@ -708,7 +708,7 @@ independently validated.
   contextual prefixes on short cards, and the reranker itself.
 - **What we do not publish.** No download count: this package's own 24-hour auto-updater generates
   most of it, so it is not a user count. No adoption, team or customer figures. No brief-token
-  figure — the last one was measured at ~600 cards and is stale at 1,645.
+  figure — the last one was measured at ~600 cards and is stale at 2,479.
 - **The eval harness is not in this repo.** It lives in the private KLYPIX desktop repository. The
   numbers above are ours to defend, not yours to reproduce from here — treat them accordingly.
 

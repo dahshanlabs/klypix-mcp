@@ -529,8 +529,16 @@ export async function opBrainAsk({ vault, canvas, question, as_of, k = 10, log =
   } catch { semantic = null; cardVecs = null; }
   // Parity with search_all_brains (8445e9c): never say "warming — retry" to a
   // host with no runtime installed — for them that advice is wrong forever and
-  // their results are the measured recall@5 = 0% lexical path.
-  if (!semantic) mode = semanticFallbackNotice(false) || mode;
+  // their results are the measured recall@5 = 0% lexical path. The full notice
+  // is a SEPARATE advisory line: gluing three sentences and a filesystem path
+  // into the "N matched, X ranking" header garbled every lexical-only answer
+  // (2026-08-14 review), and later "+ rerank"/"+ status-mode" suffixes would
+  // have landed mid-sentence.
+  let fallbackNotice = null;
+  if (!semantic) {
+    fallbackNotice = semanticFallbackNotice(false);
+    if (fallbackNotice) mode = fallbackNotice.startsWith('LEXICAL ONLY') ? 'lexical-only (no semantic runtime)' : 'lexical (semantic warming)';
+  }
   const kk = Math.max(1, Math.min(20, k || 10));
   const timeTravel = asOfTs != null;
   // Cross-encoder rerank is OPT-IN. On the frozen human/paraphrase set it made
@@ -565,7 +573,8 @@ export async function opBrainAsk({ vault, canvas, question, as_of, k = 10, log =
   if (result.statusStrong && !timeTravel) {
     try { statusMd = statusContextToMarkdown(struct); mode += ' + status-mode'; } catch { statusMd = ''; }
   }
-  return { blocks: [text(stamp + statusMd + questionContextToMarkdown(q, result, { mode, as_of: timeTravel ? as_of : null }))] };
+  const noticeMd = fallbackNotice ? `> ${fallbackNotice}\n\n` : '';
+  return { blocks: [text(stamp + noticeMd + statusMd + questionContextToMarkdown(q, result, { mode, as_of: timeTravel ? as_of : null }))] };
 }
 
 // ── brain_challenge — the adversarial brain ───────────────────────────────────

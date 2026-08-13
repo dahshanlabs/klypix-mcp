@@ -400,9 +400,15 @@ function sweepStaleTmp(dir) {
 // replace only what it drained, so a batch a peer queued meanwhile survives.
 const PENDING_CAPTURES_FILE = path.join(os.homedir(), '.claude', 'project-brain', 'pending', `${sha(normBrainPath(laneCanon(BRAIN)))}.captures.json`);
 const PENDING_CAPTURES_LOCK = PENDING_CAPTURES_FILE + '.lock';
-function readMainPendingFile() {
-    try { const d = JSON.parse(fs.readFileSync(PENDING_CAPTURES_FILE, 'utf8')); return Array.isArray(d) ? d : []; } catch { return []; }
+// A non-ENOENT read failure must ABORT any read-modify-write instead of
+// masquerading as an empty queue — an RMW over a transient EPERM/corrupt read
+// would rewrite the file as "just my change" and destroy every queued batch
+// (2026-08-14 adversarial review). ENOENT alone means genuinely empty.
+function readMainPendingChecked() {
+    try { const d = JSON.parse(fs.readFileSync(PENDING_CAPTURES_FILE, 'utf8')); return { ok: true, batches: Array.isArray(d) ? d : [] }; }
+    catch (e) { return e?.code === 'ENOENT' ? { ok: true, batches: [] } : { ok: false, batches: [] }; }
 }
+function readMainPendingFile() { return readMainPendingChecked().batches; }
 // Orphan sidecars: the lossless fallback when the pending LOCK itself is
 // contended (two sessions refuse in the same instant — the trigger, a held
 // brain lock, is CORRELATED across sessions, so "rare" was wrong). Each orphan
@@ -427,7 +433,9 @@ function readPendingCaptures() {
 function updatePendingCaptures(mutate) {
     const got = acquireLock(PENDING_CAPTURES_LOCK, { tries: 20, waitMs: 25 });
     try {
-        const next = mutate(readMainPendingFile());
+        const read = readMainPendingChecked();
+        if (!read.ok) return;   // unreadable ≠ empty: abort the RMW, preserve the bytes; the next drain retries
+        const next = mutate(read.batches);
         fs.mkdirSync(path.dirname(PENDING_CAPTURES_FILE), { recursive: true });
         const tmp = `${PENDING_CAPTURES_FILE}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
         fs.writeFileSync(tmp, JSON.stringify(next));
@@ -443,7 +451,9 @@ function queuePendingCapture(batch) {
     const got = acquireLock(PENDING_CAPTURES_LOCK, { tries: 20, waitMs: 25 });
     if (got) {
         try {
-            const next = [...readMainPendingFile(), batch];
+            const read = readMainPendingChecked();
+            if (!read.ok) throw new Error('pending queue unreadable — RMW would destroy it; using the orphan path');
+            const next = [...read.batches, batch];
             fs.mkdirSync(path.dirname(PENDING_CAPTURES_FILE), { recursive: true });
             const tmp = `${PENDING_CAPTURES_FILE}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
             fs.writeFileSync(tmp, JSON.stringify(next));

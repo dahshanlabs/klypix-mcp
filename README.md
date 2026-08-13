@@ -693,14 +693,19 @@ Read this section before you build on any of it.
 Every number here is measured on our own project brain. Nothing below is published, benchmarked or
 independently validated.
 
-- **Dogfood scale.** KLYPIX itself is built with its own brain: **1,645 cards and 1,521
+- **Dogfood scale.** KLYPIX itself is built with its own brain: **2,479 cards and 2,018
   connections**, written by multiple concurrent agent sessions, receipts in the file. Current as of
-  2026-08-01.
+  2026-08-13.
 - **Recall.** 73% of past decisions recovered with one search round, 55% brief-only, 0% cold.
   Caveat that travels with it: n=20, our own brain, self-authored questions, LLM-judged.
-- **Ranker.** recall@5 of the true source card went **15% → 40%** across two upgrades (n=20 frozen
-  human-paraphrase questions), measured with the optional on-device reranker enabled. The
-  experiment that *regressed* — contextual prefixes on short cards — is recorded next to the wins.
+- **Ranker.** With the production embedder (the eval harness was fixed 2026-08-10 — it had been
+  measuring a vector space the product does not use): recall@5 **30%**, recall@10 35%, recall@20
+  45%, MRR 0.22 of the true source card on n=20 frozen human-paraphrase questions. Lexical-only
+  scores 0% on the same set. The previously published "15% → 40% with the reranker" is **retired**:
+  re-measured validly, the reranker *reduced* recall@5 to 25% and now ships off by default. At n=20
+  every one of these percentages carries a ±20-point 95% confidence interval — treat them as
+  directional until the larger frozen set lands. The regressions are recorded next to the wins:
+  contextual prefixes on short cards, and the reranker itself.
 - **What we do not publish.** No download count: this package's own 24-hour auto-updater generates
   most of it, so it is not a user count. No adoption, team or customer figures. No brief-token
   figure — the last one was measured at ~600 cards and is stale at 1,645.

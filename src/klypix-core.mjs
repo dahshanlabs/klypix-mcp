@@ -171,12 +171,15 @@ const sha1 = (s) => crypto.createHash('sha1').update(s).digest('hex');
 // "↩ superseded" variant AND the gardener's "⤵ consolidated" stamp), so
 // cross-brain as_of was silently stricter than brain_ask as_of (2026-07-23).
 
-// ── On-device cross-encoder reranker (brain_ask precision) ───────────────────
-// Eval-proven on the frozen human-paraphrase set (2026-07-15): recall@5 15%→40%,
-// MRR 0.087→0.28, top-1 0%→20%. Scores (question, cardText) PAIRS jointly (full
-// token interaction, unlike the bi-encoder cosine) and reorders a wide candidate
-// net. The bounded runtime keeps the same q8 model and scoring while owning
-// tensor disposal and serialization. Disable outright with KLYPIX_RERANK=0.
+// ── On-device cross-encoder reranker (brain_ask, opt-in experiment) ──────────
+// RETIRED as a default after the 2026-08-10 harness fix. The "recall@5 15%→40%"
+// that once justified it here was measured in a vector space the product does
+// not use (mean-pooled, unprefixed queries — the broken pre-fix harness).
+// Re-measured with the PRODUCTION embedder on the frozen human-paraphrase set:
+// the single BGE pass scores recall@5 30% / MRR 0.22; adding the reranker DROPS
+// that to 25% / 0.167 and costs ~3.5s/query. It still scores (question, card)
+// pairs jointly with full token interaction; keep it reachable for experiments
+// via KLYPIX_RERANK=1 (opt-IN — off by default; see the gate below).
 
 // ── small block helpers ──────────────────────────────────────────────────────
 const text = (t) => ({ kind: 'text', text: t });
@@ -523,11 +526,15 @@ export async function opBrainAsk({ vault, canvas, question, as_of, k = 10, log =
       const vecs = await vectorsForBrain(pipe, t.file, struct.cards);
       if (qv && vecs && vecs.size) { semantic = new Map(); for (const [id, v] of vecs) semantic.set(id, dot(qv, v)); cardVecs = vecs; mode = 'semantic+lexical (on-device)'; }
     }
-  } catch { semantic = null; cardVecs = null; mode = 'lexical (semantic warming — retry for semantic ranking)'; }
+  } catch { semantic = null; cardVecs = null; }
+  // Parity with search_all_brains (8445e9c): never say "warming — retry" to a
+  // host with no runtime installed — for them that advice is wrong forever and
+  // their results are the measured recall@5 = 0% lexical path.
+  if (!semantic) mode = semanticFallbackNotice(false) || mode;
   const kk = Math.max(1, Math.min(20, k || 10));
   const timeTravel = asOfTs != null;
   // Cross-encoder rerank is OPT-IN. On the frozen human/paraphrase set it made
-  // BGE top-5 recall worse (35%→25%) and added ~3.5s/query. Keep the reversible
+  // BGE top-5 recall worse (30%→25%) and added ~3.5s/query. Keep the reversible
   // escape hatch for experiments, but the best measured experience is the single
   // BGE pass. Suppressed under as_of either way.
   const wantRerank = !timeTravel && process.env.KLYPIX_RERANK === '1';

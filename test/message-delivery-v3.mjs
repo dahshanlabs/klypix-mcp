@@ -148,6 +148,26 @@ try {
   assert.equal(liveOffer.length, 1);
   assert.equal(messageDeliveryState(readLaneMessage(laneFileFor(endedBrain, home), lateMessage.id), recipient), 'offered');
   assert.equal(endSession({ brainPath: endedBrain, home, now: now + 16, id: recipient }).ok, true);
+  upsertSession({
+    brainPath: endedBrain, home, now: now + 17, id: 'ended-recipient-alias-holder',
+    aliases: [recipient], channel: 'lifecycle', event: 'SessionStart',
+  });
+  const endedLaneFile = laneFileFor(endedBrain, home);
+  const offeredAfterEnd = readLaneMessage(endedLaneFile, lateMessage.id);
+  const lateReceipt = messageDeliveryReceipt(offeredAfterEnd, recipient);
+  const beforeLateReceipt = fs.readFileSync(endedLaneFile, 'utf8');
+  const rejectedLateReceipt = consumeMessageReceipt({
+    brainPath: endedBrain, home, now: now + 17,
+    sessionId: recipient, messageId: lateMessage.id, offerToken: lateReceipt.offerToken,
+    actionId: 'late-explicit-receipt',
+  });
+  assert.deepEqual(
+    { ok: rejectedLateReceipt.ok, changed: rejectedLateReceipt.changed, status: rejectedLateReceipt.status, reason: rejectedLateReceipt.reason },
+    { ok: false, changed: false, status: 'rejected', reason: 'session-not-live' },
+  );
+  assert.equal(fs.readFileSync(endedLaneFile, 'utf8'), beforeLateReceipt,
+    'an alias cannot consume for a missing exact recipient and the lane remains byte-for-byte unchanged');
+  assert.equal(messageDeliveryState(readLaneMessage(endedLaneFile, lateMessage.id), recipient), 'offered');
   upsertSession({ brainPath: endedBrain, home, now: now + 17, id: recipient, channel: 'lifecycle', event: 'PreToolUse' });
   const lateAck = receiveMessages({
     brainPath: endedBrain, home, now: now + 17,

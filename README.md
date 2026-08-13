@@ -79,7 +79,7 @@ npx klypix-mcp conformance
 
 It runs in a temporary fixture and touches nothing else. It checks tool discovery, task memory,
 truthful peer reporting, overlap surfacing, proactive logging, and in-band delivery of a peer note.
-It verifies 15 required coordination behaviours — not the 22 tools, and not the retrieval engine.
+It verifies 15 required coordination behaviours — not the 26 tools, and not the retrieval engine.
 
 ---
 
@@ -495,7 +495,7 @@ The MCP verbs below are what agents call. These are what **you** call:
 
 ---
 
-## The 22 verbs
+## The 26 verbs
 
 | Tool | What it does |
 |---|---|
@@ -514,6 +514,10 @@ The MCP verbs below are what agents call. These are what **you** call:
 | `project_map_context` | Read-only, bounded code-graph evidence beside correction-aware brain context, with exact-path review proposals; external artifacts (e.g. Graphify) are supported but never installed or run locally |
 | `project_map_scan` | KLYPIX's own zero-install scanner: gitignore-aware file inventory + file-level import edges (relative, tsconfig-alias, and monorepo-workspace imports resolved) written to `klypix-map/graph.json` — which then serves `project_map_context` automatically |
 | `project_map_drift` | Read-only drift report: brain cards whose referenced files are gone or moved (with rename candidates), plus a headline when the checkout itself is behind its origin default branch |
+| `remote_status` | Inspect the local KLYPIX tray relay and its verified Remote capabilities |
+| `remote_sessions` | List coding-agent sessions with exact provider, host-binding and capability receipts |
+| `remote_actions` | List pending questions, approvals, failures, conflicts and reviews reported by supported providers |
+| `remote_command` | Control one exact verified coding-agent session using a fresh capability receipt; unsupported operations fail closed |
 | `canvas_view` | Returns the board as a structured render spec plus a text summary, and declares an MCP Apps (SEP-1865) UI resource |
 | `read_canvas` | A canvas as markdown (cards, connection graph, `[[links]]`, `#tags`) |
 | `search_canvases` | Search across canvases by name and content |
@@ -522,7 +526,7 @@ The MCP verbs below are what agents call. These are what **you** call:
 | `add_to_canvas` | Append cards/connections (positions preserved) |
 | `list_canvases` | List every `.klypix` in the vault |
 
-Exactly 22, machine-verifiable with `npx klypix-mcp doctor`.
+Exactly 26, machine-verifiable with `npx klypix-mcp doctor`.
 
 > **`canvas_view`:** no MCP Apps host has been observed rendering the UI resource yet — there is no
 > screenshot and no host-level test. Hosts without the extension get clean text, which is the path
@@ -722,7 +726,8 @@ Your `brain.klypix` is yours — it is a plain ZIP and stays readable with or wi
 Issues and pull requests: [github.com/dahshanlabs/klypix-mcp](https://github.com/dahshanlabs/klypix-mcp).
 Questions or feedback: [hello@klypix.com](mailto:hello@klypix.com).
 
-The repository carries 59 test files, 54 of them in the `npm test` chain, covering the presence
+The repository carries 68 test files: 62 listed directly in `scripts.test`, plus the
+`pretest` workflow gate. Together they cover the presence
 lane and its cross-machine relay, the Context Gateway, supervisor hot-swap, auto-update, retrieval
 quality, decay, challenge, lenses, the format guard, the git tools (including a real `git merge`
 through the merge driver), uninstall, and conformance. Run them with `npm test` from a clone — they

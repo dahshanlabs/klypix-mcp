@@ -289,6 +289,7 @@ jobs:
             "test/cli-args.mjs",
             "test/evidence-publication-gate.mjs",
             "test/release-evidence-cli.mjs",
+            "test/remote-client.mjs",
             "test/publish-workflow.mjs",
             "test/publish-verdict.mjs",
           ];

@@ -19,6 +19,7 @@ import {
   messageDeliveryReceipt,
   messageDecayInfo,
   peekMessages,
+  pinLaneIdentity,
   postPresenceMessage,
   receiveMessages,
   rekeySessionIdentity,
@@ -57,6 +58,266 @@ export const KLYPIX_MCP_INSTRUCTIONS = [
 ].join(' ');
 
 const compact = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+
+const EXACT_FILE_MAX_CHARS = 512;
+const EXACT_FILE_MAX_COUNT = 20;
+const GLOB_FILE_CHARS = new Set(['*', '?', '[', ']', '{', '}']);
+
+const fileScopeError = (index, code, message, value) => ({
+  index,
+  code,
+  message,
+  ...(typeof value === 'string' ? { file: value.slice(0, EXACT_FILE_MAX_CHARS) } : {}),
+});
+
+const pathIsInside = (root, candidate) => {
+  const relative = path.relative(root, candidate);
+  return relative === '' || (relative !== '..'
+    && !relative.startsWith(`..${path.sep}`)
+    && !path.isAbsolute(relative));
+};
+
+// brain_sync coordinates exact FILE ownership. Accepting directories, globs,
+// absolute paths, or alternate spellings (./x, x//y, x\\y) makes two sessions
+// describe the same file with different keys and silently defeats the warning.
+// Validate before ANY task/result/presence mutation; missing future files are
+// valid, but their nearest existing parent must still resolve inside the project.
+export function validateExactFileScope(files, { projectRoot } = {}) {
+  if (!Array.isArray(files)) {
+    return {
+      ok: false,
+      files: [],
+      errors: [fileScopeError(null, 'files-not-array', '`files` must be an array of exact project-relative file paths')],
+    };
+  }
+  if (files.length > EXACT_FILE_MAX_COUNT) {
+    return {
+      ok: false,
+      files: [],
+      errors: [fileScopeError(null, 'files-too-many', `\`files\` may contain at most ${EXACT_FILE_MAX_COUNT} exact paths`)],
+    };
+  }
+
+  const root = path.resolve(projectRoot || process.cwd());
+  let realRoot = root;
+  try { realRoot = fs.realpathSync.native(root); } catch { /* a not-yet-created project has lexical containment only */ }
+  const errors = [];
+  const seen = new Map();
+
+  for (let index = 0; index < files.length; index++) {
+    const value = files[index];
+    if (typeof value !== 'string') {
+      errors.push(fileScopeError(index, 'file-not-string', `files[${index}] must be a string`, value));
+      continue;
+    }
+    if (!value.length || !value.trim()) {
+      errors.push(fileScopeError(index, 'file-empty', `files[${index}] must not be empty`, value));
+      continue;
+    }
+    if (value.length > EXACT_FILE_MAX_CHARS) {
+      errors.push(fileScopeError(index, 'file-too-long', `files[${index}] exceeds ${EXACT_FILE_MAX_CHARS} characters`, value));
+      continue;
+    }
+    if (value !== value.trim() || /[\u0000-\u001f\u007f]/.test(value)) {
+      errors.push(fileScopeError(index, 'file-noncanonical', `files[${index}] must not contain surrounding whitespace or control characters`, value));
+      continue;
+    }
+    if (path.isAbsolute(value) || path.posix.isAbsolute(value) || path.win32.isAbsolute(value)) {
+      errors.push(fileScopeError(index, 'file-absolute', `files[${index}] must be relative to the project root`, value));
+      continue;
+    }
+    if (/^[A-Za-z]:/.test(value)) {
+      errors.push(fileScopeError(index, 'file-noncanonical', `files[${index}] must not use a drive-relative path`, value));
+      continue;
+    }
+    if (value.endsWith('/') || value.endsWith('\\')) {
+      errors.push(fileScopeError(index, 'file-trailing-slash', `files[${index}] names a directory-like path; supply an exact file`, value));
+      continue;
+    }
+    if (value.includes('\\') || value !== path.posix.normalize(value)
+      || value.split('/').some((segment) => !segment || segment === '.' || segment === '..')) {
+      const escaping = value.split('/').includes('..');
+      errors.push(fileScopeError(index, escaping ? 'file-escapes-project' : 'file-noncanonical',
+        `files[${index}] must use canonical forward-slash project-relative form`, value));
+      continue;
+    }
+    if ([...value].some((character) => GLOB_FILE_CHARS.has(character))) {
+      errors.push(fileScopeError(index, 'file-glob-like', `files[${index}] must name one exact file, not a glob-like pattern`, value));
+      continue;
+    }
+
+    const folded = value.toLowerCase();
+    if (seen.has(folded)) {
+      errors.push(fileScopeError(index, 'file-duplicate',
+        `files[${index}] duplicates files[${seen.get(folded)}] after case folding`, value));
+      continue;
+    }
+    seen.set(folded, index);
+
+    const target = path.resolve(root, ...value.split('/'));
+    if (!pathIsInside(root, target)) {
+      errors.push(fileScopeError(index, 'file-escapes-project', `files[${index}] resolves outside the project root`, value));
+      continue;
+    }
+
+    try {
+      const stat = fs.statSync(target);
+      if (stat.isDirectory()) {
+        errors.push(fileScopeError(index, 'file-is-directory', `files[${index}] is an existing directory; supply exact files within it`, value));
+        continue;
+      }
+      const realTarget = fs.realpathSync.native(target);
+      if (!pathIsInside(realRoot, realTarget)) {
+        errors.push(fileScopeError(index, 'file-escapes-project', `files[${index}] resolves through a link outside the project root`, value));
+      }
+      continue;
+    } catch (error) {
+      if (!['ENOENT', 'ENOTDIR'].includes(error?.code)) {
+        errors.push(fileScopeError(index, 'file-unverifiable', `files[${index}] could not be verified (${error?.code || 'filesystem error'})`, value));
+        continue;
+      }
+      if (error?.code === 'ENOTDIR') {
+        errors.push(fileScopeError(index, 'file-parent-not-directory', `files[${index}] has an existing parent that is not a directory`, value));
+        continue;
+      }
+    }
+
+    // The file may be created later. Resolve the nearest existing parent so an
+    // existing symlink cannot turn that future path into an out-of-project file.
+    let ancestor = path.dirname(target);
+    while (pathIsInside(root, ancestor)) {
+      try {
+        const stat = fs.statSync(ancestor);
+        if (!stat.isDirectory()) {
+          errors.push(fileScopeError(index, 'file-parent-not-directory', `files[${index}] has an existing parent that is not a directory`, value));
+        } else if (!pathIsInside(realRoot, fs.realpathSync.native(ancestor))) {
+          errors.push(fileScopeError(index, 'file-escapes-project', `files[${index}] resolves through a link outside the project root`, value));
+        }
+        break;
+      } catch (error) {
+        if (!['ENOENT', 'ENOTDIR'].includes(error?.code)) {
+          errors.push(fileScopeError(index, 'file-unverifiable', `files[${index}] parent could not be verified (${error?.code || 'filesystem error'})`, value));
+          break;
+        }
+      }
+      const parent = path.dirname(ancestor);
+      if (parent === ancestor) break;
+      ancestor = parent;
+    }
+  }
+
+  return { ok: errors.length === 0, files: errors.length ? [] : [...files], errors };
+}
+
+const canonicalPathKey = (value) => {
+  const resolved = path.resolve(value);
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+};
+
+// Node 18 exposes bigint dev/ino on every supported platform. Together with
+// lstat identity (the junction/symlink object) and realpath identity (its
+// target), this detects both a link retarget and an atomic file replacement.
+// Do not include size/mtime: an in-place brain edit is not a routing change.
+const filesystemIdentity = (target, { link = false } = {}) => {
+  const stat = link
+    ? fs.lstatSync(target, { bigint: true })
+    : fs.statSync(target, { bigint: true });
+  return [stat.dev, stat.ino, stat.mode, stat.birthtimeNs]
+    .map((value) => String(value))
+    .join(':');
+};
+
+const directProjectBrain = (projectRoot) => {
+  for (const name of ['brain.klypix', 'brain.any']) {
+    const candidate = path.join(projectRoot, name);
+    try {
+      if (!fs.statSync(candidate).isFile()) continue;
+      const realRoot = fs.realpathSync.native(projectRoot);
+      const realBrain = fs.realpathSync.native(candidate);
+      if (canonicalPathKey(path.dirname(realBrain)) !== canonicalPathKey(realRoot)) {
+        return { ok: false, reason: 'project-brain-escapes-root', brainPath: null };
+      }
+      return {
+        ok: true,
+        brainPath: candidate,
+        realRoot,
+        realBrain,
+        binding: Object.freeze({
+          lexicalProject: path.resolve(projectRoot),
+          canonicalProject: path.resolve(realRoot),
+          lexicalBrain: path.resolve(candidate),
+          canonicalBrain: path.resolve(realBrain),
+          projectLinkIdentity: filesystemIdentity(projectRoot, { link: true }),
+          projectObjectIdentity: filesystemIdentity(projectRoot),
+          brainLinkIdentity: filesystemIdentity(candidate, { link: true }),
+          brainObjectIdentity: filesystemIdentity(candidate),
+        }),
+      };
+    } catch { /* try the alternate direct brain filename */ }
+  }
+  return { ok: false, reason: 'project-brain-missing', brainPath: null };
+};
+
+const sameProjectBinding = (binding) => {
+  try {
+    if (!binding || typeof binding !== 'object') return false;
+    if (canonicalPathKey(fs.realpathSync.native(binding.lexicalProject))
+      !== canonicalPathKey(binding.canonicalProject)) return false;
+    if (canonicalPathKey(fs.realpathSync.native(binding.lexicalBrain))
+      !== canonicalPathKey(binding.canonicalBrain)) return false;
+    if (canonicalPathKey(path.dirname(binding.lexicalBrain))
+      !== canonicalPathKey(binding.lexicalProject)) return false;
+    if (canonicalPathKey(path.dirname(binding.canonicalBrain))
+      !== canonicalPathKey(binding.canonicalProject)) return false;
+    if (!fs.statSync(binding.lexicalProject).isDirectory()
+      || !fs.statSync(binding.lexicalBrain).isFile()) return false;
+    return filesystemIdentity(binding.lexicalProject, { link: true }) === binding.projectLinkIdentity
+      && filesystemIdentity(binding.lexicalProject) === binding.projectObjectIdentity
+      && filesystemIdentity(binding.lexicalBrain, { link: true }) === binding.brainLinkIdentity
+      && filesystemIdentity(binding.lexicalBrain) === binding.brainObjectIdentity;
+  } catch {
+    return false;
+  }
+};
+
+const syncPreflightFailure = ({ status, reason, requestedProject, errors = [] }) => {
+  const invalidProject = status !== 'invalid-scope';
+  const guidance = invalidProject
+    ? 'Supply the nonempty absolute path of the exact existing project root that directly contains brain.klypix or brain.any.'
+    : 'Use unique canonical forward-slash paths to individual files (for example `src/app.ts`); missing future files are allowed.';
+  const headline = invalidProject
+    ? 'KLYPIX project routing was not changed because `project` is not an exact project-brain root.'
+    : 'KLYPIX task scope was not changed because `files` is not an exact-file declaration.';
+  return {
+    sessions: [],
+    messages: [],
+    notice: '',
+    conflicts: [],
+    resultConflicts: [],
+    alertsQueued: [],
+    laneWriteOk: null,
+    laneWriteSkippedReason: status,
+    deliveryWriteOk: null,
+    deliveryWriteSkippedReason: status,
+    isError: true,
+    structured: {
+      schemaVersion: 1,
+      status,
+      reason,
+      requestedProject: requestedProject || null,
+      ...(errors.length ? { errors } : {}),
+      mutation: 'none',
+      identityMutation: 'none',
+      deliveryMutation: 'none',
+      timingMs: { coordination: 0 },
+    },
+    text: [
+      headline,
+      ...errors.slice(0, 20).map((error) => `- ${error.message}`),
+      guidance,
+    ].join('\n'),
+  };
+};
 
 // File-key normalization. `root` (optional) is the project root the two rows share
 // — passing it folds an ABSOLUTE declaration and a REPO-RELATIVE one onto the same
@@ -405,13 +666,18 @@ function markResultClaimPending({ brainPath, sessionId, home, at = Date.now() })
     fd = fs.openSync(file, 'wx');
     fs.writeSync(fd, JSON.stringify({ schemaVersion: 1, sessionId: String(sessionId), pendingAt: at }));
     try { fs.fsyncSync(fd); } catch { /* existence is already fail-closed */ }
-    return { ok: true, pending: true, file };
+    return { ok: true, pending: true, file, created: true };
   } catch (error) {
-    if (error?.code === 'EEXIST') return { ok: true, pending: true, file };
+    if (error?.code === 'EEXIST') {
+      // File existence is the fail-closed semantic. Even an unusual existing
+      // filesystem object at this exact private marker path preserves the
+      // completion obligation; payload shape is deliberately non-authoritative.
+      return { ok: true, pending: true, file, created: false };
+    }
     // If creation succeeded but writing the diagnostic payload failed, the
     // marker still carries the required semantic and is therefore a success.
     try {
-      if (fs.statSync(file)) return { ok: true, pending: true, file };
+      if (fs.statSync(file)) return { ok: true, pending: true, file, created: true };
     } catch { /* report the original failure below */ }
     return { ok: false, pending: true, file, reason: error?.code || error?.message || 'marker-write-failed' };
   } finally {
@@ -443,16 +709,31 @@ export function resolveHostPid(env = process.env) {
 // goes stale when the MCP server outlives /clear or a resume (the server
 // process persists; the session id rotates) — re-reading the hostmap on every
 // touch keeps the adopted id current with zero agent cooperation.
-export function hostmapSessionId({ brainPath, hostPid, home, now = Date.now() } = {}) {
-  if (!brainPath || !hostPid) return null;
+function hostmapSessionState({ brainPath, hostPid, home, now = Date.now() } = {}) {
+  if (!brainPath || !hostPid) return { status: 'absent', id: null };
   try {
     const file = laneFileFor(brainPath, home).replace(/\.json$/, '.hostmap');
     const map = JSON.parse(fs.readFileSync(file, 'utf8'));
     const entry = map && typeof map === 'object' ? map[String(hostPid)] : null;
-    if (!entry || !compact(entry.sessionId)) return null;
-    if (now - Number(entry.ts || 0) > 10 * 60 * 1000) return null;   // stale mapping — host gone
-    return compact(entry.sessionId).slice(0, 160);
-  } catch { return null; }
+    if (!entry || !compact(entry.sessionId)) return { status: 'absent', id: null };
+    if (now - Number(entry.ts || 0) > 10 * 60 * 1000) return { status: 'stale', id: null };   // stale mapping — host gone
+    const mapped = compact(entry.sessionId).slice(0, 160);
+    // The lifecycle writer updates hostmap + lane as two atomic files. If the
+    // second rename fails, the sidecar can briefly be ahead. Adopt only once a
+    // matching live lifecycle row for this host pid exists; otherwise an MCP
+    // touch would create a blank B while A still owns the real lifecycle scope.
+    const row = listActiveSessions({ brainPath, home, now }).find((session) => session.id === mapped);
+    if (!row || !Array.isArray(row.channels) || !row.channels.includes('lifecycle')
+      || Number(row.hostPid || 0) !== Number(hostPid)) {
+      return { status: 'sidecar-ahead', id: mapped };
+    }
+    return { status: 'ready', id: mapped };
+  } catch { return { status: 'unavailable', id: null }; }
+}
+
+export function hostmapSessionId(options = {}) {
+  const resolved = hostmapSessionState(options);
+  return resolved.status === 'ready' ? resolved.id : null;
 }
 
 function gitBranch(cwd) {
@@ -491,6 +772,10 @@ export function createMcpPresence({
   now = () => Date.now(),
   setIntervalFn = setInterval,
   clearIntervalFn = clearInterval,
+  // Narrow fault-injection seam for durability regressions. Production never
+  // supplies it; keeping the injected surface at the semantic marker writer
+  // avoids monkey-patching global fs methods in concurrent tests.
+  markResultClaimPendingFn = markResultClaimPending,
   // Decay-aware LAST-KNOWN stamps (2026-07-28 post-mortem, class B): the
   // injected engine surface ({ classifyDecay, decayStaleMs, decayMessageStamp,
   // formatDecayAge } from klypix-format.mjs) that lets every MCP delivery
@@ -510,6 +795,8 @@ export function createMcpPresence({
     || MCP_INBOX_POLL_MS;
   let vault = path.resolve(initialVault || process.cwd());
   let brainPath = null;
+  let brainLaneIdentity = null;
+  let currentProjectBinding = null;
   let timer = null;
   let inboxTimer = null;
   let started = false;
@@ -521,25 +808,330 @@ export function createMcpPresence({
   const sentTexts = new Set();
   const notifiedConflicts = new Set();
   const announcedMessageIds = new Set();
+  // Public preflight objects are capabilities, never the authority itself.
+  // All trusted fields live only in these private WeakMaps so property mutation,
+  // cloning, or replay cannot redirect a later sync.
+  const pendingSyncPreflights = new WeakMap();
+  const consumedSyncPreflights = new WeakMap();
+  const authorizedSyncPreflights = new WeakMap();
+  const syncInputKey = ({ project, projectProvided = project !== undefined, files, phase = 'checkpoint' } = {}) => JSON.stringify({
+    projectProvided: Boolean(projectProvided),
+    project: projectProvided ? project : null,
+    files: files === undefined ? null : files,
+    phase: ['start', 'checkpoint', 'complete'].includes(phase) ? phase : 'checkpoint',
+  });
+
+  // Semantic validation belongs before request-identity adoption. In
+  // particular, an explicit project is a routing authority, not a cwd hint:
+  // never resolve a relative value and never walk upward from the supplied
+  // directory. The opaque token lets sync consume this exact checked snapshot
+  // instead of repeating filesystem validation after identity has changed.
+  const preflightSync = ({ project, projectProvided = project !== undefined, files, phase = 'checkpoint' } = {}) => {
+    let requestedVault;
+    let resultBrainPath;
+
+    let projectBinding = null;
+    if (projectProvided) {
+      if (typeof project !== 'string' || !project.length || project.length > 4_096
+        || project !== project.trim() || /[\u0000-\u001f\u007f]/.test(project)) {
+        return {
+          ok: false,
+          report: syncPreflightFailure({
+            status: 'invalid-project',
+            reason: 'project-empty-or-noncanonical',
+            requestedProject: typeof project === 'string' ? project.slice(0, 512) : null,
+          }),
+        };
+      }
+      if (!path.isAbsolute(project)) {
+        return {
+          ok: false,
+          report: syncPreflightFailure({
+            status: 'invalid-project',
+            reason: 'project-not-absolute',
+            requestedProject: project.slice(0, 512),
+          }),
+        };
+      }
+      requestedVault = path.resolve(project);
+      try {
+        if (!fs.statSync(requestedVault).isDirectory()) {
+          return {
+            ok: false,
+            report: syncPreflightFailure({
+              status: 'invalid-project',
+              reason: 'project-not-directory',
+              requestedProject: requestedVault,
+            }),
+          };
+        }
+      } catch {
+        return {
+          ok: false,
+          report: syncPreflightFailure({
+            status: 'invalid-project',
+            reason: 'project-not-existing-directory',
+            requestedProject: requestedVault,
+          }),
+        };
+      }
+      const directBrain = directProjectBrain(requestedVault);
+      if (!directBrain.ok) {
+        return {
+          ok: false,
+          report: syncPreflightFailure({
+            status: 'invalid-project',
+            reason: directBrain.reason,
+            requestedProject: requestedVault,
+          }),
+        };
+      }
+      projectBinding = directBrain.binding;
+      // Route only through the canonical objects captured above. A later
+      // retarget of the caller's junction/symlink cannot redirect lane hashing,
+      // result ledgers, registry writes, or brain reads after validation.
+      requestedVault = projectBinding.canonicalProject;
+      resultBrainPath = projectBinding.canonicalBrain;
+    } else {
+      requestedVault = vault;
+      resultBrainPath = started && requestedVault === vault
+        ? brainPath
+        : findProjectBrain(requestedVault);
+      if (resultBrainPath) {
+        const directBrain = directProjectBrain(path.dirname(resultBrainPath));
+        if (directBrain.ok) {
+          projectBinding = directBrain.binding;
+          resultBrainPath = projectBinding.canonicalBrain;
+        }
+      }
+    }
+
+    let declaredFiles = files;
+    if (files !== undefined) {
+      const checkedScope = validateExactFileScope(files, {
+        projectRoot: resultBrainPath ? path.dirname(resultBrainPath) : requestedVault,
+      });
+      if (!checkedScope.ok) {
+        return {
+          ok: false,
+          report: syncPreflightFailure({
+            status: 'invalid-scope',
+            reason: 'invalid-file-scope',
+            requestedProject: requestedVault,
+            errors: checkedScope.errors,
+          }),
+        };
+      }
+      declaredFiles = checkedScope.files;
+    }
+
+    const capability = Object.freeze({ ok: true });
+    pendingSyncPreflights.set(capability, Object.freeze({
+      inputKey: syncInputKey({ project, projectProvided, files, phase }),
+      projectProvided,
+      requestedVault,
+      resultBrainPath,
+      declaredFiles: declaredFiles === undefined ? undefined : Object.freeze([...declaredFiles]),
+      projectBinding,
+      laneIdentity: projectBinding?.canonicalBrain || resultBrainPath || null,
+      requestedProject: projectProvided ? project : requestedVault,
+    }));
+    return capability;
+  };
+
+  const consumeSyncPreflight = (preflight, input = {}) => {
+    const snapshot = preflight && typeof preflight === 'object'
+      ? pendingSyncPreflights.get(preflight)
+      : null;
+    if (!snapshot) {
+      return {
+        ok: false,
+        report: syncPreflightFailure({
+          status: 'invalid-preflight',
+          reason: 'preflight-capability-invalid-or-replayed',
+        }),
+      };
+    }
+    pendingSyncPreflights.delete(preflight);
+    if (snapshot.inputKey !== syncInputKey(input)) {
+      return {
+        ok: false,
+        report: syncPreflightFailure({
+          status: 'invalid-preflight',
+          reason: 'preflight-input-changed',
+          requestedProject: snapshot.requestedProject,
+        }),
+      };
+    }
+    if (snapshot.projectBinding && !sameProjectBinding(snapshot.projectBinding)) {
+      return {
+        ok: false,
+        report: syncPreflightFailure({
+          status: 'project-changed',
+          reason: 'project-or-brain-identity-changed-after-preflight',
+          requestedProject: snapshot.requestedProject,
+        }),
+      };
+    }
+    const consumed = Object.freeze({ ok: true });
+    consumedSyncPreflights.set(consumed, snapshot);
+    return consumed;
+  };
+
+  const revalidateConsumedSyncPreflight = (preflight, input = {}) => {
+    const snapshot = preflight && typeof preflight === 'object'
+      ? consumedSyncPreflights.get(preflight)
+      : null;
+    if (!snapshot || snapshot.inputKey !== syncInputKey(input)) {
+      return {
+        ok: false,
+        report: syncPreflightFailure({
+          status: 'invalid-preflight',
+          reason: snapshot ? 'preflight-input-changed' : 'preflight-capability-invalid-or-replayed',
+          requestedProject: snapshot?.requestedProject,
+        }),
+      };
+    }
+    consumedSyncPreflights.delete(preflight);
+    if (snapshot.projectBinding && !sameProjectBinding(snapshot.projectBinding)) {
+      return {
+        ok: false,
+        report: syncPreflightFailure({
+          status: 'project-changed',
+          reason: 'project-or-brain-identity-changed-after-preflight',
+          requestedProject: snapshot.requestedProject,
+        }),
+      };
+    }
+    // This is the final, one-shot authorization point. The snapshot routes by
+    // canonical project/brain paths, so retargeting the caller's lexical link
+    // after authorization cannot redirect the operation. In particular, the
+    // worker can now adopt request identity without needing an unsafe inverse
+    // lane operation if a later lexical-path check observes a change.
+    const authorized = Object.freeze({ ok: true });
+    authorizedSyncPreflights.set(authorized, snapshot);
+    return authorized;
+  };
+
+  const verifyProjectBinding = (binding) => !binding || sameProjectBinding(binding);
+  const verifyCurrentProjectBinding = () => verifyProjectBinding(currentProjectBinding);
+  const refreshCurrentProjectBinding = () => {
+    if (!currentProjectBinding) return { ok: true, status: 'not-bound' };
+    try {
+      // Never start from the lexical path: if the project directory was
+      // replaced with a junction, following it would "refresh" trust onto the
+      // attacker-selected target. The captured canonical root itself must still
+      // be the same directory object; only the direct brain file may have been
+      // atomically replaced by a managed KLYPIX write.
+      if (filesystemIdentity(currentProjectBinding.canonicalProject)
+        !== currentProjectBinding.projectObjectIdentity) {
+        return { ok: false, status: 'project-changed' };
+      }
+      if (canonicalPathKey(fs.realpathSync.native(currentProjectBinding.lexicalProject))
+        !== canonicalPathKey(currentProjectBinding.canonicalProject)) {
+        return { ok: false, status: 'project-changed' };
+      }
+      const refreshed = directProjectBrain(currentProjectBinding.canonicalProject);
+      if (!refreshed.ok
+        || canonicalPathKey(refreshed.binding.canonicalProject)
+          !== canonicalPathKey(currentProjectBinding.canonicalProject)
+        || path.basename(refreshed.binding.canonicalBrain)
+          !== path.basename(currentProjectBinding.canonicalBrain)) {
+        return { ok: false, status: 'project-changed' };
+      }
+      currentProjectBinding = Object.freeze({
+        ...refreshed.binding,
+        // Retain the caller's exact lexical root so later retargeting remains
+        // observable; the refreshed brain identity comes only from canonical root.
+        lexicalProject: currentProjectBinding.lexicalProject,
+        lexicalBrain: path.join(
+          currentProjectBinding.lexicalProject,
+          path.basename(refreshed.binding.canonicalBrain),
+        ),
+        projectLinkIdentity: currentProjectBinding.projectLinkIdentity,
+      });
+      brainLaneIdentity = currentProjectBinding.canonicalBrain;
+      pinLaneIdentity(brainPath, brainLaneIdentity);
+      return { ok: true, status: 'refreshed' };
+    } catch {
+      return { ok: false, status: 'project-changed' };
+    }
+  };
 
   // Session-id rotation: the id is resolved once at spawn, but this server
   // process outlives /clear and session resume — the hook-written hostmap is
   // re-checked on every touch so the lane row follows the CURRENT session id
   // instead of silently mislabeling every later conversation (2026-07-29 audit).
-  const adoptHostSession = (stamp) => {
+  const adoptHostSession = (stamp, targetBrainPath = brainPath, {
+    requireDestinationClaim = false,
+    verifyBinding: verifyBindingFn = null,
+  } = {}) => {
     try {
-      if (!brainPath || !hostPid) return;
+      if (!targetBrainPath || !hostPid) return { ok: true, status: 'not-applicable' };
       // Codex has many logical threads below one desktop parent. Its hostmap is
       // ambiguous by construction; only request metadata may rekey it.
-      if (clientInfo().client === 'codex') return;
-      const mapped = hostmapSessionId({ brainPath, hostPid, home, now: stamp });
-      if (!mapped || mapped === sessionId) return;
+      const info = clientInfo();
+      if (verifyBindingFn && !verifyBindingFn()) {
+        return { ok: false, status: 'project-changed', reason: 'project-or-brain-identity-changed-during-host-callback' };
+      }
+      if (info.client === 'codex') return { ok: true, status: 'not-applicable', clientInfo: info };
+      const hostIdentity = hostmapSessionState({ brainPath: targetBrainPath, hostPid, home, now: stamp });
+      if (verifyBindingFn && !verifyBindingFn()) {
+        return { ok: false, status: 'project-changed', reason: 'project-or-brain-identity-changed-before-host-adoption' };
+      }
+      if (hostIdentity.status === 'sidecar-ahead') {
+        return { ok: false, status: 'sidecar-ahead', mappedId: hostIdentity.id };
+      }
+      const mapped = hostIdentity.status === 'ready' ? hostIdentity.id : null;
+      if (!mapped || mapped === sessionId) {
+        return { ok: true, status: mapped ? 'current' : hostIdentity.status, clientInfo: info };
+      }
       const previous = sessionId;
-      const priorClaim = readResultClaimPending({ brainPath, sessionId: previous, home });
-      if (resultClaimsPending || priorClaim.pending || !priorClaim.ok) {
-        const migrated = markResultClaimPending({ brainPath, sessionId: mapped, home, at: stamp });
-        if (migrated.ok && priorClaim.ok) {
-          clearResultClaimPending({ brainPath, sessionId: previous, home });
+      const priorClaim = readResultClaimPending({ brainPath: targetBrainPath, sessionId: previous, home });
+      const sameProject = targetBrainPath === brainPath;
+      if (requireDestinationClaim
+        || (sameProject && resultClaimsPending)
+        || priorClaim.pending
+        || !priorClaim.ok) {
+        const destinationClaim = readResultClaimPending({
+          brainPath: targetBrainPath,
+          sessionId: mapped,
+          home,
+        });
+        let migrated;
+        try {
+          migrated = markResultClaimPendingFn({ brainPath: targetBrainPath, sessionId: mapped, home, at: stamp });
+        } catch (error) {
+          migrated = { ok: false, reason: error?.code || error?.message || 'marker-write-threw' };
+        }
+        // The marker writer is an injected/fallible preparation callback. It may
+        // yield to host code, so revalidate the exact project+brain objects before
+        // committing either the source-marker clear or the lane identity change.
+        // A marker created only for this aborted preparation is safe to unwind;
+        // never attempt an inverse lane rekey after mutation has begun.
+        if (verifyBindingFn && !verifyBindingFn()) {
+          if (migrated?.created === true && destinationClaim.ok && !destinationClaim.pending) {
+            clearResultClaimPending({ brainPath: targetBrainPath, sessionId: mapped, home });
+          }
+          return {
+            ok: false,
+            status: 'project-changed',
+            mappedId: mapped,
+            reason: 'project-or-brain-identity-changed-during-result-claim-preparation',
+          };
+        }
+        if (!migrated.ok) {
+          return {
+            ok: false,
+            status: 'result-claim-migration-failed',
+            mappedId: mapped,
+            reason: migrated.reason || 'marker-write-failed',
+          };
+        }
+        if (priorClaim.ok) {
+          // Destination-first: failure to clear the old marker leaves a safe
+          // duplicate, never a missing obligation on the adopted identity.
+          clearResultClaimPending({ brainPath: targetBrainPath, sessionId: previous, home });
         }
       }
       sessionId = mapped;
@@ -548,7 +1140,7 @@ export function createMcpPresence({
       // The old row's mcp channel is ours — release it so the lane never holds
       // two rows for one logical session longer than a single touch interval.
       removeSession({
-        brainPath,
+        brainPath: targetBrainPath,
         id: previous,
         channel: 'mcp',
         expectedPid: process.pid,
@@ -556,16 +1148,45 @@ export function createMcpPresence({
         now: stamp,
       });
       lastPeers = '';
-    } catch { /* rotation is best-effort — an fs error must never kill the heartbeat */ }
+      return { ok: true, status: 'adopted', previous, sessionId, brainPath: targetBrainPath, clientInfo: info };
+    } catch {
+      // Ordinary hostmap I/O remains best-effort. A positively identified
+      // sidecar-ahead state is returned above and must never be swallowed.
+      return { ok: true, status: 'unavailable' };
+    }
   };
 
   // A host can rotate its logical session id (/clear, resume) before the next
   // heartbeat. Message sending needs the current id BEFORE it snapshots target
   // recipients, so expose a read/identity refresh that does not consume inbox
   // messages or create a second delivery transition in the same tool action.
-  const adoptRequestIdentity = (extra, { toolName, toolInput } = {}) => {
+  const adoptRequestIdentity = (extra, { toolName, toolInput, verifyBinding: verifyBindingFn = null } = {}) => {
     const stamp = now();
-    const info = clientInfo();
+    const hostIdentity = adoptHostSession(stamp, brainPath, { verifyBinding: verifyBindingFn });
+    if (hostIdentity?.ok === false) {
+      const sidecarAhead = hostIdentity.status === 'sidecar-ahead';
+      return {
+        ok: false,
+        status: hostIdentity.status || 'hostmap-adoption-failed',
+        id: null,
+        actionId: codexToolActionId(extra, { toolName, toolInput }),
+        sessionId,
+        diagnostic: sidecarAhead
+          ? `KLYPIX identity safety check deferred this action: lifecycle identity ${hostIdentity.mappedId || 'unknown'} is staged in the host sidecar but its exact live lifecycle row is not committed yet. No handler, presence identity, or queued-message delivery changed.`
+          : `KLYPIX identity safety check deferred this action: durable result-claim state could not move to lifecycle identity ${hostIdentity.mappedId || 'unknown'} (${hostIdentity.reason || 'migration failed'}). No handler, presence identity, lane, or queued-message delivery changed.`,
+      };
+    }
+    const info = hostIdentity.clientInfo || clientInfo();
+    if (verifyBindingFn && !verifyBindingFn()) {
+      return {
+        ok: false,
+        status: 'project-changed',
+        id: null,
+        actionId: codexToolActionId(extra, { toolName, toolInput }),
+        sessionId,
+        diagnostic: 'KLYPIX identity safety check deferred this action because the project or brain object changed during the host callback. No request identity or queued-message delivery changed.',
+      };
+    }
     const resolved = resolveRequestIdentity(extra, {
       client: info.client,
       toolName,
@@ -578,11 +1199,11 @@ export function createMcpPresence({
         diagnostic: `KLYPIX identity safety check deferred this action: ${resolved.diagnostic}. No presence identity or queued-message delivery changed.`,
       };
     }
-    if (!resolved.id) return { ...resolved, sessionId };
+    if (!resolved.id) return { ...resolved, sessionId, clientInfo: info };
     if (resolved.id === sessionId) {
       logicalSessionId = resolved.id;
       identitySource = 'mcp-request';
-      return { ...resolved, status: 'current', sessionId };
+      return { ...resolved, status: 'current', sessionId, clientInfo: info };
     }
 
     const previous = sessionId;
@@ -616,7 +1237,7 @@ export function createMcpPresence({
         sentTexts.clear();
         notifiedConflicts.clear();
         announcedMessageIds.clear();
-        return { ...resolved, status: 'rotated-after-end', sessionId };
+        return { ...resolved, status: 'rotated-after-end', sessionId, clientInfo: info };
       }
       if (rotation?.reason !== 'source-not-ended') {
         return {
@@ -673,19 +1294,42 @@ export function createMcpPresence({
         sentTexts.clear();
         notifiedConflicts.clear();
         announcedMessageIds.clear();
-        return { ...resolved, status: 'switched-live-session', sessionId };
+        return { ...resolved, status: 'switched-live-session', sessionId, clientInfo: info };
       }
     }
     const priorClaim = brainPath
       ? readResultClaimPending({ brainPath, sessionId: previous, home })
       : { ok: true, pending: resultClaimsPending };
     if (brainPath && (resultClaimsPending || priorClaim.pending || !priorClaim.ok)) {
-      const marker = markResultClaimPending({
-        brainPath,
-        sessionId: resolved.id,
-        home,
-        at: stamp,
-      });
+      const destinationClaim = readResultClaimPending({ brainPath, sessionId: resolved.id, home });
+      let marker;
+      try {
+        marker = markResultClaimPendingFn({
+          brainPath,
+          sessionId: resolved.id,
+          home,
+          at: stamp,
+        });
+      } catch (error) {
+        marker = { ok: false, reason: error?.code || error?.message || 'marker-write-threw' };
+      }
+      // Identity migration has a strict prepare/commit boundary: the fallible
+      // destination marker completes first, then the exact binding is checked,
+      // and only then may rekeySessionIdentity mutate the lane. If the callback
+      // retargeted a junction, unwind only our freshly-created preparation marker.
+      if (verifyBindingFn && !verifyBindingFn()) {
+        if (marker?.created === true && destinationClaim.ok && !destinationClaim.pending) {
+          clearResultClaimPending({ brainPath, sessionId: resolved.id, home });
+        }
+        return {
+          ok: false,
+          status: 'project-changed',
+          id: null,
+          actionId: resolved.actionId,
+          sessionId,
+          diagnostic: 'KLYPIX identity safety check deferred this action because the project or brain object changed during result-claim preparation. No presence identity, lane, or queued-message delivery changed.',
+        };
+      }
       if (!marker.ok) {
         return {
           ok: false,
@@ -735,7 +1379,7 @@ export function createMcpPresence({
     identitySource = 'mcp-request';
     lastPeers = '';
     announcedMessageIds.clear();
-    return { ...resolved, status: 'adopted', sessionId };
+    return { ...resolved, status: 'adopted', sessionId, clientInfo: info };
   };
 
   const refreshIdentity = () => {
@@ -769,6 +1413,8 @@ export function createMcpPresence({
   // the next KLYPIX tool result / brain_sync call.
   const pollInbox = () => {
     if (!brainPath) return [];
+    const identity = adoptHostSession(now());
+    if (identity?.ok === false) return [];
     const pending = peekMessages({
       brainPath,
       sessionId,
@@ -795,17 +1441,35 @@ export function createMcpPresence({
     files,
     replaceFiles = false,
     actionId = '',
+    hostIdentityPrepared = false,
+    clientInfoPrepared = null,
+    branchPrepared,
   } = {}) => {
     if (!brainPath) return { sessions: [], messages: [], notice: '', laneWriteOk: null, laneWriteSkippedReason: 'no-lane' };
     const stamp = now();
-    adoptHostSession(stamp);
-    const { client, surface } = clientInfo();
+    const identity = hostIdentityPrepared
+      ? { ok: true, status: 'prepared' }
+      : adoptHostSession(stamp);
+    if (identity?.ok === false) {
+      return {
+        sessions: listActiveSessions({ brainPath, home, now: stamp }),
+        messages: [],
+        notice: '',
+        laneWriteOk: false,
+        laneWriteSkippedReason: `identity-${identity.status || 'adoption-failed'}`,
+        deliveryWriteOk: false,
+        deliveryWriteSkippedReason: `identity-${identity.status || 'adoption-failed'}`,
+      };
+    }
+    const { client, surface } = clientInfoPrepared || clientInfo();
     const sessions = upsertSession({
       brainPath,
       id: sessionId,
       client,
       surface,
-      branch: gitBranch(path.dirname(brainPath)),
+      branch: branchPrepared !== undefined
+        ? branchPrepared
+        : gitBranch(path.dirname(brainPath)),
       intent,
       intentSource: intent !== undefined ? 'declared' : null,
       files,
@@ -874,32 +1538,45 @@ export function createMcpPresence({
     };
   };
 
-  const stop = () => {
+  const stop = ({ sessionId: stopSessionId = sessionId } = {}) => {
     if (timer) clearIntervalFn(timer);
     if (inboxTimer) clearIntervalFn(inboxTimer);
     timer = null;
     inboxTimer = null;
     if (brainPath) removeSession({
       brainPath,
-      id: sessionId,
+      id: stopSessionId,
       channel: 'mcp',
       expectedPid: process.pid,
       home,
       now: now(),
     });
     brainPath = null;
+    brainLaneIdentity = null;
+    currentProjectBinding = null;
     started = false;
     lastPeers = '';
     announcedMessageIds.clear();
   };
 
-  const start = (nextVault = vault, details = {}) => {
+  const start = (nextVault = vault, details = {}, validatedSelection = null) => {
     const resolved = path.resolve(nextVault || vault);
-    if (started && resolved === vault) return touch({ event: 'McpReconnect', includePresence: true });
-    if (started) stop();
+    const selectedBrainPath = validatedSelection && Object.prototype.hasOwnProperty.call(validatedSelection, 'brainPath')
+      ? validatedSelection.brainPath
+      : undefined;
+    if (started && resolved === vault
+      && (selectedBrainPath === undefined || selectedBrainPath === brainPath)) {
+      return touch({ event: 'McpReconnect', includePresence: true });
+    }
+    if (started) stop({
+      sessionId: validatedSelection?.sourceSessionId || sessionId,
+    });
     vault = resolved;
-    brainPath = findProjectBrain(vault);
+    brainPath = selectedBrainPath === undefined ? findProjectBrain(vault) : selectedBrainPath;
     if (!brainPath) return { sessions: [], messages: [], notice: '' };
+    brainLaneIdentity = validatedSelection?.laneIdentity || brainPath;
+    currentProjectBinding = validatedSelection?.projectBinding || null;
+    pinLaneIdentity(brainPath, brainLaneIdentity);
     started = true;
     const first = touch({
       event: details.event || 'McpInitialize',
@@ -909,6 +1586,9 @@ export function createMcpPresence({
       intent: details.intent,
       files: details.files,
       replaceFiles: details.replaceFiles === true,
+      hostIdentityPrepared: details.hostIdentityPrepared === true,
+      clientInfoPrepared: details.clientInfoPrepared || null,
+      branchPrepared: details.branchPrepared,
     });
     // Consume the write verdict (1.52.0 plumbed it; nothing read it): a
     // contended lane skips the write, and ~3 skipped heartbeats in a row used
@@ -944,26 +1624,238 @@ export function createMcpPresence({
     deliverMessages = true,
     include_context,
     actionId = '',
+    preflight,
+    requestIdentity,
   } = {}) => {
     const syncStartedAt = Date.now();
     const nextPhase = ['start', 'checkpoint', 'complete'].includes(phase) ? phase : 'checkpoint';
     const completing = nextPhase === 'complete';
+    const preflightInput = {
+      project,
+      projectProvided: project !== undefined,
+      files,
+      phase: nextPhase,
+    };
+    let checkedPreflight = null;
+    if (preflight && typeof preflight === 'object' && authorizedSyncPreflights.has(preflight)) {
+      checkedPreflight = authorizedSyncPreflights.get(preflight);
+      authorizedSyncPreflights.delete(preflight);
+      if (checkedPreflight.inputKey !== syncInputKey(preflightInput)) {
+        checkedPreflight = {
+          ok: false,
+          report: syncPreflightFailure({
+            status: 'invalid-preflight',
+            reason: 'preflight-input-changed',
+          }),
+        };
+      } else if (checkedPreflight.projectBinding
+        && !sameProjectBinding(checkedPreflight.projectBinding)) {
+        checkedPreflight = {
+          ok: false,
+          report: syncPreflightFailure({
+            status: 'project-changed',
+            reason: 'project-or-brain-identity-changed-after-authorization',
+            requestedProject: checkedPreflight.requestedProject,
+          }),
+        };
+      }
+    } else {
+      const candidate = preflight || preflightSync(preflightInput);
+      if (!candidate.ok) checkedPreflight = candidate;
+      else {
+        const consumed = consumedSyncPreflights.has(candidate)
+          ? candidate
+          : consumeSyncPreflight(candidate, preflightInput);
+        if (!consumed.ok) checkedPreflight = consumed;
+        else {
+          const authorized = revalidateConsumedSyncPreflight(consumed, preflightInput);
+          if (!authorized.ok) checkedPreflight = authorized;
+          else {
+            checkedPreflight = authorizedSyncPreflights.get(authorized);
+            authorizedSyncPreflights.delete(authorized);
+          }
+        }
+      }
+    }
+    if (!checkedPreflight || checkedPreflight.ok === false) {
+      const report = checkedPreflight?.report || syncPreflightFailure({
+        status: 'invalid-preflight',
+        reason: 'preflight-capability-invalid-or-replayed',
+      });
+      report.structured.phase = nextPhase;
+      report.structured.timingMs.coordination = Math.max(0, Date.now() - syncStartedAt);
+      return report;
+    }
+    const {
+      requestedVault,
+      resultBrainPath,
+      declaredFiles,
+      projectBinding,
+      laneIdentity,
+    } = checkedPreflight;
+    if (resultBrainPath && laneIdentity) pinLaneIdentity(resultBrainPath, laneIdentity);
+    const verifiedBinding = () => verifyProjectBinding(projectBinding);
+    const switchingProject = Boolean(started && resultBrainPath && resultBrainPath !== brainPath);
+    const bindingTargetProject = Boolean(resultBrainPath && (!started || resultBrainPath !== brainPath));
+    let sourceSessionIdForStop = switchingProject ? sessionId : null;
+    let targetHostIdentityAdopted = false;
+    let preparedClientInfo = requestIdentity?.clientInfo || null;
+    // Request metadata is resolved (purely) by the worker before this call, but
+    // committed only after the exact target project capability is authorized.
+    // This prevents invalid brain_sync routing from rekeying the current lane.
+    if (requestIdentity?.ok === false) {
+      const report = syncPreflightFailure({
+        status: requestIdentity.status || 'invalid-request-identity',
+        reason: requestIdentity.diagnostic || requestIdentity.status || 'invalid-request-identity',
+        requestedProject: checkedPreflight.requestedProject || requestedVault,
+      });
+      report.structured.phase = nextPhase;
+      report.structured.timingMs.coordination = Math.max(0, Date.now() - syncStartedAt);
+      return report;
+    }
+    if (requestIdentity?.id && clientInfo().client !== 'codex') {
+      const report = syncPreflightFailure({
+        status: 'invalid-request-identity',
+        reason: 'logical request identity is accepted only from Codex host metadata',
+        requestedProject: checkedPreflight.requestedProject || requestedVault,
+      });
+      report.structured.phase = nextPhase;
+      report.structured.timingMs.coordination = Math.max(0, Date.now() - syncStartedAt);
+      return report;
+    }
+    if (started && resultBrainPath && resultBrainPath === brainPath) {
+      const hostAdoption = adoptHostSession(now(), brainPath, { verifyBinding: verifiedBinding });
+      if (hostAdoption?.ok === false) {
+        const durationMs = Math.max(0, Date.now() - syncStartedAt);
+        return {
+          sessions: [],
+          messages: [],
+          notice: '',
+          conflicts: [],
+          resultConflicts: [],
+          alertsQueued: [],
+          laneWriteOk: null,
+          laneWriteSkippedReason: `identity-${hostAdoption.status || 'adoption-failed'}`,
+          deliveryWriteOk: null,
+          deliveryWriteSkippedReason: `identity-${hostAdoption.status || 'adoption-failed'}`,
+          isError: true,
+          structured: {
+            schemaVersion: 1,
+            status: hostAdoption.status || 'identity-adoption-failed',
+            phase: nextPhase,
+            reason: hostAdoption.reason || hostAdoption.status || 'identity-adoption-failed',
+            requestedProject: checkedPreflight.requestedProject || requestedVault,
+            mutation: 'none',
+            identityMutation: 'none',
+            deliveryMutation: 'none',
+            timingMs: { coordination: durationMs },
+          },
+          text: `KLYPIX identity safety check deferred brain_sync before task, result, lane, registry, or message mutation (${hostAdoption.reason || hostAdoption.status || 'identity adoption failed'}). Retry after the exact lifecycle identity and durable result-claim state are available.`,
+        };
+      }
+      preparedClientInfo = hostAdoption.clientInfo || preparedClientInfo;
+    }
+    if (bindingTargetProject) {
+      // Cross-project routing must establish the target lane's exact lifecycle
+      // identity before task timestamps, result markers/ledgers, or stop(A).
+      // Unlike a same-project rotation, A's worker-local result obligation does
+      // not belong to B; adoptHostSession therefore consults only B's durable
+      // source marker when targetBrainPath differs from the current brain.
+      const hostAdoption = adoptHostSession(now(), resultBrainPath, {
+        requireDestinationClaim: results !== undefined,
+        verifyBinding: verifiedBinding,
+      });
+      if (hostAdoption?.ok === false) {
+        const durationMs = Math.max(0, Date.now() - syncStartedAt);
+        return {
+          sessions: [], messages: [], notice: '', conflicts: [], resultConflicts: [], alertsQueued: [],
+          laneWriteOk: null,
+          laneWriteSkippedReason: `identity-${hostAdoption.status || 'adoption-failed'}`,
+          deliveryWriteOk: null,
+          deliveryWriteSkippedReason: `identity-${hostAdoption.status || 'adoption-failed'}`,
+          isError: true,
+          structured: {
+            schemaVersion: 1,
+            status: hostAdoption.status || 'identity-adoption-failed',
+            phase: nextPhase,
+            reason: hostAdoption.reason || hostAdoption.status || 'identity-adoption-failed',
+            requestedProject: checkedPreflight.requestedProject || requestedVault,
+            mutation: 'none',
+            identityMutation: 'none',
+            deliveryMutation: 'none',
+            timingMs: { coordination: durationMs },
+          },
+          text: `KLYPIX identity safety check deferred brain_sync before task, result, lane, registry, or message mutation (${hostAdoption.reason || hostAdoption.status || 'identity adoption failed'}). Retry after the target project's exact lifecycle identity and durable result-claim state are available.`,
+        };
+      }
+      targetHostIdentityAdopted = hostAdoption.status === 'adopted';
+      preparedClientInfo = hostAdoption.clientInfo || preparedClientInfo;
+      if (switchingProject && targetHostIdentityAdopted) {
+        sourceSessionIdForStop = hostAdoption.previous;
+      }
+    }
+    if (requestIdentity?.id && requestIdentity.id !== sessionId) {
+      // After target routing is authorized, use the existing adoption machinery
+      // against the still-bound lane. Codex never consults a lifecycle hostmap;
+      // all fallible target-host gating has already completed above.
+      const adopted = adoptRequestIdentity({
+        _meta: { threadId: requestIdentity.id },
+      }, {
+        toolName: 'brain_sync',
+        toolInput: { project, files, phase: nextPhase },
+        verifyBinding: verifiedBinding,
+      });
+      if (adopted?.ok === false) {
+        const report = syncPreflightFailure({
+          status: adopted.status || 'request-identity-adoption-failed',
+          reason: adopted.diagnostic || adopted.status || 'request-identity-adoption-failed',
+          requestedProject: checkedPreflight.requestedProject || requestedVault,
+        });
+        report.structured.phase = nextPhase;
+        // Adoption failure paths are designed fail-closed before lane mutation.
+        report.structured.timingMs.coordination = Math.max(0, Date.now() - syncStartedAt);
+        return report;
+      }
+      if (switchingProject && !targetHostIdentityAdopted) {
+        sourceSessionIdForStop = sessionId;
+      }
+    }
+    // All host/client callbacks that can run before coordination mutation have
+    // completed. Guard the exact directory+brain objects one final time here;
+    // every later lane/marker/ledger lookup is pinned to laneIdentity and cannot
+    // be redirected by a lexical junction retarget.
+    if (!preparedClientInfo) preparedClientInfo = clientInfo();
+    const preparedBranch = resultBrainPath
+      ? gitBranch(path.dirname(resultBrainPath))
+      : null;
+    if (!verifiedBinding()) {
+      const report = syncPreflightFailure({
+        status: 'project-changed',
+        reason: 'project-or-brain-identity-changed-before-sync-mutation',
+        requestedProject: checkedPreflight.requestedProject || requestedVault,
+      });
+      report.structured.phase = nextPhase;
+      report.structured.timingMs.coordination = Math.max(0, Date.now() - syncStartedAt);
+      return report;
+    }
+    if (bindingTargetProject) {
+      // Result obligations are project-local durable state, not a property of
+      // this long-lived worker process. A checkpoint/complete A -> B switch
+      // derives the in-memory bit from B only after every fallible host callback
+      // and the final binding guard. Never clear A's marker here.
+      const targetClaim = readResultClaimPending({
+        brainPath: resultBrainPath,
+        sessionId,
+        home,
+      });
+      resultClaimsPending = targetClaim.pending || !targetClaim.ok;
+    }
     if (nextPhase === 'start') {
       taskStartedAt = now();
       notifiedConflicts.clear();
     } else if (!taskStartedAt && !completing) {
       taskStartedAt = now();
     }
-    // Some IDE extension hosts launch a project-scoped MCP server from the
-    // IDE's own installation directory. `project` is the host-independent
-    // Context Gateway binding: one explicit workspace root selects exactly one
-    // brain/presence lane for this connection. Omitting it preserves the
-    // configured launch vault for backwards compatibility.
-    const requestedVault = compact(project) ? path.resolve(project) : vault;
-    const resultBrainPath = started && requestedVault === vault
-      ? brainPath
-      : findProjectBrain(requestedVault);
-    if (started && resultBrainPath && resultBrainPath === brainPath) adoptHostSession(now());
     const hasDefinedResults = results !== undefined;
     let resultReconciliation = null;
     let completionBlocked = false;
@@ -993,7 +1885,7 @@ export function createMcpPresence({
 
     if (hasDefinedResults) {
       resultClaimsPending = true;
-      const marked = markResultClaimPending({
+      const marked = markResultClaimPendingFn({
         brainPath: resultBrainPath,
         sessionId,
         home,
@@ -1025,6 +1917,9 @@ export function createMcpPresence({
           brainPath: resultBrainPath,
           projectRoot: resultBrainPath ? path.dirname(resultBrainPath) : requestedVault,
           sessionId,
+          sessionAliases: activeCompletionScope
+            ? [activeCompletionScope.logicalSessionId, ...(activeCompletionScope.aliases || [])]
+            : [],
           declaredScope: activeCompletionScope
             ? { intent: activeCompletionScope.intent || '', files: activeCompletionScope.files || [] }
             : undefined,
@@ -1085,12 +1980,23 @@ export function createMcpPresence({
       // A phase:start is a hard task boundary. Omitting files must clear the
       // prior task's scope instead of accidentally inheriting it.
       files: clearCompletionScope ? []
-        : (completing ? undefined : (nextPhase === 'start' ? (files ?? []) : files)),
+        : (completing ? undefined : (nextPhase === 'start' ? (declaredFiles ?? []) : declaredFiles)),
       replaceFiles: clearCompletionScope || nextPhase === 'start',
+      // The exact target lifecycle identity was checked above. Re-running a
+      // fallible hostmap read after task/result mutation (or after stop(A))
+      // would reopen the transaction window this sync just closed.
+      hostIdentityPrepared: Boolean(resultBrainPath),
+      clientInfoPrepared: preparedClientInfo,
+      branchPrepared: preparedBranch,
     };
-    let report = started && requestedVault === vault
+    let report = started && requestedVault === vault && resultBrainPath === brainPath
       ? touch(details)
-      : start(requestedVault, details);
+      : start(requestedVault, details, {
+        brainPath: resultBrainPath,
+        sourceSessionId: sourceSessionIdForStop,
+        laneIdentity,
+        projectBinding,
+      });
     const resultConflicts = [...(resultReconciliation?.conflicts || []), ...stateConflicts];
     // A completion write that did not land is not completion. The old scope is
     // still authoritative in the lane, so retain it and say so explicitly.
@@ -1298,12 +2204,20 @@ export function createMcpPresence({
     };
   };
 
-  const decorateToolResult = (result, { actionId = '', deliverMessages = true } = {}) => {
+  const decorateToolResult = (result, {
+    actionId = '',
+    deliverMessages = true,
+    verifyBinding: verifyBindingFn = null,
+    clientInfoPrepared = null,
+  } = {}) => {
+    if (verifyBindingFn && !verifyBindingFn()) return result;
     if (!started) start(vault);
     const { sessions, notice, deliveryWriteOk, deliveryWriteSkippedReason } = touch({
       event: 'McpToolUse',
       deliverMessages: deliverMessages !== false,
       actionId: actionId || `mcp-tool:${process.pid}:${++modelActionSequence}`,
+      hostIdentityPrepared: Boolean(clientInfoPrepared),
+      clientInfoPrepared,
     });
     // Mechanical brain_sync nudge (once per server session): the "call
     // brain_sync first" contract was instructions-only — zero enforcement —
@@ -1342,6 +2256,15 @@ export function createMcpPresence({
     touch,
     pollInbox,
     sync,
+    preflightSync,
+    consumeSyncPreflight,
+    revalidateConsumedSyncPreflight,
+    resolveRequestIdentity: (extra, options = {}) => resolveRequestIdentity(extra, {
+      ...options,
+      client: clientInfo().client,
+    }),
+    verifyCurrentProjectBinding,
+    refreshCurrentProjectBinding,
     adoptRequestIdentity,
     refreshIdentity,
     noteSent,

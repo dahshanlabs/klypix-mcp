@@ -242,12 +242,19 @@ ok(aging.intentAt === now + 6 * 60 * 1000, 'V4: a CHANGED intent re-stamps inten
   const mapFile = laneFileFor(brainPath, home).replace(/\.json$/, '.hostmap');
   fs.mkdirSync(path.dirname(mapFile), { recursive: true });
   fs.writeFileSync(mapFile, JSON.stringify({ 4242: { sessionId: 'rotated-session', ts: now } }));
+  upsertSession({
+    brainPath, home, now, id: 'rotated-session', client: 'claude-code',
+    channel: 'lifecycle', event: 'UserPromptSubmit', hostPid: 4242,
+  });
   ok(hostmapSessionId({ brainPath, hostPid: 4242, home, now: now + 1000 }) === 'rotated-session',
     'V7: a fresh hostmap entry maps host pid → current session id');
   ok(hostmapSessionId({ brainPath, hostPid: 4242, home, now: now + 11 * 60 * 1000 }) === null,
     'V7: a stale hostmap entry (host gone >10m) is ignored');
   ok(hostmapSessionId({ brainPath, hostPid: 9999, home, now: now + 1000 }) === null,
     'V7: an unknown host pid maps to nothing');
+  fs.writeFileSync(mapFile, JSON.stringify({ 4242: { sessionId: 'sidecar-ahead-session', ts: now } }));
+  ok(hostmapSessionId({ brainPath, hostPid: 4242, home, now: now + 1000 }) === null,
+    'V7: a sidecar-ahead id is ignored until its matching lifecycle row commits');
 }
 
 // ── V8: the REAL hook — lane row shape, live file observation, message overflow ──

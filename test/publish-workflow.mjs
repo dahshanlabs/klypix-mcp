@@ -72,6 +72,7 @@ ok(body(npmFloor).includes('11.5.1') && !body(npmFloor).includes('npm install'),
 const version = step('Version validation (the tag must match package.json)');
 const evidence = step('Verify committed corroborated release evidence');
 const install = step('Install (npm ci — lockfile enforced)');
+const testChain = step('Assert the test chain still contains the load-bearing suites');
 const tarball = step('Tarball contents (npm pack --dry-run + assertions)');
 ok(gateProof < version && version < evidence && evidence < install && install < tarball && tarball < publishIndex,
   'identity and evidence are verified before dependency execution, then tests and tarball proof precede OIDC');
@@ -84,6 +85,8 @@ ok(body(evidence).includes('--require-corroborated')
   && body(evidence).includes('--git-commit "$SOURCE_COMMIT"')
   && body(evidence).includes('.release-evidence/v${VERSION}'),
   'the release gate invokes the real verifier against corroborated evidence for the source parent');
+ok(body(testChain).includes('test/remote-client.mjs'),
+  'the load-bearing suite gate pins the Remote attachment security regression suite');
 ok(body(tarball).includes('.release-evidence'),
   'release evidence is explicitly forbidden from the consumer tarball');
 

@@ -200,6 +200,49 @@ ok(resolved.structured.status === 'complete'
   && resolvedSelf?.intent === '' && resolvedSelf?.files?.length === 0,
 'a corrected corroborating result returns a portable peer receipt and then clears scope');
 
+// A provisional MCP identity may record a conflicting run before Codex request
+// metadata reveals the exact thread id. Rekey retains the provisional id as an
+// alias; the corrected exact-id retry must migrate/exclude that old run rather
+// than treating its own evidence as an independent conflicting peer.
+const provisionalId = 'mcp-result-provisional';
+const exactResultId = '019ff22f-d710-7093-b76b-14f0b1fade00';
+const rekeyedResults = createMcpPresence({
+  server: fakeServer('codex'),
+  initialVault: project,
+  env: { KLYPIX_MCP_CONNECTION_ID: provisionalId },
+  home,
+  now: () => clock + 20,
+  setIntervalFn: timer,
+  clearIntervalFn() {},
+});
+rekeyedResults.start();
+rekeyedResults.sync({ phase: 'start', intent: 'verify rekeyed result evidence', files: ['a.txt'] });
+const provisionalConflict = rekeyedResults.sync({ phase: 'complete', results: [numericConflict] });
+ok(provisionalConflict.isError === true
+  && provisionalConflict.structured.resultConflicts.some((conflict) => conflict.metric === 'recallAt5'),
+  'a provisional result conflict is durably recorded before exact identity adoption');
+const adoptedResultId = rekeyedResults.adoptRequestIdentity({
+  _meta: {
+    threadId: exactResultId,
+    'x-codex-turn-metadata': {
+      session_id: exactResultId,
+      thread_id: exactResultId,
+      turn_id: 'result-rekey-turn',
+    },
+  },
+}, { toolName: 'brain_sync', toolInput: { phase: 'complete' } });
+ok(adoptedResultId.status === 'adopted' && rekeyedResults.id === exactResultId,
+  'the provisional result session adopts the exact Codex thread id');
+const correctedAfterRekey = rekeyedResults.sync({ phase: 'complete', results: [corroborating] });
+const rekeyLedger = JSON.parse(fs.readFileSync(resultLedgerFileFor(brainPath, home), 'utf8'));
+ok(correctedAfterRekey.isError !== true
+  && correctedAfterRekey.structured.resultReconciliation?.status === 'corroborated'
+  && !(correctedAfterRekey.structured.resultConflicts || [])
+    .some((conflict) => conflict.peerRunId === 'numeric-conflict')
+  && !rekeyLedger.entries.some((entry) => entry.sessionId === provisionalId),
+  'post-rekey correction excludes and migrates its own provisional ledger evidence');
+rekeyedResults.stop();
+
 const mcpG = presence('result-session-g', 6);
 mcpG.start();
 mcpG.sync({ phase: 'start', intent: 'compare a reranked experiment', files: ['g.txt'] });

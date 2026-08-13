@@ -255,9 +255,40 @@ upsertSession({
   intent: 'receive registered tool message',
   home: registeredHome,
 });
+const sidecarWindowNote = postPresenceMessage({
+  brainPath: registeredBrain,
+  from: 'registered-receiver',
+  to: 'pre-clear-sender',
+  text: 'A inbox must remain pending during sidecar-ahead.',
+  home: registeredHome,
+});
 fs.writeFileSync(registeredLane.replace(/\.json$/, '.hostmap'), JSON.stringify({
   424242: { sessionId: 'post-clear-sender', ts: Date.now() },
 }));
+const sidecarDeferredCall = await registeredClient.callTool({
+  name: 'brain_message',
+  arguments: { text: 'this handler must not run', to: 'all' },
+});
+const afterSidecarDeferredCall = fs.readFileSync(registeredLane, 'utf8');
+const afterSidecarData = JSON.parse(afterSidecarDeferredCall);
+ok(sidecarDeferredCall.isError === true
+  && sidecarDeferredCall.structuredContent?.status === 'sidecar-ahead'
+  && sidecarDeferredCall.content?.some((block) => /No handler, presence identity, or queued-message delivery changed/i.test(block.text || '')),
+'the universal registered-tool pre-handler defers while B exists only in hostmap');
+const sidecarHandlerBlocked = !afterSidecarData.messages.some((message) => message.text === 'this handler must not run');
+const sidecarNotePending = messageDeliveryState(afterSidecarData.messages
+  .find((message) => message.id === sidecarWindowNote.message?.id), 'pre-clear-sender') === 'pending';
+ok(sidecarHandlerBlocked && sidecarNotePending,
+'a sidecar-ahead registered action leaves its handler unrun and A delivery pending');
+upsertSession({
+  brainPath: registeredBrain,
+  id: 'post-clear-sender',
+  client: 'cursor',
+  channel: 'lifecycle',
+  event: 'UserPromptSubmit',
+  hostPid: 424242,
+  home: registeredHome,
+});
 const registeredResult = await registeredClient.callTool({
   name: 'brain_message',
   arguments: { text: 'registered tool identity refresh', to: 'all' },

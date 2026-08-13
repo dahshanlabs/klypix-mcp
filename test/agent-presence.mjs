@@ -206,7 +206,7 @@ ok(syncA.text.includes('phase start')
 const syncB = mcpB.sync({
   phase: 'start',
   intent: 'review the shared runtime',
-  files: ['src\\mcp-presence.mjs', 'README.md'],
+  files: ['src/mcp-presence.mjs', 'README.md'],
 });
 ok(syncB.conflicts.length === 1
   && syncB.conflicts[0].files.includes('src/mcp-presence.mjs')
@@ -214,7 +214,7 @@ ok(syncB.conflicts.length === 1
   && syncB.text.includes('queued before MCP initialization')
   && syncB.alertsQueued.length === 1
   && syncB.structured.counts.activeTasks === 2,
-  'brain_sync delivers queued messages, returns structured task peers, and flags exact overlap across path separators');
+  'brain_sync delivers queued messages, returns structured task peers, and flags exact canonical overlap');
 const previewed = mcpA.pollInbox();
 ok(previewed.some((message) => message.text.includes('Automatic KLYPIX overlap alert'))
   && mcpAServer.notices.some((notice) => String(notice.data).includes('Automatic KLYPIX overlap alert')),

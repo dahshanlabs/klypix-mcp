@@ -348,7 +348,7 @@ function readSharedLaneChecked() {
         return { ok: false, missing: false, data: null, reason: `lane-corrupt:${String(error?.message || 'invalid-json').slice(0, 80)}` };
     }
 }
-const laneFailureFooter = (reason) => '\n## âš ï¸ KLYPIX coordination lane unavailable\n'
+const laneFailureFooter = (reason) => '\n## ⚠️ KLYPIX coordination lane unavailable\n'
     + `The shared presence/message lane could not be safely read or written (${String(reason || 'unknown').slice(0, 100)}). Its prior bytes were preserved; no heartbeat or delivery receipt was claimed. Repair or restore the lane, then retry.\n`;
 function recordLaneFailure(reason, mode = 'presence-lane') {
     const value = String(reason || 'unknown-lane-failure').slice(0, 160);
@@ -445,11 +445,33 @@ function readHostmapChecked() {
         return { ok: false, missing: false, data: null, reason: `hostmap-corrupt:${String(error?.message || 'invalid-json').slice(0, 80)}` };
     }
 }
-function writeHostmapAtomic(payload) {
+function writeHostmapAtomic(payload, renameSync = fs.renameSync) {
     const tmp = HOSTMAP_FILE + '.' + process.pid + '-' + Math.random().toString(36).slice(2, 8) + '.tmp';
     fs.writeFileSync(tmp, payload);
-    try { fs.renameSync(tmp, HOSTMAP_FILE); }
-    catch (error) { try { fs.unlinkSync(tmp); } catch { /* best-effort */ } throw error; }
+    try { renameSync(tmp, HOSTMAP_FILE); }
+    catch (firstError) {
+        // Windows can transiently reject rename-over-open with EPERM while an
+        // AV scanner or reader releases the destination. Match the lane
+        // writer's bounded retry; never leave a temp file on final failure.
+        try { renameSync(tmp, HOSTMAP_FILE); }
+        catch (finalError) {
+            try { fs.unlinkSync(tmp); } catch { /* best-effort */ }
+            throw finalError || firstError;
+        }
+    }
+}
+function commitPresenceIdentityFiles({ lanePayload, hostmapPayload = null, writeHostmap = writeHostmapAtomic, writeLane = writeLaneAtomic }) {
+    // Identity sidecar first. If it cannot advance, the lifecycle B row is not
+    // committed and the MCP worker remains consistently on A. If the later lane
+    // commit fails, the sidecar may be ahead, but MCP adoption requires a
+    // matching live lifecycle row and therefore waits for the next successful
+    // lifecycle touch instead of creating a blank B twin.
+    if (hostmapPayload !== null) {
+        try { writeHostmap(hostmapPayload); }
+        catch (error) { error.klypixPresencePhase = 'hostmap'; throw error; }
+    }
+    try { writeLane(lanePayload); }
+    catch (error) { error.klypixPresencePhase = 'lane'; throw error; }
 }
 const safeGit = (args, timeout = 1500) => { try { return execSync(`git ${args}`, { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout }); } catch { return ''; } };
 const gitBranch = () => { const b = safeGit('rev-parse --abbrev-ref HEAD', 1000).trim(); return b && b !== 'HEAD' ? b : null; };
@@ -652,22 +674,24 @@ function touchSession(sid, patch = {}) {
             // MCP-written rows on every heartbeat). Message eviction prefers
             // terminal notes (capMsgs) so an unconsumed note is never silently lost.
             const keptMsgs = maintainMsgs(data0.messages, now);
-            writeLaneAtomic(JSON.stringify({ ...data0, sessions: list.slice(-40), messages: keptMsgs }));
+            const lanePayload = JSON.stringify({ ...data0, sessions: list.slice(-40), messages: keptMsgs });
             // Hostmap: host-pid → CURRENT session id, re-read by the MCP server on
             // every touch so its lane row follows /clear + resume id rotation. The
             // file is per-PROJECT (all host pids write it), so its read-modify-write
             // runs INSIDE the same lane lock, and the write is atomic (temp+rename) —
             // an unlocked plain write let host B revert host A's fresh rotation and a
             // torn read wiped every other host's mapping (review-caught).
+            let hostmapPayload = null;
             if (HOST_PID) {
-                try {
-                    const kept = {};
-                    for (const [k, v] of Object.entries(hostmapRead.data)) if (v && now - Number(v.ts || 0) < SESSION_FRESH_MS) kept[k] = v;
-                    kept[String(HOST_PID)] = { sessionId: sid, ts: now };
-                    writeHostmapAtomic(JSON.stringify(kept));
-                } catch (error) {
-                    return recordLaneFailure(error?.code || error?.message || 'hostmap-write-failed', 'presence-hostmap');
-                }
+                const kept = {};
+                for (const [k, v] of Object.entries(hostmapRead.data)) if (v && now - Number(v.ts || 0) < SESSION_FRESH_MS) kept[k] = v;
+                kept[String(HOST_PID)] = { sessionId: sid, ts: now };
+                hostmapPayload = JSON.stringify(kept);
+            }
+            try { commitPresenceIdentityFiles({ lanePayload, hostmapPayload }); }
+            catch (error) {
+                const mode = error?.klypixPresencePhase === 'hostmap' ? 'presence-hostmap' : 'presence-lane';
+                return recordLaneFailure(error?.code || error?.message || 'presence-identity-write-failed', mode);
             }
             return { ok: true, reason: null };
         } finally { if (got) releaseLock(SESSIONS_LOCK); }
@@ -988,17 +1012,57 @@ function snapshotMsgAudience(messages) {
 }
 
 function validateStagedMsg(raw, now) {
+    const sourceVersion = Math.max(1, Number(raw?.deliveryVersion || 1));
     const m = normalizeMsg(raw, now);
-    if (!m || !Array.isArray(m.candidateIds)) return { ok: false, reason: 'outbox-corrupt:message-missing-audience' };
+    if (!m) return { ok: false, reason: 'outbox-corrupt:invalid-message' };
+    const quarantineV3 = (reason) => sourceVersion >= MSG_DELIVERY_VERSION
+        ? { ok: true, message: terminalizeMsg(m, now, reason), corruptQuarantined: true }
+        : null;
+    if (!Array.isArray(m.candidateIds)) {
+        if (sourceVersion >= MSG_DELIVERY_VERSION) {
+            // A syntactically valid v3 row with a missing immutable audience is
+            // corrupt, but it must not permanently head-of-line block every
+            // later valid marker. It cannot be delivered honestly, so preserve
+            // it as a terminal failed receipt and continue draining the queue.
+            m.candidateIds = [];
+            return {
+                ok: true,
+                message: terminalizeMsg(m, now, 'corrupt-outbox-missing-audience'),
+                corruptQuarantined: true,
+            };
+        }
+        // v1/v2 staged a marker before it knew the send-time audience. After a
+        // restart there is no honest way to distinguish the original peers
+        // from sessions that joined later, so never re-resolve it dynamically.
+        // Preserve it in the shared lane as a durable failed receipt and let
+        // later valid rows drain; one pre-upgrade outbox entry must not jam the
+        // entire Claude coordination channel forever.
+        m.candidateIds = [];
+        return {
+            ok: true,
+            message: terminalizeMsg(m, now, 'legacy-outbox-audience-unknown'),
+            legacyQuarantined: true,
+        };
+    }
     m.candidateIds = [...new Set(m.candidateIds.map(msgRecipientKey).filter(Boolean))];
     const target = String(m.to || '').trim().toLowerCase();
     const broadcast = !target || target === 'all' || target === '*';
-    if (m.candidateIds.includes(msgRecipientKey(m.from))) return { ok: false, reason: 'outbox-corrupt:self-audience' };
-    if (broadcast && m.candidateIds.length === 0) return { ok: false, reason: 'outbox-corrupt:empty-audience' };
-    if (!broadcast && m.candidateIds.length !== 1) return { ok: false, reason: 'outbox-corrupt:target-not-unique' };
+    if (m.candidateIds.includes(msgRecipientKey(m.from))) {
+        return quarantineV3('corrupt-outbox-self-audience')
+            || { ok: false, reason: 'outbox-corrupt:self-audience' };
+    }
+    if (broadcast && m.candidateIds.length === 0) {
+        return quarantineV3('corrupt-outbox-empty-audience')
+            || { ok: false, reason: 'outbox-corrupt:empty-audience' };
+    }
+    if (!broadcast && m.candidateIds.length !== 1) {
+        return quarantineV3('corrupt-outbox-target-not-unique')
+            || { ok: false, reason: 'outbox-corrupt:target-not-unique' };
+    }
     const audience = new Set(m.candidateIds);
     if ((m.deliveries || []).some(record => !audience.has(msgRecipientKey(record?.recipientId || record?.id)))) {
-        return { ok: false, reason: 'outbox-corrupt:delivery-outside-audience' };
+        return quarantineV3('corrupt-outbox-delivery-outside-audience')
+            || { ok: false, reason: 'outbox-corrupt:delivery-outside-audience' };
     }
     return { ok: true, message: m };
 }
@@ -1038,6 +1102,7 @@ function postMessages(msgs) {
     const got = acquireLock(SESSIONS_LOCK, { tries: 20, waitMs: 25 });
     if (!got) return { ok: false, durable: true, posted: 0, pending: staged.rows.length, reason: 'lane-lock-timeout' };
     let posted = 0;
+    let failed = 0;
     const drainedIds = new Set();
     try {
         const laneRead = readSharedLaneChecked();
@@ -1055,6 +1120,12 @@ function postMessages(msgs) {
             m.deliveryVersion = MSG_DELIVERY_VERSION;
             if (!Array.isArray(m.deliveries)) m.deliveries = [];
             if (!Array.isArray(m.seen)) m.seen = [];
+            if (msgTerminal(m)) {
+                kept.push(m);
+                existingIds.add(String(m.id));
+                failed++;
+                continue;
+            }
             // candidateIds was fixed before this message first entered the
             // durable outbox. Drains are forbidden from re-resolving it.
             for (const recipientId of m.candidateIds) {
@@ -1074,7 +1145,7 @@ function postMessages(msgs) {
     } finally { releaseLock(SESSIONS_LOCK); }
     const cleared = updateMsgOutbox((current) => current.filter(m => !drainedIds.has(String(m?.id || ''))));
     if (!cleared.ok) return { ok: false, durable: true, posted, pending: staged.rows.length, reason: cleared.reason || cleared.error || 'outbox-clear-failed' };
-    return { ok: true, durable: true, posted, pending: cleared.rows.length };
+    return { ok: true, durable: true, posted, failed, pending: cleared.rows.length };
 }
 // Full id, unique >=8-char id prefix, or exact unique branch. Intent/client/
 // surface substring matching is unsafe: a fuzzy target can consume a warning
@@ -1171,8 +1242,18 @@ function messageActionId(input = readHookInput(), tp = '') {
 }
 function messageFooter(sid, tp, lib, actionId = messageActionId(readHookInput(), tp)) {
     if (!sid) return '';
-    postMessages([]);   // drain any durable marker outbox before reading this inbox
     const now = Date.now();
+    // A hook event can arrive after SessionEnd or while a hostmap rotation is
+    // only half-committed. Require this exact logical id to have its own live
+    // row before draining the outbox or touching any delivery receipt. An alias
+    // on another row is deliberately insufficient.
+    const eligibility = readSharedLaneChecked();
+    if (!eligibility.ok) {
+        recordLaneFailure(eligibility.reason, 'message-delivery');
+        return laneFailureFooter(eligibility.reason);
+    }
+    if (!pruneSessions(eligibility.data.sessions, now).some(s => s.id === sid)) return '';
+    postMessages([]);   // drain any durable marker outbox only for a live recipient action
     const got = acquireLock(SESSIONS_LOCK, { tries: 15, waitMs: 25 });
     if (!got) return '\n## ⚠️ KLYPIX message delivery unavailable\nThe shared message lane is busy; no note was marked offered. Retry on the next supported action.\n';
     let delivered = [];
@@ -1188,6 +1269,7 @@ function messageFooter(sid, tp, lib, actionId = messageActionId(readHookInput(),
         const messages = maintainMsgs(data.messages, now);
         const sessions = pruneSessions(data.sessions, now);
         const me = sessions.find(s => s.id === sid);
+        if (!me) return '';
         const due = messages.filter(m => {
             const state = msgDeliveryState(m, sid);
             const record = msgDeliveryRecord(m, sid);
@@ -3458,5 +3540,5 @@ if (!process.env.KLYPIX_BRAIN_NO_MAIN) {
 
 // Exported for hermetic unit tests only (gated by KLYPIX_BRAIN_NO_MAIN above so the
 // import doesn't run main()/exit the test). Not part of the runtime hook contract.
-export { refreshNpmCurrency, versionCurrencyFooter, bakedBrainVersion, httpsFetchLatest, cmpSemver, decayStampForMessage, messageActionId, messageFooter, postMessages, touchSession, MSG_OUTBOX_FILE, HOSTMAP_FILE, SESSIONS_FILE, splitMarkerSuffixes, evidenceGitPath, gitBlobOid, computeFreshness, selfHealFooter };
+export { refreshNpmCurrency, versionCurrencyFooter, bakedBrainVersion, httpsFetchLatest, cmpSemver, decayStampForMessage, messageActionId, messageFooter, postMessages, touchSession, writeHostmapAtomic, commitPresenceIdentityFiles, MSG_OUTBOX_FILE, HOSTMAP_FILE, SESSIONS_FILE, splitMarkerSuffixes, evidenceGitPath, gitBlobOid, computeFreshness, selfHealFooter };
 // (shouldSelfUpdate is exported at its declaration above — the auto-propagation decision seam for tests)

@@ -45,6 +45,8 @@ try {
     messageFooter,
     postMessages,
     touchSession,
+    writeHostmapAtomic,
+    commitPresenceIdentityFiles,
   } = await import(hookUrl.href);
 
   // Claude's duplicated lane writer must also fail closed. A parse failure is
@@ -55,6 +57,8 @@ try {
   fs.writeFileSync(laneFile, corruptBytes);
   const corruptFooter = messageFooter(recipient, '', {}, 'corrupt-action');
   assert.match(corruptFooter, /coordination lane unavailable/i);
+  assert.ok(corruptFooter.includes('⚠️') && !corruptFooter.includes('âš'),
+    'the coordination failure heading is valid UTF-8, not mojibake');
   assert.match(corruptFooter, /prior bytes were preserved/i);
   assert.equal(fs.readFileSync(laneFile, 'utf8'), corruptBytes);
   fs.unlinkSync(laneFile);
@@ -75,6 +79,37 @@ try {
   assert.equal(fs.readFileSync(HOSTMAP_FILE, 'utf8'), corruptHostmap);
   assert.equal(fs.readFileSync(laneFile, 'utf8'), laneBeforeHostmapFailure);
   fs.unlinkSync(HOSTMAP_FILE);
+
+  let renameAttempts = 0;
+  writeHostmapAtomic(JSON.stringify({ retry: true }), (source, destination) => {
+    renameAttempts++;
+    if (renameAttempts === 1) {
+      const error = new Error('destination temporarily open');
+      error.code = 'EPERM';
+      throw error;
+    }
+    fs.renameSync(source, destination);
+  });
+  assert.equal(renameAttempts, 2, 'a transient Windows EPERM receives one bounded hostmap rename retry');
+  assert.deepEqual(JSON.parse(fs.readFileSync(HOSTMAP_FILE, 'utf8')), { retry: true });
+  fs.unlinkSync(HOSTMAP_FILE);
+
+  const commitOrder = [];
+  commitPresenceIdentityFiles({
+    lanePayload: 'lane',
+    hostmapPayload: 'hostmap',
+    writeHostmap: () => commitOrder.push('hostmap'),
+    writeLane: () => commitOrder.push('lane'),
+  });
+  assert.deepEqual(commitOrder, ['hostmap', 'lane'], 'identity sidecar commits before the lifecycle row');
+  let laneCommitAttempted = false;
+  assert.throws(() => commitPresenceIdentityFiles({
+    lanePayload: 'lane',
+    hostmapPayload: 'hostmap',
+    writeHostmap: () => { const error = new Error('hostmap failed'); error.code = 'EPERM'; throw error; },
+    writeLane: () => { laneCommitAttempted = true; },
+  }), (error) => error.code === 'EPERM' && error.klypixPresencePhase === 'hostmap');
+  assert.equal(laneCommitAttempted, false, 'a failed hostmap cannot commit a split lifecycle row');
 
   const markerMessage = (id, to, text = id) => ({
     id,
@@ -102,18 +137,23 @@ try {
   assert.equal(readMessage('empty-broadcast'), undefined);
   upsertSession({ brainPath, home, now, id: recipient, channel: 'lifecycle', event: 'UserPromptSubmit' });
 
-  // Fail closed on a legacy/corrupt staged empty broadcast as well: draining
-  // never turns it into a posted message or silently clears the evidence.
+  // A corrupt staged empty broadcast is undeliverable, but it becomes a
+  // visible terminal receipt instead of permanently jamming later markers.
   const stagedEmpty = { ...markerMessage('staged-empty-broadcast', 'all'), candidateIds: [] };
   fs.mkdirSync(path.dirname(MSG_OUTBOX_FILE), { recursive: true });
   fs.writeFileSync(MSG_OUTBOX_FILE, JSON.stringify([stagedEmpty]));
   const emptyDrain = postMessages([]);
-  assert.equal(emptyDrain.ok, false);
+  assert.equal(emptyDrain.ok, true);
   assert.equal(emptyDrain.posted, 0);
+  assert.equal(emptyDrain.failed, 1);
+  assert.equal(emptyDrain.pending, 0);
   assert.equal(emptyDrain.durable, true);
-  assert.equal(emptyDrain.reason, 'outbox-corrupt:empty-audience');
-  assert.equal(readMessage('staged-empty-broadcast'), undefined);
+  assert.equal(readMessage('staged-empty-broadcast')?.deadLetter?.reason, 'corrupt-outbox-empty-audience');
   assert.equal(fs.existsSync(MSG_OUTBOX_FILE), true);
+  assert.deepEqual(JSON.parse(fs.readFileSync(MSG_OUTBOX_FILE, 'utf8')), []);
+  const afterEmptyDrain = readLane();
+  afterEmptyDrain.messages = afterEmptyDrain.messages.filter((message) => message.id !== 'staged-empty-broadcast');
+  writeLane(afterEmptyDrain);
   fs.unlinkSync(MSG_OUTBOX_FILE);
 
   // The durable marker outbox is also fail-closed. Existing malformed bytes
@@ -128,6 +168,89 @@ try {
   assert.match(corruptOutboxPost.reason, /^outbox-corrupt:/);
   assert.equal(fs.readFileSync(MSG_OUTBOX_FILE, 'utf8'), corruptOutbox);
   assert.equal(readMessage('must-not-post'), undefined);
+  fs.unlinkSync(MSG_OUTBOX_FILE);
+
+  // A v1/v2 row may already be durably staged when this hook upgrades. Those
+  // rows predate immutable candidateIds, so resolving them against today's
+  // sessions could leak an old broadcast to a later joiner. Quarantine the old
+  // row as a visible failed receipt without allowing it to jam newer messages.
+  const legacyStaged = {
+    ...markerMessage('legacy-staged-without-audience', 'all', 'Legacy staged note.'),
+    deliveryVersion: 2,
+  };
+  delete legacyStaged.candidateIds;
+  fs.writeFileSync(MSG_OUTBOX_FILE, JSON.stringify([legacyStaged]));
+  const afterLegacy = postMessages([markerMessage('post-upgrade-message', recipient)]);
+  assert.equal(afterLegacy.ok, true);
+  assert.equal(afterLegacy.posted, 1);
+  assert.equal(afterLegacy.failed, 1);
+  assert.equal(afterLegacy.pending, 0);
+  assert.equal(fs.existsSync(MSG_OUTBOX_FILE), true);
+  assert.deepEqual(JSON.parse(fs.readFileSync(MSG_OUTBOX_FILE, 'utf8')), []);
+  const quarantinedLegacy = readMessage('legacy-staged-without-audience');
+  assert.deepEqual(quarantinedLegacy.candidateIds, []);
+  assert.equal(quarantinedLegacy.deadLetter?.reason, 'legacy-outbox-audience-unknown');
+  assert.equal(readMessage('post-upgrade-message')?.deadLetter, undefined);
+  assert.deepEqual(readMessage('post-upgrade-message')?.candidateIds, [recipient]);
+  const afterLegacyLane = readLane();
+  afterLegacyLane.messages = afterLegacyLane.messages.filter((message) => ![
+    'legacy-staged-without-audience',
+    'post-upgrade-message',
+  ].includes(message.id));
+  writeLane(afterLegacyLane);
+  fs.unlinkSync(MSG_OUTBOX_FILE);
+
+  // A valid-shaped v3 row whose immutable audience was lost is corrupt and
+  // undeliverable, but must not head-of-line block later valid markers forever.
+  const corruptV3 = markerMessage('v3-staged-without-audience', 'all', 'Corrupt v3 staged note.');
+  delete corruptV3.candidateIds;
+  fs.writeFileSync(MSG_OUTBOX_FILE, JSON.stringify([corruptV3]));
+  const afterCorruptV3 = postMessages([markerMessage('after-corrupt-v3', recipient)]);
+  assert.equal(afterCorruptV3.ok, true);
+  assert.equal(afterCorruptV3.posted, 1);
+  assert.equal(afterCorruptV3.failed, 1);
+  assert.equal(afterCorruptV3.pending, 0);
+  assert.deepEqual(JSON.parse(fs.readFileSync(MSG_OUTBOX_FILE, 'utf8')), []);
+  const quarantinedV3 = readMessage('v3-staged-without-audience');
+  assert.deepEqual(quarantinedV3.candidateIds, []);
+  assert.equal(quarantinedV3.deadLetter?.reason, 'corrupt-outbox-missing-audience');
+  assert.deepEqual(readMessage('after-corrupt-v3')?.candidateIds, [recipient]);
+  const afterCorruptV3Lane = readLane();
+  afterCorruptV3Lane.messages = afterCorruptV3Lane.messages.filter((message) => ![
+    'v3-staged-without-audience',
+    'after-corrupt-v3',
+  ].includes(message.id));
+  writeLane(afterCorruptV3Lane);
+  fs.unlinkSync(MSG_OUTBOX_FILE);
+
+  const corruptAudienceRows = [
+    { ...markerMessage('v3-self-audience', 'all'), candidateIds: [sender] },
+    { ...markerMessage('v3-target-not-unique', recipient), candidateIds: [recipient, 'another-peer'] },
+    {
+      ...markerMessage('v3-delivery-outside-audience', recipient),
+      candidateIds: [recipient],
+      deliveries: [{ recipientId: 'outside-peer', state: 'pending', attempts: 0 }],
+    },
+  ];
+  fs.writeFileSync(MSG_OUTBOX_FILE, JSON.stringify(corruptAudienceRows));
+  const afterCorruptAudience = postMessages([markerMessage('after-corrupt-audience', recipient)]);
+  assert.equal(afterCorruptAudience.ok, true);
+  assert.equal(afterCorruptAudience.posted, 1);
+  assert.equal(afterCorruptAudience.failed, 3);
+  assert.equal(afterCorruptAudience.pending, 0);
+  const corruptAudienceReasons = new Map(readLane().messages
+    .filter((message) => /^v3-(?:self|target|delivery)-/.test(message.id))
+    .map((message) => [message.id, message.deadLetter?.reason]));
+  assert.equal(corruptAudienceReasons.get('v3-self-audience'), 'corrupt-outbox-self-audience');
+  assert.equal(corruptAudienceReasons.get('v3-target-not-unique'), 'corrupt-outbox-target-not-unique');
+  assert.equal(corruptAudienceReasons.get('v3-delivery-outside-audience'), 'corrupt-outbox-delivery-outside-audience');
+  assert.deepEqual(readMessage('after-corrupt-audience')?.candidateIds, [recipient]);
+  const afterCorruptAudienceLane = readLane();
+  afterCorruptAudienceLane.messages = afterCorruptAudienceLane.messages.filter((message) => ![
+    ...corruptAudienceRows.map((row) => row.id),
+    'after-corrupt-audience',
+  ].includes(message.id));
+  writeLane(afterCorruptAudienceLane);
   fs.unlinkSync(MSG_OUTBOX_FILE);
 
   // Targeted marker sends are accepted only when exactly one OTHER live row
@@ -180,6 +303,37 @@ try {
   targetLane.sessions = targetLane.sessions.filter((session) => session.id !== delayedLate);
   targetLane.messages = targetLane.messages.filter((message) => message.id !== delayedId);
   writeLane(targetLane);
+
+  // Exact live identity is mandatory on the Claude hook surface. A retained
+  // alias must not authorize an ended/missing recipient id to offer, ack, or
+  // rewrite its inbox.
+  const noExactRecipient = postPresenceMessage({
+    brainPath,
+    home,
+    now: now + 2,
+    from: sender,
+    to: recipient,
+    text: 'Do not deliver through another row\'s alias.',
+  });
+  assert.equal(noExactRecipient.posted, true);
+  let noExactLane = readLane();
+  noExactLane.sessions = noExactLane.sessions.filter((session) => session.id !== recipient);
+  writeLane(noExactLane);
+  const aliasHolder = 'claude-alias-holder-0007';
+  upsertSession({
+    brainPath, home, now: now + 2, id: aliasHolder, aliases: [recipient],
+    channel: 'lifecycle', event: 'UserPromptSubmit',
+  });
+  const beforeNoExactFooter = fs.readFileSync(laneFile, 'utf8');
+  assert.equal(messageFooter(recipient, '', {}, 'missing-exact-recipient-action'), '');
+  assert.equal(fs.readFileSync(laneFile, 'utf8'), beforeNoExactFooter,
+    'messageFooter is a byte-for-byte no-op without its exact live recipient row');
+  assert.equal(messageDeliveryState(readMessage(noExactRecipient.message.id), recipient), 'pending');
+  noExactLane = readLane();
+  noExactLane.sessions = noExactLane.sessions.filter((session) => session.id !== aliasHolder);
+  noExactLane.messages = noExactLane.messages.filter((message) => message.id !== noExactRecipient.message.id);
+  writeLane(noExactLane);
+  upsertSession({ brainPath, home, now: now + 2, id: recipient, channel: 'lifecycle', event: 'UserPromptSubmit' });
 
   const posted = postPresenceMessage({
     brainPath,

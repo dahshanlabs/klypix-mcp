@@ -39,6 +39,7 @@ import {
   registerProjectBrain,
   spawnAutoUpdateHelper,
 } from '../src/mcp-auto-update.mjs';
+import { remoteActions, remoteCommand, remoteSessions, remoteStatus } from '../src/remote-client.mjs';
 // Namespace import (already in-process via the klypix-core chain, so zero added
 // load cost) so a bundle whose klypix-format predates classifyDecay degrades
 // gracefully — a named import of a missing export would kill the whole server.
@@ -214,6 +215,74 @@ const mcpPresence = createMcpPresence({
     formatDecayAge: typeof brainFormat.formatDecayAge === 'function' ? brainFormat.formatDecayAge : undefined,
   } : {},
 });
+// Once brain_sync binds this connection to an exact project brain, all
+// project-brain-default tools must use that same file. Leaving canvas undefined
+// lets klypix-core's intentional cwd/env precedence substitute an ambient brain
+// from the worker launch directory. Explicit caller canvas always wins.
+const boundBrainCanvas = (canvas) => canvas || mcpPresence.brainPath;
+
+const noMutationBrainSyncResult = (report, { phase, totalStartedAt = Date.now() } = {}) => {
+  const totalMs = Math.max(0, Date.now() - totalStartedAt);
+  return {
+    content: [{
+      type: 'text',
+      text: report?.text || 'KLYPIX brain_sync preflight rejected this request without mutation.',
+    }],
+    structuredContent: {
+      ...(report?.structured || {}),
+      phase: phase || report?.structured?.phase || 'checkpoint',
+      mutation: 'none',
+      identityMutation: 'none',
+      deliveryMutation: 'none',
+      context: {
+        mode: 'not-requested',
+        hits: [],
+        sufficient: false,
+        durationMs: 0,
+      },
+      timingMs: {
+        ...(report?.structured?.timingMs || {}),
+        context: 0,
+        total: totalMs,
+      },
+    },
+    isError: true,
+  };
+};
+
+const partialMutationBrainSyncResult = (report, { phase, totalStartedAt = Date.now() } = {}) => ({
+  content: [{
+    type: 'text',
+    text: report?.text || 'KLYPIX stopped later brain_sync work after project routing changed.',
+  }],
+  structuredContent: {
+    ...(report?.structured || {}),
+    phase: phase || report?.structured?.phase || 'checkpoint',
+    mutation: report?.structured?.mutation || 'presence-only',
+    identityMutation: report?.structured?.identityMutation || 'none',
+    deliveryMutation: report?.structured?.deliveryMutation || 'none',
+    timingMs: {
+      ...(report?.structured?.timingMs || {}),
+      total: Math.max(0, Date.now() - totalStartedAt),
+    },
+  },
+  isError: true,
+});
+
+const projectChangedToolResult = () => ({
+  content: [{
+    type: 'text',
+    text: 'KLYPIX project routing changed after brain_sync. This tool was rejected before identity, handler, presence, or message-delivery mutation; call brain_sync again with the exact current project root.',
+  }],
+  structuredContent: {
+    schemaVersion: 1,
+    status: 'project-changed',
+    mutation: 'none',
+    identityMutation: 'none',
+    deliveryMutation: 'none',
+  },
+  isError: true,
+});
 
 // Map a protocol-neutral core result → an MCP tool result.
 // Every tool call carries host request metadata in the SDK callback's second
@@ -223,10 +292,45 @@ const mcpPresence = createMcpPresence({
 // message is offered or acknowledged.
 const registerToolRaw = server.registerTool.bind(server);
 server.registerTool = (name, config, handler) => registerToolRaw(name, config, async (args, extra) => {
-  const identity = mcpPresence.adoptRequestIdentity(extra, {
-    toolName: name,
-    toolInput: args,
-  });
+  // brain_sync's project and exact-file declarations are routing authority.
+  // Validate them before generic request identity adoption so a rejected call
+  // cannot rekey a session, touch a lane, register a project, self-heal a
+  // harness, observe a ship, or query task context. The opaque checked snapshot
+  // is consumed by sync below, avoiding a second post-adoption filesystem pass.
+  let brainSyncPreflight = null;
+  if (name === 'brain_sync') {
+    const preflightInput = {
+      project: args?.project,
+      projectProvided: Object.prototype.hasOwnProperty.call(args || {}, 'project'),
+      files: args?.files,
+      phase: args?.phase || 'checkpoint',
+    };
+    brainSyncPreflight = mcpPresence.preflightSync(preflightInput);
+    if (!brainSyncPreflight.ok) {
+      return noMutationBrainSyncResult(brainSyncPreflight.report, { phase: args?.phase });
+    }
+    brainSyncPreflight = mcpPresence.consumeSyncPreflight(brainSyncPreflight, preflightInput);
+    if (!brainSyncPreflight.ok) {
+      return noMutationBrainSyncResult(brainSyncPreflight.report, { phase: args?.phase });
+    }
+    brainSyncPreflight = mcpPresence.revalidateConsumedSyncPreflight(brainSyncPreflight, preflightInput);
+    if (!brainSyncPreflight.ok) {
+      return noMutationBrainSyncResult(brainSyncPreflight.report, { phase: args?.phase });
+    }
+  }
+  if (name !== 'brain_sync' && !mcpPresence.verifyCurrentProjectBinding()) {
+    return projectChangedToolResult();
+  }
+  // brain_sync owns a target-aware identity transaction inside sync(). Running
+  // the generic gate here would mutate the currently bound project A before an
+  // explicit A -> B call has proven that B is safely adoptable.
+  const identity = name === 'brain_sync'
+    ? mcpPresence.resolveRequestIdentity(extra, { toolName: name, toolInput: args })
+    : mcpPresence.adoptRequestIdentity(extra, {
+      toolName: name,
+      toolInput: args,
+      verifyBinding: mcpPresence.verifyCurrentProjectBinding,
+    });
   if (!identity.ok) {
     return {
       content: [{ type: 'text', text: identity.diagnostic }],
@@ -239,11 +343,55 @@ server.registerTool = (name, config, handler) => registerToolRaw(name, config, a
       isError: true,
     };
   }
-  const result = await handler(args, { ...extra, klypixRequestIdentity: identity });
+  if (name !== 'brain_sync' && !mcpPresence.verifyCurrentProjectBinding()) {
+    return projectChangedToolResult();
+  }
+  const result = await handler(args, {
+    ...extra,
+    klypixRequestIdentity: identity,
+    klypixClientName: identity.clientInfo?.surface || '',
+    ...(brainSyncPreflight ? { klypixBrainSyncPreflight: brainSyncPreflight } : {}),
+  });
   // brain_sync performs its own single presence/message transition. Decorating
   // it again would acknowledge in the same call a note it had only just offered.
   if (name === 'brain_sync') return result;
-  return mcpPresence.decorateToolResult(result, { actionId: identity.actionId });
+  if (result?.isError !== true) {
+    // Managed brain writes use atomic replacement, legitimately changing the
+    // brain inode captured at sync. Refresh only from the unchanged canonical
+    // project root; a lexical junction retarget can never be adopted here.
+    const refreshedBinding = mcpPresence.refreshCurrentProjectBinding();
+    if (!refreshedBinding.ok) {
+      return partialMutationBrainSyncResult({
+        structured: {
+          schemaVersion: 1,
+          status: 'project-changed',
+          mutation: 'handler-complete',
+          identityMutation: identity.status === 'current' ? 'none' : identity.status,
+          deliveryMutation: 'none',
+        },
+        text: 'KLYPIX project routing changed while the tool was running. The handler result is withheld and message delivery was not advanced; call brain_sync again.',
+      });
+    }
+  }
+  // Recheck even for failed handlers: decoration is itself a presence/delivery
+  // transition and may never run against a binding that changed in the handler.
+  if (!mcpPresence.verifyCurrentProjectBinding()) {
+    return partialMutationBrainSyncResult({
+      structured: {
+        schemaVersion: 1,
+        status: 'project-changed',
+        mutation: result?.isError === true ? 'handler-attempted' : 'handler-complete',
+        identityMutation: identity.status === 'current' ? 'none' : identity.status,
+        deliveryMutation: 'none',
+      },
+      text: 'KLYPIX project routing changed while the tool was running. The handler result is withheld and message delivery was not advanced; call brain_sync again.',
+    });
+  }
+  return mcpPresence.decorateToolResult(result, {
+    actionId: identity.actionId,
+    verifyBinding: mcpPresence.verifyCurrentProjectBinding,
+    clientInfoPrepared: identity.clientInfo,
+  });
 });
 
 const toContent = (r) => {
@@ -254,6 +402,91 @@ const toContent = (r) => {
   if (r.structured && typeof r.structured === 'object') result.structuredContent = r.structured;
   return result;
 };
+
+// Return raw MCP results here. The universal registerTool wrapper above owns
+// the single presence/message transition for every non-brain_sync call. A
+// helper-level decoration would offer and then acknowledge one note inside the
+// same Remote call, violating delivery-v3's later-action invariant.
+const remoteToolResult = (label, value) => ({
+  content: [{ type: 'text', text: `${label}\n\n${JSON.stringify(value, null, 2)}` }],
+  structuredContent: { result: value },
+});
+const remoteToolError = (error) => {
+  const message = typeof error?.message === 'string' && /^KLYPIX_[A-Z0-9_]+$/.test(error.message)
+    ? error.message : 'KLYPIX_REMOTE_REQUEST_REJECTED';
+  return {
+    content: [{ type: 'text', text: `${message}. The KLYPIX desktop window may be closed, but its tray relay must be running and Remote control must be enabled.` }],
+    isError: true,
+  };
+};
+const remoteProjectRoot = () => (mcpPresence.brainPath ? path.dirname(mcpPresence.brainPath) : null);
+
+server.registerTool('remote_status', {
+  title: 'Inspect the local KLYPIX Remote relay',
+  description: 'Reports whether the KLYPIX tray relay, discovery, provider hooks, verified controls, phone pairing, and encrypted network relay are active. The desktop WINDOW may be closed; KLYPIX must still be running in the tray and the PC must be awake.',
+  annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  inputSchema: {},
+}, async () => {
+  try { return remoteToolResult('KLYPIX Remote status', await remoteStatus({ projectRoot: remoteProjectRoot() })); }
+  catch (error) { return remoteToolError(error); }
+});
+
+server.registerTool('remote_sessions', {
+  title: 'List coding-agent sessions by KLYPIX project',
+  description: 'Lists local coding-agent sessions with their project/path binding, current state, active host binding, and exact capability receipts. Treat each receipt as the truth for that specific provider + version + live session; never infer a missing action. The KLYPIX tray relay must be running.',
+  annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  inputSchema: {},
+}, async () => {
+  try { return remoteToolResult('KLYPIX Remote sessions', await remoteSessions({ projectRoot: remoteProjectRoot() })); }
+  catch (error) { return remoteToolError(error); }
+});
+
+server.registerTool('remote_actions', {
+  title: 'List pending coding-agent decisions',
+  description: 'Lists pending questions, permission requests, confirmations, failures, conflicts, and reviews reported by supported provider hooks. Approval/rejection still requires the exact session capability receipt and request digest. The KLYPIX tray relay must be running.',
+  annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  inputSchema: {},
+}, async () => {
+  try { return remoteToolResult('KLYPIX Remote actions', await remoteActions({ projectRoot: remoteProjectRoot() })); }
+  catch (error) { return remoteToolError(error); }
+});
+
+server.registerTool('remote_command', {
+  title: 'Control one verified coding-agent session',
+  description: 'Sends one command to the exact machine/provider/session and host binding named by a fresh remote_sessions capability receipt. Supports opening the exact provider session, messages, images/files, interrupt, approve/reject, close/archive/resume only when that exact receipt says the operation is available. File paths are local to this PC. The KLYPIX tray relay must be running and verified controls enabled.',
+  annotations: { destructiveHint: true, idempotentHint: false, openWorldHint: true },
+  inputSchema: {
+    machine_id: z.string().min(1).max(256),
+    provider: z.enum(['antigravity-agent', 'claude-code', 'codex', 'cursor-agent', 'gemini-cli', 'grok-build', 'kimi-code', 'opencode', 'pi', 'qoder', 'mistral-vibe', 'unknown']),
+    external_session_id: z.string().min(1).max(512),
+    operation: z.enum(['send-text', 'send-message', 'attach-image', 'attach-file', 'interrupt', 'approve', 'reject', 'close', 'archive', 'resume', 'open-provider']),
+    capability_receipt_id: z.string().min(1).max(256).describe('Fresh receipt id for this exact operation from remote_sessions.'),
+    binding_id: z.string().min(1).max(256).describe('Fresh host binding id named by the receipt.'),
+    request_digest: z.string().regex(/^[0-9a-f]{64}$/).optional().describe('Required for approve/reject; copy it from the pending remote action.'),
+    text: z.string().min(1).max(20000).optional(),
+    replace_draft: z.boolean().optional(),
+    attachments: z.array(z.object({
+      path: z.string().min(1).max(2048).describe('Absolute local file path on this PC.'),
+      kind: z.enum(['image', 'video', 'audio', 'document', 'file']),
+      mime_type: z.string().min(1).max(128).optional(),
+    })).max(25).optional(),
+  },
+}, async ({ machine_id, provider, external_session_id, operation, capability_receipt_id, binding_id, request_digest, text, replace_draft, attachments }, extra) => {
+  try {
+    const receipt = await remoteCommand({
+      machineId: machine_id, provider, externalSessionId: external_session_id, operation,
+      capabilityReceiptId: capability_receipt_id, bindingId: binding_id,
+      requestDigest: request_digest, text, replaceDraft: replace_draft,
+      attachments: attachments?.map((attachment) => ({
+        path: attachment.path, kind: attachment.kind, mimeType: attachment.mime_type,
+      })),
+    }, {
+      projectRoot: remoteProjectRoot(),
+      actionIdentity: extra.klypixRequestIdentity?.actionId,
+    });
+    return remoteToolResult('KLYPIX Remote command receipt', receipt);
+  } catch (error) { return remoteToolError(error); }
+});
 
 server.registerTool('list_canvases', {
   title: 'List KLYPIX canvases',
@@ -291,7 +524,7 @@ server.registerTool('brain_ask', {
     as_of: z.string().optional().describe('Optional YYYY-MM-DD: answer as of that date (superseded cards count as live if they were current then).'),
     k: z.number().optional().describe('Max cards to surface for synthesis (default 10, capped 20).'),
   },
-}, async ({ question, canvas, as_of, k }) => toContent(await opBrainAsk({ vault: mcpPresence.vault, canvas, question, as_of, k, log })));
+}, async ({ question, canvas, as_of, k }) => toContent(await opBrainAsk({ vault: mcpPresence.vault, canvas: boundBrainCanvas(canvas), question, as_of, k, log })));
 
 server.registerTool('project_map_context', {
   title: 'Project Map context - current code structure plus brain decisions',
@@ -321,7 +554,7 @@ server.registerTool('project_map_context', {
   const sessionRoot = path.resolve(mcpPresence.vault);
   const foreignProject = explicitProject && path.relative(sessionRoot, explicitProject) !== '';
   const contextRoot = explicitProject || sessionRoot;
-  let brainCanvas;
+  let brainCanvas = boundBrainCanvas();
   if (foreignProject) {
     const candidate = ['brain.klypix', 'brain.any']
       .map(name => path.join(explicitProject, name))
@@ -433,9 +666,8 @@ server.registerTool('brain_challenge', {
     canvas: z.string().optional().describe('Brain canvas filename/path. Defaults to the project brain ("brain").'),
     k: z.number().optional().describe('Max contradiction candidates to surface (default 8, capped 20).'),
   },
-}, async ({ claim, canvas, k }) => {
-  let via; try { via = server.server.getClientVersion()?.name; } catch { /* optional */ }
-  return toContent(await opBrainChallenge({ vault: mcpPresence.vault, canvas, claim, k, via, log }));
+}, async ({ claim, canvas, k }, extra) => {
+  return toContent(await opBrainChallenge({ vault: mcpPresence.vault, canvas: boundBrainCanvas(canvas), claim, k, via: extra.klypixClientName, log }));
 });
 
 server.registerTool('brain_insights', {
@@ -446,7 +678,7 @@ server.registerTool('brain_insights', {
     staleDays: z.number().optional().describe('Open questions older than this many days count as stale (default 21).'),
     view: z.enum(['full', 'areas', 'status']).optional().describe('"areas" = a cheap category map (what sections exist + live counts) to orient BEFORE retrieving. "status" = where each active area stands (newest milestone + open count). "full" (default) = hubs, orphans, stale questions and areas.'),
   },
-}, async ({ canvas, staleDays, view }) => toContent(await opBrainInsights({ vault: mcpPresence.vault, canvas, staleDays, view })));
+}, async ({ canvas, staleDays, view }) => toContent(await opBrainInsights({ vault: mcpPresence.vault, canvas: boundBrainCanvas(canvas), staleDays, view })));
 
 server.registerTool('brain_lens', {
   title: 'Brain lens — machine-readable views of a brain (freshness · provenance · activity · timeline · orrery · unresolved)',
@@ -459,7 +691,7 @@ server.registerTool('brain_lens', {
     limit: z.number().optional().describe('Cap for recent-activity entries (default 30).'),
     structured: z.boolean().optional().describe('Also return the full machine-readable lens object (large — tens of KB). Default false: the markdown answers the question, and the object was previously attached to every call whether or not anything read it.'),
   },
-}, async ({ canvas, view, root, staleDays, limit, structured }) => toContent(await opBrainLens({ vault: mcpPresence.vault, canvas, view, root, staleDays, limit, structured })));
+}, async ({ canvas, view, root, staleDays, limit, structured }) => toContent(await opBrainLens({ vault: mcpPresence.vault, canvas: boundBrainCanvas(canvas), view, root, staleDays, limit, structured })));
 
 server.registerTool('brain_connect', {
   title: 'Connect related-but-unlinked brain cards (densify the graph)',
@@ -473,7 +705,7 @@ server.registerTool('brain_connect', {
     pairs: z.array(z.object({ fromId: z.string(), toId: z.string() })).optional().describe('Explicit card-id pairs to connect (bypasses auto-proposal). Use to dismiss a reconcile false-positive: pass the two card ids with relationship:"not_contradiction".'),
     relationship: z.string().optional().describe('Relationship for explicit `pairs` (e.g. "not_contradiction" to permanently dismiss a contradiction candidate, or "relates_to", "depends_on", "supports").'),
   },
-}, async ({ canvas, apply, max, threshold, scope, pairs, relationship }) => toContent(await opBrainConnect({ vault: mcpPresence.vault, canvas, apply, max, threshold, scope, pairs, relationship, log })));
+}, async ({ canvas, apply, max, threshold, scope, pairs, relationship }) => toContent(await opBrainConnect({ vault: mcpPresence.vault, canvas: boundBrainCanvas(canvas), apply, max, threshold, scope, pairs, relationship, log })));
 
 server.registerTool('brain_reconcile', {
   title: 'Reconcile the brain — contradictions between cards + unrecorded migrations',
@@ -483,7 +715,7 @@ server.registerTool('brain_reconcile', {
     root: z.string().optional().describe("Project root holding the migrations dir (default: the brain file's folder)."),
     mode: z.enum(['all', 'contradictions', 'migrations', 'legacy', 'claims']).optional().describe('Which pass to run (default "all"): contradictions · migrations · legacy (pre-v1.15 raw-bash ship cards to tidy) · claims (open "remaining:/next:" clauses a later milestone likely fulfilled — receipts + ✓ markers, never auto-archived).'),
   },
-}, async ({ canvas, root, mode }) => toContent(await opBrainReconcile({ vault: mcpPresence.vault, canvas, root, mode })));
+}, async ({ canvas, root, mode }) => toContent(await opBrainReconcile({ vault: mcpPresence.vault, canvas: boundBrainCanvas(canvas), root, mode })));
 
 server.registerTool('brain_garden', {
   title: 'Garden the brain — consolidate over-grown areas (sleep-time compute)',
@@ -497,7 +729,7 @@ server.registerTool('brain_garden', {
     })).optional().describe('Required when apply:true — one entry per area you want consolidated.'),
     approve: z.string().optional().describe('Required when apply:true — the 8-char human-approval code. You are never shown it: the human runs `npx klypix-mcp garden-code` and pastes the code into chat after reviewing your plan. Never guess or fabricate it.'),
   },
-}, async ({ canvas, apply, syntheses, approve }) => toContent(await opBrainGarden({ vault: mcpPresence.vault, canvas, apply, syntheses, approve })));
+}, async ({ canvas, apply, syntheses, approve }) => toContent(await opBrainGarden({ vault: mcpPresence.vault, canvas: boundBrainCanvas(canvas), apply, syntheses, approve })));
 
 server.registerTool('create_canvas', {
   title: 'Create a KLYPIX canvas',
@@ -518,11 +750,10 @@ server.registerTool('add_to_canvas', {
     cards: z.array(cardSchema).min(1).describe('Cards to add.'),
     connections: z.array(connSchema).optional(),
   },
-}, async ({ canvas, cards, connections }) => {
+}, async ({ canvas, cards, connections }, extra) => {
   // Provenance: stamp WHICH agent wrote these cards (from the MCP client's
   // initialize handshake — cursor / claude / cline).
-  let via; try { via = server.server.getClientVersion()?.name; } catch { /* optional */ }
-  return toContent(await opAddToCanvas({ vault: mcpPresence.vault, canvas, cards, connections, via }));
+  return toContent(await opAddToCanvas({ vault: mcpPresence.vault, canvas, cards, connections, via: extra.klypixClientName }));
 });
 
 server.registerTool('brain_note', {
@@ -535,9 +766,8 @@ server.registerTool('brain_note', {
     closes: z.string().optional().describe('Title or [[wikilink]] of a strategy/question card this note fulfils — resolves+archives it and draws a "closed by" arrow.'),
     canvas: z.string().optional().describe('Brain canvas filename/path. Defaults to the project brain ("brain").'),
   },
-}, async ({ text, marker, area, closes, canvas }) => {
-  let via; try { via = server.server.getClientVersion()?.name; } catch { /* optional */ }
-  return toContent(await opBrainNote({ vault: mcpPresence.vault, canvas, text, area, marker: marker || '', closes, via }));
+}, async ({ text, marker, area, closes, canvas }, extra) => {
+  return toContent(await opBrainNote({ vault: mcpPresence.vault, canvas: boundBrainCanvas(canvas), text, area, marker: marker || '', closes, via: extra.klypixClientName }));
 });
 
 server.registerTool('brain_message', {
@@ -548,8 +778,7 @@ server.registerTool('brain_message', {
     to: z.string().optional().describe('Target hint — a peer session id-prefix or branch name; omit or "all" for every live session.'),
     canvas: z.string().optional().describe('Brain canvas filename/path. Defaults to the project brain ("brain").'),
   },
-}, async ({ text, to, canvas }) => {
-  let via; try { via = server.server.getClientVersion()?.name; } catch { /* optional */ }
+}, async ({ text, to, canvas }, extra) => {
   mcpPresence.noteSent(text);
   return toContent(await opBrainMessage({
     vault: mcpPresence.vault,
@@ -557,11 +786,11 @@ server.registerTool('brain_message', {
     // The worker process can be launched from an IDE/install directory that has
     // a different ancestor brain; falling back to process.cwd() would split the
     // sender presence and its message across two unrelated project lanes.
-    canvas: canvas || mcpPresence.brainPath,
+    canvas: boundBrainCanvas(canvas),
     text,
     to,
-    via,
-    from: mcpPresence.refreshIdentity(),
+    via: extra.klypixClientName,
+    from: extra.klypixRequestIdentity.sessionId,
   }));
 });
 
@@ -628,7 +857,7 @@ server.registerTool('brain_sync', {
     openWorldHint: false,
   },
   inputSchema: {
-    project: z.string().optional().describe('Absolute current project root containing brain.klypix. Supply it on phase "start" so routing stays correct even when the MCP host launches from its own install directory.'),
+    project: z.string().optional().describe('Nonempty absolute current project root that directly contains brain.klypix or brain.any. Supply it on phase "start" so routing stays correct even when the MCP host launches from its own install directory.'),
     intent: z.string().max(160).optional().describe('One sentence describing the current task. Supply for start/checkpoint; completion clears it.'),
     files: z.array(z.string()).max(20).optional().describe('Project-relative files you expect to touch or have touched. Exact overlaps with peers are flagged.'),
     phase: z.enum(['start', 'checkpoint', 'complete']).optional().describe('start replaces prior task scope; checkpoint merges changed scope; complete clears task intent/files. Default: checkpoint.'),
@@ -650,7 +879,12 @@ server.registerTool('brain_sync', {
     results,
     deliverMessages: include_context !== false,
     actionId: extra?.klypixRequestIdentity?.actionId || '',
+    preflight: extra?.klypixBrainSyncPreflight,
+    requestIdentity: extra?.klypixRequestIdentity,
   });
+  if (report.isError === true && report.structured?.mutation === 'none') {
+    return noMutationBrainSyncResult(report, { phase, totalStartedAt });
+  }
   // Zero-manual harness convergence: brain_sync is the one project-aware
   // gateway every MCP host can call. Register MCP-only projects here (Claude's
   // lifecycle hook is no longer the sole registry writer), then reconcile only
@@ -658,16 +892,40 @@ server.registerTool('brain_sync', {
   let harness = null;
   let registration = null;
   if (phase === 'start' && report.structured?.brain) {
+    if (!mcpPresence.verifyCurrentProjectBinding()) {
+      return partialMutationBrainSyncResult({
+        ...report,
+        isError: true,
+        structured: { ...report.structured, status: 'project-changed', mutation: 'presence-only' },
+        text: 'KLYPIX project routing changed after coordination. Harness, ship observation, and context retrieval were stopped; retry brain_sync.',
+      }, { phase, totalStartedAt });
+    }
     registration = registerProjectBrain({
       brainPath: report.structured.brain,
       brainDir: RUNTIME_BRAIN_DIR,
     });
+    if (!mcpPresence.verifyCurrentProjectBinding()) {
+      return partialMutationBrainSyncResult({
+        ...report,
+        isError: true,
+        structured: { ...report.structured, status: 'project-changed', mutation: 'presence-and-registration' },
+        text: 'KLYPIX project routing changed during project registration. Later sync side effects were stopped; retry brain_sync.',
+      }, { phase, totalStartedAt });
+    }
     harness = await reconcileRegisteredProjects({
       brainDir: RUNTIME_BRAIN_DIR,
       version: PKG_VERSION,
       brainPaths: [report.structured.brain],
       rules: { auditProject, compactAgentsBrief, linkProject },
     });
+    if (!mcpPresence.verifyCurrentProjectBinding()) {
+      return partialMutationBrainSyncResult({
+        ...report,
+        isError: true,
+        structured: { ...report.structured, status: 'project-changed', mutation: 'presence-registration-harness' },
+        text: 'KLYPIX project routing changed during harness reconciliation. Ship observation and context retrieval were stopped; retry brain_sync.',
+      }, { phase, totalStartedAt });
+    }
   }
   // Class-C ship observation, host-neutral: brain_sync is the ONE surface every
   // MCP host calls at task start, so an MCP-only project (no Claude/Codex hook)
@@ -676,7 +934,7 @@ server.registerTool('brain_sync', {
   let shipNotice = '';
   if (phase === 'start') {
     try {
-      const dir = project ? path.resolve(project) : mcpPresence.vault;
+      const dir = report.structured?.project || mcpPresence.vault;
       if (typeof brainFormat.observeShipDrift === 'function' && dir) {
         const { execFileSync } = await import('child_process');
         shipNotice = brainFormat.observeShipDrift(dir, {
@@ -691,6 +949,10 @@ server.registerTool('brain_sync', {
   if (phase !== 'complete' && include_context !== false && (intent || files?.length)) {
     taskContext = await opBrainTaskContext({
       vault: mcpPresence.vault,
+      // Exact brain chosen by project preflight. Supplying the absolute canvas
+      // prevents klypix-core's cwd-aware fallback from substituting a foreign
+      // parent/launch brain after the routing decision has already been made.
+      canvas: report.structured?.brain,
       intent,
       files,
       k: 5,
@@ -847,7 +1109,7 @@ function recordRunningServer({ remove = false } = {}) {
 // is try/caught (import, HTML load, register) and degrades to a plain text tool.
 const CANVAS_VIEW_DESC = 'Read any .klypix canvas/brain as a SPATIAL BOARD (defaults to the project brain): returns a text summary plus a structured render spec of cards, containers and connection arrows. It ALSO declares an MCP Apps (SEP-1865) UI resource, so a host with that extension can render the spec as an interactive read-only whiteboard — EXPERIMENTAL: no host has been observed rendering it, so do not promise the user a visual board. Hosts without the extension get the text summary, which is the verified path. Use when the user asks to SEE the canvas/brain/board layout, not just query it.';
 const canvasViewHandler = async ({ canvas }) => {
-  const r = await opCanvasView({ vault: mcpPresence.vault, canvas });
+  const r = await opCanvasView({ vault: mcpPresence.vault, canvas: boundBrainCanvas(canvas) });
   const c = toContent(r);
   return r.structured ? { ...c, structuredContent: r.structured } : c;
 };

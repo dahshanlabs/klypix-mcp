@@ -346,8 +346,18 @@ function inspectPeers(brainDir, brainPath, now, selfId = null) {
       now,
     })
     : { sent: 0, receipts: [] };
-  const syncedCount = live.filter(p => p.synced).length;
-  const activeUnscopedCount = live.filter(p => p.activeUnscoped).length;
+  // Readiness is a logical-session verdict, so its numerator must use the same
+  // denominator as logicalSessionCount. A lifecycle + MCP pair for one exact
+  // thread is two observable connections, but never two scoped sessions.
+  const logicalStates = [...logicalGroups.values()].map((rows) => {
+    const synced = rows.some((row) => row.synced);
+    return {
+      synced,
+      activeUnscoped: !synced && rows.some((row) => row.activeUnscoped),
+    };
+  });
+  const syncedCount = logicalStates.filter((state) => state.synced).length;
+  const activeUnscopedCount = logicalStates.filter((state) => state.activeUnscoped).length;
   return {
     file,
     live,
@@ -363,7 +373,7 @@ function inspectPeers(brainDir, brainPath, now, selfId = null) {
     rawRecent,
     syncedCount,
     activeUnscopedCount,
-    idleUnscopedCount: Math.max(0, live.length - syncedCount - activeUnscopedCount),
+    idleUnscopedCount: Math.max(0, logicalGroups.size - syncedCount - activeUnscopedCount),
     identityMergeGaps,
     // Compatibility field for older programmatic consumers. A host-pid repeat
     // is deliberately never classified as a twin again.

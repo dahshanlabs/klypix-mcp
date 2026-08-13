@@ -181,6 +181,43 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
   fs.rmSync(proj, { recursive: true, force: true });
 }
 
+// Readiness counts use logical sessions, while connection topology remains
+// visible. A lifecycle + MCP row for one exact thread must not produce an
+// impossible "2 scoped of 1 logical" denominator.
+{
+  const home = path.join(os.tmpdir(), `klypix-doctor-logical-count-${process.pid}`);
+  const project = path.join(home, 'project');
+  const brain = path.join(project, 'brain.klypix');
+  fs.rmSync(home, { recursive: true, force: true });
+  fs.mkdirSync(project, { recursive: true });
+  fs.writeFileSync(brain, 'logical-count fixture');
+  const lane = laneFileFor(brain, home);
+  fs.mkdirSync(path.dirname(lane), { recursive: true });
+  const now = Date.now();
+  fs.writeFileSync(lane, JSON.stringify({
+    version: 1,
+    sessions: [{
+      id: 'connection-lifecycle', logicalSessionId: 'thread-exact', client: 'codex',
+      intent: 'verify one logical scope', files: ['src/exact.mjs'],
+      lastSeen: now, channelSeen: { lifecycle: now }, activityAt: now,
+    }, {
+      id: 'connection-mcp', logicalSessionId: 'thread-exact', client: 'codex',
+      intent: '', files: [], lastSeen: now, channelSeen: { mcp: now },
+    }],
+    messages: [],
+  }));
+  const report = inspect({ home, projectDir: project, now });
+  const text = render(report, { color: false });
+  ok(report.sessions.logicalSessionCount === 1
+    && report.sessions.connectionCount === 2
+    && report.sessions.syncedCount === 1
+    && report.sessions.activeUnscopedCount === 0
+    && report.sessions.idleUnscopedCount === 0
+    && /1 logical session · 2 live connections · 1 with declared task scope/.test(text),
+  'doctor uses one logical-session denominator while retaining both live connections');
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
 // A deliberately hibernated supervisor has released its worker but still owns
 // a healthy pull-only connection. Doctor must use the sleeping target for
 // version alignment and must not call the expected worker absence an outage.
@@ -280,7 +317,10 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
   ok(names.includes('brain_lens'), 'brain_lens is a registered MCP tool');
   ok(names.includes('project_map_scan'), 'project_map_scan is a registered MCP tool');
   ok(names.includes('project_map_drift'), 'project_map_drift is a registered MCP tool');
-  ok(names.length === 22, `tool manifest is 22 verbs (got ${names.length})`);
+  ok(names.length === 26, `tool manifest is 26 verbs (got ${names.length})`);
+  for (const remoteTool of ['remote_status', 'remote_sessions', 'remote_actions', 'remote_command']) {
+    ok(names.includes(remoteTool), `${remoteTool} is a registered MCP tool`);
+  }
 
   // Seed one real lane receipt for THIS MCP session. The doctor must use the
   // adopted session id passed by the running worker, not guess a sender.

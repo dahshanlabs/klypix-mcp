@@ -965,6 +965,7 @@ export function recordResultManifests({
   brainPath,
   projectRoot,
   sessionId,
+  sessionAliases = [],
   declaredScope,
   results,
   home,
@@ -1028,13 +1029,31 @@ export function recordResultManifests({
   }
   try {
     const data = readLedger(ledgerFile);
-    const freshEntries = data.entries.filter((entry) => entry?.sessionId && entry?.manifest
-      && now - Number(entry.recordedAt || 0) < freshMs);
+    const ownSessionIds = new Set([sessionId, ...(Array.isArray(sessionAliases) ? sessionAliases : [])]
+      .map((value) => String(value || '').trim()).filter(Boolean));
+    // Presence rekey keeps the provisional id as an explicit alias on the
+    // canonical row. Migrate matching ledger entries under this ledger lock so
+    // a corrected post-rekey submission can never compare against its own old
+    // provisional run as if it came from an independent peer.
+    const migratedEntries = data.entries.filter((entry) => entry?.sessionId && entry?.manifest
+      && now - Number(entry.recordedAt || 0) < freshMs)
+      .map((entry) => ownSessionIds.has(String(entry.sessionId))
+        ? { ...entry, sessionId: String(sessionId) }
+        : entry);
+    const latestBySessionClaim = new Map();
+    for (const entry of migratedEntries) {
+      const key = `${entry.sessionId}\0${entry.manifest?.claimKey || entry.claimKey || ''}`;
+      const prior = latestBySessionClaim.get(key);
+      if (!prior || Number(entry.recordedAt || 0) >= Number(prior.recordedAt || 0)) {
+        latestBySessionClaim.set(key, entry);
+      }
+    }
+    const freshEntries = [...latestBySessionClaim.values()];
     const submittedClaims = new Set(manifests.map((manifest) => manifest.claimKey));
     const peerEntries = [];
     const peerValidationConflicts = [];
     for (const entry of freshEntries) {
-      if (entry.sessionId === sessionId || !submittedClaims.has(entry.manifest?.claimKey)) continue;
+      if (ownSessionIds.has(String(entry.sessionId)) || !submittedClaims.has(entry.manifest?.claimKey)) continue;
       const checked = validateResultManifest(entry.manifest, { projectRoot, verifyReport: true });
       if (!checked.ok) {
         peerValidationConflicts.push({
@@ -1061,7 +1080,7 @@ export function recordResultManifests({
       reconciliation.status = 'needs-reconciliation';
       reconciliation.conflicts.push(...peerValidationConflicts);
     }
-    const kept = freshEntries.filter((entry) => !(entry.sessionId === sessionId
+    const kept = freshEntries.filter((entry) => !(ownSessionIds.has(String(entry.sessionId))
       && submittedClaims.has(entry.manifest?.claimKey)));
     for (let index = 0; index < manifests.length; index++) {
       kept.push({

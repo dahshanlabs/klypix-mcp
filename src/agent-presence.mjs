@@ -31,6 +31,7 @@ const canonicalPath = (value) => {
   try { return fs.realpathSync.native(value); }
   catch { return path.resolve(value); }
 };
+const PINNED_LANE_IDENTITIES = new Map();
 const sleepSync = (ms) => {
   try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
   catch { /* best effort */ }
@@ -151,9 +152,25 @@ export function findProjectBrain(cwd = process.cwd()) {
   }
 }
 
-export function laneFileFor(brainPath, home = os.homedir()) {
-  const key = sha16(normBrainPath(canonicalPath(brainPath)));
+export function laneFileFor(brainPath, home = os.homedir(), stableIdentityPath = null) {
+  // `stableIdentityPath` is supplied only by a caller that has already captured
+  // and revalidated the exact canonical brain object. Do not realpath it again:
+  // a host callback between validation and this call may have retargeted the
+  // lexical project junction, but it must not redirect lane hashing.
+  const pinKey = normBrainPath(path.resolve(brainPath));
+  const identity = stableIdentityPath
+    ? path.resolve(stableIdentityPath)
+    : (PINNED_LANE_IDENTITIES.get(pinKey) || canonicalPath(brainPath));
+  const key = sha16(normBrainPath(identity));
   return path.join(home, '.claude', 'project-brain', 'sessions', `${key}.json`);
+}
+
+export function pinLaneIdentity(brainPath, stableIdentityPath = brainPath) {
+  if (!brainPath || !stableIdentityPath) return { ok: false, reason: 'no-brain-or-identity' };
+  const key = normBrainPath(path.resolve(brainPath));
+  const identity = path.resolve(stableIdentityPath);
+  PINNED_LANE_IDENTITIES.set(key, identity);
+  return { ok: true, key, identity, laneFile: laneFileFor(brainPath, undefined, identity) };
 }
 
 // Missing is a valid first-use lane. Every other read failure is materially
@@ -1651,6 +1668,13 @@ export function consumeMessageReceipt({
     if (!laneRead.ok) return receiptResult(false, false, 'retry', laneRead.reason, wantedMessageId, recipientId);
     const data = laneRead.data;
     const sessions = pruneSessions(data.sessions, now);
+    // Consumption is authority carried by the recipient's exact live logical
+    // row, not by a retained alias or a token from a conversation that ended.
+    // Check before normalizing or mutating message state so a late receipt is a
+    // byte-for-byte no-op.
+    if (!sessions.some((session) => session.id === recipientId)) {
+      return receiptResult(false, false, 'rejected', 'session-not-live', wantedMessageId, recipientId);
+    }
     const messages = maintainMessages(data.messages, now);
     const message = messages.find((candidate) => recipientKey(candidate?.id) === wantedMessageId);
     if (!message) return receiptResult(false, false, 'rejected', 'message-not-found', wantedMessageId, recipientId);

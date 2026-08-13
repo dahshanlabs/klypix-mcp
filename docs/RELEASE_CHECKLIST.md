@@ -79,7 +79,8 @@ git push origin v<version>
 gh release create v<version> --title "v<version> — <headline>" --notes "..."
 ```
 
-Publishing the GitHub Release fires the workflow. Nothing else does — see §5.
+Publishing the GitHub Release fires the normal workflow; `workflow_dispatch` is the
+explicit manual rerun path. Both bind the exact release tag — see Gate 5.
 
 ## 3. Watch the run
 
@@ -148,12 +149,11 @@ guarantees it cannot silently leave the chain.
 past a red suite by dispatching manually — the manual path runs the same gate.
 
 ### Gate 5 · Version validation
-**Proves** five things:
+**Proves** four things:
 1. both a published Release and a manual dispatch resolve to the exact tag `v<version>`;
 2. that tag matches `package.json` and points at this exact checkout;
 3. the tagged checkout is a one-parent evidence commit, never a merge commit;
-4. its sole parent (`HEAD^`) is the source target the evidence must bind;
-5. the version is not already on npm.
+4. its sole parent (`HEAD^`) is the source target the evidence must bind.
 
 **If it fails:**
 - *"Tag X does not match package.json version Y"* — bump the version or re-tag. Never
@@ -161,13 +161,6 @@ past a red suite by dispatching manually — the manual path runs the same gate.
 - *"No tag v<version> exists"* — you dispatched from a branch. Tag first.
 - *"must be one evidence commit with exactly one parent"* — rebuild the evidence-only
   commit directly on top of the intended source commit; do not tag a merge or source commit.
-- *"already published on npm"* — bump the version. This check is stricter than the old
-  behaviour on purpose: it turns an unreadable failure deep inside `npm publish` into a
-  one-line message. The one case it costs you: re-dispatching a run for a version that
-  *did* reach the registry is now blocked at the gate instead of at publish. That is the
-  same outcome, reported earlier.
-- Network flake reading the registry is **not** treated as "not published" — only a
-  definitive non-empty answer blocks.
 
 ### Gate 6 · Corroborated release evidence
 **Proves** the checked-out tag is exactly one evidence-only commit after the source
@@ -274,6 +267,11 @@ ship a patch release once the path is fixed. **If the verification step only war
 ("could not read the package back"), the publish succeeded and the registry was slow to
 index; confirm by hand:
 
+If the privileged job reports *"already published on npm with different integrity"*,
+bump the version. An idempotent rerun skips `npm publish` only when the immutable registry
+tarball has the exact integrity produced by the gate-cleared checkout. A mismatch or a
+transport failure is a hard stop; neither can waive the integrity comparison.
+
 ```bash
 npm view klypix-mcp@<version> --json | grep -A3 attestations
 ```
@@ -290,9 +288,10 @@ npm view klypix-mcp@<version> --json | grep -A3 attestations
 
 ## 6. Manual re-runs
 
-`workflow_dispatch` exists for re-running a release whose publish step failed for an
-infrastructure reason. It runs **the same gate** — there is no bypass, by design. It will
-refuse to publish untagged code and will refuse a version already on the registry.
+`workflow_dispatch` exists for re-running a release whose publish or provenance-readback
+step failed for an infrastructure reason. It runs **the same gate** — there is no bypass,
+by design. It refuses untagged code; if the version is already on the registry, it proceeds
+only when the immutable tarball integrity exactly matches the gate-cleared checkout.
 
 ## 7. What this pipeline deliberately does not do
 
@@ -305,13 +304,15 @@ State these plainly rather than assuming them away:
 - **It does not test on Windows.** The gate runs on `ubuntu-latest` only, while a large
   share of users — and the known `EPERM`/rename flakes — are on Windows. A matrix run is
   a follow-up.
-- **It does not verify the installed flat bundle end to end**, only the npm tarball.
+- **It does not verify, end to end, the flat bundle produced from the packed tarball.**
+  The source installer/flat runtime and the packed CLI are gated separately, so their
+  composition still relies on the installer and tarball-content assertions agreeing.
 - **It cannot unpublish.** Every gate exists because the one thing that cannot be undone
   is a bad publish.
 
 ---
 
-## KNOWN ISSUE — the post-publish provenance check false-negatives
+## Historical issue — post-publish provenance false-negatives
 
 **Found on the first real run of this pipeline (v1.44.0, 2026-07-30).**
 
@@ -333,12 +334,12 @@ completes npm can return a non-empty body that is *not the package*. It parses t
 `undefined@undefined`, the `.dist.attestations.provenance` lookup is undefined,
 and the step reports "NO provenance" on an artifact that has it.
 
-**Fix (not yet applied — an attempt broke the YAML and was reverted):** the retry
-guard must require a *parsable `.name`* before accepting the response, not merely
-a non-empty body, and must fall through to the existing warn-and-exit-0 path when
-the registry never indexes in time. Edit it carefully — the step is a multi-line
-`run:` block and a naive string replacement corrupts the block mapping.
+**Current fix:** the read-back now polls the anonymous registry document, requires the
+exact package name, version and provenance object before declaring success, distinguishes
+an absent version from OIDC provenance-indexing lag, and relies on the next release gate
+to re-verify any lagged predecessor. Keep the multi-line `run:` block covered by
+`test/publish-workflow.mjs`; careless YAML replacement can still corrupt the mapping.
 
-**Until it is fixed:** a red X on this step alone does **not** mean the publish
-failed. Check the publish step's own log for `+ <name>@<version>` and the sigstore
-line before reacting. Every other gate failure is real.
+If a future read-back failure appears, inspect the classified outcome and the publish
+step's `+ <name>@<version>` / Sigstore lines before reacting; an absent package, a foreign
+publisher and OIDC indexing lag are now reported separately.

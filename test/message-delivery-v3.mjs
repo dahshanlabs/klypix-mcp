@@ -81,19 +81,32 @@ try {
   assert.deepEqual({ ok: repeated.ok, changed: repeated.changed, status: repeated.status },
     { ok: true, changed: false, status: 'consumed' });
 
-  // A legacy v2 acknowledgement is conservative: it migrates but does not
-  // retire as consumed or fabricate an offer token.
+  // History is never rewritten (2026-08-13): a v2-RETIRED message stays
+  // retired. The old migration deleted retiredAt to "conservatively replay",
+  // which resurrected delivered notes and re-terminalized week-old ones as
+  // FAILED — falsifying delivery history in both directions. What v2 proved
+  // (model-context injection) is recorded as a retirement note, no more.
   const lane = JSON.parse(fs.readFileSync(laneFile, 'utf8'));
   lane.messages.push({
     id: 'legacy-v2-message', from: sender, to: recipient, text: 'legacy', ts: now + 6,
     deliveryVersion: 2, seen: [recipient], candidateIds: [recipient], retiredAt: now + 6,
     deliveries: [{ recipientId: recipient, state: 'acknowledged', acknowledgedAt: now + 6 }],
   });
+  // A v2 message still IN FLIGHT (no retirement) keeps the conservative
+  // migration: legacy seen[] proves only an offer, so it replays once.
+  lane.messages.push({
+    id: 'legacy-v2-inflight', from: sender, to: recipient, text: 'legacy inflight', ts: now + 6,
+    deliveryVersion: 2, seen: [recipient], candidateIds: [recipient],
+  });
   fs.writeFileSync(laneFile, JSON.stringify(lane));
   const replayed = receiveMessages({ brainPath, home, now: now + 7, sessionId: recipient, actionId: 'legacy-action' });
-  assert(replayed.some((message) => message.id === 'legacy-v2-message'));
+  assert(!replayed.some((message) => message.id === 'legacy-v2-message'),
+    'a v2-retired message must not be resurrected');
+  assert(replayed.some((message) => message.id === 'legacy-v2-inflight'),
+    'a v2 in-flight message still replays once');
   const migrated = readLaneMessage(laneFile, 'legacy-v2-message');
-  assert.equal(migrated.retiredAt, undefined);
+  assert.equal(migrated.retiredAt, now + 6);
+  assert(String(migrated.retirement?.reason || '').includes('v2-retired'));
   assert.equal(messageDeliveryState(migrated, recipient), 'acknowledged');
 
   // A solo broadcast is an explicit send failure, not a durable zero-audience

@@ -856,6 +856,7 @@ function normalizeMsg(m, now = Date.now()) {
             ...(raw.acknowledgedActionId ? { acknowledgedActionId: String(raw.acknowledgedActionId).slice(0, 160) } : {}),
             ...(raw.consumedActionId ? { consumedActionId: String(raw.consumedActionId).slice(0, 160) } : {}),
             ...(raw.offerToken ? { offerToken: String(raw.offerToken).slice(0, 160) } : {}),
+            ...(raw.consumedVia ? { consumedVia: String(raw.consumedVia).slice(0, 40) } : {}),
             ...(raw.reason ? { reason: String(raw.reason).slice(0, 120) } : {}),
             ...(raw.legacySeen ? { legacySeen: true } : {}),
         });
@@ -871,10 +872,15 @@ function normalizeMsg(m, now = Date.now()) {
     next.deliveryVersion = MSG_DELIVERY_VERSION;
     next.deliveries = [...records.values()];
     if (!Array.isArray(next.seen)) next.seen = [];
-    // v2 retired on acknowledgement, which proved only model-context injection.
-    // Conservatively reopen those records. A native v3 retired receipt already
-    // represents full consumption and must survive normalization unchanged.
-    if (sourceVersion < MSG_DELIVERY_VERSION && next.retiredAt && !next.deadLetter) delete next.retiredAt;
+    // History is never rewritten (2026-08-13, PARITY with agent-presence.mjs
+    // normalizeMessageDelivery). The old "conservatively reopen" migration
+    // deleted retiredAt from v2-retired messages, resurrecting a week of
+    // delivered notes and re-terminalizing the >24h ones as FAILED. A v2
+    // retirement proved model-context injection; it stays retired, recorded
+    // as exactly that and no more.
+    if (sourceVersion < MSG_DELIVERY_VERSION && next.retiredAt && !next.deadLetter && !next.retirement) {
+        next.retirement = { reason: 'v2-retired — model-context injection proven, explicit consumption unknown', at: Number(next.retiredAt) || now };
+    }
     return next;
 }
 function msgDeliveryState(m, sid) {
@@ -902,6 +908,7 @@ function setMsgDelivery(m, sid, state, now, reason = null, actionId = '') {
         if (actionId) r.offeredActionId = String(actionId).slice(0, 160);
         delete r.acknowledgedAt; delete r.consumedAt;
         delete r.acknowledgedActionId; delete r.consumedActionId;
+        delete r.consumedVia;
         delete r.failedAt; delete r.reason;
     } else if (state === 'acknowledged') {
         if (!r.offerToken) r.offerToken = makeMsgOfferToken();
@@ -924,13 +931,25 @@ function setMsgDelivery(m, sid, state, now, reason = null, actionId = '') {
 function terminalizeMsg(m, now, reason) {
     const next = normalizeMsg(m, now);
     const known = new Set([...(Array.isArray(next.candidateIds) ? next.candidateIds : []), ...next.deliveries.map(r => r.recipientId)].map(msgRecipientKey).filter(Boolean));
-    let failed = known.size === 0;
+    // Honest terminal split (2026-08-13, PARITY with agent-presence.mjs
+    // terminalizeMessage): 'acknowledged' reached model context on two
+    // independent actions — expiry after that is not a delivery failure.
+    // Only never-delivered (pending) and offered-once-unconfirmed records
+    // fail; an all-acknowledged message retires as delivered-unconfirmed.
+    let failures = 0, reachedUnconsumed = 0;
     for (const id of known) {
-        if (msgDeliveryState(next, id) === 'consumed') continue;
-        failed = true; setMsgDelivery(next, id, 'failed', now, reason);
+        const state = msgDeliveryState(next, id);
+        if (state === 'consumed') continue;
+        if (state === 'acknowledged') { reachedUnconsumed++; continue; }
+        failures++;
+        setMsgDelivery(next, id, 'failed', now, state === 'pending' ? `${reason} (never delivered)` : `${reason} (offered once, unconfirmed)`);
     }
-    if (failed) next.deadLetter = { state: 'failed', reason, at: now };
-    else next.retiredAt = now;
+    if (failures || known.size === 0) {
+        next.deadLetter = { state: 'failed', reason, at: now };
+    } else {
+        next.retiredAt = now;
+        if (reachedUnconsumed) next.retirement = { reason: `${reason} — after acknowledgement (delivered, consumption unconfirmed)`, at: now };
+    }
     return next;
 }
 const msgTerminal = (m) => Boolean(m?.deadLetter || m?.retiredAt);
@@ -1323,10 +1342,14 @@ function messageFooter(sid, tp, lib, actionId = messageActionId(readHookInput(),
         const due = messages.filter(m => {
             const state = msgDeliveryState(m, sid);
             const record = msgDeliveryRecord(m, sid);
+            // 'acknowledged' re-renders ONLY without action-identity evidence
+            // of a third action; with evidence the lease pass below retires it
+            // as consumed instead of injecting it a third time (PARITY with
+            // agent-presence.mjs receiveMessages).
             return m && !msgTerminal(m) && m.from !== sid
-                && ['pending', 'offered', 'acknowledged'].includes(state)
+                && (['pending', 'offered'].includes(state)
+                    || (state === 'acknowledged' && (!actionId || !record?.acknowledgedActionId)))
                 && !(state === 'offered' && actionId && record?.offeredActionId === String(actionId))
-                && !(state === 'acknowledged' && actionId && record?.acknowledgedActionId === String(actionId))
                 && msgTargetsMe(m, me, sid, sessions);
         }).sort((left, right) => {
             // Fresh pending work wins the six-message context budget, followed
@@ -1370,12 +1393,28 @@ function messageFooter(sid, tp, lib, actionId = messageActionId(readHookInput(),
             const prior = msgDeliveryState(m, sid);
             if (prior === 'pending') setMsgDelivery(m, sid, 'offered', now, null, actionId);
             else if (prior === 'offered' || prior === 'acknowledged') {
-                // A later independent action acknowledges the offer. Further
-                // actions keep replaying it and refresh only the action dedupe;
-                // acknowledgement never retires a note in v3.
+                // A later independent action acknowledges the offer.
                 setMsgDelivery(m, sid, 'acknowledged', now, null, actionId);
             }
             retireFullyConsumedMsg(m, now);
+        }
+        // Lease auto-consume (2026-08-13, PARITY with agent-presence.mjs
+        // receiveMessages): a note acknowledged on an EARLIER action is retired
+        // as consumed (consumedVia 'auto-lease') when this later independent
+        // action arrives, instead of replaying for 24h and dead-lettering as
+        // "failed" a note the model saw repeatedly. The explicit
+        // brain_message_receipt still records the stronger 'receipt' claim.
+        if (actionId) {
+            for (const m of messages) {
+                if (msgTerminal(m) || m.from === sid) continue;
+                const record = msgDeliveryRecord(m, sid);
+                if (!record || record.state !== 'acknowledged') continue;
+                if (!record.acknowledgedActionId || record.acknowledgedActionId === String(actionId)) continue;
+                if (!msgTargetsMe(m, me, sid, sessions)) continue;
+                setMsgDelivery(m, sid, 'consumed', now, null, actionId);
+                record.consumedVia = 'auto-lease';
+                retireFullyConsumedMsg(m, now);
+            }
         }
         writeLaneAtomic(JSON.stringify({ ...data, sessions, messages }));
     } catch (error) {

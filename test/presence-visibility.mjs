@@ -89,13 +89,17 @@ const replayAndOverflow = receiveMessages({ brainPath, sessionId: 'rx', home, no
 ok(replayAndOverflow.length === 6
   && replayAndOverflow.filter(m => !firstBatch.some(f => f.id === m.id)).length === 2,
   'V2: pending overflow is prioritized ahead of acknowledged replays and cannot starve');
+// batch-3 under the lease: the four notes acknowledged on batch-2 are
+// auto-consumed (third independent action) instead of replayed, so only the
+// four still-offered notes render and advance to acknowledged.
 const finishAcknowledgement = receiveMessages({ brainPath, sessionId: 'rx', home, now: now + 300, actionId: 'batch-3' });
-ok(finishAcknowledgement.length === 6,
-  'V2: remaining offers replay on a later in-band action and become acknowledged');
+ok(finishAcknowledgement.length === 4,
+  `V2: remaining offers replay while acknowledged notes lease-consume (got ${finishAcknowledgement.length})`);
 let deliveryLane = JSON.parse(fs.readFileSync(laneFileFor(brainPath, home), 'utf8'));
 const initialEight = deliveryLane.messages.filter((message) => /^note number /.test(message.text));
-ok(initialEight.length === 8 && initialEight.every((message) => messageDeliveryState(message, 'rx') === 'acknowledged'),
-  'V2: every overflowed note reaches acknowledgement without silent loss');
+ok(initialEight.length === 8 && initialEight.every((message) =>
+  ['acknowledged', 'consumed'].includes(messageDeliveryState(message, 'rx'))),
+  'V2: every overflowed note reaches acknowledgement or lease-consumption without silent loss');
 for (const message of initialEight) {
   const receipt = messageDeliveryReceipt(message, 'rx');
   consumeMessageReceipt({
@@ -190,9 +194,13 @@ consumeMessageReceipt({ brainPath, sessionId: 'rx', messageId: laterActionAck[0]
     candidateIds: ['rx'], deliveryVersion: 3, deliveries: [],
   };
   const receiptCapped = capMessages([pendingBeforeAcked, ...acknowledgedRows], 30, now + 100);
+  // Eviction still targets the most-progressed note first, but an acknowledged
+  // note (already in model context twice) evicts as a visible delivered-
+  // unconfirmed retirement — never as a false "failed" dead letter.
   ok(!receiptCapped.find(m => m.id === pendingBeforeAcked.id)?.deadLetter
-    && receiptCapped.filter(m => m.deadLetter?.reason === 'lane-capacity-overflow').length === 1,
-  'V3: capacity fails an acknowledged replay before unseen pending work and retains a visible dead letter');
+    && receiptCapped.filter(m => m.deadLetter).length === 0
+    && receiptCapped.filter(m => String(m.retirement?.reason || '').includes('lane-capacity-overflow')).length === 1,
+  'V3: capacity evicts an acknowledged replay before unseen pending work, as a visible retirement not a false failure');
 }
 
 // ── V4: intentAt semantics ───────────────────────────────────────────────────
@@ -325,12 +333,15 @@ ok(aging.intentAt === now + 6 * 60 * 1000, 'V4: a CHANGED intent re-stamps inten
     'V8: unseen overflow is prioritized ahead of acknowledged replay traffic');
   const out3 = runHook(['--prompt'], { session_id: 'sess-v8', prompt: 'deliver the rest' });
   ok(/unique payload/.test(out3),
-    'V8: offered and acknowledged notes remain model-visible until explicit consumption');
+    'V8: still-offered notes remain model-visible on the next action');
   lane = JSON.parse(fs.readFileSync(laneFile, 'utf8'));
   const inbox = lane.messages.filter((message) => /^mm-/.test(message.id));
   ok(inbox.length === 8 && inbox.every((message) =>
-    ['offered', 'acknowledged'].includes(messageDeliveryState(message, 'sess-v8'))),
-  'V8: every overflowed note reached a token-bearing non-terminal delivery state');
+    ['offered', 'acknowledged', 'consumed'].includes(messageDeliveryState(message, 'sess-v8'))),
+  'V8: every overflowed note reached a token-bearing delivered state (offered/acknowledged/lease-consumed)');
+  ok(inbox.some((message) => message.deliveries?.some((delivery) =>
+    delivery.recipientId === 'sess-v8' && delivery.consumedVia === 'auto-lease')),
+  'V8: notes acknowledged on an earlier action lease-consumed instead of replaying forever');
   for (const message of inbox) {
     const receipt = message.deliveries?.find((delivery) => delivery.recipientId === 'sess-v8');
     consumeMessageReceipt({ brainPath: path.join(hookProj, 'brain.klypix'), sessionId: 'sess-v8',

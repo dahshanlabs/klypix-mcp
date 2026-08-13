@@ -369,16 +369,21 @@ try {
   assert.equal(delivery.acknowledgedActionId, 'claude-action-2');
   assert.equal(stored.retiredAt, undefined);
 
-  // Acknowledgement is durable but non-terminal: later actions replay the note
-  // with the same per-recipient token until an explicit consume receipt lands.
+  // Lease auto-consume (2026-08-13): the note has been rendered into model
+  // context on TWO independent actions (offer, then acknowledgement). The
+  // third independent action retires it as consumed instead of replaying it
+  // for 24h — the footer goes quiet and the record says how it was consumed.
   const third = messageFooter(recipient, '', {}, 'claude-action-3');
   stored = readMessage(posted.message.id);
   delivery = stored.deliveries.find((entry) => entry.recipientId === recipient);
-  assert(third.includes(delivery.offerToken));
-  assert.equal(delivery.state, 'acknowledged');
-  assert.equal(delivery.acknowledgedActionId, 'claude-action-3');
-  assert.equal(stored.retiredAt, undefined);
+  assert.equal(third, '', 'the third action consumes the lease instead of re-rendering');
+  assert.equal(delivery.state, 'consumed');
+  assert.equal(delivery.consumedVia, 'auto-lease');
+  assert.equal(delivery.consumedActionId, 'claude-action-3');
+  assert(Number(stored.retiredAt) > 0, 'a fully-consumed message retires');
 
+  // An explicit receipt after the lease upgrades the record to the stronger
+  // "acted on it" claim — it is not a dead token.
   const consumed = consumeMessageReceipt({
     brainPath,
     home,
@@ -393,8 +398,10 @@ try {
     { ok: true, changed: true, status: 'consumed' },
   );
   stored = readMessage(posted.message.id);
+  delivery = stored.deliveries.find((entry) => entry.recipientId === recipient);
   assert.equal(messageDeliveryState(stored, recipient), 'consumed');
-  assert.equal(stored.retiredAt, now + 10);
+  assert.equal(delivery.consumedVia, 'receipt');
+  assert(Number(stored.retiredAt) > 0);
   assert.equal(messageFooter(recipient, '', {}, 'claude-action-5'), '');
 
   // v3 snapshots the audience at send time. A later chat must not receive an
@@ -416,24 +423,41 @@ try {
   lane.messages = lane.messages.filter((message) => message.id !== broadcast.message.id);
   writeLane(lane);
 
-  // Legacy seen/retired state was recorded before model delivery. v3 reopens,
-  // replays, mints a token, and never fabricates consumption.
+  // History is never rewritten (2026-08-13): a legacy v2-RETIRED message
+  // stays retired — the old "reopen and replay" migration resurrected
+  // delivered notes and later dead-lettered them as failed. Only a legacy
+  // message still IN FLIGHT (no retirement) replays, mints a token on
+  // acknowledgement, and can be consumed.
   lane = readLane();
   lane.messages.push({
-    id: 'legacy-seen-message',
+    id: 'legacy-seen-retired',
     from: sender,
     to: recipient,
-    text: 'Legacy note must replay.',
+    text: 'Legacy retired note must stay retired.',
     ts: now + 11,
     seen: [recipient],
     candidateIds: [recipient],
     retiredAt: now + 11,
   });
+  lane.messages.push({
+    id: 'legacy-seen-inflight',
+    from: sender,
+    to: recipient,
+    text: 'Legacy in-flight note must replay.',
+    ts: now + 11,
+    seen: [recipient],
+    candidateIds: [recipient],
+  });
   writeLane(lane);
   const legacyFooter = messageFooter(recipient, '', {}, 'claude-action-6');
-  const legacy = readMessage('legacy-seen-message');
+  const retired = readMessage('legacy-seen-retired');
+  assert(!legacyFooter.includes('legacy-seen-retired'), 'a v2-retired note must not resurrect');
+  assert.equal(retired.deliveryVersion, 3);
+  assert.equal(retired.retiredAt, now + 11);
+  assert(String(retired.retirement?.reason || '').includes('v2-retired'));
+  const legacy = readMessage('legacy-seen-inflight');
   const legacyDelivery = legacy.deliveries.find((entry) => entry.recipientId === recipient);
-  assert(legacyFooter.includes('legacy-seen-message'));
+  assert(legacyFooter.includes('legacy-seen-inflight'));
   assert.equal(legacy.deliveryVersion, 3);
   assert.equal(legacy.retiredAt, undefined);
   assert.equal(legacyDelivery.legacySeen, true);
@@ -479,7 +503,10 @@ try {
   assert.equal(nativeV3.retiredAt, now + 12);
   assert.equal(messageDeliveryState(nativeV3, recipient), 'consumed');
 
-  // TTL expiration dead-letters acknowledged-but-unconsumed notes.
+  // TTL expiration is honest (2026-08-13): an ACKNOWLEDGED note reached model
+  // context on two independent actions — expiry retires it as delivered-
+  // unconfirmed, never as failed. Only records the note never reached
+  // (pending) or reached exactly once (offered) dead-letter, each saying so.
   lane = readLane();
   lane.messages.push({
     id: 'expired-unconsumed',
@@ -499,11 +526,28 @@ try {
       acknowledgedAt: now,
     }],
   });
+  lane.messages.push({
+    id: 'expired-undelivered',
+    from: sender,
+    to: recipient,
+    text: 'Expired before any delivery.',
+    ts: Date.now() - (24 * 60 * 60 * 1000) - 5_000,
+    deliveryVersion: 3,
+    seen: [],
+    candidateIds: [recipient],
+    deliveries: [{ recipientId: recipient, state: 'pending', attempts: 0 }],
+  });
   writeLane(lane);
   messageFooter(recipient, '', {}, 'claude-action-8');
   const expired = readMessage('expired-unconsumed');
-  assert.equal(expired.deadLetter.reason, 'expired-before-consumption');
-  assert.equal(messageDeliveryState(expired, recipient), 'failed');
+  assert.equal(expired.deadLetter, undefined, 'an acknowledged note must not dead-letter on expiry');
+  assert(Number(expired.retiredAt) > 0);
+  assert(String(expired.retirement?.reason || '').includes('after acknowledgement'));
+  assert.equal(messageDeliveryState(expired, recipient), 'acknowledged');
+  const undelivered = readMessage('expired-undelivered');
+  assert.equal(undelivered.deadLetter.reason, 'expired-before-consumption');
+  assert.equal(messageDeliveryState(undelivered, recipient), 'failed');
+  assert(String(undelivered.deliveries.find((entry) => entry.recipientId === recipient)?.reason || '').includes('never delivered'));
 
   // Apply the six-note budget before grouping identical text. The footer may
   // render one instruction line, but it exposes exactly six receipts and the
@@ -621,9 +665,14 @@ try {
   }
   writeLane(lane);
   messageFooter(recipient, '', {}, 'claude-action-9');
+  // Eviction still terminalizes the most-progressed note first, but an
+  // acknowledged note evicts as delivered-unconfirmed (visible retirement
+  // receipt), never as a false "failed".
   const overflow = readMessage('capacity-acknowledged');
-  assert.equal(overflow.deadLetter.reason, 'lane-capacity-overflow');
-  assert.equal(messageDeliveryState(overflow, recipient), 'failed');
+  assert.equal(overflow.deadLetter, undefined, 'an acknowledged eviction is not a delivery failure');
+  assert(Number(overflow.retiredAt) > 0);
+  assert(String(overflow.retirement?.reason || '').includes('lane-capacity-overflow'));
+  assert.equal(messageDeliveryState(overflow, recipient), 'acknowledged');
   assert.equal(readMessage('capacity-offered').deadLetter, undefined);
   assert.equal(readMessage('capacity-pending-0').deadLetter, undefined);
 

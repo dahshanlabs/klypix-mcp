@@ -90,13 +90,13 @@ ok(/from sender-s/.test(first), 'the sender label is the stable logical session 
 const second = runHook('sess-recv');
 ok(second.includes(NOTE), 'same session, next prompt → note replays before later-action acknowledgement');
 const third = runHook('sess-recv');
-ok(third.includes(NOTE), 'same session, third prompt → acknowledged note still replays until consumption');
+ok(!third.includes(NOTE), 'same session, third prompt → the lease auto-consumes instead of replaying');
 const laneAfterAck = JSON.parse(fs.readFileSync(laneFileFor(path.join(proj, 'brain.klypix'), home), 'utf8'));
 const firstMessage = laneAfterAck.messages.find((message) => message.text === NOTE);
 const firstDelivery = firstMessage?.deliveries?.find((delivery) => delivery.recipientId === 'sess-recv');
 ok(firstMessage?.deliveryVersion === 3
-  && firstMessage.deliveries?.find((delivery) => delivery.recipientId === 'sess-recv')?.state === 'acknowledged',
-'the shared lane persists the pending → offered → acknowledged receipt');
+  && firstDelivery?.state === 'consumed' && firstDelivery?.consumedVia === 'auto-lease',
+'the shared lane persists the pending → offered → acknowledged → auto-lease-consumed receipt');
 const consumed = consumeMessageReceipt({
   brainPath: path.join(proj, 'brain.klypix'),
   sessionId: 'sess-recv',
@@ -147,7 +147,7 @@ fs.writeFileSync(laneFile, JSON.stringify(legacyLane), 'utf8');
 const legacyReplay = runHook('sess-legacy');
 ok(legacyReplay.includes(legacyText), 'legacy seen[] row replays once instead of being trusted as acknowledged');
 const legacyAck = runHook('sess-legacy');
-ok(legacyAck.includes(legacyText), 'legacy row remains visible after later-action acknowledgement');
+ok(!legacyAck.includes(legacyText), 'legacy row lease-consumes on the action after its acknowledgement');
 const migratedLegacy = JSON.parse(fs.readFileSync(laneFile, 'utf8')).messages
   .find((message) => message.id === 'legacy-false-positive');
 const migratedDelivery = migratedLegacy?.deliveries?.find((delivery) => delivery.recipientId === 'sess-legacy');
@@ -184,8 +184,8 @@ ok(drainedOffer.includes(lockNote),
   'a later hook drains the durable outbox and offers the full-session-id-directed note');
 const recoveredAck = runHook(lockTarget);
 const recoveredReplay = runHook(lockTarget);
-ok(recoveredAck.includes(lockNote) && recoveredReplay.includes(lockNote),
-  'the recovered note follows the same offer → replay/ack lifecycle until consumption');
+ok(recoveredAck.includes(lockNote) && !recoveredReplay.includes(lockNote),
+  'the recovered note follows the same offer → acknowledge → auto-lease lifecycle');
 const recoveredMessage = JSON.parse(fs.readFileSync(lockedLane, 'utf8')).messages
   .find((message) => message.text === lockNote);
 const recoveredDelivery = recoveredMessage?.deliveries?.find((delivery) => delivery.recipientId === lockTarget);

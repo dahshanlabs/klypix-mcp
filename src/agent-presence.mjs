@@ -454,6 +454,7 @@ function normalizeDeliveryRecord(record) {
     ...(record?.acknowledgedActionId ? { acknowledgedActionId: String(record.acknowledgedActionId).slice(0, 160) } : {}),
     ...(record?.consumedActionId ? { consumedActionId: String(record.consumedActionId).slice(0, 160) } : {}),
     ...(record?.offerToken ? { offerToken: String(record.offerToken).slice(0, 160) } : {}),
+    ...(record?.consumedVia ? { consumedVia: String(record.consumedVia).slice(0, 40) } : {}),
     ...(record?.reason ? { reason: String(record.reason).slice(0, 120) } : {}),
     ...(record?.legacySeen ? { legacySeen: true } : {}),
   };
@@ -485,9 +486,16 @@ export function normalizeMessageDelivery(message, now = Date.now()) {
   next.deliveryVersion = MESSAGE_DELIVERY_VERSION;
   next.deliveries = [...byRecipient.values()];
   if (!Array.isArray(next.seen)) next.seen = [];
-  // v2 retired on acknowledgement, which proved only model-context injection.
-  // v3 must conservatively replay it until a token-bound consume receipt lands.
-  if (sourceVersion < MESSAGE_DELIVERY_VERSION && next.retiredAt && !next.deadLetter) delete next.retiredAt;
+  // History is never rewritten (2026-08-13). The previous migration deleted
+  // retiredAt from v2-retired messages to "conservatively replay" them — which
+  // resurrected up to a week of already-delivered notes, and immediately
+  // re-terminalized every one older than 24h as FAILED. That falsified
+  // delivery history in both directions on first post-upgrade touch. A v2
+  // retirement proved model-context injection; it stays retired, recorded as
+  // exactly that and no more.
+  if (sourceVersion < MESSAGE_DELIVERY_VERSION && next.retiredAt && !next.deadLetter && !next.retirement) {
+    next.retirement = { reason: 'v2-retired — model-context injection proven, explicit consumption unknown', at: Number(next.retiredAt) || now };
+  }
   return next;
 }
 
@@ -527,6 +535,7 @@ function setDeliveryState(message, sessionId, state, now, reason = null, actionI
     delete record.consumedAt;
     delete record.acknowledgedActionId;
     delete record.consumedActionId;
+    delete record.consumedVia;
     delete record.failedAt;
     delete record.reason;
   } else if (state === 'acknowledged') {
@@ -557,14 +566,29 @@ function terminalizeMessage(message, now, reason) {
     ...(Array.isArray(next.candidateIds) ? next.candidateIds : []),
     ...next.deliveries.map((entry) => entry.recipientId),
   ].map(recipientKey).filter(Boolean));
-  let unconsumed = known.size === 0;
+  // Split by how far delivery actually got (2026-08-13). 'acknowledged' means
+  // the note was rendered into model context on two independent actions —
+  // expiring after that is NOT a delivery failure, and the old blanket
+  // 'failed' told the sender "no target consumed it" about a note the model
+  // saw repeatedly. Only recipients the note never reached (pending) or
+  // reached exactly once without confirmation (offered) fail, each with a
+  // reason that says which. A message whose every recipient at least
+  // acknowledged retires as delivered-unconfirmed instead of dead-lettering.
+  let failures = 0, reachedUnconsumed = 0;
   for (const recipientId of known) {
-    if (messageDeliveryState(next, recipientId) === 'consumed') continue;
-    unconsumed = true;
-    setDeliveryState(next, recipientId, 'failed', now, reason);
+    const state = messageDeliveryState(next, recipientId);
+    if (state === 'consumed') continue;
+    if (state === 'acknowledged') { reachedUnconsumed++; continue; }
+    failures++;
+    setDeliveryState(next, recipientId, 'failed', now,
+      state === 'pending' ? `${reason} (never delivered)` : `${reason} (offered once, unconfirmed)`);
   }
-  if (unconsumed) next.deadLetter = { state: 'failed', reason, at: now };
-  else next.retiredAt = now;
+  if (failures || known.size === 0) {
+    next.deadLetter = { state: 'failed', reason, at: now };
+  } else {
+    next.retiredAt = now;
+    if (reachedUnconsumed) next.retirement = { reason: `${reason} — after acknowledgement (delivered, consumption unconfirmed)`, at: now };
+  }
   return next;
 }
 
@@ -1537,9 +1561,13 @@ export function receiveMessages({
       const record = messageDeliveryRecord(message, sessionId);
       return !isTerminalMessage(message)
         && message.from !== sessionId
-        && (state === 'pending' || state === 'offered' || state === 'acknowledged')
+        // 'acknowledged' re-renders ONLY when there is no action-identity
+        // evidence of a third action (no actionId on this call, or a legacy
+        // record acknowledged without one). With evidence, the lease pass
+        // below retires it as consumed instead of injecting it a third time.
+        && (state === 'pending' || state === 'offered'
+          || (state === 'acknowledged' && (!actionId || !record?.acknowledgedActionId)))
         && !(state === 'offered' && actionId && record?.offeredActionId === String(actionId))
-        && !(state === 'acknowledged' && actionId && record?.acknowledgedActionId === String(actionId))
         && messageTargetsSession(message, me, sessionId, sessions);
     }).sort((left, right) => {
       // Never let an acknowledged-but-not-yet-consumed replay starve a fresh
@@ -1575,6 +1603,30 @@ export function receiveMessages({
       else if (previous === 'pending') setDeliveryState(message, sessionId, 'offered', now, null, actionId);
       else if (previous === 'acknowledged' && !messageDeliveryRecord(message, sessionId)?.offerToken) {
         setDeliveryState(message, sessionId, 'acknowledged', now, null, actionId);
+      }
+    }
+    // Lease auto-consume (2026-08-13). An acknowledged note was rendered into
+    // model context on TWO independent actions; when a THIRD independent
+    // action arrives, the model has demonstrably moved on with the note in
+    // hand. Retire it as consumed (consumedVia 'auto-lease') instead of
+    // replaying it every action for 24h and then dead-lettering a note the
+    // model saw repeatedly as "failed" — the old design guaranteed a steady
+    // background rate of false-failure receipts from every recipient that
+    // cannot (hook-only lanes) or does not copy offer tokens back. The
+    // explicit brain_message_receipt remains the only path that can record
+    // the stronger claim (consumedVia 'receipt' — "I acted on it").
+    // Requires a real, DIFFERENT actionId: with no action identity there is
+    // no evidence of a third action, so behavior stays replay-until-receipt.
+    if (actionId) {
+      for (const message of messages) {
+        if (isTerminalMessage(message) || message.from === sessionId) continue;
+        const record = messageDeliveryRecord(message, sessionId);
+        if (!record || record.state !== 'acknowledged') continue;
+        if (!record.acknowledgedActionId || record.acknowledgedActionId === String(actionId)) continue;
+        if (!messageTargetsSession(message, me, sessionId, sessions)) continue;
+        setDeliveryState(message, sessionId, 'consumed', now, null, actionId);
+        record.consumedVia = 'auto-lease';
+        retireFullyConsumed(message, now);
       }
     }
     // Persist migration/expiry/dead-letter changes even when the inbox is empty.
@@ -1684,6 +1736,15 @@ export function consumeMessageReceipt({
       return receiptResult(false, false, 'rejected', 'offer-token-mismatch', wantedMessageId, recipientId);
     }
     if (state === 'consumed') {
+      // An auto-leased consumption (the third-action lease in receiveMessages)
+      // proves the model moved on with the note in context; an explicit
+      // receipt is the STRONGER claim — "I acted on it". Record the upgrade.
+      if (record.consumedVia !== 'receipt') {
+        record.consumedVia = 'receipt';
+        fs.mkdirSync(path.dirname(laneFile), { recursive: true });
+        writeLaneFileAtomic(laneFile, JSON.stringify({ ...data, sessions, messages }));
+        return receiptResult(true, true, 'consumed', null, wantedMessageId, recipientId);
+      }
       return receiptResult(true, false, 'consumed', null, wantedMessageId, recipientId);
     }
     if (state === 'offered') {
@@ -1698,6 +1759,8 @@ export function consumeMessageReceipt({
       return receiptResult(false, false, 'rejected', 'delivery-not-acknowledged', wantedMessageId, recipientId);
     }
     setDeliveryState(message, recipientId, 'consumed', now, null, actionId);
+    const consumedRecord = messageDeliveryRecord(message, recipientId);
+    if (consumedRecord) consumedRecord.consumedVia = 'receipt';
     retireFullyConsumed(message, now);
     fs.mkdirSync(path.dirname(laneFile), { recursive: true });
     writeLaneFileAtomic(laneFile, JSON.stringify({ ...data, sessions, messages }));

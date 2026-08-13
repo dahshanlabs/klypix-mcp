@@ -218,9 +218,25 @@ export async function atomicWrite(filePath, buf, opts = {}) {
     }
     const tmp = filePath + '.tmp-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
     fs.writeFileSync(tmp, buf);
-    try { fs.renameSync(tmp, filePath); }    // Node uses MoveFileEx(REPLACE_EXISTING) on Windows → overwrites atomically
-    catch (e) { try { fs.rmSync(tmp); } catch { /* */ } throw e; }
+    // Windows rename-over-open-destination throws EPERM/EBUSY/EACCES while
+    // another process (a desktop save/read, AV, an indexer) briefly holds the
+    // target — three real capture failures in the field (.hook-health.jsonl,
+    // 2026-08-11/12). A bounded backoff (~2.7s total) outlasts a transient
+    // hold; a persistent holder still throws so callers can queue the batch —
+    // delayed is acceptable, lost is not.
+    for (let attempt = 0; ; attempt++) {
+        try { fs.renameSync(tmp, filePath); break; }   // Node uses MoveFileEx(REPLACE_EXISTING) on Windows → overwrites atomically
+        catch (e) {
+            if (attempt >= RENAME_BACKOFF_MS.length || !RENAME_RETRYABLE_CODES.has(e?.code)) {
+                try { fs.rmSync(tmp); } catch { /* */ }
+                throw e;
+            }
+            await new Promise((resolve) => setTimeout(resolve, RENAME_BACKOFF_MS[attempt]));
+        }
+    }
 }
+const RENAME_RETRYABLE_CODES = new Set(['EPERM', 'EBUSY', 'EACCES']);
+const RENAME_BACKOFF_MS = [40, 120, 300, 700, 1500];
 
 // ── verify: suffix (decay-aware status, 2026-07-28 post-mortem) ──────────────
 // A card may carry the EXACT live-probe command for its fast-decay claim as a

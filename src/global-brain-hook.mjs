@@ -400,19 +400,69 @@ function sweepStaleTmp(dir) {
 // replace only what it drained, so a batch a peer queued meanwhile survives.
 const PENDING_CAPTURES_FILE = path.join(os.homedir(), '.claude', 'project-brain', 'pending', `${sha(normBrainPath(laneCanon(BRAIN)))}.captures.json`);
 const PENDING_CAPTURES_LOCK = PENDING_CAPTURES_FILE + '.lock';
-function readPendingCaptures() {
+function readMainPendingFile() {
     try { const d = JSON.parse(fs.readFileSync(PENDING_CAPTURES_FILE, 'utf8')); return Array.isArray(d) ? d : []; } catch { return []; }
+}
+// Orphan sidecars: the lossless fallback when the pending LOCK itself is
+// contended (two sessions refuse in the same instant — the trigger, a held
+// brain lock, is CORRELATED across sessions, so "rare" was wrong). Each orphan
+// is one batch in its own uniquely-named file, written tmp→rename so a drain's
+// readdir never sees a torn one. Drained orphans are deleted by PATH only
+// after the brain write is durable — same discipline as clear-by-id.
+function listOrphanCaptureFiles() {
+    try {
+        const dir = path.dirname(PENDING_CAPTURES_FILE);
+        const prefix = path.basename(PENDING_CAPTURES_FILE) + '.orphan-';
+        return fs.readdirSync(dir).filter((n) => n.startsWith(prefix) && !/\.tmp-[a-z0-9-]+$/.test(n)).map((n) => path.join(dir, n));
+    } catch { return []; }
+}
+function readPendingCaptures() {
+    const batches = readMainPendingFile();
+    for (const f of listOrphanCaptureFiles()) {
+        try { const b = JSON.parse(fs.readFileSync(f, 'utf8')); if (b && typeof b === 'object') batches.push({ ...b, __orphanPath: f }); }
+        catch { /* unreadable orphan stays in place; the next drain retries it */ }
+    }
+    return batches;
 }
 function updatePendingCaptures(mutate) {
     const got = acquireLock(PENDING_CAPTURES_LOCK, { tries: 20, waitMs: 25 });
     try {
-        const next = mutate(readPendingCaptures());
+        const next = mutate(readMainPendingFile());
         fs.mkdirSync(path.dirname(PENDING_CAPTURES_FILE), { recursive: true });
-        const tmp = PENDING_CAPTURES_FILE + '.tmp';
+        const tmp = `${PENDING_CAPTURES_FILE}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
         fs.writeFileSync(tmp, JSON.stringify(next));
         fs.renameSync(tmp, PENDING_CAPTURES_FILE);
-    } catch { /* never break the session; the transcript markers remain the fallback */ }
+    } catch { /* clears are retried by the next drain; adds go through queuePendingCapture */ }
     finally { if (got) releaseLock(PENDING_CAPTURES_LOCK); }
+}
+// Lossless add. RMW under the pending lock is first choice; on lock contention
+// or a failed write it falls back to an append-only orphan file. Returns false
+// only when BOTH paths failed — the caller must then leave every baseline
+// unadvanced so the markers are re-gathered next Stop instead of lost.
+function queuePendingCapture(batch) {
+    const got = acquireLock(PENDING_CAPTURES_LOCK, { tries: 20, waitMs: 25 });
+    if (got) {
+        try {
+            const next = [...readMainPendingFile(), batch];
+            fs.mkdirSync(path.dirname(PENDING_CAPTURES_FILE), { recursive: true });
+            const tmp = `${PENDING_CAPTURES_FILE}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+            fs.writeFileSync(tmp, JSON.stringify(next));
+            fs.renameSync(tmp, PENDING_CAPTURES_FILE);
+            return true;
+        } catch { /* fall through to the orphan path */ }
+        finally { releaseLock(PENDING_CAPTURES_LOCK); }
+    }
+    try {
+        fs.mkdirSync(path.dirname(PENDING_CAPTURES_FILE), { recursive: true });
+        const orphan = `${PENDING_CAPTURES_FILE}.orphan-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+        const tmp = `${orphan}.tmp-${process.pid}`;
+        fs.writeFileSync(tmp, JSON.stringify(batch));
+        fs.renameSync(tmp, orphan);
+        return true;
+    } catch { return false; }
+}
+function clearDrainedOrphans(paths) {
+    for (const f of (paths || [])) { try { fs.unlinkSync(f); } catch { /* re-drained next time; landing twice is superseded away */ } }
 }
 const SESSION_FRESH_MS = 10 * 60 * 1000;   // a lane unseen for 10min is treated as ended
 const MCP_SESSION_FRESH_MS = 3 * 60 * 1000; // an mcp-channel heartbeat is dead after 3min (matches agent-presence)
@@ -2531,28 +2581,35 @@ async function capture(lib) {
     // cards into [Area] containers, and wires [[wikilink]] connections.
     const doCapture = async (locked) => {
         const merged = readState(); for (const k of seen) merged.add(k);
+        // Own-batch snapshot BEFORE the drain merges queued peers' batches in:
+        // if the brain write fails we re-queue only OUR contribution (drained
+        // batches stay queued — ids/paths clear only after a durable write),
+        // so nothing lands twice and nothing is lost.
+        const ownCards = cards.slice(), ownResolutions = resolutions.slice(), ownUpdates = updates.slice();
         if (!locked) {
-            // REFUSED: never write from a stale base. The batch is queued durably
-            // (same home as the dedup state) and drained by the next capture in
-            // this project — deferred-but-safe beats immediate-but-clobbering.
-            if (cards.length || resolutions.length || updates.length) {
-                updatePendingCaptures((current) => [
-                    ...current,
-                    { id: `${Date.now()}-${process.pid}-${Math.random().toString(36).slice(2)}`, ts: nowIso(), cards, resolutions, updates },
-                ]);
+            // REFUSED: never write from a stale base. The batch is queued
+            // (lock-held RMW, falling back to an orphan sidecar) and drained by
+            // the next capture — deferred-but-safe beats immediate-but-clobbering.
+            // Baselines advance ONLY if the queue write really succeeded;
+            // otherwise everything stays re-gatherable from the transcript.
+            const queued = (cards.length || resolutions.length || updates.length)
+                ? queuePendingCapture({ id: `${Date.now()}-${process.pid}-${Math.random().toString(36).slice(2)}`, ts: nowIso(), cards, resolutions, updates })
+                : true;
+            if (queued) {
+                writeState(merged);
+                writeLastCommit(newLastCommit); // safe: the batch itself is durably queued (verified above, not assumed)
+                if (drainedShips && typeof lib.clearPendingShips === 'function') lib.clearPendingShips(CWD);
+                advanceShipBaseline(lib);
             }
-            writeState(merged);
-            writeLastCommit(newLastCommit); // safe: the batch itself is durably queued
-            if (drainedShips && typeof lib.clearPendingShips === 'function') lib.clearPendingShips(CWD);
-            advanceShipBaseline(lib);
-            appendJsonl(HEALTH, { ts: nowIso(), project: path.basename(CWD), mode: 'capture', ok: false, err: 'lock-timeout — batch QUEUED for the next capture; brain untouched' }, 500);
-            process.stderr.write('[brain] capture deferred: the brain lock is held (desktop save or peer capture) — batch queued durably, nothing lost\n');
+            appendJsonl(HEALTH, { ts: nowIso(), project: path.basename(CWD), mode: 'capture', ok: false, err: queued ? 'lock-timeout — batch QUEUED for the next capture; brain untouched' : 'lock-timeout AND queue write failed — nothing advanced; markers remain re-gatherable' }, 500);
+            process.stderr.write(queued ? '[brain] capture deferred: the brain lock is held (desktop save or peer capture) — batch queued durably, nothing lost\n' : '[brain] capture deferred AND queueing failed — markers stay in the transcript for the next Stop\n');
             return null;
         }
         // Drain the queue UNDER the lock: read, land, clear-by-id — a peer's
         // batch queued after this read survives, and no batch lands twice.
         const pendingBatches = readPendingCaptures();
         const drainedPendingIds = new Set(pendingBatches.map(b => b && b.id).filter(Boolean));
+        const drainedOrphanPaths = pendingBatches.map(b => b && b.__orphanPath).filter(Boolean);
         for (const b of pendingBatches) {
             if (!b || typeof b !== 'object') continue;
             for (const c of (Array.isArray(b.cards) ? b.cards : [])) cards.push(c);
@@ -2594,6 +2651,7 @@ async function capture(lib) {
             writeState(merged);
             writeLastCommit(newLastCommit);
             if (drainedPendingIds.size) updatePendingCaptures((current) => current.filter(b => b && !drainedPendingIds.has(b.id)));
+            clearDrainedOrphans(drainedOrphanPaths);
             if (drainedShips && typeof lib.clearPendingShips === 'function') lib.clearPendingShips(CWD);
             advanceShipBaseline(lib);
             return null;
@@ -2605,10 +2663,28 @@ async function capture(lib) {
         });
         // Re-pack the whole grid so a container that grew never overlaps its neighbor.
         let out = res.buffer; try { out = (await lib.tidyBrain(res.buffer)).buffer; } catch { /* keep append result if tidy fails */ }
-        await lib.atomicWrite(BRAIN, out);
+        try {
+            await lib.atomicWrite(BRAIN, out);
+        } catch (e) {
+            // The write failed even after atomicWrite's bounded EPERM backoff
+            // (something held brain.klypix past ~2.7s — a desktop save, AV, an
+            // indexer). Same discipline as a lock refusal: queue OUR OWN batch
+            // durably (drained batches stay queued — their ids/paths were never
+            // cleared), advance baselines only if that queue write succeeded,
+            // and exit 0 by contract. Field case: the 2026-08-12 EPERM landed
+            // on a session's FINAL Stop and its markers had nowhere to go.
+            const queued = (ownCards.length || ownResolutions.length || ownUpdates.length)
+                ? queuePendingCapture({ id: `${Date.now()}-${process.pid}-${Math.random().toString(36).slice(2)}`, ts: nowIso(), cards: ownCards, resolutions: ownResolutions, updates: ownUpdates })
+                : true;
+            if (queued) { writeState(merged); writeLastCommit(newLastCommit); }
+            appendJsonl(HEALTH, { ts: nowIso(), project: path.basename(CWD), mode: 'capture', ok: false, err: `write failed (${e?.code || String(e?.message || e).slice(0, 80)}) — own batch ${queued ? 'QUEUED durably' : 'NOT queued; markers remain re-gatherable'}; drained batches remain queued` }, 500);
+            process.stderr.write(`[brain] capture write failed (${e?.code || 'error'}) — ${queued ? 'batch queued durably, nothing lost' : 'queueing ALSO failed; markers stay in the transcript for the next Stop'}\n`);
+            return null;
+        }
         writeState(merged);
         writeLastCommit(newLastCommit); // advance the commit baseline only after a successful write
         if (drainedPendingIds.size) updatePendingCaptures((current) => current.filter(b => b && !drainedPendingIds.has(b.id)));
+        clearDrainedOrphans(drainedOrphanPaths);
         // Same discipline for the two ship channels: the queue is consumed and
         // the observation baseline advances ONLY now that the cards are durable.
         if (drainedShips && typeof lib.clearPendingShips === 'function') lib.clearPendingShips(CWD);

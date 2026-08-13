@@ -18,6 +18,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import crypto from 'crypto';
+import { createRequire } from 'module';
 
 const PB_DIR = path.join(os.homedir(), '.claude', 'project-brain');
 const EMB_DIR = path.join(PB_DIR, 'embeddings');
@@ -29,6 +30,46 @@ export const HOOK_EMBEDDING_MODEL_ID = 'Xenova/bge-small-en-v1.5';
 export const HOOK_EMBEDDING_QUERY_PREFIX = 'Represent this sentence for searching relevant passages: ';
 export const HOOK_EMBEDDING_POOLING = 'cls';
 export const HOOK_EMBEDDING_CACHE_KEY = `${HOOK_EMBEDDING_MODEL_ID}|q8|${HOOK_EMBEDDING_POOLING}|query-instruction-v1`;
+const MIN_SAFE_SHARP_VERSION = [0, 35, 3];
+
+function findPackageManifest(entryPath, expectedName) {
+    let dir = path.dirname(entryPath);
+    while (dir !== path.dirname(dir)) {
+        try {
+            const manifestPath = path.join(dir, 'package.json');
+            const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+            if (manifest?.name === expectedName) return { manifestPath, manifest };
+        } catch { /* keep walking */ }
+        dir = path.dirname(dir);
+    }
+    return null;
+}
+
+function isSafeSharpVersion(version) {
+    const parts = String(version || '').split('.').slice(0, 3).map(Number);
+    if (parts.length !== 3 || parts.some(part => !Number.isInteger(part) || part < 0)) return false;
+    for (let i = 0; i < MIN_SAFE_SHARP_VERSION.length; i++) {
+        if (parts[i] !== MIN_SAFE_SHARP_VERSION[i]) return parts[i] > MIN_SAFE_SHARP_VERSION[i];
+    }
+    return true;
+}
+
+export function semanticRuntimeEntryIfSafe(transformersEntry) {
+    try {
+        const transformers = findPackageManifest(transformersEntry, '@huggingface/transformers');
+        if (!transformers) return null;
+        const sharpEntry = createRequire(transformers.manifestPath).resolve('sharp');
+        const sharp = findPackageManifest(sharpEntry, 'sharp');
+        return sharp && isSafeSharpVersion(sharp.manifest.version) ? transformersEntry : null;
+    } catch { return null; }
+}
+
+function ambientTransformersEntryIfSafe() {
+    try {
+        const entry = createRequire(import.meta.url).resolve('@huggingface/transformers');
+        return semanticRuntimeEntryIfSafe(entry);
+    } catch { return null; }
+}
 
 // Memoized within THIS process only (a one-shot hook run) — across prompts it
 // reloads cold, which is exactly why we only pay it on a lexical miss.
@@ -37,15 +78,20 @@ function getEmbedder() {
     if (_embedder !== undefined) return _embedder;
     _embedder = (async () => {
         let t;
-        try { t = await import('@huggingface/transformers'); }
-        catch {
+        const ambientEntry = ambientTransformersEntryIfSafe();
+        if (ambientEntry) {
+            try { t = await import('@huggingface/transformers'); } catch { /* try owned runtime */ }
+        }
+        if (!t) {
             const base = path.join(PB_DIR, 'semantic', 'node_modules', '@huggingface', 'transformers', 'dist');
             let last;
             for (const f of ['transformers.node.mjs', 'transformers.mjs']) {
-                try { t = await import(new URL('file:///' + path.join(base, f).replace(/\\/g, '/')).href); last = null; break; }
+                const entry = path.join(base, f);
+                if (!semanticRuntimeEntryIfSafe(entry)) continue;
+                try { t = await import(new URL('file:///' + entry.replace(/\\/g, '/')).href); last = null; break; }
                 catch (e) { last = e; }
             }
-            if (!t) throw last;
+            if (!t) throw last || new Error('semantic runtime rejected: sharp must be >=0.35.3');
         }
         t.env.cacheDir = path.join(PB_DIR, 'hf-cache');
         return await t.pipeline('feature-extraction', HOOK_EMBEDDING_MODEL_ID, { dtype: 'q8' });

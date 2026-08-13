@@ -13,6 +13,7 @@ import { createRequire } from 'module';
 const PB_DIR = path.join(os.homedir(), '.claude', 'project-brain');
 const EMB_DIR = path.join(PB_DIR, 'embeddings');
 const sha1 = (s) => crypto.createHash('sha1').update(String(s)).digest('hex');
+const MIN_SAFE_SHARP_VERSION = [0, 35, 3];
 export const EMBEDDING_MODEL_ID = 'Xenova/bge-small-en-v1.5';
 export const EMBEDDING_QUERY_PREFIX = 'Represent this sentence for searching relevant passages: ';
 export const EMBEDDING_POOLING = 'cls';
@@ -236,16 +237,59 @@ function disposeTensorTree(value, seen = new Set()) {
   for (const item of Object.values(value)) disposeTensorTree(item, seen);
 }
 
+function findPackageManifest(entryPath, expectedName) {
+  let dir = path.dirname(entryPath);
+  while (dir !== path.dirname(dir)) {
+    try {
+      const manifestPath = path.join(dir, 'package.json');
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+      if (manifest?.name === expectedName) return { manifestPath, manifest };
+    } catch { /* keep walking */ }
+    dir = path.dirname(dir);
+  }
+  return null;
+}
+
+function isSafeSharpVersion(version) {
+  const parts = String(version || '').split('.').slice(0, 3).map(Number);
+  if (parts.length !== 3 || parts.some(part => !Number.isInteger(part) || part < 0)) return false;
+  for (let i = 0; i < MIN_SAFE_SHARP_VERSION.length; i++) {
+    if (parts[i] !== MIN_SAFE_SHARP_VERSION[i]) return parts[i] > MIN_SAFE_SHARP_VERSION[i];
+  }
+  return true;
+}
+
+export function semanticRuntimeEntryIfSafe(transformersEntry) {
+  try {
+    const transformers = findPackageManifest(transformersEntry, '@huggingface/transformers');
+    if (!transformers) return null;
+    const sharpEntry = createRequire(transformers.manifestPath).resolve('sharp');
+    const sharp = findPackageManifest(sharpEntry, 'sharp');
+    return sharp && isSafeSharpVersion(sharp.manifest.version) ? transformersEntry : null;
+  } catch { return null; }
+}
+
+function ambientTransformersEntryIfSafe() {
+  try {
+    const entry = createRequire(import.meta.url).resolve('@huggingface/transformers');
+    return semanticRuntimeEntryIfSafe(entry);
+  } catch { return null; }
+}
+
 async function loadTransformers() {
-  try { return await import('@huggingface/transformers'); }
-  catch {
+  if (ambientTransformersEntryIfSafe()) {
+    try { return await import('@huggingface/transformers'); } catch { /* try owned runtime */ }
+  }
+  {
     const base = path.join(PB_DIR, 'semantic', 'node_modules', '@huggingface', 'transformers', 'dist');
     let lastErr;
     for (const f of ['transformers.node.mjs', 'transformers.mjs']) {
-      try { return await import(new URL('file:///' + path.join(base, f).replace(/\\/g, '/')).href); }
+      const entry = path.join(base, f);
+      if (!semanticRuntimeEntryIfSafe(entry)) continue;
+      try { return await import(new URL('file:///' + entry.replace(/\\/g, '/')).href); }
       catch (error) { lastErr = error; }
     }
-    throw lastErr;
+    throw lastErr || new Error('semantic runtime rejected: sharp must be >=0.35.3');
   }
 }
 
@@ -267,13 +311,15 @@ export function semanticRuntimeInstalled() {
   if (runtimeInstalledCache !== null) return runtimeInstalledCache;
   let found = false;
   try {
-    createRequire(import.meta.url).resolve('@huggingface/transformers');
-    found = true;
+    const entry = createRequire(import.meta.url).resolve('@huggingface/transformers');
+    found = Boolean(semanticRuntimeEntryIfSafe(entry));
   } catch {
+    // Fall through to the owned runtime below.
+  }
+  if (!found) {
     const base = path.join(PB_DIR, 'semantic', 'node_modules', '@huggingface', 'transformers', 'dist');
-    found = ['transformers.node.mjs', 'transformers.mjs'].some(f => {
-      try { return fs.existsSync(path.join(base, f)); } catch { return false; }
-    });
+    found = ['transformers.node.mjs', 'transformers.mjs']
+      .some(f => Boolean(semanticRuntimeEntryIfSafe(path.join(base, f))));
   }
   runtimeInstalledCache = found;
   return found;

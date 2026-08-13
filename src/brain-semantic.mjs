@@ -58,7 +58,10 @@ export function semanticRuntimeEntryIfSafe(transformersEntry) {
     try {
         const transformers = findPackageManifest(transformersEntry, '@huggingface/transformers');
         if (!transformers) return null;
-        const sharpEntry = createRequire(transformers.manifestPath).resolve('sharp');
+        // Resolve from the exact executable bundle entry. Resolving from the
+        // package manifest misses a Sharp installation shadowed under dist/
+        // even though that is the copy the ESM bundle itself will import.
+        const sharpEntry = createRequire(transformersEntry).resolve('sharp');
         const sharp = findPackageManifest(sharpEntry, 'sharp');
         return sharp && isSafeSharpVersion(sharp.manifest.version) ? transformersEntry : null;
     } catch { return null; }

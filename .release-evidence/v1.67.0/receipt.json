@@ -1,0 +1,233 @@
+{
+  "schemaVersion": 1,
+  "package": {
+    "name": "klypix-mcp",
+    "version": "1.67.0"
+  },
+  "gitCommit": "78c8e46507c63b50618e78030b143aa710762fd5",
+  "generatedAt": 1800000002000,
+  "resultReceipt": {
+    "schemaVersion": 2,
+    "generatedAt": 1800000001000,
+    "status": "corroborated",
+    "publicationEligible": true,
+    "machineLocal": true,
+    "ledgerFreshMs": 86400000,
+    "claims": [
+      {
+        "claimKey": "brain.core.v1.67.0.release",
+        "status": "corroborated",
+        "submitted": {
+          "manifestSchemaVersion": 2,
+          "runId": "klypix-mcp-1.67.0-qualification-b",
+          "gitCommit": "78c8e46507c63b50618e78030b143aa710762fd5",
+          "manifestHash": "e833547ab13010b0006c9ca00e411f29e3a14c503d67a197ac8b4220f8bd44c2",
+          "reportSha256": "bf1aabdd9e6a23e4254b61c728f713c0c03a39bb68770467439e9a70f7b38f4b",
+          "inputFingerprint": "60e4b28cd74dd2554dece2faa5c0f5a6c34cf7c8e5d9917d3d1945ef80ef2e84",
+          "configurationFingerprint": "2f7e2b17140ed0c3615199ec5b845c7be60e3b770b57b3104e334b3e1aa7fd58",
+          "scopeFingerprint": "b44cfc26ddcd6d54b6903d951fcbed3d3c27b126aaf7090cd00d078f87aeef2f",
+          "artifactFingerprint": "0ffb3e7c2e3032577c167d44fe2f4e18de9e0565550935b8b558fd8a3645ae11",
+          "evaluationFingerprint": "c25600171da82241df385acd5a1634d5f48458e53397a7b069bcce03b0a9029a",
+          "publicClaimsFingerprint": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        },
+        "compared": [
+          {
+            "manifest": {
+              "schemaVersion": 2,
+              "claimKey": "brain.core.v1.67.0.release",
+              "report": {
+                "path": ".release-evidence/v1.67.0/artifacts/run-a.json",
+                "sha256": "493fb019e55702e93a7398ba7b7bd30b054368fd9ca5586fd5cbe1b56b5f5ff8"
+              },
+              "provenance": {
+                "producer": "klypix-mcp-release-qualification/v1",
+                "runId": "klypix-mcp-1.67.0-qualification-a",
+                "gitCommit": "78c8e46507c63b50618e78030b143aa710762fd5",
+                "dirtyDigest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+              },
+              "input": {
+                "fingerprint": "60e4b28cd74dd2554dece2faa5c0f5a6c34cf7c8e5d9917d3d1945ef80ef2e84",
+                "details": {
+                  "evaluation": "brain-core-release-critical",
+                  "release": "klypix-mcp@1.67.0",
+                  "sourceCommit": "78c8e46507c63b50618e78030b143aa710762fd5",
+                  "suiteFiles": [
+                    "test/publish-workflow.mjs",
+                    "test/remote-client.mjs",
+                    "test/mcp-supervisor.mjs",
+                    "test/request-identity.mjs",
+                    "test/session-identity-core.mjs",
+                    "test/agent-presence.mjs",
+                    "test/message-delivery-v3.mjs",
+                    "test/claude-message-delivery-v3.mjs",
+                    "test/result-reconcile.mjs",
+                    "test/evidence-publication-gate.mjs",
+                    "test/release-evidence-cli.mjs",
+                    "test/install-version.mjs",
+                    "test/context-gateway.mjs",
+                    "test/conformance.mjs",
+                    "test/brain-doctor.mjs",
+                    "test/lane-message.mjs",
+                    "test/presence-visibility.mjs"
+                  ]
+                }
+              },
+              "configuration": {
+                "fingerprint": "2f7e2b17140ed0c3615199ec5b845c7be60e3b770b57b3104e334b3e1aa7fd58",
+                "details": {
+                  "node": "24.13.1",
+                  "npm": "11.8.0",
+                  "policy": "two-independent-clean-checkout-runs",
+                  "requiredPasses": 17
+                }
+              },
+              "metrics": {
+                "suite-pass-ratio": {
+                  "value": 1,
+                  "count": 17,
+                  "tolerance": 0,
+                  "unit": "ratio",
+                  "numerator": 17
+                }
+              },
+              "scope": {
+                "intent": "Qualify the klypix-mcp 1.67.0 Brain core release with two independent clean-checkout runs.",
+                "files": [
+                  ".release-evidence/v1.67.0/artifacts/run-a.json",
+                  ".release-evidence/v1.67.0/artifacts/run-b.json"
+                ]
+              },
+              "artifacts": [
+                {
+                  "path": ".release-evidence/v1.67.0/artifacts/run-a.json",
+                  "sha256": "493fb019e55702e93a7398ba7b7bd30b054368fd9ca5586fd5cbe1b56b5f5ff8",
+                  "kind": "evaluation-result"
+                }
+              ],
+              "evaluations": [
+                {
+                  "name": "brain-core-release-critical",
+                  "artifact": {
+                    "path": ".release-evidence/v1.67.0/artifacts/run-a.json",
+                    "sha256": "493fb019e55702e93a7398ba7b7bd30b054368fd9ca5586fd5cbe1b56b5f5ff8"
+                  },
+                  "metricKeys": [
+                    "suite-pass-ratio"
+                  ],
+                  "resultFingerprint": "31f10ee43a57af4e3b4c8fbac5d4037faccc611892c6b8dab39c584e1d61deb7"
+                }
+              ],
+              "publicClaims": []
+            },
+            "runId": "klypix-mcp-1.67.0-qualification-a",
+            "manifestSchemaVersion": 2,
+            "gitCommit": "78c8e46507c63b50618e78030b143aa710762fd5",
+            "manifestHash": "01a085b9e5744948f021cff1fc7320e01c084582410af6df7a311c977bf86de9",
+            "reportSha256": "493fb019e55702e93a7398ba7b7bd30b054368fd9ca5586fd5cbe1b56b5f5ff8",
+            "inputFingerprint": "60e4b28cd74dd2554dece2faa5c0f5a6c34cf7c8e5d9917d3d1945ef80ef2e84",
+            "configurationFingerprint": "2f7e2b17140ed0c3615199ec5b845c7be60e3b770b57b3104e334b3e1aa7fd58",
+            "scopeFingerprint": "b44cfc26ddcd6d54b6903d951fcbed3d3c27b126aaf7090cd00d078f87aeef2f",
+            "artifactFingerprint": "ed5aef5d2abfe38c4094215f2b558a4301cecc78e43bf4d6330e2ffd785219bc",
+            "evaluationFingerprint": "c25600171da82241df385acd5a1634d5f48458e53397a7b069bcce03b0a9029a",
+            "publicClaimsFingerprint": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+          }
+        ]
+      }
+    ],
+    "conflicts": []
+  },
+  "resultReceiptHash": "eede7886bf69e030a843fc306323b15d35388b972b6bbff041f6af338af5478d",
+  "manifests": [
+    {
+      "manifest": {
+        "schemaVersion": 2,
+        "claimKey": "brain.core.v1.67.0.release",
+        "report": {
+          "path": ".release-evidence/v1.67.0/artifacts/run-b.json",
+          "sha256": "bf1aabdd9e6a23e4254b61c728f713c0c03a39bb68770467439e9a70f7b38f4b"
+        },
+        "provenance": {
+          "producer": "klypix-mcp-release-qualification/v1",
+          "runId": "klypix-mcp-1.67.0-qualification-b",
+          "gitCommit": "78c8e46507c63b50618e78030b143aa710762fd5",
+          "dirtyDigest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "input": {
+          "fingerprint": "60e4b28cd74dd2554dece2faa5c0f5a6c34cf7c8e5d9917d3d1945ef80ef2e84",
+          "details": {
+            "evaluation": "brain-core-release-critical",
+            "release": "klypix-mcp@1.67.0",
+            "sourceCommit": "78c8e46507c63b50618e78030b143aa710762fd5",
+            "suiteFiles": [
+              "test/publish-workflow.mjs",
+              "test/remote-client.mjs",
+              "test/mcp-supervisor.mjs",
+              "test/request-identity.mjs",
+              "test/session-identity-core.mjs",
+              "test/agent-presence.mjs",
+              "test/message-delivery-v3.mjs",
+              "test/claude-message-delivery-v3.mjs",
+              "test/result-reconcile.mjs",
+              "test/evidence-publication-gate.mjs",
+              "test/release-evidence-cli.mjs",
+              "test/install-version.mjs",
+              "test/context-gateway.mjs",
+              "test/conformance.mjs",
+              "test/brain-doctor.mjs",
+              "test/lane-message.mjs",
+              "test/presence-visibility.mjs"
+            ]
+          }
+        },
+        "configuration": {
+          "fingerprint": "2f7e2b17140ed0c3615199ec5b845c7be60e3b770b57b3104e334b3e1aa7fd58",
+          "details": {
+            "node": "24.13.1",
+            "npm": "11.8.0",
+            "policy": "two-independent-clean-checkout-runs",
+            "requiredPasses": 17
+          }
+        },
+        "metrics": {
+          "suite-pass-ratio": {
+            "value": 1,
+            "count": 17,
+            "tolerance": 0,
+            "unit": "ratio",
+            "numerator": 17
+          }
+        },
+        "scope": {
+          "intent": "Qualify the klypix-mcp 1.67.0 Brain core release with two independent clean-checkout runs.",
+          "files": [
+            ".release-evidence/v1.67.0/artifacts/run-a.json",
+            ".release-evidence/v1.67.0/artifacts/run-b.json"
+          ]
+        },
+        "artifacts": [
+          {
+            "path": ".release-evidence/v1.67.0/artifacts/run-b.json",
+            "sha256": "bf1aabdd9e6a23e4254b61c728f713c0c03a39bb68770467439e9a70f7b38f4b",
+            "kind": "evaluation-result"
+          }
+        ],
+        "evaluations": [
+          {
+            "name": "brain-core-release-critical",
+            "artifact": {
+              "path": ".release-evidence/v1.67.0/artifacts/run-b.json",
+              "sha256": "bf1aabdd9e6a23e4254b61c728f713c0c03a39bb68770467439e9a70f7b38f4b"
+            },
+            "metricKeys": [
+              "suite-pass-ratio"
+            ],
+            "resultFingerprint": "3651474da142c7807382392e75c17c2f0e1f8fe1b61c262abbfe6ddc5e6ef55f"
+          }
+        ],
+        "publicClaims": []
+      },
+      "manifestHash": "e833547ab13010b0006c9ca00e411f29e3a14c503d67a197ac8b4220f8bd44c2"
+    }
+  ],
+  "receiptHash": "0c8c5fdb34aca671aeee8905082457ab9a326d3171be91d4f5ee23c30a4f0a33"
+}

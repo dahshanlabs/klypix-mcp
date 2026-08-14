@@ -311,7 +311,12 @@ function runInstall(home, projectCwd, args = []) {
   fs.writeFileSync(path.join(bd, '.brain-version.json'), JSON.stringify({
     brainVersion: '1.0.0', appVersion: '99.0.0', via: 'app', dirty: false,
   }));
-  fs.writeFileSync(path.join(bd, '.mcp-runtime.json'), JSON.stringify({ ...runtime, version: '99.0.0' }));
+  // Simulate an npm-owned newer install explicitly: when this suite runs from
+  // an UNTAGGED checkout, the earlier real install stamped dev:true, and the
+  // installer's dev-owner protection would preempt the version comparison this
+  // case exists to exercise. Pinning channel/dev makes the case hermetic
+  // against the repo's tag state (green on release commits AND pre-release).
+  fs.writeFileSync(path.join(bd, '.mcp-runtime.json'), JSON.stringify({ ...runtime, version: '99.0.0', channel: 'npm', dev: false }));
   const preserved = runInstall(home, proj);
   ok(/Installed brain v99\.0\.0 is newer/.test(preserved)
     && JSON.parse(fs.readFileSync(path.join(bd, '.mcp-runtime.json'), 'utf8')).version === '99.0.0',

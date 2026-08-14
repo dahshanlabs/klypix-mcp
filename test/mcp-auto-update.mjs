@@ -313,7 +313,11 @@ try {
       // into a red suite. The failure was also silent-by-shape — `result` was
       // never inspected, so a timeout surfaced as an ENOENT on the manifest
       // read below instead of "the installer did not finish".
-      timeout: 300_000,
+      // 2026-08-14: 300s ETIMEDOUT twice in a row on a machine running six
+      // concurrent agent sessions (AV scanning every copied package). The
+      // ceiling exists only to catch a HUNG installer, not to race ambient
+      // load — 600s still catches hangs and stops red suites nobody caused.
+      timeout: 600_000,
     });
     ok(result.status === 0, `real runtime-only installer exits 0 (status ${result.status}${result.error ? `, ${result.error.message}` : ''})`);
     const runtime = JSON.parse(fs.readFileSync(path.join(brainDir, '.mcp-runtime.json'), 'utf8'));

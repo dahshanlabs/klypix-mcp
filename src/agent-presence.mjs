@@ -49,6 +49,53 @@ export const MACHINE_ID = (() => {
   catch { return sha16(`${os.hostname?.() || 'unknown'}|${os.platform?.() || 'unknown'}`); }
 })();
 
+// ── Dead-host sweep (2026-08-14 wave) ────────────────────────────────────────
+// TTL pruning alone leaves a crashed host's rows visible for up to 10 minutes —
+// long enough for a peer to "coordinate" with a ghost. When any session touches
+// the lane, rows whose HOST process is provably dead are swept immediately.
+// The probe is deliberately narrow, because a false sweep erases live presence:
+//   · only rows written on THIS machine (row.machine === MACHINE_ID; a pid from
+//     another machine or a cloud-relayed row lives in a foreign pid namespace),
+//   · only rows whose hostPid came from a host-declared env var
+//     (hostPidSource === 'env'). A ppid-guessed pid may be a short-lived shell
+//     wrapper — probing it would sweep a perfectly live session — so guessed
+//     pids are used for row correlation only, never for liveness,
+//   · only rows older than a grace window, so a row written moments ago by a
+//     process racing its own exit cannot flap.
+// Anything the probe cannot decide falls back to the TTL rule — the sweep can
+// only ever REMOVE provably-dead rows earlier, never keep rows longer.
+// The grace deliberately EXCEEDS the MCP heartbeat interval (60s in
+// mcp-presence.mjs — not imported here because that module imports this one):
+// a session that is still writing heartbeats keeps its row's age under the
+// grace, so even a WRONGLY-declared host pid (say, a stale KLYPIX_HOST_PID
+// leaked from a shell profile) can never sweep a session that is actively
+// alive. Only silent rows — the crash shape the sweep exists for — get probed.
+export const DEAD_HOST_GRACE_MS = 90 * 1000;
+
+// kill(pid, 0) is the portable liveness probe (works on Windows via
+// OpenProcess). ESRCH ⇒ no such process; EPERM/EACCES ⇒ exists but owned by
+// someone else ⇒ alive. Anything else — invalid input or an error code this
+// table doesn't know — returns null ("cannot say"), NEVER false: an unproven
+// death must fall back to TTL, because a false "dead" erases live presence.
+export function isProcessAlive(pid) {
+  const n = Number(pid);
+  if (!Number.isInteger(n) || n <= 0) return null;
+  try { process.kill(n, 0); return true; }
+  catch (err) {
+    if (err?.code === 'ESRCH') return false;
+    if (err?.code === 'EPERM' || err?.code === 'EACCES') return true;
+    return null;
+  }
+}
+
+export function isDeadHostRow(session, now = Date.now(), probe = isProcessAlive) {
+  if (!session || session.via === 'cloud') return false;
+  if (String(session.hostPidSource || '') !== 'env') return false;
+  if (!session.machine || String(session.machine) !== String(MACHINE_ID)) return false;
+  if (now - Number(session.lastSeen || 0) < DEAD_HOST_GRACE_MS) return false;
+  return probe(session.hostPid) === false;
+}
+
 // A lane write can legitimately FAIL: the lock is held and we give up rather than
 // clobber a peer's just-posted message. That path returned listActiveSessions(),
 // i.e. the exact same shape as a success — so a dropped heartbeat was
@@ -405,6 +452,9 @@ function pruneSessions(sessions, now) {
   const out = [];
   for (const session of (Array.isArray(sessions) ? sessions : [])) {
     if (!session?.id) continue;
+    // Dead-host sweep: a row whose host process is provably gone is removed on
+    // the next lane touch instead of lingering for the full TTL window.
+    if (isDeadHostRow(session, now)) continue;
     const hadChannels = session.channelSeen
       && typeof session.channelSeen === 'object'
       && !Array.isArray(session.channelSeen)
@@ -691,6 +741,7 @@ export function upsertSession({
   transportStatus = null,
   cwd = null,
   hostPid = null,
+  hostPidSource = null,
   logicalSessionId = null,
   identitySource = null,
   aliases,
@@ -782,6 +833,16 @@ export function upsertSession({
       // Host-process correlation is diagnostic topology only. A desktop parent
       // can own many chats, so hostPid must never imply identity or deduping.
       hostPid: Number(hostPid) || previous.hostPid || null,
+      // Provenance of the pid decides what it may be used for: 'env' (declared
+      // by the host itself, safe to liveness-probe) vs 'ppid' (a best-effort
+      // parent guess, correlation only). ADDITIVE — absent means unknown, and
+      // unknown is never probed. Kept aligned with the pid it describes: a new
+      // pid without a declared source resets the field rather than inheriting
+      // the previous pid's provenance.
+      hostPidSource: Number(hostPid)
+        ? (hostPidSource ? String(hostPidSource).slice(0, 16)
+          : (Number(hostPid) === Number(previous.hostPid) ? previous.hostPidSource || null : null))
+        : previous.hostPidSource || null,
       logicalSessionId: recipientKey(logicalSessionId || previous.logicalSessionId || '') || null,
       identitySource: String(identitySource || previous.identitySource || 'provisional').slice(0, 80),
       aliases: normalizeAliases(aliases === undefined ? previous.aliases : [...(previous.aliases || []), ...(aliases || [])], id),
@@ -1043,8 +1104,15 @@ export function endSession({ brainPath, id, home, now = Date.now(), expectedPid 
     endedSessions.push({ id: recipientKey(row?.logicalSessionId || row?.id || id), endedAt: now,
       aliases: normalizeAliases(identities, row?.logicalSessionId || row?.id || id) });
     endedSessions = endedSessions.slice(-ENDED_SESSION_CAP);
+    // The sweep also removes transport twins that never completed id adoption:
+    // an mcp-<pid> row whose logicalSessionId names the ended identity IS this
+    // session and must not linger until its own TTL. Rotation stays safe — a
+    // NEW conversation created after SessionEnd(A) carries its OWN id as
+    // logicalSessionId (rotateEndedSessionIdentity sets logicalSessionId=toKey
+    // and never aliases A), so it can never match A's identity set here.
     const kept = sessions.filter((session) => !identities.includes(recipientKey(session.id))
-      && !normalizeAliases(session.aliases).some((alias) => identities.includes(alias)));
+      && !normalizeAliases(session.aliases).some((alias) => identities.includes(alias))
+      && !(session.logicalSessionId && identities.includes(recipientKey(session.logicalSessionId))));
     fs.mkdirSync(path.dirname(laneFile), { recursive: true });
     writeLaneFileAtomic(laneFile, JSON.stringify({
       ...data,
@@ -1071,6 +1139,7 @@ export function rotateEndedSessionIdentity({
   surface = 'mcp',
   cwd = null,
   hostPid = null,
+  hostPidSource = null,
   identitySource = 'mcp-request',
   home,
   now = Date.now(),
@@ -1129,6 +1198,8 @@ export function rotateEndedSessionIdentity({
       deliveryReachability: sessionDeliveryReachability({ channels: Object.keys(channelSeen), transport }),
       cwd: cwd ? path.resolve(cwd) : (existing?.cwd || path.dirname(brainPath)),
       hostPid: Number(hostPid) || existing?.hostPid || null,
+      hostPidSource: (Number(hostPid) && hostPidSource) ? String(hostPidSource).slice(0, 16)
+        : existing?.hostPidSource || null,
       logicalSessionId: toKey,
       identitySource: String(identitySource || 'mcp-request').slice(0, 80),
       // Never attach A as an alias: targeting A after its close must continue
@@ -1172,6 +1243,7 @@ export function switchMcpSessionIdentity({
   surface = 'mcp',
   cwd = null,
   hostPid = null,
+  hostPidSource = null,
   identitySource = 'mcp-request',
   home,
   now = Date.now(),
@@ -1270,6 +1342,8 @@ export function switchMcpSessionIdentity({
       deliveryReachability: sessionDeliveryReachability({ channels: Object.keys(channelSeen), transport }),
       cwd: cwd ? path.resolve(cwd) : (existing?.cwd || path.dirname(brainPath)),
       hostPid: Number(hostPid) || existing?.hostPid || null,
+      hostPidSource: (Number(hostPid) && hostPidSource) ? String(hostPidSource).slice(0, 16)
+        : existing?.hostPidSource || null,
       logicalSessionId: toKey,
       identitySource: String(identitySource || 'mcp-request').slice(0, 80),
       // Even a stale/pre-fix B row must not retain A as a targeting alias.
@@ -1895,39 +1969,127 @@ const clientLabel = (session) => {
   return client.replace(/(^|[-_ ])([a-z])/g, (_m, prefix, letter) => `${prefix}${letter.toUpperCase()}`);
 };
 
+// 'mcp'/'unknown' are placeholders (getClientVersion() is optional) — only a
+// concretely known client name may VETO a fold; a placeholder stays compatible.
+const specificClient = (client) => {
+  const value = String(client || '').toLowerCase();
+  return value && value !== 'mcp' && value !== 'unknown' ? value : null;
+};
+
+// Group live lane rows into LOGICAL sessions for rendering. One conversation
+// can hold multiple transport rows when id adoption failed mid-flight (the
+// lifecycle id plus an mcp-<pid> provisional). Rendering each row as its own
+// session double-counts peers, so the footer merges — but merge order matters:
+//   1. exact logical identity (logicalSessionId || id) — always safe;
+//   2. pid-assisted fold, ONLY for an mcp-only row with no logical identity
+//      that shares machine + hostPid + a compatible client with EXACTLY ONE
+//      identity-anchored session. Codex runs many threads below one desktop
+//      pid, so any ambiguity fails open as separate sessions (hiding a real
+//      peer is worse than showing a twin twice — 2026-07-30 hardening).
+// This is a RENDER grouping only: lane rows, identity, message audiences and
+// conflict detection are untouched.
+export function mergePresenceRows(sessions) {
+  const rows = (Array.isArray(sessions) ? sessions : []).filter((row) => row?.id);
+  const keyOf = (row) => (recipientKey(row.logicalSessionId) || recipientKey(row.id)).toLowerCase();
+  const groups = new Map();
+  for (const row of rows) {
+    const key = keyOf(row);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(row);
+  }
+  const isAnchored = (group) => group.some((row) => recipientKey(row.logicalSessionId)
+    || (Array.isArray(row.channels) && row.channels.includes('lifecycle')));
+  const isFoldableOrphan = (group) => group.length === 1
+    && group.every((row) => !recipientKey(row.logicalSessionId)
+      && row.via !== 'cloud'
+      && Number(row.hostPid) > 0
+      && row.machine
+      && Array.isArray(row.channels) && row.channels.length
+      && row.channels.every((channel) => channel === 'mcp'));
+  const anchoredKeys = [...groups.keys()].filter((key) => isAnchored(groups.get(key)));
+  for (const [key, group] of [...groups.entries()]) {
+    if (!isFoldableOrphan(group)) continue;
+    const orphan = group[0];
+    const candidates = anchoredKeys.filter((anchorKey) => groups.get(anchorKey)?.some((row) => row.machine
+      && String(row.machine) === String(orphan.machine)
+      && Number(row.hostPid) === Number(orphan.hostPid)
+      && (!specificClient(row.client) || !specificClient(orphan.client)
+        || specificClient(row.client) === specificClient(orphan.client))));
+    if (candidates.length !== 1) continue;   // ambiguous or none → fail open
+    groups.get(candidates[0]).push(orphan);
+    groups.delete(key);
+  }
+  return [...groups.values()].map((groupRows) => {
+    const primary = groupRows.find((row) => Array.isArray(row.channels) && row.channels.includes('lifecycle'))
+      || groupRows.find((row) => recipientKey(row.logicalSessionId))
+      || [...groupRows].sort((a, b) => Number(b.lastSeen || 0) - Number(a.lastSeen || 0))[0];
+    // The freshest declared intent wins across the group's rows — a brain_sync
+    // scope declared on the mcp twin must not vanish behind a silent lifecycle
+    // row (the twin's channels/scope count TOWARD the session, never hidden).
+    const intentRow = [...groupRows]
+      .filter((row) => String(row.intent || '').trim())
+      .sort((a, b) => Number(b.intentAt || b.lastSeen || 0) - Number(a.intentAt || a.lastSeen || 0))[0] || primary;
+    return {
+      primary,
+      rows: groupRows,
+      channels: [...new Set(groupRows.flatMap((row) => Array.isArray(row.channels) ? row.channels : []))],
+      lastSeen: Math.max(...groupRows.map((row) => Number(row.lastSeen || 0)), 0),
+      intent: String(intentRow.intent || ''),
+      intentAt: intentRow.intentAt || null,
+      branch: primary.branch || groupRows.map((row) => row.branch).find(Boolean) || null,
+    };
+  });
+}
+
 export function formatPresenceMessage(sessions, selfId, { includeSolo = false, now = Date.now() } = {}) {
   const active = Array.isArray(sessions) ? sessions : [];
-  const others = active.filter((session) => session.id !== selfId);
+  const merged = mergePresenceRows(active);
+  const selfKey = recipientKey(selfId);
+  const isSelfGroup = (group) => group.rows.some((row) => recipientKey(row.id) === selfKey
+    || recipientKey(row.logicalSessionId) === selfKey
+    || normalizeAliases(row.aliases).includes(selfKey));
+  const others = merged.filter((group) => !isSelfGroup(group));
   if (!includeSolo && !others.length) return '';
 
   const counts = new Map();
-  for (const session of active) {
-    const label = clientLabel(session);
+  for (const group of merged) {
+    const label = clientLabel(group.primary);
     counts.set(label, (counts.get(label) || 0) + 1);
   }
   const mix = [...counts.entries()].map(([label, count]) => `${label} ${count}`).join(', ');
+  // When transports outnumber logical sessions, say so — folding a twin must
+  // never silently understate how many live connections the lane holds.
+  const connectionNote = active.length > merged.length
+    ? `; ${active.length} connections` : '';
   const lines = [
-    `KLYPIX session awareness: ${active.length} active session${active.length === 1 ? '' : 's'} on this project (${mix || 'none'}); ${others.length} other${others.length === 1 ? '' : 's'} besides this chat.`,
+    `KLYPIX session awareness: ${merged.length} active session${merged.length === 1 ? '' : 's'} on this project (${mix || 'none'}${connectionNote}); ${others.length} other${others.length === 1 ? '' : 's'} besides this chat.`,
   ];
   if (!others.length) {
     lines.push('Saved/recent chat rows are history, not active sessions; a session counts only while an authorized MCP connection or lifecycle adapter has heartbeated in the last 10 minutes.');
     return lines.join('\n');
   }
   lines.push('Other active sessions:');
-  for (const session of others.slice(0, 8)) {
-    const ageMin = Math.max(0, Math.round((now - Number(session.lastSeen || now)) / 60_000));
+  // Uniqueness is computed over the merged primaries: UUIDv7 ids started in the
+  // same window share a long time prefix, so each shown prefix grows (git
+  // short-hash style, floor 8) until it names exactly one session.
+  const prefixRows = merged.map((group) => group.primary);
+  for (const group of others.slice(0, 8)) {
+    const session = group.primary;
+    const ageMin = Math.max(0, Math.round((now - Number(group.lastSeen || now)) / 60_000));
     // A heartbeat refreshes lastSeen while carrying an old intent forward — show
     // the INTENT's own age when it meaningfully lags the heartbeat, so a
     // 100-minute-old task line can never read as "what they're doing right now".
-    const intentAgeMin = session.intentAt ? Math.max(0, Math.round((now - Number(session.intentAt)) / 60_000)) : null;
+    const intentAgeMin = group.intentAt ? Math.max(0, Math.round((now - Number(group.intentAt)) / 60_000)) : null;
     const intentAge = intentAgeMin !== null && intentAgeMin - ageMin > 3 ? ` (intent set ${intentAgeMin}m ago)` : '';
     const details = [
       clientLabel(session),
-      session.branch ? `branch ${session.branch}` : null,
-      session.intent ? `"${String(session.intent).slice(0, 90)}"${intentAge}` : null,
+      group.rows.length > 1 ? `${group.rows.length} connections` : null,
+      group.branch ? `branch ${group.branch}` : null,
+      group.intent ? `"${String(group.intent).slice(0, 90)}"${intentAge}` : null,
       `${ageMin}m ago`,
     ].filter(Boolean);
-    lines.push(`- ${String(session.id).slice(0, 8)}: ${details.join(' | ')}`);
+    const shortId = shortestUniqueSessionPrefix(prefixRows, session.id) || String(session.id).slice(0, 8);
+    lines.push(`- ${shortId}: ${details.join(' | ')}`);
   }
   // v1.32.0 law: a truncated list must never render as a complete one.
   if (others.length > 8) lines.push(`- …and ${others.length - 8} more live session(s) not listed — brain_doctor shows all.`);

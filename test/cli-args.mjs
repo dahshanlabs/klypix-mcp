@@ -73,6 +73,10 @@ const run = (args, { cwd = REPO, home = HOME_ROOT, timeout = 60_000 } = {}) => {
       USERPROFILE: home,
       KLYPIX_MCP_INSTALL_DIR: path.join(home, 'bundle'),
       KLYPIX_AUTO_UPDATE: '0',
+      // The suite runs from a source checkout that is only tagged at release
+      // commits; these cases test flag/dispatcher parity, not the released-tag
+      // deploy guard (locked separately by test/released-tag-guard.mjs).
+      KLYPIX_MCP_ALLOW_UNTAGGED: '1',
     },
   });
   return {

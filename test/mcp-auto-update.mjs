@@ -305,6 +305,10 @@ try {
         HOME: home,
         USERPROFILE: home,
         KLYPIX_MCP_INSTALL_DIR: brainDir,
+        // This spawns the REAL installer from the source checkout, which is
+        // only tagged at release commits — acknowledge the released-tag
+        // deploy guard (its own behavior is locked by test/released-tag-guard.mjs).
+        KLYPIX_MCP_ALLOW_UNTAGGED: '1',
       },
       encoding: 'utf8',
       // This spawns the REAL installer, which copies the engine plus ~106

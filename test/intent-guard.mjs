@@ -108,6 +108,12 @@ ok(laneRow().intent === '',
 clock += 1000;
 mcp.sync({ phase: 'start', intent: 'second task' });
 clock += 1000;
+// A checkpoint marks this as a deliberate multi-step task, so the following
+// complete is a true task boundary. (A complete with no results, no checkpoint,
+// moments after start is downgraded to a scope-preserving checkpoint — the
+// turn-end guard, covered in test/completion-guard.mjs.)
+mcp.sync({ phase: 'checkpoint' });
+clock += 1000;
 mcp.sync({ phase: 'complete' });
 ok(laneRow().intent === '' && (laneRow().files || []).length === 0,
   'phase complete clears intent and files');

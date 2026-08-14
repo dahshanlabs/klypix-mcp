@@ -10,6 +10,8 @@
 //   npx klypix-mcp install            # install / update the brain on this machine
 //   npx klypix-mcp install --force    # overwrite even a newer / dev-deployed brain
 //   npx klypix-mcp install --codex-hooks  # optional prompt/file awareness; Codex asks for trust
+//   npx klypix-mcp install --allow-untagged  # acknowledge deploying an UNTAGGED source checkout
+//                                            # (dev deploy; also KLYPIX_MCP_ALLOW_UNTAGGED=1)
 //
 // Never-throws-silently: it's an explicit CLI, so it reports what it did and exits
 // non-zero on a real failure. Never wires a broken settings.json (refuse + restore).
@@ -17,7 +19,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
-import { spawn } from 'child_process';
+import { execFileSync, spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 import {
     connectCodexMcpServer,
@@ -29,8 +31,9 @@ import {
     codexPresenceHookStatus,
     mergeCodexPresenceHooks,
 } from '../src/codex-hooks.mjs';
-import { brainInstallDecision } from '../src/install-version.mjs';
+import { brainInstallDecision, deploySourceDecision } from '../src/install-version.mjs';
 import { acquireInstallLockSync, releaseInstallLockSync } from '../src/install-lock.mjs';
+import { collectRepoState } from '../src/repo-state.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PKG_ROOT = path.resolve(__dirname, '..');
@@ -45,6 +48,11 @@ const VERSION = (() => { try { return JSON.parse(fs.readFileSync(path.join(PKG_R
 const FORCE = process.argv.includes('--force');
 const CODEX_HOOKS = process.argv.includes('--codex-hooks');
 const RUNTIME_ONLY = process.argv.includes('--runtime-only');
+// Released-tag deploy-guard acknowledgement. Deliberately a SEPARATE axis from
+// --force: --force is destination authority (overwrite what is installed),
+// this is source authority (knowingly deploy an untagged working tree).
+const ALLOW_UNTAGGED = process.argv.includes('--allow-untagged')
+    || process.env.KLYPIX_MCP_ALLOW_UNTAGGED === '1';
 
 const HOME = os.homedir();
 const CLAUDE_DIR = path.join(HOME, '.claude');
@@ -224,6 +232,52 @@ try {
         if (!RUNTIME_ONLY) reportCodex(wireCodex());
         process.exit(0);
     }
+
+    // ── Released-tag deploy guard (2026-08-14 bundle-currency incident) ──────
+    // A source checkout whose HEAD does not carry the release tag for its own
+    // package version is UNRELEASED code, yet this installer used to lay it
+    // down machine-globally with receipts claiming a clean npm delivery — the
+    // exact twin of the desktop near-miss that shipped this wave. Only
+    // PKG_ROOT's own git state is interrogated (never process.cwd(): the
+    // auto-update child runs the installer with the PROJECT as cwd), and only
+    // when PKG_ROOT itself contains a .git entry — an npm/npx tarball install
+    // has none and IS the released artifact, so it stays exempt; the registry
+    // channel is already tag-bound by publish.yml. The tag must point at HEAD
+    // (`git tag --points-at HEAD` semantics inside collectRepoState): the
+    // release tag names the exact evidence commit, so any non-HEAD comparison
+    // would certify code the tag never covered.
+    const checkout = exists(path.join(PKG_ROOT, '.git')) ? collectRepoState(PKG_ROOT) : null;
+    const sourceDecision = deploySourceDecision({ checkout, allowUntagged: ALLOW_UNTAGGED });
+    const checkoutLabel = `v${VERSION}, branch ${checkout?.branch || '(detached)'}, head ${checkout?.headShort || '?'}`;
+    if (sourceDecision.action === 'refuse') {
+        releaseInstallLockSync(installLock);
+        console.error(`✗ refusing to deploy an UNRELEASED source checkout machine-globally: ${checkoutLabel} — no release tag v${VERSION} at HEAD; no files were changed.`);
+        console.error('  Released installs come from the registry: npx -y klypix-mcp@latest install');
+        console.error('  To deliberately deploy this working tree (a dev deploy), acknowledge it: re-run with --allow-untagged or KLYPIX_MCP_ALLOW_UNTAGGED=1.');
+        console.error('  An acknowledged dev deploy is stamped dev-owned, so brain_doctor shows it and auto-update will not silently replace it.');
+        process.exit(1);
+    }
+    const untaggedSource = sourceDecision.source === 'untagged-working-tree';
+    // Deploy-time snapshot for ANY git-checkout deploy (tagged or acknowledged-
+    // untagged): the release tag certifies HEAD's bytes, not the working
+    // tree's, so uncommitted changes make even a TAGGED deploy differ from
+    // what was released — a clean `dirty:false` stamp would lie about exactly
+    // that (the receipt-honesty defect this wave exists to kill). An
+    // unreadable status degrades to false rather than inventing a DIRTY nag
+    // in every session brief. Tarball installs (checkout null) skip the spawn.
+    const sourceDirty = Boolean(checkout) && (() => {
+        try {
+            return execFileSync('git', ['status', '--porcelain'], {
+                cwd: PKG_ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 1500,
+            }).trim().length > 0;
+        } catch { return false; }
+    })();
+    if (untaggedSource) {
+        console.log(`• untagged source deploy acknowledged: ${checkoutLabel}${sourceDirty ? ' (working tree DIRTY)' : ''} — receipts record a dev-owned install; a later released install needs --force.`);
+    } else if (sourceDirty) {
+        console.log(`⚠ release-tagged checkout has uncommitted changes (${checkoutLabel}) — deployed bytes differ from the release; stamping dirty:true so brain_doctor surfaces it.`);
+    }
+
     fs.mkdirSync(BRAIN_DIR, { recursive: true });
     // 1) runtime dependency CLOSURE (jszip+fractional-indexing for the hook/engine,
     //    @modelcontextprotocol/sdk+zod for the local MCP server). Resolve each via
@@ -281,7 +335,7 @@ try {
     // canvas-view-app.html is the canvas_view MCP App UI — staged raw (an HTML
     // file must never get a JS-comment banner) beside the flat server, which
     // resolves it via its ./canvas-view-app.html candidate path.
-    for (const f of ['global-brain-hook.mjs', 'brain-semantic.mjs', 'semantic-memory.mjs', 'brain-note.mjs', 'brain-git-hook.mjs', 'git-capture-install.mjs', 'brain-history.mjs', 'brain-graveyard.mjs', 'klypix-format.mjs', 'klypix-core.mjs', 'brain-write-lock.mjs', 'agent-rules.mjs', 'brain-doctor.mjs', 'agent-presence.mjs', 'mcp-presence.mjs', 'result-reconcile.mjs', 'finding-routing.mjs', 'presence-relay.mjs', 'mcp-supervisor.mjs', 'mcp-auto-update.mjs', 'runtime-inspector.mjs', 'project-graph.mjs', 'remote-client.mjs', 'bench.mjs', 'codex-brain-hook.mjs', 'codex-hooks.mjs', 'canvas-view-app.html']) {
+    for (const f of ['global-brain-hook.mjs', 'brain-semantic.mjs', 'semantic-memory.mjs', 'brain-note.mjs', 'brain-git-hook.mjs', 'git-capture-install.mjs', 'brain-history.mjs', 'brain-graveyard.mjs', 'klypix-format.mjs', 'klypix-core.mjs', 'brain-write-lock.mjs', 'agent-rules.mjs', 'brain-doctor.mjs', 'agent-presence.mjs', 'mcp-presence.mjs', 'repo-state.mjs', 'result-reconcile.mjs', 'finding-routing.mjs', 'presence-relay.mjs', 'mcp-supervisor.mjs', 'mcp-auto-update.mjs', 'runtime-inspector.mjs', 'project-graph.mjs', 'remote-client.mjs', 'bench.mjs', 'codex-brain-hook.mjs', 'codex-hooks.mjs', 'canvas-view-app.html']) {
         const s = path.join(SRC, f); if (exists(s)) staged.push({ dst: f, content: fs.readFileSync(s, 'utf8') });
     }
     for (const [src, dst] of [
@@ -344,19 +398,38 @@ try {
     // a crash between receipts remains recoverable because the next installer
     // compares both and keeps the highest valid Brain Core version.
     const installedAt = new Date().toISOString();
+    // Receipt honesty (2026-08-14): an acknowledged untagged source deploy is
+    // a DEV delivery — stamping it 'npm'/dirty:false made unreleased code
+    // byte-for-byte indistinguishable from a released install. 'dev' is
+    // existing receipt vocabulary (brainInstallDecision's dev-owned preserve,
+    // auto-update's dev skip, doctor's channel/dev/dirty rendering all consume
+    // it); sourceSha/branch are additive fields for post-hoc audit. dev:true
+    // goes in BOTH receipts because the runtime receipt commits first — a
+    // crash between the two writes must not leave a dev deploy unmarked.
     const runtime = {
         protocol: 1,
         version: VERSION,
         worker: 'klypix-mcp-worker.mjs',
-        channel: 'npm',
+        channel: untaggedSource ? 'dev' : 'npm',
+        ...(untaggedSource ? { dev: true, sourceSha: checkout?.headShort || null, branch: checkout?.branch || null } : {}),
         installedAt,
         files: Object.fromEntries(staged.map(st => [st.dst, crypto.createHash('sha256').update(st.content).digest('hex')])),
     };
     const runtimePath = path.join(BRAIN_DIR, '.mcp-runtime.json');
     fs.writeFileSync(runtimePath + '.klypix-new', JSON.stringify(runtime, null, 2) + '\n', 'utf8');
     fs.renameSync(runtimePath + '.klypix-new', runtimePath);
+    // A tagged-but-DIRTY checkout keeps via:'npm' (the tag still names the
+    // payload identity, and dev:true would stop auto-update from healing the
+    // machine back to clean released bytes) but stamps dirty:true + the audit
+    // fields — doctor's DIRTY line and the hook's dirty nag both read the
+    // stamp. The clean released path stays byte-identical to pre-guard.
+    const versionStamp = untaggedSource
+        ? { brainVersion: VERSION, via: 'dev', dev: true, dirty: sourceDirty, sourceSha: checkout?.headShort || null, branch: checkout?.branch || null, installedAt }
+        : sourceDirty
+            ? { brainVersion: VERSION, via: 'npm', dirty: true, sourceSha: checkout?.headShort || null, branch: checkout?.branch || null, installedAt }
+            : { brainVersion: VERSION, via: 'npm', dirty: false, installedAt };
     const versionPath = path.join(BRAIN_DIR, '.brain-version.json');
-    fs.writeFileSync(versionPath + '.klypix-new', JSON.stringify({ brainVersion: VERSION, via: 'npm', dirty: false, installedAt }, null, 2), 'utf8');
+    fs.writeFileSync(versionPath + '.klypix-new', JSON.stringify(versionStamp, null, 2), 'utf8');
     fs.renameSync(versionPath + '.klypix-new', versionPath);
 
     // 7) migrate THIS project's .mcp.json off npx onto the now-installed local bundle

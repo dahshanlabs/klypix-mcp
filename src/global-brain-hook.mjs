@@ -476,6 +476,38 @@ function clearDrainedOrphans(paths) {
 }
 const SESSION_FRESH_MS = 10 * 60 * 1000;   // a lane unseen for 10min is treated as ended
 const MCP_SESSION_FRESH_MS = 3 * 60 * 1000; // an mcp-channel heartbeat is dead after 3min (matches agent-presence)
+// ── Dead-host sweep (BEHAVIOR PARITY with agent-presence.mjs isDeadHostRow —
+// duplicated because this hook stays free of sibling static imports; the
+// canonical rule + rationale live there). A row whose host process is provably
+// dead is swept on the next lane touch instead of lingering for the full TTL.
+// Narrow by design: same machine only, host-DECLARED ('env') pids only (a
+// 'ppid' guess may be a transient shell wrapper), and only past a grace window
+// that EXCEEDS the 60s MCP heartbeat interval — a still-heartbeating session
+// can never be probed, so even a wrongly-declared host pid cannot sweep it.
+const DEAD_HOST_GRACE_MS = 90 * 1000;
+// Same machine-identity formula as agent-presence.mjs MACHINE_ID (sha1 16-hex
+// of hostname|platform|username) — rows stamped here and there must compare equal.
+const MACHINE_ID = (() => {
+    try { return crypto.createHash('sha1').update(`${os.hostname()}|${os.platform()}|${os.userInfo().username}`).digest('hex').slice(0, 16); }
+    catch { return crypto.createHash('sha1').update(`${os.hostname?.() || 'unknown'}|${os.platform?.() || 'unknown'}`).digest('hex').slice(0, 16); }
+})();
+const isProcessAlive = (pid) => {
+    const n = Number(pid);
+    if (!Number.isInteger(n) || n <= 0) return null;   // unknown — never "dead"
+    try { process.kill(n, 0); return true; }
+    catch (err) {
+        if (err?.code === 'ESRCH') return false;       // proven: no such process
+        if (err?.code === 'EPERM' || err?.code === 'EACCES') return true; // exists, not ours
+        return null;   // unrecognized error — "cannot say", never "dead" (TTL rules)
+    }
+};
+const isDeadHostRow = (s, now) => {
+    if (!s || s.via === 'cloud') return false;
+    if (String(s.hostPidSource || '') !== 'env') return false;
+    if (!s.machine || String(s.machine) !== MACHINE_ID) return false;
+    if (now - Number(s.lastSeen || 0) < DEAD_HOST_GRACE_MS) return false;
+    return isProcessAlive(s.hostPid) === false;
+};
 // The host CLI's pid (Claude Code exports CLAUDE_PID to every child, including
 // this hook AND the MCP server it spawns): the correlation key that lets the two
 // halves of ONE logical session — the lifecycle row and the mcp row — recognize
@@ -563,6 +595,7 @@ const pruneSessions = (list, now) => {
     const out = [];
     for (const s of (Array.isArray(list) ? list : [])) {
         if (!s || !s.id) continue;
+        if (isDeadHostRow(s, now)) continue;   // provably-dead host ⇒ sweep now, not at TTL
         const hadChannels = s.channelSeen && typeof s.channelSeen === 'object' && !Array.isArray(s.channelSeen) && Object.keys(s.channelSeen).length > 0;
         const channelSeen = freshChannelSeen(s.channelSeen, now);
         const priorChannelOwners = s.channelOwners && typeof s.channelOwners === 'object' && !Array.isArray(s.channelOwners)
@@ -685,7 +718,11 @@ function touchSession(sid, patch = {}) {
                 client: 'claude-code', surface: prev.surface || 'claude-code',
                 logicalSessionId: sid, identitySource: 'claude-lifecycle',
                 cwd: prev.cwd || CWD,
-                ...(HOST_PID ? { hostPid: HOST_PID } : {}),
+                // CLAUDE_PID is host-DECLARED, so its provenance is 'env' — the
+                // dead-host sweep may probe it. `machine` scopes that probe to
+                // this machine's pid namespace (same formula as agent-presence).
+                ...(HOST_PID ? { hostPid: HOST_PID, hostPidSource: 'env' } : {}),
+                machine: MACHINE_ID,
                 branch: patch.branch !== undefined ? patch.branch : (prev.branch ?? null),
                 intent: nextIntent,
                 ...(intentChanged ? { intentAt: now, intentSource: 'prompt' } : {}),
@@ -770,6 +807,28 @@ function livePeers(sid) {
     try { return pruneSessions(readSessions(), Date.now()).filter(s => s.id !== sid && s.pid !== process.pid && !isOwnTwin(s)); }
     catch { return []; }
 }
+// Unique id prefixes (PARITY with agent-presence.mjs shortestUniqueSessionPrefix
+// — duplicated because this hook stays free of sibling static imports): two
+// same-window UUIDv7 peers share a long time prefix, so a fixed 8-char slice can
+// render both identically — and the `🧠 MSG [<id-prefix>]` router below is
+// fail-closed on ambiguity, making that shown prefix silently unroutable. Grow
+// each prefix (git short-hash style, floor 8) until it names exactly one row.
+// Uses msgSessionIdentityKeys (defined later in this module; safe — only called
+// at runtime, long after module init) so the shown prefix is unique over the
+// SAME key set the router resolves against.
+function shortestUniquePeerPrefix(rows, id, minLength = 8) {
+    const wanted = String(id || '').trim().toLowerCase();
+    const row = rows.find(r => msgSessionIdentityKeys(r).includes(wanted));
+    if (!row) return String(id || '').slice(0, minLength);
+    const canonical = String(row.id || '');
+    for (let size = minLength; size < canonical.length; size++) {
+        const prefix = canonical.slice(0, size).toLowerCase();
+        if (rows.filter(r => msgSessionIdentityKeys(r).some(key => key.startsWith(prefix))).length === 1) {
+            return canonical.slice(0, size);
+        }
+    }
+    return canonical;
+}
 // Zero-cost-UNLESS-a-peer-exists footer: lists other live sessions and ESCALATES
 // when one shares your branch or is editing files you changed. Empty string when
 // you're solo (the common case) — preserves the per-prompt "nothing → zero tokens"
@@ -816,7 +875,9 @@ function peerFooter(sid) {
         let warn = '';
         if (shared.length) warn = `  · ⚠️ both edited: ${shared.slice(0, 5).join(', ')} — expect a conflict, KEEP BOTH`;
         else if (p.branch && myBranch && p.branch === myBranch) warn = '  · ⚠️ same branch — pull/rebase before you commit';
-        lines.push(`- session ${String(p.id).slice(0, 8)} · ${bits.join(' · ')}${warn}`);
+        // Unique over the full live list (not just shown peers) — the MSG router
+        // resolves a prefix against every row, so uniqueness must match that set.
+        lines.push(`- session ${shortestUniquePeerPrefix(list, p.id)} · ${bits.join(' · ')}${warn}`);
     }
     // v1.32.0 law: a truncated list must never render as a complete one. This
     // overflow line is unconditional — never subject to any budget.

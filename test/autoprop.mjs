@@ -202,7 +202,12 @@ const REUSED_ISO = new Date(Date.now() - 10 * 60 * 1000).toISOString();
 }
 
 function runInstall(home, projectCwd, args = []) {
-  const env = { ...process.env, HOME: home, USERPROFILE: home };
+  // These cases exercise the install MECHANICS (atomicity, locks, migration),
+  // and the suite runs from a source checkout that is only tagged at release
+  // commits — so acknowledge the released-tag deploy guard explicitly. The
+  // guard's own refusal/ack/receipt behavior is locked by
+  // test/released-tag-guard.mjs against dedicated git fixtures.
+  const env = { ...process.env, HOME: home, USERPROFILE: home, KLYPIX_MCP_ALLOW_UNTAGGED: '1' };
   delete env.KLYPIX_BRAIN_NO_MAIN;
   return execFileSync(process.execPath, [INSTALL, ...args], { cwd: projectCwd, env, encoding: 'utf8' });
 }
@@ -221,7 +226,7 @@ function runInstall(home, projectCwd, args = []) {
   fs.writeFileSync(path.join(proj, '.mcp.json'), JSON.stringify({ mcpServers: { 'klypix-canvas': { command: 'npx', args: ['-y', 'klypix-mcp', '--vault', '.'] } } }, null, 2));
   runInstall(home, proj);
   const bd = path.join(home, '.claude', 'project-brain');
-  for (const f of ['global-brain-hook.mjs', 'klypix-format.mjs', 'klypix-core.mjs', 'semantic-memory.mjs', 'brain-write-lock.mjs', 'klypix-mcp-server.mjs', 'klypix-mcp-worker.mjs', 'mcp-supervisor.mjs', 'mcp-auto-update.mjs', 'klypix-conformance.mjs', 'klypix-runtime.mjs', 'klypix-semantic-warm.mjs', 'runtime-inspector.mjs', 'agent-rules.mjs', 'brain-doctor.mjs', 'agent-presence.mjs', 'mcp-presence.mjs', 'remote-client.mjs', 'result-reconcile.mjs', 'presence-relay.mjs', 'codex-brain-hook.mjs', 'codex-hooks.mjs']) {
+  for (const f of ['global-brain-hook.mjs', 'klypix-format.mjs', 'klypix-core.mjs', 'semantic-memory.mjs', 'brain-write-lock.mjs', 'klypix-mcp-server.mjs', 'klypix-mcp-worker.mjs', 'mcp-supervisor.mjs', 'mcp-auto-update.mjs', 'klypix-conformance.mjs', 'klypix-runtime.mjs', 'klypix-semantic-warm.mjs', 'runtime-inspector.mjs', 'agent-rules.mjs', 'brain-doctor.mjs', 'agent-presence.mjs', 'mcp-presence.mjs', 'repo-state.mjs', 'remote-client.mjs', 'result-reconcile.mjs', 'presence-relay.mjs', 'codex-brain-hook.mjs', 'codex-hooks.mjs']) {
     ok(fs.existsSync(path.join(bd, f)), `D: installed ${f}`);
   }
   ok(fs.existsSync(path.join(bd, 'node_modules', 'jszip')), 'D: runtime deps (jszip) copied');
@@ -323,7 +328,7 @@ function runInstall(home, projectCwd, args = []) {
   ok(!fs.existsSync(path.join(bd, '.install.lock')), 'D: the install lock is released after completion');
 
   // concurrency: two installs at once are idempotent (lock serializes; no torn state)
-  const env = { ...process.env, HOME: home, USERPROFILE: home }; delete env.KLYPIX_BRAIN_NO_MAIN;
+  const env = { ...process.env, HOME: home, USERPROFILE: home, KLYPIX_MCP_ALLOW_UNTAGGED: '1' }; delete env.KLYPIX_BRAIN_NO_MAIN;
   const { execFile } = await import('child_process');
   const run = () => new Promise(res => execFile(process.execPath, [INSTALL], { cwd: proj, env }, (e) => res(e ? 1 : 0)));
   const [a, b] = await Promise.all([run(), run()]);

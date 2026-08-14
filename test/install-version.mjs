@@ -4,6 +4,7 @@ import path from 'path';
 import {
   brainInstallDecision,
   compareBrainVersions,
+  deploySourceDecision,
   highestInstalledBrainVersion,
   parseBrainVersion,
 } from '../src/install-version.mjs';
@@ -37,10 +38,44 @@ ok(highestInstalledBrainVersion({ stamp: { brainVersion: '1.65.0' }, runtime: { 
 ok(brainInstallDecision({ candidateVersion: '1.66.0', stamp: { appVersion: '1.3.999', via: 'app' }, runtime: { version: '1.67.0' } }).action === 'preserve',
   'legacy app-only stamp falls back to the committed runtime version');
 
+// ── released-tag deploy-source policy (2026-08-14 bundle-currency incident) ──
+// The classifier is pure: callers feed it collectRepoState(PKG_ROOT) facts.
+const taggedCheckout = { packageVersion: '1.68.0', isReleaseTag: true, branch: 'master', headShort: 'abc1234' };
+const untaggedCheckout = { packageVersion: '1.69.0', isReleaseTag: false, branch: 'core/feature', headShort: 'def5678' };
+ok(deploySourceDecision({ checkout: null }).action === 'proceed'
+  && deploySourceDecision({ checkout: null }).source === 'released-artifact',
+'a non-git source (npm/npx tarball) is exempt — it IS the released artifact');
+ok(deploySourceDecision({ checkout: taggedCheckout }).action === 'proceed'
+  && deploySourceDecision({ checkout: taggedCheckout }).source === 'released-tag',
+'a checkout whose HEAD carries its own release tag proceeds');
+ok(deploySourceDecision({ checkout: untaggedCheckout }).action === 'refuse'
+  && deploySourceDecision({ checkout: untaggedCheckout }).source === 'untagged-working-tree',
+'an untagged working tree is REFUSED without explicit acknowledgement');
+ok(deploySourceDecision({ checkout: untaggedCheckout, allowUntagged: true }).action === 'proceed'
+  && deploySourceDecision({ checkout: untaggedCheckout, allowUntagged: true }).acknowledged === true,
+'--allow-untagged / KLYPIX_MCP_ALLOW_UNTAGGED=1 acknowledges an untagged deploy');
+ok(deploySourceDecision({ checkout: { packageVersion: null, isReleaseTag: false } }).action === 'proceed'
+  && deploySourceDecision({ checkout: { packageVersion: null, isReleaseTag: false } }).source === 'unversioned-source',
+'a checkout without a package version defers to the invalid-candidate refusal (no double guess)');
+
+// Dev ownership survives a crash between the two receipt writes: the installer
+// commits .mcp-runtime.json (dev:true) BEFORE .brain-version.json, and the dev
+// files are already fully deployed by then — so a runtime-only dev marker must
+// preserve exactly like the stamp marker does.
+ok(brainInstallDecision({ candidateVersion: '1.68.0', stamp: { brainVersion: '1.68.0', via: 'npm' }, runtime: { version: '1.68.0', dev: true } }).reason === 'dev-owned',
+  'a dev marker only in the runtime receipt (torn stamp write) still preserves the dev deploy');
+ok(brainInstallDecision({ candidateVersion: '1.68.0', stamp: { brainVersion: '1.68.0', via: 'npm' }, runtime: { version: '1.68.0', dev: true }, force: true }).action === 'install',
+  '--force still overrides a runtime-only dev marker');
+
 const installerSource = fs.readFileSync(new URL('../bin/klypix-install.mjs', import.meta.url), 'utf8');
 ok(installerSource.indexOf('const installLock = acquireInstallLockSync(BRAIN_DIR)')
   < installerSource.indexOf('const decision = brainInstallDecision('),
   'the real npm installer acquires the shared lock before reading its version verdict');
+ok(installerSource.indexOf('const decision = brainInstallDecision(')
+  < installerSource.indexOf('const sourceDecision = deploySourceDecision(')
+  && installerSource.indexOf('const sourceDecision = deploySourceDecision(')
+  < installerSource.indexOf('fs.mkdirSync(BRAIN_DIR'),
+'the released-tag guard runs after the version verdict (preserve paths deploy nothing) and before any file is laid down');
 
 const lockDir = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-install-lock-'));
 try {

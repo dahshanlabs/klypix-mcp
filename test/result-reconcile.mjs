@@ -310,6 +310,10 @@ ok(validLaneBlocked.isError === true
 const mcpE = presence('result-session-e', 4);
 mcpE.start();
 mcpE.sync({ phase: 'start', intent: 'legacy no-result task', files: ['e.txt'] });
+// The intervening checkpoint marks a deliberate multi-step task; without it a
+// result-less complete this close to start is downgraded by the turn-end guard
+// (test/completion-guard.mjs) instead of exercising the legacy path.
+mcpE.sync({ phase: 'checkpoint' });
 const legacy = mcpE.sync({ phase: 'complete' });
 ok(legacy.structured.status === 'complete' && legacy.isError !== true,
   'completion without a result claim preserves the existing backward-compatible path');

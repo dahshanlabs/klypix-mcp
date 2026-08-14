@@ -459,7 +459,10 @@ class Supervisor {
           channel: 'mcp',
           event: 'McpHibernated',
           transportStatus: 'pull-only',
+          // ppid provenance: correlation only — the dead-host sweep never
+          // probes a guessed pid (see agent-presence.mjs isDeadHostRow).
           hostPid: this.parentPid,
+          hostPidSource: 'ppid',
         });
         // Hibernation intentionally has no model-context consumer. Peek only:
         // a best-effort UI warning may wake the human, but the durable note stays
@@ -984,6 +987,7 @@ class Supervisor {
             brainPath: who.brainPath, id: who.id, client: who.client,
             surface: who.surface, branch: who.branch, channel: 'mcp',
             event: 'McpRecoveryFailed', transportStatus: 'impaired', hostPid: this.parentPid,
+            hostPidSource: 'ppid',   // correlation only, never liveness-probed
           });
         } catch { /* TTL remains the backstop */ }
       }

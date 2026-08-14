@@ -142,6 +142,26 @@ function fixture(tag) {
     f.cleanup();
 }
 
+// ── P7b: peer footer id prefixes grow until unique (2026-08-14 parity) ───────
+// Two same-window UUIDv7 sessions share a long time prefix; a fixed 8-char
+// slice rendered both identically, and the `🧠 MSG [<id-prefix>]` router is
+// fail-closed on ambiguity — so the shown prefix was silently unroutable.
+{
+    const f = fixture('peer-prefix');
+    fs.writeFileSync(path.join(f.proj, 'brain.klypix'), await buildKlypixMap({
+        title: 'brain', areas: [{ title: 'Goal', cards: [{ text: 'seed' }] }],
+    }));
+    const shared = 'shared-prefix-2026';   // well past the 8-char floor
+    f.run(['--prompt'], { session_id: `${shared}-alpha`, prompt: 'zzz nothing matches this one' });
+    f.run(['--prompt'], { session_id: `${shared}-beta`, prompt: 'zzz nothing matches this one' });
+    const out = f.run(['--prompt'], { session_id: 'observer-session', prompt: 'zzz nothing matches this one' });
+    ok(out.includes(`session ${shared}-a `) && out.includes(`session ${shared}-b `),
+        'P7b: same-window peer ids grow past the 8-char floor until each prefix is unique');
+    ok(!out.includes(`session ${shared.slice(0, 8)} `),
+        'P7b: the old ambiguous fixed 8-char slice is gone from the footer');
+    f.cleanup();
+}
+
 // ── P9: harvested ship cards carry #auto ─────────────────────────────────────
 {
     const f = fixture('auto');

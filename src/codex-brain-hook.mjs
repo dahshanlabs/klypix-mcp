@@ -14,6 +14,7 @@ import {
   peekMessages,
   postPresenceMessage,
   receiveMessages,
+  shortestUniqueSessionPrefix,
   upsertSession,
 } from './agent-presence.mjs';
 import { recordCodexHookExecution } from './codex-hooks.mjs';
@@ -33,6 +34,21 @@ function readInput() {
     return {};
   }
 }
+
+// Best-available host pid for lane-row correlation (2026-08-14 wave). Codex
+// rows previously carried no hostPid at all, so the footer/doctor could never
+// group a lifecycle row with its MCP-worker sibling. KLYPIX_HOST_PID is a
+// host-declared contract (provenance 'env' — safe for the dead-host liveness
+// sweep); otherwise this hook's direct parent is a best-effort guess
+// (provenance 'ppid' — usable for row correlation only, NEVER probed for
+// liveness, because the parent may be a transient shell wrapper whose exit
+// says nothing about the session).
+const HOST_PID = (() => {
+  const envPid = Number(process.env.KLYPIX_HOST_PID || 0);
+  if (Number.isInteger(envPid) && envPid > 0) return { pid: envPid, source: 'env' };
+  const ppid = Number(process.ppid);
+  return Number.isInteger(ppid) && ppid > 0 ? { pid: ppid, source: 'ppid' } : { pid: null, source: null };
+})();
 
 // Thin binding of the engine's host-neutral ship observer to a Codex project
 // dir. Guarded on the export so an older bundled klypix-format degrades to no
@@ -214,26 +230,30 @@ export function stampReceivedMessages(messages, now = Date.now(),
   return leftovers.length ? [...out, ...leftovers].join('\n') : out.join('\n');
 }
 
-function formatConflictWarning(conflicts, event) {
+function formatConflictWarning(conflicts, event, sessions = []) {
   if (!conflicts.length) return '';
   const moment = event === 'PreToolUse' ? 'before this edit runs' : 'after this file operation';
+  // Grow each shown id (floor 12) until unique — same-window UUIDv7 peers
+  // otherwise render as one ambiguous prefix.
+  const shortId = (id) => shortestUniqueSessionPrefix(sessions, id, 12) || String(id).slice(0, 12);
   return [
     `KLYPIX BLOCKING exact-file overlap detected ${moment}:`,
     ...conflicts.map((peer) =>
-      `- ${String(peer.id).slice(0, 12)}${peer.intent ? ` "${String(peer.intent).slice(0, 90)}"` : ''}: ${peer.files.join(', ')}`),
+      `- ${shortId(peer.id)}${peer.intent ? ` "${String(peer.intent).slice(0, 90)}"` : ''}: ${peer.files.join(', ')}`),
     'Coordinate file ownership now. Do not continue overlapping edits until one session yields or the scopes are separated.',
   ].join('\n');
 }
 
-function queueConflictAlerts({ brainPath, sessionId, intent, conflicts, turnId }) {
+function queueConflictAlerts({ brainPath, sessionId, intent, conflicts, turnId, sessions = [] }) {
   const queued = [];
+  const selfShortId = shortestUniqueSessionPrefix(sessions, sessionId, 12) || String(sessionId).slice(0, 12);
   for (const peer of conflicts) {
     const filesKey = peer.files.map((file) => String(file).toLowerCase()).sort().join('|');
     const result = postPresenceMessage({
       brainPath,
       from: sessionId,
       to: peer.id,
-      text: `Automatic KLYPIX pre-edit overlap alert: ${String(sessionId).slice(0, 12)}`
+      text: `Automatic KLYPIX pre-edit overlap alert: ${selfShortId}`
         + `${intent ? ` is working on "${String(intent).slice(0, 110)}"` : ' is editing'}`
         + ` and reports the same file(s): ${peer.files.join(', ')}. Coordinate ownership now.`,
       dedupeKey: `hook-overlap|${sessionId}|${peer.id}|${turnId || 'turn'}|${filesKey}`,
@@ -304,6 +324,7 @@ async function main() {
     replaceFiles: humanTurn,
     event,
     channel: 'lifecycle',
+    ...(HOST_PID.pid ? { hostPid: HOST_PID.pid, hostPidSource: HOST_PID.source } : {}),
     logicalSessionId: sessionId,
     identitySource: 'codex-lifecycle',
     cwd,
@@ -327,6 +348,7 @@ async function main() {
       intent: me?.intent || '',
       conflicts,
       turnId: input.turn_id || input.turnId || '',
+      sessions,
     });
   }
   if (event === 'SessionStart') {
@@ -363,7 +385,7 @@ async function main() {
   }
   if (event === 'PreToolUse' || event === 'PostToolUse') {
     emitSystemMessage([
-      formatConflictWarning(conflicts, event),
+      formatConflictWarning(conflicts, event, sessions),
       stampReceivedMessages(messages, Date.now(), undefined, sessionId),
     ], event);
     return;

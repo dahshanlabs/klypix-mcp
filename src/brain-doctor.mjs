@@ -43,6 +43,19 @@ let gitCaptureLib = null;
 try { gitCaptureLib = await import('./git-capture-install.mjs'); } catch { gitCaptureLib = null; }
 let historyLib = null;
 try { historyLib = await import('./brain-history.mjs'); } catch { historyLib = null; }
+// repo-state powers the advisory CHECKOUT line (released-tag visibility). Same
+// failure-tolerant idiom: a half-updated flat bundle that predates the module
+// must degrade to omitting the line, never kill the doctor.
+let repoStateLib = null;
+try { repoStateLib = await import('./repo-state.mjs'); } catch { repoStateLib = null; }
+// agent-presence is the CANONICAL owner of the session-liveness rule (freshness
+// windows + dead-host sweep). The doctor deliberately keeps reading lane files
+// directly so it can diagnose a broken bundle, so this import is failure-
+// tolerant too: on a bundle without it, the local fallback literals below keep
+// the doctor alive — but a healthy bundle can no longer drift from the engine
+// (the exact drift that once produced three different live-session counts).
+let presenceLib = null;
+try { presenceLib = await import('./agent-presence.mjs'); } catch { presenceLib = null; }
 
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -56,7 +69,12 @@ const cmpSemver = (a, b) => { const pa = String(a || '').split('.').map(n => par
 
 const HOOK_MARK = 'global-brain-hook';
 const HOOK_EVENTS = ['SessionStart', 'UserPromptSubmit', 'Stop', 'PostToolUse'];
-const SESSION_FRESH_MS = 10 * 60 * 1000;   // matches the hook's lane-freshness window
+// Liveness windows imported from the canonical rule; literals are the LAST
+// RESORT for a bundle whose agent-presence predates the exports.
+const SESSION_FRESH_MS = Number(presenceLib?.SESSION_FRESH_MS) > 0
+  ? Number(presenceLib.SESSION_FRESH_MS) : 10 * 60 * 1000;
+const MCP_SESSION_FRESH_MS = Number(presenceLib?.MCP_SESSION_FRESH_MS) > 0
+  ? Number(presenceLib.MCP_SESSION_FRESH_MS) : 3 * 60 * 1000;
 
 // ── VERSION layer ────────────────────────────────────────────────────────────
 function inspectVersion(brainDir) {
@@ -256,8 +274,11 @@ function inspectSupervisors(brainDir, baked) {
 // Channel-aware liveness, mirroring agent-presence.mjs: an mcp-channel heartbeat
 // is dead after 3 minutes even though the flat 10-minute window keeps the row —
 // without this the hook, brain_sync, and doctor reported three different counts.
-const MCP_SESSION_FRESH_MS = 3 * 60 * 1000;
+// (Both windows are now imported from agent-presence at the top of this file.)
 const sessionLiveness = (s, now) => {
+  // Dead-host parity: a row every WRITER would sweep on its next lane touch
+  // must not render as live here. Guarded — an old bundle simply skips it.
+  if (typeof presenceLib?.isDeadHostRow === 'function' && presenceLib.isDeadHostRow(s, now)) return null;
   const channelSeen = (s?.channelSeen && typeof s.channelSeen === 'object' && !Array.isArray(s.channelSeen)) ? s.channelSeen : null;
   if (channelSeen && Object.keys(channelSeen).length) {
     const fresh = Object.entries(channelSeen)
@@ -468,6 +489,31 @@ export function inspect(opts = {}) {
     } catch { history = { available: true, count: 0, newestAt: null }; }
   }
   const tools = inspectTools(brainDir, PKG_ROOT);
+  // ── CHECKOUT (release-state visibility, 2026-08-14 incident) ──────────────
+  // Advisory, never a verdict layer: when the PROJECT itself is a versioned
+  // source checkout, report mechanically whether HEAD carries its own release
+  // tag — the 1.3.107 release shipped from an off-trunk branch because no
+  // surface made branch/release state visible at the moment of action, and
+  // doctor is the one client-neutral surface every agent can query. Only set
+  // when a git identity AND a package version exist (release state is
+  // meaningless without a version to be released); any probe failure omits
+  // the block. collectRepoState is bounded + 60s-cached, so this adds no
+  // meaningful cost to a doctor run.
+  let checkout = null;
+  if (repoStateLib && typeof repoStateLib.collectRepoState === 'function') {
+    try {
+      const state = repoStateLib.collectRepoState(projectDir);
+      if (state && state.packageVersion) {
+        checkout = {
+          branch: state.branch,
+          headShort: state.headShort,
+          version: state.packageVersion,
+          tagsAtHead: state.tagsAtHead,
+          releaseState: state.isReleaseTag ? 'released-tag' : 'untagged-working-tree',
+        };
+      }
+    } catch { checkout = null; }
+  }
   const env = opts.env || process.env;
   // MCP passes the adopted live id explicitly. The CLI can inherit a host id,
   // but never invents one: a guessed sender would display somebody else's note.
@@ -553,7 +599,10 @@ export function inspect(opts = {}) {
   const actions = [];
   if (!version.installed) actions.push('npx klypix-mcp install   # no brain installed on this machine');
   else {
-    if (version.dirty) actions.push('node scripts/deploy-brain.mjs   # running uncommitted (dirty) hook code — commit + re-deploy');
+    // The old remediation here named scripts/deploy-brain.mjs — a script that
+    // does not exist in the published package, so the one string every client
+    // renders verbatim was unrunnable. Point at commands that actually run.
+    if (version.dirty) actions.push('npx klypix-mcp install --force   # running uncommitted (dirty) source code — restore the released npm version, or commit and re-deploy deliberately with --allow-untagged');
     if (npm && npm.matches === false) actions.push(`npx klypix-mcp install   # installed brain v${version.baked} < npm latest v${npm.latest}`);
     if (running.matchesInstalled === false) actions.push(`/mcp reconnect (or restart the session)   # LIVE server v${running.version} ≠ installed v${version.baked} — the running MCP server is stale`);
     if (version.supervisorCapable && running.known && !supervisors.active) actions.push('/mcp reconnect once   # activate the zero-restart supervisor; compatible future core updates hot-swap automatically');
@@ -576,7 +625,9 @@ export function inspect(opts = {}) {
     }
   }
 
-  return { verdict, layers, drifted, readinessWarnings, version, running, supervisors, autoUpdate, hooks, codexSmart, codexHooks, gitCapture, history, tools, peers, sessions: peers, receipts: peers.receipts, receiptSessionId, harness, npm, decayGuard, project: { dir: projectDir, brainPath, hasBrain }, brainDir, actions };
+  // `checkout` is additive (schema-stable): downstream renderers keep parsing
+  // every existing field; it never feeds layers/verdict/actions by design.
+  return { verdict, layers, drifted, readinessWarnings, version, running, supervisors, autoUpdate, hooks, codexSmart, codexHooks, gitCapture, history, tools, peers, sessions: peers, receipts: peers.receipts, receiptSessionId, harness, npm, decayGuard, checkout, project: { dir: projectDir, brainPath, hasBrain }, brainDir, actions };
 }
 
 // One-line drift summary (empty when clean) — for a footer / status line.
@@ -722,6 +773,17 @@ export function render(r, opts = {}) {
           : gc.state === 'no-git' ? `${c.dim}not a git repo${c.rst}`
             : `${c.dim}${gc.state} — installs automatically at the next session start${c.rst}`;
     L.push(`${gmark} ${c.bold}GIT-CAP${c.rst}  ${detail}`);
+  }
+  // CHECKOUT — release state of the project's own source tree. Advisory only
+  // (never a verdict layer): its job is to make branch + released-tag truth
+  // visible at the moment of action, not to fail anything.
+  if (r.checkout) {
+    const where = `${r.checkout.branch ? `branch ${r.checkout.branch}` : 'detached HEAD'}, head ${r.checkout.headShort || '?'}`;
+    if (r.checkout.releaseState === 'released-tag') {
+      L.push(`${ok} ${c.bold}CHECKOUT${c.rst} source checkout at its release tag: v${r.checkout.version} (${where})`);
+    } else {
+      L.push(`${warn}${c.bold}CHECKOUT${c.rst} untagged working tree — v${r.checkout.version} has no release tag at HEAD (${c.yel}${where}${c.rst}) ${c.dim}· a build/release from here ships unreleased code (advisory)${c.rst}`);
+    }
   }
   // Restore points — say the count and the age, because "you can undo an
   // accidental delete" is only believable if the machine can show the receipts.

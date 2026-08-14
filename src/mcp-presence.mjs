@@ -26,6 +26,7 @@ import {
   rotateEndedSessionIdentity,
   removeSession,
   sessionDeliveryReachability,
+  shortestUniqueSessionPrefix,
   switchMcpSessionIdentity,
   upsertSession,
 } from './agent-presence.mjs';
@@ -35,10 +36,17 @@ import {
 // canonical copy lives in the pure module because that one is import-restricted
 // (crypto only), so it can never grow a dependency this file would inherit.
 import { normalizeFileKey } from './finding-routing.mjs';
+import { collectRepoState, repoStateWarnings } from './repo-state.mjs';
 import { recordResultManifests } from './result-reconcile.mjs';
 
 export const MCP_HEARTBEAT_MS = 60_000;
 export const MCP_INBOX_POLL_MS = 3_000;
+// Turn-end vs task-end (2026-08-14 wave): a phase "complete" carrying no result
+// evidence, landing this soon after the worker's task start with NO intervening
+// checkpoint, is mechanically indistinguishable from a per-turn sign-off (the
+// tool instruction reads per-turn to Codex). Such a complete is downgraded to a
+// scope-preserving checkpoint instead of wiping declared intent/files mid-task.
+export const PREMATURE_COMPLETE_WINDOW_MS = 3 * 60 * 1000;
 
 // Standard MCP server instructions are the approval-free awareness path. Hosts
 // that surface InitializeResult.instructions to the model learn the same
@@ -459,6 +467,9 @@ function formatTaskPresence(snapshot, now = Date.now()) {
     return lines.join('\n');
   }
   lines.push('Other active tasks:');
+  // UUIDv7 peers started in the same window share a long time prefix — grow
+  // each shown id (git short-hash style, floor 12) until it names one session.
+  const prefixRows = [snapshot.self, ...snapshot.peers].filter(Boolean);
   for (const peer of snapshot.peers.slice(0, 8)) {
     const intentAgeMin = peer.intentAgeMs !== null ? Math.round(peer.intentAgeMs / 60_000) : null;
     const heartbeatMin = Math.round(peer.ageMs / 60_000);
@@ -471,7 +482,8 @@ function formatTaskPresence(snapshot, now = Date.now()) {
       peer.intent ? `"${String(peer.intent).slice(0, 90)}"${intentAge}` : null,
       peer.files.length ? peer.files.slice(0, 4).join(', ') + (peer.files.length > 4 ? ` (+${peer.files.length - 4} more)` : '') : null,
     ].filter(Boolean);
-    lines.push(`- ${String(peer.id).slice(0, 12)}: ${details.join(' | ')}`);
+    const shortId = shortestUniqueSessionPrefix(prefixRows, peer.id, 12) || String(peer.id).slice(0, 12);
+    lines.push(`- ${shortId}: ${details.join(' | ')}`);
   }
   // v1.32.0 law: a truncated list must never render as a complete one.
   if (snapshot.peers.length > 8) lines.push(`- …and ${snapshot.peers.length - 8} more active task(s) not listed — brain_doctor shows all.`);
@@ -790,6 +802,16 @@ export function createMcpPresence({
   let logicalSessionId = seedIdentity.logicalSessionId;
   let identitySource = seedIdentity.identitySource;
   const hostPid = resolveHostPid(env);
+  // Best-available pid for lane-row correlation (2026-08-14 wave): a host that
+  // declares no CLAUDE_PID/KLYPIX_HOST_PID (Codex today) still has a direct
+  // parent, and that pid lets readers group this worker's row with its
+  // lifecycle sibling. Provenance rides along: 'env' pids are host-declared and
+  // safe to liveness-probe; a 'ppid' guess may be a transient wrapper, so the
+  // dead-host sweep never probes it — correlation only. The hostmap path keeps
+  // using ONLY the env pid (a guessed pid must never adopt a hostmap identity).
+  const laneHostPid = hostPid
+    || (Number.isInteger(process.ppid) && process.ppid > 0 ? process.ppid : null);
+  const laneHostPidSource = hostPid ? 'env' : (laneHostPid ? 'ppid' : null);
   const effectiveInboxPollMs = Number(env?.KLYPIX_MCP_INBOX_POLL_MS)
     || Number(inboxPollMs)
     || MCP_INBOX_POLL_MS;
@@ -802,6 +824,10 @@ export function createMcpPresence({
   let started = false;
   let lastPeers = '';
   let taskStartedAt = 0;
+  // Turn-end heuristic input: has this task generation seen an explicit
+  // checkpoint? A model that checkpoints treats the task as multi-step, so its
+  // later complete is a deliberate task boundary, not a per-turn sign-off.
+  let checkpointSinceTaskStart = false;
   let resultClaimsPending = false;
   let syncNudgeShown = false;
   let modelActionSequence = 0;
@@ -1217,7 +1243,8 @@ export function createMcpPresence({
           client: info.client,
           surface: info.surface,
           cwd: path.dirname(brainPath),
-          hostPid,
+          hostPid: laneHostPid,
+          hostPidSource: laneHostPidSource,
           home,
           now: stamp,
           expectedPid: process.pid,
@@ -1233,6 +1260,7 @@ export function createMcpPresence({
         identitySource = 'mcp-request';
         resultClaimsPending = false;
         taskStartedAt = 0;
+        checkpointSinceTaskStart = false;
         lastPeers = '';
         sentTexts.clear();
         notifiedConflicts.clear();
@@ -1267,7 +1295,8 @@ export function createMcpPresence({
             client: info.client,
             surface: info.surface,
             cwd: path.dirname(brainPath),
-            hostPid,
+            hostPid: laneHostPid,
+            hostPidSource: laneHostPidSource,
             home,
             now: stamp,
             expectedPid: process.pid,
@@ -1290,6 +1319,7 @@ export function createMcpPresence({
         identitySource = 'mcp-request';
         resultClaimsPending = false;
         taskStartedAt = 0;
+        checkpointSinceTaskStart = false;
         lastPeers = '';
         sentTexts.clear();
         notifiedConflicts.clear();
@@ -1477,7 +1507,8 @@ export function createMcpPresence({
       event,
       channel: 'mcp',
       cwd: path.dirname(brainPath),
-      hostPid,
+      hostPid: laneHostPid,
+      hostPidSource: laneHostPidSource,
       logicalSessionId,
       identitySource,
       home,
@@ -1857,10 +1888,12 @@ export function createMcpPresence({
     }
     if (nextPhase === 'start') {
       taskStartedAt = now();
+      checkpointSinceTaskStart = false;
       notifiedConflicts.clear();
     } else if (!taskStartedAt && !completing) {
       taskStartedAt = now();
     }
+    if (nextPhase === 'checkpoint') checkpointSinceTaskStart = true;
     const hasDefinedResults = results !== undefined;
     let resultReconciliation = null;
     let completionBlocked = false;
@@ -1962,7 +1995,26 @@ export function createMcpPresence({
       };
       completionBlocked = true;
     }
-    const clearCompletionScope = completing && !completionBlocked;
+    // (d) Turn-end vs task-end (2026-08-14 wave). The tool instruction "call
+    // brain_sync with phase complete before your final response" reads PER TURN
+    // to some hosts, so a model may complete moments after declaring scope —
+    // wiping intent/files while the task is still mid-flight, leaving the
+    // session scope-less to every peer until the next prompt or tool event. A
+    // complete with NO result evidence, arriving within
+    // PREMATURE_COMPLETE_WINDOW_MS of this worker's task start with NO
+    // intervening checkpoint, downgrades to a scope-PRESERVING checkpoint and
+    // says why. A complete carrying results, following a checkpoint, or on a
+    // mature task keeps full completion semantics, and the blocked
+    // needs-reconciliation path above always wins (a deferral must never let a
+    // completion bypass result reconciliation).
+    const completionDeferred = completing && !completionBlocked
+      && !hasDefinedResults && !resultClaimsPending
+      && taskStartedAt > 0
+      && now() - taskStartedAt < PREMATURE_COMPLETE_WINDOW_MS
+      && !checkpointSinceTaskStart
+      && Boolean(activeCompletionScope
+        && (compact(activeCompletionScope.intent) || (activeCompletionScope.files || []).length));
+    const clearCompletionScope = completing && !completionBlocked && !completionDeferred;
     const priorCompletionScope = clearCompletionScope ? activeCompletionScope : null;
     const shouldDeliverMessages = deliverMessages !== false && include_context !== false;
     const details = {
@@ -2044,7 +2096,9 @@ export function createMcpPresence({
         });
       }
     }
-    if (completing && !completionBlocked) {
+    // A deferred (turn-end) complete keeps the task open — its conflict-alert
+    // dedupe state must survive with it; only a REAL completion resets it.
+    if (clearCompletionScope) {
       notifiedConflicts.clear();
     }
     if (!brainPath) {
@@ -2093,7 +2147,7 @@ export function createMcpPresence({
           brainPath,
           from: sessionId,
           to: peer.id,
-          text: `Automatic KLYPIX overlap alert: ${String(sessionId).slice(0, 12)}`
+          text: `Automatic KLYPIX overlap alert: ${shortestUniqueSessionPrefix(report.sessions, sessionId, 12) || String(sessionId).slice(0, 12)}`
             + `${compact(intent) ? ` plans "${compact(intent).slice(0, 110)}"` : ' synchronized a task'}`
             + ` and reports the same file(s): ${peer.files.join(', ')}. Coordinate before editing.`,
           dedupeKey: `overlap|${sessionId}|${peer.id}|${taskStartedAt}|${filesKey}`,
@@ -2108,17 +2162,30 @@ export function createMcpPresence({
       ? [
         'KLYPIX exact file-overlap warning:',
         ...conflicts.map((peer) =>
-          `- ${String(peer.id).slice(0, 12)}${peer.intent ? ` "${String(peer.intent).slice(0, 80)}"` : ''}: ${peer.files.join(', ')}`),
+          `- ${shortestUniqueSessionPrefix(report.sessions, peer.id, 12) || String(peer.id).slice(0, 12)}${peer.intent ? ` "${String(peer.intent).slice(0, 80)}"` : ''}: ${peer.files.join(', ')}`),
         alertsQueued.length
           ? 'The earlier peer was automatically queued an exact-once overlap alert; coordinate ownership before editing.'
           : 'Coordinate ownership before editing the overlapping files.',
       ].join('\n')
       : 'No exact file overlap is currently reported by another synchronized task.';
+    // Mechanical repo-state (2026-08-14 bundle-currency incident): branch, tag
+    // and version truth plus bundled-mirror drift, collected IN THE SERVER so
+    // every MCP client — Claude, Codex, Cursor, Cline, Desktop — gets equal
+    // protection with no hook. Derived from the verified brainPath (never raw
+    // caller input, per the pinned-binding guard above); any git failure
+    // degrades to omitting the block; a 60s per-process cache keeps repeated
+    // syncs cheap. Stateless — it never touches the observeShipDrift baseline,
+    // so a fresh session on an already-drifted repo still sees the drift.
+    const repoState = completing ? null : collectRepoState(path.dirname(brainPath));
+    const repoStateWarning = repoStateWarnings(repoState).join('\n');
     const durationMs = Math.max(0, Date.now() - syncStartedAt);
     const messagesText = formatReceivedMessages(report.messages, stamp, decay, sessionId);
     const structured = {
       schemaVersion: 1,
-      status: completing ? (completionBlocked ? 'needs-reconciliation' : 'complete') : 'active',
+      status: completing
+        ? (completionBlocked ? 'needs-reconciliation'
+          : (completionDeferred ? 'complete-deferred' : 'complete'))
+        : 'active',
       phase: nextPhase,
       project: path.dirname(brainPath),
       brain: brainPath,
@@ -2149,6 +2216,19 @@ export function createMcpPresence({
         };
       }),
       alertsQueued,
+      // Additive (schema 1): the machine-readable record of WHY a complete was
+      // downgraded to a scope-preserving checkpoint (turn-end heuristic).
+      ...(completionDeferred ? {
+        completionDeferred: {
+          reason: 'premature-complete-no-results',
+          sinceTaskStartMs: Math.max(0, stamp - taskStartedAt),
+          scopeRetained: true,
+        },
+      } : {}),
+      // Additive (schema 1): downstream renderers keep parsing self.branch and
+      // peers[].branch exactly as before; repoState is the machine-readable
+      // release-state contract the advisory prose merely mirrors.
+      ...(repoState ? { repoState } : {}),
       ...(resultReconciliation ? { resultReconciliation: {
         status: resultReconciliation.status,
         claims: resultReconciliation.claims || [],
@@ -2189,13 +2269,18 @@ export function createMcpPresence({
     const deliveryWarning = shouldDeliverMessages && report.deliveryWriteOk === false
       ? `KLYPIX message delivery was deferred safely: ${report.deliveryWriteSkippedReason || 'the receipt write did not land'}. No queued note was reported as delivered; retry on the next KLYPIX action.`
       : '';
+    const deferralText = completionDeferred
+      ? 'KLYPIX completion deferred: this complete carried no results and arrived moments after task start with no intervening checkpoint, so it reads as turn-end, not task-end. The declared intent/files were RETAINED for peers. When the task is truly finished, complete again after a checkpoint (or include a result manifest) to clear the scope.'
+      : '';
     const text = [
       `KLYPIX Context Gateway: session ${sessionId} · phase ${nextPhase} · coordination ${durationMs}ms.`,
+      deferralText,
       resultText,
       formatTaskPresence(snapshot, stamp),
       messagesText,
       deliveryWarning,
       conflictText,
+      repoStateWarning,
     ].filter(Boolean).join('\n\n');
     return {
       ...report,

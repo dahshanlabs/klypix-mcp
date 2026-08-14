@@ -80,7 +80,9 @@ function readPackage(dir) {
 // keeps its copy module-private). Prerelease suffixes are deliberately NOT
 // ordered here — callers compare exact strings first, so "1.2.3-beta" vs
 // "1.2.3" lands in the ahead branch rather than pretending alignment.
-const cmpSemver3 = (a, b) => {
+// Exported (1.70.0): the release-lease advisory in mcp-presence compares the
+// checkout's packageVersion against latestReleaseTag with the same policy.
+export const cmpSemver3 = (a, b) => {
   const pa = String(a || '').split('.').map((n) => parseInt(n, 10) || 0);
   const pb = String(b || '').split('.').map((n) => parseInt(n, 10) || 0);
   for (let i = 0; i < 3; i++) if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) - (pb[i] || 0);
@@ -143,6 +145,33 @@ function repoStateForDir(git, dir) {
 function versionReleased(git, dir, name, version) {
   const out = git(dir, ['tag', '--list', ...releaseTagNames(name, version)]);
   return out === null ? null : out.length > 0;
+}
+
+// The HIGHEST release-shaped tag anywhere in the repo (v1.2.3 / 1.2.3 /
+// <name>@1.2.3) → { tag, version } or null. This is the "last released"
+// baseline the zero-config release advisory compares packageVersion against:
+// a checkout sitting at a HIGHER version than any release tag is release
+// preparation in progress, whether or not anyone declared it. One bounded
+// spawn; a junk-tag flood is capped rather than scanned forever.
+const MAX_TAG_SCAN = 2000;
+function latestReleaseTag(git, dir, name) {
+  const out = git(dir, ['tag', '--list']);
+  if (!out) return null;
+  let best = null;
+  for (const line of out.split('\n').slice(0, MAX_TAG_SCAN)) {
+    const tag = line.trim();
+    if (!tag) continue;
+    let version = null;
+    const plain = /^v?(\d+\.\d+\.\d+)$/.exec(tag);
+    if (plain) version = plain[1];
+    else if (name && tag.startsWith(`${name}@`)) {
+      const candidate = tag.slice(name.length + 1);
+      if (/^\d+\.\d+\.\d+$/.test(candidate)) version = candidate;
+    }
+    if (!version) continue;
+    if (!best || cmpSemver3(version, best.version) > 0) best = { tag, version };
+  }
+  return best;
 }
 
 // Zero-config bundled-mirror detection — the exact incident geometry:
@@ -226,6 +255,9 @@ export function collectRepoState(projectDir, {
     if (root) {
       state = {
         ...root,
+        // Additive (1.70.0): the release baseline for the zero-config release
+        // advisory. Root repo only — siblings keep their per-version probe.
+        latestReleaseTag: latestReleaseTag(git, dir, readPackage(dir)?.name || null),
         siblings: detectSiblings(git, dir),
         durationMs: Math.max(0, now() - startedAt),
       };

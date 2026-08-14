@@ -11,9 +11,11 @@ import { execFileSync } from 'child_process';
 import path from 'path';
 import {
   codexToolActionId,
+  declareReleaseLease,
   findProjectBrain,
   formatPresenceMessage,
   formatReceivedMessages,
+  freeReleaseLease,
   laneFileFor,
   listActiveSessions,
   messageDeliveryReceipt,
@@ -21,7 +23,9 @@ import {
   peekMessages,
   pinLaneIdentity,
   postPresenceMessage,
+  readReleaseLease,
   receiveMessages,
+  refreshReleaseLease,
   rekeySessionIdentity,
   rotateEndedSessionIdentity,
   removeSession,
@@ -36,7 +40,7 @@ import {
 // canonical copy lives in the pure module because that one is import-restricted
 // (crypto only), so it can never grow a dependency this file would inherit.
 import { normalizeFileKey } from './finding-routing.mjs';
-import { collectRepoState, repoStateWarnings } from './repo-state.mjs';
+import { cmpSemver3, collectRepoState, repoStateWarnings } from './repo-state.mjs';
 import { recordResultManifests } from './result-reconcile.mjs';
 
 export const MCP_HEARTBEAT_MS = 60_000;
@@ -60,6 +64,7 @@ export const KLYPIX_MCP_INSTRUCTIONS = [
   'A coordination note is not consumed merely because it was offered: after a later independent KLYPIX action acknowledges the offer, call brain_message_receipt with its exact message id and offer token only when you actually incorporated it into your work.',
   'Call brain_sync again when your file scope materially changes, and with phase "complete" before your final response.',
   'When a task publishes a quantified or otherwise machine-checkable claim, include its validated result manifest in the completion sync; conflicting or incomparable peer results retain the task scope until reconciled.',
+  'A session preparing a RELEASE of the project should declare it by adding releaseIntent {version, ref} to brain_sync: the first declarer takes an exclusive lease every peer sees, and a second declarer gets a hard conflict naming the holder.',
   'Do not read the full brain brief unless brain_sync says its compact context is insufficient or the task asks for broad history/status; use brain_ask for deeper retrieval.',
   'Capture only durable decisions or milestones with brain_note.',
   'Never hand-edit brain.klypix. If the current project has no brain.klypix, ignore this workflow.',
@@ -215,6 +220,30 @@ export function validateExactFileScope(files, { projectRoot } = {}) {
   }
 
   return { ok: errors.length === 0, files: errors.length ? [] : [...files], errors };
+}
+
+// releaseIntent: { version, ref } — a session's declared intent to prepare a
+// RELEASE of this project. Validated fail-closed before any sync mutation
+// (client-neutral: the worker's Zod schema is a convenience, not the guard).
+// Version must be semver-shaped (optional leading v, bounded prerelease/build
+// suffix); ref is any bounded, control-character-free git ref name.
+const RELEASE_VERSION_RE = /^v?\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]{1,40})?$/;
+export function validateReleaseIntent(value) {
+  if (value === undefined || value === null) return { provided: false, ok: true };
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    return { provided: true, ok: false, errors: ['releaseIntent must be an object of the form { version, ref }'] };
+  }
+  const version = typeof value.version === 'string' ? value.version.trim() : '';
+  const ref = typeof value.ref === 'string' ? value.ref.trim() : '';
+  const errors = [];
+  if (!version || version.length > 64 || !RELEASE_VERSION_RE.test(version)) {
+    errors.push('releaseIntent.version must be a semver-shaped version string (for example "1.70.0")');
+  }
+  if (!ref || ref.length > 200 || /[\u0000-\u001f\u007f\s]/.test(ref)) {
+    errors.push('releaseIntent.ref must be a nonempty bounded git ref (branch or tag) with no whitespace or control characters');
+  }
+  if (errors.length) return { provided: true, ok: false, errors };
+  return { provided: true, ok: true, version: version.replace(/^v/i, ''), ref };
 }
 
 const canonicalPathKey = (value) => {
@@ -375,6 +404,24 @@ export const isLogicalTwin = (peer, me) => Boolean(
 // insufficient. Consumers should migrate to isLogicalTwin.
 export const isSuspectedTwin = isLogicalTwin;
 
+// A COMPLETED task's surviving observations are history, not a live claim
+// (1.70.0 review-caught): the completion guard clears DECLARED scope exactly so
+// peers stop coordinating against finished work, and MCP heartbeats keep the
+// row alive for the whole host-process lifetime — without this gate a session
+// that completed hours ago kept rendering as an active task and a BLOCKING
+// conflict source through its observed markers. The markers stay on the ROW
+// (the edits are real; doctor/forensics keep them); only the live read
+// surfaces ignore them once the task is complete-and-idle. Revival is cheap
+// and automatic: a new McpTaskStart clears completedAt (agent-presence), a
+// fresh human prompt does the same in the lifecycle hook, and any fresh
+// declaration or intent makes the session non-idle again.
+const completedIdleSession = (session) => Boolean(session?.completedAt)
+  && !compact(session?.intent)
+  && !(Array.isArray(session?.files) && session.files.length);
+const liveObservedFiles = (session) => (completedIdleSession(session)
+  ? []
+  : (Array.isArray(session?.observedFiles) ? session.observedFiles : []));
+
 export function findPresenceConflicts(sessions, selfId, { projectRoot } = {}) {
   const active = Array.isArray(sessions) ? sessions : [];
   const me = active.find((session) => session.id === selfId);
@@ -383,19 +430,44 @@ export function findPresenceConflicts(sessions, selfId, { projectRoot } = {}) {
   // session's own cwd is that root (mcp-presence sets it to dirname(brain.klypix),
   // and brain_sync's explicit `project` flows into it).
   const root = projectRoot || me.cwd || null;
-  const mine = new Map((me.files || [])
-    .map((file) => [normalizeFileKey(file, root), String(file || '').replace(/\\/g, '/')])
-    .filter(([key]) => key));
+  // Automatic scope adoption (1.70.0): overlap is computed over the UNION of a
+  // session's declared files and its host-OBSERVED edits (row.observedFiles —
+  // written by the lifecycle hooks when an edit lands outside any declared
+  // scope). A session that never called brain_sync still collides for real.
+  // The observed/declared distinction is preserved per path so every warning
+  // can state the confidence of each side's claim: an observed path is a real
+  // edit but an unconfirmed boundary; a declared path is an owned scope.
+  const scopeEntries = (session) => {
+    // completedIdleSession gate: a finished task's leftover observations are
+    // not a live overlap claim (see the helper above findPresenceConflicts).
+    const observed = liveObservedFiles(session);
+    const observedKeys = new Set(observed
+      .map((file) => normalizeFileKey(file, root))
+      .filter(Boolean));
+    const entries = new Map();
+    for (const file of [
+      ...(Array.isArray(session?.files) ? session.files : []),
+      ...observed,
+    ]) {
+      const key = normalizeFileKey(file, root);
+      if (!key || entries.has(key)) continue;
+      entries.set(key, {
+        display: String(file || '').replace(/\\/g, '/'),
+        observed: observedKeys.has(key),
+      });
+    }
+    return entries;
+  };
+  const mine = scopeEntries(me);
   if (!mine.size) return [];
   const conflicts = [];
   for (const peer of active) {
     if (peer.id === selfId) continue;
     if (isSuspectedTwin(peer, me)) continue;   // own twin row — a session cannot conflict with itself
-    const overlap = [...new Set((peer.files || [])
-      .map((file) => normalizeFileKey(file, root))
-      .filter((file) => mine.has(file))
-      .map((file) => mine.get(file)))];
-    if (!overlap.length) continue;
+    const theirs = scopeEntries(peer);
+    const overlapKeys = [...theirs.keys()].filter((key) => mine.has(key));
+    if (!overlapKeys.length) continue;
+    const overlap = overlapKeys.map((key) => mine.get(key).display);
     conflicts.push({
       id: peer.id,
       client: peer.client,
@@ -406,13 +478,43 @@ export function findPresenceConflicts(sessions, selfId, { projectRoot } = {}) {
       kind: 'exact-file',
       severity: 'blocking',
       sameWorktree: normalizeFileKey(peer.cwd) === normalizeFileKey(me.cwd),
+      // ADDITIVE (1.70.0): which overlapping paths each side only OBSERVED
+      // (adopted from live edits) rather than declared. Renderers use these to
+      // state claim confidence; absent/empty means every claim was declared.
+      peerObservedFiles: overlapKeys.filter((key) => theirs.get(key).observed).map((key) => mine.get(key).display),
+      selfObservedFiles: overlapKeys.filter((key) => mine.get(key).observed).map((key) => mine.get(key).display),
     });
   }
   return conflicts;
 }
 
+// Shared annotation for conflict renders: mark each overlapping path whose
+// claim (on either side) was observed rather than declared, and say what the
+// mark means exactly once. Returns { files: [...], legend } — legend is ''
+// when every claim was declared, keeping pre-1.70 output byte-identical.
+export function annotateConflictFiles(conflict) {
+  const observed = new Set([
+    ...(Array.isArray(conflict?.peerObservedFiles) ? conflict.peerObservedFiles : []),
+    ...(Array.isArray(conflict?.selfObservedFiles) ? conflict.selfObservedFiles : []),
+  ]);
+  const files = (Array.isArray(conflict?.files) ? conflict.files : [])
+    .map((file) => (observed.has(file) ? `${file}*` : file));
+  const legend = files.some((file) => file.endsWith('*'))
+    ? ' (* = observed from live edits, scope not declared)'
+    : '';
+  return { files, legend };
+}
+
 const isTaskSession = (session) =>
-  Boolean(compact(session?.intent) || (Array.isArray(session?.files) && session.files.length));
+  Boolean(compact(session?.intent)
+    || (Array.isArray(session?.files) && session.files.length)
+    // Automatic scope adoption: a session that never declared anything but has
+    // host-observed edits has a KNOWN (if unconfirmed) scope — surface it as an
+    // active task instead of burying it as "scope unknown". Completed-and-idle
+    // sessions are exempt (liveObservedFiles): their observations are history,
+    // and counting them re-promoted every finished task to "active" for the
+    // rest of the host process's life.
+    || liveObservedFiles(session).length > 0);
 
 const publicSession = (session, now) => {
   const transport = session?.transport && typeof session.transport === 'object'
@@ -430,6 +532,9 @@ const publicSession = (session, now) => {
     intentAgeMs: session?.intentAt ? Math.max(0, now - Number(session.intentAt)) : null,
     intentSource: session?.intentSource || null,
     files: Array.isArray(session?.files) ? session.files : [],
+    // ADDITIVE (1.70.0): paths adopted from this session's live edits with no
+    // declared scope covering them — real edits, unconfirmed boundaries.
+    observedFiles: Array.isArray(session?.observedFiles) ? session.observedFiles : [],
     ageMs: Math.max(0, now - Number(session?.lastSeen || now)),
     deliveryReachability: session?.deliveryReachability || sessionDeliveryReachability(session),
     transport,
@@ -470,23 +575,34 @@ function formatTaskPresence(snapshot, now = Date.now()) {
   // UUIDv7 peers started in the same window share a long time prefix — grow
   // each shown id (git short-hash style, floor 12) until it names one session.
   const prefixRows = [snapshot.self, ...snapshot.peers].filter(Boolean);
+  let anyObservedShown = false;
   for (const peer of snapshot.peers.slice(0, 8)) {
     const intentAgeMin = peer.intentAgeMs !== null ? Math.round(peer.intentAgeMs / 60_000) : null;
     const heartbeatMin = Math.round(peer.ageMs / 60_000);
     const intentAge = intentAgeMin !== null && intentAgeMin - heartbeatMin > 3 ? ` (intent set ${intentAgeMin}m ago)` : '';
+    // Scope = declared ∪ observed; a `*` marks a path this peer was only
+    // OBSERVED editing (automatic scope adoption — no declaration made).
+    const observedKeys = new Set((peer.observedFiles || []).map((file) => normalizeFileKey(file)));
+    const scope = [...new Set([...(peer.files || []), ...(peer.observedFiles || [])])];
+    const shownScope = scope.slice(0, 4).map((file) => {
+      if (!observedKeys.has(normalizeFileKey(file))) return file;
+      anyObservedShown = true;
+      return `${file}*`;
+    });
     const details = [
       peer.client,
       peer.deliveryReachability && peer.deliveryReachability !== 'connected'
         ? `delivery ${peer.deliveryReachability}` : null,
       peer.branch ? `branch ${peer.branch}` : null,
       peer.intent ? `"${String(peer.intent).slice(0, 90)}"${intentAge}` : null,
-      peer.files.length ? peer.files.slice(0, 4).join(', ') + (peer.files.length > 4 ? ` (+${peer.files.length - 4} more)` : '') : null,
+      scope.length ? shownScope.join(', ') + (scope.length > 4 ? ` (+${scope.length - 4} more)` : '') : null,
     ].filter(Boolean);
     const shortId = shortestUniqueSessionPrefix(prefixRows, peer.id, 12) || String(peer.id).slice(0, 12);
     lines.push(`- ${shortId}: ${details.join(' | ')}`);
   }
   // v1.32.0 law: a truncated list must never render as a complete one.
   if (snapshot.peers.length > 8) lines.push(`- …and ${snapshot.peers.length - 8} more active task(s) not listed — brain_doctor shows all.`);
+  if (anyObservedShown) lines.push('* = observed from that session\'s live edits (scope not declared) — real overlap, unconfirmed boundary.');
   lines.push(`Point-in-time as of ${new Date(now).toISOString().slice(11, 16)}Z — re-sync before acting on it.`);
   return lines.join('\n');
 }
@@ -770,6 +886,7 @@ const peerFingerprint = (sessions, selfId) => (Array.isArray(sessions) ? session
     session.branch,
     session.intent,
     ...(Array.isArray(session.files) ? session.files : []),
+    ...(Array.isArray(session.observedFiles) ? session.observedFiles : []),
   ].join('|'))
   .sort()
   .join('\n');
@@ -1657,6 +1774,7 @@ export function createMcpPresence({
     files,
     phase = 'checkpoint',
     results,
+    releaseIntent,
     deliverMessages = true,
     include_context,
     actionId = '',
@@ -1666,6 +1784,26 @@ export function createMcpPresence({
     const syncStartedAt = Date.now();
     const nextPhase = ['start', 'checkpoint', 'complete'].includes(phase) ? phase : 'checkpoint';
     const completing = nextPhase === 'complete';
+    // Release intent is validated fail-closed BEFORE any mutation (same
+    // contract as project/file preflight): a malformed declaration must not
+    // half-sync and silently skip the lease it asked for.
+    const releaseIntentChecked = validateReleaseIntent(releaseIntent);
+    if (releaseIntentChecked.provided && !releaseIntentChecked.ok) {
+      const report = syncPreflightFailure({
+        status: 'invalid-release-intent',
+        reason: 'release-intent-malformed',
+        requestedProject: typeof project === 'string' ? project.slice(0, 512) : null,
+      });
+      report.structured.phase = nextPhase;
+      report.structured.errors = releaseIntentChecked.errors.map((message) => ({ message }));
+      report.structured.timingMs.coordination = Math.max(0, Date.now() - syncStartedAt);
+      report.text = [
+        'KLYPIX release intent was rejected; no task, lease, presence, or message state changed.',
+        ...releaseIntentChecked.errors.map((error) => `- ${error}`),
+        'Supply releaseIntent as { version: "X.Y.Z", ref: "<git branch or tag>" }.',
+      ].join('\n');
+      return report;
+    }
     const preflightInput = {
       project,
       projectProvided: project !== undefined,
@@ -2143,13 +2281,14 @@ export function createMcpPresence({
         const key = `${peer.id}|${filesKey}`;
         if (notifiedConflicts.has(key)) continue;
         notifiedConflicts.add(key);
+        const annotated = annotateConflictFiles(peer);
         const queued = postPresenceMessage({
           brainPath,
           from: sessionId,
           to: peer.id,
           text: `Automatic KLYPIX overlap alert: ${shortestUniqueSessionPrefix(report.sessions, sessionId, 12) || String(sessionId).slice(0, 12)}`
             + `${compact(intent) ? ` plans "${compact(intent).slice(0, 110)}"` : ' synchronized a task'}`
-            + ` and reports the same file(s): ${peer.files.join(', ')}. Coordinate before editing.`,
+            + ` and reports the same file(s): ${annotated.files.join(', ')}${annotated.legend}. Coordinate before editing.`,
           dedupeKey: `overlap|${sessionId}|${peer.id}|${taskStartedAt}|${filesKey}`,
           home,
           now: stamp,
@@ -2161,8 +2300,10 @@ export function createMcpPresence({
     const conflictText = conflicts.length
       ? [
         'KLYPIX exact file-overlap warning:',
-        ...conflicts.map((peer) =>
-          `- ${shortestUniqueSessionPrefix(report.sessions, peer.id, 12) || String(peer.id).slice(0, 12)}${peer.intent ? ` "${String(peer.intent).slice(0, 80)}"` : ''}: ${peer.files.join(', ')}`),
+        ...conflicts.map((peer) => {
+          const annotated = annotateConflictFiles(peer);
+          return `- ${shortestUniqueSessionPrefix(report.sessions, peer.id, 12) || String(peer.id).slice(0, 12)}${peer.intent ? ` "${String(peer.intent).slice(0, 80)}"` : ''}: ${annotated.files.join(', ')}${annotated.legend}`;
+        }),
         alertsQueued.length
           ? 'The earlier peer was automatically queued an exact-once overlap alert; coordinate ownership before editing.'
           : 'Coordinate ownership before editing the overlapping files.',
@@ -2178,6 +2319,133 @@ export function createMcpPresence({
     // so a fresh session on an already-drifted repo still sees the drift.
     const repoState = completing ? null : collectRepoState(path.dirname(brainPath));
     const repoStateWarning = repoStateWarnings(repoState).join('\n');
+    // ── Release lease (1.70.0 measured wave) ────────────────────────────────
+    // Exclusive per-project release-preparation coordination, riding the lane
+    // file and its existing liveness rules (agent-presence.mjs). Semantics:
+    //   declare (start/checkpoint) → take or hard-conflict; holder re-declare
+    //   refreshes. A plain checkpoint from the holder refreshes the ~2h TTL. A
+    //   REAL completion (not a deferred turn-end, not a blocked one) frees it.
+    //   Expiry and the dead-session sweep free it without any cooperation.
+    // Every peer's sync while a lease is active gains one footer line; with no
+    // lease but a checkout AHEAD of the last released tag, a zero-config soft
+    // advisory names the gap. All response fields are additive (schema 1).
+    let releaseLease = null;
+    let releaseText = '';
+    let releaseFooterLine = '';
+    let releaseAdvisory = null;
+    let releaseAdvisoryText = '';
+    {
+      const leaseStamp = now();
+      let outcome = null;
+      if (releaseIntentChecked.provided && completing) {
+        // The DECLARATION is ignored on completion, but a REAL completion must
+        // still free a lease this session holds — a holder who kept attaching
+        // releaseIntent to every sync (the natural refresh pattern) must not
+        // leave the lease squatting until expiry just because the final sync
+        // carried it too. A non-holder's freed attempt is 'not-holder' and the
+        // ignored notice stands.
+        outcome = { ok: false, status: 'ignored-on-complete' };
+        if (clearCompletionScope) {
+          const freed = freeReleaseLease({ brainPath, sessionId, home, now: leaseStamp });
+          if (freed.status === 'released') outcome = freed;
+        }
+      } else if (releaseIntentChecked.provided) {
+        outcome = declareReleaseLease({
+          brainPath,
+          sessionId,
+          version: releaseIntentChecked.version,
+          ref: releaseIntentChecked.ref,
+          client: (preparedClientInfo || {}).client || 'unknown',
+          home,
+          now: leaseStamp,
+        });
+      } else if (clearCompletionScope) {
+        const freed = freeReleaseLease({ brainPath, sessionId, home, now: leaseStamp });
+        if (freed.status === 'released') outcome = freed;
+      } else if (!completing) {
+        const refreshed = refreshReleaseLease({ brainPath, sessionId, home, now: leaseStamp });
+        // 'lease-lost' = THIS session held the lease but it lapsed (TTL passed
+        // with no checkpoint). Surfacing it beats silent pruning: a holder who
+        // believes they still own release preparation must be told they don't.
+        if (refreshed.status === 'refreshed' || refreshed.status === 'lease-lost') outcome = refreshed;
+      }
+      const active = readReleaseLease({ brainPath, home, now: leaseStamp });
+      const prefixFor = (id) =>
+        shortestUniqueSessionPrefix(report.sessions, id, 12) || String(id).slice(0, 12);
+      const holderBlock = active ? {
+        sessionId: active.holderId,
+        sessionPrefix: prefixFor(active.holderId),
+        client: active.holderClient,
+        version: active.version,
+        ref: active.ref,
+        takenAt: active.takenAt,
+        refreshedAt: active.refreshedAt,
+        expiresAt: active.expiresAt,
+      } : null;
+      if (outcome?.status === 'conflict') {
+        const holder = outcome.holder;
+        const holderPrefix = prefixFor(holder.holderId);
+        releaseLease = {
+          status: 'conflict',
+          kind: 'release-lease-held',
+          severity: 'blocking',
+          requested: { version: releaseIntentChecked.version, ref: releaseIntentChecked.ref },
+          holder: {
+            sessionId: holder.holderId,
+            sessionPrefix: holderPrefix,
+            client: holder.holderClient,
+            version: holder.version,
+            ref: holder.ref,
+            takenAt: holder.takenAt,
+            refreshedAt: holder.refreshedAt,
+            expiresAt: holder.expiresAt,
+          },
+        };
+        releaseText = `KLYPIX release-lease conflict: session ${holderPrefix} already holds the EXCLUSIVE release lease for this project — v${holder.version} from ${holder.ref}. Your releaseIntent (v${releaseIntentChecked.version} from ${releaseIntentChecked.ref}) was NOT granted. Coordinate with the holder; the lease frees on their real completion, on its ~2h expiry without checkpoints, or when their session ends.`;
+      } else if (outcome?.status === 'ignored-on-complete') {
+        releaseLease = { status: 'ignored-on-complete', ...(holderBlock ? { holder: holderBlock } : {}) };
+        releaseText = 'KLYPIX releaseIntent was ignored: declare it with phase "start" or "checkpoint", not on completion (completion FREES a held lease).';
+      } else if (outcome && outcome.ok === false) {
+        releaseLease = { status: 'declare-failed', reason: outcome.status };
+        releaseText = `KLYPIX release lease was not recorded (${outcome.status}); no lease state changed. Retry on the next sync.`;
+      } else if (outcome?.status === 'taken' || outcome?.status === 'refreshed') {
+        releaseLease = {
+          status: outcome.status,
+          ...(outcome.reclaimed ? { reclaimed: outcome.reclaimed } : {}),
+          ...(holderBlock ? { holder: holderBlock } : {}),
+        };
+        if (releaseIntentChecked.provided) {
+          releaseText = outcome.status === 'taken'
+            ? `KLYPIX release lease taken: this session now EXCLUSIVELY holds release preparation for v${releaseIntentChecked.version} from ${releaseIntentChecked.ref}${outcome.reclaimed ? ` (reclaimed: the previous lease was ${outcome.reclaimed === 'expired' ? 'expired' : 'held by a session that is no longer live'})` : ''}. Checkpoints refresh the ~2h lease; phase "complete" frees it.`
+            : `KLYPIX release lease refreshed: v${releaseIntentChecked.version} from ${releaseIntentChecked.ref}.`;
+        }
+      } else if (outcome?.status === 'lease-lost') {
+        releaseLease = { status: 'lease-lost', reason: outcome.reason || null };
+        releaseText = 'KLYPIX release lease lost: the exclusive release lease this session held expired without a checkpoint inside its ~2h TTL and has been cleared. If the release is still in preparation, re-declare it with releaseIntent { version, ref }.';
+      } else if (outcome?.status === 'released') {
+        releaseLease = {
+          status: 'released',
+          released: { version: outcome.lease?.version || null, ref: outcome.lease?.ref || null },
+        };
+        releaseText = `KLYPIX release lease freed: completion released the exclusive release lease (v${outcome.lease?.version} from ${outcome.lease?.ref}).`;
+      } else if (active) {
+        releaseLease = { status: 'held', holder: holderBlock };
+      }
+      if (active) {
+        releaseFooterLine = `release in preparation: v${active.version} from ${active.ref} (session ${prefixFor(active.holderId)})`;
+      } else if (!completing && repoState?.packageVersion && repoState?.latestReleaseTag?.version
+        && cmpSemver3(repoState.packageVersion, repoState.latestReleaseTag.version) > 0) {
+        // Zero-config visibility: nobody declared anything, but this checkout's
+        // package version is AHEAD of every release tag — release preparation
+        // is mechanically in progress. Soft advisory only, never blocking.
+        releaseAdvisory = {
+          kind: 'checkout-ahead-of-last-release',
+          packageVersion: repoState.packageVersion,
+          latestReleaseTag: repoState.latestReleaseTag,
+        };
+        releaseAdvisoryText = `KLYPIX release advisory: this checkout's package version ${repoState.packageVersion} is ahead of the last released tag ${repoState.latestReleaseTag.tag}${repoState.branch ? ` (branch ${repoState.branch})` : ''} and no release lease is declared. If a release is in preparation, declare it: brain_sync { releaseIntent: { version, ref } } takes the exclusive release lease and tells every peer.`;
+      }
+    }
     const durationMs = Math.max(0, Date.now() - syncStartedAt);
     const messagesText = formatReceivedMessages(report.messages, stamp, decay, sessionId);
     const structured = {
@@ -2229,6 +2497,11 @@ export function createMcpPresence({
       // peers[].branch exactly as before; repoState is the machine-readable
       // release-state contract the advisory prose merely mirrors.
       ...(repoState ? { repoState } : {}),
+      // Additive (schema 1): the exclusive release-preparation lease — grant /
+      // refresh / conflict / release outcome plus the current holder — and the
+      // zero-config checkout-ahead advisory when nothing is declared.
+      ...(releaseLease ? { releaseLease } : {}),
+      ...(releaseAdvisory ? { releaseAdvisory } : {}),
       ...(resultReconciliation ? { resultReconciliation: {
         status: resultReconciliation.status,
         claims: resultReconciliation.claims || [],
@@ -2276,11 +2549,15 @@ export function createMcpPresence({
       `KLYPIX Context Gateway: session ${sessionId} · phase ${nextPhase} · coordination ${durationMs}ms.`,
       deferralText,
       resultText,
+      releaseText,
       formatTaskPresence(snapshot, stamp),
       messagesText,
       deliveryWarning,
       conflictText,
       repoStateWarning,
+      releaseAdvisoryText,
+      // The one-line footer every peer sees while any release lease is active.
+      releaseFooterLine,
     ].filter(Boolean).join('\n\n');
     return {
       ...report,

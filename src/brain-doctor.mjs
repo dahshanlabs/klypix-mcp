@@ -531,9 +531,24 @@ export function inspect(opts = {}) {
   const harness = hasBrain ? auditProject(projectDir, { version: harnessVer }) : { files: [], drift: [], ok: true, version: harnessVer };
 
   // npm currency (caller fetches it; we just compare to the baked truth).
+  // Three honest states, not two (G4/G5/G6, 2026-08-14): `matches` collapsed
+  // installed>registry into "current" (cmp <= 0), so a machine running an
+  // UNRELEASED build rendered "✓ current" — the exact opposite of the truth a
+  // release gate needs. `relation` is the additive truthful field:
+  //   'ahead'   — installed > registry (running unreleased code; a warning)
+  //   'current' — installed == registry
+  //   'stale'   — installed < registry (behind; the existing drift path)
+  // `matches` keeps its historical boolean semantics for downstream parsers.
   const npm = (opts.npmLatest && !String(opts.npmLatest).startsWith('('))
-    ? { latest: opts.npmLatest, matches: version.baked ? cmpSemver(opts.npmLatest, version.baked) <= 0 : null }
-    : (opts.npmLatest ? { latest: opts.npmLatest, matches: null } : null);
+    ? (() => {
+      const cmp = version.baked ? cmpSemver(opts.npmLatest, version.baked) : null;
+      return {
+        latest: opts.npmLatest,
+        matches: cmp == null ? null : cmp <= 0,
+        relation: cmp == null ? null : (cmp > 0 ? 'stale' : cmp < 0 ? 'ahead' : 'current'),
+      };
+    })()
+    : (opts.npmLatest ? { latest: opts.npmLatest, matches: null, relation: null } : null);
 
   // ── verdict ──────────────────────────────────────────────────────────────
   const layers = {
@@ -603,7 +618,8 @@ export function inspect(opts = {}) {
     // does not exist in the published package, so the one string every client
     // renders verbatim was unrunnable. Point at commands that actually run.
     if (version.dirty) actions.push('npx klypix-mcp install --force   # running uncommitted (dirty) source code — restore the released npm version, or commit and re-deploy deliberately with --allow-untagged');
-    if (npm && npm.matches === false) actions.push(`npx klypix-mcp install   # installed brain v${version.baked} < npm latest v${npm.latest}`);
+    if (npm && npm.relation === 'stale') actions.push(`npx klypix-mcp install   # installed brain v${version.baked} < npm latest v${npm.latest}`);
+    if (npm && npm.relation === 'ahead') actions.push(`publish the release (or \`npx klypix-mcp install\` to restore the released version)   # installed brain v${version.baked} > npm latest v${npm.latest} — this machine runs an UNRELEASED build`);
     if (running.matchesInstalled === false) actions.push(`/mcp reconnect (or restart the session)   # LIVE server v${running.version} ≠ installed v${version.baked} — the running MCP server is stale`);
     if (version.supervisorCapable && running.known && !supervisors.active) actions.push('/mcp reconnect once   # activate the zero-restart supervisor; compatible future core updates hot-swap automatically');
     if (hooks.missing.length) actions.push(`npx klypix-mcp install   # half-wired: hooks not active — ${hooks.missing.join(', ')}`);
@@ -669,11 +685,16 @@ export function render(r, opts = {}) {
   L.push(`${c.bold}# brain_doctor${c.rst}  —  ${head}`);
   L.push('');
 
-  // VERSION
-  const vmark = r.layers.version === 'ok' ? ok : r.layers.version === 'absent' ? warn : warn;
+  // VERSION — 'ahead' (installed > registry) is a WARNING mark, never "✓ current":
+  // it means this machine runs unreleased code (deliberate dev deploy or a
+  // forgotten publish), and a release gate reading "current" here shipped wrong.
+  const npmRel = r.npm ? (r.npm.relation ?? (r.npm.matches === false ? 'stale' : r.npm.matches === true ? 'current' : null)) : null;
+  const vmark = r.layers.version === 'ok' ? (npmRel === 'ahead' ? warn : ok) : warn;
   L.push(`${vmark} ${c.bold}VERSION${c.rst}  brain core ${c.bold}v${r.version.baked || '(not deployed)'}${c.rst}${r.version.channel ? ` ${c.dim}via ${r.version.channel}${c.rst}` : ''}${r.version.dev ? `  ${c.yel}dev${c.rst}` : ''}`);
   if (r.version.dirty) L.push(`        ${c.red}DIRTY — running uncommitted hook code (source ${String(r.version.sourceSha || '?').slice(0, 12)})${c.rst}`);
-  if (r.npm) L.push(`        npm latest v${r.npm.latest}  ${r.npm.matches === false ? c.yel + '⚠ installed brain is behind' + c.rst : r.npm.matches === true ? c.grn + '✓ current' + c.rst : c.dim + '(no baked version to compare)' + c.rst}`);
+  if (r.npm) L.push(`        npm latest v${r.npm.latest}  ${npmRel === 'stale' ? c.yel + '⚠ installed brain is behind' + c.rst
+    : npmRel === 'ahead' ? c.yel + `⚠ AHEAD of npm — installed v${r.version.baked} > registry v${r.npm.latest}: running an UNRELEASED build (publish it, or expect peers to differ)` + c.rst
+      : npmRel === 'current' ? c.grn + '✓ current' + c.rst : c.dim + '(no baked version to compare)' + c.rst}`);
 
   // RUNNING (behavioral truth — the live MCP server(s), not the baked file)
   if (r.running) {

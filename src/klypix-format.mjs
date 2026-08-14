@@ -1985,6 +1985,23 @@ export function rankForQuestion(struct, question, { semantic = null, k = 10, as_
         // in ANY form: true answers score as low as 0.498 while out-of-domain
         // top-1 reaches 0.683, so no threshold separates them. Before re-adding
         // one, build a negative/unanswerable set and an abstain metric.
+        //
+        // ── 2026-08-14 (1.70 measured wave): this fusion is SATURATED given the
+        // bi-encoder's rank order. On the frozen v2 set (n=113) vs the real
+        // 2,542-card brain (baseline MRR 0.456 · recall@5 62%), five candidate
+        // reweightings were swept against cached production cosines and ALL
+        // landed at or below noise: a title/tag-only lexical leg for non-anchor
+        // queries (+1 question at best; MRR 0.456→0.395 and top-1 36%→25% at
+        // useful weights — failure analysis shows lexical evidence sits on
+        // distractors, golds had ≥2 precise hits in only 1/43 misses), a
+        // status-recency prior (flat), stronger archived demotion (−0.2…−1.0
+        // all LOSE gold — archived cards can be the answer), MMR near-dupe
+        // deferral (flat), and an area-consensus prior (flat to −0.023 MRR).
+        // Graph expansion ceilings: gold connected to a top-10 hit in 2/43
+        // misses, via wikilinks 0/43. CI-clearing recall gains must come from
+        // the embedding side, not from reweighting here. The kept behaviors are
+        // pinned numerically in test/retrieval-fusion.mjs — a change that trips
+        // that suite must re-run the harness before shipping.
         const semRank = new Map(scored
             .filter(hit => Number.isFinite(hit.sem))
             .sort((a, b) => b.sem - a.sem)
@@ -2947,7 +2964,12 @@ export async function addBrainConnections(buffer, edges) {
             id: `con_${rand()}`, fromId: e.fromId, toId: e.toId,
             relationship: REL.has(e.relationship) ? e.relationship : 'relates_to',
             label: typeof e.label === 'string' ? e.label : undefined,
-            arrowHead: true, width: 2, color: typeof e.color === 'string' ? e.color : '#10b981', style: 'solid',
+            // style/width are honored additively (no caller passed them before
+            // 1.70.0) so the orphan backfill's --areas edges render with the
+            // same muted dashed containment styling capture uses — the same
+            // semantic edge must not draw bold-solid from one writer and
+            // muted-dashed from the other.
+            arrowHead: true, width: Number.isFinite(e.width) ? e.width : 2, color: typeof e.color === 'string' ? e.color : '#10b981', style: e.style === 'dashed' ? 'dashed' : 'solid',
         });
         added++;
     }
@@ -3002,6 +3024,120 @@ export function proposeStructuralConnections(struct, { maxPerCard = 2 } = {}) {
         edges.push({ fromId: e.a, toId: e.b, why: e.why });
     }
     return edges;
+}
+
+// ── Orphan gardener (1.70.0) — the CONFIDENT auto-link selector ─────────────
+// Shared by capture (a new card must not land as a graph orphan) and the
+// `orphans` backfill CLI. For each zero-degree live decision/milestone card
+// (the brainInsights orphan definition — questions and 🌿/⤵ consolidation
+// artifacts are excluded, so counts stay coherent with every other surface),
+// it proposes:
+//   • areaId  — the card's own area container (always known, always safe), and
+//   • anchor  — AT MOST ONE lexical-anchor edge, only when the evidence is
+//     unambiguous. Precision over recall, by recorded trap (a live probe once
+//     attached unrelated correction overlays): never fan out, never guess
+//     among multiple candidates. Confidence ladder, first hit wins:
+//       1. exact [[wikilink]] whose text equals exactly ONE other card's title
+//       2. exact file-slug tag (#name-ext, e.g. #brain-doctor-mjs) carried by
+//          exactly ONE other live card
+//       3. ≥0.6 title-token overlap AND ≥3 shared tokens, with exactly ONE
+//          candidate above the bar (two qualifying candidates = ambiguous =
+//          no edge; two shared words alone are never confident)
+// Pure + additive: returns proposals; callers draw the edges. `connections`
+// lets capture pass its in-flight (already mutated) edge list so a card linked
+// earlier in the same batch is never re-proposed.
+const TITLE_OVERLAP_AT = 0.6;
+// Two shared words are never confident evidence. Card titles are TRUNCATED
+// (~35 chars), so two 3-token titles sharing 2 brain-ubiquitous tokens
+// ('klypix'+'canvas', 'open'+'canvas') hit exactly 0.67 and cleared the ratio
+// bar alone — field review of the real 2,494-card brain (2026-08-14) found
+// ~6 clearly-wrong pairs of 78 built exactly that way ("JSON Canvas importer"
+// → "TWO colour systems", "market-sizing slide" → "MAC BUILT"). Requiring ≥3
+// shared informative tokens kept 41/78 pairs with a clean spot-check; the
+// dropped real pairs stay for brain_connect review (precision over recall,
+// by recorded trap).
+const TITLE_MIN_HITS = 3;
+// No single-letter extensions ('c'/'h'): the real brain carries tags like
+// #dir-c that are not file slugs, and a false slug is a guessed edge (field
+// dry-run against the 2,494-card brain, 2026-08-14).
+const FILE_SLUG_TAG_RE = /^[\p{L}\p{N}_]+(?:-[\p{L}\p{N}_]+)*-(?:mjs|cjs|js|ts|tsx|jsx|py|rb|go|rs|md|json|ya?ml|toml|css|html|sql|sh|ps1|swift|kt|java|cs|cpp)$/u;
+// Title-overlap tokens: the area prefix ("canvas: …") and glue words inflate
+// overlap between ANY two same-area cards — a real 0.60 pair made of 'canvas',
+// 'one', 'click', 'the' is a guess, not an anchor (same field dry-run).
+const TITLE_STOP = new Set(['the', 'and', 'for', 'with', 'not', 'are', 'was', 'has', 'this', 'that',
+    'from', 'into', 'over', 'now', 'new', 'one', 'two', 'all', 'its', 'our', 'you', 'your', 'per',
+    'via', 'out', 'off', 'when', 'then', 'than', 'but', 'can', 'get', 'got', 'still', 'more']);
+const anchorTitleTok = (s) => new Set(String(s || '')
+    .replace(/^[^:\n]{1,40}:\s*/, '')                      // drop the "Area:" prefix
+    .toLowerCase()
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter(w => w.length >= 3 && !TITLE_STOP.has(w)));
+export function proposeOrphanAnchorLinks(struct, { onlyIds = null, connections = null } = {}) {
+    const conns = Array.isArray(connections) ? connections : struct.connections;
+    const deg = new Map();
+    for (const cn of conns) {
+        if (cn.fromId) deg.set(cn.fromId, (deg.get(cn.fromId) || 0) + 1);
+        if (cn.toId) deg.set(cn.toId, (deg.get(cn.toId) || 0) + 1);
+    }
+    const containers = new Map(struct.cards.filter(c => c.type === 'container').map(c => [c.id, c]));
+    const live = struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim() && !/^archive$/i.test(c.area || ''));
+    const normTag = (t) => String(t || '').toLowerCase().replace(/^#/, '');
+    const tagIx = new Map();
+    for (const c of live) for (const t of (c.tags || [])) {
+        const k = normTag(t);
+        if (!k) continue;
+        if (!tagIx.has(k)) tagIx.set(k, []);
+        tagIx.get(k).push(c.id);
+    }
+    const titles = live
+        .filter(c => (c.title || '').trim())
+        .map(c => ({ id: c.id, t: c.title.trim().toLowerCase(), atok: anchorTitleTok(c.title) }));
+    const out = [];
+    for (const c of live) {
+        if (onlyIds && !onlyIds.has(c.id)) continue;
+        if ((deg.get(c.id) || 0) > 0) continue;                       // already in the graph
+        if (isOpenCard(c) || /🌿|⤵/.test(c.text || '')) continue;     // brainInsights orphan definition
+        const parent = containers.get(c.parentId);
+        const areaId = parent && !/^archive$/i.test(parent.title || '') ? parent.id : null;
+        let anchor = null;
+        // 1 — exact [[wikilink]] (exact title equality; the capture pass's own
+        // startsWith wikilink matcher runs BEFORE this, so anything reaching
+        // here either had no link or an inexact one — only exactness is safe).
+        for (const link of (c.links || [])) {
+            const want = String(link).trim().toLowerCase();
+            if (!want) continue;
+            const hits = titles.filter(e => e.id !== c.id && e.t === want);
+            if (hits.length === 1) { anchor = { toId: hits[0].id, why: `[[${String(link).trim()}]]` }; break; }
+        }
+        // 2 — exact file-slug tag shared with exactly ONE other card.
+        if (!anchor) for (const t of (c.tags || [])) {
+            const k = normTag(t);
+            if (!FILE_SLUG_TAG_RE.test(k)) continue;
+            const hits = (tagIx.get(k) || []).filter(id => id !== c.id);
+            if (hits.length === 1) { anchor = { toId: hits[0], why: `#${k}` }; break; }
+        }
+        // 3 — ≥0.6 title overlap with ONE unambiguous candidate. Overlap is
+        // hits / max(|a|,|b|): subset titles ("Auth" ⊂ "Auth token rotation")
+        // must NOT score 1.0. Tokens come from anchorTitleTok (area prefix and
+        // glue words stripped), and both titles need ≥3 real tokens — a match
+        // built on boilerplate is a guess, not an anchor.
+        if (!anchor) {
+            const mine = anchorTitleTok(c.title || '');
+            if (mine.size >= 3) {
+                const qualified = [];
+                for (const e of titles) {
+                    if (e.id === c.id || e.atok.size < 3) continue;
+                    let hit = 0; for (const w of mine) if (e.atok.has(w)) hit++;
+                    const s = hit / Math.max(mine.size, e.atok.size);
+                    if (hit >= TITLE_MIN_HITS && s >= TITLE_OVERLAP_AT) qualified.push({ id: e.id, s });
+                    if (qualified.length > 1) break;                  // ambiguous — stop early
+                }
+                if (qualified.length === 1) anchor = { toId: qualified[0].id, why: `title ${qualified[0].s.toFixed(2)}` };
+            }
+        }
+        if (areaId || anchor) out.push({ cardId: c.id, areaId, anchor });
+    }
+    return out;
 }
 
 // ── Atomic brain capture: supersede + append + resolve + auto-link ──────────
@@ -4156,6 +4292,24 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
             }
             if (hintEdges) stats.hintEdges = hintEdges;
         } catch { /* hint persistence is opportunistic — never fail a capture */ }
+        // ORPHAN GARDENER AT CAPTURE (1.70.0) — a capture must not mint graph
+        // orphans. Any just-added decision/milestone card that every pass above
+        // (supersede/closes/wikilink/structural/hint) left with ZERO edges gets:
+        //   • an edge to its own area container (muted, dashed — containment
+        //     made visible, so the card is reachable from the graph), and
+        //   • at most ONE confident lexical-anchor edge (exact [[wikilink]],
+        //     exact file-slug tag, or an unambiguous ≥0.6 title overlap) —
+        //     never a fan-out, never a guess among multiple candidates.
+        // Additive + lossless; a failure never fails the capture.
+        if (newIds.size) {
+            try {
+                for (const p of proposeOrphanAnchorLinks(struct, { onlyIds: newIds, connections: canvas.connections })) {
+                    if (p.anchor) addConn(p.cardId, p.anchor.toId, 'auto', 'relates_to');
+                    if (p.areaId) addConn(p.cardId, p.areaId, 'in area', 'relates_to', { color: 'rgba(120,120,135,0.45)', width: 1, style: 'dashed' });
+                    stats.orphanLinked = (stats.orphanLinked || 0) + 1;
+                }
+            } catch { /* orphan auto-link is opportunistic — never fail a capture */ }
+        }
         stampBrainKind(manifest);
         work = await finalizeBrainZip(zip, canvas, manifest, now);
     }

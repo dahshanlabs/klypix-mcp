@@ -737,10 +737,39 @@ function touchSession(sid, patch = {}) {
                     ? Math.max(0, Number(patch.transcriptBytes))
                     : (prev.scopeTranscriptBytes ?? null),
                 // addFiles UNIONS under the lane lock (live observed scope);
-                // files REPLACES (Stop rewrites the session's full set).
+                // files REPLACES (Stop rewrites the session's full set). Cap
+                // pressure evicts OBSERVED-marked entries before anything else
+                // (parity with upsertSession, review-caught 1.70.0): a plain
+                // slice(-20) let an observation flood push brain_sync-DECLARED
+                // files off the row, silently shrinking peers' overlap coverage
+                // of declared work.
                 files: patch.addFiles !== undefined
-                    ? [...new Set([...baseFiles, ...patch.addFiles])].slice(-20)
+                    ? (() => {
+                        const union = [...new Set([...baseFiles, ...patch.addFiles])];
+                        if (union.length <= 20) return union;
+                        const obs = new Set([...(prev.observedFiles || []), ...(patch.addObservedFiles || [])]);
+                        const declared = union.filter(f => !obs.has(f));
+                        const observed = union.filter(f => obs.has(f));
+                        return [...observed.slice(-Math.max(0, 20 - declared.length)), ...declared.slice(-20)];
+                    })()
                     : (patch.files !== undefined ? patch.files : baseFiles),
+                // OBSERVED scope adoption (1.70.0): paths the host REPORTED this
+                // session editing with NO declared scope covering them. They also
+                // ride files[] (addFiles above) for pre-1.70 readers, but the
+                // marker here is what keeps an observation from ever reading as a
+                // declaration. LRU (re-observation moves to the tail), cap 20.
+                // Deliberately NOT reset by startsScope and NOT cleared by the
+                // completion path — an undeclared edit stays real in the worktree
+                // after the task that made it; only LRU pressure or session TTL
+                // retires it.
+                ...(patch.addObservedFiles !== undefined
+                    ? {
+                        observedFiles: [
+                            ...(prev.observedFiles || []).filter(f => !patch.addObservedFiles.includes(f)),
+                            ...patch.addObservedFiles,
+                        ].slice(-20),
+                    }
+                    : {}),
                 // ships ACCUMULATE across turns (deduped, last 5) so a peer sees the
                 // session's recent ship-events, not just the latest turn's.
                 ships: patch.ships !== undefined ? [...new Set([...(prev.ships || []), ...patch.ships])].slice(-5) : (prev.ships ?? []),
@@ -829,6 +858,28 @@ function shortestUniquePeerPrefix(rows, id, minLength = 8) {
     }
     return canonical;
 }
+// Release-lease footer line (1.70.0 measured wave): brain_sync's releaseIntent
+// records an EXCLUSIVE release-preparation lease in this same lane file. Every
+// peer's footer carries one line while it is active, so a second session never
+// starts cutting the same release blind. PARITY with agent-presence.mjs
+// releaseLeaseVerdict (duplicated because this hook stays free of sibling
+// static imports by design): a lease is active only while it is unexpired
+// (~2h TTL refreshed by holder checkpoints) AND its holder still answers for a
+// LIVE lane row — expiry and the dead-session sweep free it with no cooperation.
+function releaseLeaseFooterLine(list, now) {
+    try {
+        const lease = readSharedLaneChecked().data?.releaseLease;
+        if (!lease || typeof lease !== 'object' || Array.isArray(lease)) return '';
+        const holderId = String(lease.holderId || '').trim().slice(0, 160);
+        const version = String(lease.version || '').trim().replace(/^v/i, '').slice(0, 64);
+        const ref = String(lease.ref || '').trim().slice(0, 200);
+        const refreshedAt = Number(lease.refreshedAt || lease.takenAt || 0);
+        const ttlMs = Math.max(60000, Number(lease.ttlMs) || 2 * 60 * 60 * 1000);
+        if (!holderId || !version || !ref || !refreshedAt || now >= refreshedAt + ttlMs) return '';
+        if (!list.some(s => msgSessionIdentityKeys(s).includes(holderId.toLowerCase()))) return '';
+        return `- 🚢 release in preparation: v${version} from ${ref} (session ${shortestUniquePeerPrefix(list, holderId)})`;
+    } catch { return ''; }
+}
 // Zero-cost-UNLESS-a-peer-exists footer: lists other live sessions and ESCALATES
 // when one shares your branch or is editing files you changed. Empty string when
 // you're solo (the common case) — preserves the per-prompt "nothing → zero tokens"
@@ -851,11 +902,34 @@ function peerFooter(sid) {
     // Normalize like the MCP detector's normalizeFileKey (slashes, ./ prefix,
     // case) so hook-observed and brain_sync-declared spellings cross-match.
     const fileKey = (f) => String(f || '').replace(/\\/g, '/').replace(/^\.\//, '').trim().toLowerCase();
-    const myFiles = new Set(((me && Array.isArray(me.files)) ? me.files : []).map(fileKey));
+    // Overlap is computed over observed∪declared on BOTH sides (automatic scope
+    // adoption, 1.70.0): a session that never declared a scope still collides
+    // for real when the hook has observed it editing the same path. A session
+    // whose task COMPLETED and went idle (brain_sync phase complete: intent ''
+    // + files [] + completedAt stamped) contributes NO live observations —
+    // parity with mcp-presence completedIdleSession; without it a finished
+    // task's leftover markers kept warning peers for the session's whole
+    // lifetime. A fresh human prompt starts the next scope (startsScope clears
+    // completedAt), reviving the observed lane automatically.
+    const liveObservedOf = (s) => {
+        if (!s) return [];
+        const done = Boolean(s.completedAt) && !String(s.intent || '').trim()
+            && !(Array.isArray(s.files) && s.files.length);
+        return (!done && Array.isArray(s.observedFiles)) ? s.observedFiles : [];
+    };
+    const scopeOf = (s) => [...new Set([
+        ...((s && Array.isArray(s.files)) ? s.files : []),
+        ...liveObservedOf(s),
+    ])];
+    const observedKeysOf = (s) => new Set(liveObservedOf(s).map(fileKey));
+    const myFiles = new Set(scopeOf(me).map(fileKey));
+    const myObservedKeys = observedKeysOf(me);
     const myBranch = me && me.branch;
     const ago = (ts) => { const m = Math.max(0, Math.round((now - (ts || now)) / 60000)); return m <= 0 ? 'just now' : `${m}m ago`; };
     const asOf = new Date(now).toISOString().slice(11, 16) + 'Z';
     const lines = ['', `## ⚠️ Other live session(s) in this project — ${peers.length} total, as of ${asOf}${hiddenIdle ? ` (+${hiddenIdle} inactive not shown)` : ''} — coordinate (the brain is shared, NOT live-merged)`];
+    const releaseLine = releaseLeaseFooterLine(list, now);
+    if (releaseLine) lines.push(releaseLine);
     for (const p of peers.slice(0, 4)) {
         const bits = [];
         if (p.branch) bits.push(`branch \`${p.branch}\``);
@@ -870,10 +944,20 @@ function peerFooter(sid) {
         }
         const ships = Array.isArray(p.ships) ? p.ships : [];
         if (ships.length) bits.push(`🏁 shipped: ${ships.slice(-3).join('; ')}`);
-        if (Array.isArray(p.files) && p.files.length) bits.push(`✏️ ${p.files.slice(-4).join(', ')}${p.files.length > 4 ? ` (+${p.files.length - 4})` : ''}`);
-        const shared = (Array.isArray(p.files) ? p.files : []).filter(f => myFiles.has(fileKey(f)));
+        const pScope = scopeOf(p);
+        if (pScope.length) bits.push(`✏️ ${pScope.slice(-4).join(', ')}${pScope.length > 4 ? ` (+${pScope.length - 4})` : ''}`);
+        const pObservedKeys = observedKeysOf(p);
+        const shared = pScope.filter(f => myFiles.has(fileKey(f)));
         let warn = '';
-        if (shared.length) warn = `  · ⚠️ both edited: ${shared.slice(0, 5).join(', ')} — expect a conflict, KEEP BOTH`;
+        if (shared.length) {
+            // The observed/declared distinction rides the warning so a peer knows
+            // the CONFIDENCE of each claim: * = adopted from live edits, not a
+            // declared scope (real overlap, unconfirmed boundary).
+            const mark = (f) => (pObservedKeys.has(fileKey(f)) || myObservedKeys.has(fileKey(f))) ? `${f}*` : f;
+            const marked = shared.slice(0, 5).map(mark);
+            const legend = marked.some(f => f.endsWith('*')) ? ' (* = observed from live edits, scope not declared)' : '';
+            warn = `  · ⚠️ both edited: ${marked.join(', ')} — expect a conflict, KEEP BOTH${legend}`;
+        }
         else if (p.branch && myBranch && p.branch === myBranch) warn = '  · ⚠️ same branch — pull/rebase before you commit';
         // Unique over the full live list (not just shown peers) — the MSG router
         // resolves a prefix against every row, so uniqueness must match that set.
@@ -1912,7 +1996,11 @@ function observeFileScope(input, sid) {
             const me = readSessions().find(s => s.id === sid);
             if (me && Array.isArray(me.files) && me.files.includes(rel)) return;   // already recorded — skip the lock
         } catch { /* pre-check is best-effort */ }
-        touchSession(sid, { addFiles: [rel] });
+        // Not covered by any declared scope (a brain_sync declaration lands in
+        // files[], which the pre-check above just cleared) → automatic scope
+        // ADOPTION: the row gains the path as an OBSERVED file, distinct from a
+        // declaration, while still joining files[] for pre-1.70 readers.
+        touchSession(sid, { addFiles: [rel], addObservedFiles: [rel] });
     } catch { /* observation is best-effort */ }
 }
 

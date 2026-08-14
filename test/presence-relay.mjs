@@ -89,7 +89,9 @@ const richRow = {
 const frame = buildPresenceFrame(richRow, { machineId: 'mach-a', hostLabel: 'DEV-PC-A', root: 'E:/work/repo', now });
 ok(frame && frame.v === PRESENCE_WIRE_VERSION && frame.sid === 'sess-a' && frame.files[0] === 'src/app.tsx',
   'presence frame carries the declared metadata');
-const allowedKeys = ['v', 'kind', 'sid', 'machine', 'host', 'client', 'surface', 'branch', 'intent', 'files', 'sentAt'];
+// observedFiles (1.70.0 automatic scope adoption) is whitelisted alongside
+// files: same canonicalWireFiles scrub, so it can carry repo-relative keys only.
+const allowedKeys = ['v', 'kind', 'sid', 'machine', 'host', 'client', 'surface', 'branch', 'intent', 'files', 'observedFiles', 'sentAt'];
 ok(Object.keys(frame).every((key) => allowedKeys.includes(key))
   && !JSON.stringify(frame).includes('secret') && !JSON.stringify(frame).includes('4242')
   && !JSON.stringify(frame).toLowerCase().includes('cwd'),

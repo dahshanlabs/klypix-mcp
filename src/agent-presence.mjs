@@ -718,6 +718,16 @@ function normalizeFiles(files) {
   return out.slice(-20);
 }
 
+// Comparison fold for scope coverage checks — mirrors mcp-presence.mjs
+// normalizeFileKey's slash/./-prefix/case fold (duplicated because THAT module
+// imports THIS one). Coverage must match across spellings: a hook observes
+// `src\App.tsx` while brain_sync declared `src/app.tsx`.
+const scopeKey = (file) => String(file || '').replace(/\\/g, '/').replace(/^\.\//, '').trim().toLowerCase();
+
+// Cap for the observed-scope lane (automatic scope adoption, 1.70.0). Kept as
+// its own constant so writers and tests agree on the LRU bound.
+export const OBSERVED_FILES_CAP = 20;
+
 export function listActiveSessions({ brainPath, home, now = Date.now() }) {
   if (!brainPath) return [];
   const lane = readLane(laneFileFor(brainPath, home));
@@ -736,6 +746,16 @@ export function upsertSession({
   intentSource = null,
   files,
   replaceFiles = false,
+  // Automatic scope adoption (1.70.0): paths the HOST reported this session
+  // editing (hook PostToolUse / codex tool events) — observations, never
+  // declarations. A path already covered by the row's DECLARED scope is
+  // ignored (the declaration is the higher-confidence claim); anything else
+  // joins `observedFiles` (LRU, cap OBSERVED_FILES_CAP) AND the legacy
+  // `files` union so pre-1.70 readers keep their overlap coverage. The
+  // `observedFiles` marker is what lets every 1.70+ reader state the
+  // observed/declared distinction instead of mistaking a live edit for a
+  // declared scope.
+  observedFiles,
   event = null,
   channel = null,
   transportStatus = null,
@@ -779,9 +799,51 @@ export function upsertSession({
       transport[String(channel)] = { status: String(status).slice(0, 40), at: now };
       channelOwners[String(channel)] = process.pid;
     }
-    const mergedFiles = files === undefined
+    let mergedFiles = files === undefined
       ? normalizeFiles(previous.files)
       : normalizeFiles(replaceFiles ? files : [...(previous.files || []), ...(files || [])]);
+    // ── Observed-scope maintenance (automatic scope adoption, 1.70.0) ────────
+    // `files` arrivals are DECLARATIONS (brain_sync). A path the declaration
+    // now names sheds its observed marker — the claim was upgraded, never
+    // duplicated. A declaration NOT covering an observed path leaves the
+    // marker alone (replaceFiles/completion clears declared scope only:
+    // the 1.69.0 completion guard must never erase what a session was
+    // OBSERVED editing — those edits are still real in the worktree).
+    const prevObserved = normalizeFiles(previous.observedFiles);
+    const declarationKeys = files !== undefined
+      ? new Set(normalizeFiles(files).map(scopeKey))
+      : null;
+    let nextObserved = declarationKeys
+      ? prevObserved.filter((file) => !declarationKeys.has(scopeKey(file)))
+      : prevObserved;
+    if (observedFiles !== undefined) {
+      // Declared coverage = files minus observed markers (observed paths ride
+      // in `files` too, for pre-1.70 readers — they are not declarations).
+      const observedKeys = new Set(nextObserved.map(scopeKey));
+      const declaredCovered = new Set(mergedFiles.map(scopeKey).filter((key) => !observedKeys.has(key)));
+      for (const file of normalizeFiles(observedFiles)) {
+        const key = scopeKey(file);
+        if (declaredCovered.has(key)) continue;   // declared scope covers it — nothing to adopt
+        nextObserved = nextObserved.filter((existing) => scopeKey(existing) !== key);
+        nextObserved.push(file);                  // LRU: a re-observation moves to the tail
+        if (!mergedFiles.some((existing) => scopeKey(existing) === key)) mergedFiles.push(file);
+      }
+      // Cap pressure evicts OBSERVATIONS, never declarations (review-caught,
+      // 1.70.0): normalizeFiles' plain slice(-20) let an observation flood push
+      // a session's DECLARED files out of files[] — peers silently lost
+      // blocking coverage on declared work, and a later re-edit of the evicted
+      // path re-entered it as observed, rendering an owned scope as
+      // `*`-unconfirmed. Declarations keep the tail (slice keeps newest); the
+      // observations fill whatever room remains, oldest evicted first.
+      if (mergedFiles.length > 20) {
+        const observedKeySet = new Set(nextObserved.map(scopeKey));
+        const declared = mergedFiles.filter((file) => !observedKeySet.has(scopeKey(file)));
+        const observed = mergedFiles.filter((file) => observedKeySet.has(scopeKey(file)));
+        mergedFiles = [...observed.slice(-Math.max(0, 20 - declared.length)), ...declared];
+      }
+      mergedFiles = normalizeFiles(mergedFiles);
+    }
+    nextObserved = nextObserved.slice(-OBSERVED_FILES_CAP);
     // Intent freshness is its OWN timestamp: lastSeen is refreshed by heartbeats
     // that never touch intent, so without intentAt a 100-minute-old intent renders
     // under "active just now" (2026-07-29 audit). Stamped only when the intent
@@ -816,6 +878,11 @@ export function upsertSession({
       ...(intentChanged ? { intentAt: now, intentSource: intentSource || 'declared' }
         : (previous.intentAt ? { intentAt: previous.intentAt, intentSource: previous.intentSource || null } : {})),
       files: mergedFiles,
+      // ADDITIVE observed lane: written only for rows that ever carried it, so
+      // pre-1.70 rows stay byte-stable through a touch that changes nothing.
+      ...(nextObserved.length || previous.observedFiles !== undefined
+        ? { observedFiles: nextObserved }
+        : {}),
       event: event ?? previous.event ?? null,
       ...(activityEvent
         ? { activityAt: now, activityKind: activityEvent }
@@ -903,6 +970,13 @@ export function upsertRemoteSessions({ brainPath, rows, machineId = MACHINE_ID, 
       const existingIdx = sessions.findIndex((session) => session.id === row.id);
       if (existingIdx >= 0 && sessions[existingIdx].via !== 'cloud') continue;   // local row wins
       const previous = existingIdx >= 0 ? sessions[existingIdx] : {};
+      // REPLACE semantics, like `files` below: the frame is a full snapshot of
+      // the sender's row, so an empty/absent observed lane must CLEAR the
+      // mirror. The `...previous` spread otherwise pinned a completed remote
+      // task's stale markers to the local mirror forever (review-caught
+      // 1.70.0) — remote rows carry no completedAt, so no local gate could
+      // ever retire them.
+      const remoteObserved = normalizeFiles(row.observedFiles).slice(-OBSERVED_FILES_CAP);
       const next = {
         ...previous,
         id: String(row.id),
@@ -914,6 +988,10 @@ export function upsertRemoteSessions({ brainPath, rows, machineId = MACHINE_ID, 
         // pre-guard build can relay junk intent — never mirror it verbatim.
         intent: looksMachineTurn(row.intent) ? String(previous.intent || '') : String(row.intent || '').slice(0, 160),
         files: normalizeFiles(row.files),
+        // Observed/declared distinction crosses machines too (additive — an old
+        // sender simply never populates it; see remoteObserved above for the
+        // replace-not-merge rule).
+        ...(remoteObserved.length ? { observedFiles: remoteObserved } : {}),
         machine: String(row.machine),
         host: row.host ?? previous.host ?? null,
         via: 'cloud',
@@ -924,6 +1002,9 @@ export function upsertRemoteSessions({ brainPath, rows, machineId = MACHINE_ID, 
         startedAt: previous.startedAt || now,
         lastSeen: now,
       };
+      // The `...previous` spread carried any stale marker into `next`; an empty
+      // snapshot clears it (see the replace-not-merge rule above).
+      if (!remoteObserved.length) delete next.observedFiles;
       if (existingIdx >= 0) sessions[existingIdx] = next;
       else sessions.push(next);
     }
@@ -1124,6 +1205,229 @@ export function endSession({ brainPath, id, home, now = Date.now(), expectedPid 
   } finally {
     releaseLock(lockFile);
   }
+}
+
+// ── Release lease (1.70.0 measured wave) ────────────────────────────────────
+// One EXCLUSIVE per-project release-preparation record in the same lane file
+// every presence reader already parses. First declarer takes it; a second
+// declarer gets a hard conflict naming the holder+version+ref. The lease is
+// bounded three ways, all reusing the lane's existing liveness machinery:
+//   • TTL (~2h) refreshed by the holder's checkpoints — a stalled release
+//     cannot squat on the project forever;
+//   • freed explicitly when the holder's task truly completes;
+//   • freed implicitly when the holder stops being a live lane session
+//     (TTL pruning + dead-host sweep, via pruneSessions) — a crashed holder
+//     never blocks the next release engineer.
+// The stored record is additive lane state: every existing mutator spreads
+// `...data` on write, so the key survives session/message maintenance, and
+// old readers simply ignore it.
+export const RELEASE_LEASE_TTL_MS = 2 * 60 * 60 * 1000;
+
+const releaseLeaseVersionKey = (value) => String(value || '').trim().replace(/^v/i, '').slice(0, 64);
+const releaseLeaseRefKey = (value) => String(value || '').trim().slice(0, 200);
+
+function normalizeReleaseLease(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const holderId = recipientKey(raw.holderId);
+  const version = releaseLeaseVersionKey(raw.version);
+  const ref = releaseLeaseRefKey(raw.ref);
+  const takenAt = Number(raw.takenAt || 0);
+  const refreshedAt = Number(raw.refreshedAt || raw.takenAt || 0);
+  if (!holderId || !version || !ref || !takenAt || !refreshedAt) return null;
+  const ttlMs = Math.max(60_000, Number(raw.ttlMs) || RELEASE_LEASE_TTL_MS);
+  return {
+    holderId,
+    holderClient: String(raw.holderClient || 'unknown').slice(0, 40),
+    version,
+    ref,
+    takenAt,
+    refreshedAt,
+    ttlMs,
+    expiresAt: refreshedAt + ttlMs,
+  };
+}
+
+// The holder may have rotated ids since taking the lease — match against the
+// same identity set message routing uses (id, logical id, aliases).
+const sessionOwnsLease = (session, holderId) => {
+  const key = recipientKey(holderId);
+  return Boolean(key && session && (recipientKey(session.id) === key
+    || recipientKey(session.logicalSessionId) === key
+    || normalizeAliases(session.aliases).includes(key)));
+};
+
+// Verdict for a stored lease against pre-PRUNED sessions (the caller must pass
+// pruneSessions output so TTL pruning and the dead-host sweep both apply):
+// { status: 'active' | 'expired' | 'dead-holder', lease } or null (no/invalid
+// record). Only 'active' binds anyone; the other verdicts are reclaimable.
+export function releaseLeaseVerdict(rawLease, sessions, now = Date.now()) {
+  const lease = normalizeReleaseLease(rawLease);
+  if (!lease) return null;
+  if (now >= lease.expiresAt) return { status: 'expired', lease };
+  const alive = (Array.isArray(sessions) ? sessions : [])
+    .some((session) => sessionOwnsLease(session, lease.holderId));
+  return { status: alive ? 'active' : 'dead-holder', lease };
+}
+
+// Read-only: the ACTIVE lease or null. Lock-free like every other read surface
+// (atomic lane writes guarantee a parseable snapshot).
+export function readReleaseLease({ brainPath, home, now = Date.now() } = {}) {
+  if (!brainPath) return null;
+  const lane = readLane(laneFileFor(brainPath, home));
+  const verdict = releaseLeaseVerdict(lane.releaseLease, pruneSessions(lane.sessions, now), now);
+  return verdict?.status === 'active' ? verdict.lease : null;
+}
+
+// Shared lock/read/verdict/write skeleton for the three mutators. `mutate`
+// returns { write, lease, outcome }: lease === null deletes the record,
+// undefined leaves it untouched. Sessions/messages bytes are preserved as-is —
+// a lease mutation must never race presence maintenance into data loss.
+function mutateReleaseLease({ brainPath, home, now, mutate }) {
+  if (!brainPath) return { ok: false, status: 'no-brain' };
+  const laneFile = laneFileFor(brainPath, home);
+  const lockFile = laneFile + '.lock';
+  if (!acquireLock(lockFile)) return { ok: false, status: 'lane-locked' };
+  try {
+    const laneRead = readMutableLane(laneFile);
+    if (!laneRead.ok) return { ok: false, status: laneRead.reason };
+    const data = laneRead.data;
+    const sessions = pruneSessions(data.sessions, now);
+    const verdict = releaseLeaseVerdict(data.releaseLease, sessions, now);
+    const result = mutate({ data, sessions, verdict });
+    if (result.write) {
+      const next = { ...data };
+      if (result.lease === null) delete next.releaseLease;
+      else if (result.lease !== undefined) next.releaseLease = result.lease;
+      fs.mkdirSync(path.dirname(laneFile), { recursive: true });
+      writeLaneFileAtomic(laneFile, JSON.stringify(next));
+    }
+    return result.outcome;
+  } finally {
+    releaseLock(lockFile);
+  }
+}
+
+const leaseHeldBy = (verdict, sessions, callerId) => {
+  if (!verdict) return false;
+  const me = sessions.find((session) => recipientKey(session.id) === callerId) || null;
+  return recipientKey(verdict.lease.holderId) === callerId
+    || sessionOwnsLease(me, verdict.lease.holderId);
+};
+
+// First-declarer-wins exclusive take. Same holder re-declaring refreshes (and
+// may retarget version/ref); an expired or dead-holder record is reclaimed with
+// the reason surfaced; a live foreign holder is a hard conflict carrying the
+// full holder record so the caller can name it.
+export function declareReleaseLease({
+  brainPath,
+  sessionId,
+  version,
+  ref,
+  client = 'unknown',
+  home,
+  now = Date.now(),
+  ttlMs = RELEASE_LEASE_TTL_MS,
+}) {
+  const holderId = recipientKey(sessionId);
+  const nextVersion = releaseLeaseVersionKey(version);
+  const nextRef = releaseLeaseRefKey(ref);
+  if (!holderId || !nextVersion || !nextRef) return { ok: false, status: 'invalid-release-intent' };
+  return mutateReleaseLease({ brainPath, home, now, mutate: ({ sessions, verdict }) => {
+    const mine = leaseHeldBy(verdict, sessions, holderId);
+    if (verdict?.status === 'active' && !mine) {
+      return { write: false, outcome: { ok: false, status: 'conflict', holder: verdict.lease } };
+    }
+    const stillMine = mine && verdict?.status === 'active';
+    const stored = {
+      schemaVersion: 1,
+      holderId,
+      holderClient: String(client || 'unknown').slice(0, 40),
+      version: nextVersion,
+      ref: nextRef,
+      takenAt: stillMine ? verdict.lease.takenAt : now,
+      refreshedAt: now,
+      ttlMs: Math.max(60_000, Number(ttlMs) || RELEASE_LEASE_TTL_MS),
+    };
+    const reclaimed = !stillMine && verdict ? verdict.status : null;
+    return {
+      write: true,
+      lease: stored,
+      outcome: {
+        ok: true,
+        status: stillMine ? 'refreshed' : 'taken',
+        ...(reclaimed && reclaimed !== 'active' ? { reclaimed } : {}),
+        lease: normalizeReleaseLease(stored),
+      },
+    };
+  } });
+}
+
+// Checkpoint refresh: only the live holder advances refreshedAt. A stale
+// record (expired / dead holder) found by ANY caller is pruned so readers stop
+// parsing it — the lane's dead-session sweep analogue for this key.
+export function refreshReleaseLease({ brainPath, sessionId, home, now = Date.now() }) {
+  const callerId = recipientKey(sessionId);
+  if (!callerId) return { ok: false, status: 'no-session' };
+  // Lock-free fast path: this runs on EVERY non-completing sync of every
+  // session, and almost always there is no lease at all. Skipping the lane
+  // lock then keeps lease bookkeeping from doubling lock traffic project-wide.
+  // Race-safe: a lease declared concurrently is simply refreshed on the
+  // caller's NEXT sync, and a just-declared lease is by definition fresh.
+  if (brainPath && readLane(laneFileFor(brainPath, home)).releaseLease === undefined) {
+    return { ok: true, status: 'no-lease' };
+  }
+  return mutateReleaseLease({ brainPath, home, now, mutate: ({ sessions, verdict }) => {
+    if (!verdict) return { write: false, outcome: { ok: true, status: 'no-lease' } };
+    const mine = leaseHeldBy(verdict, sessions, callerId);
+    if (verdict.status !== 'active') {
+      return {
+        write: true,
+        lease: null,
+        outcome: { ok: true, status: mine ? 'lease-lost' : 'stale-pruned', reason: verdict.status },
+      };
+    }
+    if (!mine) return { write: false, outcome: { ok: true, status: 'not-holder' } };
+    const stored = {
+      schemaVersion: 1,
+      holderId: verdict.lease.holderId,
+      holderClient: verdict.lease.holderClient,
+      version: verdict.lease.version,
+      ref: verdict.lease.ref,
+      takenAt: verdict.lease.takenAt,
+      refreshedAt: now,
+      ttlMs: verdict.lease.ttlMs,
+    };
+    return {
+      write: true,
+      lease: stored,
+      outcome: { ok: true, status: 'refreshed', lease: normalizeReleaseLease(stored) },
+    };
+  } });
+}
+
+// Explicit free — the holder's real task completion. A non-holder can never
+// free a LIVE peer's lease, but anyone may clear a stale record.
+export function freeReleaseLease({ brainPath, sessionId, home, now = Date.now() }) {
+  const callerId = recipientKey(sessionId);
+  if (!callerId) return { ok: false, status: 'no-session' };
+  // Same lock-free fast path as refreshReleaseLease: every real completion
+  // calls this, and almost none of them hold a lease. Race-safe for the same
+  // reason — a record this snapshot cannot see is one this caller cannot own.
+  if (brainPath && readLane(laneFileFor(brainPath, home)).releaseLease === undefined) {
+    return { ok: true, status: 'no-lease' };
+  }
+  return mutateReleaseLease({ brainPath, home, now, mutate: ({ sessions, verdict }) => {
+    if (!verdict) return { write: false, outcome: { ok: true, status: 'no-lease' } };
+    const mine = leaseHeldBy(verdict, sessions, callerId);
+    if (!mine && verdict.status === 'active') {
+      return { write: false, outcome: { ok: true, status: 'not-holder' } };
+    }
+    return {
+      write: true,
+      lease: null,
+      outcome: { ok: true, status: mine ? 'released' : 'stale-pruned', lease: verdict.lease },
+    };
+  } });
 }
 
 // A long-lived MCP worker can observe SessionEnd(A) and then receive the first

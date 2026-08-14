@@ -131,6 +131,11 @@ await runVerb('brain-history', './klypix-brain-history.mjs');
 // the card's bytes to graveyard/ instead of destroying them; this lists, restores
 // and (permanently) purges them.
 await runVerb('brain-deleted', './klypix-brain-deleted.mjs');
+// `npx klypix-mcp orphans` — the orphan gardener's backfill: report how many live
+// cards sit outside the graph, link the CONFIDENT subset (one unambiguous lexical
+// anchor each — never a fan-out). Dry-run by default; --apply takes a forced
+// restore point first, so the whole pass is one brain-history restore from undone.
+await runVerb('orphans', './klypix-orphans.mjs');
 await runVerb('diff', './klypix-diff.mjs');
 await runVerb('pr-brief', './klypix-pr-brief.mjs');
 
@@ -868,8 +873,12 @@ server.registerTool('brain_sync', {
     // marker before rejecting them. A strict transport schema rejected first,
     // allowing a later result-less completion to bypass that state entirely.
     results: z.unknown().optional().describe('On phase complete, 1-8 result manifests for stable claim keys. The in-handler versioned validator rejects malformed, empty, unknown-field, or incomparable evidence and retains task scope.'),
+    releaseIntent: z.object({
+      version: z.string().max(64).describe('The version this session intends to release (e.g. "1.70.0").'),
+      ref: z.string().max(200).describe('The git ref (branch or tag) the release will be cut from.'),
+    }).optional().describe('Declare EXCLUSIVE intent to prepare a release of this project. The first declarer takes a ~2h lease (refreshed by checkpoints, freed by phase "complete", by expiry, or when the holder session ends); a second declarer gets a structured hard conflict naming the holder, version, and ref. While any lease is active every peer\'s sync gains a "release in preparation" footer line.'),
   },
-}, async ({ project, intent, files, phase, include_context, results }, extra) => {
+}, async ({ project, intent, files, phase, include_context, results, releaseIntent }, extra) => {
   const totalStartedAt = Date.now();
   const report = mcpPresence.sync({
     project,
@@ -877,6 +886,7 @@ server.registerTool('brain_sync', {
     files,
     phase,
     results,
+    releaseIntent,
     deliverMessages: include_context !== false,
     actionId: extra?.klypixRequestIdentity?.actionId || '',
     preflight: extra?.klypixBrainSyncPreflight,

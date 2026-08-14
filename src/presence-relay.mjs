@@ -112,6 +112,18 @@ export function buildPresenceFrame(session, { machineId, hostLabel = null, root 
     branch: session.branch ? str(session.branch, 80) : null,
     intent: str(session.intent, 160),
     files: canonicalWireFiles(session.files, root),
+    // ADDITIVE wire field (1.70.0, same wire version): which of the paths were
+    // only OBSERVED (adopted from live edits, never declared). An old receiver
+    // whitelists it away; an old sender simply never populates it. A session
+    // whose task COMPLETED and went idle sends none — the frame carries no
+    // completedAt, so the receiver could never apply the completed-idle gate
+    // itself, and mirroring stale observations would keep a finished task
+    // rendering as a live overlap source on every other machine.
+    observedFiles: canonicalWireFiles(
+      session.completedAt && !str(session.intent, 160)
+        && !(Array.isArray(session.files) && session.files.length)
+        ? [] : session.observedFiles,
+      root),
     sentAt: Number(now) || Date.now(),          // informational only — see property 4
   };
 }
@@ -135,6 +147,7 @@ export function acceptPresenceFrame(frame, { machineId, now = Date.now() } = {})
     branch: frame.branch ? str(frame.branch, 80) : null,
     intent: str(frame.intent, 160),
     files: canonicalWireFiles(frame.files, null),
+    observedFiles: canonicalWireFiles(frame.observedFiles, null),
     machine,
     host: frame.host ? str(frame.host, 40) : null,
     via: 'cloud',

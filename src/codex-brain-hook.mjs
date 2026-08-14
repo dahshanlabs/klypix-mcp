@@ -23,7 +23,7 @@ import { opBrainTaskContext } from './klypix-core.mjs';
 // load cost) so a bundle whose klypix-format predates classifyDecay degrades
 // gracefully — a named import of a missing export would kill the whole hook.
 import * as brainFormat from './klypix-format.mjs';
-import { findPresenceConflicts } from './mcp-presence.mjs';
+import { annotateConflictFiles, findPresenceConflicts } from './mcp-presence.mjs';
 
 function readInput() {
   try {
@@ -238,8 +238,13 @@ function formatConflictWarning(conflicts, event, sessions = []) {
   const shortId = (id) => shortestUniqueSessionPrefix(sessions, id, 12) || String(id).slice(0, 12);
   return [
     `KLYPIX BLOCKING exact-file overlap detected ${moment}:`,
-    ...conflicts.map((peer) =>
-      `- ${shortId(peer.id)}${peer.intent ? ` "${String(peer.intent).slice(0, 90)}"` : ''}: ${peer.files.join(', ')}`),
+    ...conflicts.map((peer) => {
+      // Observed/declared distinction (1.70.0): a `*` marks a path whose claim
+      // was adopted from live edits, not declared — real overlap, unconfirmed
+      // boundary; the legend renders only when a mark exists.
+      const annotated = annotateConflictFiles(peer);
+      return `- ${shortId(peer.id)}${peer.intent ? ` "${String(peer.intent).slice(0, 90)}"` : ''}: ${annotated.files.join(', ')}${annotated.legend}`;
+    }),
     'Coordinate file ownership now. Do not continue overlapping edits until one session yields or the scopes are separated.',
   ].join('\n');
 }
@@ -249,13 +254,14 @@ function queueConflictAlerts({ brainPath, sessionId, intent, conflicts, turnId, 
   const selfShortId = shortestUniqueSessionPrefix(sessions, sessionId, 12) || String(sessionId).slice(0, 12);
   for (const peer of conflicts) {
     const filesKey = peer.files.map((file) => String(file).toLowerCase()).sort().join('|');
+    const annotated = annotateConflictFiles(peer);
     const result = postPresenceMessage({
       brainPath,
       from: sessionId,
       to: peer.id,
       text: `Automatic KLYPIX pre-edit overlap alert: ${selfShortId}`
         + `${intent ? ` is working on "${String(intent).slice(0, 110)}"` : ' is editing'}`
-        + ` and reports the same file(s): ${peer.files.join(', ')}. Coordinate ownership now.`,
+        + ` and reports the same file(s): ${annotated.files.join(', ')}${annotated.legend}. Coordinate ownership now.`,
       dedupeKey: `hook-overlap|${sessionId}|${peer.id}|${turnId || 'turn'}|${filesKey}`,
     });
     if (result.posted) queued.push(peer.id);
@@ -308,9 +314,16 @@ async function main() {
   // turn is mid-task plumbing — it must keep the files exactly as it keeps the
   // intent (review-caught: the guard preserved intent but wiped files[]).
   const humanTurn = event === 'UserPromptSubmit' && prompt !== undefined;
-  const files = event === 'PreToolUse' || event === 'PostToolUse'
+  // Tool-touched paths are OBSERVATIONS, not declarations (automatic scope
+  // adoption, 1.70.0). They used to ride the `files` param, which fabricated a
+  // declared scope out of every edit; upsertSession's observed lane keeps them
+  // visible to every reader (they still join files[] for pre-1.70 renderers)
+  // while marking them observed, and skips any path the session's DECLARED
+  // scope (brain_sync) already covers.
+  const observed = event === 'PreToolUse' || event === 'PostToolUse'
     ? touchedFiles(input, projectDir)
-    : (humanTurn ? [] : undefined);
+    : undefined;
+  const files = humanTurn ? [] : undefined;
   const sessions = upsertSession({
     brainPath,
     id: sessionId,
@@ -322,6 +335,7 @@ async function main() {
     intent: prompt === undefined ? undefined : prompt,
     files,
     replaceFiles: humanTurn,
+    observedFiles: observed,
     event,
     channel: 'lifecycle',
     ...(HOST_PID.pid ? { hostPid: HOST_PID.pid, hostPidSource: HOST_PID.source } : {}),
@@ -375,7 +389,8 @@ async function main() {
   }
   if (event === 'UserPromptSubmit') {
     const me = sessions.find((session) => session.id === sessionId);
-    const context = await compactTaskContext(projectDir, prompt, me?.files || []);
+    const context = await compactTaskContext(projectDir, prompt,
+      [...new Set([...(me?.files || []), ...(me?.observedFiles || [])])]);
     emitSystemMessage([
       context,
       formatPresenceMessage(sessions, sessionId),

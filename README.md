@@ -85,28 +85,55 @@ It verifies 15 required coordination behaviours — not the 26 tools, and not th
 
 ## Quick start
 
-**Claude Code + Codex:**
+Run this **inside your project**:
 
 ```bash
 npx klypix-mcp install
 ```
 
-This copies the engine and a local MCP runtime into `~/.claude/project-brain`, wires Claude Code's
-four lifecycle hooks, writes Codex's global `~/.codex/AGENTS.md` guidance block, and wires Codex's
-MCP connection **for the project you run it in**.
+One command, every editor. It finds the project root (walking up, so running it from `src/` is
+fine), gives the project a brain if it doesn't have one, wires the agent tools you actually have
+installed, registers the lossless `.klypix` merge driver if it's a git repo, and then **proves the
+result** before it exits:
 
-Be precise about what "machine-global" covers:
+```text
+  project   E:\work\api  (git repository root)
+  brain     created brain.klypix — a starter brain, ready for its first decision
+  editors   Claude Code · Cursor · Codex · Gemini CLI · Antigravity · VS Code
+  wired     9 file(s) · 9 updated   (skipped 5 for tools you don't have)
+  git       lossless .klypix merge driver registered
+  verified  ✓ 26 tools reachable via .mcp.json (892ms)
+```
 
-- **Machine-global** — the engine + runtime in `~/.claude/project-brain`, the four Claude Code
-  hooks in `~/.claude/settings.json`, and the `~/.codex/AGENTS.md` guidance. Claude Code is
-  therefore covered in every project on that machine that has a `./brain.klypix`.
-- **Per project** — Codex's MCP connection. `install` writes it into `<cwd>/.codex/config.toml`,
-  only when that directory has a `brain.klypix`, and it deliberately **removes** any *global*
-  `~/.codex/config.toml` KLYPIX entry (a global entry resolves its `--vault` from the wrong
-  directory and binds the wrong brain). Run `install` — or `link` — once inside each brain project
-  you want Codex wired to.
+That last line is the point. MCP config fails **silently** — a wrong entry means the server never
+starts, the agent quietly loses every brain verb, and nothing reports an error. So `install` opens
+a real stdio handshake against the config it just wrote and counts the tools that answered. A
+broken entry dies in ~100ms with `Connection closed` and is reported, not shipped.
 
-It does **not** set up Cursor, Cline, Windsurf, Copilot, Gemini CLI or Aider — those need `link`.
+What goes where:
+
+- **Machine-global, once** — the engine + runtime in `~/.claude/project-brain`, Claude Code's four
+  lifecycle hooks in `~/.claude/settings.json`, and the `~/.codex/AGENTS.md` guidance block. Claude
+  Code is therefore covered in every project on that machine that has a `./brain.klypix`.
+- **Per project** — MCP config and rules for Cursor, Codex, Cline, Windsurf, Copilot, Gemini CLI /
+  Antigravity and Aider. Run `install` once inside each project.
+
+Three things it deliberately will **not** do:
+
+- **Write for editors you don't have.** Config is projected only for hosts detected on this
+  machine — a two-person team using one editor no longer commits rules for six they never opened.
+  A file your project *already* carries stays maintained regardless, so you can't silently stop
+  updating your team's committed configs.
+- **Wire a directory that isn't a project.** It refuses your home folder, a drive root, and
+  anything with no brain, no git repo and no project manifest. A mistyped command can't seed a
+  brain into `C:\Users\you`.
+- **Replace a project-owned server.** A repo-relative launch like
+  `node scripts/klypix-mcp-server.mjs` is deliberate — it resolves offline and rides a bundle the
+  repo version-gates — so it's left byte-identical and reported. An explicit `link` still rewrites
+  everything: an action you didn't ask for stays more conservative than one you did.
+
+Opt out with `--no-project` (CI images, scripted provisioning). `--json` emits the report as
+structured data; `--verify-all` handshakes every written config instead of one.
 
 Optional, opt-in, and approved inside Codex itself:
 
@@ -119,15 +146,16 @@ file-overlap warning. Codex owns the trust decision and will ask you to review t
 `brain_doctor` reports this layer separately as off, execution-unverified, or active. Even with it
 on, **Codex never captures decisions automatically** — the Codex hook never writes the brain.
 
-**Every other agent tool — one command per project:**
+**Re-project everything explicitly:**
 
 ```bash
 npx klypix-mcp link
 ```
 
-Writes 14 managed, hash-stamped files: MCP server config for six hosts, plus rules files for
-eight. Managed blocks are merged into your existing instruction files and never clobber your
-content.
+`install` already does this for the editors you have. Reach for `link` when you want all 14
+managed, hash-stamped files regardless of what's installed — MCP server config for six hosts plus
+rules files for eight — or to repair drift. Managed blocks are merged into your existing
+instruction files and never clobber your content.
 
 ```bash
 npx klypix-mcp link --check    # audits without writing; exits non-zero on drift
@@ -481,8 +509,8 @@ The MCP verbs below are what agents call. These are what **you** call:
 | Command | What it does |
 |---|---|
 | `npx klypix-mcp init` | Seed a starter `brain.klypix` here and print an MCP config |
-| `npx klypix-mcp install` | Install the engine + Claude Code hooks on this machine (see Quick start) |
-| `npx klypix-mcp link` | Wire this project for Cursor, Cline, Windsurf, Copilot, Gemini CLI, Aider (`--check` audits) |
+| `npx klypix-mcp install` | Set up everything: machine engine + hooks, then this project — brain, config for the editors you have, merge driver, verified (see Quick start) |
+| `npx klypix-mcp link` | Re-project all 14 managed files regardless of what is installed (`--check` audits) |
 | `npx klypix-mcp doctor` | One verdict: version, hosts, live sessions, tool count, drift. Exits non-zero — usable as a CI gate |
 | `npx klypix-mcp runtime` | Passive per-connection process/RAM attribution (`--json`, optional `--watch seconds`); never kills or deduplicates |
 | `npx klypix-mcp conformance` | Launch two real MCP clients against this build and verify coordination behaviour |

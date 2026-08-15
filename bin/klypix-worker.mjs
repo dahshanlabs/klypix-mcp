@@ -876,7 +876,8 @@ server.registerTool('brain_sync', {
     releaseIntent: z.object({
       version: z.string().max(64).describe('The version this session intends to release (e.g. "1.70.0").'),
       ref: z.string().max(200).describe('The git ref (branch or tag) the release will be cut from.'),
-    }).optional().describe('Declare EXCLUSIVE intent to prepare a release of this project. The first declarer takes a ~2h lease (refreshed by checkpoints, freed by phase "complete", by expiry, or when the holder session ends); a second declarer gets a structured hard conflict naming the holder, version, and ref. While any lease is active every peer\'s sync gains a "release in preparation" footer line.'),
+      acknowledge: z.array(z.string().max(40)).max(64).optional().describe('Commit shas this release DELIBERATELY leaves behind. Only needed after a refusal: if the ref would drop finished work, the lease is refused and the response names every sha. Re-declare with those shas here to proceed — and tell the user what they are first.'),
+    }).optional().describe('Declare EXCLUSIVE intent to prepare a release of this project. The first declarer takes a ~2h lease (refreshed by checkpoints, freed by phase "complete", by expiry, or when the holder session ends); a second declarer gets a structured hard conflict naming the holder, version, and ref. While any lease is active every peer\'s sync gains a "release in preparation" footer line. A NEW declaration is also checked against what the release would LEAVE BEHIND: if the ref is missing commits that are on trunk or on a branch a live peer session is working on, the lease is REFUSED (nothing is changed) and the response lists them — report those commits to the user, then re-declare with acknowledge:[...] naming each sha if the release should go ahead without them.'),
   },
 }, async ({ project, intent, files, phase, include_context, results, releaseIntent }, extra) => {
   const totalStartedAt = Date.now();

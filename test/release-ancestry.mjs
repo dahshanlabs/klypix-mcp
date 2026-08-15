@@ -60,6 +60,7 @@ try {
   git('checkout', '-q', '-b', 'release/1.0.0');
   const clean = releaseAncestry(repo, 'release/1.0.0');
   ok('RA1 a release cut from trunk is a descendant', clean?.isDescendant === true);
+  ok('RA1 and reports status ok', clean.status === 'ok');
   ok('RA1 nothing is missing', clean.missingCount === 0);
   ok('RA1 and it produces no warnings', releaseAncestryWarnings(clean).length === 0);
 
@@ -82,7 +83,9 @@ try {
   ok('RA6 it leads with the consequence', /RELEASE WOULD LEAVE WORK BEHIND/.test(warn));
   ok('RA6 it names the count', /2 finished commit/.test(warn));
   ok('RA6 it lists the shas', warn.includes(dropped1));
-  ok('RA6 it instructs the reader to inform the user', /TELL THE USER/.test(warn));
+  ok('RA6 it instructs the reader to inform the user', /Say this to them in your own words/.test(warn));
+  ok('RA6 it explains the CONSEQUENCE, not just the fact', /will not be in it/.test(warn));
+  ok('RA6 it warns the loss would go unnoticed', /nobody will notice/.test(warn));
 
   // ---- RA3 — the case trunk alone misses --------------------------------
   // Reset so the release IS a perfect descendant of origin/master, then put the
@@ -107,8 +110,8 @@ try {
   ok('RA3 the source is labelled a peer branch', withPeers.sources[0].kind === 'peer-branch');
   ok('RA3 and names it', withPeers.sources[0].ref === 'peer-work');
   ok('RA3 the commit is identified', withPeers.missing[0].sha === unpushed);
-  ok('RA3 the text says another session is working there',
-    /another session is working/.test(releaseAncestryWarnings(withPeers).join('\n')));
+  ok('RA3 the text says someone is working on that branch right now',
+    /someone is working on right now/.test(releaseAncestryWarnings(withPeers).join('\n')));
 
   // ---- RA7 — a ref is never its own source ------------------------------
   const selfRef = releaseAncestry(repo, 'peer-work', { peerBranches: ['peer-work', 'peer-work'] });
@@ -136,17 +139,89 @@ try {
   ok('RA8 and the remainder is stated, never silently dropped',
     /…and \d+ more/.test(releaseAncestryWarnings(many).join('\n')));
 
-  // ---- RA5 — unanswerable is null, never a guess ------------------------
-  ok('RA5 an unknown ref returns null', releaseAncestry(repo, 'no/such/ref') === null);
-  ok('RA5 an empty project dir returns null', releaseAncestry('', 'master') === null);
+  // ---- RA5 — "cannot answer" is its own state, and it FAILS CLOSED --------
+  // Returning null here made "the ref does not exist" and "git timed out"
+  // indistinguishable from "clean", and the caller granted the lease silently.
+  // An agent could trigger it with a single mistyped ref name.
+  const unknownRef = releaseAncestry(repo, 'no/such/ref');
+  ok('RA5 an unknown ref is reported as unknown, never as clean', unknownRef.status === 'unknown');
+  ok('RA5 it names the reason', unknownRef.reason === 'target-unresolved');
+  ok('RA5 it is NOT a descendant — silence must not read as a pass', unknownRef.isDescendant === false);
+  const unknownWarn = releaseAncestryWarnings(unknownRef).join('\n');
+  ok('RA5 it says the check could not run', /COULD NOT RUN/.test(unknownWarn));
+  ok('RA5 and explicitly denies being an all-clear', /not an all-clear/.test(unknownWarn));
+  ok('RA5 an empty project dir is unknown', releaseAncestry('', 'master').status === 'unknown');
   const notARepo = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-norepo-'));
   try {
-    ok('RA5 a directory that is not a repo returns null', releaseAncestry(notARepo, 'master') === null);
+    ok('RA5 a directory that is not a repo is unknown', releaseAncestry(notARepo, 'master').status === 'unknown');
   } finally { fs.rmSync(notARepo, { recursive: true, force: true }); }
   ok('RA5 warnings of null are empty, never a crash', releaseAncestryWarnings(null).length === 0);
 
+  // ---- RA9 — EVERY trunk candidate, not the first that resolves ----------
+  // First-match-wins picked origin/master in any normal clone and therefore
+  // never compared LOCAL master — which is exactly where the 2026-08-15
+  // commits sat, unpushed. The feature was blind to its own motivating
+  // incident for any session with no live peer on that branch.
+  git('checkout', '-q', 'master');
+  const localOnly = commit('feat: committed locally and never pushed');
+  git('checkout', '-q', 'release/1.0.0');
+  git('merge', '-q', 'origin/master', '-m', 'merge remote trunk');
+  const bothTrunks = releaseAncestry(repo, 'release/1.0.0');
+  ok('RA9 a release level with origin/master is still dirty vs LOCAL master',
+    bothTrunks.status === 'dirty');
+  ok('RA9 the local commit is named with NO peer branches supplied',
+    bothTrunks.sources.some((s) => s.missing.some((c) => c.sha === localOnly)));
+  ok('RA9 local master is labelled trunk, not a peer branch',
+    bothTrunks.sources.find((s) => s.ref === 'master')?.kind === 'trunk');
+
+  // ---- RA12 — a sha is demanded ONCE, not once per source ----------------
+  // trunk plus a peer sitting on trunk is the DEFAULT configuration.
+  const deduped = releaseAncestry(repo, 'release/1.0.0', { peerBranches: ['master', 'master'] });
+  const allShas = deduped.sources.flatMap((s) => s.missing.map((c) => c.sha));
+  ok('RA12 no sha is listed twice across sources', new Set(allShas).size === allShas.length);
+
+  // ---- RA11 — a merge-only divergence cannot be acknowledged away --------
+  // --count always included merges while the listing used --no-merges, so a
+  // divergence made only of merges reported missingCount > 0 with nothing
+  // listed — and an empty list opened the gate with no acknowledgement.
+  const mrepo = globalThis.__mrepo = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-merge-'));
+  const mg = (...args) => execFileSync('git', args, { cwd: mrepo, encoding: 'utf8', stdio: 'pipe' });
+  const mcommit = (msg) => {
+    fs.writeFileSync(path.join(mrepo, `${msg.replace(/\W/g, '')}.txt`), msg);
+    mg('add', '-A'); execFileSync('git', ['commit', '-q', '-m', msg], { cwd: mrepo, stdio: 'pipe' });
+  };
+  mg('init', '-q', '-b', 'master'); mg('config', 'user.email', 't@e.com'); mg('config', 'user.name', 'T');
+  mcommit('base');
+  mg('checkout', '-q', '-b', 'side'); mcommit('side work');
+  mg('checkout', '-q', 'master');
+  mg('checkout', '-q', '-b', 'release/2.0.0');
+  mg('checkout', '-q', 'master');
+  execFileSync('git', ['merge', '--no-ff', '-q', 'side', '-m', 'merge side'], { cwd: mrepo, stdio: 'pipe' });
+  const mergeOnly = releaseAncestry(mrepo, 'release/2.0.0');
+  ok('RA11 a divergence is detected', mergeOnly.status !== 'ok');
+  ok('RA11 merges are now LISTED, so the listing is a subset of the count',
+    mergeOnly.status === 'dirty' && mergeOnly.missing.length > 0);
+  ok('RA11 the count and the listing agree in the user\'s favour',
+    mergeOnly.missing.length <= mergeOnly.missingCount);
+
+  // ---- RA13 — a ref at the same sha as the release is CLEAN, not unknown --
+  // Cutting a release branch from trunk and declaring immediately is the most
+  // common legitimate case; dropping the equal ref left zero candidates and
+  // the new cannot-answer path then refused it.
+  const freshRepo = globalThis.__freshRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-fresh-'));
+  const fg = (...args) => execFileSync('git', args, { cwd: freshRepo, encoding: 'utf8', stdio: 'pipe' });
+  fg('init', '-q', '-b', 'master'); fg('config', 'user.email', 't@e.com'); fg('config', 'user.name', 'T');
+  fs.writeFileSync(path.join(freshRepo, 'f.txt'), 'x'); fg('add', '-A');
+  execFileSync('git', ['commit', '-q', '-m', 'base'], { cwd: freshRepo, stdio: 'pipe' });
+  fg('checkout', '-q', '-b', 'release/1.0.0');
+  const justCut = releaseAncestry(freshRepo, 'release/1.0.0');
+  ok('RA13 a branch just cut from trunk reads clean', justCut.status === 'ok' && justCut.isDescendant === true);
+  ok('RA13 and produces no warnings', releaseAncestryWarnings(justCut).length === 0);
+
   console.log(`✓ release ancestry — ${pass}/${pass} assertions`);
 } finally {
-  try { fs.rmSync(repo, { recursive: true, force: true }); } catch { /* temp */ }
+  for (const d of [repo, , globalThis.__mrepo, globalThis.__freshRepo]) {
+    if (d) { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* temp */ } }
+  }
   try { fs.rmSync(`${repo}-origin.git`, { recursive: true, force: true }); } catch { /* temp */ }
 }

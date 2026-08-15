@@ -242,8 +242,61 @@ export function validateReleaseIntent(value) {
   if (!ref || ref.length > 200 || /[\u0000-\u001f\u007f\s]/.test(ref)) {
     errors.push('releaseIntent.ref must be a nonempty bounded git ref (branch or tag) with no whitespace or control characters');
   }
+  // acknowledge: the commits this release KNOWINGLY leaves behind. Optional,
+  // and only ever consulted when the ancestry gate found something — see
+  // ancestryAcknowledged. Bounded like every other caller-supplied list.
+  let acknowledge = [];
+  if (value.acknowledge !== undefined && value.acknowledge !== null) {
+    if (!Array.isArray(value.acknowledge)) {
+      errors.push('releaseIntent.acknowledge must be an array of commit shas the release deliberately leaves behind');
+    } else {
+      acknowledge = value.acknowledge
+        .filter((s) => typeof s === 'string')
+        .map((s) => s.trim().toLowerCase())
+        .filter((s) => /^[0-9a-f]{4,40}$/.test(s))
+        .slice(0, 64);
+    }
+  }
   if (errors.length) return { provided: true, ok: false, errors };
-  return { provided: true, ok: true, version: version.replace(/^v/i, ''), ref };
+  return { provided: true, ok: true, version: version.replace(/^v/i, ''), ref, acknowledge };
+}
+
+/**
+ * Does this acknowledgement actually name what the release would drop?
+ *
+ * The whole point of the handshake is that a session cannot take the lease
+ * without REPRODUCING the shas it is choosing to leave behind — and a model
+ * that has to reproduce them has, in practice, had to read and relay them.
+ * Nothing in MCP can force an agent to speak to its human; the closest
+ * available thing is to make silence insufficient to proceed.
+ *
+ * Prefix-tolerant in both directions so a caller may echo the short shas we
+ * printed or the full ones from their own `git log`.
+ */
+export function ancestryAcknowledged(ancestry, acknowledge = []) {
+  if (!ancestry) return true;
+  if (ancestry.isDescendant || ancestry.status === 'ok') return true;
+  // WHICH unknowns block, and which do not — the line matters in both
+  // directions, and getting it wrong is expensive either way.
+  //
+  // BLOCKS. 'target-unresolved' means we ARE in a git repo and the ref you
+  // named is not in it: the cheapest bypass in the whole design was a mistyped
+  // or invented ref name, which used to return null and grant the lease in
+  // silence. 'unnameable' means a divergence exists whose commits could not be
+  // listed — an empty list must never satisfy the gate.
+  //
+  // DOES NOT BLOCK. A project with no git at all, or a repo with no trunk and
+  // no peer to compare against, is not an unanswered question — it is a
+  // MEANINGLESS one. Blocking there would stop a designer's brain in a plain
+  // folder, or a brand-new repo with a single branch, from ever declaring a
+  // release. That is a false positive of exactly the kind that teaches people
+  // to ignore the gate.
+  if (ancestry.status === 'unnameable') return false;
+  if (ancestry.status === 'unknown') return ancestry.reason !== 'target-unresolved';
+  const listed = (ancestry.sources || []).flatMap((s) => s.missing || []).map((c) => String(c.sha || '').toLowerCase());
+  if (!listed.length) return false;
+  const given = (acknowledge || []).map((s) => String(s || '').toLowerCase()).filter(Boolean);
+  return listed.every((sha) => given.some((g) => g.startsWith(sha) || sha.startsWith(g)));
 }
 
 const canonicalPathKey = (value) => {
@@ -2364,6 +2417,8 @@ export function createMcpPresence({
     let releaseFooterLine = '';
     let releaseAdvisory = null;
     let releaseAdvisoryText = '';
+    let workAtRisk = null;
+    let workAtRiskText = '';
     {
       const leaseStamp = now();
       let outcome = null;
@@ -2380,15 +2435,63 @@ export function createMcpPresence({
           if (freed.status === 'released') outcome = freed;
         }
       } else if (releaseIntentChecked.provided) {
-        outcome = declareReleaseLease({
-          brainPath,
-          sessionId,
-          version: releaseIntentChecked.version,
-          ref: releaseIntentChecked.ref,
-          client: (preparedClientInfo || {}).client || 'unknown',
-          home,
-          now: leaseStamp,
-        });
+        // ── THE HANDSHAKE (1.72.0) ────────────────────────────────────────
+        // Before a lease is granted, ask the one question nothing used to ask:
+        // would this release leave finished work behind? If it would, REFUSE —
+        // and require the next attempt to name, sha by sha, exactly what it is
+        // choosing to drop.
+        //
+        // A warning attached to a granted lease is one a model may relay or may
+        // not; the founder's correction was that the USER has to be informed.
+        // MCP has no channel to a human, so the strongest honest mechanism is
+        // to make silence insufficient: a session that cannot proceed without
+        // reproducing the missing commits has, in practice, had to surface them.
+        //
+        // Only a NEW declaration is gated. A holder refreshing mid-release is
+        // never re-blocked — that would be an obstacle, not a gate — and a
+        // deliberate off-trunk hotfix is one acknowledged call away.
+        const existingLease = readReleaseLease({ brainPath, home, now: leaseStamp });
+        // recipientKey is module-private in agent-presence; the same normalization
+        // (trim + 160-char bound) reproduced here rather than widening its surface.
+        const holderKey = (v) => String(v || '').trim().slice(0, 160);
+        // EXEMPT THE REF, NOT THE HOLDER. Exempting whoever held the lease let a
+        // session declare a clean ref, take the lease, then re-declare pointing
+        // at a DIRTY one and sail through — the gate exempted them for being the
+        // holder. What deserves exemption is re-declaring the SAME ref that was
+        // already gated; anything else is a new release decision.
+        const sameRefAsHeld = !!existingLease
+          && holderKey(existingLease.holderId) === holderKey(sessionId)
+          && String(existingLease.ref || '') === String(releaseIntentChecked.ref || '');
+        let gateAncestry = null;
+        if (!sameRefAsHeld) {
+          try {
+            const peerBranches = [
+              ...new Set((report.sessions || [])
+                .filter((s) => s?.id !== sessionId)
+                .map((s) => String(s?.branch || '').trim())
+                .filter(Boolean)),
+            ];
+            gateAncestry = releaseAncestry(path.dirname(brainPath), releaseIntentChecked.ref, { peerBranches });
+          } catch {
+            // A probe that throws is not an all-clear either.
+            gateAncestry = { status: 'unknown', reason: 'git-unavailable', ref: releaseIntentChecked.ref, isDescendant: false, missingCount: 0, sources: [], missing: [] };
+          }
+        }
+        if (gateAncestry && !gateAncestry.isDescendant
+          && !ancestryAcknowledged(gateAncestry, releaseIntentChecked.acknowledge)) {
+          outcome = { ok: false, status: 'ancestry-unacknowledged', ancestry: gateAncestry };
+        } else {
+          outcome = declareReleaseLease({
+            brainPath,
+            sessionId,
+            version: releaseIntentChecked.version,
+            ref: releaseIntentChecked.ref,
+            client: (preparedClientInfo || {}).client || 'unknown',
+            home,
+            now: leaseStamp,
+          });
+          if (gateAncestry && !gateAncestry.isDescendant) outcome = { ...outcome, acknowledgedAncestry: gateAncestry };
+        }
       } else if (clearCompletionScope) {
         const freed = freeReleaseLease({ brainPath, sessionId, home, now: leaseStamp });
         if (freed.status === 'released') outcome = freed;
@@ -2412,7 +2515,38 @@ export function createMcpPresence({
         refreshedAt: active.refreshedAt,
         expiresAt: active.expiresAt,
       } : null;
-      if (outcome?.status === 'conflict') {
+      if (outcome?.status === 'ancestry-unacknowledged') {
+        const anc = outcome.ancestry;
+        const shas = (anc.sources || []).flatMap((s) => s.missing || []).map((c) => c.sha);
+        releaseLease = {
+          status: 'refused',
+          kind: 'release-would-leave-work-behind',
+          severity: 'blocking',
+          requested: { version: releaseIntentChecked.version, ref: releaseIntentChecked.ref },
+          ancestry: {
+            trunk: anc.trunk,
+            ref: anc.ref,
+            missingCount: anc.missingCount,
+            sources: anc.sources,
+          },
+          // Exactly what the retry must echo. Named so a caller never has to
+          // guess the shape of the second call.
+          acknowledgeRequired: shas,
+        };
+        releaseText = [
+          'KLYPIX release lease REFUSED — the lease was not taken. No release state changed.',
+          '',
+          ...releaseAncestryWarnings(anc),
+          '',
+          // Deliberately NOT a ready-to-paste call. Pre-rendering the exact
+          // retry made the bypass the easiest thing on screen — an agent could
+          // copy it and never say a word to anyone. The shas are listed above;
+          // reproducing them is the work, and the work is the point.
+          shas.length
+            ? `To proceed anyway, re-send releaseIntent with an "acknowledge" array naming each of the ${shas.length} sha(s) listed above. Only do that after the user has been told and has decided.`
+            : 'This release cannot be acknowledged automatically — the missing work could not be listed. Resolve it with the user before continuing.',
+        ].join('\n');
+      } else if (outcome?.status === 'conflict') {
         const holder = outcome.holder;
         const holderPrefix = prefixFor(holder.holderId);
         releaseLease = {
@@ -2483,7 +2617,12 @@ export function createMcpPresence({
               .filter(Boolean)),
           ];
           const ancestry = releaseAncestry(path.dirname(brainPath), active.ref, { peerBranches });
-          const warnings = releaseAncestryWarnings(ancestry);
+          // Only a genuinely DIRTY ancestry is worth repeating on a granted
+          // lease. An unknown that the gate deliberately chose not to block on
+          // (no git, nothing to compare) must not leak a scary CHECK COULD NOT
+          // RUN line into every sync of a plain-folder project — that is the
+          // alarm fatigue this whole design is trying to avoid.
+          const warnings = ancestry && ancestry.status !== 'unknown' ? releaseAncestryWarnings(ancestry) : [];
           if (warnings.length) {
             releaseLease = {
               ...releaseLease,
@@ -2502,6 +2641,32 @@ export function createMcpPresence({
       }
       if (active) {
         releaseFooterLine = `release in preparation: v${active.version} from ${active.ref} (session ${prefixFor(active.holderId)})`;
+        // ── THE THIRD QUESTION (1.72.0) ──────────────────────────────────
+        // The ancestry gate protects the session CUTTING the release. This is
+        // its mirror, for everyone else: "is my finished work going to make it
+        // into the build somebody is preparing right now?"
+        //
+        // Unpushed commits are the common way the answer is no, and the
+        // situation is invisible from both sides — the releaser cannot see a
+        // branch that was never pushed, and the author has no reason to think
+        // about a release they are not cutting. Both halves of the 2026-08-15
+        // miss are this, seen from the two ends.
+        //
+        // Free: aheadBehindOrigin is already collected. Advisory, and only
+        // while a release is genuinely in flight, so it can never become
+        // ambient noise.
+        const ahead = Number(repoState?.aheadBehindOrigin?.ahead || 0);
+        const holderIsSelf = holderBlock && holderBlock.sessionId === sessionId;
+        if (!completing && ahead > 0 && !holderIsSelf) {
+          workAtRisk = {
+            kind: 'unpushed-work-during-release',
+            aheadCount: ahead,
+            upstream: repoState.aheadBehindOrigin.upstream,
+            branch: repoState.branch || null,
+            release: { version: active.version, ref: active.ref },
+          };
+          workAtRiskText = `KLYPIX work-at-risk: a release is being prepared right now (v${active.version} from ${active.ref}), and this checkout has ${ahead} commit(s) on ${repoState.branch || 'HEAD'} that are NOT pushed to ${repoState.aheadBehindOrigin.upstream}. Work that never reached the remote cannot be in that build. If any of it belongs in v${active.version}, say so to the user and coordinate with the release session now (brain_message) — after the cut is far more expensive than before it.`;
+        }
       } else if (!completing && repoState?.packageVersion && repoState?.latestReleaseTag?.version
         && cmpSemver3(repoState.packageVersion, repoState.latestReleaseTag.version) > 0) {
         // Zero-config visibility: nobody declared anything, but this checkout's
@@ -2576,6 +2741,7 @@ export function createMcpPresence({
       // zero-config checkout-ahead advisory when nothing is declared.
       ...(releaseLease ? { releaseLease } : {}),
       ...(releaseAdvisory ? { releaseAdvisory } : {}),
+      ...(workAtRisk ? { workAtRisk } : {}),
       ...(resultReconciliation ? { resultReconciliation: {
         status: resultReconciliation.status,
         claims: resultReconciliation.claims || [],
@@ -2630,6 +2796,7 @@ export function createMcpPresence({
       conflictText,
       repoStateWarning,
       releaseAdvisoryText,
+      workAtRiskText,
       // The one-line footer every peer sees while any release lease is active.
       releaseFooterLine,
     ].filter(Boolean).join('\n\n');

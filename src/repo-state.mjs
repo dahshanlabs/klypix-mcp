@@ -173,12 +173,35 @@ const UNIT_SEP = '';
 export function releaseAncestry(projectDir, ref, { execGit = defaultExecGit, peerBranches = [] } = {}) {
   const git = makeGit(execGit);
   const dir = String(projectDir || '');
-  if (!dir) return null;
+  if (!dir) return { status: 'unknown', reason: 'no-project-dir', isDescendant: false, missingCount: 0, sources: [], missing: [] };
   const target = String(ref || '').trim() || 'HEAD';
-  const resolves = (r) => git(dir, ['rev-parse', '--verify', `${r}^{commit}`]) !== null;
-  if (!resolves(target)) return null;
+  const shaOf = (r) => git(dir, ['rev-parse', '--verify', `${r}^{commit}`]);
+  const resolves = (r) => shaOf(r) !== null;
+  // A gate that cannot run must SAY SO. Returning null here made "the ref does
+  // not exist" and "git timed out" indistinguishable from "clean" — and the
+  // caller granted the lease silently, which an agent could trigger with a
+  // single mistyped ref name. Unknown is now its own state, and the gateway
+  // treats it as blocking.
+  if (git(dir, ['rev-parse', '--git-dir']) === null) {
+    return { status: 'unknown', reason: 'git-unavailable', ref: target, isDescendant: false, missingCount: 0, sources: [], missing: [] };
+  }
+  const targetSha = shaOf(target);
+  if (targetSha === null) {
+    return { status: 'unknown', reason: 'target-unresolved', ref: target, isDescendant: false, missingCount: 0, sources: [], missing: [] };
+  }
 
-  const trunk = TRUNK_REFS.find(resolves) || null;
+  // ALL trunk candidates, not the first that resolves. First-match-wins picked
+  // origin/master in every normal clone and therefore NEVER compared LOCAL
+  // master — which is exactly where the 2026-08-15 commits sat, unpushed. The
+  // feature was blind to its own motivating incident for any session without a
+  // live peer on that branch. Local trunk ahead of a release ref is precise,
+  // not heuristic, so this adds no squash-merge noise beyond what origin/master
+  // already carries. `origin/HEAD` is probed too, so a repo whose trunk is
+  // `develop` or `trunk` is not left with no gate at all.
+  const trunkRefs = TRUNK_REFS.filter(resolves);
+  const originHead = git(dir, ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD']);
+  if (originHead && !trunkRefs.includes(originHead) && resolves(originHead)) trunkRefs.push(originHead);
+  const trunk = trunkRefs[0] || null;
 
   // WHY PEER BRANCHES, and not trunk alone — learned the hard way on
   // 2026-08-15. The trunk check alone said release/1.3.113 was fine: it IS a
@@ -193,11 +216,19 @@ export function releaseAncestry(projectDir, ref, { execGit = defaultExecGit, pee
   // sees WHO IS WORKING WHERE.
   const seen = new Set();
   const candidates = [];
-  for (const r of [trunk, ...peerBranches]) {
+  const trunkSet = new Set(trunkRefs);
+  for (const r of [...trunkRefs, ...peerBranches]) {
     const name = String(r || '').trim();
     if (!name || name === target || seen.has(name)) continue;
+    // Unresolvable refs are dropped; SAME-SHA refs are deliberately kept. A
+    // release branch cut from trunk and declared immediately is the single most
+    // common legitimate case, and dropping the equal ref left zero candidates —
+    // which the new "cannot answer" path then refused. Kept, the ancestry check
+    // finds it is trivially an ancestor, contributes no source, and the release
+    // reads clean, which is the truth.
+    if (shaOf(name) === null) continue;
     seen.add(name);
-    if (resolves(name)) candidates.push({ ref: name, kind: name === trunk ? 'trunk' : 'peer-branch' });
+    candidates.push({ ref: name, kind: trunkSet.has(name) ? 'trunk' : 'peer-branch' });
   }
 
   // NO third source, deliberately — and this is a decision, not an omission.
@@ -212,38 +243,57 @@ export function releaseAncestry(projectDir, ref, { execGit = defaultExecGit, pee
   // construction), so the gate keeps only those. The cost is stated honestly in
   // the doc comment above rather than papered over with a noisy proxy.
 
-  if (!candidates.length) return null;
+  if (!candidates.length) {
+    return { status: 'unknown', reason: 'no-comparable-refs', ref: target, trunk, isDescendant: false, missingCount: 0, sources: [], missing: [] };
+  }
 
   const sources = [];
+  const claimed = new Set();   // shas already attributed to an earlier source
   for (const cand of candidates) {
     // `merge-base --is-ancestor` exits 0/1, and makeGit turns a non-zero exit
     // into null — so null here means "not an ancestor", not "unknown".
     if (git(dir, ['merge-base', '--is-ancestor', cand.ref, target]) !== null) continue;
+    // MERGES ARE INCLUDED. `--count` always counted them while the listing used
+    // --no-merges, so a divergence made ONLY of merge commits produced
+    // missingCount > 0 with nothing listed — and an empty list opened the gate
+    // with no acknowledgement at all. The listing must be a subset of the count
+    // or the two disagree in the caller's favour.
     const countRaw = git(dir, ['rev-list', '--count', `${target}..${cand.ref}`]);
     const count = Number(countRaw);
     if (!Number.isFinite(count) || count <= 0) continue;
-    // Git's own %x1f escape as the field separator: a commit subject can contain
-    // any character a human types, so the delimiter must be one that cannot.
-    const log = git(dir, ['log', '--no-merges', `--max-count=${MAX_MISSING_LISTED}`,
+    const log = git(dir, ['log', `--max-count=${MAX_MISSING_LISTED}`,
       `--format=%h%x1f%s`, `${target}..${cand.ref}`]);
-    const missing = (log || '').split('\n').filter(Boolean).map((line) => {
+    const parsed = (log || '').split('\n').filter(Boolean).map((line) => {
       const sep = line.indexOf(UNIT_SEP);
       return sep < 0
         ? { sha: line.trim(), subject: '' }
         : { sha: line.slice(0, sep).trim(), subject: line.slice(sep + 1).slice(0, 120) };
     });
+    // Trunk and a peer sitting on trunk are the DEFAULT configuration, so the
+    // same commits would otherwise be counted twice and demanded twice. Each
+    // sha is attributed to the first source that reports it.
+    const missing = parsed.filter((c) => c.sha && !claimed.has(c.sha));
+    for (const c of missing) claimed.add(c.sha);
+    if (!missing.length && count > 0 && parsed.length) continue;   // wholly duplicated source
     sources.push({ ...cand, missingCount: count, missing });
   }
 
+  if (!sources.length) {
+    return { status: 'ok', trunk, ref: target, isDescendant: true, missingCount: 0, sources: [], missing: [] };
+  }
   const missingCount = sources.reduce((n, s) => n + s.missingCount, 0);
+  const listed = sources.flatMap((s) => s.missing);
   return {
+    // A divergence we can count but cannot NAME is still a refusal — the caller
+    // must not be able to acknowledge an empty list.
+    status: listed.length ? 'dirty' : 'unnameable',
     trunk,
     ref: target,
-    isDescendant: sources.length === 0,
+    isDescendant: false,
     missingCount,
     sources,
     // Flattened for the common case of one diverged source.
-    missing: sources.flatMap((s) => s.missing).slice(0, MAX_MISSING_LISTED),
+    missing: listed.slice(0, MAX_MISSING_LISTED),
   };
 }
 
@@ -257,19 +307,44 @@ export function releaseAncestry(projectDir, ref, { execGit = defaultExecGit, pee
  * lease and stay quiet about what the release would drop.
  */
 export function releaseAncestryWarnings(ancestry) {
-  if (!ancestry || ancestry.isDescendant || !ancestry.sources?.length) return [];
+  if (!ancestry || ancestry.isDescendant) return [];
+
+  // A gate that could not run is a finding, not a pass. Silence here was how a
+  // mistyped ref, a missing git, or a 1.5s timeout turned the whole check off
+  // while looking exactly like a clean release.
+  if (ancestry.status === 'unknown') {
+    const why = {
+      'git-unavailable': 'git could not be read in this project',
+      'target-unresolved': `the ref "${ancestry.ref}" does not exist here`,
+      'no-comparable-refs': 'there is no trunk or peer branch to compare against',
+      'no-project-dir': 'no project directory was supplied',
+    }[ancestry.reason] || ancestry.reason || 'the check could not run';
+    return [
+      `RELEASE CHECK COULD NOT RUN — ${why}.`,
+      'This is not an all-clear: nothing was verified about what this release would leave out.',
+      'Tell the user, and check by hand that the release branch contains everything it should.',
+    ];
+  }
+
   const { ref, missingCount, sources } = ancestry;
+  const named = sources.flatMap((s) => s.missing).length;
   const lines = [
-    `RELEASE WOULD LEAVE WORK BEHIND — ${missingCount} finished commit(s) are not in ${ref}.`,
+    `RELEASE WOULD LEAVE WORK BEHIND — ${missingCount} finished commit(s) already exist that this release does not include.`,
   ];
   for (const s of sources) {
     lines.push(s.kind === 'trunk'
-      ? `  ${ref} is not a descendant of ${s.ref} (trunk) — ${s.missingCount} commit(s):`
-      : `  ${s.missingCount} commit(s) on ${s.ref}, where another session is working, are missing:`);
+      ? `  ${s.missingCount} commit(s) on ${s.ref} (the main line) are not in ${ref}:`
+      : `  ${s.missingCount} commit(s) on ${s.ref} — a branch someone is working on right now — are not in ${ref}:`);
     for (const c of s.missing) lines.push(`    · ${c.sha} ${c.subject}`);
-    if (s.missingCount > s.missing.length) lines.push(`    · …and ${s.missingCount - s.missing.length} more`);
+    if (s.missingCount > s.missing.length) lines.push(`    · …and ${s.missingCount - s.missing.length} more not listed`);
   }
-  lines.push('TELL THE USER before building: merge those in, or confirm this release deliberately excludes them.');
+  if (!named) {
+    lines.push('  (none of them could be listed individually — they are merge commits; inspect the range by hand)');
+  }
+  lines.push('');
+  lines.push('WHAT THIS MEANS FOR THE USER: if this release is built now, that work will not be in it,');
+  lines.push('and nobody will notice until someone looks for a feature that is missing.');
+  lines.push('Say this to them in your own words, listing what is above, BEFORE going any further.');
   return lines;
 }
 

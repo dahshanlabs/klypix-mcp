@@ -344,7 +344,11 @@ try {
       fs.mkdirSync(dir, { recursive: true });
       fs.writeFileSync(path.join(dir, 'brain.klypix'), 'fixture');
       fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name, version }, null, 2));
-      git(dir, 'init');
+      // Explicit branch name: the fixtures declare releaseIntent.ref 'main',
+      // and since 1.72.0 a ref that does not resolve is REFUSED (naming a
+      // nonexistent ref was the cheapest bypass in the gate). git init's default
+      // branch varies by version and user config, so pin it.
+      git(dir, 'init', '-b', 'main');
       git(dir, '-c', 'user.email=release-lease@test', '-c', 'user.name=release-lease-test',
         '-c', 'commit.gpgsign=false', 'add', '-A');
       git(dir, '-c', 'user.email=release-lease@test', '-c', 'user.name=release-lease-test',

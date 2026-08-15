@@ -199,6 +199,19 @@ export function releaseAncestry(projectDir, ref, { execGit = defaultExecGit, pee
     seen.add(name);
     if (resolves(name)) candidates.push({ ref: name, kind: name === trunk ? 'trunk' : 'peer-branch' });
   }
+
+  // NO third source, deliberately — and this is a decision, not an omission.
+  // A scan of recently-committed local branches was built and MEASURED against
+  // this repo: it produced 30-62 "missing" commits across 6-14 branches, most of
+  // them work already squash-merged into trunk under different SHAs. Ancestry
+  // cannot see through a squash, so the heuristic manufactures false positives
+  // at exactly the moment someone is trying to ship — and this project has the
+  // scar for that: five consecutive releases reported red over perfect publishes,
+  // and the recorded lesson is that alarm fatigue is itself a release-integrity
+  // defect. Trunk and live-peer branches are both PRECISE (no false positives by
+  // construction), so the gate keeps only those. The cost is stated honestly in
+  // the doc comment above rather than papered over with a noisy proxy.
+
   if (!candidates.length) return null;
 
   const sources = [];

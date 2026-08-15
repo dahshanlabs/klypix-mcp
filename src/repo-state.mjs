@@ -139,6 +139,127 @@ function repoStateForDir(git, dir) {
   };
 }
 
+// Trunk candidates, most-authoritative first. The remote tracking ref beats a
+// local branch: a local `master` can itself be stale, and the question a
+// release must answer is "does this carry everything the TEAM has landed".
+const TRUNK_REFS = ['origin/master', 'origin/main', 'master', 'main'];
+const MAX_MISSING_LISTED = 8;
+const UNIT_SEP = '';
+
+/**
+ * Would this release leave finished work behind?
+ *
+ * The recorded rule is "never ship a build that is not a descendant of trunk —
+ * the check is ANCESTRY, not version number", and it exists because desktop
+ * 1.3.107 was the highest version number KLYPIX had ever produced while missing
+ * 211 trunk commits and an entire feature. A higher number on an off-trunk
+ * branch is perfect camouflage.
+ *
+ * Until now that rule lived only as a card — recall, which works exactly as
+ * often as somebody exercises it. On 2026-08-15 nobody did: three finished
+ * commits sat on master while a release was cut from a branch that could never
+ * contain them, and the FOUNDER caught it, not the tooling. Coordination in
+ * this engine has always been about files two sessions are editing RIGHT NOW;
+ * nothing ever asked whether finished work was actually IN the build. This is
+ * that missing axis.
+ *
+ * Advisory data, never a refusal — a hotfix cut from a tag is a legitimate
+ * off-trunk release. The caller decides; this only makes it impossible to be
+ * unaware.
+ *
+ * @returns {null|{trunk, ref, isDescendant, missingCount, missing:Array<{sha,subject}>}}
+ *   null when the question cannot be answered (no git, no trunk, unknown ref).
+ */
+export function releaseAncestry(projectDir, ref, { execGit = defaultExecGit, peerBranches = [] } = {}) {
+  const git = makeGit(execGit);
+  const dir = String(projectDir || '');
+  if (!dir) return null;
+  const target = String(ref || '').trim() || 'HEAD';
+  const resolves = (r) => git(dir, ['rev-parse', '--verify', `${r}^{commit}`]) !== null;
+  if (!resolves(target)) return null;
+
+  const trunk = TRUNK_REFS.find(resolves) || null;
+
+  // WHY PEER BRANCHES, and not trunk alone — learned the hard way on
+  // 2026-08-15. The trunk check alone said release/1.3.113 was fine: it IS a
+  // descendant of origin/master. But origin/master was 214 commits behind the
+  // LOCAL master where the finished work actually sat, unpushed. Trunk ancestry
+  // catches the 1.3.107 class (a branch forked off trunk long ago); it cannot
+  // catch work that has not reached trunk yet.
+  //
+  // The presence lane is the only thing that knows which branches are live,
+  // which is precisely why this belongs in the coordination engine and not in
+  // one repo's prebuild script. A prebuild gate can only see refs; the lane
+  // sees WHO IS WORKING WHERE.
+  const seen = new Set();
+  const candidates = [];
+  for (const r of [trunk, ...peerBranches]) {
+    const name = String(r || '').trim();
+    if (!name || name === target || seen.has(name)) continue;
+    seen.add(name);
+    if (resolves(name)) candidates.push({ ref: name, kind: name === trunk ? 'trunk' : 'peer-branch' });
+  }
+  if (!candidates.length) return null;
+
+  const sources = [];
+  for (const cand of candidates) {
+    // `merge-base --is-ancestor` exits 0/1, and makeGit turns a non-zero exit
+    // into null — so null here means "not an ancestor", not "unknown".
+    if (git(dir, ['merge-base', '--is-ancestor', cand.ref, target]) !== null) continue;
+    const countRaw = git(dir, ['rev-list', '--count', `${target}..${cand.ref}`]);
+    const count = Number(countRaw);
+    if (!Number.isFinite(count) || count <= 0) continue;
+    // Git's own %x1f escape as the field separator: a commit subject can contain
+    // any character a human types, so the delimiter must be one that cannot.
+    const log = git(dir, ['log', '--no-merges', `--max-count=${MAX_MISSING_LISTED}`,
+      `--format=%h%x1f%s`, `${target}..${cand.ref}`]);
+    const missing = (log || '').split('\n').filter(Boolean).map((line) => {
+      const sep = line.indexOf(UNIT_SEP);
+      return sep < 0
+        ? { sha: line.trim(), subject: '' }
+        : { sha: line.slice(0, sep).trim(), subject: line.slice(sep + 1).slice(0, 120) };
+    });
+    sources.push({ ...cand, missingCount: count, missing });
+  }
+
+  const missingCount = sources.reduce((n, s) => n + s.missingCount, 0);
+  return {
+    trunk,
+    ref: target,
+    isDescendant: sources.length === 0,
+    missingCount,
+    sources,
+    // Flattened for the common case of one diverged source.
+    missing: sources.flatMap((s) => s.missing).slice(0, MAX_MISSING_LISTED),
+  };
+}
+
+/**
+ * The half that actually matters: lines a HUMAN reads.
+ *
+ * Founder's correction, verbatim — "at least the user should be
+ * informed/asked about it". A structured field only a model consumes is not a
+ * gate, because a model can decline to mention it. These strings ride the
+ * release-lease response at blocking severity, so a session cannot take the
+ * lease and stay quiet about what the release would drop.
+ */
+export function releaseAncestryWarnings(ancestry) {
+  if (!ancestry || ancestry.isDescendant || !ancestry.sources?.length) return [];
+  const { ref, missingCount, sources } = ancestry;
+  const lines = [
+    `RELEASE WOULD LEAVE WORK BEHIND — ${missingCount} finished commit(s) are not in ${ref}.`,
+  ];
+  for (const s of sources) {
+    lines.push(s.kind === 'trunk'
+      ? `  ${ref} is not a descendant of ${s.ref} (trunk) — ${s.missingCount} commit(s):`
+      : `  ${s.missingCount} commit(s) on ${s.ref}, where another session is working, are missing:`);
+    for (const c of s.missing) lines.push(`    · ${c.sha} ${c.subject}`);
+    if (s.missingCount > s.missing.length) lines.push(`    · …and ${s.missingCount - s.missing.length} more`);
+  }
+  lines.push('TELL THE USER before building: merge those in, or confirm this release deliberately excludes them.');
+  return lines;
+}
+
 // Released means "a tag anywhere in the repo names this version" — not only at
 // HEAD, because a checkout routinely moves past the commit it tagged while the
 // version itself stays published.

@@ -40,7 +40,7 @@ import {
 // canonical copy lives in the pure module because that one is import-restricted
 // (crypto only), so it can never grow a dependency this file would inherit.
 import { normalizeFileKey } from './finding-routing.mjs';
-import { cmpSemver3, collectRepoState, repoStateWarnings } from './repo-state.mjs';
+import { cmpSemver3, collectRepoState, releaseAncestry, releaseAncestryWarnings, repoStateWarnings } from './repo-state.mjs';
 import { recordResultManifests } from './result-reconcile.mjs';
 
 export const MCP_HEARTBEAT_MS = 60_000;
@@ -2460,6 +2460,45 @@ export function createMcpPresence({
         releaseText = `KLYPIX release lease freed: completion released the exclusive release lease (v${outcome.lease?.version} from ${outcome.lease?.ref}).`;
       } else if (active) {
         releaseLease = { status: 'held', holder: holderBlock };
+      }
+      // ── Would this release leave finished work behind? (1.72.0) ──────────
+      // Coordination in this engine had always been about files two sessions
+      // are editing RIGHT NOW. Nothing ever asked whether finished work was
+      // actually IN the build being cut — so on 2026-08-15 a release was
+      // prepared from a branch that could not contain three completed commits,
+      // and the FOUNDER noticed, not the tooling.
+      //
+      // It rides the LEASE because that is the one moment a release announces
+      // itself, and it is reported at blocking severity so the declaring
+      // session cannot take the lease and stay quiet: the founder's own
+      // correction was "at least the user should be informed/asked about it".
+      // Advisory in effect, unmissable in delivery — a hotfix cut from a tag is
+      // legitimate, so the human decides, but never unknowingly.
+      if (active && releaseIntentChecked.provided && (outcome?.status === 'taken' || outcome?.status === 'refreshed')) {
+        try {
+          const peerBranches = [
+            ...new Set((report.sessions || [])
+              .filter((s) => s?.id !== sessionId)
+              .map((s) => String(s?.branch || '').trim())
+              .filter(Boolean)),
+          ];
+          const ancestry = releaseAncestry(path.dirname(brainPath), active.ref, { peerBranches });
+          const warnings = releaseAncestryWarnings(ancestry);
+          if (warnings.length) {
+            releaseLease = {
+              ...releaseLease,
+              ancestry: {
+                kind: 'release-would-leave-work-behind',
+                severity: 'blocking',
+                trunk: ancestry.trunk,
+                ref: ancestry.ref,
+                missingCount: ancestry.missingCount,
+                sources: ancestry.sources,
+              },
+            };
+            releaseText = `${releaseText}\n\n${warnings.join('\n')}`;
+          }
+        } catch { /* a git probe must never break a sync */ }
       }
       if (active) {
         releaseFooterLine = `release in preparation: v${active.version} from ${active.ref} (session ${prefixFor(active.holderId)})`;

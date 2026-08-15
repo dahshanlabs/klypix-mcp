@@ -71,7 +71,7 @@ const CODEX_CONFIG = path.join(HOME, '.codex', 'config.toml');
 const HOOK_MARK = 'global-brain-hook';
 const exists = (p) => { try { fs.statSync(p); return true; } catch { return false; } };
 const fwd = (p) => p.replace(/\\/g, '/');
-const copyRetrySleepSync = (ms) => {
+const retrySleepSync = (ms) => {
     try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
     catch { /* best effort */ }
 };
@@ -81,7 +81,7 @@ function copyFileRobust(src, dest, tries = 8) {
         catch (error) {
             const retryable = ['EBUSY', 'EPERM', 'EACCES'].includes(error?.code);
             if (!retryable || attempt === tries) throw error;
-            copyRetrySleepSync(20 * attempt);
+            retrySleepSync(20 * attempt);
         }
     }
 }
@@ -174,6 +174,44 @@ function reportCodex(result) {
 // update hook runs install per project, so every project heals once). Only the
 // known npx/node launch is migrated; a hand-customized command / invalid JSON is
 // left untouched, and the original is backed up. Best-effort, never throws.
+// ── Windows rename hardening (1.71.1) ───────────────────────────────────────
+// Every atomic commit in this installer is a rename-over-destination, and on
+// Windows that throws EPERM/EBUSY/EACCES while ANY process briefly holds the
+// target — an AV scan, an indexer, or, routinely on a developer machine, the
+// live MCP servers reading the very bundle we are replacing. Measured 2026-08-15:
+// three failures in one session with 7-14 servers live, on .mcp-runtime.json and
+// brain-history.mjs; each retry succeeded immediately.
+//
+// The failure is loud rather than silent, and a manual re-run fixes it — but
+// this is the FIRST command a new user types, and a raw EPERM stack at that
+// moment is a bad first contact. So the installer now outlasts a transient
+// holder using the SAME bounded backoff the brain write funnel has used since
+// 1.68.0 (klypix-format.mjs atomicWrite): ~2.7s total, then rethrow. A
+// persistent holder still fails loudly — delayed is acceptable, silently wrong
+// is not, and pretending we wrote a file we did not would be far worse.
+const RENAME_RETRYABLE_CODES = new Set(['EPERM', 'EBUSY', 'EACCES']);
+const RENAME_BACKOFF_MS = [40, 120, 300, 700, 1500];
+/** fs.renameSync that outlasts a transient Windows lock on the destination. */
+function renameSyncWithBackoff(from, to) {
+    for (let attempt = 0; ; attempt++) {
+        try { return fs.renameSync(from, to); }
+        catch (e) {
+            if (attempt >= RENAME_BACKOFF_MS.length || !RENAME_RETRYABLE_CODES.has(e?.code)) {
+                // Name the real cause: "EPERM: operation not permitted" tells a
+                // user nothing actionable, and the fix is usually to close the
+                // editors whose servers hold the bundle.
+                if (RENAME_RETRYABLE_CODES.has(e?.code)) {
+                    e.message = `${e.message}\n  ↳ ${path.basename(to)} is held by another process after ~2.7s of retries.`
+                        + '\n    On Windows this is normally a running MCP server, an antivirus scan, or an indexer.'
+                        + '\n    Close your editors (or quit KLYPIX) and run the command again — nothing was left half-written.';
+                }
+                throw e;
+            }
+            retrySleepSync(RENAME_BACKOFF_MS[attempt]);
+        }
+    }
+}
+
 function migrateProjectMcpConfig() {
     try {
         const file = path.join(process.cwd(), '.mcp.json');
@@ -362,7 +400,7 @@ try {
     } catch { /* .prev rollback snapshot is best-effort */ }
     const renameOrder = staged.slice().sort((a, b) => (a.dst === 'global-brain-hook.mjs' ? 1 : 0) - (b.dst === 'global-brain-hook.mjs' ? 1 : 0));
     let n = 0;
-    for (const st of renameOrder) { fs.renameSync(path.join(BRAIN_DIR, st.dst + '.klypix-new'), path.join(BRAIN_DIR, st.dst)); n++; }
+    for (const st of renameOrder) { renameSyncWithBackoff(path.join(BRAIN_DIR, st.dst + '.klypix-new'), path.join(BRAIN_DIR, st.dst)); n++; }
 
     // 3) mark the dir an ESM package
     fs.writeFileSync(path.join(BRAIN_DIR, 'package.json'), JSON.stringify({ name: 'klypix-project-brain', private: true, type: 'module' }, null, 2));
@@ -397,7 +435,7 @@ try {
         const tmp = SETTINGS + '.klypix-tmp';
         fs.writeFileSync(tmp, JSON.stringify(settings, null, 2), 'utf8');
         JSON.parse(fs.readFileSync(tmp, 'utf8'));   // verify before swap
-        fs.renameSync(tmp, SETTINGS);
+        renameSyncWithBackoff(tmp, SETTINGS);
     }
 
     // 6) Commit the runtime pointer and version receipt atomically while the
@@ -424,7 +462,7 @@ try {
     };
     const runtimePath = path.join(BRAIN_DIR, '.mcp-runtime.json');
     fs.writeFileSync(runtimePath + '.klypix-new', JSON.stringify(runtime, null, 2) + '\n', 'utf8');
-    fs.renameSync(runtimePath + '.klypix-new', runtimePath);
+    renameSyncWithBackoff(runtimePath + '.klypix-new', runtimePath);
     // A tagged-but-DIRTY checkout keeps via:'npm' (the tag still names the
     // payload identity, and dev:true would stop auto-update from healing the
     // machine back to clean released bytes) but stamps dirty:true + the audit
@@ -437,7 +475,7 @@ try {
             : { brainVersion: VERSION, via: 'npm', dirty: false, installedAt };
     const versionPath = path.join(BRAIN_DIR, '.brain-version.json');
     fs.writeFileSync(versionPath + '.klypix-new', JSON.stringify(versionStamp, null, 2), 'utf8');
-    fs.renameSync(versionPath + '.klypix-new', versionPath);
+    renameSyncWithBackoff(versionPath + '.klypix-new', versionPath);
 
     // 7) migrate THIS project's .mcp.json off npx onto the now-installed local bundle
     //    (heals an existing stale config so the next MCP server spawn runs current).

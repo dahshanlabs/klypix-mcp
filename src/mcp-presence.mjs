@@ -961,6 +961,38 @@ function gitBranch(cwd) {
   }
 }
 
+/**
+ * The branch THIS SESSION is actually on — the neutral-vendor fix.
+ *
+ * Until 1.72.0 every MCP host reported the branch of the VAULT directory,
+ * because the seam records `cwd: path.dirname(brainPath)`. Only Claude Code
+ * and hooked Codex — the two hosts with lifecycle hooks — supplied a true
+ * per-session branch, so the product was measurably better on those two. For a
+ * layer whose entire claim is that every coding agent is served equally, that
+ * asymmetry is the one defect that cannot be argued away.
+ *
+ * The MCP server is launched BY the host, so its own process.cwd() is the
+ * workspace the user opened for every host that sets it — Cursor, Cline,
+ * Windsurf, VS Code, Codex, Kimi, OpenCode, and anything else that speaks MCP,
+ * with no hook and no host-specific code. A host that launches from its own
+ * install directory simply yields no branch there, and the vault answer stands
+ * exactly as before: strictly more signal, never less.
+ *
+ * Deliberately NOT written into the presence row's `cwd`. That field is
+ * session IDENTITY, and the overlap matcher normalizes declared file paths
+ * against it — moving it would silently change which files count as the same
+ * file, which is a far larger blast radius than this fix is worth.
+ */
+const hostCwdBranch = (vaultDir) => {
+  let hostCwd = null;
+  try { hostCwd = process.cwd(); } catch { hostCwd = null; }
+  if (hostCwd && path.resolve(hostCwd) !== path.resolve(vaultDir || '')) {
+    const fromHost = gitBranch(hostCwd);
+    if (fromHost) return fromHost;
+  }
+  return gitBranch(vaultDir);
+};
+
 const peerFingerprint = (sessions, selfId) => (Array.isArray(sessions) ? sessions : [])
   .filter((session) => session.id !== selfId)
   .map((session) => [
@@ -1699,7 +1731,7 @@ export function createMcpPresence({
       surface,
       branch: branchPrepared !== undefined
         ? branchPrepared
-        : gitBranch(path.dirname(brainPath)),
+        : hostCwdBranch(path.dirname(brainPath)),
       intent,
       intentSource: intent !== undefined ? 'declared' : null,
       files,
@@ -2083,7 +2115,7 @@ export function createMcpPresence({
     // be redirected by a lexical junction retarget.
     if (!preparedClientInfo) preparedClientInfo = clientInfo();
     const preparedBranch = resultBrainPath
-      ? gitBranch(path.dirname(resultBrainPath))
+      ? hostCwdBranch(path.dirname(resultBrainPath))
       : null;
     if (!verifiedBinding()) {
       const report = syncPreflightFailure({

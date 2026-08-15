@@ -45,18 +45,19 @@ const CACHE_MS = 60_000;
 // worth caching too, or every sync in a non-git project re-pays the spawn).
 const repoStateCache = new Map();
 
-function defaultExecGit(args, cwd) {
+function defaultExecGit(args, cwd, timeoutMs) {
   return execFileSync('git', args, {
     cwd,
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'ignore'],
-    timeout: GIT_TIMEOUT_MS,
+    // Most probes are rev-parse-fast; patch-id work needs its own budget.
+    timeout: Number(timeoutMs) > 0 ? Number(timeoutMs) : GIT_TIMEOUT_MS,
   });
 }
 
-const makeGit = (execGit) => (cwd, args) => {
+const makeGit = (execGit) => (cwd, args, timeoutMs) => {
   try {
-    const out = execGit(args, cwd);
+    const out = execGit(args, cwd, timeoutMs);
     return typeof out === 'string' ? out.trim() : null;
   } catch {
     return null;   // no git on PATH, not a repo, timeout — all the same: no data
@@ -144,6 +145,12 @@ function repoStateForDir(git, dir) {
 // release must answer is "does this carry everything the TEAM has landed".
 const TRUNK_REFS = ['origin/master', 'origin/main', 'master', 'main'];
 const MAX_MISSING_LISTED = 8;
+// git cherry has no --max-count, so a pathological divergence is bounded here
+// rather than parsed forever.
+const MAX_CHERRY_SCAN = 500;
+// Measured 670ms on a real 200-commit divergence; the shared 1500ms budget was
+// already failing intermittently and reporting the release as clean.
+const CHERRY_TIMEOUT_MS = 10_000;
 const UNIT_SEP = '';
 
 /**
@@ -253,16 +260,61 @@ export function releaseAncestry(projectDir, ref, { execGit = defaultExecGit, pee
     // `merge-base --is-ancestor` exits 0/1, and makeGit turns a non-zero exit
     // into null — so null here means "not an ancestor", not "unknown".
     if (git(dir, ['merge-base', '--is-ancestor', cand.ref, target]) !== null) continue;
-    // MERGES ARE INCLUDED. `--count` always counted them while the listing used
-    // --no-merges, so a divergence made ONLY of merge commits produced
-    // missingCount > 0 with nothing listed — and an empty list opened the gate
-    // with no acknowledgement at all. The listing must be a subset of the count
-    // or the two disagree in the caller's favour.
-    const countRaw = git(dir, ['rev-list', '--count', `${target}..${cand.ref}`]);
-    const count = Number(countRaw);
-    if (!Number.isFinite(count) || count <= 0) continue;
-    const log = git(dir, ['log', `--max-count=${MAX_MISSING_LISTED}`,
-      `--format=%h%x1f%s`, `${target}..${cand.ref}`]);
+    // `git cherry` INSTEAD OF `rev-list`, and this is the single most important
+    // line in the module. rev-list compares SHAS, so it reported as "missing"
+    // every commit that had been rebased, cherry-picked, or squash-merged into
+    // the target under a new sha — measured on the real repo, that was 30-62
+    // false positives across 6-14 branches, and it forced an otherwise-good
+    // source to be deleted rather than tuned.
+    //
+    // `git cherry <target> <source>` compares PATCH-IDs: `+` means the change
+    // genuinely is not there, `-` means an equivalent change already is.
+    // Verified on real repos: it sees through a rebase, a cherry-pick, and a
+    // single-commit squash. It does NOT see through a squash of several commits
+    // into one (the combined diff cannot match any individual patch-id) — an
+    // honest, documented residue rather than a silent one.
+    //
+    // It also fixes the merge over-count for free: where rev-list said 2 for a
+    // divergence carrying one real change plus its merge commit, cherry says 1.
+    // Count and listing now come from the SAME source, so they can no longer
+    // disagree in the caller's favour — which is what let a merge-only
+    // divergence satisfy the handshake with an empty list.
+    //
+    // TIMEOUT DISCIPLINE, learned the hard way one commit before this shipped:
+    // patch-id computation is far slower than the rev-parse probes this module
+    // was built around, and at the shared 1500ms budget `git cherry` returned
+    // null on the real repo — which the loop read as "nothing missing" and the
+    // gate reported the release as CLEAN. A false negative here is strictly
+    // worse than every false positive this module has ever produced, so cherry
+    // gets its own budget AND a failure is never allowed to mean "clean".
+    const cherry = git(dir, ['cherry', target, cand.ref], CHERRY_TIMEOUT_MS);
+    let count;
+    let shown;
+    let approximate = false;
+    if (cherry !== null) {
+      const missingShas = cherry.split('\n')
+        .filter((l) => l.startsWith('+ '))
+        .map((l) => l.slice(2).trim())
+        .filter(Boolean)
+        .slice(0, MAX_CHERRY_SCAN);
+      count = missingShas.length;
+      if (count <= 0) continue;              // every change is already present
+      shown = missingShas.slice(0, MAX_MISSING_LISTED);
+    } else {
+      // FALL BACK, never skip. rev-list is sha-based so it over-reports
+      // rebases and squashes, but over-reporting is a conversation and
+      // under-reporting is a lost feature. The source is marked approximate so
+      // the text can say the equivalence check could not run.
+      const countRaw = git(dir, ['rev-list', '--count', `${target}..${cand.ref}`]);
+      count = Number(countRaw);
+      if (!Number.isFinite(count) || count <= 0) continue;
+      approximate = true;
+      const fallbackLog = git(dir, ['log', `--max-count=${MAX_MISSING_LISTED}`, '--format=%H', `${target}..${cand.ref}`]);
+      shown = (fallbackLog || '').split('\n').map((s) => s.trim()).filter(Boolean);
+    }
+    if (!shown.length) continue;
+    // One bounded call for the subjects of just what will be shown.
+    const log = git(dir, ['log', '--no-walk', `--format=%h%x1f%s`, ...shown]);
     const parsed = (log || '').split('\n').filter(Boolean).map((line) => {
       const sep = line.indexOf(UNIT_SEP);
       return sep < 0
@@ -275,7 +327,11 @@ export function releaseAncestry(projectDir, ref, { execGit = defaultExecGit, pee
     const missing = parsed.filter((c) => c.sha && !claimed.has(c.sha));
     for (const c of missing) claimed.add(c.sha);
     if (!missing.length && count > 0 && parsed.length) continue;   // wholly duplicated source
-    sources.push({ ...cand, missingCount: count, missing });
+    // `approximate` = the patch-id equivalence check could not run for this
+    // source, so the list may include work that is already present under a
+    // different sha. Carried on the source so the text can say so rather than
+    // asserting a precision it does not have.
+    sources.push({ ...cand, missingCount: count, missing, ...(approximate ? { approximate: true } : {}) });
   }
 
   if (!sources.length) {
@@ -337,6 +393,10 @@ export function releaseAncestryWarnings(ancestry) {
       : `  ${s.missingCount} commit(s) on ${s.ref} — a branch someone is working on right now — are not in ${ref}:`);
     for (const c of s.missing) lines.push(`    · ${c.sha} ${c.subject}`);
     if (s.missingCount > s.missing.length) lines.push(`    · …and ${s.missingCount - s.missing.length} more not listed`);
+    if (s.approximate) {
+      lines.push('    (this list is approximate — the equivalence check could not run, so some of');
+      lines.push('     these may already be in the release under a different commit id)');
+    }
   }
   if (!named) {
     lines.push('  (none of them could be listed individually — they are merge commits; inspect the range by hand)');

@@ -218,9 +218,56 @@ try {
   ok('RA13 a branch just cut from trunk reads clean', justCut.status === 'ok' && justCut.isDescendant === true);
   ok('RA13 and produces no warnings', releaseAncestryWarnings(justCut).length === 0);
 
+  // ---- RA14 — patch-id equivalence, and the timeout that must never lie ----
+  // rev-list compares SHAS, so a rebase / cherry-pick / single-commit squash
+  // reads as "missing" — measured at 30-62 false positives on the real repo.
+  // git cherry compares PATCH-IDs and sees through all three.
+  //
+  // The fixture must leave `work` genuinely NOT an ancestor of the release,
+  // or the ancestry short-circuit fires first and this proves nothing: an
+  // earlier version of this test cherry-picked the ONLY commit, which made
+  // work an ancestor and silently exercised no code at all.
+  const eq = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-eq-'));
+  globalThis.__eqRepo = eq;
+  const eg = (...a) => execFileSync('git', a, { cwd: eq, encoding: 'utf8', stdio: 'pipe' });
+  const ec = (m, f) => { fs.writeFileSync(path.join(eq, f), m); eg('add', '-A'); execFileSync('git', ['commit', '-q', '-m', m], { cwd: eq, stdio: 'pipe' }); };
+  eg('init', '-q', '-b', 'main'); eg('config', 'user.email', 't@e.com'); eg('config', 'user.name', 'T');
+  ec('base', 'a.txt');
+  eg('checkout', '-q', '-b', 'work');
+  ec('already applied elsewhere', 'x.txt');
+  ec('genuinely missing', 'y.txt');
+  eg('checkout', '-q', 'main');
+  // Only the FIRST work commit reaches main, under a different sha.
+  execFileSync('git', ['cherry-pick', 'work~1'], { cwd: eq, stdio: 'pipe' });
+  eg('checkout', '-q', '-b', 'rel', 'main');
+
+  const precise = releaseAncestry(eq, 'rel', { peerBranches: ['work'] });
+  ok('RA14 the cherry-picked commit is excluded by patch-id equivalence',
+    precise.status === 'dirty' && precise.missingCount === 1);
+  ok('RA14 and the one genuinely-missing commit is the one reported',
+    precise.missing.some((c) => /genuinely missing/.test(c.subject)));
+  ok('RA14 the already-applied change is NOT reported',
+    !precise.missing.some((c) => /already applied/.test(c.subject)));
+
+  // A probe that FAILS must never read as clean: it falls back to the
+  // sha-based comparison, over-reports rather than under-reports, and says so.
+  const failing = releaseAncestry(eq, 'rel', {
+    peerBranches: ['work'],
+    execGit: (args, cwd, t) => {
+      if (args[0] === 'cherry') throw Object.assign(new Error('simulated timeout'), { code: 'ETIMEDOUT' });
+      return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: t || 5000 });
+    },
+  });
+  ok('RA14 a failed equivalence probe still reports the divergence', failing.status === 'dirty');
+  ok('RA14 the fallback OVER-reports rather than under-reporting',
+    failing.missingCount >= precise.missingCount);
+  ok('RA14 and marks itself approximate', failing.sources.every((s) => s.approximate === true));
+  ok('RA14 the text admits the list may be imprecise',
+    /list is approximate/.test(releaseAncestryWarnings(failing).join('\n')));
+
   console.log(`✓ release ancestry — ${pass}/${pass} assertions`);
 } finally {
-  for (const d of [repo, , globalThis.__mrepo, globalThis.__freshRepo]) {
+  for (const d of [repo, , globalThis.__mrepo, globalThis.__freshRepo, globalThis.__eqRepo]) {
     if (d) { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* temp */ } }
   }
   try { fs.rmSync(`${repo}-origin.git`, { recursive: true, force: true }); } catch { /* temp */ }

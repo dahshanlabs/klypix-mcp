@@ -442,7 +442,10 @@ try {
   for (const [index, call] of [
     { name: 'brain_note', arguments: { text: `MUST_NOT_WRITE_${process.pid}`, area: 'Routing' } },
     { name: 'brain_ask', arguments: { question: 'What is FOREIGN_LAUNCH_CONTEXT?', k: 3 } },
-    { name: 'remote_status', arguments: {} },
+    // Was remote_status until KLYPIX Remote was removed (2026-08-15). The third
+    // case only needs a read-only tool with an empty input schema, so that the
+    // gate is proven on a call carrying no arguments of its own.
+    { name: 'list_canvases', arguments: {} },
   ].entries()) {
     const rejected = await workerClient.callTool({
       ...call,

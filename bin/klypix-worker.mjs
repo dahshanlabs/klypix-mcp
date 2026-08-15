@@ -39,7 +39,6 @@ import {
   registerProjectBrain,
   spawnAutoUpdateHelper,
 } from '../src/mcp-auto-update.mjs';
-import { remoteActions, remoteCommand, remoteSessions, remoteStatus } from '../src/remote-client.mjs';
 // Namespace import (already in-process via the klypix-core chain, so zero added
 // load cost) so a bundle whose klypix-format predates classifyDecay degrades
 // gracefully — a named import of a missing export would kill the whole server.
@@ -407,91 +406,6 @@ const toContent = (r) => {
   if (r.structured && typeof r.structured === 'object') result.structuredContent = r.structured;
   return result;
 };
-
-// Return raw MCP results here. The universal registerTool wrapper above owns
-// the single presence/message transition for every non-brain_sync call. A
-// helper-level decoration would offer and then acknowledge one note inside the
-// same Remote call, violating delivery-v3's later-action invariant.
-const remoteToolResult = (label, value) => ({
-  content: [{ type: 'text', text: `${label}\n\n${JSON.stringify(value, null, 2)}` }],
-  structuredContent: { result: value },
-});
-const remoteToolError = (error) => {
-  const message = typeof error?.message === 'string' && /^KLYPIX_[A-Z0-9_]+$/.test(error.message)
-    ? error.message : 'KLYPIX_REMOTE_REQUEST_REJECTED';
-  return {
-    content: [{ type: 'text', text: `${message}. The KLYPIX desktop window may be closed, but its tray relay must be running and Remote control must be enabled.` }],
-    isError: true,
-  };
-};
-const remoteProjectRoot = () => (mcpPresence.brainPath ? path.dirname(mcpPresence.brainPath) : null);
-
-server.registerTool('remote_status', {
-  title: 'Inspect the local KLYPIX Remote relay',
-  description: 'Reports whether the KLYPIX tray relay, discovery, provider hooks, verified controls, phone pairing, and encrypted network relay are active. The desktop WINDOW may be closed; KLYPIX must still be running in the tray and the PC must be awake.',
-  annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: false },
-  inputSchema: {},
-}, async () => {
-  try { return remoteToolResult('KLYPIX Remote status', await remoteStatus({ projectRoot: remoteProjectRoot() })); }
-  catch (error) { return remoteToolError(error); }
-});
-
-server.registerTool('remote_sessions', {
-  title: 'List coding-agent sessions by KLYPIX project',
-  description: 'Lists local coding-agent sessions with their project/path binding, current state, active host binding, and exact capability receipts. Treat each receipt as the truth for that specific provider + version + live session; never infer a missing action. The KLYPIX tray relay must be running.',
-  annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: false },
-  inputSchema: {},
-}, async () => {
-  try { return remoteToolResult('KLYPIX Remote sessions', await remoteSessions({ projectRoot: remoteProjectRoot() })); }
-  catch (error) { return remoteToolError(error); }
-});
-
-server.registerTool('remote_actions', {
-  title: 'List pending coding-agent decisions',
-  description: 'Lists pending questions, permission requests, confirmations, failures, conflicts, and reviews reported by supported provider hooks. Approval/rejection still requires the exact session capability receipt and request digest. The KLYPIX tray relay must be running.',
-  annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: false },
-  inputSchema: {},
-}, async () => {
-  try { return remoteToolResult('KLYPIX Remote actions', await remoteActions({ projectRoot: remoteProjectRoot() })); }
-  catch (error) { return remoteToolError(error); }
-});
-
-server.registerTool('remote_command', {
-  title: 'Control one verified coding-agent session',
-  description: 'Sends one command to the exact machine/provider/session and host binding named by a fresh remote_sessions capability receipt. Supports opening the exact provider session, messages, images/files, interrupt, approve/reject, close/archive/resume only when that exact receipt says the operation is available. File paths are local to this PC. The KLYPIX tray relay must be running and verified controls enabled.',
-  annotations: { destructiveHint: true, idempotentHint: false, openWorldHint: true },
-  inputSchema: {
-    machine_id: z.string().min(1).max(256),
-    provider: z.enum(['antigravity-agent', 'claude-code', 'codex', 'cursor-agent', 'gemini-cli', 'grok-build', 'kimi-code', 'opencode', 'pi', 'qoder', 'mistral-vibe', 'unknown']),
-    external_session_id: z.string().min(1).max(512),
-    operation: z.enum(['send-text', 'send-message', 'attach-image', 'attach-file', 'interrupt', 'approve', 'reject', 'close', 'archive', 'resume', 'open-provider']),
-    capability_receipt_id: z.string().min(1).max(256).describe('Fresh receipt id for this exact operation from remote_sessions.'),
-    binding_id: z.string().min(1).max(256).describe('Fresh host binding id named by the receipt.'),
-    request_digest: z.string().regex(/^[0-9a-f]{64}$/).optional().describe('Required for approve/reject; copy it from the pending remote action.'),
-    text: z.string().min(1).max(20000).optional(),
-    replace_draft: z.boolean().optional(),
-    attachments: z.array(z.object({
-      path: z.string().min(1).max(2048).describe('Absolute local file path on this PC.'),
-      kind: z.enum(['image', 'video', 'audio', 'document', 'file']),
-      mime_type: z.string().min(1).max(128).optional(),
-    })).max(25).optional(),
-  },
-}, async ({ machine_id, provider, external_session_id, operation, capability_receipt_id, binding_id, request_digest, text, replace_draft, attachments }, extra) => {
-  try {
-    const receipt = await remoteCommand({
-      machineId: machine_id, provider, externalSessionId: external_session_id, operation,
-      capabilityReceiptId: capability_receipt_id, bindingId: binding_id,
-      requestDigest: request_digest, text, replaceDraft: replace_draft,
-      attachments: attachments?.map((attachment) => ({
-        path: attachment.path, kind: attachment.kind, mimeType: attachment.mime_type,
-      })),
-    }, {
-      projectRoot: remoteProjectRoot(),
-      actionIdentity: extra.klypixRequestIdentity?.actionId,
-    });
-    return remoteToolResult('KLYPIX Remote command receipt', receipt);
-  } catch (error) { return remoteToolError(error); }
-});
 
 server.registerTool('list_canvases', {
   title: 'List KLYPIX canvases',

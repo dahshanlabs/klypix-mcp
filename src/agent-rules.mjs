@@ -660,36 +660,61 @@ function classifyMcp(file, wrapKey, projectDir) {
 
 // The projection map — the single source of truth shared by WRITE (linkProject) and
 // CHECK (auditProject), so the two can never disagree about what's projected where.
+//
+// `editors` (1.71.0) names which detected hosts justify writing each file, so a
+// project stops collecting managed config for tools nobody on the machine has.
+// `standard: true` marks the cross-tool AGENTS.md convention — justified by ANY
+// agent host rather than one specific id. Filtering only happens when a caller
+// passes an explicit editor set; the default projects everything, exactly as
+// before, so every existing caller is unaffected.
 function targets(projectDir) {
   const j = (...p) => path.join(projectDir, ...p);
   return {
     rules: [
-      { tool: 'Codex / AGENTS.md standard', file: j('AGENTS.md'), kind: 'merge' },
-      { tool: 'Cursor', file: j('.cursor', 'rules', 'klypix-brain.mdc'), kind: 'dedicated', frontmatter: '---\ndescription: KLYPIX project brain — read at task start, capture decisions\nalwaysApply: true\n---' },
-      { tool: 'Windsurf', file: j('.windsurf', 'rules', 'klypix-brain.md'), kind: 'dedicated', frontmatter: '---\ntrigger: always_on\n---' },
-      { tool: 'Cline', file: j('.clinerules', 'klypix-brain.md'), kind: 'dedicated', frontmatter: '' },
-      { tool: 'GitHub Copilot', file: j('.github', 'copilot-instructions.md'), kind: 'merge' },
+      { tool: 'Codex / AGENTS.md standard', file: j('AGENTS.md'), kind: 'merge', editors: ['codex'], standard: true },
+      { tool: 'Cursor', file: j('.cursor', 'rules', 'klypix-brain.mdc'), kind: 'dedicated', editors: ['cursor'], frontmatter: '---\ndescription: KLYPIX project brain — read at task start, capture decisions\nalwaysApply: true\n---' },
+      { tool: 'Windsurf', file: j('.windsurf', 'rules', 'klypix-brain.md'), kind: 'dedicated', editors: ['windsurf'], frontmatter: '---\ntrigger: always_on\n---' },
+      { tool: 'Cline', file: j('.clinerules', 'klypix-brain.md'), kind: 'dedicated', editors: ['cline'], frontmatter: '' },
+      { tool: 'GitHub Copilot', file: j('.github', 'copilot-instructions.md'), kind: 'merge', editors: ['copilot'] },
       // Added 1.13.0 — close the "not generated at all" coverage gap the audit flagged.
-      { tool: 'Gemini CLI', file: j('GEMINI.md'), kind: 'merge' },
-      { tool: 'Aider', file: j('CONVENTIONS.md'), kind: 'dedicated', frontmatter: '' },
+      { tool: 'Gemini CLI', file: j('GEMINI.md'), kind: 'merge', editors: ['gemini-cli', 'antigravity'] },
+      { tool: 'Aider', file: j('CONVENTIONS.md'), kind: 'dedicated', editors: ['aider'], frontmatter: '' },
       // Added 1.29.1 — Antigravity (Gemini IDE) reads .agents/AGENTS.md; the desktop
       // app already writes it (projectBrainConnect.ts), this adds CLI audit coverage.
       // kind:'merge' so the fenced block coexists with any existing content.
-      { tool: 'Antigravity', file: j('.agents', 'AGENTS.md'), kind: 'merge' },
+      { tool: 'Antigravity', file: j('.agents', 'AGENTS.md'), kind: 'merge', editors: ['antigravity'] },
       // Intentionally NO project CLAUDE.md target. Claude receives the same task
       // contract mechanically through lifecycle hooks + MCP tool instructions;
       // the desktop legacy connector still owns CLAUDE.md, so a second Core
       // writer here would create duelling managed blocks and update churn.
     ],
     mcp: [
-      { tool: 'Codex', file: j('.codex', 'config.toml'), format: 'toml' },
-      { tool: 'Claude Code', file: j('.mcp.json'), wrapKey: 'mcpServers', withType: false },
-      { tool: 'Cursor', file: j('.cursor', 'mcp.json'), wrapKey: 'mcpServers', withType: false },
-      { tool: 'Cline', file: j('.cline', 'mcp.json'), wrapKey: 'mcpServers', withType: false },
-      { tool: 'Gemini CLI / Antigravity', file: j('.gemini', 'settings.json'), wrapKey: 'mcpServers', withType: false },
-      { tool: 'VS Code (Copilot/Continue)', file: j('.vscode', 'mcp.json'), wrapKey: 'servers', withType: true },
+      { tool: 'Codex', file: j('.codex', 'config.toml'), format: 'toml', editors: ['codex'] },
+      { tool: 'Claude Code', file: j('.mcp.json'), wrapKey: 'mcpServers', withType: false, editors: ['claude-code'] },
+      { tool: 'Cursor', file: j('.cursor', 'mcp.json'), wrapKey: 'mcpServers', withType: false, editors: ['cursor'] },
+      { tool: 'Cline', file: j('.cline', 'mcp.json'), wrapKey: 'mcpServers', withType: false, editors: ['cline'] },
+      { tool: 'Gemini CLI / Antigravity', file: j('.gemini', 'settings.json'), wrapKey: 'mcpServers', withType: false, editors: ['gemini-cli', 'antigravity'] },
+      { tool: 'VS Code (Copilot/Continue)', file: j('.vscode', 'mcp.json'), wrapKey: 'servers', withType: true, editors: ['vscode', 'copilot'] },
     ],
   };
+}
+
+/**
+ * Should this target be projected, given the hosts detected on the machine?
+ *
+ * Three independent yeses, in order of strength:
+ *  1. a detected host reads it;
+ *  2. it is the cross-tool AGENTS.md standard and SOME agent host is present;
+ *  3. the file already exists in the project — a teammate committed it, so it
+ *     stays current whether or not THIS machine has that editor. Without this
+ *     rule a one-editor developer would silently stop maintaining the configs
+ *     the rest of their team depends on.
+ */
+function targetJustified(target, editors, anyEditor) {
+  if (!editors) return true;                                        // unfiltered: project everything
+  if ((target.editors || []).some((id) => editors.has(id))) return true;
+  if (target.standard && anyEditor) return true;
+  return exists(target.file);
 }
 
 const relFile = (projectDir, abs) => path.relative(projectDir, abs).replace(/\\/g, '/');
@@ -698,14 +723,39 @@ const relFile = (projectDir, abs) => path.relative(projectDir, abs).replace(/\\/
  * Wire a project so EVERY agent tool reads + captures its brain automatically — or,
  * with { check:true }, AUDIT the projection without touching disk.
  * @param {string} projectDir absolute project root (holds ./brain.klypix)
- * @param {{ version?: string, check?: boolean }} [opts]
- * @returns {{ rules: Array, mcp: Array, hasBrain: boolean, version: string, check: boolean }}
+ * @param {{ version?: string, check?: boolean, editors?: Set<string>|string[] }} [opts]
+ *   editors — when supplied, project only what a detected host actually reads
+ *   (plus files the project already carries). Omit for the legacy write-all.
+ * @returns {{ rules, mcp, hasBrain, version, check, skipped: Array }}
  */
 export function linkProject(projectDir, opts = {}) {
   const version = opts.version || resolveVersion();
   const check = !!opts.check;
   const t = targets(projectDir);
   const hasBrain = exists(path.join(projectDir, 'brain.klypix')) || exists(path.join(projectDir, 'brain.any'));
+
+  const editors = opts.editors == null ? null
+    : (opts.editors instanceof Set ? opts.editors : new Set(opts.editors));
+  const anyEditor = !!editors && editors.size > 0;
+  // Files the caller has decided not to touch at all — used by the automatic
+  // setup path to leave a project-owned (vendored, repo-relative) server alone.
+  // An explicitly typed `link` still rewrites everything; an action the user
+  // did not ask for should be more conservative than one they did.
+  const exclude = opts.exclude instanceof Set ? opts.exclude
+    : new Set(Array.isArray(opts.exclude) ? opts.exclude : []);
+  const skipped = [];
+  const keep = (target) => {
+    const file = relFile(projectDir, target.file);
+    if (exclude.has(file)) {
+      skipped.push({ tool: target.tool, file, why: 'project-owned server — left untouched' });
+      return false;
+    }
+    if (targetJustified(target, editors, anyEditor)) return true;
+    skipped.push({ tool: target.tool, file, why: 'not installed on this machine' });
+    return false;
+  };
+  t.rules = t.rules.filter(keep);
+  t.mcp = t.mcp.filter(keep);
 
   const rules = t.rules.map((r) => {
     const file = relFile(projectDir, r.file);
@@ -761,7 +811,7 @@ export function linkProject(projectDir, opts = {}) {
     }
   });
 
-  return { rules, mcp, hasBrain, version, check };
+  return { rules, mcp, hasBrain, version, check, skipped };
 }
 
 /**

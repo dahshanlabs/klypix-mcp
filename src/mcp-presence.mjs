@@ -541,6 +541,15 @@ const publicSession = (session, now) => {
   };
 };
 
+// Freshness floor for "is this undeclared connection actually WORKING?".
+// Only real prompt/tool work stamps activityAt; heartbeats deliberately
+// preserve it, so a fresh stamp means work, not merely a live socket.
+const UNDECLARED_ACTIVE_MS = 10 * 60 * 1000;
+const isUndeclaredActive = (session, now) =>
+  !isTaskSession(session)
+  && Number(session?.activityAt || 0) > 0
+  && now - Number(session.activityAt) < UNDECLARED_ACTIVE_MS;
+
 export function buildPresenceSnapshot(sessions, selfId, { now = Date.now() } = {}) {
   const connected = Array.isArray(sessions) ? sessions : [];
   const self = connected.find((session) => session.id === selfId) || null;
@@ -548,25 +557,46 @@ export function buildPresenceSnapshot(sessions, selfId, { now = Date.now() } = {
   const others = connected.filter((session) => session.id !== selfId && !isSuspectedTwin(session, self));
   const twinCount = connected.length - 1 - others.length;
   const tasks = others.filter(isTaskSession);
+  // 1.71.0 — "background" conflated two very different things: a connection
+  // sitting idle, and a session actively editing this repo that never declared
+  // a scope. Only the second one falsifies the coordination promise, because a
+  // peer reading this snapshot cannot see the work it is doing. Doctor has
+  // drawn that line since 1.70; the sync response buried it in one number.
+  const undeclaredActive = others.filter((session) => isUndeclaredActive(session, now));
   return {
     connectionCount: connected.length - Math.max(0, twinCount),
     activeTaskCount: tasks.length + (self && isTaskSession(self) ? 1 : 0),
-    // "background" here means SYNC-SILENT, not idle: a connection that never
-    // declared a task may still be actively working — say so, don't bury it.
+    // Retained verbatim for every existing reader: idle + undeclared-active.
     backgroundConnectionCount: others.length - tasks.length,
+    // ADDITIVE: the subset that is provably working without declaring scope.
+    undeclaredActiveCount: undeclaredActive.length,
+    idleConnectionCount: Math.max(0, others.length - tasks.length - undeclaredActive.length),
     suspectedTwinCount: Math.max(0, twinCount),
     self: self ? publicSession(self, now) : null,
     peers: tasks.map((session) => publicSession(session, now)),
+    // Named, not just counted — a peer can address them with brain_message.
+    undeclaredActive: undeclaredActive.map((session) => publicSession(session, now)),
   };
 }
 
-function formatTaskPresence(snapshot, now = Date.now()) {
+export function formatTaskPresence(snapshot, now = Date.now()) {
   const taskWord = snapshot.activeTaskCount === 1 ? 'task' : 'tasks';
   const connectionWord = snapshot.connectionCount === 1 ? 'connection' : 'connections';
+  // The undeclared-ACTIVE count is stated separately and first among the
+  // caveats: it is the only figure here that means "work you cannot see".
+  const unseen = Number(snapshot.undeclaredActiveCount || 0);
+  const idle = Number(snapshot.idleConnectionCount ?? snapshot.backgroundConnectionCount ?? 0);
+  const caveats = [];
+  if (unseen) caveats.push(`${unseen} working WITHOUT declared scope — real edits you cannot see`);
+  if (idle) caveats.push(`${idle} connected but idle`);
   const lines = [
     `KLYPIX task presence: ${snapshot.activeTaskCount} active ${taskWord} across ${snapshot.connectionCount} live ${connectionWord}`
-      + (snapshot.backgroundConnectionCount ? ` (${snapshot.backgroundConnectionCount} connected without a declared task — presence known, scope unknown)` : '') + '.',
+      + (caveats.length ? ` (${caveats.join('; ')})` : '') + '.',
   ];
+  if (unseen) {
+    lines.push(`⚠ Overlap detection covers DECLARED scope only, so ${unseen === 1 ? 'that session is' : 'those sessions are'} invisible to it.`
+      + ' Treat a clean conflict report as incomplete, and coordinate directly (brain_message) before touching shared files.');
+  }
   if (!snapshot.peers.length) {
     lines.push('No other DECLARED task is active; connections that never called brain_sync are not listed here — they may still be working (see the connection count above).');
     return lines.join('\n');
@@ -2462,6 +2492,11 @@ export function createMcpPresence({
         connections: snapshot.connectionCount,
         activeTasks: snapshot.activeTaskCount,
         backgroundConnections: snapshot.backgroundConnectionCount,
+        // 1.71.0 — the half of `backgroundConnections` that is actually
+        // WORKING. A caller that reports "no conflicts" while this is non-zero
+        // is reporting an incomplete search, not a clear one.
+        undeclaredActive: snapshot.undeclaredActiveCount,
+        idleConnections: snapshot.idleConnectionCount,
       },
       peers: snapshot.peers,
       conflicts,

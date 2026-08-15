@@ -34,6 +34,7 @@ import {
 import { brainInstallDecision, deploySourceDecision } from '../src/install-version.mjs';
 import { acquireInstallLockSync, releaseInstallLockSync } from '../src/install-lock.mjs';
 import { collectRepoState } from '../src/repo-state.mjs';
+import { runSetup, renderBrief } from '../src/setup.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PKG_ROOT = path.resolve(__dirname, '..');
@@ -48,6 +49,12 @@ const VERSION = (() => { try { return JSON.parse(fs.readFileSync(path.join(PKG_R
 const FORCE = process.argv.includes('--force');
 const CODEX_HOOKS = process.argv.includes('--codex-hooks');
 const RUNTIME_ONLY = process.argv.includes('--runtime-only');
+// Project wiring is the default because it is the step users did not know
+// existed. These opt OUT for the cases that genuinely want machine-only:
+// CI images, scripted provisioning, and anyone wiring the project by hand.
+const NO_PROJECT = process.argv.includes('--no-project');
+const VERIFY_ALL = process.argv.includes('--verify-all');
+const SETUP_JSON = process.argv.includes('--json');
 // Released-tag deploy-guard acknowledgement. Deliberately a SEPARATE axis from
 // --force: --force is destination authority (overwrite what is installed),
 // this is source authority (knowingly deploy an untagged working tree).
@@ -480,6 +487,24 @@ try {
         console.log('  Enhanced Codex auto-context + pre-edit overlap guard: re-run with `--codex-hooks`, then approve/review KLYPIX once in a Codex surface that supports hook trust.');
     }
     console.log('  Compatible brain-core updates hot-swap behind the same MCP connection. Only the one-time legacy→supervisor migration, a supervisor change, or an intentionally breaking tool/protocol change needs reconnect.');
+
+    // 9) PROJECT setup (1.71.0) — the step users never knew they had to take.
+    //    `install` wired the machine; without this it wired nothing a Cursor,
+    //    Antigravity, Codex, Cline or Copilot user could see, and the failure
+    //    was silent. A runtime-only refresh deliberately skips it: that path
+    //    exists to preserve every host/project config byte.
+    if (!RUNTIME_ONLY && !NO_PROJECT) {
+        try {
+            const report = await runSetup({ verifyAll: VERIFY_ALL });
+            if (SETUP_JSON) console.log(JSON.stringify(report, null, 2));
+            else console.log(renderBrief(report));
+        } catch (e) {
+            // The machine install already succeeded and is independently
+            // useful; a project-wiring failure must report itself, not undo it.
+            console.error(`⚠ project setup could not finish: ${e?.message || e}`);
+            console.error('  The machine install is intact — re-run inside your project, or use `npx klypix-mcp link`.');
+        }
+    }
     console.log('  Verify anytime: `npx klypix-mcp doctor`; prove two-client behavior with `npx klypix-mcp conformance`.');
 } catch (e) {
     releaseInstallLockSync(installLock);

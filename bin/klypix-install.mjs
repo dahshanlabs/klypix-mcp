@@ -246,7 +246,7 @@ const flatten = (code) => code
     .replace(/\.\.\/src\/klypix-(core|format)\.mjs/g, './klypix-$1.mjs')
     // brain-doctor + agent-rules (the server's lazy `import('../src/brain-doctor.mjs')`
     // for the brain_doctor tool) → flat sibling refs in the runtime layout.
-    .replace(/\.\.\/src\/(bench|brain-doctor|agent-presence|agent-rules|finding-routing|mcp-presence|mcp-supervisor|mcp-auto-update|presence-relay|semantic-memory|runtime-inspector|project-graph|git-capture-install|remote-client)\.mjs/g, './$1.mjs')
+    .replace(/\.\.\/src\/(bench|brain-doctor|agent-presence|agent-rules|finding-routing|mcp-presence|mcp-supervisor|mcp-auto-update|presence-relay|semantic-memory|runtime-inspector|project-graph|git-capture-install)\.mjs/g, './$1.mjs')
     .replace(/klypix-worker\.mjs/g, 'klypix-mcp-worker.mjs')
     .replace(/const PKG_VERSION = \(\(\) => \{[\s\S]*?\}\)\(\);/, `const PKG_VERSION = '${VERSION}'; // baked at install (flat layout has no package.json)`);
 
@@ -380,7 +380,7 @@ try {
     // canvas-view-app.html is the canvas_view MCP App UI — staged raw (an HTML
     // file must never get a JS-comment banner) beside the flat server, which
     // resolves it via its ./canvas-view-app.html candidate path.
-    for (const f of ['global-brain-hook.mjs', 'brain-semantic.mjs', 'semantic-memory.mjs', 'brain-note.mjs', 'brain-git-hook.mjs', 'git-capture-install.mjs', 'brain-history.mjs', 'brain-graveyard.mjs', 'klypix-format.mjs', 'klypix-core.mjs', 'brain-write-lock.mjs', 'agent-rules.mjs', 'brain-doctor.mjs', 'agent-presence.mjs', 'mcp-presence.mjs', 'repo-state.mjs', 'result-reconcile.mjs', 'finding-routing.mjs', 'presence-relay.mjs', 'mcp-supervisor.mjs', 'mcp-auto-update.mjs', 'runtime-inspector.mjs', 'project-graph.mjs', 'remote-client.mjs', 'bench.mjs', 'codex-brain-hook.mjs', 'codex-hooks.mjs', 'canvas-view-app.html']) {
+    for (const f of ['global-brain-hook.mjs', 'brain-semantic.mjs', 'semantic-memory.mjs', 'brain-note.mjs', 'brain-git-hook.mjs', 'git-capture-install.mjs', 'brain-history.mjs', 'brain-graveyard.mjs', 'klypix-format.mjs', 'klypix-core.mjs', 'brain-write-lock.mjs', 'agent-rules.mjs', 'brain-doctor.mjs', 'agent-presence.mjs', 'mcp-presence.mjs', 'repo-state.mjs', 'result-reconcile.mjs', 'finding-routing.mjs', 'presence-relay.mjs', 'mcp-supervisor.mjs', 'mcp-auto-update.mjs', 'runtime-inspector.mjs', 'project-graph.mjs', 'bench.mjs', 'codex-brain-hook.mjs', 'codex-hooks.mjs', 'canvas-view-app.html']) {
         const s = path.join(SRC, f); if (exists(s)) staged.push({ dst: f, content: fs.readFileSync(s, 'utf8') });
     }
     for (const [src, dst] of [

@@ -85,8 +85,11 @@ ok(body(evidence).includes('--require-corroborated')
   && body(evidence).includes('--git-commit "$SOURCE_COMMIT"')
   && body(evidence).includes('.release-evidence/v${VERSION}'),
   'the release gate invokes the real verifier against corroborated evidence for the source parent');
-ok(body(testChain).includes('test/remote-client.mjs'),
-  'the load-bearing suite gate pins the Remote attachment security regression suite');
+// The Remote attachment security suite was pinned here until KLYPIX Remote was
+// removed (2026-08-15). Its only subject was buildRemoteCommand, which no longer
+// exists, so the pin goes with it rather than guarding a deleted surface.
+ok(body(testChain).includes('test/semantic-security.mjs'),
+  'the load-bearing suite gate pins the semantic security suite');
 ok(body(tarball).includes('.release-evidence'),
   'release evidence is explicitly forbidden from the consumer tarball');
 

@@ -39,7 +39,11 @@ async function captureBrain(tag, commands) {
   const transcript = path.join(home, 'transcript.jsonl');
   fs.writeFileSync(transcript, commands.map((c, i) => (typeof c === 'string' ? entry('t' + i, c) : entry('t' + i, c.command, c.tool))).join('\n') + '\n');
 
-  const env = { ...process.env, HOME: home, USERPROFILE: home };
+  // These fixtures are ship commands with no 🧠 marker — exactly what the
+  // uncaptured-work nudge exists to refuse (exit 2), which would throw here.
+  // This suite is about the CARD the ship produces, so opt out; test/capture-gap.mjs
+  // owns the nudge's own behavior.
+  const env = { ...process.env, HOME: home, USERPROFILE: home, KLYPIX_BRAIN_NUDGE: 'off' };
   delete env.KLYPIX_BRAIN_NO_MAIN;   // the subprocess MUST run main() (real Stop/--capture)
   execFileSync(process.execPath, [HOOK, '--capture'], {
     cwd: proj, env, encoding: 'utf8',
@@ -85,7 +89,9 @@ ok(/published to npm/.test(codexShip), 'a publish through a lowercase host shell
   fs.writeFileSync(path.join(brainHome, '.npm-currency.json'), JSON.stringify({ pkg: 'klypix-mcp', latest: '1.15.0', checkedAt: Date.now() }));
   fs.writeFileSync(path.join(proj, 'brain.klypix'), await buildKlypixMap({ title: 'brain', areas: [{ title: 'Goal', cards: [{ text: 'seed card' }] }] }));
   fs.writeFileSync(path.join(proj, 'package.json'), JSON.stringify({ name: 'obs-fixture', version: '1.0.0' }));
-  const env = { ...process.env, HOME: home, USERPROFILE: home };
+  // Same reason as the harness above: unmarked ship fixtures would trip the
+  // uncaptured-work nudge's exit 2. See test/capture-gap.mjs.
+  const env = { ...process.env, HOME: home, USERPROFILE: home, KLYPIX_BRAIN_NUDGE: 'off' };
   delete env.KLYPIX_BRAIN_NO_MAIN;
   const readOnce = () => execFileSync(process.execPath, [HOOK], { cwd: proj, env, encoding: 'utf8', input: JSON.stringify({ session_id: 'sess-obs', transcript_path: '' }) });
   const first = readOnce();

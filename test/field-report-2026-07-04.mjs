@@ -197,7 +197,7 @@ const DAY = 86_400_000;
     const bigText = `WidgetArea: widget-pipeline-config is the central batching config for the render pipeline. ${filler} Final note: ${SENTINEL}.`;
     fs.writeFileSync(path.join(proj, 'brain.klypix'), await buildKlypixMap({ title: 'brain', areas: [{ title: 'WidgetArea', cards: [{ text: bigText }] }] }));
 
-    const env = { ...process.env, HOME: home, USERPROFILE: home };
+    const env = { ...process.env, HOME: home, USERPROFILE: home, KLYPIX_BRAIN_NUDGE: 'off' };
     delete env.KLYPIX_BRAIN_NO_MAIN;
     const runPrompt = (prompt) => execFileSync(process.execPath, [HOOK, '--prompt'], {
         cwd: proj, env, encoding: 'utf8',

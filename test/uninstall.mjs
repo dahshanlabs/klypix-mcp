@@ -70,6 +70,7 @@ const run = (args, { cwd = REPO, home, timeout = 60_000 } = {}) => {
       ...process.env,
       HOME: home,
       USERPROFILE: home,
+      KLYPIX_BRAIN_NUDGE: 'off',
       // ALWAYS explicit — never let a stray inherited value point a test at the
       // developer's real bundle.
       KLYPIX_MCP_INSTALL_DIR: path.join(home, '.claude', 'project-brain'),

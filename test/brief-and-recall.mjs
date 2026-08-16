@@ -35,7 +35,7 @@ function fixture(tag) {
     // throttle the Stop-hook npm-currency refresh so no test makes a network call
     fs.writeFileSync(path.join(home, '.claude', 'project-brain', '.npm-currency.json'),
         JSON.stringify({ pkg: 'klypix-mcp', latest: '1.17.0', checkedAt: Date.now() }));
-    const env = { ...process.env, HOME: home, USERPROFILE: home };
+    const env = { ...process.env, HOME: home, USERPROFILE: home, KLYPIX_BRAIN_NUDGE: 'off' };
     delete env.KLYPIX_BRAIN_NO_MAIN;
     const run = (args, input) => execFileSync(process.execPath, [HOOK, ...args], { cwd: proj, env, encoding: 'utf8', input: JSON.stringify(input) });
     const cleanup = () => { for (const d of [home, proj]) fs.rmSync(d, { recursive: true, force: true }); };

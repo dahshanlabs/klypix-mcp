@@ -207,7 +207,7 @@ function runInstall(home, projectCwd, args = []) {
   // commits — so acknowledge the released-tag deploy guard explicitly. The
   // guard's own refusal/ack/receipt behavior is locked by
   // test/released-tag-guard.mjs against dedicated git fixtures.
-  const env = { ...process.env, HOME: home, USERPROFILE: home, KLYPIX_MCP_ALLOW_UNTAGGED: '1' };
+  const env = { ...process.env, HOME: home, USERPROFILE: home, KLYPIX_BRAIN_NUDGE: 'off', KLYPIX_MCP_ALLOW_UNTAGGED: '1' };
   delete env.KLYPIX_BRAIN_NO_MAIN;
   return execFileSync(process.execPath, [INSTALL, ...args], { cwd: projectCwd, env, encoding: 'utf8' });
 }
@@ -333,7 +333,7 @@ function runInstall(home, projectCwd, args = []) {
   ok(!fs.existsSync(path.join(bd, '.install.lock')), 'D: the install lock is released after completion');
 
   // concurrency: two installs at once are idempotent (lock serializes; no torn state)
-  const env = { ...process.env, HOME: home, USERPROFILE: home, KLYPIX_MCP_ALLOW_UNTAGGED: '1' }; delete env.KLYPIX_BRAIN_NO_MAIN;
+  const env = { ...process.env, HOME: home, USERPROFILE: home, KLYPIX_BRAIN_NUDGE: 'off', KLYPIX_MCP_ALLOW_UNTAGGED: '1' }; delete env.KLYPIX_BRAIN_NO_MAIN;
   const { execFile } = await import('child_process');
   const run = () => new Promise(res => execFile(process.execPath, [INSTALL], { cwd: proj, env }, (e) => res(e ? 1 : 0)));
   const [a, b] = await Promise.all([run(), run()]);

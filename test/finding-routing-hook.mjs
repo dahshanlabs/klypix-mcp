@@ -46,7 +46,7 @@ async function makeProject(tag) {
   const run = (mode, { transcript = [], sessionId = 'self-' + tag, prompt } = {}) => {
     const tp = path.join(home, `t-${mode.replace(/\W/g, '')}-${sessionId}-${transcript.length}.jsonl`);
     fs.writeFileSync(tp, transcript.map((e) => JSON.stringify(e)).join('\n') + '\n');
-    const env = { ...process.env, HOME: home, USERPROFILE: home };
+    const env = { ...process.env, HOME: home, USERPROFILE: home, KLYPIX_BRAIN_NUDGE: 'off' };
     delete env.KLYPIX_BRAIN_NO_MAIN;
     return execFileSync(process.execPath, [HOOK, mode], {
       cwd: proj, env, encoding: 'utf8',

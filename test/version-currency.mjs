@@ -63,6 +63,31 @@ const manualLine = versionCurrencyFooter({ file: cacheFile, brainDir: dir, env: 
 ok(/Automatic updates are off/.test(manualLine) && /npx klypix-mcp install/.test(manualLine),
    'explicit auto-update opt-out → manual fallback remains available');
 
+// The cached figure must be DATED, and an overdue check must say the number is a
+// FLOOR — the 2026-08-16 field report's notice claimed a one-minor gap while the
+// registry was ~29 minors ahead, because nothing said how old the check was.
+ok(/checked \d+d ago/.test(line) && /FLOOR/.test(line),
+   'a long-overdue check is dated and declared a floor, not a live fact');
+writeCache({ pkg: 'klypix-mcp', latest: '1.14.0', checkedAt: Date.now() - 3 * 3_600_000 });
+const freshLine = footer();
+ok(/checked 3h ago/.test(freshLine) && !/FLOOR/.test(freshLine),
+   'a recent check is dated but not caveated');
+
+// Two channels fetch npm latest onto a machine (this cache via the Claude Code
+// Stop hook, .autoupdate-status.json via the MCP auto-updater). Whichever ran
+// most recently is the one to believe — a host that never runs the Stop hook
+// would otherwise be stuck with a months-old figure.
+const auStamp = path.join(dir, '.autoupdate-status.json');
+writeCache({ pkg: 'klypix-mcp', latest: '1.14.0', checkedAt: Date.now() - 30 * 86_400_000 });
+fs.writeFileSync(auStamp, JSON.stringify({ latestVersion: '1.20.0', checkedAt: new Date(Date.now() - 3_600_000).toISOString() }));
+ok(/v1\.20\.0/.test(footer()), 'the FRESHER auto-update stamp wins over a month-old currency cache');
+fs.writeFileSync(auStamp, JSON.stringify({ latestVersion: '1.15.0', checkedAt: new Date(Date.now() - 60 * 86_400_000).toISOString() }));
+writeCache({ pkg: 'klypix-mcp', latest: '1.14.0', checkedAt: Date.now() - 3_600_000 });
+ok(/v1\.14\.0/.test(footer()), 'a stale auto-update stamp never overrides a fresher cache');
+fs.writeFileSync(auStamp, JSON.stringify({ latestVersion: 'not-a-version', checkedAt: new Date().toISOString() }));
+ok(/v1\.14\.0/.test(footer()), 'a malformed auto-update stamp is ignored, not adopted');
+fs.rmSync(auStamp, { force: true });
+
 writeCache({ pkg: 'klypix-mcp', latest: '9.9.9', checkedAt: 1 });
 ok(versionCurrencyFooter({ file: cacheFile, brainDir: path.join(dir, 'nope') }) === '',
    'no baked server version → silent (nothing to compare)');
@@ -106,7 +131,7 @@ ok(!!after.lastError, 'failed fetch records lastError + advances checkedAt (no o
     const proj = makeVault();
     await seedBrain(proj);
 
-    const env = { ...process.env, HOME: home, USERPROFILE: home };
+    const env = { ...process.env, HOME: home, USERPROFILE: home, KLYPIX_BRAIN_NUDGE: 'off' };
     delete env.KLYPIX_BRAIN_NO_MAIN;   // the subprocess MUST run main() (real SessionStart)
     env.KLYPIX_AUTO_UPDATE = '0';      // this fixture (cached latest > baked) would otherwise fire the SessionStart self-update — off so the test stays hermetic (self-update is covered by test/autoprop.mjs)
     const before = fs.readFileSync(cachePath, 'utf8');

@@ -223,12 +223,16 @@ try {
           offeredAt: now - 900,
           acknowledgedAt: now - 500,
           consumedAt: now - 250,
+          // The STRONG claim: this peer sent a real receipt. Without this marker the
+          // record is an auto-lease or unknown, and the renderer must not say
+          // "explicitly" — the conformance fixture has to state which it means.
+          consumedVia: 'receipt',
         }],
         seen: ['finding-owner'],
       }],
       sessions: lane, selfId: 'finding-sender', now,
     });
-    checks.findingReceiptRendered = /explicitly consumed by all 1 target peer\(s\) after model-context delivery \(not human-read\)/.test(renderReceiptSummary(receipt));
+    checks.findingReceiptRendered = /explicitly consumed by all 1 target peer\(s\) via receipt \(not human-read\)/.test(renderReceiptSummary(receipt));
   }
 
   // ── Cross-PC presence: simulated two-machine scenario ─────────────────────

@@ -265,9 +265,58 @@ try {
   ok('RA14 the text admits the list may be imprecise',
     /list is approximate/.test(releaseAncestryWarnings(failing).join('\n')));
 
+  // ---- RA15 — a truncated list must show the NEWEST work ----------------
+  // Field case 2026-08-16, desktop v1.3.120. The gate refused correctly and
+  // reported 69 commits missing from master, but `git cherry` emits OLDEST
+  // first and the slice took the head of that list — so the eight shown were
+  // weeks old, while an Arrow tool and a zoom-relative stroke-width pair
+  // committed 28 minutes earlier (which a peer had already promised would ride
+  // the next build) sat at the tail and were never displayed. The human
+  // approved a narrow build on an accurate refusal whose visible evidence
+  // omitted the deciding facts. Worse, the two code paths disagreed: the
+  // approximate `git log` fallback showed the newest, so the PRECISE path was
+  // the less useful one. Truncation is a RANKING problem — show what someone is
+  // most likely to be waiting for.
+  const ord = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-ancestry-order-'));
+  globalThis.__ordRepo = ord;
+  const ogit = (...a) => execFileSync('git', a, { cwd: ord, encoding: 'utf8', stdio: 'pipe' }).trim();
+  execFileSync('git', ['init', '-q', '-b', 'master', ord], { stdio: 'pipe' });
+  ogit('config', 'user.email', 't@example.com');
+  ogit('config', 'user.name', 'Test');
+  const ocommit = (msg) => {
+    fs.writeFileSync(path.join(ord, 'f.txt'), `${msg}\n${Math.random()}`);
+    ogit('add', '-A');
+    execFileSync('git', ['commit', '-q', '-m', msg], { cwd: ord, stdio: 'pipe' });
+  };
+  ocommit('base');
+  ogit('checkout', '-q', '-b', 'rel');
+  ogit('checkout', '-q', 'master');
+  // 12 commits, oldest→newest. Only the last 8 may be shown.
+  for (let i = 1; i <= 12; i++) ocommit(`work ${String(i).padStart(2, '0')}`);
+
+  const ordered = releaseAncestry(ord, 'rel', { peerBranches: ['master'] });
+  const subjects = ordered.sources[0].missing.map((c) => c.subject).join(' | ');
+  ok('RA15 the precise path still finds every missing commit', ordered.missingCount === 12);
+  ok('RA15 the list is capped at 8', ordered.sources[0].missing.length === 8);
+  ok('RA15 the NEWEST commit is shown', /work 12/.test(subjects));
+  ok('RA15 the second-newest is shown too', /work 11/.test(subjects));
+  ok('RA15 the OLDEST commits are the ones truncated away, not the newest',
+    !/work 01/.test(subjects) && !/work 02/.test(subjects));
+  // The two code paths must not disagree about WHICH commits matter.
+  const approx = releaseAncestry(ord, 'rel', {
+    peerBranches: ['master'],
+    execGit: (args, cwd, t) => {
+      if (args[0] === 'cherry') throw Object.assign(new Error('simulated timeout'), { code: 'ETIMEDOUT' });
+      return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: t || 5000 });
+    },
+  });
+  const approxSubjects = approx.sources[0].missing.map((c) => c.subject).sort().join(' | ');
+  ok('RA15 the approximate fallback selects the SAME newest commits as the precise path',
+    approxSubjects === ordered.sources[0].missing.map((c) => c.subject).sort().join(' | '));
+
   console.log(`✓ release ancestry — ${pass}/${pass} assertions`);
 } finally {
-  for (const d of [repo, , globalThis.__mrepo, globalThis.__freshRepo, globalThis.__eqRepo]) {
+  for (const d of [repo, , globalThis.__mrepo, globalThis.__freshRepo, globalThis.__eqRepo, globalThis.__ordRepo]) {
     if (d) { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* temp */ } }
   }
   try { fs.rmSync(`${repo}-origin.git`, { recursive: true, force: true }); } catch { /* temp */ }

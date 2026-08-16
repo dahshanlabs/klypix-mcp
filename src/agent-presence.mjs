@@ -2471,7 +2471,7 @@ export function formatReceivedMessages(messages, now = Date.now(), decay = {}, s
     lines.push(`- from ${senderLabel} (${ageMin}m ago): ${neutralizeMarkers(String(message.text || '').replace(/\s+/g, ' ').trim().slice(0, 400))}`);
     const receipts = group.map((item) => messageDeliveryReceipt(item, sessionId)).filter(Boolean);
     if (receipts.length) {
-      lines.push(`  Receipt(s): ${receipts.map((receipt) => `${receipt.messageId}:${receipt.offerToken}`).join(', ')}. After incorporating ${receipts.length === 1 ? 'it' : 'them'}, call brain_message_receipt with each exact message_id and offer_token.`);
+      lines.push(`  Receipt(s): ${receipts.map((receipt) => `${receipt.messageId}:${receipt.offerToken}`).join(', ')}. After incorporating ${receipts.length === 1 ? 'it' : 'them'}, call brain_message_receipt with each exact message_id and offer_token — that is the ONLY way the sender learns you acted on ${receipts.length === 1 ? 'it' : 'them'}. If you skip it, your next independent action auto-consumes ${receipts.length === 1 ? 'this note' : 'these notes'} and the sender is told only that ${receipts.length === 1 ? 'it was' : 'they were'} auto-consumed.`);
     }
     const info = messageDecayInfo({ ...message, ts: oldestTs }, now, decay);
     if (info) lines.push(`  ${info.stampText}`);

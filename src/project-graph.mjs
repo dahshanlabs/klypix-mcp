@@ -791,10 +791,16 @@ function checkoutStaleness(root) {
   const target = (defaultRef || '').trim() || ['origin/main', 'origin/master']
     .find(ref => runGit(root, ['rev-parse', '--verify', '--quiet', ref]) != null);
   if (!target) return null;
-  const behindRaw = runGit(root, ['rev-list', '--count', `HEAD..${target}`]);
-  const behind = Number((behindRaw || '').trim());
-  if (!Number.isFinite(behind)) return null;
-  return { branch: (head || '').trim() || null, comparedTo: target, behind };
+  // Two-sided, deliberately: a checkout that is behind AND ahead has DIVERGED,
+  // and telling its agent to "pull" is advice the measurement itself contradicts.
+  // Same idiom as repo-state.mjs — one call answers both questions.
+  const counts = runGit(root, ['rev-list', '--left-right', '--count', `HEAD...${target}`]);
+  const match = (counts || '').trim().match(/^(\d+)\s+(\d+)$/);
+  if (!match) return null;
+  const ahead = Number(match[1]);
+  const behind = Number(match[2]);
+  if (!Number.isFinite(ahead) || !Number.isFinite(behind)) return null;
+  return { branch: (head || '').trim() || null, comparedTo: target, behind, ahead, diverged: ahead > 0 && behind > 0 };
 }
 
 /**
@@ -883,7 +889,13 @@ export function brainDriftMarkdown(result) {
   const lines = ['# Brain drift — cards vs the repo\'s real files'];
   const stale = result.staleCheckout;
   if (stale && stale.behind > 0) {
-    lines.push(`⚠️ **This checkout is ${stale.behind} commit(s) behind \`${stale.comparedTo}\`** (branch \`${stale.branch || '?'}\`, as of the last fetch). Files reported missing below may simply not be in THIS checkout — pull before trusting the card verdicts.`);
+    // State the measurement, never the operation: on a diverged checkout "pull"
+    // is contradicted by the very numbers printed beside it, and this tool has
+    // no way to know whether the local commits are meant to be kept.
+    const where = `(branch \`${stale.branch || '?'}\`, as of the last fetch)`;
+    lines.push(stale.diverged
+      ? `⚠️ **This checkout has DIVERGED from \`${stale.comparedTo}\`: ${stale.ahead} commit(s) ahead, ${stale.behind} behind** ${where}. Files reported missing below may simply not be in THIS checkout, and files reported present may exist only here. The verdicts are unreliable until the two lines are reconciled — which is a decision about the ${stale.ahead} local commit(s), not a fast-forward.`
+      : `⚠️ **This checkout is ${stale.behind} commit(s) behind \`${stale.comparedTo}\`** ${where}. Files reported missing below may simply not be in THIS checkout; the verdicts are unreliable until this checkout matches \`${stale.comparedTo}\`.`);
   }
   const s = result.summary;
   lines.push(`Checked ${s.cards} card(s); ${s.cardsWithCheckableRefs} referenced this repo's files (${s.refsChecked} reference(s), ${s.refsOk} still valid). **${s.driftedCards} card(s) reference files that are gone or moved.**`);

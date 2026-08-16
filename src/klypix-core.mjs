@@ -1189,7 +1189,7 @@ export async function opBrainMessage({ vault, canvas, text: msgText, to, via, fr
   const message = result.message;
   const candidates = Array.isArray(message.candidateIds) ? message.candidateIds.length : 0;
   return {
-    blocks: [text(`📨 queued in this project's coordination lane (to: ${message.to}; id: ${message.id}) — ${candidates} live target session(s) were snapshotted. Delivery is pending until a supported lifecycle/MCP action offers it into model-visible context; it replays through acknowledgement until the receiver explicitly records consumption with brain_message_receipt. This is a coordination receipt, not proof a human read it and not a brain card — use brain_note for durable project decisions.`)],
+    blocks: [text(`📨 queued in this project's coordination lane (to: ${message.to}; id: ${message.id}) — ${candidates} live target session(s) were snapshotted. Delivery is pending until a supported lifecycle/MCP action offers it into model-visible context, and it replays until the offer is acknowledged. AFTER acknowledgement it retires one of two ways: the receiver calls brain_message_receipt with the exact message id and offer token ("acted on it"), or a further independent action AUTO-CONSUMES it without any receipt. Your receipt line names which. Auto-consumption is not proof the note was acted on, and no path here is proof a human read it. Not a brain card — use brain_note for durable project decisions.`)],
     message,
   };
 }

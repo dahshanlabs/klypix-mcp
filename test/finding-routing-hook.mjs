@@ -210,7 +210,7 @@ const peerLane = (tag) => ([
   ok(message?.candidateIds?.join() === 'docowner-1',
     'H8.1: the Claude marker writer snapshots the live recipient id at send time');
   message.deliveryVersion = 3;
-  message.deliveries = [{ recipientId: 'docowner-1', state: 'consumed', acknowledgedAt: Date.now(), consumedAt: Date.now() }];
+  message.deliveries = [{ recipientId: 'docowner-1', state: 'consumed', acknowledgedAt: Date.now(), consumedAt: Date.now(), consumedVia: 'receipt' }];
   data.sessions = data.sessions.filter((s) => s.id === 'self-h8');
   P.writeLane(data);
   const start = P.run('--read', { sessionId: 'self-h8' });

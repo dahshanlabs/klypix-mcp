@@ -511,6 +511,14 @@ const receiptRecordMap = (message) => {
       state: ['pending', 'offered', 'acknowledged', 'consumed', 'failed'].includes(raw?.state)
         ? raw.state : 'offered',
       reason: raw?.reason ? String(raw.reason) : null,
+      // HOW consumption happened, not just THAT it did. Dropping this during
+      // normalization is the root cause of the receipt surfaces calling every
+      // consumption "explicit": the distinction was recorded on disk by
+      // agent-presence and then discarded one layer before the renderer, so no
+      // renderer could tell the strong claim from the weak one. Only the two
+      // values the writer actually sets are honoured; anything else is unknown.
+      consumedVia: raw?.consumedVia === 'receipt' || raw?.consumedVia === 'auto-lease'
+        ? raw.consumedVia : null,
     });
   }
   // Historical `seen` was stamped before output transport/model injection. It
@@ -551,6 +559,17 @@ export function summarizeReceipts({ messages, sessions, selfId, now = Date.now()
     const failed = stateIds('failed');
     const pending = candidateIds.filter((id) => !records.has(id) || records.get(id)?.state === 'pending');
     const unresolved = [...pending, ...offered, ...acknowledged].map((id) => String(id).slice(0, 8));
+    // WHY consumption is split: 'consumed' is reached two very different ways.
+    // 'receipt' is the strong claim — the recipient named the message id and offer
+    // token, i.e. "I acted on it". 'auto-lease' is the weak one — a later independent
+    // action merely followed the offer, which is evidence of activity, not of uptake.
+    // An ABSENT consumedVia is UNKNOWN, never auto-lease: the field is serialized only
+    // when set (agent-presence.mjs:507) and deleted on state reset (:588), so records
+    // written by an older bundled engine carry no marker and must not be miscounted.
+    const via = (id) => records.get(id)?.consumedVia || null;
+    const consumedByReceipt = consumed.filter((id) => via(id) === 'receipt');
+    const consumedByLease = consumed.filter((id) => via(id) === 'auto-lease');
+    const consumedUnknownVia = consumed.filter((id) => via(id) === null);
     return {
       id: m.id,
       to: m.to || 'all',
@@ -560,6 +579,9 @@ export function summarizeReceipts({ messages, sessions, selfId, now = Date.now()
       text: String(m.text || '').slice(0, 120),
       acknowledged: acknowledged.length,
       consumed: consumed.length,
+      consumedByReceipt: consumedByReceipt.length,
+      consumedByLease: consumedByLease.length,
+      consumedUnknownVia: consumedUnknownVia.length,
       // Compatibility alias for programmatic consumers. It now means a later
       // model-context acknowledgement milestone (including subsequently
       // consumed deliveries), never `seen` and never human-read.
@@ -571,11 +593,38 @@ export function summarizeReceipts({ messages, sessions, selfId, now = Date.now()
       offeredIds: offered.map((id) => String(id).slice(0, 8)),
       acknowledgedIds: acknowledged.map((id) => String(id).slice(0, 8)),
       consumedIds: consumed.map((id) => String(id).slice(0, 8)),
+      consumedByReceiptIds: consumedByReceipt.map((id) => String(id).slice(0, 8)),
+      consumedByLeaseIds: consumedByLease.map((id) => String(id).slice(0, 8)),
       failedIds: failed.map((id) => String(id).slice(0, 8)),
       deadLetterReason: m.deadLetter?.reason ? String(m.deadLetter.reason) : null,
     };
   });
   return { sent: receipts.length, receipts };
+}
+
+// ONE phrase, shared by every receipt surface. Two renderers drifting apart is how
+// "explicitly consumed" survived after auto-lease made it untrue on most paths, so
+// the wording lives in exactly one place and both callers below must use it.
+// `receipt.consumed === receipt.candidates` is the caller's precondition.
+export function fullConsumptionPhrase(receipt) {
+  const weak = (receipt.consumedByLease || 0) + (receipt.consumedUnknownVia || 0);
+  if (!weak) {
+    return `explicitly consumed by all ${receipt.candidates} target peer(s) via receipt (not human-read)`;
+  }
+  const parts = [];
+  if (receipt.consumedByReceipt) parts.push(`${receipt.consumedByReceipt} by explicit receipt`);
+  if (receipt.consumedByLease) parts.push(`${receipt.consumedByLease} auto-consumed after a later independent action`);
+  if (receipt.consumedUnknownVia) parts.push(`${receipt.consumedUnknownVia} consumed by an unrecorded route`);
+  return `consumed by all ${receipt.candidates} target peer(s) — ${parts.join(', ')}; auto-consumption is not proof the note was acted on, and never proof a human read it`;
+}
+
+// Shown only when some peers consumed by the weak route, so a partial line still
+// distinguishes uptake from mere activity.
+function partialConsumptionSplit(receipt) {
+  if (!receipt.consumed) return '';
+  const weak = (receipt.consumedByLease || 0) + (receipt.consumedUnknownVia || 0);
+  if (!weak) return '';
+  return ` (${receipt.consumedByReceipt || 0} by receipt, ${weak} auto-consumed)`;
 }
 
 // One honest line per receipt. `pending` is listed by id-prefix up to 4 — a name
@@ -590,14 +639,14 @@ export function renderReceipt(receipt) {
     return `- ${who}, ${age}: queued with no live local target snapshot; no local delivery is claimed. “${receipt.text}”`;
   }
   if (receipt.consumed === receipt.candidates && !receipt.failed) {
-    return `- ${who}, ${age}: explicitly consumed by all ${receipt.candidates} target peer(s) after model-context delivery (not human-read). “${receipt.text}”`;
+    return `- ${who}, ${age}: ${fullConsumptionPhrase(receipt)}. “${receipt.text}”`;
   }
   const pending = receipt.pendingIds.slice(0, 4).join(', ');
   const more = receipt.pendingIds.length > 4 ? ` +${receipt.pendingIds.length - 4} more` : '';
   const offered = receipt.offered ? ` · offered ${receipt.offered}, awaiting later-action ack` : '';
   const acknowledged = receipt.acknowledged ? ` · acknowledged ${receipt.acknowledged}, awaiting explicit consumption` : '';
   const failed = receipt.failed ? ` · failed ${receipt.failed}${failure ? ` (${failure})` : ''}` : '';
-  return `- ${who}, ${age}: consumed ${receipt.consumed} of ${receipt.candidates}${offered}${acknowledged}${failed}${pending ? ` · unresolved ${pending}${more}` : ''}. “${receipt.text}”`;
+  return `- ${who}, ${age}: consumed ${receipt.consumed} of ${receipt.candidates}${partialConsumptionSplit(receipt)}${offered}${acknowledged}${failed}${pending ? ` · unresolved ${pending}${more}` : ''}. “${receipt.text}”`;
 }
 
 // Compact, text-free receipt for surfaces that must stay cheap (SessionStart
@@ -615,14 +664,14 @@ export function renderReceiptSummary(summary) {
       : `📬 Your last note${target} (${age}): queued with no live local target snapshot; no local delivery claimed.`;
   }
   if (receipt.consumed === receipt.candidates && !receipt.failed) {
-    return `📬 Your last note${target} (${age}): explicitly consumed by all ${receipt.candidates} target peer(s) after model-context delivery (not human-read).`;
+    return `📬 Your last note${target} (${age}): ${fullConsumptionPhrase(receipt)}.`;
   }
   const pending = receipt.pendingIds.slice(0, 4).join(', ');
   const more = receipt.pendingIds.length > 4 ? ` +${receipt.pendingIds.length - 4} more` : '';
   const offered = receipt.offered ? ` · offered ${receipt.offered}, awaiting ack` : '';
   const acknowledged = receipt.acknowledged ? ` · acknowledged ${receipt.acknowledged}, awaiting explicit consumption` : '';
   const failed = receipt.failed ? ` · failed ${receipt.failed}${failure ? ` (${failure})` : ''}` : '';
-  return `📬 Your last note${target} (${age}): consumed ${receipt.consumed} of ${receipt.candidates}${offered}${acknowledged}${failed}${pending ? ` · unresolved ${pending}${more}` : ''}.`;
+  return `📬 Your last note${target} (${age}): consumed ${receipt.consumed} of ${receipt.candidates}${partialConsumptionSplit(receipt)}${offered}${acknowledged}${failed}${pending ? ` · unresolved ${pending}${more}` : ''}.`;
 }
 
 export function renderReceipts(summary, { limit = 3 } = {}) {

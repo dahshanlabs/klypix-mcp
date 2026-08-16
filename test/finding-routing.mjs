@@ -294,13 +294,49 @@ const fresh = (extra = {}) => ({ lastSeen: NOW - 30_000, startedAt: NOW - 600_00
   ok(/consumed 0 of 2 · acknowledged 1, awaiting explicit consumption · unresolved peer-bbb, peer-aaa/.test(renderReceipt(r)),
     '10.4: the rendered receipt keeps acknowledgement and consumption distinct');
 
-  const allConsumed = summarizeReceipts({ messages: [{
+  // 'consumed' is reached two ways and they are NOT the same claim. This fixture
+  // originally set no consumedVia at all and still asserted "explicitly consumed"
+  // — the test was pinning a claim its own data never supported, which is how the
+  // word survived after auto-lease made it untrue on the common path.
+  const consumedBy = (via) => summarizeReceipts({ messages: [{
     id: 'm', from: 'me-0000', to: 'all', text: 't', ts: NOW - 60_000,
     candidateIds: ['peer-aaa', 'peer-bbb'], deliveryVersion: 3,
-    deliveries: ['peer-aaa', 'peer-bbb'].map((recipientId) => ({ recipientId, state: 'consumed', acknowledgedAt: NOW - 30_000, consumedAt: NOW - 20_000 })),
+    deliveries: ['peer-aaa', 'peer-bbb'].map((recipientId) => ({
+      recipientId, state: 'consumed', acknowledgedAt: NOW - 30_000, consumedAt: NOW - 20_000,
+      ...(via ? { consumedVia: via } : {}),
+    })),
   }], sessions, selfId: 'me-0000', now: NOW });
-  ok(/explicitly consumed by all 2 target peer\(s\).*not human-read/.test(renderReceipt(allConsumed.receipts[0])),
-    '10.5: all-target wording names explicit agent consumption and disclaims human reading');
+
+  const byReceipt = consumedBy('receipt');
+  ok(/explicitly consumed by all 2 target peer\(s\) via receipt .*not human-read/.test(renderReceipt(byReceipt.receipts[0])),
+    '10.5: "explicitly consumed" is reserved for peers that sent a real receipt, and still disclaims human reading');
+
+  // THE CASE THAT MATTERS: a later independent action auto-consumes the note
+  // without any receipt. That is evidence of activity, not of uptake, and the
+  // sender must not be told otherwise.
+  const byLease = consumedBy('auto-lease');
+  const leaseText = renderReceipt(byLease.receipts[0]);
+  ok(byLease.receipts[0].consumedByLease === 2 && byLease.receipts[0].consumedByReceipt === 0,
+    '10.5b: auto-leased consumption is counted separately from receipt consumption');
+  ok(!/explicitly consumed/.test(leaseText) && /auto-consumed after a later independent action/.test(leaseText),
+    '10.5c: an auto-leased note is NEVER reported as explicitly consumed');
+  ok(/not proof the note was acted on/.test(leaseText),
+    '10.5d: and the weaker claim is stated in words, not left to inference');
+
+  // A record written by an older bundled engine carries no marker at all.
+  // Absent must read as UNKNOWN, never be silently promoted to either claim.
+  const unmarked = consumedBy(null);
+  ok(unmarked.receipts[0].consumedUnknownVia === 2 && unmarked.receipts[0].consumedByLease === 0,
+    '10.5e: a missing consumedVia counts as unknown, not as auto-lease');
+  ok(!/explicitly consumed/.test(renderReceipt(unmarked.receipts[0])),
+    '10.5f: and an unmarked legacy record is never upgraded to an explicit claim');
+
+  // Both receipt surfaces must agree; two renderers drifting apart is the
+  // original defect. renderReceiptSummary is the compact SessionStart line.
+  ok(/explicitly consumed/.test(renderReceiptSummary(byReceipt))
+    && !/explicitly consumed/.test(renderReceiptSummary(byLease))
+    && /auto-consumed after a later independent action/.test(renderReceiptSummary(byLease)),
+    '10.5g: the compact and full renderers make the SAME distinction');
 
   const alone = summarizeReceipts({ messages: [{ id: 'm', from: 'me-0000', to: 'all', text: 't', ts: NOW - 60_000, seen: [] }], sessions: [{ id: 'me-0000', ...fresh() }], selfId: 'me-0000', now: NOW });
   ok(/queued with no live local target snapshot; no local delivery is claimed/.test(renderReceipt(alone.receipts[0])),

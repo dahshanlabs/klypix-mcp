@@ -299,7 +299,22 @@ export function releaseAncestry(projectDir, ref, { execGit = defaultExecGit, pee
         .slice(0, MAX_CHERRY_SCAN);
       count = missingShas.length;
       if (count <= 0) continue;              // every change is already present
-      shown = missingShas.slice(0, MAX_MISSING_LISTED);
+      // NEWEST FIRST, and this is the whole point of the list. `git cherry` emits
+      // OLDEST first, so slicing it raw showed the eight most ANCIENT missing
+      // commits while hiding everything recent — and the fallback branch below,
+      // which uses `git log`, showed the eight NEWEST. The two paths disagreed,
+      // and the PRECISE one was the worse of the two.
+      //
+      // Field case 2026-08-16, desktop v1.3.120: the gate refused correctly and
+      // named 69 commits missing from master, but the eight it SHOWED were weeks
+      // old. The three the human was actually waiting for — an Arrow tool and a
+      // zoom-relative stroke-width pair committed 28 minutes earlier, which a peer
+      // session had already promised would "ride the next build" — sat at the end
+      // of the list and were never displayed. The human approved a narrow build on
+      // an accurate refusal whose visible evidence omitted the deciding facts.
+      // A truncated list is a RANKING problem: show what someone is most likely to
+      // be waiting for, which is always the most recent work.
+      shown = missingShas.reverse().slice(0, MAX_MISSING_LISTED);
     } else {
       // FALL BACK, never skip. rev-list is sha-based so it over-reports
       // rebases and squashes, but over-reporting is a conversation and

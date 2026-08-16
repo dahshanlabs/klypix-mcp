@@ -348,6 +348,7 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
       offeredAt: receiptNow - 900,
       acknowledgedAt: receiptNow - 500,
       consumedAt: receiptNow - 250,
+      consumedVia: 'receipt',
       offerToken: 'doctor-test-offer-token',
     }],
     seen: ['doctor-peer'],
@@ -362,7 +363,7 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
   'brain_doctor returns the host-neutral layered verdict');
   ok(/2 logical sessions · 2 live connections/.test(text),
     'the MCP connection and synthetic live peer are counted separately without hooks');
-  ok(/your last note \(just now\): explicitly consumed by all 1 target peer\(s\) after model-context delivery \(not human-read\)\./.test(text),
+  ok(/your last note \(just now\): explicitly consumed by all 1 target peer\(s\) via receipt \(not human-read\)\./.test(text),
     'brain_doctor renders a real explicit consumption receipt without claiming a human read it');
 
   const synced = await client.callTool({

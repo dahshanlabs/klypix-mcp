@@ -958,7 +958,11 @@ function peerFooter(sid) {
             const legend = marked.some(f => f.endsWith('*')) ? ' (* = observed from live edits, scope not declared)' : '';
             warn = `  · ⚠️ both edited: ${marked.join(', ')} — expect a conflict, KEEP BOTH${legend}`;
         }
-        else if (p.branch && myBranch && p.branch === myBranch) warn = '  · ⚠️ same branch — pull/rebase before you commit';
+        // State the fact, never the git operation. This runs in a latency-sensitive
+        // hook and must not spawn git, so it cannot know whether the branch is merely
+        // behind or has DIVERGED — and on a diverged branch "pull/rebase" is advice
+        // the real state contradicts. Naming the collision is what this footer is for.
+        else if (p.branch && myBranch && p.branch === myBranch) warn = '  · ⚠️ same branch — your commits will interleave; coordinate before you commit';
         // Unique over the full live list (not just shown peers) — the MSG router
         // resolves a prefix against every row, so uniqueness must match that set.
         lines.push(`- session ${shortestUniquePeerPrefix(list, p.id)} · ${bits.join(' · ')}${warn}`);
@@ -966,7 +970,7 @@ function peerFooter(sid) {
     // v1.32.0 law: a truncated list must never render as a complete one. This
     // overflow line is unconditional — never subject to any budget.
     if (peers.length > 4) lines.push(`- …and ${peers.length - 4} more live session(s) not shown — \`npx klypix-mcp doctor\` or brain_sync lists all.`);
-    lines.push('Coordinate BEFORE touching shared files: reply with `🧠 MSG [<their id-prefix or branch>]: <text>` (or call `brain_message`). KLYPIX queues it for supported lifecycle/MCP actions and replays it until the receiving model explicitly records consumption with `brain_message_receipt`. Check the brain for durable decisions/ships.');
+    lines.push('Coordinate BEFORE touching shared files: reply with `🧠 MSG [<their id-prefix or branch>]: <text>` (or call `brain_message`). KLYPIX queues it for supported lifecycle/MCP actions and replays it until the offer is acknowledged; the receiver then either records uptake with `brain_message_receipt` or a further independent action auto-consumes it without one. Check the brain for durable decisions/ships.');
     return lines.join('\n');
 }
 

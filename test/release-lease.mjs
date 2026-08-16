@@ -411,6 +411,44 @@ try {
       || ['held'].includes(plain.structured.releaseLease.status) === false
       || Boolean(plain.structured.releaseLease.holder)),
   'RL10: schemaVersion stays 1 on ordinary syncs');
+
+  // ── RL12: the HOLDER is warned BEFORE the lease lapses ─────────────────────
+  // Field failure 2026-08-16: a coordinator lost the lease mid-release-build and
+  // only noticed because the "release in preparation" line vanished from an
+  // unrelated render. The design's 'lease-lost' message cannot reach a holder in
+  // any project with peers — a non-holder's sync meets the expired lease first,
+  // prunes it ('stale-pruned', write:true) and is told nothing, after which the
+  // holder's sync takes the no-lease fast path. So the warning has to arrive
+  // while the lease still EXISTS. RL11 covers lease-lost on a solo project,
+  // which is why this gap survived.
+  const warnProject = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-lease-warn-'));
+  fs.writeFileSync(path.join(warnProject, 'brain.klypix'), fs.readFileSync(path.join(project, 'brain.klypix')));
+  const warnHolder = createMcpPresence({
+    server: {}, initialVault: warnProject, env: { KLYPIX_SESSION_ID: 'warn-holder' },
+    home, now: () => clock.value, setIntervalFn: timer, clearIntervalFn: () => {},
+  });
+  const declared = warnHolder.sync({
+    project: warnProject, phase: 'start', intent: 'cut the release',
+    releaseIntent: { version: '9.9.9', ref: 'release/9.9.9' },
+  });
+  ok(declared.structured?.releaseLease?.status === 'taken', 'RL12a: holder takes the lease');
+
+  const freshCheck = warnHolder.sync({ project: warnProject, phase: 'checkpoint', intent: 'still building' });
+  ok(freshCheck.structured?.releaseLease?.expiringSoon !== true,
+    'RL12b: a fresh lease is NOT flagged as expiring');
+
+  // Wind to inside the warning window but BEFORE expiry — the last moment the
+  // holder can still act.
+  clock.value += RELEASE_LEASE_TTL_MS - (10 * 60 * 1000);
+  const nearly = warnHolder.sync({ project: warnProject, phase: 'checkpoint', intent: 'still building' });
+  const lease = nearly.structured?.releaseLease;
+  ok(lease?.expiringSoon === true, 'RL12c: the holder IS warned while the lease still exists (the regression guard)');
+  ok(typeof lease?.expiresInMs === 'number' && lease.expiresInMs > 0,
+    'RL12d: the holder is told how long is left, not merely that it is soon');
+  ok(/expires in ~\d+ min/.test(nearly.text || ''),
+    'RL12e: the warning rides the text channel the holder actually reads');
+
+  try { fs.rmSync(warnProject, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch { /* best-effort */ }
 } finally {
   for (const target of [home, project, deadProject, unitProject, completeProject, lostProject, aheadRepo, alignedRepo]) {
     try { fs.rmSync(target, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch { /* best-effort */ }

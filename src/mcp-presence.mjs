@@ -598,6 +598,12 @@ const publicSession = (session, now) => {
 // Only real prompt/tool work stamps activityAt; heartbeats deliberately
 // preserve it, so a fresh stamp means work, not merely a live socket.
 const UNDECLARED_ACTIVE_MS = 10 * 60 * 1000;
+
+// How much of the ~2h release lease must remain before the HOLDER is warned.
+// 25 minutes is longer than a full desktop candidate build + verify, so a
+// holder who sees the warning still has time to finish or refresh rather than
+// losing the lease mid-release.
+const RELEASE_LEASE_WARN_MS = 25 * 60 * 1000;
 const isUndeclaredActive = (session, now) =>
   !isTaskSession(session)
   && Number(session?.activityAt || 0) > 0
@@ -1829,6 +1835,11 @@ export function createMcpPresence({
       : undefined;
     if (started && resolved === vault
       && (selectedBrainPath === undefined || selectedBrainPath === brainPath)) {
+      // Same reason as the sync() adoption above: a reconnect to the vault we
+      // are already on must still re-adopt the freshly validated binding, or a
+      // brain rewritten since the last bind leaves this connection guarded by a
+      // dead inode.
+      if (validatedSelection?.projectBinding) currentProjectBinding = validatedSelection.projectBinding;
       return touch({ event: 'McpReconnect', includePresence: true });
     }
     if (started) stop({
@@ -2299,6 +2310,19 @@ export function createMcpPresence({
       clientInfoPrepared: preparedClientInfo,
       branchPrepared: preparedBranch,
     };
+    // Adopt the preflight's binding on BOTH arms, not just the start() arm.
+    // A same-project re-sync takes touch(), which never reassigns — so the
+    // guard kept comparing a binding whose brain inode had already been retired
+    // by an atomic write (every managed brain write is writeFileSync+rename, so
+    // ANY write by anyone, including this session's own Stop hook, mints a new
+    // inode). The result was a permanent deadlock: brain_sync succeeded and
+    // reported the right project while every other verb was rejected, and the
+    // only refresh path was itself gated behind the failing check. This binding
+    // was already validated three times earlier in THIS call (preflightSync →
+    // consumeSyncPreflight → revalidateConsumedSyncPreflight), so adopting it is
+    // strictly more current than retaining the stale one and grants no new
+    // authority — the canonical-root and escape checks already ran on it.
+    if (projectBinding) currentProjectBinding = projectBinding;
     let report = started && requestedVault === vault && resultBrainPath === brainPath
       ? touch(details)
       : start(requestedVault, details, {
@@ -2454,6 +2478,10 @@ export function createMcpPresence({
     {
       const leaseStamp = now();
       let outcome = null;
+      // Set when the holder's own sync arrived with the lease already close to
+      // lapsing; reported after the refresh so the holder learns the habit that
+      // protects them, not merely that nothing broke this time.
+      let nearExpiryBeforeRefreshMs = null;
       if (releaseIntentChecked.provided && completing) {
         // The DECLARATION is ignored on completion, but a REAL completion must
         // still free a lease this session holds — a holder who kept attaching
@@ -2528,6 +2556,17 @@ export function createMcpPresence({
         const freed = freeReleaseLease({ brainPath, sessionId, home, now: leaseStamp });
         if (freed.status === 'released') outcome = freed;
       } else if (!completing) {
+        // Snapshot BEFORE the refresh. A holder's sync refreshes the lease, so
+        // by the time we report, expiry has already moved out and "expiring
+        // soon" is never true — yet the risk was real a millisecond earlier.
+        // The field failure was a holder who ran a 40-minute build with no
+        // sync in it and lost the lease silently; the useful moment to say so
+        // is the sync that arrives while the clock is still low.
+        const preRefresh = readReleaseLease({ brainPath, home, now: leaseStamp });
+        if (preRefresh && preRefresh.holderId === sessionId && preRefresh.expiresAt) {
+          const leftBefore = Math.max(0, preRefresh.expiresAt - leaseStamp);
+          if (leftBefore <= RELEASE_LEASE_WARN_MS) nearExpiryBeforeRefreshMs = leftBefore;
+        }
         const refreshed = refreshReleaseLease({ brainPath, sessionId, home, now: leaseStamp });
         // 'lease-lost' = THIS session held the lease but it lapsed (TTL passed
         // with no checkpoint). Surfacing it beats silent pruning: a holder who
@@ -2626,6 +2665,26 @@ export function createMcpPresence({
         releaseText = `KLYPIX release lease freed: completion released the exclusive release lease (v${outcome.lease?.version} from ${outcome.lease?.ref}).`;
       } else if (active) {
         releaseLease = { status: 'held', holder: holderBlock };
+        // The holder must never learn about expiry by noticing the footer
+        // vanished — which is exactly what happened in the field on
+        // 2026-08-16, mid-release-build. The 'lease-lost' message this design
+        // relies on is UNREACHABLE in any project that has peers: a non-holder's
+        // sync meets the expired lease first, prunes it (status 'stale-pruned',
+        // write:true, lease:null) and is told nothing, so the holder's next sync
+        // takes the no-lease fast path and never reaches the lease-lost branch.
+        // Warning while the lease still EXISTS is therefore the last moment the
+        // holder can still act on it, and it needs no cross-session state.
+      }
+      // Holder-facing expiry telemetry, attached to whichever branch produced
+      // the block. Always reporting expiresInMs is half the fix on its own: the
+      // holder can see the clock instead of inferring it from a footer.
+      if (releaseLease && holderBlock && holderBlock.sessionId === sessionId && holderBlock.expiresAt) {
+        releaseLease.expiresInMs = Math.max(0, holderBlock.expiresAt - leaseStamp);
+        if (nearExpiryBeforeRefreshMs !== null) {
+          releaseLease.expiringSoon = true;
+          releaseLease.nearExpiryBeforeRefreshMs = nearExpiryBeforeRefreshMs;
+          releaseText = `KLYPIX release lease expires in ~${Math.max(1, Math.round(nearExpiryBeforeRefreshMs / 60000))} min — refreshed by this sync. Only a brain_sync from THIS session refreshes it, so a long build with no sync in it will let the lease lapse, and a peer then prunes it without telling you.`;
+        }
       }
       // ── Would this release leave finished work behind? (1.72.0) ──────────
       // Coordination in this engine had always been about files two sessions

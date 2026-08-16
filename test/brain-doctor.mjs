@@ -317,9 +317,12 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
   ok(names.includes('brain_lens'), 'brain_lens is a registered MCP tool');
   ok(names.includes('project_map_scan'), 'project_map_scan is a registered MCP tool');
   ok(names.includes('project_map_drift'), 'project_map_drift is a registered MCP tool');
-  ok(names.length === 26, `tool manifest is 26 verbs (got ${names.length})`);
+  ok(names.length === 22, `tool manifest is 22 verbs (got ${names.length})`);
+  // KLYPIX Remote was dropped from the product; its four verbs went with it.
+  // Assert their ABSENCE so the removal cannot silently regress — a brain that
+  // still advertises them promises a relay that can only fail.
   for (const remoteTool of ['remote_status', 'remote_sessions', 'remote_actions', 'remote_command']) {
-    ok(names.includes(remoteTool), `${remoteTool} is a registered MCP tool`);
+    ok(!names.includes(remoteTool), `${remoteTool} is gone with KLYPIX Remote`);
   }
 
   // Seed one real lane receipt for THIS MCP session. The doctor must use the

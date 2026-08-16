@@ -40,7 +40,7 @@ import {
 // canonical copy lives in the pure module because that one is import-restricted
 // (crypto only), so it can never grow a dependency this file would inherit.
 import { normalizeFileKey } from './finding-routing.mjs';
-import { cmpSemver3, collectRepoState, releaseAncestry, releaseAncestryWarnings, repoStateWarnings } from './repo-state.mjs';
+import { cmpSemver3, collectRepoState, commitFiles, releaseAncestry, releaseAncestryWarnings, repoStateWarnings } from './repo-state.mjs';
 import { recordResultManifests } from './result-reconcile.mjs';
 
 export const MCP_HEARTBEAT_MS = 60_000;
@@ -273,6 +273,113 @@ export function validateReleaseIntent(value) {
  * Prefix-tolerant in both directions so a caller may echo the short shas we
  * printed or the full ones from their own `git log`.
  */
+/**
+ * JOIN the leave-behind set to the presence table.
+ *
+ * The engine modelled "which files are two sessions editing right now" and,
+ * separately, "what would this release drop", and never connected them. So a
+ * dropped commit reached the human as an anonymous sha even when its author was
+ * live in the same lane, had declared the exact files, and had already told the
+ * human the work would be in that build.
+ *
+ * Field case, desktop v1.3.120 (2026-08-16): cdcddb1 and 086bb17 touch
+ * Toolbar.tsx / StrokePanel.tsx / useCanvasInteraction.ts, all DECLARED by a
+ * live session; b493ead touches strokeScale.ts, OBSERVED on another. Both were
+ * dropped, both owners were online, and the refusal named neither. A sha with a
+ * name attached is a different conversation from a sha without one.
+ *
+ * Declared scope and observed scope both count: observed is how the engine
+ * adopts scope for work a session never got round to declaring, and the whole
+ * point here is to catch work whose owner never said the right thing.
+ *
+ * Bounded and fail-open-to-anonymous: if the git probe cannot run we return the
+ * ancestry untouched. Never invent an owner — a wrong name is worse than none.
+ */
+export function annotateAncestryOwnership(ancestry, sessions, { projectRoot, selfId, execGit } = {}) {
+  if (!ancestry || !Array.isArray(ancestry.sources) || !ancestry.sources.length) return ancestry;
+  const peers = (Array.isArray(sessions) ? sessions : []).filter((s) => s && s.id !== selfId);
+  if (!peers.length || !projectRoot) return ancestry;
+
+  const shas = ancestry.sources.flatMap((s) => (s.missing || []).map((c) => c.sha)).filter(Boolean);
+  if (!shas.length) return ancestry;
+  let touched;
+  try {
+    touched = commitFiles(projectRoot, shas, execGit ? { execGit } : {});
+  } catch {
+    return ancestry;                      // probe failed — anonymous, never wrong
+  }
+  if (!touched || !touched.size) return ancestry;
+
+  // Declared ∪ observed, normalized against the project root so an absolute
+  // path from one session matches a repo-relative one from another.
+  const scopeOf = (peer) => new Set([
+    ...(Array.isArray(peer.files) ? peer.files : []),
+    ...(Array.isArray(peer.observedFiles) ? peer.observedFiles : []),
+  ].map((f) => normalizeFileKey(f, projectRoot)).filter(Boolean));
+  const peerScopes = peers.map((p) => ({ peer: p, scope: scopeOf(p) })).filter((e) => e.scope.size);
+  if (!peerScopes.length) return ancestry;
+
+  // SHARED FILES DO NOT ESTABLISH OWNERSHIP. Some paths are touched by everyone
+  // — a pending release-notes file, a strings catalog, a barrel index. If a
+  // commit's only overlap with a session is one of those, calling that session
+  // its owner is noise, and this codebase already records that alarm fatigue is
+  // itself a release-integrity defect. Ownership therefore requires at least one
+  // file that is NOT in most peers' scope; commits whose overlap is entirely
+  // shared are still reported, just not promoted or counted as peer-owned.
+  const claimCount = new Map();
+  for (const { scope } of peerScopes) {
+    for (const key of scope) claimCount.set(key, (claimCount.get(key) || 0) + 1);
+  }
+  const sharedThreshold = Math.max(2, Math.ceil(peerScopes.length / 2));
+  const isShared = (key) => (claimCount.get(key) || 0) >= sharedThreshold;
+
+  const lookup = (sha) => {
+    const key = String(sha || '').toLowerCase();
+    for (const [full, files] of touched) if (full.startsWith(key) || key.startsWith(full)) return files;
+    return null;
+  };
+
+  let peerOwnedCount = 0;
+  const sources = ancestry.sources.map((source) => {
+    const annotated = (source.missing || []).map((commit) => {
+      const files = lookup(commit.sha);
+      if (!files || !files.length) return commit;
+      const keys = files.map((f) => normalizeFileKey(f, projectRoot)).filter(Boolean);
+      const owners = peerScopes
+        .map(({ peer, scope }) => {
+          const overlap = keys.filter((k) => scope.has(k));
+          if (!overlap.length) return null;
+          const distinctive = overlap.filter((k) => !isShared(k));
+          return {
+            sessionId: peer.id,
+            prefix: String(peer.id).slice(0, 8),
+            branch: peer.branch || null,
+            intent: peer.intent ? String(peer.intent).slice(0, 120) : null,
+            // Lead with the files that actually identify this owner.
+            files: [...distinctive, ...overlap.filter((k) => isShared(k))].slice(0, 4),
+            sharedScopeOnly: distinctive.length === 0,
+          };
+        })
+        .filter(Boolean);
+      if (!owners.length) return commit;
+      // Strong owners first; a commit with none is attributed but not promoted.
+      const strong = owners.filter((o) => !o.sharedScopeOnly);
+      if (strong.length) peerOwnedCount++;
+      return { ...commit, owners: [...strong, ...owners.filter((o) => o.sharedScopeOnly)] };
+    });
+    // Peer-owned commits sort to the TOP: they are the ones with a person
+    // attached, and the list is truncated for display, so they must not be the
+    // entries that fall off the bottom.
+    const strongOwned = (c) => Array.isArray(c.owners) && c.owners.some((o) => !o.sharedScopeOnly);
+    const ordered = [
+      ...annotated.filter(strongOwned),
+      ...annotated.filter((c) => !strongOwned(c)),
+    ];
+    return { ...source, missing: ordered };
+  });
+  return { ...ancestry, sources, peerOwnedCount };
+}
+
 export function ancestryAcknowledged(ancestry, acknowledge = []) {
   if (!ancestry) return true;
   if (ancestry.isDescendant || ancestry.status === 'ok') return true;
@@ -293,7 +400,21 @@ export function ancestryAcknowledged(ancestry, acknowledge = []) {
   // to ignore the gate.
   if (ancestry.status === 'unnameable') return false;
   if (ancestry.status === 'unknown') return ancestry.reason !== 'target-unresolved';
-  const listed = (ancestry.sources || []).flatMap((s) => s.missing || []).map((c) => String(c.sha || '').toLowerCase());
+  // THE COMPLETE SET, never the display list. `missing` is the 8-per-source the
+  // prose names; `allShas` is everything the release drops. Deriving the
+  // requirement from `missing` is what let desktop v1.3.120 clear a gate over 71
+  // dropped commits by naming 10 — and the 61 it never had to name included the
+  // two features live sessions had promised the founder would be in that build.
+  // The contract is that the lease cannot be taken without REPRODUCING the shas;
+  // reproducing a truncated sample is not that contract.
+  // `allShas` is absent on ancestry objects built by an older engine, so fall
+  // back to the display list rather than vacuously passing.
+  const required = (ancestry.sources || []).flatMap((s) => (
+    Array.isArray(s.allShas) && s.allShas.length
+      ? s.allShas
+      : (s.missing || []).map((c) => c.sha)
+  )).map((s) => String(s || '').toLowerCase()).filter(Boolean);
+  const listed = [...new Set(required)];
   if (!listed.length) return false;
   const given = (acknowledge || []).map((s) => String(s || '').toLowerCase()).filter(Boolean);
   return listed.every((sha) => given.some((g) => g.startsWith(sha) || sha.startsWith(g)));
@@ -2532,6 +2653,13 @@ export function createMcpPresence({
                 .filter(Boolean)),
             ];
             gateAncestry = releaseAncestry(path.dirname(brainPath), releaseIntentChecked.ref, { peerBranches });
+            // Attach the live owner of every dropped commit BEFORE the gate
+            // decides, so a refusal can say whose work this is rather than
+            // handing the human a list of anonymous shas.
+            gateAncestry = annotateAncestryOwnership(gateAncestry, report.sessions, {
+              projectRoot: path.dirname(brainPath),
+              selfId: sessionId,
+            });
           } catch {
             // A probe that throws is not an all-clear either.
             gateAncestry = { status: 'unknown', reason: 'git-unavailable', ref: releaseIntentChecked.ref, isDescendant: false, missingCount: 0, sources: [], missing: [] };
@@ -2588,7 +2716,19 @@ export function createMcpPresence({
       } : null;
       if (outcome?.status === 'ancestry-unacknowledged') {
         const anc = outcome.ancestry;
-        const shas = (anc.sources || []).flatMap((s) => s.missing || []).map((c) => c.sha);
+        // The COMPLETE set the gate will demand, not the subset the prose names.
+        // These two used to be the same list, which is how a release dropping 71
+        // commits was acknowledged by naming 10. The prose still shows 8 per
+        // source — a wall of 71 shas teaches people to skim — but the requirement
+        // is now honest about its own size, and the text below says both numbers.
+        const shas = [...new Set((anc.sources || []).flatMap((s) => (
+          Array.isArray(s.allShas) && s.allShas.length
+            ? s.allShas
+            : (s.missing || []).map((c) => c.sha)
+        )).map((s) => String(s || '')).filter(Boolean))];
+        const namedInProse = new Set((anc.sources || [])
+          .flatMap((s) => s.missing || []).map((c) => String(c.sha || '')));
+        const unnamed = shas.filter((s) => !namedInProse.has(s)).length;
         releaseLease = {
           status: 'refused',
           kind: 'release-would-leave-work-behind',
@@ -2614,7 +2754,13 @@ export function createMcpPresence({
           // copy it and never say a word to anyone. The shas are listed above;
           // reproducing them is the work, and the work is the point.
           shas.length
-            ? `To proceed anyway, re-send releaseIntent with an "acknowledge" array naming each of the ${shas.length} sha(s) listed above. Only do that after the user has been told and has decided.`
+            ? [
+              `To proceed anyway, re-send releaseIntent with an "acknowledge" array naming each of the ${shas.length} sha(s) in acknowledgeRequired.`,
+              unnamed
+                ? `NOTE: only ${shas.length - unnamed} of those ${shas.length} are spelled out above — ${unnamed} more are in acknowledgeRequired and are NOT shown in this text. Read them before you decide; the prose is a sample, the requirement is the whole set.`
+                : '',
+              'Only do that after the user has been told and has decided.',
+            ].filter(Boolean).join(' ')
             : 'This release cannot be acknowledged automatically — the missing work could not be listed. Resolve it with the user before continuing.',
         ].join('\n');
       } else if (outcome?.status === 'conflict') {

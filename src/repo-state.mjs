@@ -177,6 +177,40 @@ const UNIT_SEP = '';
  * @returns {null|{trunk, ref, isDescendant, missingCount, missing:Array<{sha,subject}>}}
  *   null when the question cannot be answered (no git, no trunk, unknown ref).
  */
+/**
+ * Which files each commit touched — one bounded batch call.
+ *
+ * This exists to JOIN the leave-behind set to the presence table. The engine
+ * has always modelled "which files are two sessions editing right now" and,
+ * separately, "what would this release drop", and never connected them. So a
+ * dropped commit arrived as an anonymous sha even when the session that wrote
+ * it was live in the same lane, had declared the exact files, and had told the
+ * human its work would be in the build. Field case: desktop v1.3.120.
+ *
+ * Merge commits legitimately yield no names under `--name-only`; feature work
+ * is what this join is for, so that is acceptable rather than worked around.
+ */
+export function commitFiles(projectDir, shas, { execGit = defaultExecGit, timeoutMs = 4000, max = 40 } = {}) {
+  const git = makeGit(execGit);
+  const dir = String(projectDir || '');
+  const list = [...new Set((shas || []).map((s) => String(s || '').trim()).filter(Boolean))].slice(0, max);
+  const out = new Map();
+  if (!dir || !list.length) return out;
+  // An explicit  sentinel before each sha, so blocks parse unambiguously.
+  // File paths may contain almost anything; a control char cannot appear in one.
+  const SENTINEL = '';
+  const raw = git(dir, ['show', '--name-only', `--format=${SENTINEL}%H`, ...list], timeoutMs);
+  if (raw === null) return out;                       // probe failed: no owners, never a wrong owner
+  for (const block of String(raw).split(SENTINEL)) {
+    const lines = block.split('\n').map((l) => l.trim()).filter(Boolean);
+    if (!lines.length) continue;
+    const sha = lines[0];
+    if (!/^[0-9a-f]{7,40}$/i.test(sha)) continue;
+    out.set(sha.toLowerCase(), lines.slice(1));
+  }
+  return out;
+}
+
 export function releaseAncestry(projectDir, ref, { execGit = defaultExecGit, peerBranches = [] } = {}) {
   const git = makeGit(execGit);
   const dir = String(projectDir || '');
@@ -290,6 +324,9 @@ export function releaseAncestry(projectDir, ref, { execGit = defaultExecGit, pee
     const cherry = git(dir, ['cherry', target, cand.ref], CHERRY_TIMEOUT_MS);
     let count;
     let shown;
+    // Every sha this source drops, not just the ones the prose will name. The
+    // acknowledgement handshake reads this; the prose reads `shown`.
+    let allMissingShas = [];
     let approximate = false;
     if (cherry !== null) {
       const missingShas = cherry.split('\n')
@@ -314,7 +351,8 @@ export function releaseAncestry(projectDir, ref, { execGit = defaultExecGit, pee
       // an accurate refusal whose visible evidence omitted the deciding facts.
       // A truncated list is a RANKING problem: show what someone is most likely to
       // be waiting for, which is always the most recent work.
-      shown = missingShas.reverse().slice(0, MAX_MISSING_LISTED);
+      allMissingShas = missingShas.reverse();          // newest first
+      shown = allMissingShas.slice(0, MAX_MISSING_LISTED);
     } else {
       // FALL BACK, never skip. rev-list is sha-based so it over-reports
       // rebases and squashes, but over-reporting is a conversation and
@@ -324,8 +362,12 @@ export function releaseAncestry(projectDir, ref, { execGit = defaultExecGit, pee
       count = Number(countRaw);
       if (!Number.isFinite(count) || count <= 0) continue;
       approximate = true;
-      const fallbackLog = git(dir, ['log', `--max-count=${MAX_MISSING_LISTED}`, '--format=%H', `${target}..${cand.ref}`]);
-      shown = (fallbackLog || '').split('\n').map((s) => s.trim()).filter(Boolean);
+      // Fetch the full bounded set, not just what will be shown: the gate needs
+      // every sha even on the approximate path, and `git log` is already
+      // newest-first so both branches now agree on ordering AND on completeness.
+      const fallbackLog = git(dir, ['log', `--max-count=${MAX_CHERRY_SCAN}`, '--format=%H', `${target}..${cand.ref}`]);
+      allMissingShas = (fallbackLog || '').split('\n').map((s) => s.trim()).filter(Boolean);
+      shown = allMissingShas.slice(0, MAX_MISSING_LISTED);
     }
     if (!shown.length) continue;
     // One bounded call for the subjects of just what will be shown.
@@ -346,7 +388,31 @@ export function releaseAncestry(projectDir, ref, { execGit = defaultExecGit, pee
     // source, so the list may include work that is already present under a
     // different sha. Carried on the source so the text can say so rather than
     // asserting a precision it does not have.
-    sources.push({ ...cand, missingCount: count, missing, ...(approximate ? { approximate: true } : {}) });
+    // DISPLAY IS BOUNDED; THE GATE MUST NOT BE. `missing` is the 8 commits the
+    // prose will name. `allShas` is every sha this source drops, and it is what
+    // the acknowledgement handshake has to demand.
+    //
+    // Field case 2026-08-16, desktop v1.3.120: ancestryAcknowledged() derived its
+    // requirement from `missing` — the DISPLAY list — so a release dropping 71
+    // commits was cleared by naming 10. The design's whole contract is that a
+    // lease "cannot be taken without REPRODUCING the shas it is choosing to
+    // leave behind", on the reasoning that a model forced to reproduce them has
+    // in practice had to relay them. Deriving the requirement from a truncated
+    // list quietly reduced that contract to whatever happened to fit on screen.
+    // A truncated requirement is a truncated guarantee.
+    const allShas = (allMissingShas.length ? allMissingShas : parsed.map((c) => c.sha))
+      .map((s) => String(s || '').toLowerCase())
+      .filter(Boolean);
+    sources.push({
+      ...cand,
+      missingCount: count,
+      missing,
+      allShas,
+      // True when the prose cannot name everything this source drops, so the
+      // caller can say "8 of 71 shown" instead of implying the list is complete.
+      listTruncated: allShas.length > missing.length,
+      ...(approximate ? { approximate: true } : {}),
+    });
   }
 
   if (!sources.length) {
@@ -402,11 +468,26 @@ export function releaseAncestryWarnings(ancestry) {
   const lines = [
     `RELEASE WOULD LEAVE WORK BEHIND — ${missingCount} finished commit(s) already exist that this release does not include.`,
   ];
+  // The join to the presence table, stated first because it is the fact most
+  // likely to change the decision: some of this work belongs to somebody who is
+  // online now and may have already promised it would ship.
+  if (ancestry.peerOwnedCount) {
+    lines.push(`  ${ancestry.peerOwnedCount} of them touch files a LIVE session has declared or is editing — that session may have already told the user this work would be in the build. Name them to the user, and consider asking those sessions before you acknowledge.`);
+  }
   for (const s of sources) {
     lines.push(s.kind === 'trunk'
       ? `  ${s.missingCount} commit(s) on ${s.ref} (the main line) are not in ${ref}:`
       : `  ${s.missingCount} commit(s) on ${s.ref} — a branch someone is working on right now — are not in ${ref}:`);
-    for (const c of s.missing) lines.push(`    · ${c.sha} ${c.subject}`);
+    for (const c of s.missing) {
+      // A sha with a live owner attached is a different conversation from an
+      // anonymous one: it names a person who is online RIGHT NOW and who very
+      // likely believes this work is in the build. Say so on the same line.
+      const owners = (Array.isArray(c.owners) ? c.owners : []).filter((o) => !o.sharedScopeOnly);
+      const who = owners.length
+        ? `  ← OWNED BY LIVE SESSION ${owners.map((o) => o.prefix).join(', ')} (${owners[0].files.slice(0, 2).join(', ')})`
+        : '';
+      lines.push(`    · ${c.sha} ${c.subject}${who}`);
+    }
     if (s.missingCount > s.missing.length) lines.push(`    · …and ${s.missingCount - s.missing.length} more not listed`);
     if (s.approximate) {
       lines.push('    (this list is approximate — the equivalence check could not run, so some of');

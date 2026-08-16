@@ -38,9 +38,16 @@ const mockClassify = (t) => /\b(uploaded|published|deployed|installed|rolled out
 // ── Hermetic home/project — set env + cwd BEFORE importing the hook module
 // (CWD/BRAIN/SESSIONS_FILE are captured at import time). KLYPIX_BRAIN_NO_MAIN
 // is the hook's documented test seam: pure exports, main() skipped.
-const home = path.join(os.tmpdir(), 'klypix-decay-hook-home');
-const proj = path.join(os.tmpdir(), 'klypix-decay-hook-proj');
-for (const d of [home, proj]) fs.rmSync(d, { recursive: true, force: true });
+// UNIQUE PER RUN, deliberately. These were fixed paths cleared with an
+// unguarded rmSync at import time, which made the suite fail in exactly the
+// conditions this product is built for: two runs racing collide on the same
+// directory, and — the case that actually bit — a run killed mid-flight leaves
+// the stub brain open in some process, so every LATER run dies at import with
+// EPERM before a single assertion executes. A test that cannot be re-run after
+// an interrupted run is not a gate. mkdtemp costs nothing and removes the whole
+// class; teardown stays best-effort, because a leftover unique dir is harmless.
+const home = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-decay-hook-home-'));
+const proj = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-decay-hook-proj-'));
 fs.mkdirSync(path.join(home, '.claude', 'project-brain', 'sessions'), { recursive: true });
 fs.mkdirSync(proj, { recursive: true });
 fs.writeFileSync(path.join(proj, 'brain.klypix'), 'stub');   // must EXIST before import (lane key uses realpath)

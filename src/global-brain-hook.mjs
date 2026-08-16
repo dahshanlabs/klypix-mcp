@@ -10,8 +10,12 @@
 //
 // Bulletproof by contract: it runs on EVERY session/turn in EVERY project, so
 // it must be an INSTANT no-op when there's no ./brain.klypix, must NEVER throw,
-// and must ALWAYS exit 0. The format/IO work is lazy-imported only when a brain
-// is actually present, keeping non-brain projects to a bare existsSync.
+// and must ALWAYS exit 0 — with exactly ONE deliberate exception: the
+// uncaptured-work nudge (captureGapDecision) exits 2 on the Stop hook to refuse
+// a stop that would have thrown away a session's reasoning. No FAILURE ever
+// exits non-zero; only that one guarded, once-per-session decision does.
+// The format/IO work is lazy-imported only when a brain is actually present,
+// keeping non-brain projects to a bare existsSync.
 //
 // This is the source-of-truth copy (lives in the KLYPIX repo, version
 // controlled); it is copied to ~/.claude/project-brain/ alongside
@@ -261,10 +265,24 @@ function transcriptSizeBytes(file) {
 //   LEDGER  (per-project): every capture DECISION — added / skipped-seen /
 //           skipped-example / resolve / update — so you can see exactly what
 //           the harvester did (and didn't) ingest, and why.
-//   HEALTH  (global): one line per hook run — mode, ok/err, brain + brief
+//   HEALTH  (per-project): one line per hook run — mode, ok/err, brain + brief
 //           bytes — so a dead/stale/unsynced live copy stops being invisible.
 const LEDGER = path.resolve(CWD, '.claude', 'brain-capture-log.jsonl');
-const HEALTH = path.join(os.homedir(), '.claude', 'project-brain', '.hook-health.jsonl');
+// HEALTH was ONE global file interleaving every project on the machine. Two ways
+// that misled (2026-08-16 field report, both reproduced): the 500-line cap is
+// GLOBAL, so a busy neighbour evicts a quiet project's whole history long before
+// it has 500 lines of its own; and `tail`-ing it from inside a project — which
+// the self-check footer's own pointer invites — answers a DIFFERENT project's
+// question (a KLYPIX line was read as AgentLit's, right down to a brainBytes that
+// matched neither). Now one file per project directory, keyed by basename + a
+// short hash of the absolute path so two checkouts both named `docs` stay apart.
+// The legacy global file is still READ as a fallback (project-filtered) so an
+// upgraded install isn't blind on its first session, and is never written again.
+const HEALTH_LEGACY = path.join(os.homedir(), '.claude', 'project-brain', '.hook-health.jsonl');
+const HEALTH = path.join(
+    os.homedir(), '.claude', 'project-brain', 'health',
+    `${(String(path.basename(CWD) || 'project').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'project')}-${sha(CWD.toLowerCase()).slice(0, 8)}.jsonl`,
+);
 // npm-currency cache — the Stop hook refreshes this at most once/day (best-effort,
 // failure-silent); the SessionStart footer reads ONLY this file (zero network) to
 // surface a stale install. {pkg, latest, checkedAt, lastError?}.
@@ -272,6 +290,11 @@ const NPM_CURRENCY = path.join(os.homedir(), '.claude', 'project-brain', '.npm-c
 const NPM_CURRENCY_TTL = 24 * 60 * 60 * 1000;   // ≤ once/day refresh throttle
 const LOCK = path.resolve(CWD, '.claude', 'brain-capture.lock');   // serialize concurrent captures
 const DRY = process.argv.includes('--dry-run');   // inspect a capture without writing
+// The hook exits 0 by contract. The ONE deliberate exception is the
+// uncaptured-work nudge (see captureGapDecision below), which uses the Stop
+// hook's documented exit-2 path to refuse a stop and hand the reason back to the
+// model. Nothing else ever sets this — a thrown error still exits 0.
+let EXIT_CODE = 0;
 const nowIso = () => { try { return new Date().toISOString(); } catch { return ''; } };
 const brainBytes = () => { try { return fs.statSync(BRAIN).size; } catch { return 0; } };
 function appendJsonl(file, obj, maxLines = 0) {
@@ -1787,16 +1810,23 @@ function commitToCard(c) {
         ...(closes ? { closes } : {}),
     };
 }
+// `total` is the RAW new-commit count and `entries` the raw commits themselves,
+// both independent of how many became cards — the counts differ exactly when
+// commits shipped without rationale (a bare `chore:`, a subject-only commit),
+// which is the signal the uncaptured-work nudge needs, and the entries are what
+// its DRAFT is built from (subjects the session already wrote beat anything the
+// hook could invent).
+const NO_COMMITS = (newLastCommit) => ({ cards: [], total: 0, entries: [], newLastCommit });
 async function gatherCommitCards(prevCommit) {
     let head = '';
-    try { head = git('rev-parse HEAD'); } catch { return { cards: [], newLastCommit: prevCommit }; }
-    if (!head) return { cards: [], newLastCommit: prevCommit };
-    if (!prevCommit) return { cards: [], newLastCommit: head };                 // BASELINE: record HEAD, capture nothing
-    if (head === prevCommit) return { cards: [], newLastCommit: head };         // no new commits
+    try { head = git('rev-parse HEAD'); } catch { return NO_COMMITS(prevCommit); }
+    if (!head) return NO_COMMITS(prevCommit);
+    if (!prevCommit) return NO_COMMITS(head);                                  // BASELINE: record HEAD, capture nothing
+    if (head === prevCommit) return NO_COMMITS(head);                          // no new commits
     try { execSync(`git merge-base --is-ancestor ${prevCommit} HEAD`, { cwd: CWD, stdio: 'ignore', timeout: 2000 }); }
-    catch { return { cards: [], newLastCommit: head }; }                        // history rewritten → re-baseline, don't dump
+    catch { return NO_COMMITS(head); }                                         // history rewritten → re-baseline, don't dump
     let raw = '';
-    try { raw = git(`log ${prevCommit}..HEAD --no-merges --format=%x1e%H%x1f%s%x1f%b`); } catch { return { cards: [], newLastCommit: head }; }
+    try { raw = git(`log ${prevCommit}..HEAD --no-merges --format=%x1e%H%x1f%s%x1f%b`); } catch { return NO_COMMITS(head); }
     const entries = parseCommitLog(raw);
     // Revert retraction (same batch): a "feat: X" shipped-and-reverted before
     // this hook ran must not close the open card X claimed to fulfil. Reverts
@@ -1827,8 +1857,44 @@ async function gatherCommitCards(prevCommit) {
             try { appendJsonl(HEALTH, { ts: nowIso(), project: path.basename(CWD), mode: 'commit-closes', ok: true, err: `closes stripped (branch ${branch || '?'} is not default)` }, 500); } catch { /* best-effort */ }
         }
     }
-    return { cards, newLastCommit: head };
+    return { cards, total: entries.length, entries: entries.slice(0, 15), newLastCommit: head };
 }
+
+// ── Uncaptured-work nudge — silence must not be enough to end a shipping session ──
+// Capture is OPT-IN: something has to CHOOSE to emit a 🧠 marker or call
+// brain_note. That fails hardest exactly where it matters most — a long, loaded
+// session is both the least likely to remember and the most likely to have
+// produced something worth keeping. The 2026-08-16 field report is the canonical
+// instance: a multi-session workstream took a file format to a REGISTERED IANA
+// media type (spec written, 8 schema-drift bugs fixed, PR merged, registration
+// landed) and the brain recorded NONE of it — the agent had been writing to its
+// own private per-project memory dir the whole time, which no peer can read.
+// Nothing noticed that a session had merged a PR and completed an external
+// registration while contributing zero cards; a human caught it by intuition.
+//
+// Closed with the escalation this product already relies on elsewhere: a warning
+// a model may relay or may not is worth little, so the Stop hook REFUSES the stop
+// (exit 2 — the documented "prevents Claude from stopping, continues the
+// conversation" path) and hands back what it observed. The session can still end
+// in one line ("nothing durable — the commit body covers it"); it can no longer
+// end by saying NOTHING.
+//
+// Deliberately narrow, because a nudge that cries wolf gets ignored and then
+// switched off:
+//   • fires only when NOTHING recorded rationale — no 🧠 marker, no ✓/~, and no
+//     rationale-bearing commit card either. A good commit body IS capture.
+//   • needs a real artifact: a ship event (PR merge / release / publish / tag),
+//     a push, ≥2 new commits, or ≥6 files edited this session.
+//   • silent if brain.klypix itself changed inside the session window — brain_note,
+//     an MCP verb, or a peer already fed it. A busy multi-session project therefore
+//     nudges rarely, which is the right direction: false silence beats false nagging.
+//   • at most ONCE per session (stop_hook_active, plus a durable session list for
+//     hosts that don't set it), and off entirely with KLYPIX_BRAIN_NUDGE=off.
+// The decision, the draft and the per-session bookkeeping live in
+// src/capture-gap.mjs so the Stop hook and brain_sync(complete) answer the same
+// question the same way. Imported LAZILY at the call site (typeof-guarded), so a
+// stale flat deployment missing the file degrades to no nudge rather than
+// crashing the capture — the same contract every other optional module here has.
 
 // ── Live cross-session ledger (in-flight ship/version/milestone, 2026-06-28) ─────
 // The brain is ASYNC: a session's decisions/ships land in brain.klypix only at Stop
@@ -2608,6 +2674,21 @@ async function capture(lib) {
                 ledger.push({ action: 'skipped-example', area, preview });
                 continue;
             }
+            // Fourth shape, same principle: a DRAFT (from the uncaptured-work
+            // nudge) pasted back with its "WHY THIS MATTERS:" slot unfilled. The
+            // draft deliberately pre-fills every mechanical fact and leaves one
+            // blank, so an unfilled one carries the event and none of the
+            // reasoning — and would read to every future session as though the
+            // reasoning HAD been recorded. Banking that is worse than banking
+            // nothing, so refuse it and say exactly why. The sentinel mirrors
+            // WHY_SLOT in capture-gap.mjs (inlined: this is the hot marker loop,
+            // which must not depend on an optional module being deployed).
+            if (/WHY THIS MATTERS:\s*<\s*one sentence/i.test(body)) {
+                ledger.push({ action: 'skipped-unfilled-draft', area, preview });
+                process.stderr.write('[brain] ⚠️ drafted card NOT captured — its "WHY THIS MATTERS:" slot is still the placeholder. '
+                    + 'Replace it with the one sentence only you know, then re-emit; or drop the card if there is nothing durable.\n');
+                continue;
+            }
             // Dedup is for ADDITIVE markers only (decision / ? / !): re-capturing
             // one would stack a duplicate card. Type is in the key so a self-heal
             // ~ / ✓ on the SAME text isn't confused with the original decision.
@@ -2741,7 +2822,7 @@ async function capture(lib) {
     // Commit-body auto-capture: rationale-bearing feat/fix/perf commits since
     // the last run (independent of markers), pushed into the SAME capture batch.
     const prevCommit = readLastCommit();
-    const { cards: commitCards, newLastCommit } = await gatherCommitCards(prevCommit);
+    const { cards: commitCards, total: commitTotal, entries: commitEntries, newLastCommit } = await gatherCommitCards(prevCommit);
     for (const cc of commitCards) {
         // Auto-skill from the flow: a rule-stating commit ("fix: imports must stay
         // at top — TDZ") is a reusable gotcha, not a one-time event. Re-glyph it as a
@@ -2775,6 +2856,49 @@ async function capture(lib) {
         // routed to whoever declared that file. Nothing is sent. `recentPaths`
         // is this turn's real touch-set — the other half of "own scope".
         await draftFindingsFromCards(cards, verified, sid, recentPaths);
+    }
+    // Uncaptured-work nudge. Runs BEFORE the nothing-to-capture early return,
+    // because "the batch is empty" is precisely the case it exists for. It only
+    // writes stderr + sets the exit code, so the rest of capture() proceeds
+    // untouched. Lazy, typeof-guarded import: a stale flat deployment without
+    // capture-gap.mjs simply doesn't nudge.
+    const AUTHORED_ACTIONS = new Set(['add-decision', 'add-question', 'add-milestone', 'add-skill', 'resolve', 'update', 'skipped-seen']);
+    const authoredCount = ledger.filter(d => AUTHORED_ACTIONS.has(d.action)).length;
+    if (!DRY) {
+        try {
+            const gapLib = await import(new URL('./capture-gap.mjs', import.meta.url).href);
+            if (typeof gapLib.captureGapDecision === 'function') {
+                const sid = String(input.session_id || '');
+                const state = gapLib.readCaptureGapState();
+                const gap = gapLib.captureGapDecision({
+                    authored: authoredCount,
+                    commitTotal,
+                    commitCards: commitCards.length,
+                    shipped: shipSummaries,
+                    pushed: shellCmds.some(({ id, cmd }) => !errorIds.has(id) && /\bgit\s+push\b/i.test(cmd)),
+                    filesTouched: recentPaths.length,
+                    // Per-SESSION, not per-file: a peer writing the shared brain
+                    // must never silence the session that shipped and said nothing.
+                    sessionCaptured: Boolean(sid && state.captured[sid]),
+                    stopHookActive: input.stop_hook_active === true,
+                    alreadyNudged: Boolean(sid && state.nudged.includes(sid)),
+                });
+                if (gap) {
+                    const draft = typeof gapLib.draftCaptureMarker === 'function'
+                        ? gapLib.draftCaptureMarker({ shipped: shipSummaries, commits: commitEntries, filesTouched: recentPaths })
+                        : null;
+                    gapLib.recordCaptureGapNudge(sid);
+                    // fs.writeSync, not process.stderr.write — this is followed by
+                    // an immediate exit, and a piped stderr write can be async.
+                    try { fs.writeSync(2, gapLib.captureGapReason({ ...gap, draft, mode: 'refuse' })); } catch { /* */ }
+                    EXIT_CODE = 2;
+                    appendJsonl(HEALTH, {
+                        ts: nowIso(), project: path.basename(CWD), mode: 'capture-gap', ok: true,
+                        evidence: gap.evidence.join(' · '), drafted: Boolean(draft), area: draft?.area || null,
+                    }, 500);
+                }
+            }
+        } catch { /* the nudge is never allowed to break a capture */ }
     }
     // A queued batch from a prior lock-refused capture counts as work to do —
     // the authoritative drain happens INSIDE the brain lock (doCapture), so two
@@ -2978,6 +3102,16 @@ async function capture(lib) {
     }
     appendJsonl(LEDGER, { ts: nowIso(), mode: 'capture', stats, decisions: ledger }, 1000);
     appendJsonl(HEALTH, { ts: nowIso(), project: path.basename(CWD), mode: 'capture', ok: true, brainBytes: brainBytes(), added: stats.added, skipped: ledger.filter(d => d.action.startsWith('skipped')).length }, 500);
+    // Per-session capture receipt — the silence rule for a LATER turn of this same
+    // session. Only AUTHORED capture counts: a session whose only cards were
+    // machine-harvested ships/commits has still recorded no reasoning, and must
+    // stay nudgeable. brain_note (MCP) writes the same receipt for the same id.
+    if (authoredCount > 0 && stats.added + (stats.resolved || 0) + (stats.updated || 0) > 0) {
+        try {
+            const gapLib = await import(new URL('./capture-gap.mjs', import.meta.url).href);
+            gapLib.recordSessionCapture?.(String(input.session_id || ''));
+        } catch { /* receipt is best-effort */ }
+    }
 }
 
 // Keep a compact brain-brief block inside AGENTS.md so agents that read
@@ -3381,11 +3515,14 @@ function selfCheckFooter() {
     try {
         const probs = [];
         // (1) most-recent FAILED run per mode for THIS project, from the HEALTH log.
-        if (fs.existsSync(HEALTH)) {
+        // The per-project log needs no filter; the legacy global one (read only
+        // until this project has written its own file) still does.
+        {
             const proj = path.basename(CWD);
             const mine = [];
-            for (const ln of fs.readFileSync(HEALTH, 'utf8').split('\n').slice(-400)) {
-                if (!ln) continue; try { const o = JSON.parse(ln); if (o.project === proj) mine.push(o); } catch { /* skip */ }
+            const src = fs.existsSync(HEALTH) ? HEALTH : (fs.existsSync(HEALTH_LEGACY) ? HEALTH_LEGACY : null);
+            for (const ln of (src ? fs.readFileSync(src, 'utf8').split('\n').slice(-400) : [])) {
+                if (!ln) continue; try { const o = JSON.parse(ln); if (src === HEALTH || o.project === proj) mine.push(o); } catch { /* skip */ }
             }
             const latest = (mode) => { for (let i = mine.length - 1; i >= 0; i--) if (mine[i].mode === mode) return mine[i]; return null; };
             // Surface a mode's failure only if its latest run is ok:false AND RECENT.
@@ -3420,7 +3557,7 @@ function selfCheckFooter() {
         return '\n\n---\n## ⚠️ Brain self-check — the brain reported a problem with ITSELF\n'
             + 'The hook exits 0 by contract, so this is otherwise invisible (you\'d only notice by missing cards):\n'
             + probs.map(p => `- ${p}`).join('\n')
-            + `\n_Log: \`~/.claude/project-brain/.hook-health.jsonl\`. Re-deploy with \`node scripts/deploy-brain.mjs\`._\n`;
+            + `\n_Log (THIS project only): \`${HEALTH.replace(os.homedir(), '~')}\`. Re-deploy with \`node scripts/deploy-brain.mjs\`._\n`;
     } catch { return ''; }
 }
 
@@ -3492,7 +3629,22 @@ function bakedBrainVersion(brainDir = path.dirname(NPM_CURRENCY)) {
 // compare against — no nag, no noise.
 function versionCurrencyFooter({ file = NPM_CURRENCY, brainDir = path.dirname(NPM_CURRENCY), env = process.env } = {}) {
     try {
-        let cache; try { cache = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return ''; }
+        // TWO independent channels already fetch npm `latest` onto this machine and
+        // neither knew about the other: this cache (refreshed by the Claude Code Stop
+        // hook) and the MCP auto-updater's .autoupdate-status.json. On a machine driven
+        // mostly through another host the Stop hook rarely runs, so THIS cache can sit
+        // months behind while the updater's is current — the field report's "latest"
+        // was ~29 minor versions stale. Take the FRESHER of the two.
+        let cache; try { cache = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { cache = null; }
+        try {
+            const au = JSON.parse(fs.readFileSync(path.join(brainDir, '.autoupdate-status.json'), 'utf8'));
+            const auAt = Date.parse(au?.checkedAt);
+            if (/^\d+\.\d+\.\d+/.test(String(au?.latestVersion || '')) && Number.isFinite(auAt)
+                && (!cache || !Number.isFinite(cache.checkedAt) || auAt > cache.checkedAt)) {
+                cache = { pkg: 'klypix-mcp', latest: String(au.latestVersion), checkedAt: auAt };
+            }
+        } catch { /* no auto-update stamp → the Stop-hook cache stands alone */ }
+        if (!cache) return '';
         const latest = cache && cache.latest;
         // Require a well-formed semver before comparing — rejects missing, the
         // "(offline)" sentinel, and any hand-corrupted cache value (e.g. `123`,
@@ -3500,11 +3652,27 @@ function versionCurrencyFooter({ file = NPM_CURRENCY, brainDir = path.dirname(NP
         if (!latest || !/^\d+\.\d+\.\d+/.test(String(latest))) return '';
         const baked = bakedBrainVersion(brainDir);
         if (!baked) return '';                                           // nothing to compare → silent
-        if (cmpSemver(latest, baked) <= 0) return '';                    // current or ahead → silent
+        if (cmpSemver(latest, baked) <= 0) return '';                    // current or ahead => silent
+        // DATE the cached figure. This line reads as a live registry fact, and it
+        // isn't — it's whatever the Stop hook last fetched. A field report (2026-08-16)
+        // hit the failure mode: the notice claimed latest was one minor ahead while
+        // the registry was ~29 ahead, because the refresh had not run in a long time
+        // and nothing in the wording said so. Age is always shown; a cache older than
+        // the refresh TTL also says the refresh itself has stopped running, which is
+        // the real defect to chase (the number being wrong is only its symptom).
+        const ageMs = Number.isFinite(cache.checkedAt) ? Math.max(0, Date.now() - cache.checkedAt) : null;
+        const ageLabel = ageMs === null ? 'age unknown'
+            : ageMs < 90 * 60_000 ? 'checked just now'
+                : ageMs < 36 * 3_600_000 ? `checked ${Math.round(ageMs / 3_600_000)}h ago`
+                    : `checked ${Math.floor(ageMs / 86_400_000)}d ago`;
+        const staleCache = ageMs === null || ageMs > NPM_CURRENCY_TTL * 1.5;
+        const caveat = staleCache
+            ? ` The registry check is overdue (${ageLabel}), so \`v${latest}\` is a FLOOR — the real gap may be larger. Confirm with \`npm view klypix-mcp version\`.`
+            : ` (npm ${ageLabel}.)`;
         if (!autoUpdateEnabled(env)) {
-            return `\n\n---\n⚠️ **Brain update available** — installed brain core \`v${baked}\` < npm latest \`v${latest}\`. Automatic updates are off; run \`npx klypix-mcp install\`.\n`;
+            return `\n\n---\n⚠️ **Brain update available** — installed brain core \`v${baked}\` < npm latest \`v${latest}\`.${caveat} Automatic updates are off; run \`npx klypix-mcp install\`.\n`;
         }
-        return `\n\n---\n⬆️ **Brain update available** — installed brain core \`v${baked}\` < npm latest \`v${latest}\`. KLYPIX will install it automatically in the background; no action required.\n`;
+        return `\n\n---\n⬆️ **Brain update available** — installed brain core \`v${baked}\` < npm latest \`v${latest}\`.${caveat} KLYPIX will install it automatically in the background; no action required.\n`;
     } catch { return ''; }
 }
 
@@ -3570,7 +3738,8 @@ function legendFooter() {
         + '**Correcting a stale card:** include the word `CORRECTION` (or "was WRONG" / "OBSOLETE" — UPPERCASE; casing is the deliberate-signal, casual prose never fires it) in the decision — the capture then hunts the stale card across ALL areas at a lower match bar and supersedes it (archived + arrowed, with a receipt; restore from Archive if it grabbed the wrong one). A rephrased duplicate `?` merges into the existing open question instead of stacking a twin.\n'
         + '**Verified-fix rule drafts:** when a session FIXES + VERIFIES something trap-shaped that landed as a one-off note, the Stop hook auto-DRAFTS a candidate 🛠️ rule (a per-project sidecar — never a brain card). Approve a real recurring trap with the `+` marker the nudge shows you and it becomes a standing rule that fires EVERY session (like the release-naming rule); ignore the rest and they age out. Draft-only, no blind auto-capture.\n'
         + '**Session brief:** the SessionStart hook prints a ≤2KB ultra brief and writes the FULL brief to `.claude/brain-brief.md` — read that file when planning non-trivial work.\n'
-        + '**Routing:** capture project decisions / milestones / open questions / gotchas HERE, *at the moment you decide* — this brain is the shared, portable memory that survives context resets and the next agent reads. A host memory store (if any) is for *user* preferences; never leave project state only in a private scratchpad.\n'
+        + '**Routing:** capture project decisions / milestones / open questions / gotchas HERE, *at the moment you decide* — this brain is the shared, portable memory that survives context resets and the next agent reads.\n'
+        + '⚠️ **Your own memory directory is NOT this brain.** Claude Code\'s `~/.claude/projects/<project>/memory/` (and any equivalent host store) is PRIVATE to this host: no other session, agent, or human can read it. Both feel like "saving"; only `brain.klypix` is shared. A host store is for *user* preferences — never leave project state only there. (2026-08-16 field report: a whole workstream, ending in a registered IANA media type, went to the private store and reached the brain only because a human happened to ask.)\n'
         + 'Coordinate with a concurrent session: `🧠 MSG [<their-id or all>]: <text>` — a queued note (NOT a brain card), offered/acknowledged on supported model-context actions and replayed until the receiving model calls `brain_message_receipt` with its exact token.\n';
 }
 
@@ -3838,7 +4007,7 @@ if (!process.env.KLYPIX_BRAIN_NO_MAIN) {
             const mode = process.argv.includes('--prompt') ? 'prompt' : process.argv.includes('--capture') ? 'capture' : 'read';
             appendJsonl(HEALTH, { ts: nowIso(), project: path.basename(CWD), mode, ok: false, err: String((e && e.message) || e).slice(0, 200) }, 500);
         } catch { /* even the breadcrumb is best-effort */ }
-    }).finally(() => process.exit(0));
+    }).finally(() => process.exit(EXIT_CODE));
 }
 
 // Exported for hermetic unit tests only (gated by KLYPIX_BRAIN_NO_MAIN above so the

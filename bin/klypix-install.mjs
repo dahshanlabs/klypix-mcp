@@ -246,7 +246,15 @@ const flatten = (code) => code
     .replace(/\.\.\/src\/klypix-(core|format)\.mjs/g, './klypix-$1.mjs')
     // brain-doctor + agent-rules (the server's lazy `import('../src/brain-doctor.mjs')`
     // for the brain_doctor tool) → flat sibling refs in the runtime layout.
-    .replace(/\.\.\/src\/(bench|brain-doctor|agent-presence|agent-rules|finding-routing|mcp-presence|mcp-supervisor|mcp-auto-update|presence-relay|semantic-memory|enrichment|runtime-inspector|project-graph|git-capture-install)\.mjs/g, './$1.mjs')
+    // capture-gap: the worker imports it from BOTH brain_note (the per-session
+    // capture receipt) and brain_sync (the uncaptured-work check). Both are
+    // wrapped in try/catch by design, so an unflattened path here would not
+    // crash — it would make the agent-neutral half silently never fire in the
+    // deployed runtime. test/cli-args.mjs "G: no unresolved ../src/*.mjs" is the
+    // only thing standing between that and the field; it caught exactly this.
+    // (remote-client deliberately absent: the Remote feature was removed in
+    // 1.73.x, and this cherry-pick must not resurrect it — recorded rule.)
+    .replace(/\.\.\/src\/(bench|brain-doctor|agent-presence|agent-rules|capture-gap|enrichment|finding-routing|mcp-presence|mcp-supervisor|mcp-auto-update|presence-relay|semantic-memory|runtime-inspector|project-graph|git-capture-install)\.mjs/g, './$1.mjs')
     .replace(/klypix-worker\.mjs/g, 'klypix-mcp-worker.mjs')
     .replace(/const PKG_VERSION = \(\(\) => \{[\s\S]*?\}\)\(\);/, `const PKG_VERSION = '${VERSION}'; // baked at install (flat layout has no package.json)`);
 
@@ -380,7 +388,7 @@ try {
     // canvas-view-app.html is the canvas_view MCP App UI — staged raw (an HTML
     // file must never get a JS-comment banner) beside the flat server, which
     // resolves it via its ./canvas-view-app.html candidate path.
-    for (const f of ['global-brain-hook.mjs', 'brain-semantic.mjs', 'semantic-memory.mjs', 'enrichment.mjs', 'brain-note.mjs', 'brain-git-hook.mjs', 'git-capture-install.mjs', 'brain-history.mjs', 'brain-graveyard.mjs', 'klypix-format.mjs', 'klypix-core.mjs', 'brain-write-lock.mjs', 'agent-rules.mjs', 'brain-doctor.mjs', 'agent-presence.mjs', 'mcp-presence.mjs', 'repo-state.mjs', 'result-reconcile.mjs', 'finding-routing.mjs', 'presence-relay.mjs', 'mcp-supervisor.mjs', 'mcp-auto-update.mjs', 'runtime-inspector.mjs', 'project-graph.mjs', 'bench.mjs', 'codex-brain-hook.mjs', 'codex-hooks.mjs', 'canvas-view-app.html']) {
+    for (const f of ['global-brain-hook.mjs', 'capture-gap.mjs', 'brain-semantic.mjs', 'semantic-memory.mjs', 'enrichment.mjs', 'brain-note.mjs', 'brain-git-hook.mjs', 'git-capture-install.mjs', 'brain-history.mjs', 'brain-graveyard.mjs', 'klypix-format.mjs', 'klypix-core.mjs', 'brain-write-lock.mjs', 'agent-rules.mjs', 'brain-doctor.mjs', 'agent-presence.mjs', 'mcp-presence.mjs', 'repo-state.mjs', 'result-reconcile.mjs', 'finding-routing.mjs', 'presence-relay.mjs', 'mcp-supervisor.mjs', 'mcp-auto-update.mjs', 'runtime-inspector.mjs', 'project-graph.mjs', 'bench.mjs', 'codex-brain-hook.mjs', 'codex-hooks.mjs', 'canvas-view-app.html']) {
         const s = path.join(SRC, f); if (exists(s)) staged.push({ dst: f, content: fs.readFileSync(s, 'utf8') });
     }
     for (const [src, dst] of [
@@ -402,8 +410,19 @@ try {
     let n = 0;
     for (const st of renameOrder) { renameSyncWithBackoff(path.join(BRAIN_DIR, st.dst + '.klypix-new'), path.join(BRAIN_DIR, st.dst)); n++; }
 
-    // 3) mark the dir an ESM package
-    fs.writeFileSync(path.join(BRAIN_DIR, 'package.json'), JSON.stringify({ name: 'klypix-project-brain', private: true, type: 'module' }, null, 2));
+    // 3) mark the dir an ESM package — WITH the brain-core version in it. The
+    // version was only ever discoverable from .brain-version.json or by regexing
+    // the baked PKG_VERSION out of klypix-mcp-server.mjs; an agent asked "what
+    // version is this brain?", read package.json (the one place everybody looks),
+    // got `version: undefined`, and reported the install unidentifiable
+    // (2026-08-16 field report). This is provenance, never the gate: the
+    // never-downgrade decision still reads .brain-version.json / .mcp-runtime.json.
+    fs.writeFileSync(path.join(BRAIN_DIR, 'package.json'), JSON.stringify({
+        name: 'klypix-project-brain',
+        ...(VERSION ? { version: VERSION } : {}),
+        private: true,
+        type: 'module',
+    }, null, 2));
 
     // 5) wire the 4 hooks into settings.json (refuse on invalid JSON; back up;
     // atomic). A background runtime-only update refreshes the scripts while

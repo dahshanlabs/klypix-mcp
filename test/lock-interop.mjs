@@ -40,7 +40,7 @@ const LOCK = brainCaptureLockPath(brain);
 const lane = laneFileFor(brain, home);
 const PENDING = path.join(home, '.claude', 'project-brain', 'pending', path.basename(lane).replace(/\.json$/, '.captures.json'));
 
-const env = { ...process.env, HOME: home, USERPROFILE: home };
+const env = { ...process.env, HOME: home, USERPROFILE: home, KLYPIX_BRAIN_NUDGE: 'off' };
 delete env.KLYPIX_BRAIN_NO_MAIN;
 
 const TXT = (text) => ({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text }] } });

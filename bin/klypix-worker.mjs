@@ -686,7 +686,19 @@ server.registerTool('brain_note', {
     canvas: z.string().optional().describe('Brain canvas filename/path. Defaults to the project brain ("brain").'),
   },
 }, async ({ text, marker, area, closes, canvas }, extra) => {
-  return toContent(await opBrainNote({ vault: mcpPresence.vault, canvas: boundBrainCanvas(canvas), text, area, marker: marker || '', closes, via: extra.klypixClientName, enrichmentQuestion: mcpPresence.declaredIntent }));
+  // Both 1.77 and 1.78 ride this call: the enrichment question (the asker's
+  // vocabulary for retrieval) AND the per-session capture receipt below.
+  const result = await opBrainNote({ vault: mcpPresence.vault, canvas: boundBrainCanvas(canvas), text, area, marker: marker || '', closes, via: extra.klypixClientName, enrichmentQuestion: mcpPresence.declaredIntent });
+  // Per-session capture receipt — this is what stops the uncaptured-work nudge
+  // from firing at a session that DID record its reasoning, just through MCP
+  // rather than a 🧠 marker. The Stop hook and this server share one session-id
+  // space (the same presence lane), so the receipt written here is the one the
+  // hook reads. Best-effort: a receipt failure must never fail the note.
+  try {
+    const { recordSessionCapture } = await import('../src/capture-gap.mjs');
+    recordSessionCapture(extra?.klypixRequestIdentity?.sessionId || mcpPresence.id);
+  } catch { /* receipt is best-effort */ }
+  return toContent(result);
 });
 
 server.registerTool('brain_message', {
@@ -877,6 +889,77 @@ server.registerTool('brain_sync', {
       }
     } catch { /* observation is best-effort — never fail a sync */ }
   }
+  // ── Uncaptured-work check, host-neutral half ────────────────────────────────
+  // The Stop hook can REFUSE a stop; every other host has no lifecycle hook at
+  // all, so brain_sync is the only place the same question can be asked. Stamp
+  // the git HEAD at "start", and at "complete" compare it against HEAD: commits
+  // that landed during this task with nothing recorded about WHY is the same gap
+  // the hook catches, and it produces the same drafted card. Advisory only — it
+  // never changes status/mutation, so completion semantics are untouched.
+  let captureGapText = '';
+  {
+    const projectDir = report.structured?.project || mcpPresence.vault;
+    const sid = String(extra?.klypixRequestIdentity?.sessionId || mcpPresence.id || '');
+    // `require` does not exist in ESM — the child_process binding has to be
+    // imported, and gitOut must stay synchronous for the ancestry/count chain.
+    let execFileSync = null;
+    try { ({ execFileSync } = await import('child_process')); } catch { /* no child_process → no check */ }
+    const gitOut = (args) => {
+      if (!execFileSync) return '';
+      try {
+        return String(execFileSync('git', args, { cwd: projectDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 4000 })).trim();
+      } catch { return ''; }
+    };
+    // `git merge-base --is-ancestor` answers with its EXIT CODE and prints
+    // nothing, so it must be read as ok/not-ok — an output check would treat
+    // "not an ancestor" and "success" as the same empty string.
+    const gitOk = (args) => {
+      if (!execFileSync) return false;
+      try {
+        execFileSync('git', args, { cwd: projectDir, stdio: 'ignore', timeout: 4000 });
+        return true;
+      } catch { return false; }
+    };
+    try {
+      const gap = await import('../src/capture-gap.mjs');
+      if (phase === 'start' && projectDir && sid) {
+        const head = gitOut(['rev-parse', 'HEAD']);
+        if (head) gap.recordTaskBaseline(sid, { head, project: projectDir });
+      } else if (phase === 'complete' && projectDir && sid) {
+        const baseline = gap.readTaskBaseline(sid);
+        if (baseline?.head) {
+          // An ancestry check first: a rebase/reset makes the range meaningless,
+          // and reporting a rewritten history as "commits you didn't record" is
+          // exactly the cry-wolf that gets a nudge switched off.
+          const reachable = gitOk(['merge-base', '--is-ancestor', baseline.head, 'HEAD']);
+          const count = reachable ? Number(gitOut(['rev-list', '--count', '--no-merges', `${baseline.head}..HEAD`]) || 0) : 0;
+          if (count > 0) {
+            const subjects = gitOut(['log', '--no-merges', '--format=%s', `${baseline.head}..HEAD`])
+              .split('\n').map((s) => s.trim()).filter(Boolean).slice(0, 5);
+            // Bodies decide whether ANY rationale was recorded — the same rule
+            // the hook uses, so the two halves never disagree about one session.
+            const withRationale = gitOut(['log', '--no-merges', '--format=%x1e%b', `${baseline.head}..HEAD`])
+              .split('\x1e').map((b) => b.replace(/\s+/g, ' ').trim()).filter((b) => b.length >= 12).length;
+            const decision = gap.captureGapDecision({
+              commitTotal: count,
+              commitCards: withRationale,
+              sessionCaptured: gap.sessionHasCaptured(sid),
+            });
+            if (decision) {
+              const changed = gitOut(['diff', '--name-only', `${baseline.head}..HEAD`]).split('\n').filter(Boolean).slice(0, 20);
+              const draft = gap.draftCaptureMarker({
+                commits: subjects.map((subject) => ({ subject })),
+                filesTouched: changed,
+              });
+              captureGapText = gap.captureGapReason({ ...decision, draft, mode: 'advise' });
+              gap.recordCaptureGapNudge(sid);
+            }
+          }
+        }
+        gap.clearTaskBaseline(sid);
+      }
+    } catch { /* the check never fails a sync */ }
+  }
   let taskContext = null;
   if (phase !== 'complete' && include_context !== false && (intent || files?.length)) {
     taskContext = await opBrainTaskContext({
@@ -927,7 +1010,7 @@ server.registerTool('brain_sync', {
   return {
     content: [{
       type: 'text',
-      text: [report.text, harnessText, shipNotice, contextText, timingText].filter(Boolean).join('\n\n'),
+      text: [report.text, harnessText, shipNotice, captureGapText, contextText, timingText].filter(Boolean).join('\n\n'),
     }],
     structuredContent,
     ...(report.isError ? { isError: true } : {}),

@@ -73,7 +73,7 @@ try {
 // ── 2. Receiver: the REAL hook, --prompt, a different session id ────────────
 let hookActionSequence = 0;
 const runHook = (sid, tp) => {
-  const env = { ...process.env, HOME: home, USERPROFILE: home };
+  const env = { ...process.env, HOME: home, USERPROFILE: home, KLYPIX_BRAIN_NUDGE: 'off' };
   delete env.KLYPIX_BRAIN_NO_MAIN;   // the subprocess MUST run main()
   return execFileSync(process.execPath, [HOOK, '--prompt'], {
     cwd: proj, env, encoding: 'utf8',
@@ -168,7 +168,7 @@ fs.writeFileSync(lockTranscript, JSON.stringify({
 }) + '\n');
 const runCapture = () => execFileSync(process.execPath, [HOOK, '--capture'], {
   cwd: proj,
-  env: { ...process.env, HOME: home, USERPROFILE: home },
+  env: { ...process.env, HOME: home, USERPROFILE: home, KLYPIX_BRAIN_NUDGE: 'off' },
   encoding: 'utf8',
   input: JSON.stringify({ session_id: 'sess-lock-sender', transcript_path: lockTranscript }),
 });

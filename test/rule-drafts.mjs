@@ -69,7 +69,7 @@ async function makeProject(tag) {
   const run = (mode, { transcript = [], sessionId = 'sess-' + tag, prompt } = {}) => {
     const tp = path.join(home, `transcript-${Math.abs(mode.length + (prompt || '').length)}-${sessionId}.jsonl`);
     fs.writeFileSync(tp, transcript.map(e => JSON.stringify(e)).join('\n') + '\n');
-    const env = { ...process.env, HOME: home, USERPROFILE: home };
+    const env = { ...process.env, HOME: home, USERPROFILE: home, KLYPIX_BRAIN_NUDGE: 'off' };
     delete env.KLYPIX_BRAIN_NO_MAIN;
     const input = { session_id: sessionId, transcript_path: tp, ...(prompt !== undefined ? { prompt } : {}) };
     return execFileSync(process.execPath, [HOOK, mode], { cwd: proj, env, encoding: 'utf8', input: JSON.stringify(input) });

@@ -89,9 +89,18 @@ fs.writeFileSync(brain, await buildKlypixMap({ title: 'brain', areas: [{ title: 
 const LOCK = brainCaptureLockPath(brain);
 const lane = laneFileFor(brain, home);
 const PENDING = path.join(home, '.claude', 'project-brain', 'pending', path.basename(lane).replace(/\.json$/, '.captures.json'));
-const HEALTH = path.join(home, '.claude', 'project-brain', '.hook-health.jsonl');
+// The health log is PER-PROJECT (one file per project dir, named from its
+// basename + a hash of its absolute path). Read whatever landed in the dir
+// rather than recomputing the hash — the point of the test is the CONTENT.
+const HEALTH_DIR = path.join(home, '.claude', 'project-brain', 'health');
+const readHealth = () => {
+    try {
+        return fs.readdirSync(HEALTH_DIR)
+            .map((f) => fs.readFileSync(path.join(HEALTH_DIR, f), 'utf8')).join('\n');
+    } catch { return ''; }
+};
 
-const env = { ...process.env, HOME: home, USERPROFILE: home };
+const env = { ...process.env, HOME: home, USERPROFILE: home, KLYPIX_BRAIN_NUDGE: 'off' };
 delete env.KLYPIX_BRAIN_NO_MAIN;
 
 const TXT = (text) => ({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text }] } });
@@ -132,9 +141,9 @@ const unblockBrainWrites = () => { if (process.platform === 'win32') fs.chmodSyn
     ok(!cardsAfterFail.some((t) => /write-failure marker/.test(t)), 'blocked write left the brain untouched');
     const queued = readPending();
     ok(queued.some((b) => (b.cards || []).some((c) => /write-failure marker/.test(String(c.text || '')))), 'own batch was QUEUED durably on write failure');
-    let health = '';
-    try { health = fs.readFileSync(HEALTH, 'utf8'); } catch { /* */ }
+    const health = readHealth();
     ok(/write failed/.test(health) && /QUEUED durably/.test(health), 'health log tells the truth: write failed, batch queued');
+    ok(fs.readdirSync(HEALTH_DIR).length === 1, 'health log is per-project — exactly one file for this project dir');
 
     runHookCapture([TXT('no markers this time')], 's-wfail-2');
     const cardsAfterDrain = await brainCards();

@@ -113,18 +113,23 @@ export function recordEnrichment(brainPath, items, { home = os.homedir(), now = 
  * must reuse one parsed array (and, via the join memo below, one join result
  * per card) until the sidecar actually changes.
  */
-const readMemo = new Map();   // file -> { mtimeMs, entries }
+const readMemo = new Map();   // file -> { stamp, entries }
 export function readEnrichment(brainPath, { home = os.homedir(), now = Date.now() } = {}) {
   const file = enrichmentFileFor(brainPath, home);
-  let mtimeMs = 0;
-  try { mtimeMs = fs.statSync(file).mtimeMs; } catch { mtimeMs = 0; }
+  // Invalidation stamp = mtime AND size. mtime alone is not enough: under load
+  // two writes can land inside one mtime tick, and the memo then served the
+  // PRE-rewrite parse — caught by EN2 failing in the full chain (same-tick
+  // corrupt-file rewrite read back as the old healthy entries) while passing
+  // standalone, where the writes never clustered.
+  let stamp = '';
+  try { const st = fs.statSync(file); stamp = `${st.mtimeMs}|${st.size}`; } catch { stamp = ''; }
   const memo = readMemo.get(file);
-  if (memo && memo.mtimeMs === mtimeMs) return memo.entries;
-  const data = mtimeMs ? readFile(file) : { entries: {} };
+  if (memo && memo.stamp === stamp) return memo.entries;
+  const data = stamp ? readFile(file) : { entries: {} };
   const entries = Object.entries(data.entries)
     .filter(([, entry]) => now - Number(entry.ts || 0) <= ENRICHMENT_TTL_MS)
     .map(([key, entry]) => ({ key, q: (entry.q || []).map(cleanQuestion).filter(Boolean) }));
-  readMemo.set(file, { mtimeMs, entries });
+  readMemo.set(file, { stamp, entries });
   if (readMemo.size > 8) readMemo.delete(readMemo.keys().next().value);
   return entries;
 }

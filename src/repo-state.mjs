@@ -26,6 +26,7 @@
 //     so a fresh session on an already-drifted repo still sees the drift, and
 //     the ship-observation baseline is never perturbed.
 
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { execFileSync } from 'child_process';
@@ -219,6 +220,118 @@ export function commitFiles(projectDir, shas, { execGit = defaultExecGit, timeou
     });
   }
   return out;
+}
+
+// ── Committed claims — the promise that travels with the repository ─────────
+//
+// A lane claim protects a machine; a COMMITTED claim protects a team. The file
+// lives at .klypix/claims/<owner>.json, rides ordinary git push/pull, is
+// reviewable in a PR and auditable in history — so the release gate on ANY
+// clone reads promises made on any other machine, with zero infrastructure
+// beyond the version control the team already has. One file per owner keeps
+// merges trivial: two teammates staking concurrently touch different paths.
+export const COMMITTED_CLAIMS_DIR = path.join('.klypix', 'claims');
+const COMMITTED_CLAIMS_MAX_FILES = 64;
+const COMMITTED_CLAIM_MAX_BYTES = 8 * 1024;
+
+const committedClaimFileName = (ownerId) => {
+  const slug = String(ownerId || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 24) || 'owner';
+  const hash = crypto.createHash('sha1').update(String(ownerId || '')).digest('hex').slice(0, 12);
+  return `${slug}-${hash}.json`;
+};
+
+function normalizeCommittedClaim(raw, file, now) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { problem: 'not an object' };
+  if (raw.schemaVersion !== 1) return { problem: `unknown schemaVersion ${raw.schemaVersion}` };
+  const owner = raw.owner && typeof raw.owner === 'object' ? raw.owner : {};
+  const ownerId = String(owner.id || '').trim().slice(0, 160);
+  const shas = [...new Set((Array.isArray(raw.shas) ? raw.shas : [])
+    .map((s) => String(s || '').trim().toLowerCase())
+    .filter((s) => /^[0-9a-f]{4,40}$/.test(s)))].slice(0, 20);
+  const stakedAt = Number(raw.stakedAt || 0);
+  const expiresAt = Number(raw.expiresAt || 0);
+  if (!ownerId) return { problem: 'missing owner.id' };
+  if (!shas.length) return { problem: 'no valid shas' };
+  if (!stakedAt || !expiresAt) return { problem: 'missing stakedAt/expiresAt' };
+  if (now >= expiresAt) return { expired: true };
+  return {
+    claim: {
+      ownerId,
+      ownerClient: String(owner.client || 'unknown').slice(0, 40),
+      ownerLogicalId: String(owner.logicalId || '').trim().slice(0, 160) || null,
+      branch: String(raw.branch || '').slice(0, 120) || null,
+      note: String(raw.note || '').replace(/\s+/g, ' ').trim().slice(0, 160) || null,
+      shas,
+      stakedAt,
+      expiresAt,
+      committed: { file },
+    },
+  };
+}
+
+/**
+ * Read every committed claim in the working tree. Bounded, schema-validated,
+ * and LOUD about what it skipped: `problems` names each malformed file, and
+ * `truncated` says the directory exceeded the scan cap — a gate input that
+ * silently drops entries is the recurring defect this module exists to end.
+ */
+export function readCommittedClaims(projectDir, { now = Date.now() } = {}) {
+  const dir = path.join(String(projectDir || ''), COMMITTED_CLAIMS_DIR);
+  const out = { claims: [], problems: [], truncated: false };
+  let names;
+  try { names = fs.readdirSync(dir).filter((n) => n.endsWith('.json')).sort(); }
+  catch { return out; }                       // no directory = no committed claims
+  if (names.length > COMMITTED_CLAIMS_MAX_FILES) {
+    out.truncated = true;
+    names = names.slice(0, COMMITTED_CLAIMS_MAX_FILES);
+  }
+  for (const name of names) {
+    const rel = path.join(COMMITTED_CLAIMS_DIR, name);
+    try {
+      const stat = fs.statSync(path.join(dir, name));
+      if (stat.size > COMMITTED_CLAIM_MAX_BYTES) { out.problems.push({ file: rel, problem: `over ${COMMITTED_CLAIM_MAX_BYTES} bytes` }); continue; }
+      const parsed = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8'));
+      const result = normalizeCommittedClaim(parsed, rel, now);
+      if (result.claim) out.claims.push(result.claim);
+      else if (!result.expired) out.problems.push({ file: rel, problem: result.problem });
+    } catch (err) {
+      out.problems.push({ file: rel, problem: `unreadable: ${String(err?.message || err).slice(0, 80)}` });
+    }
+  }
+  return out;
+}
+
+/**
+ * Write (or overwrite) the caller's own committed claim. Atomic tmp+rename;
+ * the filename derives from the owner id, so a session can only ever occupy
+ * its own slot and a re-stake replaces rather than accumulates.
+ */
+export function writeCommittedClaim(projectDir, claim) {
+  const dir = path.join(String(projectDir || ''), COMMITTED_CLAIMS_DIR);
+  fs.mkdirSync(dir, { recursive: true });
+  const name = committedClaimFileName(claim.ownerId);
+  const file = path.join(dir, name);
+  const payload = JSON.stringify({
+    schemaVersion: 1,
+    owner: { id: claim.ownerId, client: claim.ownerClient, ...(claim.ownerLogicalId ? { logicalId: claim.ownerLogicalId } : {}) },
+    shas: claim.shas,
+    ...(claim.branch ? { branch: claim.branch } : {}),
+    ...(claim.note ? { note: claim.note } : {}),
+    stakedAt: claim.stakedAt,
+    expiresAt: claim.expiresAt,
+  }, null, 2) + '\n';
+  const tmp = `${file}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, payload, 'utf8');
+  fs.renameSync(tmp, file);
+  return { file, relPath: path.join(COMMITTED_CLAIMS_DIR, name).replace(/\\/g, '/') };
+}
+
+/** Delete the caller's own committed claim slot. Returns the relPath it removed, or null. */
+export function deleteCommittedClaim(projectDir, ownerId) {
+  const name = committedClaimFileName(ownerId);
+  const file = path.join(String(projectDir || ''), COMMITTED_CLAIMS_DIR, name);
+  try { fs.unlinkSync(file); } catch { return null; }
+  return { relPath: path.join(COMMITTED_CLAIMS_DIR, name).replace(/\\/g, '/') };
 }
 
 /**

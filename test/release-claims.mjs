@@ -319,6 +319,104 @@ try {
   ok(wfalse.ok === false && /withdraw: false does nothing/.test((wfalse.errors || []).join(' ')),
     'RC11: withdraw:false is refused with an error that names it, not an array-shaped one');
 
+  // ── RC12 — COMMITTED CLAIMS: a teammate's promise arrives with git pull ──
+  // The file is written as if pulled from another machine: its owner has NEVER
+  // had a presence row in this lane. The gate must still refuse.
+  const claimsDir = path.join(project, '.klypix', 'claims');
+  fs.mkdirSync(claimsDir, { recursive: true });
+  git('checkout', '-q', 'feature/arrow');
+  const teamSha = commit('feat: teammate work from another machine', 'src/team.ts');
+  git('checkout', '-q', 'master');
+  fs.writeFileSync(path.join(claimsDir, 'teammate-abc123def456.json'), JSON.stringify({
+    schemaVersion: 1,
+    owner: { id: 'teammate-on-other-pc', client: 'cursor' },
+    shas: [teamSha],
+    note: 'promised the founder this ships next',
+    stakedAt: clock.value - 3600_000,
+    expiresAt: clock.value + 7 * 86_400_000,
+  }, null, 2));
+  // Also a malformed and an expired file — both must be LOUD or ignored, never fatal.
+  fs.writeFileSync(path.join(claimsDir, 'broken.json'), '{ not json');
+  fs.writeFileSync(path.join(claimsDir, 'expired-claim.json'), JSON.stringify({
+    schemaVersion: 1, owner: { id: 'old-ghost' }, shas: ['abcd9999'],
+    stakedAt: clock.value - 30 * 86_400_000, expiresAt: clock.value - 16 * 86_400_000,
+  }));
+  const teamRefusal = releaser.sync({
+    project, phase: 'start',
+    releaseIntent: { version: '2.0.0', ref: 'rel' },
+  });
+  ok(teamRefusal.structured?.releaseLease?.status === 'refused',
+    'RC12: a committed claim from a machine this lane has never seen refuses the release');
+  ok(/committed: \.klypix[\\/]claims[\\/]teammate-abc123def456\.json/.test(teamRefusal.text)
+    && /travels with the repo/.test(teamRefusal.text),
+    'RC12: the refusal names the FILE and says how such a claim is withdrawn');
+  ok(/promised the founder this ships next/.test(teamRefusal.text),
+    'RC12: the teammate\'s note crosses machines intact');
+  ok(/1 committed claim file\(s\) could NOT be settled/.test(teamRefusal.text)
+    && /broken\.json/.test(teamRefusal.text),
+    'RC12: the malformed file is surfaced LOUDLY — an unreadable promise protects nobody');
+  ok(!/old-ghost|abcd9999/.test(teamRefusal.text),
+    'RC12: the expired committed claim is simply gone, not an error');
+
+  // Hostile-claim staker from RC10 still has a live lane claim on lateSha —
+  // acknowledge BOTH so the grant path exercises mixed lane+repo fulfilment.
+  const teamGrant = releaser.sync({
+    project, phase: 'checkpoint',
+    releaseIntent: { version: '2.0.0', ref: 'rel', acknowledge: [teamSha, lateSha, orphanSha] },
+  });
+  ok(['taken', 'refreshed'].includes(teamGrant.structured?.releaseLease?.status),
+    'RC12: acknowledging the committed claim\'s sha by name grants the lease');
+  ok(fs.existsSync(path.join(claimsDir, 'teammate-abc123def456.json')),
+    'RC12: an acknowledged-away committed claim KEEPS its file — the work still is not shipping');
+  releaser.sync({ project, phase: 'complete' });
+
+  // ── RC13 — publish:true writes the file; fulfilment deletes it ──────────
+  // Retire the accumulated lane claims from earlier cases so this scenario
+  // isolates: one published contained claim + the teammate's unmet file.
+  withdrawReleaseClaim({ brainPath: path.join(project, 'brain.klypix'), sessionId: 'owner-aaaa-bbbb-cccc', home, now: clock.value });
+  withdrawReleaseClaim({ brainPath: path.join(project, 'brain.klypix'), sessionId: 'late-staker-9999', home, now: clock.value });
+  withdrawReleaseClaim({ brainPath: path.join(project, 'brain.klypix'), sessionId: 'hostile-owner-1234', home, now: clock.value });
+  const publisher = makePresence('publisher-session-77');
+  const pub = publisher.sync({
+    project, phase: 'start',
+    releaseClaim: { shas: [shippedSha], note: 'publish me', publish: true },
+  });
+  ok(pub.structured?.releaseClaim?.ok === true && /\.klypix\/claims\//.test(pub.structured?.releaseClaim?.published || ''),
+    'RC13: publish:true reports the repo-relative claim file it wrote');
+  ok(/PUBLISHED to \.klypix\/claims\//.test(pub.text) && /commit that file/i.test(pub.text),
+    'RC13: the text tells the session to COMMIT the file so the promise travels');
+  const pubFile = path.join(project, pub.structured.releaseClaim.published.replace(/\//g, path.sep));
+  ok(fs.existsSync(pubFile), 'RC13: the file exists in the working tree');
+  const pubParsed = JSON.parse(fs.readFileSync(pubFile, 'utf8'));
+  ok(pubParsed.schemaVersion === 1 && pubParsed.owner.id === 'publisher-session-77'
+    && pubParsed.shas.includes(shippedSha.toLowerCase()),
+    'RC13: the committed file carries the schema, the owner, and the shas');
+  // A release CONTAINING the sha fulfils both the lane claim and the file.
+  // A fresh lease re-litigates by design (freeing the lease drops its
+  // persisted acknowledgements), so the teammate's still-unmet committed claim
+  // must be acknowledged again; the published contained claim fulfils.
+  const fulfil13 = releaser.sync({
+    project, phase: 'start',
+    releaseIntent: { version: '2.0.1', ref: 'rel', acknowledge: [teamSha] },
+  });
+  ok(['taken', 'refreshed'].includes(fulfil13.structured?.releaseLease?.status)
+    && fulfil13.structured?.releaseLease?.claimsFulfilled >= 1,
+    'RC13: a release containing the published sha is granted with fulfilment reported');
+  ok(!fs.existsSync(pubFile), 'RC13: the fulfilled committed file was DELETED from the working tree');
+  ok(/Retired committed claim file/.test(fulfil13.text) && /commit the deletion/.test(fulfil13.text),
+    'RC13: and the text instructs committing the deletion so every clone sees the promise as kept');
+  releaser.sync({ project, phase: 'complete' });
+
+  // ── RC14 — publish withdraw deletes only the caller's own slot ──────────
+  publisher.sync({ project, phase: 'checkpoint', releaseClaim: { shas: [shippedSha], publish: true } });
+  const foreignFile = path.join(claimsDir, 'teammate-abc123def456.json');
+  const before14 = fs.readFileSync(foreignFile, 'utf8');
+  const wd = publisher.sync({ project, phase: 'checkpoint', releaseClaim: { withdraw: true, publish: true } });
+  ok(/deleted; commit the deletion/.test(wd.text),
+    'RC14: publish-withdraw reports the deleted file');
+  ok(fs.readFileSync(foreignFile, 'utf8') === before14,
+    'RC14: the TEAMMATE\'s committed claim is untouched — a session can only delete its own slot');
+
   if (failures) { console.error(`\n✗ ${failures} assertion(s) failed`); process.exit(1); }
   console.log('\n✓ release claims — all assertions passed');
 } finally {

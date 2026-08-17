@@ -45,7 +45,7 @@ import {
 // canonical copy lives in the pure module because that one is import-restricted
 // (crypto only), so it can never grow a dependency this file would inherit.
 import { normalizeFileKey } from './finding-routing.mjs';
-import { cmpSemver3, collectRepoState, commitFiles, releaseAncestry, releaseAncestryWarnings, repoStateWarnings, settleClaimsAgainstRef } from './repo-state.mjs';
+import { cmpSemver3, collectRepoState, commitFiles, deleteCommittedClaim, readCommittedClaims, releaseAncestry, releaseAncestryWarnings, repoStateWarnings, settleClaimsAgainstRef, writeCommittedClaim } from './repo-state.mjs';
 import { recordResultManifests } from './result-reconcile.mjs';
 
 export const MCP_HEARTBEAT_MS = 60_000;
@@ -317,8 +317,11 @@ export function validateReleaseClaim(value) {
     else withdrawShas = parseShas(value.withdraw, 'withdraw');
   }
   const note = typeof value.note === 'string' ? value.note.replace(/\s+/g, ' ').trim().slice(0, 160) : null;
+  if (value.publish !== undefined && typeof value.publish !== 'boolean') {
+    errors.push('releaseClaim.publish must be a boolean');
+  }
   if (errors.length) return { provided: true, ok: false, errors };
-  return { provided: true, ok: true, stake: hasStake, shas, withdraw: hasWithdraw, withdrawShas, withdrawAll, note };
+  return { provided: true, ok: true, stake: hasStake, shas, withdraw: hasWithdraw, withdrawShas, withdrawAll, note, publish: value.publish === true };
 }
 
 /**
@@ -2715,6 +2718,7 @@ export function createMcpPresence({
     let workAtRisk = null;
     let workAtRiskText = '';
     let releaseClaimResult = null;
+    let committedClaimProblems = [];
     {
       const leaseStamp = now();
       let outcome = null;
@@ -2743,6 +2747,25 @@ export function createMcpPresence({
             home,
             now: leaseStamp,
           });
+        // publish:true makes the promise TRAVEL: the claim is also written as
+        // .klypix/claims/<owner>.json in the project, which the session commits
+        // like any other file — from then on every clone's release gate reads
+        // it, it is reviewable in a PR, and its whole history is auditable.
+        // The write is derived from the OWNER id, so a session can only ever
+        // occupy (or delete) its own slot.
+        if (releaseClaimChecked.publish && releaseClaimResult?.ok) {
+          try {
+            if (releaseClaimChecked.withdraw) {
+              const removed = deleteCommittedClaim(path.dirname(brainPath), sessionId);
+              if (removed) releaseClaimResult = { ...releaseClaimResult, unpublished: removed.relPath };
+            } else if (releaseClaimResult.claim) {
+              const written = writeCommittedClaim(path.dirname(brainPath), releaseClaimResult.claim);
+              releaseClaimResult = { ...releaseClaimResult, published: written.relPath };
+            }
+          } catch (err) {
+            releaseClaimResult = { ...releaseClaimResult, publishError: String(err?.message || err).slice(0, 120) };
+          }
+        }
       }
       // Set when the holder's own sync arrived with the lease already close to
       // lapsing; reported after the refresh so the holder learns the habit that
@@ -2825,10 +2848,35 @@ export function createMcpPresence({
         // (missing), never pass; only a catastrophic throw degrades to empty,
         // and ancestry still stands guard on that path.
         let claimSettlement = [];
+        committedClaimProblems = [];
         try {
-          const stakedClaims = readReleaseClaims({ brainPath, home, now: leaseStamp });
-          if (stakedClaims.length) {
-            claimSettlement = settleClaimsAgainstRef(path.dirname(brainPath), releaseIntentChecked.ref, stakedClaims);
+          const laneClaims = readReleaseClaims({ brainPath, home, now: leaseStamp });
+          // COMMITTED claims ride the repository itself — a teammate's promise
+          // arrives with ordinary `git pull`, and this gate reads it on every
+          // clone with zero infrastructure. Malformed files are surfaced, not
+          // skipped: a gate input that silently drops entries is the recurring
+          // defect this whole subsystem exists to end.
+          const committed = readCommittedClaims(path.dirname(brainPath), { now: leaseStamp });
+          committedClaimProblems = committed.problems;
+          if (committed.truncated) committedClaimProblems = [...committedClaimProblems, { file: 'directory', problem: 'claim directory exceeds the scan cap; entries beyond it were NOT settled' }];
+          // Dedupe: a lane claim and a committed claim from the SAME owner with
+          // the same shas are one promise, not two. Lane wins (fresher TTL).
+          const claimKey = (c) => `${c.ownerId}|${[...c.shas].sort().join(',')}`;
+          const laneOwners = new Set(laneClaims.map(claimKey));
+          const committedByKey = new Map(committed.claims.map((c) => [claimKey(c), c]));
+          // When a lane claim and a committed file are the same promise, the
+          // lane entry wins (fresher TTL) but must CARRY the file marker —
+          // otherwise fulfilment retires the lane copy and strands the file,
+          // and every clone keeps refusing on a promise already kept.
+          const merged = [
+            ...laneClaims.map((c) => {
+              const twin = committedByKey.get(claimKey(c));
+              return twin ? { ...c, committed: twin.committed } : c;
+            }),
+            ...committed.claims.filter((c) => !laneOwners.has(claimKey(c))),
+          ];
+          if (merged.length) {
+            claimSettlement = settleClaimsAgainstRef(path.dirname(brainPath), releaseIntentChecked.ref, merged);
           }
         } catch { claimSettlement = []; }
         const unmetClaims = claimSettlement.filter((entry) => !entry.contained);
@@ -2928,7 +2976,8 @@ export function createMcpPresence({
           if (entry.missing.length) parts.push(`${entry.missing.length} NOT in ${releaseIntentChecked.ref}: ${entry.missing.slice(0, 4).map((x) => x.slice(0, 9)).join(', ')}${entry.missing.length > 4 ? ` +${entry.missing.length - 4}` : ''}`);
           if (entry.unresolvable.length) parts.push(`${entry.unresolvable.length} unresolvable (history rewritten? owner must re-stake): ${entry.unresolvable.slice(0, 3).map((x) => x.slice(0, 9)).join(', ')}`);
           if (entry.unverified.length) parts.push(`${entry.unverified.length} unverified (probe budget)`);
-          return neutralizeMarkers(`STAKED CLAIM UNMET — session ${String(c.ownerId).slice(0, 8)} (${c.ownerClient}${c.branch ? `, ${c.branch}` : ''}) staked ${ageDays}d ago${c.note ? `: "${c.note}"` : ''} — ${parts.join(' · ')}. The owner may no longer be live; this claim is their voice.`);
+          const provenance = c.committed ? ` [committed: ${c.committed.file} — travels with the repo, withdraw by deleting the file in a commit]` : '';
+          return neutralizeMarkers(`STAKED CLAIM UNMET — session ${String(c.ownerId).slice(0, 8)} (${c.ownerClient}${c.branch ? `, ${c.branch}` : ''}) staked ${ageDays}d ago${c.note ? `: "${c.note}"` : ''} — ${parts.join(' · ')}. The owner may no longer be live; this claim is their voice.${provenance}`);
         });
         // The COMPLETE set the gate will demand, not the subset the prose names.
         // These two used to be the same list, which is how a release dropping 71
@@ -2995,6 +3044,10 @@ export function createMcpPresence({
           '',
           ...releaseAncestryWarnings(anc),
           ...(claimLines.length ? ['', ...claimLines] : []),
+          ...(committedClaimProblems.length ? [
+            '',
+            `⚠ ${committedClaimProblems.length} committed claim file(s) could NOT be settled and are NOT covered by this gate: ${committedClaimProblems.slice(0, 3).map((p) => `${p.file} (${p.problem})`).join('; ')}${committedClaimProblems.length > 3 ? ` +${committedClaimProblems.length - 3} more` : ''}. Fix or remove them — an unreadable promise protects nobody.`,
+          ] : []),
           ...claimsOnlyImperative,
           '',
           // Deliberately NOT a ready-to-paste call. Pre-rendering the exact
@@ -3048,6 +3101,7 @@ export function createMcpPresence({
         const fulfilledClaims = (outcome.claimSettlement || []).filter((entry) => entry.contained);
         const awayClaims = Array.isArray(outcome.acknowledgedClaims) ? outcome.acknowledgedClaims : [];
         let claimsNotified = 0;
+        const retiredFiles = [];
         if (fulfilledClaims.length) {
           try {
             retireFulfilledClaims({
@@ -3057,6 +3111,16 @@ export function createMcpPresence({
               now: leaseStamp,
             });
           } catch { /* retirement is best-effort; a live claim re-settles next declare */ }
+          for (const entry of fulfilledClaims) {
+            if (entry.claim.committed) {
+              // The file lives in the WORKING TREE — deleting it here and
+              // committing the deletion alongside the release is the repo-side
+              // twin of lane retirement. If the delete fails the claim simply
+              // re-settles as contained next time; never fatal.
+              const removed = deleteCommittedClaim(path.dirname(brainPath), entry.claim.ownerId);
+              if (removed) retiredFiles.push(removed.relPath);
+            }
+          }
           for (const entry of fulfilledClaims) {
             if (entry.claim.ownerId === sessionId) continue;
             const posted = postPresenceMessage({
@@ -3132,6 +3196,9 @@ export function createMcpPresence({
             : `KLYPIX release lease refreshed: v${releaseIntentChecked.version} from ${releaseIntentChecked.ref}.`;
           if (fulfilledClaims.length || awayClaims.length) {
             releaseText += ` Claims: ${fulfilledClaims.length} fulfilled${awayClaims.length ? `, ${awayClaims.length} ACKNOWLEDGED AWAY (their owners were queued a notification — the work is NOT in this build)` : ''}.`;
+            if (retiredFiles.length) {
+              releaseText += ` Retired committed claim file(s): ${retiredFiles.join(', ')} — commit the deletion with the release so every clone sees the promise as kept.`;
+            }
           }
         }
       } else if (outcome?.status === 'lease-lost') {
@@ -3364,7 +3431,7 @@ export function createMcpPresence({
       resultText,
       releaseClaimResult
         ? (releaseClaimResult.ok
-          ? `KLYPIX release claim ${releaseClaimResult.status}${releaseClaimResult.claim ? `: ${releaseClaimResult.claim.shas.length} sha(s) staked — every future releaseIntent must contain them or acknowledge them BY NAME, even after this session ends (expires ${Math.round((releaseClaimResult.claim.expiresAt - syncStartedAt) / 86_400_000)}d)` : ''}${releaseClaimResult.status === 'trimmed' || releaseClaimResult.status === 'withdrawn' ? ` (${releaseClaimResult.remaining ?? 0} sha(s) remain staked)` : ''}.`
+          ? `KLYPIX release claim ${releaseClaimResult.status}${releaseClaimResult.published ? ` — PUBLISHED to ${releaseClaimResult.published}: commit that file so the claim travels with the repo (every clone's release gate reads it; reviewable in PRs)` : ''}${releaseClaimResult.unpublished ? ` — committed file ${releaseClaimResult.unpublished} deleted; commit the deletion to withdraw it everywhere` : ''}${releaseClaimResult.publishError ? ` — WARNING: the lane claim stands but the committed file failed: ${releaseClaimResult.publishError}` : ''}${releaseClaimResult.claim ? `: ${releaseClaimResult.claim.shas.length} sha(s) staked — every future releaseIntent must contain them or acknowledge them BY NAME, even after this session ends (expires ${Math.round((releaseClaimResult.claim.expiresAt - syncStartedAt) / 86_400_000)}d)` : ''}${releaseClaimResult.status === 'trimmed' || releaseClaimResult.status === 'withdrawn' ? ` (${releaseClaimResult.remaining ?? 0} sha(s) remain staked)` : ''}.`
           : `KLYPIX release claim FAILED (${releaseClaimResult.status}${releaseClaimResult.limit ? `, limit ${releaseClaimResult.limit}` : ''}) — nothing was staked or withdrawn. ${releaseClaimResult.status === 'claims-full' ? 'The lane holds its maximum of staked claims; withdraw a stale one or raise it with the maintainers.' : ''}`)
         : '',
       releaseText,

@@ -199,14 +199,24 @@ export function commitFiles(projectDir, shas, { execGit = defaultExecGit, timeou
   // An explicit  sentinel before each sha, so blocks parse unambiguously.
   // File paths may contain almost anything; a control char cannot appear in one.
   const SENTINEL = '';
-  const raw = git(dir, ['show', '--name-only', `--format=${SENTINEL}%H`, ...list], timeoutMs);
+  // `core.quotepath=false` because git otherwise C-quotes non-ASCII paths
+  // ("\330\247..."), which normalizeFileKey can never match against a declared
+  // Arabic filename — attribution went silently blind for AR users (review
+  // catch, verified live). The subject rides the header line behind a unit
+  // separator so a commit promoted into the display from beyond the prose
+  // list still has a human-readable name.
+  const raw = git(dir, ['-c', 'core.quotepath=false', 'show', '--name-only', `--format=${SENTINEL}%H${UNIT_SEP}%s`, ...list], timeoutMs);
   if (raw === null) return out;                       // probe failed: no owners, never a wrong owner
   for (const block of String(raw).split(SENTINEL)) {
     const lines = block.split('\n').map((l) => l.trim()).filter(Boolean);
     if (!lines.length) continue;
-    const sha = lines[0];
+    const sep = lines[0].indexOf(UNIT_SEP);
+    const sha = sep < 0 ? lines[0] : lines[0].slice(0, sep);
     if (!/^[0-9a-f]{7,40}$/i.test(sha)) continue;
-    out.set(sha.toLowerCase(), lines.slice(1));
+    out.set(sha.toLowerCase(), {
+      files: lines.slice(1),
+      subject: sep < 0 ? '' : lines[0].slice(sep + 1).slice(0, 120),
+    });
   }
   return out;
 }
@@ -329,12 +339,18 @@ export function releaseAncestry(projectDir, ref, { execGit = defaultExecGit, pee
     let allMissingShas = [];
     let approximate = false;
     if (cherry !== null) {
-      const missingShas = cherry.split('\n')
+      const allCherry = cherry.split('\n')
         .filter((l) => l.startsWith('+ '))
         .map((l) => l.slice(2).trim())
-        .filter(Boolean)
-        .slice(0, MAX_CHERRY_SCAN);
-      count = missingShas.length;
+        .filter(Boolean);
+      // TAIL, not head. `git cherry` emits OLDEST first, so a head slice on a
+      // >500-commit divergence dropped the NEWEST commits from both the display
+      // AND the acknowledgement — the exact failure class the newest-first fix
+      // exists to prevent, reintroduced one level up (2026-08-17 review catch).
+      // The tail keeps the newest; `count` stays the TRUE total so missingCount
+      // never understates; `scanCapped` lets the warning text admit the cap.
+      const missingShas = allCherry.slice(-MAX_CHERRY_SCAN);
+      count = allCherry.length;
       if (count <= 0) continue;              // every change is already present
       // NEWEST FIRST, and this is the whole point of the list. `git cherry` emits
       // OLDEST first, so slicing it raw showed the eight most ANCIENT missing
@@ -372,12 +388,21 @@ export function releaseAncestry(projectDir, ref, { execGit = defaultExecGit, pee
     if (!shown.length) continue;
     // One bounded call for the subjects of just what will be shown.
     const log = git(dir, ['log', '--no-walk', `--format=%h%x1f%s`, ...shown]);
-    const parsed = (log || '').split('\n').filter(Boolean).map((line) => {
+    let parsed = (log || '').split('\n').filter(Boolean).map((line) => {
       const sep = line.indexOf(UNIT_SEP);
       return sep < 0
         ? { sha: line.trim(), subject: '' }
         : { sha: line.slice(0, sep).trim(), subject: line.slice(sep + 1).slice(0, 120) };
     });
+    // A failed SUBJECT probe must not erase the shas (2026-08-17 review catch).
+    // When this log call times out while cherry succeeded, `parsed` was empty,
+    // `missing` was empty, and the whole ancestry degraded to 'unnameable' —
+    // whose refusal then listed acknowledgeRequired from allShas while the gate
+    // unconditionally refused 'unnameable': an instruction that can never
+    // succeed. Shas without subjects are still NAMEABLE; render them bare.
+    if (!parsed.length && shown.length) {
+      parsed = shown.map((sha) => ({ sha: String(sha).slice(0, 9), subject: '' }));
+    }
     // Trunk and a peer sitting on trunk are the DEFAULT configuration, so the
     // same commits would otherwise be counted twice and demanded twice. Each
     // sha is attributed to the first source that reports it.
@@ -411,6 +436,10 @@ export function releaseAncestry(projectDir, ref, { execGit = defaultExecGit, pee
       // True when the prose cannot name everything this source drops, so the
       // caller can say "8 of 71 shown" instead of implying the list is complete.
       listTruncated: allShas.length > missing.length,
+      // True when even allShas is a cap (divergence beyond MAX_CHERRY_SCAN):
+      // the acknowledgement then covers the newest 500 but NOT everything, and
+      // the warning text must say so rather than let a capped ack read as full.
+      ...(count > allShas.length ? { scanCapped: true } : {}),
       ...(approximate ? { approximate: true } : {}),
     });
   }
@@ -489,6 +518,10 @@ export function releaseAncestryWarnings(ancestry) {
       lines.push(`    · ${c.sha} ${c.subject}${who}`);
     }
     if (s.missingCount > s.missing.length) lines.push(`    · …and ${s.missingCount - s.missing.length} more not listed`);
+    if (s.scanCapped) {
+      lines.push(`    (divergence exceeds the ${Array.isArray(s.allShas) ? s.allShas.length : 500}-commit scan cap — the acknowledgement below covers only the newest ${Array.isArray(s.allShas) ? s.allShas.length : 500};`);
+      lines.push('     a divergence this size should be RESOLVED, not acknowledged)');
+    }
     if (s.approximate) {
       lines.push('    (this list is approximate — the equivalence check could not run, so some of');
       lines.push('     these may already be in the release under a different commit id)');

@@ -888,6 +888,13 @@ export function brainDriftMarkdown(result) {
   }
   const lines = ['# Brain drift — cards vs the repo\'s real files'];
   const stale = result.staleCheckout;
+  if (stale && stale.behind === 0 && stale.ahead > 0) {
+    // The FALSE NEGATIVE is the expensive half (desktop 1.3.107 shipped
+    // off-trunk in exactly this silence): a checkout carrying unpushed commits
+    // deserves a line even when it is not behind — files reported PRESENT below
+    // may exist only here.
+    lines.push(`⚠️ **This checkout is ${stale.ahead} commit(s) ahead of \`${stale.comparedTo}\`** (branch \`${stale.branch || '?'}\`). Files reported present below may exist only in THIS checkout, not on the default branch.`);
+  }
   if (stale && stale.behind > 0) {
     // State the measurement, never the operation: on a diverged checkout "pull"
     // is contradicted by the very numbers printed beside it, and this tool has

@@ -250,11 +250,23 @@ export function validateReleaseIntent(value) {
     if (!Array.isArray(value.acknowledge)) {
       errors.push('releaseIntent.acknowledge must be an array of commit shas the release deliberately leaves behind');
     } else {
-      acknowledge = value.acknowledge
+      acknowledge = [...new Set(value.acknowledge
         .filter((s) => typeof s === 'string')
         .map((s) => s.trim().toLowerCase())
-        .filter((s) => /^[0-9a-f]{4,40}$/.test(s))
-        .slice(0, 64);
+        .filter((s) => /^[0-9a-f]{4,40}$/.test(s)))];
+      // NEVER silently slice (2026-08-17 review blocker, verified by execution).
+      // The old `.slice(0, 64)` combined with a gate that demands EVERY dropped
+      // sha meant any release leaving >64 commits behind — the v1.3.120 field
+      // case was 71 — could never be acknowledged: the caller echoed the full
+      // acknowledgeRequired list, the validator quietly kept 64, the gate
+      // demanded them all, and the refusal named no cap. An agent obeying the
+      // instructions verbatim looped forever. The bound now exceeds the
+      // ancestry scan cap (500 per source, two sources), and overflowing it is
+      // a LOUD error naming the number — a divergence that large should be
+      // resolved, not acknowledged.
+      if (acknowledge.length > 1024) {
+        errors.push(`releaseIntent.acknowledge carries ${acknowledge.length} shas — the limit is 1024. A divergence this size should be resolved (merge or rebase the ref) rather than acknowledged away.`);
+      }
     }
   }
   if (errors.length) return { provided: true, ok: false, errors };
@@ -300,7 +312,16 @@ export function annotateAncestryOwnership(ancestry, sessions, { projectRoot, sel
   const peers = (Array.isArray(sessions) ? sessions : []).filter((s) => s && s.id !== selfId);
   if (!peers.length || !projectRoot) return ancestry;
 
-  const shas = ancestry.sources.flatMap((s) => (s.missing || []).map((c) => c.sha)).filter(Boolean);
+  // Probe the FULL dropped set (bounded by commitFiles' own max), not the
+  // 8-per-source display list. Probing only the display meant a live peer's
+  // dropped commit at recency rank ≥9 stayed anonymous, peerOwnedCount
+  // undercounted the headline, and "owned commits sort to the top" was
+  // unimplementable — all four pre-release reviews converged on this
+  // (2026-08-17). Newest-first within each source so the bound spends itself
+  // on the commits someone is most likely waiting for.
+  const shas = ancestry.sources.flatMap((s) => (
+    Array.isArray(s.allShas) && s.allShas.length ? s.allShas : (s.missing || []).map((c) => c.sha)
+  )).filter(Boolean);
   if (!shas.length) return ancestry;
   let touched;
   try {
@@ -326,53 +347,84 @@ export function annotateAncestryOwnership(ancestry, sessions, { projectRoot, sel
   // itself a release-integrity defect. Ownership therefore requires at least one
   // file that is NOT in most peers' scope; commits whose overlap is entirely
   // shared are still reported, just not promoted or counted as peer-owned.
+  // The RELEASING session's own scope counts toward "shared", though it can
+  // never be an owner: with a single scoped peer the old threshold of 2 was
+  // unreachable, so a universal file (the pending release-notes doc, a strings
+  // catalog) that both the peer and the releaser had declared made the peer
+  // "owner" of every commit touching it (2026-08-17 review catch).
+  const self = (Array.isArray(sessions) ? sessions : []).find((s) => s && s.id === selfId);
+  const selfScope = self ? scopeOf(self) : new Set();
   const claimCount = new Map();
   for (const { scope } of peerScopes) {
     for (const key of scope) claimCount.set(key, (claimCount.get(key) || 0) + 1);
   }
-  const sharedThreshold = Math.max(2, Math.ceil(peerScopes.length / 2));
+  for (const key of selfScope) claimCount.set(key, (claimCount.get(key) || 0) + 1);
+  const sharedThreshold = Math.max(2, Math.ceil((peerScopes.length + (selfScope.size ? 1 : 0)) / 2));
   const isShared = (key) => (claimCount.get(key) || 0) >= sharedThreshold;
 
   const lookup = (sha) => {
     const key = String(sha || '').toLowerCase();
-    for (const [full, files] of touched) if (full.startsWith(key) || key.startsWith(full)) return files;
+    for (const [full, entry] of touched) if (full.startsWith(key) || key.startsWith(full)) return entry;
     return null;
+  };
+
+  const ownersFor = (sha) => {
+    const entry = lookup(sha);
+    if (!entry || !entry.files || !entry.files.length) return { owners: null, entry };
+    const keys = entry.files.map((f) => normalizeFileKey(f, projectRoot)).filter(Boolean);
+    const owners = peerScopes
+      .map(({ peer, scope }) => {
+        const overlap = keys.filter((k) => scope.has(k));
+        if (!overlap.length) return null;
+        const distinctive = overlap.filter((k) => !isShared(k));
+        return {
+          sessionId: peer.id,
+          prefix: String(peer.id).slice(0, 8),
+          branch: peer.branch || null,
+          intent: peer.intent ? String(peer.intent).slice(0, 120) : null,
+          // Lead with the files that actually identify this owner.
+          files: [...distinctive, ...overlap.filter((k) => isShared(k))].slice(0, 4),
+          sharedScopeOnly: distinctive.length === 0,
+        };
+      })
+      .filter(Boolean);
+    if (!owners.length) return { owners: null, entry };
+    const strong = owners.filter((o) => !o.sharedScopeOnly);
+    return { owners: [...strong, ...owners.filter((o) => o.sharedScopeOnly)], strong: strong.length > 0, entry };
   };
 
   let peerOwnedCount = 0;
   const sources = ancestry.sources.map((source) => {
+    const displayed = new Map((source.missing || []).map((c) => [String(c.sha || '').toLowerCase(), c]));
     const annotated = (source.missing || []).map((commit) => {
-      const files = lookup(commit.sha);
-      if (!files || !files.length) return commit;
-      const keys = files.map((f) => normalizeFileKey(f, projectRoot)).filter(Boolean);
-      const owners = peerScopes
-        .map(({ peer, scope }) => {
-          const overlap = keys.filter((k) => scope.has(k));
-          if (!overlap.length) return null;
-          const distinctive = overlap.filter((k) => !isShared(k));
-          return {
-            sessionId: peer.id,
-            prefix: String(peer.id).slice(0, 8),
-            branch: peer.branch || null,
-            intent: peer.intent ? String(peer.intent).slice(0, 120) : null,
-            // Lead with the files that actually identify this owner.
-            files: [...distinctive, ...overlap.filter((k) => isShared(k))].slice(0, 4),
-            sharedScopeOnly: distinctive.length === 0,
-          };
-        })
-        .filter(Boolean);
-      if (!owners.length) return commit;
-      // Strong owners first; a commit with none is attributed but not promoted.
-      const strong = owners.filter((o) => !o.sharedScopeOnly);
-      if (strong.length) peerOwnedCount++;
-      return { ...commit, owners: [...strong, ...owners.filter((o) => o.sharedScopeOnly)] };
+      const { owners, strong } = ownersFor(commit.sha);
+      if (!owners) return commit;
+      if (strong) peerOwnedCount++;
+      return { ...commit, owners };
     });
+    // PROMOTE strong-owned commits that fell outside the display into it: the
+    // whole point of the join is that a commit with a live owner must never be
+    // invisible. Their subject comes from the same bounded git probe. Bounded to
+    // the display cap so a pathological lane cannot flood the refusal.
+    const promoted = [];
+    const candidateShas = Array.isArray(source.allShas) && source.allShas.length
+      ? source.allShas : [];
+    for (const full of candidateShas) {
+      if (promoted.length >= 8) break;
+      const isDisplayed = [...displayed.keys()].some((short) => full.startsWith(short) || short.startsWith(full));
+      if (isDisplayed) continue;
+      const { owners, strong, entry } = ownersFor(full);
+      if (!owners || !strong) continue;
+      peerOwnedCount++;
+      promoted.push({ sha: full.slice(0, 9), subject: (entry && entry.subject) || '', owners, promoted: true });
+    }
     // Peer-owned commits sort to the TOP: they are the ones with a person
     // attached, and the list is truncated for display, so they must not be the
     // entries that fall off the bottom.
     const strongOwned = (c) => Array.isArray(c.owners) && c.owners.some((o) => !o.sharedScopeOnly);
     const ordered = [
       ...annotated.filter(strongOwned),
+      ...promoted,
       ...annotated.filter((c) => !strongOwned(c)),
     ];
     return { ...source, missing: ordered };
@@ -2726,9 +2778,17 @@ export function createMcpPresence({
             ? s.allShas
             : (s.missing || []).map((c) => c.sha)
         )).map((s) => String(s || '')).filter(Boolean))];
-        const namedInProse = new Set((anc.sources || [])
-          .flatMap((s) => s.missing || []).map((c) => String(c.sha || '')));
-        const unnamed = shas.filter((s) => !namedInProse.has(s)).length;
+        // PREFIX-tolerant, both directions (2026-08-17 review catch, verified by
+        // execution): the prose shows abbreviated `%h` shas while allShas are
+        // full 40-char, so an exact Set.has never matched and the honesty NOTE
+        // claimed "only 0 spelled out above" on every refusal — the one sentence
+        // added for honesty contradicted the sha list directly above it.
+        const namedInProse = [...new Set((anc.sources || [])
+          .flatMap((s) => s.missing || []).map((c) => String(c.sha || '').toLowerCase()).filter(Boolean))];
+        const unnamed = shas.filter((s) => {
+          const full = String(s).toLowerCase();
+          return !namedInProse.some((p) => full.startsWith(p) || p.startsWith(full));
+        }).length;
         releaseLease = {
           status: 'refused',
           kind: 'release-would-leave-work-behind',
@@ -2741,8 +2801,13 @@ export function createMcpPresence({
             sources: anc.sources,
           },
           // Exactly what the retry must echo. Named so a caller never has to
-          // guess the shape of the second call.
-          acknowledgeRequired: shas,
+          // guess the shape of the second call. NEVER populated on the
+          // 'unnameable' path: the gate refuses that status unconditionally, so
+          // listing shas there instructs an acknowledge that can never succeed
+          // (2026-08-17 review catch — the primary fix renders bare shas at the
+          // source so 'unnameable' now truly means no shas at all; this guard is
+          // the belt to that suspender).
+          acknowledgeRequired: anc.status === 'unnameable' ? [] : shas,
         };
         releaseText = [
           'KLYPIX release lease REFUSED — the lease was not taken. No release state changed.',
@@ -2753,7 +2818,7 @@ export function createMcpPresence({
           // retry made the bypass the easiest thing on screen — an agent could
           // copy it and never say a word to anyone. The shas are listed above;
           // reproducing them is the work, and the work is the point.
-          shas.length
+          (anc.status !== 'unnameable' && shas.length)
             ? [
               `To proceed anyway, re-send releaseIntent with an "acknowledge" array naming each of the ${shas.length} sha(s) in acknowledgeRequired.`,
               unnamed

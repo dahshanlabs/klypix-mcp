@@ -2002,6 +2002,33 @@ export function rankForQuestion(struct, question, { semantic = null, k = 10, as_
         // the embedding side, not from reweighting here. The kept behaviors are
         // pinned numerically in test/retrieval-fusion.mjs — a change that trips
         // that suite must re-run the harness before shipping.
+        //
+        // THE EMBEDDING SIDE WAS THEN SWEPT TOO (2026-08-17, n=113 frozen v2,
+        // real 2,553-card brain, production contract via embedTexts — prefix,
+        // CLS, normalize; ordering = this function's semantic formula):
+        //   bge-small q8 (ships)  MRR .436 · @5 61 · paraphrase 46   baseline
+        //   bge-small fp32        MRR .456 · @5 60 · paraphrase 46   — so the
+        //     q8 quantization is NOT the ceiling; the 384-dim model is.
+        //   bge-base  q8 (768d)   MRR .475 · @5 61 · paraphrase 51 [39,63] vs
+        //     [34,58] — every needle right, none CI-clearing, at 2.4× embed
+        //     cost (622s vs 255s full-brain) and ~3× download. NOT flipped.
+        //   exact-duplicate collapse at rank time: FLAT (61→61, para 46→46),
+        //     confirming the MMR-deferral result above by a second route.
+        //   1,500-char truncation: measurably NOT a failure mode — gold cards
+        //     >1,500 chars score BETTER (@5 71% vs 57%), and 0 of 34 paraphrase
+        //     misses attribute to it. "We truncate, therefore we miss" is
+        //     falsified; do not chunk on that rationale.
+        //   (gte-small collapsed to MRR .17 under this contract — it wants mean
+        //     pooling and no prefix, so that number is contract mismatch, not a
+        //     fair test of gte.)
+        // Failure signature stands: cosine COMPRESSION — on paraphrase misses
+        // the gold sits a median 0.040 cosine below the 5th hit, 21/34 at rank
+        // >50, 6/34 outside the 200 pool. Same-class drop-in models do not fix
+        // that on this corpus. The remaining live path is DOC-SIDE enrichment
+        // (capture-time question/intent text embedded alongside the card) or a
+        // genuinely larger embedder — both are product decisions with shipping
+        // costs, not tuning. Runner: scratchpad ab-runner.mjs pattern — embed
+        // through embedTexts with a swapped pipe, never a hand-copied contract.
         const semRank = new Map(scored
             .filter(hit => Number.isFinite(hit.sem))
             .sort((a, b) => b.sem - a.sem)

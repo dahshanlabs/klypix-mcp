@@ -624,7 +624,11 @@ function partialConsumptionSplit(receipt) {
   if (!receipt.consumed) return '';
   const weak = (receipt.consumedByLease || 0) + (receipt.consumedUnknownVia || 0);
   if (!weak) return '';
-  return ` (${receipt.consumedByReceipt || 0} by receipt, ${weak} auto-consumed)`;
+  // 'auto-consumed' is itself a mechanism claim; an unknown-route record (older
+  // engine wrote it) must not be folded into it (2026-08-17 review catch).
+  return receipt.consumedUnknownVia
+    ? ` (${receipt.consumedByReceipt || 0} by receipt, ${weak} auto-consumed or unrecorded)`
+    : ` (${receipt.consumedByReceipt || 0} by receipt, ${weak} auto-consumed)`;
 }
 
 // One honest line per receipt. `pending` is listed by id-prefix up to 4 — a name

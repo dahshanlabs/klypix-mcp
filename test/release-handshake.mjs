@@ -110,10 +110,29 @@ ok('and the error names the field', /acknowledge/.test(bad.errors.join(' ')));
 const none = validateReleaseIntent({ version: '1.2.3', ref: 'release/x' });
 ok('acknowledge is optional', none.ok === true && Array.isArray(none.acknowledge) && none.acknowledge.length === 0);
 
+// The old assertion here — `flood.acknowledge.length <= 64` — pinned a silent
+// slice as if it were a safety feature. Combined with a gate that demands EVERY
+// dropped sha, that slice made any release leaving >64 commits behind
+// permanently unacknowledgeable: the caller echoed the full acknowledgeRequired
+// list, the validator quietly kept 64, the gate demanded them all, and no error
+// named the cap (2026-08-17 review blocker, verified by execution on the
+// 71-commit v1.3.120 field case). The contract now: everything the ancestry
+// scan can demand (≤500/source) is accepted in full; beyond 1024 the validator
+// fails LOUDLY — a divergence that size should be resolved, not acknowledged.
 const flood = validateReleaseIntent({
   version: '1.2.3', ref: 'r', acknowledge: Array.from({ length: 500 }, (_, i) => `abc${String(i).padStart(4, '0')}`),
 });
-ok('acknowledge is bounded against a flood', flood.acknowledge.length <= 64);
+ok('500 valid shas — the full ancestry-scan bound — are ALL kept, never silently sliced',
+  flood.ok === true && flood.acknowledge.length === 500);
+const dupFlood = validateReleaseIntent({
+  version: '1.2.3', ref: 'r', acknowledge: Array.from({ length: 200 }, () => 'abcd1234'),
+});
+ok('duplicate shas dedupe rather than eat the bound', dupFlood.ok === true && dupFlood.acknowledge.length === 1);
+const overflow = validateReleaseIntent({
+  version: '1.2.3', ref: 'r', acknowledge: Array.from({ length: 1500 }, (_, i) => `beef${String(i).padStart(5, '0')}`),
+});
+ok('beyond 1024 the validator fails LOUDLY instead of slicing',
+  overflow.ok === false && overflow.errors.some((e) => /1024|resolved/.test(e)));
 
 // ---- H3 / H8 / H9 — the wiring, asserted against the shipping source ----
 // No UI harness exists and the gateway is a 2,600-line function; these are

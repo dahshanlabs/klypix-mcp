@@ -1,12 +1,14 @@
 # Every project gets a brain.
 
-**A portable project workspace with a shared brain.**
+**Active state management for multi-agent coding — a local-first active context engine with a shared brain.**
 *One project. One shared understanding.*
 
-**One shared project brain for multi-agent coding.** `klypix-mcp` gives supported coding agents
-and humans one versioned `brain.klypix` in your repo, containing current decisions, corrections,
-evidence anchors, open questions, active work, and handoffs. Agents read it and write to it over
-MCP. You read it and correct it in the [KLYPIX app](https://klypix.com).
+**One actively managed project brain for multi-agent coding.** `klypix-mcp` keeps one versioned
+`brain.klypix` in your repo: the project's active state — current decisions, corrections, evidence
+anchors, open questions, active work, and handoffs. Corrections supersede stale decisions,
+`brain_challenge` tests proposed decisions against standing rules and reversed approaches, and
+sessions declare their scope and get warned about same-machine file overlap. Agents read it and
+write to it over MCP. You read it and correct it in the [KLYPIX app](https://klypix.com).
 
 > **One project. Many agents. One current understanding.**
 

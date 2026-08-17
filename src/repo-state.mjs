@@ -221,6 +221,71 @@ export function commitFiles(projectDir, shas, { execGit = defaultExecGit, timeou
   return out;
 }
 
+/**
+ * Settle staked release claims against the release ref.
+ *
+ * A claim is the durable half of "you'll see it in the next build": shas an
+ * owner promised would ride the next release, surviving the owner's session.
+ * Ancestry compares trunk and LIVE peer branches; a claim covers exactly the
+ * hole that leaves — a commit on a branch nobody is on any more.
+ *
+ * Per sha, three honest outcomes: contained in the ref, MISSING from it, or
+ * UNRESOLVABLE (the sha is gone — rebase/squash rewrote it, or the branch was
+ * deleted). Unresolvable is reported as its own state, never silently treated
+ * as contained (that would let history rewriting clear a claim) and never as
+ * missing (the remedy differs: the owner must re-stake the rewritten shas).
+ *
+ * Bounded: at most `maxChecks` unique shas are probed; anything beyond is
+ * marked unverified and SAID so — a capped check must never read as a full one.
+ */
+export function settleClaimsAgainstRef(projectDir, ref, claims, { execGit = defaultExecGit, maxChecks = 64 } = {}) {
+  const git = makeGit(execGit);
+  const dir = String(projectDir || '');
+  const target = String(ref || '').trim();
+  const list = Array.isArray(claims) ? claims : [];
+  if (!dir || !target || !list.length) return [];
+  const verdictCache = new Map();   // sha -> 'contained' | 'missing' | 'unresolvable' | 'unverified'
+  let checks = 0;
+  const verdictFor = (sha) => {
+    if (verdictCache.has(sha)) return verdictCache.get(sha);
+    let verdict;
+    if (checks >= maxChecks) {
+      verdict = 'unverified';
+    } else {
+      checks++;
+      if (git(dir, ['rev-parse', '--verify', '--quiet', `${sha}^{commit}`]) === null) {
+        verdict = 'unresolvable';
+      } else {
+        // makeGit maps a non-zero exit to null, so "not an ancestor" and a
+        // failed spawn look identical here — both must BLOCK (missing), never
+        // pass: over-reporting is a conversation, under-reporting ships a
+        // build without the claimed work.
+        verdict = git(dir, ['merge-base', '--is-ancestor', sha, target]) === null ? 'missing' : 'contained';
+      }
+    }
+    verdictCache.set(sha, verdict);
+    return verdict;
+  };
+  return list.map((claim) => {
+    const missing = [];
+    const unresolvable = [];
+    const unverified = [];
+    for (const sha of claim.shas || []) {
+      const verdict = verdictFor(String(sha).toLowerCase());
+      if (verdict === 'missing') missing.push(sha);
+      else if (verdict === 'unresolvable') unresolvable.push(sha);
+      else if (verdict === 'unverified') unverified.push(sha);
+    }
+    return {
+      claim,
+      missing,
+      unresolvable,
+      unverified,
+      contained: !missing.length && !unresolvable.length && !unverified.length,
+    };
+  });
+}
+
 export function releaseAncestry(projectDir, ref, { execGit = defaultExecGit, peerBranches = [] } = {}) {
   const git = makeGit(execGit);
   const dir = String(projectDir || '');

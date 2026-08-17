@@ -1235,6 +1235,9 @@ function normalizeReleaseLease(raw) {
   const refreshedAt = Number(raw.refreshedAt || raw.takenAt || 0);
   if (!holderId || !version || !ref || !takenAt || !refreshedAt) return null;
   const ttlMs = Math.max(60_000, Number(raw.ttlMs) || RELEASE_LEASE_TTL_MS);
+  const acknowledgedShas = [...new Set((Array.isArray(raw.acknowledgedShas) ? raw.acknowledgedShas : [])
+    .map((x) => String(x || '').trim().toLowerCase())
+    .filter((x) => /^[0-9a-f]{4,40}$/.test(x)))].slice(0, 2048);
   return {
     holderId,
     holderClient: String(raw.holderClient || 'unknown').slice(0, 40),
@@ -1244,6 +1247,7 @@ function normalizeReleaseLease(raw) {
     refreshedAt,
     ttlMs,
     expiresAt: refreshedAt + ttlMs,
+    ...(acknowledgedShas.length ? { acknowledgedShas } : {}),
   };
 }
 
@@ -1327,6 +1331,14 @@ export function declareReleaseLease({
   home,
   now = Date.now(),
   ttlMs = RELEASE_LEASE_TTL_MS,
+  // Shas this declaration acknowledged away (ancestry + claims). PERSISTED on
+  // the lease so a holder's refresh does not have to re-litigate them: without
+  // this, the natural refresh pattern — keep attaching the same releaseIntent —
+  // was refused on the very claim the holder had already acknowledged, the
+  // else-chain skipped the refresh, and the lease starved mid-build: the exact
+  // failure the lease-loss warning exists for, rebuilt by the claims gate
+  // (2026-08-17 review blocker B1, found independently by all four lenses).
+  acknowledgedShas = [],
 }) {
   const holderId = recipientKey(sessionId);
   const nextVersion = releaseLeaseVersionKey(version);
@@ -1338,6 +1350,14 @@ export function declareReleaseLease({
       return { write: false, outcome: { ok: false, status: 'conflict', holder: verdict.lease } };
     }
     const stillMine = mine && verdict?.status === 'active';
+    // Union with what the held lease already acknowledged — a re-declare with a
+    // NEW acknowledgement must extend the record, never erase the history that
+    // keeps the holder's refresh from re-refusing.
+    const priorAcks = stillMine && Array.isArray(verdict.lease.acknowledgedShas)
+      ? verdict.lease.acknowledgedShas : [];
+    const acks = [...new Set([...priorAcks, ...(Array.isArray(acknowledgedShas) ? acknowledgedShas : [])]
+      .map((x) => String(x || '').trim().toLowerCase())
+      .filter((x) => /^[0-9a-f]{4,40}$/.test(x)))].slice(0, 2048);
     const stored = {
       schemaVersion: 1,
       holderId,
@@ -1347,6 +1367,7 @@ export function declareReleaseLease({
       takenAt: stillMine ? verdict.lease.takenAt : now,
       refreshedAt: now,
       ttlMs: Math.max(60_000, Number(ttlMs) || RELEASE_LEASE_TTL_MS),
+      ...(acks.length ? { acknowledgedShas: acks } : {}),
     };
     const reclaimed = !stillMine && verdict ? verdict.status : null;
     return {
@@ -1428,6 +1449,191 @@ export function freeReleaseLease({ brainPath, sessionId, home, now = Date.now() 
       outcome: { ok: true, status: mine ? 'released' : 'stale-pruned', lease: verdict.lease },
     };
   } });
+}
+
+// ── Release claims — "my commits ride the next build", surviving session exit ─
+//
+// The presence half of the release gate dies with its session: rows age out in
+// ~10 minutes, after which a dropped commit reverts to an anonymous sha, and a
+// commit on a branch NO live session is on never enters the ancestry comparison
+// at all. Field shape (2026-08-17, founder-surfaced): a session promises "you'll
+// see it in the next build", closes, and the next release passes every gate
+// while silently leaving that work behind — the exact v1.3.120 failure, one
+// session-lifetime later. A claim is that promise made DURABLE: shas + owner +
+// note, persisted in the lane, checked against EVERY releaseIntent ref until it
+// is fulfilled, withdrawn, or expires.
+//
+// Deliberately NOT a lease: claims never conflict with each other, any number
+// may coexist, and fulfilment is mechanical (the shas are contained in the
+// release ref). Same identity model as the lease (a claim survives id rotation
+// via the logical-session match), same atomic lane write, same fail-loud
+// bounding — a store the gate depends on must never silently drop an entry.
+export const RELEASE_CLAIM_TTL_MS = 14 * 24 * 60 * 60 * 1000;
+export const RELEASE_CLAIMS_MAX = 32;
+export const RELEASE_CLAIM_SHAS_MAX = 20;
+
+const claimSha = (value) => {
+  const s = String(value || '').trim().toLowerCase();
+  return /^[0-9a-f]{4,40}$/.test(s) ? s : null;
+};
+
+function normalizeReleaseClaim(raw, now = Date.now()) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const ownerId = recipientKey(raw.ownerId);
+  const shas = [...new Set((Array.isArray(raw.shas) ? raw.shas : []).map(claimSha).filter(Boolean))]
+    .slice(0, RELEASE_CLAIM_SHAS_MAX);
+  const stakedAt = Number(raw.stakedAt || 0);
+  if (!ownerId || !shas.length || !stakedAt) return null;
+  const expiresAt = Number(raw.expiresAt || 0) || (stakedAt + RELEASE_CLAIM_TTL_MS);
+  if (now >= expiresAt) return null;
+  return {
+    ownerId,
+    ownerClient: String(raw.ownerClient || 'unknown').slice(0, 40),
+    ownerLogicalId: recipientKey(raw.ownerLogicalId) || null,
+    branch: String(raw.branch || '').slice(0, 120) || null,
+    note: String(raw.note || '').replace(/\s+/g, ' ').trim().slice(0, 160) || null,
+    shas,
+    stakedAt,
+    expiresAt,
+  };
+}
+
+const liveReleaseClaims = (raw, now = Date.now()) => (Array.isArray(raw) ? raw : [])
+  .map((c) => normalizeReleaseClaim(c, now))
+  .filter(Boolean);
+
+// A claim belongs to the caller when any identity in the caller's set matches
+// the identity the claim recorded — the same rotation-tolerant rule the lease
+// uses, because "the same conversation after /clear" must still own its claim.
+const sessionOwnsClaim = (claim, sessions, callerId) => {
+  const key = recipientKey(callerId);
+  if (!key || !claim) return false;
+  if (claim.ownerId === key || claim.ownerLogicalId === key) return true;
+  const me = (Array.isArray(sessions) ? sessions : [])
+    .find((s) => recipientKey(s.id) === key) || null;
+  if (!me) return false;
+  const mine = new Set([recipientKey(me.id), recipientKey(me.logicalSessionId),
+    ...normalizeAliases(me.aliases).map(recipientKey)].filter(Boolean));
+  return mine.has(claim.ownerId) || (claim.ownerLogicalId && mine.has(claim.ownerLogicalId));
+};
+
+function mutateReleaseClaims({ brainPath, home, now, mutate }) {
+  if (!brainPath) return { ok: false, status: 'no-brain' };
+  const laneFile = laneFileFor(brainPath, home);
+  const lockFile = laneFile + '.lock';
+  if (!acquireLock(lockFile)) return { ok: false, status: 'lane-locked' };
+  try {
+    const laneRead = readMutableLane(laneFile);
+    if (!laneRead.ok) return { ok: false, status: laneRead.reason };
+    const data = laneRead.data;
+    const sessions = pruneSessions(data.sessions, now);
+    const claims = liveReleaseClaims(data.releaseClaims, now);
+    const result = mutate({ data, sessions, claims });
+    if (result.write) {
+      const next = { ...data };
+      if (!result.claims || !result.claims.length) delete next.releaseClaims;
+      else next.releaseClaims = result.claims;
+      fs.mkdirSync(path.dirname(laneFile), { recursive: true });
+      writeLaneFileAtomic(laneFile, JSON.stringify(next));
+    }
+    return result.outcome;
+  } finally {
+    releaseLock(lockFile);
+  }
+}
+
+// Stake (or extend) this session's claim. One claim per owner: re-staking
+// UNIONS the shas and refreshes note/expiry, so a session adding a second
+// commit does not spawn a second entry. The lane bound fails LOUD — silently
+// dropping a claim the gate depends on is the 1.74.0 livelock lesson applied
+// to a different store.
+export function stakeReleaseClaim({ brainPath, sessionId, client, logicalSessionId, branch, shas, note, home, now = Date.now() }) {
+  const ownerId = recipientKey(sessionId);
+  const cleanShas = [...new Set((Array.isArray(shas) ? shas : []).map(claimSha).filter(Boolean))];
+  if (!ownerId) return { ok: false, status: 'no-session' };
+  if (!cleanShas.length) return { ok: false, status: 'no-valid-shas' };
+  if (cleanShas.length > RELEASE_CLAIM_SHAS_MAX) {
+    return { ok: false, status: 'too-many-shas', limit: RELEASE_CLAIM_SHAS_MAX, given: cleanShas.length };
+  }
+  return mutateReleaseClaims({ brainPath, home, now, mutate: ({ sessions, claims }) => {
+    const mineIndex = claims.findIndex((c) => sessionOwnsClaim(c, sessions, ownerId));
+    if (mineIndex < 0 && claims.length >= RELEASE_CLAIMS_MAX) {
+      return { write: false, outcome: { ok: false, status: 'claims-full', limit: RELEASE_CLAIMS_MAX } };
+    }
+    const existing = mineIndex >= 0 ? claims[mineIndex] : null;
+    // The union must never silently shed a promised sha (review blocker B2 —
+    // executed: stake 15 + extend 10 reported 'extended' while 5 promised shas
+    // vanished; the v1.3.120 silent-drop class recurring inside its own fix).
+    const unionSize = new Set([...(existing?.shas || []), ...cleanShas]).size;
+    if (unionSize > RELEASE_CLAIM_SHAS_MAX) {
+      return { write: false, outcome: {
+        ok: false, status: 'claim-would-overflow',
+        limit: RELEASE_CLAIM_SHAS_MAX, existing: (existing?.shas || []).length, adding: cleanShas.length,
+      } };
+    }
+    const merged = {
+      ownerId,
+      ownerClient: String(client || existing?.ownerClient || 'unknown').slice(0, 40),
+      ownerLogicalId: recipientKey(logicalSessionId) || existing?.ownerLogicalId || null,
+      branch: String(branch || existing?.branch || '').slice(0, 120) || null,
+      note: String(note || existing?.note || '').replace(/\s+/g, ' ').trim().slice(0, 160) || null,
+      shas: [...new Set([...(existing?.shas || []), ...cleanShas])],
+      stakedAt: existing?.stakedAt || now,
+      expiresAt: now + RELEASE_CLAIM_TTL_MS,
+    };
+    const next = mineIndex >= 0
+      ? claims.map((c, i) => (i === mineIndex ? merged : c))
+      : [...claims, merged];
+    return { write: true, claims: next, outcome: { ok: true, status: mineIndex >= 0 ? 'extended' : 'staked', claim: merged } };
+  } });
+}
+
+// Withdraw shas from this session's claim (empty/omitted shas = the whole
+// claim). Only the owner's identity set can withdraw — a releasing session
+// must acknowledge a foreign claim through the gate, never delete it.
+export function withdrawReleaseClaim({ brainPath, sessionId, shas, home, now = Date.now() }) {
+  const ownerId = recipientKey(sessionId);
+  if (!ownerId) return { ok: false, status: 'no-session' };
+  const drop = new Set((Array.isArray(shas) ? shas : []).map(claimSha).filter(Boolean));
+  return mutateReleaseClaims({ brainPath, home, now, mutate: ({ sessions, claims }) => {
+    const mineIndex = claims.findIndex((c) => sessionOwnsClaim(c, sessions, ownerId));
+    if (mineIndex < 0) return { write: false, outcome: { ok: true, status: 'no-claim' } };
+    const mine = claims[mineIndex];
+    const kept = drop.size
+      ? mine.shas.filter((s) => ![...drop].some((d) => s.startsWith(d) || d.startsWith(s)))
+      : [];
+    const next = kept.length
+      ? claims.map((c, i) => (i === mineIndex ? { ...mine, shas: kept } : c))
+      : claims.filter((_, i) => i !== mineIndex);
+    return { write: true, claims: next, outcome: { ok: true, status: kept.length ? 'trimmed' : 'withdrawn', remaining: kept.length } };
+  } });
+}
+
+// Retire specific (claim owner, shas) pairs after a release FULFILLS them —
+// called by the gateway on a granted lease whose ref contains the shas. Whole
+// claims disappear only when every sha they carry is fulfilled.
+export function retireFulfilledClaims({ brainPath, fulfilled, home, now = Date.now() }) {
+  const byOwner = new Map((Array.isArray(fulfilled) ? fulfilled : [])
+    .map((f) => [recipientKey(f?.ownerId), new Set((f?.shas || []).map(claimSha).filter(Boolean))]));
+  if (!byOwner.size) return { ok: true, status: 'nothing-to-retire' };
+  return mutateReleaseClaims({ brainPath, home, now, mutate: ({ claims }) => {
+    let changed = false;
+    const next = claims.map((c) => {
+      const done = byOwner.get(c.ownerId);
+      if (!done || !done.size) return c;
+      const kept = c.shas.filter((s) => !done.has(s));
+      if (kept.length !== c.shas.length) changed = true;
+      return kept.length ? { ...c, shas: kept } : null;
+    }).filter(Boolean);
+    if (!changed) return { write: false, outcome: { ok: true, status: 'nothing-to-retire' } };
+    return { write: true, claims: next, outcome: { ok: true, status: 'retired' } };
+  } });
+}
+
+// Read-only: live claims. Lock-free like every other read surface.
+export function readReleaseClaims({ brainPath, home, now = Date.now() } = {}) {
+  if (!brainPath) return [];
+  return liveReleaseClaims(readLane(laneFileFor(brainPath, home)).releaseClaims, now);
 }
 
 // A long-lived MCP worker can observe SessionEnd(A) and then receive the first
@@ -2200,6 +2406,15 @@ export function postPresenceMessage({
   dedupeKey = '',
   home,
   now = Date.now(),
+  // Machine-addressed notifications only (claim owners, ancestry owners): the
+  // exact recipient id is KNOWN, and the recipient being offline is the very
+  // case the notification exists for — a staked claim outlives its session, so
+  // its owner may be gone when the release that drops their work is declared.
+  // The message waits directed in the lane (24h TTL, sender-visible dead-letter
+  // on expiry) and greets the owner's next session. NEVER set this for
+  // hand-typed targets: the exactly-one-live-row refusal below is what keeps an
+  // ambiguous prefix from queuing a note nobody will ever receive.
+  allowOfflineTarget = false,
 }) {
   const body = neutralizeMarkers(String(text || '').replace(/\s+/g, ' ').trim().slice(0, 400));
   if (!brainPath || !from || !body) return { posted: false, message: null, reason: 'invalid-message' };
@@ -2238,7 +2453,11 @@ export function postPresenceMessage({
     // unsafe: it may be an ambiguous UUID prefix or duplicated branch. Refuse
     // instead of queuing a note whose visible `to` never had a recipient.
     if (!broadcast && candidateIds.length !== 1) {
-      return { posted: false, message: null, reason: 'target-not-unique' };
+      if (!(allowOfflineTarget && candidateIds.length === 0)) {
+        return { posted: false, message: null, reason: 'target-not-unique' };
+      }
+      // Offline machine-known recipient: address the exact id we were handed.
+      candidateIds.push(String(target).slice(0, 160));
     }
     const message = {
       id: sha16(`${from}|${to}|${body}|${now}|${crypto.randomBytes(4).toString('hex')}`),

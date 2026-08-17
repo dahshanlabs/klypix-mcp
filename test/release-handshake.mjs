@@ -141,8 +141,13 @@ const read = (rel) => fs.readFileSync(path.join(__dirname, '..', rel), 'utf8').r
 const PRESENCE = read('src/mcp-presence.mjs');
 const WORKER = read('bin/klypix-worker.mjs');
 
+// 1.75.0: the refusal status is now a ternary — ancestry and STAKED CLAIMS
+// share one short-circuit, so a refusal on either half must reach
+// declareReleaseLease only through the else branch.
 ok('H2 a refused lease is never declared — the refusal short-circuits the call',
-  /status: 'ancestry-unacknowledged'[\s\S]{0,400}?\} else \{[\s\S]{0,200}?declareReleaseLease/.test(PRESENCE));
+  /status: ancestryBlocks \? 'ancestry-unacknowledged' : 'claims-unacknowledged'[\s\S]{0,500}?\} else \{[\s\S]{0,300}?declareReleaseLease/.test(PRESENCE));
+ok('H2b claims refuse through the SAME gate condition, not a separate later check',
+  /if \(ancestryBlocks \|\| claimsRefuse\)/.test(PRESENCE));
 ok('H2 the refusal says nothing was changed', /lease was not taken. No release state changed/.test(PRESENCE));
 ok('H3 the refusal carries the shas the retry must echo', /acknowledgeRequired/.test(PRESENCE));
 // The first version pre-rendered a copy-pasteable retry call. An adversarial

@@ -22,9 +22,14 @@ import {
   messageDecayInfo,
   peekMessages,
   pinLaneIdentity,
+  neutralizeMarkers,
   postPresenceMessage,
+  readReleaseClaims,
   readReleaseLease,
   receiveMessages,
+  retireFulfilledClaims,
+  stakeReleaseClaim,
+  withdrawReleaseClaim,
   refreshReleaseLease,
   rekeySessionIdentity,
   rotateEndedSessionIdentity,
@@ -40,7 +45,7 @@ import {
 // canonical copy lives in the pure module because that one is import-restricted
 // (crypto only), so it can never grow a dependency this file would inherit.
 import { normalizeFileKey } from './finding-routing.mjs';
-import { cmpSemver3, collectRepoState, commitFiles, releaseAncestry, releaseAncestryWarnings, repoStateWarnings } from './repo-state.mjs';
+import { cmpSemver3, collectRepoState, commitFiles, releaseAncestry, releaseAncestryWarnings, repoStateWarnings, settleClaimsAgainstRef } from './repo-state.mjs';
 import { recordResultManifests } from './result-reconcile.mjs';
 
 export const MCP_HEARTBEAT_MS = 60_000;
@@ -271,6 +276,48 @@ export function validateReleaseIntent(value) {
   }
   if (errors.length) return { provided: true, ok: false, errors };
   return { provided: true, ok: true, version: version.replace(/^v/i, ''), ref, acknowledge };
+}
+
+/**
+ * Validate the releaseClaim input — the durable "my commits ride the next
+ * build" promise. Fail-closed like releaseIntent: a malformed claim must
+ * never half-sync, and never silently stake less than the caller asked
+ * (the 1.74.0 acknowledge-slice lesson, applied at the door).
+ * Shapes: { shas: [...], note? } stakes/extends; { withdraw: [...] } trims
+ * ({ withdraw: [] } or { withdraw: true } clears the whole claim).
+ */
+export function validateReleaseClaim(value) {
+  if (value === undefined || value === null) return { provided: false, ok: true };
+  const errors = [];
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    return { provided: true, ok: false, errors: ['releaseClaim must be an object: { shas: [...], note? } to stake, { withdraw: [...] } to withdraw'] };
+  }
+  const hasStake = value.shas !== undefined;
+  const hasWithdraw = value.withdraw !== undefined;
+  if (hasStake === hasWithdraw) {
+    errors.push('releaseClaim needs exactly one of `shas` (stake) or `withdraw`');
+  }
+  const parseShas = (raw, field) => {
+    if (!Array.isArray(raw)) { errors.push(`releaseClaim.${field} must be an array of commit shas`); return []; }
+    const clean = [...new Set(raw
+      .filter((x) => typeof x === 'string')
+      .map((x) => x.trim().toLowerCase())
+      .filter((x) => /^[0-9a-f]{4,40}$/.test(x)))];
+    if (raw.length && !clean.length) errors.push(`releaseClaim.${field} contained no valid shas (4-40 hex chars each)`);
+    if (clean.length > 20) errors.push(`releaseClaim.${field} carries ${clean.length} shas — the limit is 20; claim the branch-defining commits, not the whole history`);
+    return clean;
+  };
+  let shas = [];
+  let withdrawShas = [];
+  let withdrawAll = false;
+  if (hasStake) shas = parseShas(value.shas, 'shas');
+  if (hasWithdraw) {
+    if (value.withdraw === true || (Array.isArray(value.withdraw) && !value.withdraw.length)) withdrawAll = true;
+    else withdrawShas = parseShas(value.withdraw, 'withdraw');
+  }
+  const note = typeof value.note === 'string' ? value.note.replace(/\s+/g, ' ').trim().slice(0, 160) : null;
+  if (errors.length) return { provided: true, ok: false, errors };
+  return { provided: true, ok: true, stake: hasStake, shas, withdraw: hasWithdraw, withdrawShas, withdrawAll, note };
 }
 
 /**
@@ -2074,6 +2121,7 @@ export function createMcpPresence({
     phase = 'checkpoint',
     results,
     releaseIntent,
+    releaseClaim,
     deliverMessages = true,
     include_context,
     actionId = '',
@@ -2100,6 +2148,23 @@ export function createMcpPresence({
         'KLYPIX release intent was rejected; no task, lease, presence, or message state changed.',
         ...releaseIntentChecked.errors.map((error) => `- ${error}`),
         'Supply releaseIntent as { version: "X.Y.Z", ref: "<git branch or tag>" }.',
+      ].join('\n');
+      return report;
+    }
+    const releaseClaimChecked = validateReleaseClaim(releaseClaim);
+    if (releaseClaimChecked.provided && !releaseClaimChecked.ok) {
+      const report = syncPreflightFailure({
+        status: 'invalid-release-claim',
+        reason: 'release-claim-malformed',
+        requestedProject: typeof project === 'string' ? project.slice(0, 512) : null,
+      });
+      report.structured.phase = nextPhase;
+      report.structured.errors = releaseClaimChecked.errors.map((message) => ({ message }));
+      report.structured.timingMs.coordination = Math.max(0, Date.now() - syncStartedAt);
+      report.text = [
+        'KLYPIX release claim was rejected; no task, lease, claim, presence, or message state changed.',
+        ...releaseClaimChecked.errors.map((error) => `- ${error}`),
+        'Supply releaseClaim as { shas: ["<sha>", ...], note?: "why it matters" } to stake, or { withdraw: [...] } to withdraw.',
       ].join('\n');
       return report;
     }
@@ -2648,9 +2713,36 @@ export function createMcpPresence({
     let releaseAdvisoryText = '';
     let workAtRisk = null;
     let workAtRiskText = '';
+    let releaseClaimResult = null;
     {
       const leaseStamp = now();
       let outcome = null;
+      // ── Release CLAIM: the durable "my commits ride the next build" ──────
+      // Executed BEFORE any releaseIntent gating in the same call, so a
+      // stake+declare combination sees its own fresh claim — symmetric with
+      // every other session's, deliberately.
+      if (releaseClaimChecked.provided) {
+        const selfRow = (report.sessions || []).find((s) => s?.id === sessionId) || {};
+        releaseClaimResult = releaseClaimChecked.withdraw
+          ? withdrawReleaseClaim({
+            brainPath,
+            sessionId,
+            shas: releaseClaimChecked.withdrawAll ? [] : releaseClaimChecked.withdrawShas,
+            home,
+            now: leaseStamp,
+          })
+          : stakeReleaseClaim({
+            brainPath,
+            sessionId,
+            client: (preparedClientInfo || {}).client || selfRow.client || 'unknown',
+            logicalSessionId: selfRow.logicalSessionId || null,
+            branch: selfRow.branch || null,
+            shas: releaseClaimChecked.shas,
+            note: releaseClaimChecked.note,
+            home,
+            now: leaseStamp,
+          });
+      }
       // Set when the holder's own sync arrived with the lease already close to
       // lapsing; reported after the refresh so the holder learns the habit that
       // protects them, not merely that nothing broke this time.
@@ -2680,9 +2772,14 @@ export function createMcpPresence({
         // to make silence insufficient: a session that cannot proceed without
         // reproducing the missing commits has, in practice, had to surface them.
         //
-        // Only a NEW declaration is gated. A holder refreshing mid-release is
-        // never re-blocked — that would be an obstacle, not a gate — and a
-        // deliberate off-trunk hotfix is one acknowledged call away.
+        // Only a NEW declaration is ANCESTRY-gated. A holder refreshing the
+        // same ref is never re-blocked on ancestry — that would be an obstacle,
+        // not a gate — and a deliberate off-trunk hotfix is one acknowledged
+        // call away. CLAIMS are the one exception: they settle on every
+        // declaration, because a claim staked after the lease was taken is
+        // exactly the promise the window between lease and build would
+        // otherwise swallow; acknowledgements persist on the lease so the
+        // holder re-litigates only what is genuinely NEW.
         const existingLease = readReleaseLease({ brainPath, home, now: leaseStamp });
         // recipientKey is module-private in agent-presence; the same normalization
         // (trim + 160-char bound) reproduced here rather than widening its surface.
@@ -2717,9 +2814,55 @@ export function createMcpPresence({
             gateAncestry = { status: 'unknown', reason: 'git-unavailable', ref: releaseIntentChecked.ref, isDescendant: false, missingCount: 0, sources: [], missing: [] };
           }
         }
-        if (gateAncestry && !gateAncestry.isDescendant
-          && !ancestryAcknowledged(gateAncestry, releaseIntentChecked.acknowledge)) {
-          outcome = { ok: false, status: 'ancestry-unacknowledged', ancestry: gateAncestry };
+        // ── STAKED CLAIMS gate — settled on EVERY declaration, including a
+        // holder's same-ref refresh. Ancestry compares trunk and LIVE peer
+        // branches; a claim covers exactly the hole that leaves: a commit whose
+        // owner has closed their session and whose branch nobody is on any
+        // more. A claim staked AFTER the lease was taken must still gate the
+        // next sync, or the window between lease and build is where a promise
+        // goes to die. Per-sha probe failures inside the settlement BLOCK
+        // (missing), never pass; only a catastrophic throw degrades to empty,
+        // and ancestry still stands guard on that path.
+        let claimSettlement = [];
+        try {
+          const stakedClaims = readReleaseClaims({ brainPath, home, now: leaseStamp });
+          if (stakedClaims.length) {
+            claimSettlement = settleClaimsAgainstRef(path.dirname(brainPath), releaseIntentChecked.ref, stakedClaims);
+          }
+        } catch { claimSettlement = []; }
+        const unmetClaims = claimSettlement.filter((entry) => !entry.contained);
+        const claimShasRequired = [...new Set(unmetClaims
+          .flatMap((entry) => [...entry.missing, ...entry.unresolvable, ...entry.unverified])
+          .map((sha) => String(sha).toLowerCase()))];
+        // The holder's PERSISTED acknowledgements count too (review blocker B1):
+        // a refresh checkpoint re-attaching the same releaseIntent must not be
+        // refused over a claim the holder already acknowledged at grant time.
+        // A claim staked SINCE then still gates — its shas are in no lease
+        // record — which is exactly the window the settle-on-every-declaration
+        // rule exists for.
+        const leaseAcks = sameRefAsHeld && Array.isArray(existingLease?.acknowledgedShas)
+          ? existingLease.acknowledgedShas : [];
+        const ackGiven = [...new Set([
+          ...(releaseIntentChecked.acknowledge || []),
+          ...leaseAcks,
+        ].map((g) => String(g).toLowerCase()))];
+        const claimsAcknowledged = claimShasRequired
+          .every((sha) => ackGiven.some((g) => sha.startsWith(g) || g.startsWith(sha)));
+        const ancestryBlocks = gateAncestry && !gateAncestry.isDescendant
+          && !ancestryAcknowledged(gateAncestry, ackGiven);
+        const claimsRefuse = claimShasRequired.length > 0 && !claimsAcknowledged;
+        if (ancestryBlocks || claimsRefuse) {
+          outcome = {
+            ok: false,
+            status: ancestryBlocks ? 'ancestry-unacknowledged' : 'claims-unacknowledged',
+            ancestry: gateAncestry
+              || { status: 'ok', ref: releaseIntentChecked.ref, isDescendant: true, missingCount: 0, sources: [], missing: [] },
+            unmetClaims,
+            // The refusal headline must not lie to a HOLDER: their held lease
+            // was not revoked — it just was not refreshed by this sync, and it
+            // lapses at TTL unless the new claim is acknowledged.
+            holderRefusal: sameRefAsHeld,
+          };
         } else {
           outcome = declareReleaseLease({
             brainPath,
@@ -2729,8 +2872,11 @@ export function createMcpPresence({
             client: (preparedClientInfo || {}).client || 'unknown',
             home,
             now: leaseStamp,
+            acknowledgedShas: ackGiven,
           });
           if (gateAncestry && !gateAncestry.isDescendant) outcome = { ...outcome, acknowledgedAncestry: gateAncestry };
+          if (unmetClaims.length) outcome = { ...outcome, acknowledgedClaims: unmetClaims };
+          if (claimSettlement.length) outcome = { ...outcome, claimSettlement };
         }
       } else if (clearCompletionScope) {
         const freed = freeReleaseLease({ brainPath, sessionId, home, now: leaseStamp });
@@ -2766,8 +2912,23 @@ export function createMcpPresence({
         refreshedAt: active.refreshedAt,
         expiresAt: active.expiresAt,
       } : null;
-      if (outcome?.status === 'ancestry-unacknowledged') {
+      if (outcome?.status === 'ancestry-unacknowledged' || outcome?.status === 'claims-unacknowledged') {
         const anc = outcome.ancestry;
+        // Staked-claim requirement rides the SAME refusal and the SAME
+        // acknowledge array: one gate, one handshake, whichever half tripped.
+        const unmetClaims = Array.isArray(outcome.unmetClaims) ? outcome.unmetClaims : [];
+        const claimShas = [...new Set(unmetClaims
+          .flatMap((entry) => [...entry.missing, ...entry.unresolvable, ...entry.unverified])
+          .map((sha) => String(sha).toLowerCase()))];
+        const claimLines = unmetClaims.map((entry) => {
+          const c = entry.claim;
+          const ageDays = Math.max(0, Math.round((leaseStamp - (c.stakedAt || leaseStamp)) / 86_400_000));
+          const parts = [];
+          if (entry.missing.length) parts.push(`${entry.missing.length} NOT in ${releaseIntentChecked.ref}: ${entry.missing.slice(0, 4).map((x) => x.slice(0, 9)).join(', ')}${entry.missing.length > 4 ? ` +${entry.missing.length - 4}` : ''}`);
+          if (entry.unresolvable.length) parts.push(`${entry.unresolvable.length} unresolvable (history rewritten? owner must re-stake): ${entry.unresolvable.slice(0, 3).map((x) => x.slice(0, 9)).join(', ')}`);
+          if (entry.unverified.length) parts.push(`${entry.unverified.length} unverified (probe budget)`);
+          return neutralizeMarkers(`STAKED CLAIM UNMET — session ${String(c.ownerId).slice(0, 8)} (${c.ownerClient}${c.branch ? `, ${c.branch}` : ''}) staked ${ageDays}d ago${c.note ? `: "${c.note}"` : ''} — ${parts.join(' · ')}. The owner may no longer be live; this claim is their voice.`);
+        });
         // The COMPLETE set the gate will demand, not the subset the prose names.
         // These two used to be the same list, which is how a release dropping 71
         // commits was acknowledged by naming 10. The prose still shows 8 per
@@ -2807,20 +2968,33 @@ export function createMcpPresence({
           // (2026-08-17 review catch — the primary fix renders bare shas at the
           // source so 'unnameable' now truly means no shas at all; this guard is
           // the belt to that suspender).
-          acknowledgeRequired: anc.status === 'unnameable' ? [] : shas,
+          acknowledgeRequired: [...new Set([...(anc.status === 'unnameable' ? [] : shas), ...claimShas])],
+          ...(unmetClaims.length ? { stakedClaims: unmetClaims.map((entry) => ({
+            owner: String(entry.claim.ownerId).slice(0, 8),
+            ownerClient: entry.claim.ownerClient,
+            branch: entry.claim.branch,
+            note: entry.claim.note,
+            stakedAt: entry.claim.stakedAt,
+            missing: entry.missing,
+            unresolvable: entry.unresolvable,
+            unverified: entry.unverified,
+          })) } : {}),
         };
         releaseText = [
-          'KLYPIX release lease REFUSED — the lease was not taken. No release state changed.',
+          outcome.holderRefusal
+            ? 'KLYPIX release refresh REFUSED — a claim staked SINCE your lease was granted is unmet. Your held lease was NOT revoked, but this sync did NOT refresh it: acknowledge the claim below or the lease lapses at its ~2h TTL.'
+            : 'KLYPIX release lease REFUSED — the lease was not taken. No release state changed.',
           '',
           ...releaseAncestryWarnings(anc),
+          ...(claimLines.length ? ['', ...claimLines] : []),
           '',
           // Deliberately NOT a ready-to-paste call. Pre-rendering the exact
           // retry made the bypass the easiest thing on screen — an agent could
           // copy it and never say a word to anyone. The shas are listed above;
           // reproducing them is the work, and the work is the point.
-          (anc.status !== 'unnameable' && shas.length)
+          ((anc.status !== 'unnameable' && shas.length) || claimShas.length)
             ? [
-              `To proceed anyway, re-send releaseIntent with an "acknowledge" array naming each of the ${shas.length} sha(s) in acknowledgeRequired.`,
+              `To proceed anyway, re-send releaseIntent with an "acknowledge" array naming each of the ${new Set([...(anc.status === 'unnameable' ? [] : shas), ...claimShas]).size} sha(s) in acknowledgeRequired.`,
               unnamed
                 ? `NOTE: only ${shas.length - unnamed} of those ${shas.length} are spelled out above — ${unnamed} more are in acknowledgeRequired and are NOT shown in this text. Read them before you decide; the prose is a sample, the requirement is the whole set.`
                 : '',
@@ -2855,15 +3029,99 @@ export function createMcpPresence({
         releaseLease = { status: 'declare-failed', reason: outcome.status };
         releaseText = `KLYPIX release lease was not recorded (${outcome.status}); no lease state changed. Retry on the next sync.`;
       } else if (outcome?.status === 'taken' || outcome?.status === 'refreshed') {
+        // ── Claim settlement on a GRANTED lease ──────────────────────────
+        // Fulfilled claims retire (their shas are in the ref — the promise is
+        // kept, with a courtesy note to the owner). Acknowledged-away claims
+        // STAY STAKED — the work still is not shipping — and their owners are
+        // notified NOW, at declare time, not after the build exists: today the
+        // releaser sees the OWNED-BY warning but the owner learns only when
+        // the installer is missing their feature (founder-surfaced 2026-08-17).
+        const fulfilledClaims = (outcome.claimSettlement || []).filter((entry) => entry.contained);
+        const awayClaims = Array.isArray(outcome.acknowledgedClaims) ? outcome.acknowledgedClaims : [];
+        let claimsNotified = 0;
+        if (fulfilledClaims.length) {
+          try {
+            retireFulfilledClaims({
+              brainPath,
+              fulfilled: fulfilledClaims.map((entry) => ({ ownerId: entry.claim.ownerId, shas: entry.claim.shas })),
+              home,
+              now: leaseStamp,
+            });
+          } catch { /* retirement is best-effort; a live claim re-settles next declare */ }
+          for (const entry of fulfilledClaims) {
+            if (entry.claim.ownerId === sessionId) continue;
+            const posted = postPresenceMessage({
+              brainPath,
+              from: sessionId,
+              to: entry.claim.ownerId,
+              text: `Your staked release claim is FULFILLED: v${releaseIntentChecked.version} declared from ${releaseIntentChecked.ref} CONTAINS your ${entry.claim.shas.length} claimed commit(s) (${entry.claim.shas.slice(0, 3).map((x) => x.slice(0, 9)).join(', ')}${entry.claim.shas.length > 3 ? '…' : ''}). The claim is retired.`,
+              allowOfflineTarget: true,
+              dedupeKey: `claim-fulfilled|${entry.claim.ownerId}|${releaseIntentChecked.version}`,
+              home,
+              now: leaseStamp,
+            });
+            if (posted.posted) claimsNotified++;
+          }
+        }
+        const notifiedOwners = new Set();
+        for (const entry of awayClaims) {
+          if (entry.claim.ownerId === sessionId) continue;
+          notifiedOwners.add(entry.claim.ownerId);
+          const gone = [...entry.missing, ...entry.unresolvable, ...entry.unverified];
+          const posted = postPresenceMessage({
+            brainPath,
+            from: sessionId,
+            to: entry.claim.ownerId,
+            text: `Release v${releaseIntentChecked.version} from ${releaseIntentChecked.ref} was declared ACKNOWLEDGING AWAY your claimed commit(s) ${gone.slice(0, 4).map((x) => String(x).slice(0, 9)).join(', ')}${gone.length > 4 ? ` +${gone.length - 4}` : ''} — they will NOT be in this build. Your claim stays staked for the next release.`,
+            allowOfflineTarget: true,
+            dedupeKey: `claim-away|${entry.claim.ownerId}|${releaseIntentChecked.version}|${releaseIntentChecked.ref}`,
+            home,
+            now: leaseStamp,
+          });
+          if (posted.posted) claimsNotified++;
+        }
+        // LIVE owners named by the ancestry annotation get the same courtesy —
+        // their commits were acknowledged away too, they just never staked.
+        const ancOwners = new Map();
+        for (const src of (outcome.acknowledgedAncestry?.sources || [])) {
+          for (const c of (src.missing || [])) {
+            for (const o of (c.owners || [])) {
+              if (o.sharedScopeOnly || !o.sessionId || o.sessionId === sessionId) continue;
+              if (notifiedOwners.has(o.sessionId)) continue;
+              const cur = ancOwners.get(o.sessionId) || [];
+              if (cur.length < 4) cur.push(`${c.sha} ${String(c.subject || '').slice(0, 60)}`.trim());
+              ancOwners.set(o.sessionId, cur);
+            }
+          }
+        }
+        for (const [ownerId, commits] of ancOwners) {
+          const posted = postPresenceMessage({
+            brainPath,
+            from: sessionId,
+            to: ownerId,
+            text: `Release v${releaseIntentChecked.version} from ${releaseIntentChecked.ref} was declared ACKNOWLEDGING AWAY commit(s) of yours: ${commits.join(' · ')} — they will NOT be in this build. Stake a releaseClaim if they must ride the next one.`,
+            allowOfflineTarget: true,
+            dedupeKey: `anc-away|${ownerId}|${releaseIntentChecked.version}|${releaseIntentChecked.ref}`,
+            home,
+            now: leaseStamp,
+          });
+          if (posted.posted) claimsNotified++;
+        }
         releaseLease = {
           status: outcome.status,
           ...(outcome.reclaimed ? { reclaimed: outcome.reclaimed } : {}),
           ...(holderBlock ? { holder: holderBlock } : {}),
+          ...(fulfilledClaims.length ? { claimsFulfilled: fulfilledClaims.length } : {}),
+          ...(awayClaims.length ? { claimsAcknowledgedAway: awayClaims.length } : {}),
+          ...(claimsNotified ? { claimOwnersNotified: claimsNotified } : {}),
         };
         if (releaseIntentChecked.provided) {
           releaseText = outcome.status === 'taken'
             ? `KLYPIX release lease taken: this session now EXCLUSIVELY holds release preparation for v${releaseIntentChecked.version} from ${releaseIntentChecked.ref}${outcome.reclaimed ? ` (reclaimed: the previous lease was ${outcome.reclaimed === 'expired' ? 'expired' : 'held by a session that is no longer live'})` : ''}. Checkpoints refresh the ~2h lease; phase "complete" frees it.`
             : `KLYPIX release lease refreshed: v${releaseIntentChecked.version} from ${releaseIntentChecked.ref}.`;
+          if (fulfilledClaims.length || awayClaims.length) {
+            releaseText += ` Claims: ${fulfilledClaims.length} fulfilled${awayClaims.length ? `, ${awayClaims.length} ACKNOWLEDGED AWAY (their owners were queued a notification — the work is NOT in this build)` : ''}.`;
+          }
         }
       } else if (outcome?.status === 'lease-lost') {
         releaseLease = { status: 'lease-lost', reason: outcome.reason || null };
@@ -3042,6 +3300,8 @@ export function createMcpPresence({
       // refresh / conflict / release outcome plus the current holder — and the
       // zero-config checkout-ahead advisory when nothing is declared.
       ...(releaseLease ? { releaseLease } : {}),
+      // Additive: outcome of a releaseClaim stake/withdraw carried in THIS call.
+      ...(releaseClaimResult ? { releaseClaim: releaseClaimResult } : {}),
       ...(releaseAdvisory ? { releaseAdvisory } : {}),
       ...(workAtRisk ? { workAtRisk } : {}),
       ...(resultReconciliation ? { resultReconciliation: {
@@ -3091,6 +3351,11 @@ export function createMcpPresence({
       `KLYPIX Context Gateway: session ${sessionId} · phase ${nextPhase} · coordination ${durationMs}ms.`,
       deferralText,
       resultText,
+      releaseClaimResult
+        ? (releaseClaimResult.ok
+          ? `KLYPIX release claim ${releaseClaimResult.status}${releaseClaimResult.claim ? `: ${releaseClaimResult.claim.shas.length} sha(s) staked — every future releaseIntent must contain them or acknowledge them BY NAME, even after this session ends (expires ${Math.round((releaseClaimResult.claim.expiresAt - syncStartedAt) / 86_400_000)}d)` : ''}${releaseClaimResult.status === 'trimmed' || releaseClaimResult.status === 'withdrawn' ? ` (${releaseClaimResult.remaining ?? 0} sha(s) remain staked)` : ''}.`
+          : `KLYPIX release claim FAILED (${releaseClaimResult.status}${releaseClaimResult.limit ? `, limit ${releaseClaimResult.limit}` : ''}) — nothing was staked or withdrawn. ${releaseClaimResult.status === 'claims-full' ? 'The lane holds its maximum of staked claims; withdraw a stale one or raise it with the maintainers.' : ''}`)
+        : '',
       releaseText,
       formatTaskPresence(snapshot, stamp),
       messagesText,

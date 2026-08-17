@@ -791,9 +791,14 @@ server.registerTool('brain_sync', {
       version: z.string().max(64).describe('The version this session intends to release (e.g. "1.70.0").'),
       ref: z.string().max(200).describe('The git ref (branch or tag) the release will be cut from.'),
       acknowledge: z.array(z.string().max(40)).max(1024).optional().describe('Commit shas this release DELIBERATELY leaves behind. Only needed after a refusal: if the ref would drop finished work, the lease is refused and the response names every sha. Re-declare with those shas here to proceed — and tell the user what they are first.'),
-    }).optional().describe('Declare EXCLUSIVE intent to prepare a release of this project. The first declarer takes a ~2h lease (refreshed by checkpoints, freed by phase "complete", by expiry, or when the holder session ends); a second declarer gets a structured hard conflict naming the holder, version, and ref. While any lease is active every peer\'s sync gains a "release in preparation" footer line. A NEW declaration is also checked against what the release would LEAVE BEHIND: if the ref is missing commits that are on trunk or on a branch a live peer session is working on, the lease is REFUSED (nothing is changed) and the response lists them — report those commits to the user, then re-declare with acknowledge:[...] naming each sha if the release should go ahead without them.'),
+    }).optional().describe('Declare EXCLUSIVE intent to prepare a release of this project. The first declarer takes a ~2h lease (refreshed by checkpoints, freed by phase "complete", by expiry, or when the holder session ends); a second declarer gets a structured hard conflict naming the holder, version, and ref. While any lease is active every peer\'s sync gains a "release in preparation" footer line. A NEW declaration is also checked against what the release would LEAVE BEHIND: if the ref is missing commits that are on trunk or on a branch a live peer session is working on, OR commits any session STAKED a releaseClaim on (even one that has since ended), the lease is REFUSED (nothing is changed) and the response lists them — report those commits to the user, then re-declare with acknowledge:[...] naming each sha if the release should go ahead without them. Acknowledging away a claimed or live-owned commit queues its owner a notification automatically.'),
+    releaseClaim: z.object({
+      shas: z.array(z.string().max(40)).max(20).optional().describe('Commit shas that MUST ride the next release. Stake after committing work a user was promised — the claim OUTLIVES this session (14d), and every future releaseIntent must contain these commits or acknowledge them by name.'),
+      note: z.string().max(160).optional().describe('One line of why — shown verbatim in any refusal that names this claim ("founder was told the Arrow tool ships in the next build").'),
+      withdraw: z.union([z.array(z.string().max(40)).max(20), z.boolean()]).optional().describe('Shas to withdraw from this session\'s claim; [] or true withdraws the whole claim. Only the staking session (or its logical continuation) can withdraw.'),
+    }).optional().describe('Stake a durable claim that specific commits ride the NEXT release — the promise "you\'ll see it in the next build" made machine-readable. Unlike presence rows (which age out ~10min after a session ends), a claim persists until fulfilled (the release ref contains the shas — auto-retired with a courtesy note), withdrawn, or expired (14d). A release that would drop claimed shas is REFUSED until they are acknowledged BY NAME, and acknowledging them away notifies the owner. Use exactly one of shas (stake/extend) or withdraw.'),
   },
-}, async ({ project, intent, files, phase, include_context, results, releaseIntent }, extra) => {
+}, async ({ project, intent, files, phase, include_context, results, releaseIntent, releaseClaim }, extra) => {
   const totalStartedAt = Date.now();
   const report = mcpPresence.sync({
     project,
@@ -802,6 +807,7 @@ server.registerTool('brain_sync', {
     phase,
     results,
     releaseIntent,
+    releaseClaim,
     deliverMessages: include_context !== false,
     actionId: extra?.klypixRequestIdentity?.actionId || '',
     preflight: extra?.klypixBrainSyncPreflight,

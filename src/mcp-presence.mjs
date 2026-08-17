@@ -3524,5 +3524,13 @@ export function createMcpPresence({
     decorateToolResult,
     get brainPath() { return brainPath; },
     get vault() { return vault; },
+    // The session's own declared intent (or ''), read fresh from the lane —
+    // the enrichment question source for MCP-side brain_note captures.
+    get declaredIntent() {
+      try {
+        const row = listActiveSessions(brainPath).find((s) => s.id === sessionId);
+        return String(row?.intent || '').slice(0, 240);
+      } catch { return ''; }
+    },
   };
 }

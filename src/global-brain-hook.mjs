@@ -2516,6 +2516,13 @@ async function capture(lib) {
     };
     const shellCmds = [];          // shell commands seen in the transcript (ship-event capture)
     const errorIds = new Set();    // tool_use ids whose result errored — skip those ship-events
+    // Question enrichment (1.77): the HUMAN prompt nearest above a marker is
+    // the natural-language question that produced the card — recorded to the
+    // retrieval sidecar so the card becomes findable in the asker's own words.
+    // deriveIntentFromPrompt is the machine-turn guard: harness-injected "user"
+    // turns (task notifications, hook output) never pollute the vocabulary.
+    let lastUserPrompt = '';
+    const enrichmentPairs = [];
     for (let transcriptIndex = 0; transcriptIndex < lines.length; transcriptIndex++) {
         const ln = lines[transcriptIndex];
         let e; try { e = JSON.parse(ln); } catch { continue; }
@@ -2531,6 +2538,14 @@ async function capture(lib) {
         );
         if (entryInScope) noteFiles(filesInEntry(e));
         scanToolBlocks(e, shellCmds, errorIds);
+        const um = e?.message ?? e;
+        if (um?.role === 'user') {
+            const rawUser = typeof um.content === 'string'
+                ? um.content
+                : Array.isArray(um.content) ? um.content.filter(part => part?.type === 'text' && typeof part.text === 'string').map(part => part.text).join('\n') : '';
+            const human = deriveIntentFromPrompt(rawUser);
+            if (human) lastUserPrompt = human.slice(0, 240);
+        }
         const text = textOf(e);
         if (!text.includes('🧠')) continue;
         for (const raw of text.split('\n')) {
@@ -2625,6 +2640,7 @@ async function capture(lib) {
             const tagLine = [areaTag, ...fileTags].filter(Boolean).join(' ');
             const card = (area ? `${area}: ${prefix}${body}` : `${prefix}${body}`) + (tagLine ? `\n${tagLine}` : '');
             cards.push({ text: card, area, borderColor, ...(closes ? { closes } : {}), ...(evidence ? { evidence } : {}), ...(verify ? { verify } : {}) });
+            if (lastUserPrompt) enrichmentPairs.push({ body, question: lastUserPrompt });
             ledger.push({ action: type === '?' ? 'add-question' : type === '!' ? 'add-milestone' : isSkill ? 'add-skill' : 'add-decision', area, preview, files: fileTags, ...(closes ? { closes } : {}), ...(evidence ? { ev: evidence.map(e => e.ref) } : {}) });
         }
     }
@@ -2907,6 +2923,15 @@ async function capture(lib) {
         try { stats = await doCapture(gotLock); } finally { if (gotLock) releaseLock(LOCK); }
     }
     if (!stats) return;
+    // Enrichment write rides ONLY a successful capture: cards that never landed
+    // must not acquire question text. Lazy + skew-safe — a stale deployment
+    // without enrichment.mjs just skips, costing recall, never correctness.
+    if (enrichmentPairs.length && stats.added > 0) {
+        try {
+            const enrich = await import(new URL('./enrichment.mjs', import.meta.url).href);
+            enrich.recordEnrichment(BRAIN, enrichmentPairs.map(pair => ({ body: pair.body, question: pair.question })));
+        } catch { /* stale deployment or unwritable sidecar — additive signal only */ }
+    }
     const bits = [`${stats.added} added`];
     if (stats.resolved) bits.push(`${stats.resolved} resolved`);
     if (stats.updated) bits.push(`${stats.updated} updated`);

@@ -686,7 +686,7 @@ server.registerTool('brain_note', {
     canvas: z.string().optional().describe('Brain canvas filename/path. Defaults to the project brain ("brain").'),
   },
 }, async ({ text, marker, area, closes, canvas }, extra) => {
-  return toContent(await opBrainNote({ vault: mcpPresence.vault, canvas: boundBrainCanvas(canvas), text, area, marker: marker || '', closes, via: extra.klypixClientName }));
+  return toContent(await opBrainNote({ vault: mcpPresence.vault, canvas: boundBrainCanvas(canvas), text, area, marker: marker || '', closes, via: extra.klypixClientName, enrichmentQuestion: mcpPresence.declaredIntent }));
 });
 
 server.registerTool('brain_message', {

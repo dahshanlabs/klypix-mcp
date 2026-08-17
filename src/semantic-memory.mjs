@@ -8,6 +8,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
+import { enrichmentTextFor, readEnrichment } from './enrichment.mjs';
 import { createRequire } from 'module';
 
 const PB_DIR = path.join(os.homedir(), '.claude', 'project-brain');
@@ -577,13 +578,28 @@ function readCache(brainPath, desiredHashes) {
 
 async function vectorsForBrainUnlocked(pipe, brainPath, cards) {
   const want = cards.filter((card) => card.type !== 'container' && (card.text || '').trim());
-  const desiredHashes = new Map(want.map((card) => [card.id, sha1(String(card.text))]));
+  // Question enrichment (1.77): the prompt/intent that produced a card is
+  // appended to its EMBED input — the asker's own vocabulary bridging the
+  // paraphrase gap the 2026-08-17 error analysis measured. Additive and
+  // machine-local like this cache itself; an empty sidecar changes nothing,
+  // and the hash covers the enrichment so its arrival re-embeds exactly the
+  // cards it touches. (Structural context was measured HARMFUL twice — 62%→52%
+  // recall@5 — so only asker-language rides here, never area/tag jargon.)
+  let enrichmentEntries = [];
+  try { enrichmentEntries = readEnrichment(brainPath); } catch { enrichmentEntries = []; }
+  const embedInputFor = (card) => {
+    const base = String(card.text).slice(0, 1500);
+    const extra = enrichmentEntries.length ? enrichmentTextFor(enrichmentEntries, card.text) : '';
+    return extra ? `${base}
+${extra}` : base;
+  };
+  const desiredHashes = new Map(want.map((card) => [card.id, sha1(embedInputFor(card))]));
   const loaded = readCache(brainPath, desiredHashes);
   const { file, cache } = loaded;
   let dirty = loaded.dirty;
   const missing = want.filter((card) => cache.cards[card.id]?.h !== desiredHashes.get(card.id));
   if (missing.length) {
-    const vectors = await embedTexts(pipe, missing.map((card) => String(card.text).slice(0, 1500)));
+    const vectors = await embedTexts(pipe, missing.map((card) => embedInputFor(card)));
     missing.forEach((card, index) => {
       cache.cards[card.id] = { h: desiredHashes.get(card.id), v: vectors[index] };
     });

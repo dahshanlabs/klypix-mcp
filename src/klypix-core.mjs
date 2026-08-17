@@ -1103,7 +1103,7 @@ export async function opAddToCanvas({ vault, canvas, cards, connections, via }) 
 // open file any agent reads AND writes": a hookless client (Cursor/Cline/Desktop)
 // can now record a decision, ask an open question, mark a milestone, resolve a card,
 // or correct one — with the full lifecycle, not just a flat append.
-export async function opBrainNote({ vault, canvas, text: noteText, area, marker = '', closes, via }) {
+export async function opBrainNote({ vault, canvas, text: noteText, area, marker = '', closes, via, enrichmentQuestion = '' }) {
   const t = brainTarget(vault, canvas);
   if (t.ambiguous) return ambiguousBrainErr(t.ambiguous);
   if (!t.file) return err(`No brain found — looked for ./brain.klypix in the project, then ${vault}. Pass canvas: "<name>".`);
@@ -1134,6 +1134,16 @@ export async function opBrainNote({ vault, canvas, text: noteText, area, marker 
     let out = res.buffer; try { out = (await tidyBrain(res.buffer)).buffer; } catch { /* keep append result if tidy fails */ }
     await atomicWrite(file, out);
     if (pendingShips.length) clearPendingShips(projectDir);   // durable now — safe to consume
+    // Question enrichment (1.77): the caller session's declared intent is the
+    // natural-language question that produced this card — recorded to the
+    // retrieval sidecar so brain_ask finds the card in the asker's vocabulary.
+    // Additive: any failure costs recall, never the write above.
+    if (enrichmentQuestion && (res.stats?.added || 0) > 0) {
+      try {
+        const enrich = await import('./enrichment.mjs');
+        enrich.recordEnrichment(file, [{ body: noteText, question: enrichmentQuestion }]);
+      } catch { /* sidecar unavailable — additive signal only */ }
+    }
     const s = res.stats || {};
     const bits = [`${s.added || 0} added`];
     for (const k of ['resolved', 'updated', 'merged', 'closed', 'superseded']) if (s[k]) bits.push(`${s[k]} ${k}`);

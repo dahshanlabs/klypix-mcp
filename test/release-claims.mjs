@@ -310,6 +310,15 @@ try {
     && !/🧠 BRAIN \[/.test(hostileRefusal.text),
     'RC10: the foreign note is NEUTRALIZED in the refusal text — no capture-marker smuggling through the gate');
 
+  // ── RC11 — fast-follows: user-imperative on claims-only refusals; honest
+  // withdraw:false error; logical-identity notification addressing ─────────
+  ok(/WHAT THIS MEANS FOR THE USER/.test(hostileRefusal.text)
+    && /the claim is the only voice it has left/.test(hostileRefusal.text),
+    'RC11: a claims-only refusal (clean ancestry) carries its own user-informing imperative block');
+  const wfalse = validateReleaseClaim({ withdraw: false });
+  ok(wfalse.ok === false && /withdraw: false does nothing/.test((wfalse.errors || []).join(' ')),
+    'RC11: withdraw:false is refused with an error that names it, not an array-shaped one');
+
   if (failures) { console.error(`\n✗ ${failures} assertion(s) failed`); process.exit(1); }
   console.log('\n✓ release claims — all assertions passed');
 } finally {

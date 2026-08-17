@@ -313,6 +313,7 @@ export function validateReleaseClaim(value) {
   if (hasStake) shas = parseShas(value.shas, 'shas');
   if (hasWithdraw) {
     if (value.withdraw === true || (Array.isArray(value.withdraw) && !value.withdraw.length)) withdrawAll = true;
+    else if (value.withdraw === false) errors.push('releaseClaim.withdraw: false does nothing — omit the field to keep the claim, or pass true / [] to withdraw it entirely');
     else withdrawShas = parseShas(value.withdraw, 'withdraw');
   }
   const note = typeof value.note === 'string' ? value.note.replace(/\s+/g, ' ').trim().slice(0, 160) : null;
@@ -2980,6 +2981,13 @@ export function createMcpPresence({
             unverified: entry.unverified,
           })) } : {}),
         };
+        const claimsOnlyImperative = (!(anc && !anc.isDescendant) && unmetClaims.length)
+          ? [
+            '',
+            'WHAT THIS MEANS FOR THE USER: the branch history is clean, but a session STAKED A CLAIM that specific commits must ride this release, and they are not in it. That session may have already told the user this work would ship — the claim is the only voice it has left.',
+            'Say this to them in your own words, naming the claim(s) above, BEFORE going any further.',
+          ]
+          : [];
         releaseText = [
           outcome.holderRefusal
             ? 'KLYPIX release refresh REFUSED — a claim staked SINCE your lease was granted is unmet. Your held lease was NOT revoked, but this sync did NOT refresh it: acknowledge the claim below or the lease lapses at its ~2h TTL.'
@@ -2987,6 +2995,7 @@ export function createMcpPresence({
           '',
           ...releaseAncestryWarnings(anc),
           ...(claimLines.length ? ['', ...claimLines] : []),
+          ...claimsOnlyImperative,
           '',
           // Deliberately NOT a ready-to-paste call. Pre-rendering the exact
           // retry made the bypass the easiest thing on screen — an agent could
@@ -3053,7 +3062,9 @@ export function createMcpPresence({
             const posted = postPresenceMessage({
               brainPath,
               from: sessionId,
-              to: entry.claim.ownerId,
+              // Logical identity preferred: a revived session matches it directly,
+              // and a SINGLE candidate keeps the receipt denominator honest.
+              to: entry.claim.ownerLogicalId || entry.claim.ownerId,
               text: `Your staked release claim is FULFILLED: v${releaseIntentChecked.version} declared from ${releaseIntentChecked.ref} CONTAINS your ${entry.claim.shas.length} claimed commit(s) (${entry.claim.shas.slice(0, 3).map((x) => x.slice(0, 9)).join(', ')}${entry.claim.shas.length > 3 ? '…' : ''}). The claim is retired.`,
               allowOfflineTarget: true,
               dedupeKey: `claim-fulfilled|${entry.claim.ownerId}|${releaseIntentChecked.version}`,
@@ -3071,7 +3082,7 @@ export function createMcpPresence({
           const posted = postPresenceMessage({
             brainPath,
             from: sessionId,
-            to: entry.claim.ownerId,
+            to: entry.claim.ownerLogicalId || entry.claim.ownerId,
             text: `Release v${releaseIntentChecked.version} from ${releaseIntentChecked.ref} was declared ACKNOWLEDGING AWAY your claimed commit(s) ${gone.slice(0, 4).map((x) => String(x).slice(0, 9)).join(', ')}${gone.length > 4 ? ` +${gone.length - 4}` : ''} — they will NOT be in this build. Your claim stays staked for the next release.`,
             allowOfflineTarget: true,
             dedupeKey: `claim-away|${entry.claim.ownerId}|${releaseIntentChecked.version}|${releaseIntentChecked.ref}`,

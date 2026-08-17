@@ -72,8 +72,21 @@ export function highestInstalledBrainVersion({ stamp, runtime } = {}) {
 //              without a readable package version also proceeds — the
 //              installer's invalid-candidate refusal already fails closed on
 //              the version itself; this policy never double-guesses it.
-export function deploySourceDecision({ checkout, allowUntagged = false } = {}) {
-  if (!checkout) return { action: 'proceed', source: 'released-artifact' };
+export function deploySourceDecision({ checkout, allowUntagged = false, gitPresent = false } = {}) {
+  // `checkout` is null in TWO very different worlds, and conflating them was a
+  // fail-open found by five consecutive evidence-gate refusals (2026-08-18):
+  // an npm/npx tarball has no .git and IS the released artifact — but a real
+  // git checkout whose probes TIMED OUT under machine load also yields null,
+  // and the guard then deployed an untagged working tree as if it were the
+  // registry channel. The caller already knows whether .git exists; when it
+  // does, an unreadable git state must REFUSE — an honest, retryable refusal
+  // beats a silent unreleased deploy, which is the exact incident class this
+  // guard was built for.
+  if (!checkout) {
+    if (gitPresent && !allowUntagged) return { action: 'refuse', source: 'unverifiable-git-state' };
+    if (gitPresent) return { action: 'proceed', source: 'unverifiable-git-state', acknowledged: true };
+    return { action: 'proceed', source: 'released-artifact' };
+  }
   if (!checkout.packageVersion) return { action: 'proceed', source: 'unversioned-source' };
   if (checkout.isReleaseTag) return { action: 'proceed', source: 'released-tag' };
   return {

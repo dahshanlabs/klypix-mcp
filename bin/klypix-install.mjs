@@ -299,12 +299,15 @@ try {
     // (`git tag --points-at HEAD` semantics inside collectRepoState): the
     // release tag names the exact evidence commit, so any non-HEAD comparison
     // would certify code the tag never covered.
-    const checkout = exists(path.join(PKG_ROOT, '.git')) ? collectRepoState(PKG_ROOT) : null;
-    const sourceDecision = deploySourceDecision({ checkout, allowUntagged: ALLOW_UNTAGGED });
+    const gitPresent = exists(path.join(PKG_ROOT, '.git'));
+    const checkout = gitPresent ? collectRepoState(PKG_ROOT) : null;
+    const sourceDecision = deploySourceDecision({ checkout, allowUntagged: ALLOW_UNTAGGED, gitPresent });
     const checkoutLabel = `v${VERSION}, branch ${checkout?.branch || '(detached)'}, head ${checkout?.headShort || '?'}`;
     if (sourceDecision.action === 'refuse') {
         releaseInstallLockSync(installLock);
-        console.error(`✗ refusing to deploy an UNRELEASED source checkout machine-globally: ${checkoutLabel} — no release tag v${VERSION} at HEAD; no files were changed.`);
+        console.error(sourceDecision.source === 'unverifiable-git-state'
+            ? `✗ refusing to deploy from a git checkout whose state could NOT be verified: ${checkoutLabel} — the git probes failed (busy machine?); no files were changed. Retry, or acknowledge a dev deploy explicitly.`
+            : `✗ refusing to deploy an UNRELEASED source checkout machine-globally: ${checkoutLabel} — no release tag v${VERSION} at HEAD; no files were changed.`);
         console.error('  Released installs come from the registry: npx -y klypix-mcp@latest install');
         console.error('  To deliberately deploy this working tree (a dev deploy), acknowledge it: re-run with --allow-untagged or KLYPIX_MCP_ALLOW_UNTAGGED=1.');
         console.error('  An acknowledged dev deploy is stamped dev-owned, so brain_doctor shows it and auto-update will not silently replace it.');

@@ -16,6 +16,19 @@ const ok = (condition, label) => {
   if (!condition) failures++;
 };
 
+// Unverifiable git state fails CLOSED (2026-08-18: five evidence-gate
+// refusals traced to a timed-out probe deploying an untagged tree as if it
+// were the registry artifact). gitPresent=true + null checkout must refuse
+// unless explicitly acknowledged; a true tarball (no .git) stays exempt.
+ok(deploySourceDecision({ checkout: null, gitPresent: true }).action === 'refuse'
+  && deploySourceDecision({ checkout: null, gitPresent: true }).source === 'unverifiable-git-state',
+'a git checkout whose probes failed is REFUSED, never treated as the released artifact');
+ok(deploySourceDecision({ checkout: null, gitPresent: true, allowUntagged: true }).action === 'proceed',
+  'the acknowledged dev-deploy path still overrides an unverifiable state');
+ok(deploySourceDecision({ checkout: null, gitPresent: false }).action === 'proceed'
+  && deploySourceDecision({ checkout: null, gitPresent: false }).source === 'released-artifact',
+'a true tarball install (no .git) keeps its exemption');
+
 ok(parseBrainVersion('1.66.0')?.raw === '1.66.0', 'stable Brain Core semver parses');
 ok(compareBrainVersions('1.66.0-beta.2', '1.66.0-beta.11') < 0, 'numeric prerelease identifiers compare numerically');
 ok(compareBrainVersions('1.66.0', '1.66.0-rc.1') > 0, 'stable release sorts above prerelease');

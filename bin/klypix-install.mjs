@@ -8,6 +8,9 @@
 // the SAME flat layout, so the two delivery channels converge on one install.
 //
 //   npx klypix-mcp install            # install / update the brain on this machine
+//   npx klypix-mcp install --dry-run  # (alias --check) print exactly what WOULD be written,
+//                                     # including the ongoing auto-update + git-hook behavior,
+//                                     # write NOTHING, exit 0 (or 1 if the install would refuse)
 //   npx klypix-mcp install --force    # overwrite even a newer / dev-deployed brain
 //   npx klypix-mcp install --codex-hooks  # optional prompt/file awareness; Codex asks for trust
 //   npx klypix-mcp install --allow-untagged  # acknowledge deploying an UNTAGGED source checkout
@@ -24,6 +27,7 @@ import { fileURLToPath } from 'url';
 import {
     connectCodexMcpServer,
     disconnectCodexMcpServer,
+    linkProject,
     mcpServerEntry,
     mergeCodexGlobalInstructions,
 } from '../src/agent-rules.mjs';
@@ -34,7 +38,8 @@ import {
 import { brainInstallDecision, deploySourceDecision } from '../src/install-version.mjs';
 import { acquireInstallLockSync, releaseInstallLockSync } from '../src/install-lock.mjs';
 import { collectRepoState } from '../src/repo-state.mjs';
-import { runSetup, renderBrief } from '../src/setup.mjs';
+import { runSetup, renderBrief, resolveProjectRoot, projectSignal, isProjectOwnedMcp, MCP_FILES } from '../src/setup.mjs';
+import { detectEditors } from '../src/editor-detect.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PKG_ROOT = path.resolve(__dirname, '..');
@@ -49,6 +54,10 @@ const VERSION = (() => { try { return JSON.parse(fs.readFileSync(path.join(PKG_R
 const FORCE = process.argv.includes('--force');
 const CODEX_HOOKS = process.argv.includes('--codex-hooks');
 const RUNTIME_ONLY = process.argv.includes('--runtime-only');
+// Install honesty (2026-08-18): --dry-run / --check previews every write this
+// command would make — and the ongoing behaviors it enables — with zero writes.
+// The same alias pair the uninstaller has honoured since it shipped.
+const DRY_RUN = process.argv.includes('--dry-run') || process.argv.includes('--check');
 // Project wiring is the default because it is the step users did not know
 // existed. These opt OUT for the cases that genuinely want machine-only:
 // CI images, scripted provisioning, and anyone wiring the project by hand.
@@ -212,7 +221,7 @@ function renameSyncWithBackoff(from, to) {
     }
 }
 
-function migrateProjectMcpConfig() {
+function migrateProjectMcpConfig({ dryRun = false } = {}) {
     try {
         const file = path.join(process.cwd(), '.mcp.json');
         if (!exists(file)) return null;
@@ -230,6 +239,7 @@ function migrateProjectMcpConfig() {
         const vault = vi >= 0 && args[vi + 1] ? args[vi + 1] : '.';
         const next = mcpServerEntry({ vault });   // local now that the bundle is installed
         if (JSON.stringify(entry) === JSON.stringify(next)) return null;   // already correct
+        if (dryRun) return { file, from: entry.command, to: next.command };   // same decision, zero writes
         servers['klypix-canvas'] = next;
         try { fs.writeFileSync(file + '.klypix-bak', raw, 'utf8'); } catch { /* best-effort backup */ }
         fs.writeFileSync(file, JSON.stringify(cfg, null, 2) + '\n', 'utf8');
@@ -257,6 +267,308 @@ const flatten = (code) => code
     .replace(/\.\.\/src\/(bench|brain-doctor|agent-presence|agent-rules|capture-gap|enrichment|finding-routing|mcp-presence|mcp-supervisor|mcp-auto-update|presence-relay|semantic-memory|runtime-inspector|project-graph|git-capture-install)\.mjs/g, './$1.mjs')
     .replace(/klypix-worker\.mjs/g, 'klypix-mcp-worker.mjs')
     .replace(/const PKG_VERSION = \(\(\) => \{[\s\S]*?\}\)\(\);/, `const PKG_VERSION = '${VERSION}'; // baked at install (flat layout has no package.json)`);
+
+// ── Shared plan computation (real install AND --dry-run read the same lists) ──
+// The staged-file and dependency-closure logic used to live inline in the
+// install body; a preview that recomputed its own copy would drift from what
+// the installer actually does, so both paths now call these.
+const STAGE_SRC_FILES = ['global-brain-hook.mjs', 'capture-gap.mjs', 'brain-semantic.mjs', 'semantic-memory.mjs', 'enrichment.mjs', 'brain-note.mjs', 'brain-git-hook.mjs', 'git-capture-install.mjs', 'brain-history.mjs', 'brain-graveyard.mjs', 'klypix-format.mjs', 'klypix-core.mjs', 'brain-write-lock.mjs', 'agent-rules.mjs', 'brain-doctor.mjs', 'agent-presence.mjs', 'mcp-presence.mjs', 'repo-state.mjs', 'result-reconcile.mjs', 'finding-routing.mjs', 'presence-relay.mjs', 'mcp-supervisor.mjs', 'mcp-auto-update.mjs', 'runtime-inspector.mjs', 'project-graph.mjs', 'bench.mjs', 'codex-brain-hook.mjs', 'codex-hooks.mjs', 'canvas-view-app.html'];
+const STAGE_BIN_FILES = [
+    ['klypix-mcp.mjs', 'klypix-mcp-server.mjs'],
+    ['klypix-worker.mjs', 'klypix-mcp-worker.mjs'],
+    ['klypix-a2a.mjs', 'klypix-a2a-server.mjs'],
+    ['klypix-conformance.mjs', 'klypix-conformance.mjs'],
+    ['klypix-runtime.mjs', 'klypix-runtime.mjs'],
+    ['klypix-semantic-warm.mjs', 'klypix-semantic-warm.mjs'],
+];
+function computeStaged() {
+    const staged = [];
+    // canvas-view-app.html is the canvas_view MCP App UI — staged raw (an HTML
+    // file must never get a JS-comment banner) beside the flat server, which
+    // resolves it via its ./canvas-view-app.html candidate path.
+    for (const f of STAGE_SRC_FILES) {
+        const s = path.join(SRC, f); if (exists(s)) staged.push({ dst: f, content: fs.readFileSync(s, 'utf8') });
+    }
+    for (const [src, dst] of STAGE_BIN_FILES) {
+        const s = path.join(BIN, src); if (exists(s)) staged.push({ dst, content: flatten(fs.readFileSync(s, 'utf8')) });
+    }
+    return staged;
+}
+
+// Runtime dependency CLOSURE (jszip+fractional-indexing for the hook/engine,
+// @modelcontextprotocol/sdk+zod for the local MCP server). Resolve each via a
+// node_modules walk so it's found wherever the package manager put it — CRITICAL
+// for `npx`, which HOISTS deps to its cache root (not PKG_ROOT/node_modules).
+// Walk transitive deps resolved FROM each package's own context (handles
+// nesting). @huggingface/transformers (optional, huge) is intentionally
+// skipped — semantic recall degrades to lexical until the host warms it.
+// fs-based on purpose: require.resolve('<name>/package.json') is blocked by
+// restrictive "exports" (e.g. fractional-indexing v3) and would silently drop a
+// dep the hook needs. With copy:false this is a pure read (the dry-run path).
+const OPTIONAL_DEPS = new Set(['@modelcontextprotocol/ext-apps']);
+function resolveDepClosure({ copy }) {
+    const destMods = path.join(BRAIN_DIR, 'node_modules');
+    const findPkgDir = (name, fromDir) => {
+        // Follow linked/isolated package roots before walking upward. A host
+        // can have AJV 6 at its app root while the linked MCP SDK resolves AJV
+        // 8 beside its real package location; starting from the symlink path
+        // would silently select the wrong major for the flat runtime.
+        let dir;
+        try { dir = fs.realpathSync(fromDir); } catch { dir = path.resolve(fromDir); }
+        for (; ;) {
+            const cand = path.join(dir, 'node_modules', ...name.split('/'));
+            if (exists(path.join(cand, 'package.json'))) return cand;
+            const parent = path.dirname(dir);
+            if (parent === dir) return null;
+            dir = parent;
+        }
+    };
+    const seen = new Set();
+    const queue = ['jszip', 'fractional-indexing', '@modelcontextprotocol/sdk', 'zod', '@modelcontextprotocol/ext-apps'].map(name => ({ name, fromDir: PKG_ROOT }));
+    const planned = []; const missing = [];
+    while (queue.length) {
+        const { name, fromDir } = queue.shift();
+        if (seen.has(name)) continue; seen.add(name);
+        const dir = findPkgDir(name, fromDir);
+        if (!dir) { if (!OPTIONAL_DEPS.has(name)) missing.push(name); continue; }
+        if (!exists(path.join(destMods, name))) {
+            if (copy) copyDir(dir, path.join(destMods, name));
+            planned.push(name);
+        }
+        try { const pj = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')); for (const d of Object.keys(pj?.dependencies || {})) queue.push({ name: d, fromDir: dir }); } catch { /* no readable package.json */ }
+    }
+    return { planned, missing };
+}
+
+// The 4 Claude Code lifecycle hooks — module-scope so the dry-run can classify
+// the current settings.json against the exact entries the installer writes.
+const brainCmd = (arg) => `node "${fwd(path.join(BRAIN_DIR, 'global-brain-hook.mjs'))}"${arg ? ' ' + arg : ''}`;
+const GROUPS = [
+    ['SessionStart', { matcher: 'startup|resume', hooks: [{ type: 'command', command: brainCmd('') }] }],
+    ['UserPromptSubmit', { hooks: [{ type: 'command', command: brainCmd('--prompt'), timeout: 10 }] }],
+    ['Stop', { hooks: [{ type: 'command', command: brainCmd('--capture') }] }],
+    ['PostToolUse', { matcher: 'Bash|PowerShell|Edit|Write', hooks: [{ type: 'command', command: brainCmd('--live'), timeout: 10 }] }],
+];
+const stripOurs = (arr) => (Array.isArray(arr) ? arr : [])
+    .map(g => (g && Array.isArray(g.hooks)) ? { ...g, hooks: g.hooks.filter(h => !(typeof h?.command === 'string' && h.command.includes(HOOK_MARK))) } : g)
+    .filter(g => !g || !Array.isArray(g.hooks) || g.hooks.length > 0);
+
+// ── Ongoing-behavior disclosure ───────────────────────────────────────────────
+// Printed by BOTH the upfront summary and the dry-run: installing is not only a
+// set of file writes, it enables two standing behaviors a user should hear
+// about from the installer itself, not discover later.
+function ongoingBehaviorLines() {
+    return [
+        '  Ongoing behavior this install enables:',
+        '  • auto-update: the MCP supervisor checks the npm registry at most once per 24h',
+        '    (machine-wide, however many sessions are open) and applies exact same-major',
+        '    stable releases runtime-only, preserving host settings and project files.',
+        '    Opt out entirely: KLYPIX_AUTO_UPDATE=0.',
+        '  • commit capture: agent sessions auto-install a post-commit/post-merge git hook',
+        '    in brain projects where the hook slots are free (rationale-bearing feat/fix/perf',
+        '    commits become brain cards; a foreign hook is never touched). Opt out:',
+        '    KLYPIX_GIT_CAPTURE=0 (machine-wide) or `npx klypix-mcp git-hook remove` (per repo, sticks).',
+        '  Preview: `npx klypix-mcp install --dry-run` · Remove: `npx klypix-mcp uninstall` (`--check` inventories first).',
+    ];
+}
+
+// One-screen upfront summary for the REAL install: what is about to happen,
+// printed before the first write. Non-interactive by design — print, then act.
+function printUpfrontSummary({ staged, depPlan }) {
+    const L = [];
+    L.push('── klypix-mcp install — about to do the following ──────────────────');
+    L.push(`  1. engine   → ${BRAIN_DIR}: ${staged.length} runtime scripts`
+        + (depPlan.planned.length ? ` + ${depPlan.planned.length} dependency package(s)` : ' (deps already present)') + ' (machine-global)');
+    L.push(RUNTIME_ONLY
+        ? '  2. hooks    → skipped (--runtime-only preserves every host/project config byte)'
+        : `  2. hooks    → ${SETTINGS}: 4 Claude Code lifecycle hooks (SessionStart brief · UserPromptSubmit retrieval · Stop capture · PostToolUse live); existing file backed up to .klypix-bak`);
+    L.push(RUNTIME_ONLY
+        ? '  3. codex    → skipped (--runtime-only)'
+        : `  3. codex    → project .codex/config.toml + ~/.codex/AGENTS.md guidance block${CODEX_HOOKS ? ' + enhanced hooks (--codex-hooks; Codex asks for trust)' : ''}`);
+    L.push(RUNTIME_ONLY || NO_PROJECT
+        ? `  4. project  → skipped (${RUNTIME_ONLY ? '--runtime-only' : '--no-project'})`
+        : '  4. project  → this project: brain seed if missing, MCP config + rules for the editors you have, lossless .klypix merge driver (git repos), then a real-client verification');
+    L.push(...ongoingBehaviorLines());
+    L.push('─────────────────────────────────────────────────────────────────────');
+    console.log(L.join('\n'));
+}
+
+// ── --dry-run / --check: the full preview, zero writes ────────────────────────
+// Reports the same decisions the real install would make (version gate, deploy
+// guard, staged files vs what is installed, dependency copies, hook wiring,
+// receipts, project wiring) and exits without touching the disk. Exit 0 when
+// the install would proceed or preserve; exit 1 when it would refuse. The
+// preview deliberately does NOT take the install lock (the lock is itself a
+// write), so a concurrent install could change the picture between preview and
+// run — the run re-decides everything under the lock anyway.
+async function runDryRun() {
+    const P = (line = '') => console.log(line);
+    P(`klypix-mcp install --dry-run — v${VERSION} → ${BRAIN_DIR}`);
+    P('Nothing below is written in this mode.\n');
+
+    // 1) Version gate — same inputs the real install reads under the lock.
+    const stamp = (() => { try { return JSON.parse(fs.readFileSync(path.join(BRAIN_DIR, '.brain-version.json'), 'utf8')); } catch { return null; } })();
+    const runtimeReceipt = (() => { try { return JSON.parse(fs.readFileSync(path.join(BRAIN_DIR, '.mcp-runtime.json'), 'utf8')); } catch { return null; } })();
+    const verdict = brainInstallDecision({ candidateVersion: VERSION, stamp, runtime: runtimeReceipt, force: FORCE });
+    if (verdict.action === 'refuse') {
+        P(`✗ WOULD REFUSE: package Brain Core version ${JSON.stringify(VERSION)} is invalid — no files would be changed.`);
+        return 1;
+    }
+    if (verdict.action === 'preserve') {
+        P(verdict.reason === 'dev-owned'
+            ? `• engine: WOULD PRESERVE — a dev deploy owns ${BRAIN_DIR} (dev:true); --force overrides.`
+            : `• engine: WOULD PRESERVE — installed brain v${verdict.installedVersion} is newer than this package v${VERSION}; --force overrides.`);
+        if (!RUNTIME_ONLY) P('• codex: project + global Codex wiring WOULD still run on the preserve path (config/instructions only, no engine bytes).');
+        P('');
+        P(ongoingBehaviorLines().join('\n'));
+        P('\n✓ dry run complete — nothing was written.');
+        return 0;
+    }
+
+    // 2) Released-tag deploy guard — identical decision, identical acknowledgement axis.
+    const gitPresent = exists(path.join(PKG_ROOT, '.git'));
+    const checkout = gitPresent ? collectRepoState(PKG_ROOT) : null;
+    const sourceVerdict = deploySourceDecision({ checkout, allowUntagged: ALLOW_UNTAGGED, gitPresent });
+    const checkoutLabel = `v${VERSION}, branch ${checkout?.branch || '(detached)'}, head ${checkout?.headShort || '?'}`;
+    if (sourceVerdict.action === 'refuse') {
+        P(sourceVerdict.source === 'unverifiable-git-state'
+            ? `✗ WOULD REFUSE: git state of this checkout could not be verified (${checkoutLabel}).`
+            : `✗ WOULD REFUSE: this is an UNRELEASED source checkout (${checkoutLabel} — no release tag v${VERSION} at HEAD).`);
+        P('  Released installs come from the registry: npx -y klypix-mcp@latest install');
+        P('  To deliberately deploy this working tree: --allow-untagged or KLYPIX_MCP_ALLOW_UNTAGGED=1 (stamped dev-owned).');
+        return 1;
+    }
+    const untaggedSource = sourceVerdict.source === 'untagged-working-tree';
+    P(`• source: ${untaggedSource ? `acknowledged UNTAGGED dev deploy (${checkoutLabel}) — receipts would record dev-owned` : gitPresent ? `release-tagged checkout (${checkoutLabel})` : 'npm/npx tarball (the released artifact)'}`);
+
+    // 3) Engine files: staged set vs what is installed right now.
+    const staged = computeStaged();
+    const states = staged.map((st) => {
+        const live = path.join(BRAIN_DIR, st.dst);
+        if (!exists(live)) return { dst: st.dst, state: 'new' };
+        try { return { dst: st.dst, state: fs.readFileSync(live, 'utf8') === st.content ? 'unchanged' : 'changed' }; }
+        catch { return { dst: st.dst, state: 'changed' }; }
+    });
+    const byState = (s) => states.filter((x) => x.state === s);
+    P(`• engine → ${BRAIN_DIR}: ${staged.length} scripts would be staged and atomically renamed into place`);
+    P(`    new ${byState('new').length} · changed ${byState('changed').length} · byte-identical ${byState('unchanged').length}`);
+    for (const f of byState('new')) P(`      + ${f.dst}`);
+    for (const f of byState('changed')) P(`      ~ ${f.dst}`);
+    P(`    (current copies of replaced files are backed up to ${path.join(BRAIN_DIR, '.prev')})`);
+    P(`    ${path.join(BRAIN_DIR, 'package.json')} — name/version marker (provenance, not the gate)`);
+
+    // 4) Dependency closure — read-only walk of the exact copy plan.
+    const depPlan = resolveDepClosure({ copy: false });
+    if (depPlan.missing.length) {
+        P(`✗ WOULD REFUSE: required dependency package(s) unresolvable: ${depPlan.missing.join(', ')}`);
+        return 1;
+    }
+    P(depPlan.planned.length
+        ? `• deps → ${path.join(BRAIN_DIR, 'node_modules')}: ${depPlan.planned.length} package tree(s) would be copied: ${depPlan.planned.slice(0, 12).join(', ')}${depPlan.planned.length > 12 ? ', …' : ''}`
+        : '• deps: all required packages already present — nothing copied');
+
+    // 5) Claude Code hooks in settings.json.
+    if (RUNTIME_ONLY) {
+        P('• hooks: skipped (--runtime-only preserves every host/project config byte)');
+    } else if (exists(SETTINGS)) {
+        const raw = fs.readFileSync(SETTINGS, 'utf8');
+        let parsed = null; let broken = false;
+        if (raw.trim()) { try { parsed = JSON.parse(raw); } catch { broken = true; } }
+        if (broken) {
+            P(`✗ WOULD REFUSE: ${SETTINGS} is invalid JSON — the installer refuses to overwrite a broken config.`);
+            return 1;
+        }
+        P(`• hooks → ${SETTINGS} (existing file would be backed up to .klypix-bak, then rewritten atomically):`);
+        for (const [evt, entry] of GROUPS) {
+            const groups = Array.isArray(parsed?.hooks?.[evt]) ? parsed.hooks[evt] : [];
+            const ours = groups.filter((g) => Array.isArray(g?.hooks) && g.hooks.some((h) => typeof h?.command === 'string' && h.command.includes(HOOK_MARK)));
+            const current = ours.some((g) => JSON.stringify(g) === JSON.stringify(entry));
+            P(`    ${current ? '=' : ours.length ? '~' : '+'} ${evt}: ${current ? 'already current' : ours.length ? 'managed entry would be refreshed' : 'managed entry would be added'} (${entry.hooks[0].command.replace(/^node /, 'node ')})`);
+        }
+        P('    every non-KLYPIX hook and setting in the file is preserved');
+    } else {
+        P(`• hooks → ${SETTINGS}: file would be created with the 4 KLYPIX lifecycle hook entries`);
+    }
+
+    // 6) Receipts.
+    const sourceDirty = Boolean(checkout) && (() => {
+        try {
+            return execFileSync('git', ['status', '--porcelain'], {
+                cwd: PKG_ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 1500,
+            }).trim().length > 0;
+        } catch { return false; }
+    })();
+    P(`• receipts → .mcp-runtime.json + .brain-version.json (channel: ${untaggedSource ? 'dev' : 'npm'}${untaggedSource ? ', dev:true' : ''}${sourceDirty ? ', dirty:true' : ''})`);
+
+    // 7) This project's .mcp.json migration — the real decision, write skipped.
+    const migrated = RUNTIME_ONLY ? null : migrateProjectMcpConfig({ dryRun: true });
+    if (migrated) P(`• project config: ${migrated.file} klypix-canvas entry would migrate ${migrated.from} → ${migrated.to} (backup .mcp.json.klypix-bak)`);
+
+    // 8) Codex wiring (conditions checked read-only; merge logic not simulated).
+    if (!RUNTIME_ONLY) {
+        const hasProjectBrain = exists(path.join(process.cwd(), 'brain.klypix')) || exists(path.join(process.cwd(), 'brain.any'));
+        P('• codex:');
+        P(hasProjectBrain
+            ? `    ${path.join(process.cwd(), '.codex', 'config.toml')} — klypix-canvas MCP entry (project-scoped)`
+            : '    project MCP entry skipped — no ./brain.klypix in this folder');
+        const codexGlobalRaw = (() => { try { return fs.readFileSync(CODEX_CONFIG, 'utf8'); } catch { return ''; } })();
+        if (/klypix/i.test(codexGlobalRaw)) P(`    ${CODEX_CONFIG} — any KLYPIX-owned global MCP table would be removed (other servers preserved)`);
+        P(`    ${path.join(HOME, '.codex', 'AGENTS.md')} — managed KLYPIX guidance block merged/refreshed`);
+        P(CODEX_HOOKS
+            ? `    ${path.join(HOME, '.codex', 'hooks.json')} — enhanced lifecycle hooks (--codex-hooks; Codex asks for trust)`
+            : '    enhanced Codex hooks: off (opt in with --codex-hooks)');
+    }
+
+    // 9) Project setup preview (read-only halves of runSetup).
+    if (!RUNTIME_ONLY && !NO_PROJECT) {
+        const { root, why } = resolveProjectRoot(process.cwd());
+        const signal = projectSignal(root);
+        P(`• project setup → ${root} (${why}):`);
+        if (!signal.ok) {
+            P(`    would be skipped — ${signal.why}`);
+        } else {
+            const brainPath = ['brain.klypix', 'brain.any'].map((n) => path.join(root, n)).find(exists);
+            P(brainPath ? `    brain: ${brainPath} exists — left untouched` : `    brain: ${path.join(root, 'brain.klypix')} would be seeded (starter areas)`);
+            try {
+                const detected = detectEditors();
+                const names = [...detected.present.values()].map((e) => e.name);
+                P(`    editors detected: ${names.length ? names.join(' · ') : 'none'}`);
+                const projectOwned = MCP_FILES.filter((rel) => isProjectOwnedMcp(path.join(root, rel)));
+                const audit = linkProject(root, { check: true, editors: detected.present.keys(), exclude: projectOwned });
+                const targets = [...(audit.rules || []), ...(audit.mcp || [])];
+                const statusOf = (t) => String(t.status || t.action || '').toLowerCase();
+                const toWrite = targets.filter((t) => ['missing', 'stale'].includes(statusOf(t)));
+                const current = targets.filter((t) => statusOf(t) === 'ok');
+                const attention = targets.filter((t) => !['missing', 'stale', 'ok'].includes(statusOf(t)));
+                P(`    config/rules files: ${toWrite.length} would be written/updated · ${current.length} already current${attention.length ? ` · ${attention.length} hand-edited/unreadable (see \`npx klypix-mcp link --check\`)` : ''}${audit.skipped?.length ? ` · ${audit.skipped.length} skipped (tools you don't have)` : ''}`);
+                for (const t of toWrite.slice(0, 16)) P(`      ~ ${t.file}`);
+                if (projectOwned.length) P(`    project-owned MCP config left byte-identical: ${projectOwned.join(', ')}`);
+            } catch (e) {
+                P(`    (editor/config audit unavailable in preview: ${e?.message || e})`);
+            }
+            if (exists(path.join(root, '.git'))) {
+                let driver = null;
+                try { driver = execFileSync('git', ['config', '--get', 'merge.klypix.driver'], { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 1500 }).trim(); } catch { /* unset */ }
+                P(driver
+                    ? '    merge driver: already registered — would be re-registered harmlessly'
+                    : '    merge driver: lossless .klypix merge driver would be registered (git config + .gitattributes)');
+            }
+            P('    verification (a real MCP client handshake) runs only on a real install');
+        }
+    } else if (!RUNTIME_ONLY) {
+        P('• project setup: skipped (--no-project)');
+    }
+
+    P('');
+    P(ongoingBehaviorLines().join('\n'));
+    P('\n✓ dry run complete — nothing was written. (Preview runs without the install lock; the real install re-decides everything under it.)');
+    return 0;
+}
+
+if (DRY_RUN) {
+    try { process.exit(await runDryRun()); }
+    catch (e) { console.error(`✗ dry run failed: ${e?.message || e}`); process.exit(1); }
+}
 
 const installLock = acquireInstallLockSync(BRAIN_DIR);
 if (!installLock) {
@@ -334,76 +646,29 @@ try {
         console.log(`⚠ release-tagged checkout has uncommitted changes (${checkoutLabel}) — deployed bytes differ from the release; stamping dirty:true so brain_doctor surfaces it.`);
     }
 
+    // Upfront honesty: the one-screen summary of what this command is about to
+    // do — including the standing behaviors it enables (24h auto-update, the
+    // session git-hook auto-install) — printed BEFORE the first write.
+    // Non-interactive on purpose: print, then act. `--dry-run` previews the
+    // same plan in detail without acting at all.
+    const staged = computeStaged();
+    printUpfrontSummary({ staged, depPlan: resolveDepClosure({ copy: false }) });
+
     fs.mkdirSync(BRAIN_DIR, { recursive: true });
-    // 1) runtime dependency CLOSURE (jszip+fractional-indexing for the hook/engine,
-    //    @modelcontextprotocol/sdk+zod for the local MCP server). Resolve each via
-    //    createRequire so it's found wherever the package manager put it — CRITICAL
-    //    for `npx`, which HOISTS deps to its cache root (not PKG_ROOT/node_modules).
-    //    Walk transitive deps resolved FROM each package's own context (handles
-    //    nesting). @huggingface/transformers (optional, huge) is intentionally
-    //    skipped — semantic recall degrades to lexical until the host warms it.
-    // Resolve a package DIR by walking node_modules upward (Node-style): checks
-    // fromDir/node_modules/<name>, then each parent — so it finds hoisted deps under
-    // npx AND nested ones. fs-based on purpose: require.resolve('<name>/package.json')
-    // is blocked by restrictive "exports" (e.g. fractional-indexing v3) and would
-    // silently drop a dep the hook needs.
-    const destMods = path.join(BRAIN_DIR, 'node_modules');
-    const findPkgDir = (name, fromDir) => {
-        // Follow linked/isolated package roots before walking upward. A host
-        // can have AJV 6 at its app root while the linked MCP SDK resolves AJV
-        // 8 beside its real package location; starting from the symlink path
-        // would silently select the wrong major for the flat runtime.
-        let dir;
-        try { dir = fs.realpathSync(fromDir); } catch { dir = path.resolve(fromDir); }
-        for (; ;) {
-            const cand = path.join(dir, 'node_modules', ...name.split('/'));
-            if (exists(path.join(cand, 'package.json'))) return cand;
-            const parent = path.dirname(dir);
-            if (parent === dir) return null;
-            dir = parent;
-        }
-    };
-    const seen = new Set();
-    // @modelcontextprotocol/ext-apps powers the canvas_view MCP App; the server
-    // treats it as OPTIONAL (lazy import, degrades to a text-only tool), so a
-    // resolve failure here must NOT abort — it's queued but tolerated if missing.
-    const OPTIONAL_DEPS = new Set(['@modelcontextprotocol/ext-apps']);
-    const queue = ['jszip', 'fractional-indexing', '@modelcontextprotocol/sdk', 'zod', '@modelcontextprotocol/ext-apps'].map(name => ({ name, fromDir: PKG_ROOT }));
-    let deps = 0; const missing = [];
-    while (queue.length) {
-        const { name, fromDir } = queue.shift();
-        if (seen.has(name)) continue; seen.add(name);
-        const dir = findPkgDir(name, fromDir);
-        if (!dir) { if (!OPTIONAL_DEPS.has(name)) missing.push(name); continue; }
-        if (!exists(path.join(destMods, name))) { copyDir(dir, path.join(destMods, name)); deps++; }
-        try { const pj = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')); for (const d of Object.keys(pj?.dependencies || {})) queue.push({ name: d, fromDir: dir }); } catch { /* no readable package.json */ }
-    }
+    // 1) runtime dependency CLOSURE — the shared walk (see resolveDepClosure
+    //    above), here with copy:true so missing packages are laid down.
+    const { planned, missing } = resolveDepClosure({ copy: true });
+    const deps = planned.length;
     if (missing.length) { releaseInstallLockSync(installLock); console.error(`✗ could not resolve required dep(s): ${missing.join(', ')} — aborting (the brain hook needs them).`); process.exit(1); }
 
-    // 2) STAGE the scripts (engine + hook + flattened servers), write each to
-    //    `<name>.klypix-new`, back up the current copy to .prev/, then atomically
-    //    rename them into place — global-brain-hook.mjs LAST, so its engine + deps
-    //    are already present the instant the entry point flips. Each file is always
-    //    fully-old-or-fully-new (rename is atomic); a crash mid-pass leaves a
-    //    version-skew-safe brain (the hook guards on missing engine exports), never
-    //    a truncated hook. Deps (step 1) are additive and already in place.
-    const staged = [];
-    // canvas-view-app.html is the canvas_view MCP App UI — staged raw (an HTML
-    // file must never get a JS-comment banner) beside the flat server, which
-    // resolves it via its ./canvas-view-app.html candidate path.
-    for (const f of ['global-brain-hook.mjs', 'capture-gap.mjs', 'brain-semantic.mjs', 'semantic-memory.mjs', 'enrichment.mjs', 'brain-note.mjs', 'brain-git-hook.mjs', 'git-capture-install.mjs', 'brain-history.mjs', 'brain-graveyard.mjs', 'klypix-format.mjs', 'klypix-core.mjs', 'brain-write-lock.mjs', 'agent-rules.mjs', 'brain-doctor.mjs', 'agent-presence.mjs', 'mcp-presence.mjs', 'repo-state.mjs', 'result-reconcile.mjs', 'finding-routing.mjs', 'presence-relay.mjs', 'mcp-supervisor.mjs', 'mcp-auto-update.mjs', 'runtime-inspector.mjs', 'project-graph.mjs', 'bench.mjs', 'codex-brain-hook.mjs', 'codex-hooks.mjs', 'canvas-view-app.html']) {
-        const s = path.join(SRC, f); if (exists(s)) staged.push({ dst: f, content: fs.readFileSync(s, 'utf8') });
-    }
-    for (const [src, dst] of [
-        ['klypix-mcp.mjs', 'klypix-mcp-server.mjs'],
-        ['klypix-worker.mjs', 'klypix-mcp-worker.mjs'],
-        ['klypix-a2a.mjs', 'klypix-a2a-server.mjs'],
-        ['klypix-conformance.mjs', 'klypix-conformance.mjs'],
-        ['klypix-runtime.mjs', 'klypix-runtime.mjs'],
-        ['klypix-semantic-warm.mjs', 'klypix-semantic-warm.mjs'],
-    ]) {
-        const s = path.join(BIN, src); if (exists(s)) staged.push({ dst, content: flatten(fs.readFileSync(s, 'utf8')) });
-    }
+    // 2) STAGE the scripts (engine + hook + flattened servers — computeStaged
+    //    above), write each to `<name>.klypix-new`, back up the current copy to
+    //    .prev/, then atomically rename them into place — global-brain-hook.mjs
+    //    LAST, so its engine + deps are already present the instant the entry
+    //    point flips. Each file is always fully-old-or-fully-new (rename is
+    //    atomic); a crash mid-pass leaves a version-skew-safe brain (the hook
+    //    guards on missing engine exports), never a truncated hook. Deps
+    //    (step 1) are additive and already in place.
     for (const st of staged) fs.writeFileSync(path.join(BRAIN_DIR, st.dst + '.klypix-new'), st.content);
     try {
         const prevDir = path.join(BRAIN_DIR, '.prev'); fs.mkdirSync(prevDir, { recursive: true });
@@ -429,17 +694,9 @@ try {
 
     // 5) wire the 4 hooks into settings.json (refuse on invalid JSON; back up;
     // atomic). A background runtime-only update refreshes the scripts while
-    // deliberately preserving every host/project config byte.
-    const brainCmd = (arg) => `node "${fwd(path.join(BRAIN_DIR, 'global-brain-hook.mjs'))}"${arg ? ' ' + arg : ''}`;
-    const GROUPS = [
-        ['SessionStart', { matcher: 'startup|resume', hooks: [{ type: 'command', command: brainCmd('') }] }],
-        ['UserPromptSubmit', { hooks: [{ type: 'command', command: brainCmd('--prompt'), timeout: 10 }] }],
-        ['Stop', { hooks: [{ type: 'command', command: brainCmd('--capture') }] }],
-        ['PostToolUse', { matcher: 'Bash|PowerShell|Edit|Write', hooks: [{ type: 'command', command: brainCmd('--live'), timeout: 10 }] }],
-    ];
-    const stripOurs = (arr) => (Array.isArray(arr) ? arr : [])
-        .map(g => (g && Array.isArray(g.hooks)) ? { ...g, hooks: g.hooks.filter(h => !(typeof h?.command === 'string' && h.command.includes(HOOK_MARK))) } : g)
-        .filter(g => !g || !Array.isArray(g.hooks) || g.hooks.length > 0);
+    // deliberately preserving every host/project config byte. brainCmd/GROUPS/
+    // stripOurs live at module scope so the dry-run classifies against the
+    // exact entries written here.
     let settings = {};
     let rawSettings = '';
     if (!RUNTIME_ONLY && exists(SETTINGS)) {
@@ -501,7 +758,7 @@ try {
 
     // 7) migrate THIS project's .mcp.json off npx onto the now-installed local bundle
     //    (heals an existing stale config so the next MCP server spawn runs current).
-    const migrated = RUNTIME_ONLY ? null : migrateProjectMcpConfig();
+    const migrated = RUNTIME_ONLY ? null : migrateProjectMcpConfig({ dryRun: false });
 
     // Codex needs native MCP tools, conditional guidance, and lifecycle presence.
     const codex = RUNTIME_ONLY ? null : wireCodex();

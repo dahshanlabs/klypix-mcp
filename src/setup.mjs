@@ -93,7 +93,7 @@ export function projectSignal(root, { home = null } = {}) {
 // Every MCP config this project could carry, relative to its root. Kept beside
 // the projection map's own list so the ownership check covers all six hosts,
 // not just the Claude Code one the original migration knew about.
-const MCP_FILES = [
+export const MCP_FILES = [
   '.mcp.json', '.cursor/mcp.json', '.cline/mcp.json',
   '.gemini/settings.json', '.vscode/mcp.json', '.codex/config.toml',
 ];

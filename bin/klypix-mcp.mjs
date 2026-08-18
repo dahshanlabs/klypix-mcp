@@ -27,6 +27,8 @@ const USAGE = [
   'Verbs:',
   '  install [--force] [--codex-hooks]   set up everything: machine engine + Claude hooks, then THIS project —',
   '          [--no-project] [--json]     brain, config for the editors you actually have, merge driver, verified',
+  '          [--dry-run|--check]         preview every write + the standing behaviors (24h auto-update,',
+  '                                      session git-hook install) — prints the plan, writes NOTHING',
   '  link [dir] [--check]                project this project\'s 14 managed agent config files (--check audits, writes nothing, exits 1 on drift)',
   '  doctor [--npm] [--all] [--json]     read-only self-check; exits 1 on drift',
   '  runtime [--json] [--watch seconds]  passive MCP process/RAM attribution; never terminates a process',

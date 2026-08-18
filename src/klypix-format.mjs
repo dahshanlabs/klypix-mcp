@@ -1745,7 +1745,21 @@ export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMile
 // open questions + a pointer to the FULL brief file the hook writes alongside.
 // The pointer + marker legend are reserved OUT of the budget so they always fit.
 export const ULTRA_BUDGET_CHARS = 1_800;   // sibling of BUDGET_CHARS above — sized for the harness preview, not token cost
-export function structToUltraBrief(struct, { freshness = null, briefPath = '.claude/brain-brief.md', budgetChars = ULTRA_BUDGET_CHARS } = {}) {
+// stableCounts (2026-08-18): the AGENTS.md brief block is COMMITTED into
+// adopters' repos, and its exact card/connection/per-area counters changed on
+// every capture — so an unchanged set of headlines still rewrote AGENTS.md at
+// every Stop, dirtying checkouts (release worktrees included) with pure
+// counter noise. With stableCounts the volatile counters are rounded (header)
+// or omitted (areas, skills tail), so the block's bytes change only when its
+// CONTENT does. The SessionStart stdout tier keeps exact counts — it is
+// ephemeral output, not a committed file.
+const approxCount = (n) => {
+    const v = Number(n) || 0;
+    if (v < 20) return String(v);
+    const step = v < 200 ? 10 : 100;
+    return `~${Math.round(v / step) * step}`;
+};
+export function structToUltraBrief(struct, { freshness = null, briefPath = '.claude/brain-brief.md', budgetChars = ULTRA_BUDGET_CHARS, stableCounts = false } = {}) {
     const texts = struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim());
     const isArchived = (c) => /^archive$/i.test(c.area || '');
     const isFocus = (c) => /(^|\s)focus\b/i.test(c.area || '');
@@ -1766,12 +1780,14 @@ export function structToUltraBrief(struct, { freshness = null, briefPath = '.cla
     const pushIf = (l) => { if (used + l.length + 1 > budget) return false; out.push(l); used += l.length + 1; return true; };
     const tail = [
         '',
-        `📖 **Full brief: \`${briefPath}\`** — skills (${skills.length}), milestones, recent decisions, connections, self-heal detail. READ IT before planning non-trivial work.`,
+        `📖 **Full brief: \`${briefPath}\`** — skills${stableCounts ? '' : ` (${skills.length})`}, milestones, recent decisions, connections, self-heal detail. READ IT before planning non-trivial work.`,
         '🧠 Capture: `🧠 BRAIN [Area]: <decision>` · `?` question · `!` milestone · `+` skill · `✓` resolve · `~` update · a "CORRECTION: …" decision supersedes its stale card across areas · suffixes `closes:` / `ev:` (full legend in the brief file).',
     ];
     const budget = Math.max(400, budgetChars - tail.reduce((s, l) => s + l.length + 1, 0));
     push(`# ${struct.title} — brain (ultra brief)`);
-    push(`*${struct.counts.cards} cards · ${struct.counts.connections} connections — this is the preview tier; the full brief is one Read away (below)*`);
+    push(stableCounts
+        ? `*${approxCount(struct.counts.cards)} cards · ${approxCount(struct.counts.connections)} connections — this is the preview tier; the full brief is one Read away (below)*`
+        : `*${struct.counts.cards} cards · ${struct.counts.connections} connections — this is the preview tier; the full brief is one Read away (below)*`);
     // clip = surrogate-safe truncation for arbitrary strings (head() covers cards).
     const clip = (s, n) => { const t = flat(s); return t.length > n ? safeCut(t, n - 1) : t; };
     if (focus.length && pushIf('') && pushIf('## 📌 Human focus (act on these first)')) {
@@ -1795,10 +1811,31 @@ export function structToUltraBrief(struct, { freshness = null, briefPath = '.cla
         if (shown < open.length) pushIf(`- …and ${open.length - shown} more — in the full brief.`);
     }
     const areas = struct.cards.filter(c => c.type === 'container' && !/^archive$/i.test(c.title || ''))
-        .map(c => `${flat(c.title)} (${texts.filter(t => t.parentId === c.id).length})`);
+        .map(c => stableCounts ? flat(c.title) : `${flat(c.title)} (${texts.filter(t => t.parentId === c.id).length})`);
     if (areas.length) { pushIf(''); pushIf(clip('Areas: ' + areas.join(' · '), 240)); }
     push(...tail);
     return out.join('\n') + '\n';
+}
+
+// ── Canonical AGENTS.md brief block ──────────────────────────────────────────
+// ONE builder shared by BOTH writers of the committed `klypix-brain-brief`
+// block — the Stop hook's refreshAgentsBrief and agent-rules'
+// compactAgentsBrief. Before 2026-08-18 the two produced different comment
+// lines and exact counters, so they ping-ponged AGENTS.md between byte-variant
+// blocks and every capture rewrote the file even when nothing an agent reads
+// had changed. Contract: same struct ⇒ byte-identical block, and a capture
+// that changes no headline (a card landing in an area, counters drifting)
+// leaves the block untouched. Deterministic — no timestamps, no rand.
+export const AGENTS_BRIEF_START = '<!-- klypix-brain-brief:start -->';
+export const AGENTS_BRIEF_END = '<!-- klypix-brain-brief:end -->';
+export const AGENTS_BRIEF_RE = /<!-- klypix-brain-brief:start -->[\s\S]*?<!-- klypix-brain-brief:end -->/;
+export function agentsBriefBlock(struct, { budgetChars = 3200 } = {}) {
+    const brief = structToUltraBrief(struct, {
+        briefPath: '.claude/brain-brief.md',
+        budgetChars: Math.max(1200, Math.min(5000, Number(budgetChars) || 3200)),
+        stableCounts: true,
+    }).trim();
+    return `${AGENTS_BRIEF_START}\n<!-- compact fallback only — auto-refreshed from brain.klypix; brain_sync supplies task-ranked context -->\n${brief}\n${AGENTS_BRIEF_END}`;
 }
 
 // ── Relevance ranking ─────────────────────────────────────────────────────

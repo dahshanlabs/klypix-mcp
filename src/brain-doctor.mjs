@@ -56,6 +56,11 @@ try { repoStateLib = await import('./repo-state.mjs'); } catch { repoStateLib = 
 // (the exact drift that once produced three different live-session counts).
 let presenceLib = null;
 try { presenceLib = await import('./agent-presence.mjs'); } catch { presenceLib = null; }
+// brain-sanitize powers the PRIVACY layer (PII/secret scan over brain text).
+// Same failure-tolerant idiom: a flat bundle that predates the module degrades
+// the layer to 'unknown', never kills the doctor.
+let sanitizeLib = null;
+try { sanitizeLib = await import('./brain-sanitize.mjs'); } catch { sanitizeLib = null; }
 
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -446,9 +451,38 @@ export function inspectDecayGuard(brainDir, lib, now = Date.now()) {
   };
 }
 
+// ── PRIVACY layer (PII/secret scan over brain text, 2026-08-18) ──────────────
+// The brain is durable, often git-committed, sometimes cloud-synced — and
+// agents write into it automatically. Real incidents put an Apple cert
+// fingerprint, a personal email, and a home path into shared brains. This
+// layer REPORTS counts + kinds (redacted previews only); it never edits the
+// brain — redaction is a human decision.
+//
+// Async by necessity (parseKlypix unzips), so it cannot live inside the
+// synchronous inspect(): callers run it first and pass the result as
+// opts.privacy. A caller that skips it simply gets no PRIVACY layer — absence
+// of a scan must never render as "scanned clean".
+export async function inspectPrivacy(projectDir, { fmt = fmtLib, sanitize = sanitizeLib } = {}) {
+  const klypixBrain = path.join(projectDir, 'brain.klypix');
+  const anyBrain = path.join(projectDir, 'brain.any');
+  const brainPath = fs.existsSync(klypixBrain) ? klypixBrain : anyBrain;
+  if (!fs.existsSync(brainPath)) return null;
+  if (!sanitize || typeof sanitize.scanBrainStruct !== 'function') return { scanned: false, reason: 'brain-sanitize module unavailable' };
+  if (!fmt || typeof fmt.parseKlypix !== 'function') return { scanned: false, reason: 'format engine unavailable' };
+  try {
+    const parsed = await fmt.parseKlypix(fs.readFileSync(brainPath));
+    // parseKlypix returns { struct, zip, canvas, … }; the card struct is nested.
+    return sanitize.scanBrainStruct(parsed?.struct || parsed);
+  } catch (error) {
+    return { scanned: false, reason: String(error?.message || error).slice(0, 160) };
+  }
+}
+
 /**
  * Inspect this machine's brain (+ a project's harness projection) as one report.
- * @param {{ projectDir?: string, home?: string, now?: number, npmLatest?: string|null }} [opts]
+ * @param {{ projectDir?: string, home?: string, now?: number, npmLatest?: string|null,
+ *   privacy?: object|null }} [opts] — privacy is the awaited inspectPrivacy() result
+ *   (inspect() itself stays synchronous).
  */
 export function inspect(opts = {}) {
   const home = opts.home || os.homedir();
@@ -524,6 +558,8 @@ export function inspect(opts = {}) {
   const peers = inspectPeers(brainDir, brainPath, now, receiptSessionId);
   // opts.fmtLib is a test seam (stub engines); production uses the module lib.
   const decayGuard = inspectDecayGuard(brainDir, opts.fmtLib !== undefined ? opts.fmtLib : fmtLib, now);
+  // Awaited by the caller (inspectPrivacy is async; inspect stays sync).
+  const privacy = opts.privacy !== undefined ? opts.privacy : null;
 
   // Harness drift only counts toward the verdict for a real brain project; auditProject
   // against the BAKED brain version (the deployed truth) when available.
@@ -588,6 +624,11 @@ export function inspect(opts = {}) {
     decayGuard: !decayGuard.libLoaded ? 'unknown'
       : (!decayGuard.exported || decayGuard.rendererStamps === false
         || decayGuard.deployedFmtCurrent === false || decayGuard.deployedHookCurrent === false) ? 'drift' : 'ok',
+    // PRIVACY reports, never drifts: findings are a human review queue (the
+    // doctor never edits the brain), and an unscanned run is a fact, not a
+    // verdict flip.
+    privacy: !hasBrain || privacy == null ? 'n/a'
+      : (!privacy.scanned ? 'unknown' : (Number(privacy.total || 0) > 0 ? 'warning' : 'ok')),
   };
   const drifted = Object.values(layers).filter(s => s === 'drift').length;
   // A live session that has not declared task scope cannot contribute overlap
@@ -613,6 +654,10 @@ export function inspect(opts = {}) {
   if (autoUpdate.result === 'verification-refused') {
     readinessWarnings.push(autoUpdate.error
       || `automatic update to v${autoUpdate.latestVersion || '?'} was refused by release verification (current version kept)`);
+  }
+  if (layers.privacy === 'warning') {
+    const kindList = Object.entries(privacy.kinds || {}).map(([kind, count]) => `${kind}×${count}`).join(', ');
+    readinessWarnings.push(`${privacy.total} possible secret/PII finding(s) in brain text (${kindList}) — review; the doctor never auto-edits`);
   }
   const verdict = !version.installed
     ? 'NOT-INSTALLED'
@@ -651,7 +696,7 @@ export function inspect(opts = {}) {
 
   // `checkout` is additive (schema-stable): downstream renderers keep parsing
   // every existing field; it never feeds layers/verdict/actions by design.
-  return { verdict, layers, drifted, readinessWarnings, version, running, supervisors, autoUpdate, hooks, codexSmart, codexHooks, gitCapture, history, tools, peers, sessions: peers, receipts: peers.receipts, receiptSessionId, harness, npm, decayGuard, checkout, project: { dir: projectDir, brainPath, hasBrain }, brainDir, actions };
+  return { verdict, layers, drifted, readinessWarnings, version, running, supervisors, autoUpdate, hooks, codexSmart, codexHooks, gitCapture, history, tools, peers, sessions: peers, receipts: peers.receipts, receiptSessionId, harness, npm, decayGuard, privacy, checkout, project: { dir: projectDir, brainPath, hasBrain }, brainDir, actions };
 }
 
 // One-line drift summary (empty when clean) — for a footer / status line.
@@ -845,6 +890,24 @@ export function render(r, opts = {}) {
           : d.deployedFmtCurrent === false ? 'deployed klypix-format.mjs predates the decay guard'
             : 'deployed global-brain-hook.mjs predates message stamps';
       L.push(`${dmark} ${c.bold}DECAY${c.rst}    ${c.red}${why} — stale status claims can render as CURRENT state${c.rst}`);
+    }
+  }
+
+  // PRIVACY (PII/secret scan over brain text — reported, never auto-edited).
+  // Rendered only when a scan actually ran or failed: absence of a scan must
+  // never read as "scanned clean".
+  if (r.project.hasBrain && r.privacy) {
+    if (!r.privacy.scanned) {
+      L.push(`${c.dim}· ${c.bold}PRIVACY${c.rst}${c.dim}  brain text not scanned (${r.privacy.reason || 'unknown'})${c.rst}`);
+    } else if (r.layers.privacy === 'warning') {
+      const kindList = Object.entries(r.privacy.kinds || {}).map(([kind, count]) => `${kind}×${count}`).join(' · ');
+      L.push(`${warn} ${c.bold}PRIVACY${c.rst}  ${c.yel}${r.privacy.total} possible secret/PII finding(s) in brain text: ${kindList}${c.rst} ${c.dim}— review and redact by hand; the doctor never edits the brain${c.rst}`);
+      for (const f of (r.privacy.findings || []).slice(0, 8)) {
+        L.push(`        ${c.dim}· ${f.kind} “${f.match}” in card ${f.cardId || '?'} (${f.field || 'text'})${c.rst}`);
+      }
+      if ((r.privacy.findings || []).length > 8) L.push(`        ${c.dim}· … ${(r.privacy.findings || []).length - 8} more (see --json)${c.rst}`);
+    } else {
+      L.push(`${ok} ${c.bold}PRIVACY${c.rst}  no secrets/PII detected in brain text ${c.dim}(${r.privacy.cards} card(s) scanned; conservative — misses over false positives)${c.rst}`);
     }
   }
 

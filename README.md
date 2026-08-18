@@ -517,7 +517,7 @@ The MCP verbs below are what agents call. These are what **you** call:
 | `npx klypix-mcp runtime` | Passive per-connection process/RAM attribution (`--json`, optional `--watch seconds`); never kills or deduplicates |
 | `npx klypix-mcp conformance` | Launch two real MCP clients against this build and verify coordination behaviour |
 | `npx klypix-mcp git-driver` | Register the lossless `.klypix` merge driver for a repo (`status` to check) |
-| `npx klypix-mcp git-hook` | Wire the agent-neutral commit-capture hook: rationale-bearing `feat`/`fix`/`perf` commits from any agent, branch, or worktree card into the brain at commit time (`install`/`remove`/`status`; sessions auto-install it where the hook slots are free) |
+| `npx klypix-mcp git-hook` | Wire the agent-neutral commit-capture hook: rationale-bearing `feat`/`fix`/`perf` commits from any agent or branch card into the brain at commit time (`install`/`remove`/`status`; sessions auto-install it where the hook slots are free). Linked worktrees and OS-temp trees are skipped by default — opt one in with `KLYPIX_BRAIN_WORKTREE_CAPTURE=1`, or silence everything with `KLYPIX_BRAIN_QUIET=1` (see Security and permissions) |
 | `npx klypix-mcp brain-history` | Restore points for this brain — `list` them, `restore <id>` one. Written automatically before every brain write, kept machine-local, and never throttled away for a write that removes cards |
 | `npx klypix-mcp diff [ref]` | Card-level brain diff against a git ref, as markdown |
 | `npx klypix-mcp pr-brief [ref]` | Brain cards referencing the files changed since a ref, as markdown |
@@ -668,6 +668,17 @@ keep lazy first-use indexing instead.
   data, but a note relays whatever its sender typed (and automatic overlap alerts name the declared
   file paths involved). The scope is versioned: an older metadata-only grant does not authorize note
   text and must be granted again. No current consent, no frames.
+- **One quiet switch silences every automatic writer.** Set `KLYPIX_BRAIN_QUIET=1` (or drop a
+  `.klypix-brain-quiet` file in the project root — the env var wins in both directions, so `=0`
+  overrides a marker) and nothing KLYPIX-automatic writes into that checkout: no commit capture, no
+  Stop-hook capture, no AGENTS.md brief refresh, no managed-file reconcile, no registry
+  registration. Reads and session context keep working; each skipped writer leaves one debug line
+  on stderr. Made for release builds and any tree that must stay byte-clean.
+- **Ephemeral checkouts are not projects.** A linked git worktree, or any tree under the OS temp
+  directory, is skipped by commit capture and registry registration by default (and the reconcile
+  pass never write-touches it); registry rows whose brain is gone or lives in the OS temp dir are
+  pruned automatically. A deliberate long-lived worktree opts back in with
+  `KLYPIX_BRAIN_WORKTREE_CAPTURE=1`. Main checkouts are unaffected.
 - **`install` writes to your home directory:** `~/.claude/project-brain` (engine + runtime),
   `~/.claude/settings.json` (four hooks — written even if Claude Code is not installed),
   `~/.codex/AGENTS.md` (guidance block), and with `--codex-hooks`, `~/.codex/hooks.json`. It also

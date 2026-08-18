@@ -25,6 +25,7 @@ import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
+import { brainQuiet } from './brain-quiet.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
@@ -400,19 +401,29 @@ export async function compactAgentsBrief(projectDir, { check = false, budgetChar
       try { return fs.statSync(file).isFile(); } catch { return false; }
     });
   if (!brainFile || !fs.existsSync(agentsFile)) return { status: 'skipped', action: 'skipped', reason: 'no brain/AGENTS.md' };
+  // Quiet tree (2026-08-18): reads are fine, but never rewrite a checkout's
+  // AGENTS.md — release worktrees were restamped mid-build by exactly this pass.
+  if (!check && brainQuiet({ projectDir: dir }).quiet) {
+    return { status: 'skipped', action: 'skipped', reason: 'quiet tree — writes disabled' };
+  }
   const raw = fs.readFileSync(agentsFile, 'utf8');
   const start = '<!-- klypix-brain-brief:start -->';
   const end = '<!-- klypix-brain-brief:end -->';
   const re = /<!-- klypix-brain-brief:start -->[\s\S]*?<!-- klypix-brain-brief:end -->/;
   if (!re.test(raw)) return { status: 'skipped', action: 'skipped', reason: 'no generated brief block' };
   try {
-    const { parseKlypix, structToUltraBrief } = await import('./klypix-format.mjs');
-    const { struct } = await parseKlypix(fs.readFileSync(brainFile));
-    const brief = structToUltraBrief(struct, {
-      briefPath: '.claude/brain-brief.md',
-      budgetChars: Math.max(1200, Math.min(5000, Number(budgetChars) || 3200)),
-    }).trim();
-    const block = `${start}\n<!-- compact fallback only; brain_sync supplies task-ranked context -->\n${brief}\n${end}`;
+    const format = await import('./klypix-format.mjs');
+    const { struct } = await format.parseKlypix(fs.readFileSync(brainFile));
+    // The CANONICAL block builder (shared with the Stop hook's refreshAgentsBrief;
+    // stable counters, one comment line) — same struct ⇒ same bytes, so the two
+    // writers stopped ping-ponging AGENTS.md between byte-variant blocks. The
+    // fallback below only serves a stale klypix-format without the export.
+    const block = typeof format.agentsBriefBlock === 'function'
+      ? format.agentsBriefBlock(struct, { budgetChars })
+      : `${start}\n<!-- compact fallback only; brain_sync supplies task-ranked context -->\n${format.structToUltraBrief(struct, {
+        briefPath: '.claude/brain-brief.md',
+        budgetChars: Math.max(1200, Math.min(5000, Number(budgetChars) || 3200)),
+      }).trim()}\n${end}`;
     const next = raw.replace(re, block);
     if (next === raw) return { status: 'ok', action: 'unchanged', bytes: Buffer.byteLength(block) };
     if (check) return { status: 'stale', action: 'check', bytes: Buffer.byteLength(block) };
@@ -733,6 +744,14 @@ export function linkProject(projectDir, opts = {}) {
   const check = !!opts.check;
   const t = targets(projectDir);
   const hasBrain = exists(path.join(projectDir, 'brain.klypix')) || exists(path.join(projectDir, 'brain.any'));
+  // Quiet tree (2026-08-18): the audit (check:true) still runs — reads are
+  // allowed — but a write-mode link must not touch a single file in a checkout
+  // marked quiet (KLYPIX_BRAIN_QUIET=1 or .klypix-brain-quiet; env wins). Every
+  // target reports action:'skipped' so callers see WHY nothing converged.
+  if (!check && brainQuiet({ projectDir, env: opts.env }).quiet) {
+    const asSkipped = (target) => ({ tool: target.tool, file: relFile(projectDir, target.file), action: 'skipped', why: 'quiet tree — writes disabled' });
+    return { rules: t.rules.map(asSkipped), mcp: t.mcp.map(asSkipped), hasBrain, version, check, skipped: [], quiet: true };
+  }
 
   const editors = opts.editors == null ? null
     : (opts.editors instanceof Set ? opts.editors : new Set(opts.editors));

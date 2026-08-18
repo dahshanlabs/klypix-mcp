@@ -25,6 +25,7 @@ import crypto from 'crypto';
 import https from 'https';
 import { spawn } from 'child_process';
 import { fileURLToPath, pathToFileURL } from 'url';
+import { brainQuiet, ephemeralCheckout, isTempPath } from './brain-quiet.mjs';
 
 export const AUTO_UPDATE_TTL_MS = 24 * 60 * 60 * 1000;
 export const AUTO_UPDATE_LOCK_STALE_MS = 30 * 60 * 1000;
@@ -94,6 +95,7 @@ export function registerProjectBrain({
   brainPath,
   brainDir = path.join(os.homedir(), '.claude', 'project-brain'),
   now = Date.now(),
+  env = process.env,
 } = {}) {
   const candidate = path.resolve(String(brainPath || ''));
   if (!['brain.klypix', 'brain.any'].includes(path.basename(candidate).toLowerCase())) {
@@ -102,6 +104,17 @@ export function registerProjectBrain({
   try {
     if (!fs.statSync(candidate).isFile()) return { registered: false, reason: 'missing-brain' };
   } catch { return { registered: false, reason: 'missing-brain' }; }
+  // A quiet or ephemeral checkout is not an independent project (2026-08-18):
+  // release worktrees self-registered on SessionStart until the machine
+  // registry held ~20 throwaway entries, and the reconcile then write-touched
+  // every one of them. Skips are marked `skipped: true` so callers with a
+  // legacy fallback path know the refusal was deliberate, not a failure.
+  // KLYPIX_BRAIN_WORKTREE_CAPTURE=1 opts a long-lived worktree back in.
+  const projectDir = path.dirname(candidate);
+  const quiet = brainQuiet({ projectDir, env });
+  if (quiet.quiet) return { registered: false, skipped: true, reason: 'quiet' };
+  const eph = ephemeralCheckout({ projectDir, env });
+  if (eph.ephemeral) return { registered: false, skipped: true, reason: eph.reason };
 
   const files = autoUpdatePaths(brainDir);
   let token = null;
@@ -169,12 +182,53 @@ async function loadInstalledAgentRules(brainDir, version) {
   return import(`${pathToFileURL(file).href}?harness=${encodeURIComponent(version || 'current')}-${Date.now()}`);
 }
 
+/**
+ * Registry hygiene (2026-08-18): drop entries whose brain no longer exists or
+ * whose project sits in the OS temp dir — throwaway checkouts must not keep a
+ * durable registry row (or a reconcile visit) after registration stopped
+ * accepting them. Locked + atomic like every other registry write; a busy lock
+ * simply skips pruning until the next pass (fail-open).
+ */
+export function pruneRegisteredProjects({
+  brainDir = path.join(os.homedir(), '.claude', 'project-brain'),
+  now = Date.now(),
+  env = process.env,
+} = {}) {
+  const files = autoUpdatePaths(brainDir);
+  // KLYPIX_BRAIN_WORKTREE_CAPTURE=1 declares this machine's temp trees real
+  // projects — keep their rows too, or every pass would prune what the next
+  // sync re-registers. Missing brains are always pruned.
+  const keepTemp = ['1', 'true', 'on', 'yes'].includes(String(env?.KLYPIX_BRAIN_WORKTREE_CAPTURE ?? '').trim().toLowerCase());
+  const prunable = (item) => {
+    if (!item?.path) return true;
+    if (!keepTemp && isTempPath(path.dirname(path.resolve(item.path)))) return true;
+    try { return !fs.statSync(path.resolve(item.path)).isFile(); } catch { return true; }
+  };
+  const current = readJson(files.registry);
+  const brains = Array.isArray(current?.brains) ? current.brains : [];
+  if (!brains.some(prunable)) return { pruned: 0 };
+  const token = acquireLock(files.registryLock, now, 10_000);
+  if (!token) return { pruned: 0, reason: 'busy' };
+  try {
+    const locked = readJson(files.registry) || {};
+    const lockedBrains = Array.isArray(locked.brains) ? locked.brains : [];
+    const kept = lockedBrains.filter((item) => !prunable(item));
+    if (kept.length !== lockedBrains.length) atomicJson(files.registry, { ...locked, brains: kept });
+    return { pruned: lockedBrains.length - kept.length };
+  } catch (error) {
+    return { pruned: 0, reason: cleanError(error) };
+  } finally {
+    releaseLock(files.registryLock, token);
+  }
+}
+
 /** Reconcile every registered project (or an explicit brain subset). */
 export async function reconcileRegisteredProjects({
   brainDir = path.join(os.homedir(), '.claude', 'project-brain'),
   version = null,
   brainPaths = null,
   rules = null,
+  env = process.env,
 } = {}) {
   const requested = Array.isArray(brainPaths)
     ? brainPaths.map((brainPath) => ({
@@ -183,6 +237,9 @@ export async function reconcileRegisteredProjects({
       project: path.basename(path.dirname(path.resolve(brainPath))),
     }))
     : readRegisteredProjectBrains(brainDir);
+  // Registry-driven passes also prune dead/temp rows on sight, so the machine
+  // registry converges instead of accumulating one entry per throwaway tree.
+  const pruneReceipt = Array.isArray(brainPaths) ? null : pruneRegisteredProjects({ brainDir, env });
   const unique = [];
   const seen = new Set();
   for (const item of requested.slice(0, 200)) {
@@ -193,6 +250,7 @@ export async function reconcileRegisteredProjects({
   }
 
   const summary = { checked: unique.length, updated: 0, unchanged: 0, failed: 0, skipped: 0, projects: [] };
+  if (pruneReceipt?.pruned) summary.pruned = pruneReceipt.pruned;
   if (!unique.length) return summary;
   let projector;
   try { projector = rules || await loadInstalledAgentRules(brainDir, version); }
@@ -214,6 +272,23 @@ export async function reconcileRegisteredProjects({
       if (!['brain.klypix', 'brain.any'].includes(brainName) || !fs.statSync(item.brainPath).isFile()) {
         summary.skipped++;
         summary.projects.push({ project: item.project, status: 'skipped', reason: 'brain-missing' });
+        continue;
+      }
+      // Never write-touch a quiet or ephemeral checkout (2026-08-18): a release
+      // worktree restamped by this pass mid-build dirtied the tree and broke a
+      // real desktop release. Quiet = KLYPIX_BRAIN_QUIET=1 or a
+      // .klypix-brain-quiet marker in the project root (env wins); ephemeral =
+      // linked git worktree or OS-temp tree. Reads elsewhere are unaffected.
+      const quiet = brainQuiet({ projectDir: item.projectDir, env });
+      if (quiet.quiet) {
+        summary.skipped++;
+        summary.projects.push({ project: item.project, status: 'skipped', reason: 'quiet' });
+        continue;
+      }
+      const eph = ephemeralCheckout({ projectDir: item.projectDir, env });
+      if (eph.ephemeral) {
+        summary.skipped++;
+        summary.projects.push({ project: item.project, status: 'skipped', reason: eph.reason });
         continue;
       }
       for (let attempt = 0; attempt < 20 && !projectToken; attempt++) {

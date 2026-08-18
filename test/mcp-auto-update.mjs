@@ -121,14 +121,20 @@ try {
     fs.mkdirSync(path.join(projectB, '.cline'), { recursive: true });
     fs.writeFileSync(path.join(projectB, '.cline', 'mcp.json'), '{ invalid-json');
 
-    const a = registerProjectBrain({ brainPath: path.join(projectA, 'brain.klypix'), brainDir: dir, now: 10 });
-    const b = registerProjectBrain({ brainPath: path.join(projectB, 'brain.klypix'), brainDir: dir, now: 20 });
-    registerProjectBrain({ brainPath: path.join(projectA, 'brain.klypix'), brainDir: dir, now: 30 });
+    // The fixture projects live under os.tmpdir(), which registration and
+    // reconcile now treat as ephemeral by default — the override env declares
+    // them real projects so this scenario keeps testing what it always did.
+    // test/hook-quiet.mjs covers the ephemeral default itself.
+    const realTree = { KLYPIX_BRAIN_WORKTREE_CAPTURE: '1' };
+    const a = registerProjectBrain({ brainPath: path.join(projectA, 'brain.klypix'), brainDir: dir, now: 10, env: realTree });
+    const b = registerProjectBrain({ brainPath: path.join(projectB, 'brain.klypix'), brainDir: dir, now: 20, env: realTree });
+    registerProjectBrain({ brainPath: path.join(projectA, 'brain.klypix'), brainDir: dir, now: 30, env: realTree });
     const registered = readRegisteredProjectBrains(dir);
     const receipt = await reconcileRegisteredProjects({
       brainDir: dir,
       version: '1.5.2',
       rules: { auditProject, compactAgentsBrief, linkProject },
+      env: realTree,
     });
     const humanAgents = fs.readFileSync(path.join(projectA, 'AGENTS.md'), 'utf8');
     const pendingDirs = [dir];

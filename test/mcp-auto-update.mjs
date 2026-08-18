@@ -81,6 +81,9 @@ try {
       brainDir: dir,
       now: 200_000,
       fetchLatest: async () => '1.5.2',
+      // Release verification has its own suite (test/update-provenance.mjs);
+      // stubbed here so this test keeps its no-network guarantee.
+      verifyRelease: async () => ({ ok: true }),
       installVersion: async (version, { brainDir }) => {
         exact = version;
         writeRuntime(brainDir, version);
@@ -159,6 +162,7 @@ try {
       currentVersion: '1.5.2',
       now: 300_000,
       fetchLatest: async () => '1.5.2',
+      verifyRelease: async () => ({ ok: true }),
       installVersion: async (version, { brainDir }) => {
         installed = true;
         writeRuntime(brainDir, version);

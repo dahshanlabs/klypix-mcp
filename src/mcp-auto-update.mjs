@@ -9,6 +9,13 @@
 //   - default on, with KLYPIX_AUTO_UPDATE=0|off|false|no as the explicit opt-out;
 //   - one registry check per machine per 24 hours;
 //   - stable, same-major releases only (a new major requires a manual install);
+//   - BEFORE any install, the release is verified client-side (tarball hash vs
+//     dist.integrity + npm SLSA provenance attestation naming this repository —
+//     src/update-provenance.mjs). Verification failure FAILS CLOSED: the
+//     current version is kept and a visible 'verification-refused' receipt is
+//     written; only a registry that cannot be reached at all degrades to the
+//     quiet contained-failure path. KLYPIX_UPDATE_VERIFY=off disables this
+//     (dangerous — documented in SECURITY.md);
 //   - npm installs an exact version and verifies the package's registry integrity;
 //   - runtime installation is isolated; only after verification do we reconcile
 //     KLYPIX-managed blocks/config entries in registered brain projects;
@@ -25,6 +32,7 @@ import crypto from 'crypto';
 import https from 'https';
 import { spawn } from 'child_process';
 import { fileURLToPath, pathToFileURL } from 'url';
+import { verifyReleaseProvenance } from './update-provenance.mjs';
 
 export const AUTO_UPDATE_TTL_MS = 24 * 60 * 60 * 1000;
 export const AUTO_UPDATE_LOCK_STALE_MS = 30 * 60 * 1000;
@@ -486,6 +494,8 @@ export async function runAutoUpdateCheck({
   fetchLatest = fetchLatestStableVersion,
   installVersion = installExactRuntime,
   reconcileProjects = reconcileRegisteredProjects,
+  verifyRelease = verifyReleaseProvenance,
+  env = process.env,
 } = {}) {
   const files = autoUpdatePaths(brainDir);
   if (!enabled) return { checked: false, result: 'disabled' };
@@ -580,6 +590,30 @@ export async function runAutoUpdateCheck({
         return finalize(status, installed.version);
       }
 
+      // Verify-before-install (fail closed). A refusal is NOT the contained
+      // 'failed' path: it keeps the current version AND leaves a loud,
+      // distinguishable receipt — brain_doctor renders 'verification-refused'
+      // in red. Only reason 'network' (registry unreachable mid-verification)
+      // degrades to the existing quiet contained-failure path via throw.
+      let verification = null;
+      if (typeof verifyRelease === 'function') {
+        verification = await verifyRelease(latestVersion, { env });
+        if (verification && verification.ok === false) {
+          if (verification.reason === 'refused') {
+            const status = {
+              protocol: 1,
+              result: 'verification-refused',
+              checkedAt,
+              currentVersion: installed.version,
+              latestVersion,
+              error: `update to v${latestVersion} REFUSED: ${verification.error || 'release verification failed'} — kept v${installed.version || 'current'}`,
+            };
+            atomicJson(files.status, status);
+            return { checked: true, ...status };
+          }
+          throw new Error(verification.error || 'release verification could not reach the registry');
+        }
+      }
       await installVersion(latestVersion, { brainDir: files.brainDir });
       const verified = readInstalledRuntime(files.brainDir);
       if (!verified.managed || compareSemver(verified.version, latestVersion) !== 0) {
@@ -594,6 +628,11 @@ export async function runAutoUpdateCheck({
         latestVersion,
         installedVersion: verified.version,
         lastUpdatedAt: completedAt,
+        // Observability, not a gate: the gate already ran above. 'skipped'
+        // makes a KLYPIX_UPDATE_VERIFY=off install auditable after the fact.
+        ...(verification?.skipped
+          ? { verification: `SKIPPED (${verification.skipped})` }
+          : verification?.repo ? { verification: `provenance verified → ${verification.repo}` } : {}),
       };
       return finalize(status, verified.version);
     } catch (error) {

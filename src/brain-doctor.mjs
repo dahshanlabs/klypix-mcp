@@ -567,7 +567,8 @@ export function inspect(opts = {}) {
       : (version.supervisorCapable ? 'pending-reconnect' : 'legacy'),
     autoUpdate: !autoUpdate.enabled
       ? 'off'
-      : (autoUpdate.result === 'failed' || Number(autoUpdate.harness?.failed || 0) > 0 ? 'warning' : 'ok'),
+      : (autoUpdate.result === 'failed' || autoUpdate.result === 'verification-refused'
+        || Number(autoUpdate.harness?.failed || 0) > 0 ? 'warning' : 'ok'),
     hooks: !hooks.settingsPresent ? 'absent' : (hooks.missing.length ? 'drift' : 'ok'),
     // Codex MCP presence is the automatic baseline. Hooks are an OPTIONAL
     // enrichment layer, so off/unverified must never make the brain "drifted".
@@ -605,6 +606,13 @@ export function inspect(opts = {}) {
   }
   if (Number(autoUpdate.harness?.failed || 0) > 0) {
     readinessWarnings.push(`${autoUpdate.harness.failed} automatic harness repair(s) remain partial`);
+  }
+  // A refused update is the verification gate doing its job — but a human must
+  // SEE it (it is either a supply-chain event or attestation-indexing lag, and
+  // only a person can decide which). Never render this machine as all-clear.
+  if (autoUpdate.result === 'verification-refused') {
+    readinessWarnings.push(autoUpdate.error
+      || `automatic update to v${autoUpdate.latestVersion || '?'} was refused by release verification (current version kept)`);
   }
   const verdict = !version.installed
     ? 'NOT-INSTALLED'
@@ -748,6 +756,13 @@ export function render(r, opts = {}) {
   // AUTO-UPDATE (host-neutral supervisor policy; never part of the drift verdict).
   if (!r.autoUpdate?.enabled) {
     L.push(`${c.dim}· ${c.bold}AUTO-UPDATE${c.rst}  off by KLYPIX_AUTO_UPDATE${c.rst}`);
+  } else if (r.autoUpdate.result === 'verification-refused') {
+    // The refusal receipt, rendered loud: verification failed CLOSED and the
+    // current version was kept. Either the npm artifact is not what this
+    // repository published (supply-chain event) or its attestation has not
+    // indexed yet (retried automatically next cycle) — a human decides which.
+    L.push(`${warn} ${c.bold}AUTO-UPDATE${c.rst}  ${c.red}update REFUSED by release verification — current version kept${c.rst}${r.autoUpdate.error ? `\n        ${c.red}${r.autoUpdate.error}${c.rst}` : ''}`);
+    L.push(`        ${c.dim}verify by hand: npm view klypix-mcp dist.integrity · https://registry.npmjs.org/-/npm/v1/attestations/klypix-mcp@${r.autoUpdate.latestVersion || '<version>'}${c.rst}`);
   } else if (r.autoUpdate.result === 'failed') {
     L.push(`${warn} ${c.bold}AUTO-UPDATE${c.rst}  enabled · last check failed safely${r.autoUpdate.error ? `: ${c.yel}${r.autoUpdate.error}${c.rst}` : ''}`);
   } else if (r.autoUpdate.result === 'major-blocked') {

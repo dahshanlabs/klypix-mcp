@@ -10,6 +10,10 @@
 // Bulletproof by contract (it runs on EVERY commit in a connected repo): instant
 // no-op when there's no ./brain.klypix, NEVER throws, ALWAYS exits 0. It is the
 // SAME capture rule the Claude-Code hook uses (CC_RE + body>=12 rationale gate).
+// Quiet trees (KLYPIX_BRAIN_QUIET=1 / .klypix-brain-quiet) and ephemeral
+// checkouts (linked worktrees, OS-temp trees) are skipped at run time — the
+// hook lives in the COMMON hooks dir and used to dirty release worktrees;
+// KLYPIX_BRAIN_WORKTREE_CAPTURE=1 opts a deliberate worktree back in.
 //
 // Two safety properties for the case where a repo ALSO runs the Claude-Code Stop
 // hook (the dogfood scenario — both would otherwise capture the same commit):
@@ -73,6 +77,24 @@ const writePrev = (s) => { try { fs.mkdirSync(path.dirname(STATE), { recursive: 
 
 async function main() {
     if (!fs.existsSync(BRAIN)) return;                              // not a brain project → instant no-op
+    // Runtime opt-outs (2026-08-18 field incident: this hook fired in ephemeral
+    // release worktrees, appending commit cards mid-build and dirtying the tree
+    // — KLYPIX_GIT_CAPTURE only gates the INSTALLER, not the hook run).
+    //   • quiet tree (KLYPIX_BRAIN_QUIET=1 / .klypix-brain-quiet) → no writes;
+    //   • ephemeral checkout (linked worktree or OS temp dir) → no writes,
+    //     unless KLYPIX_BRAIN_WORKTREE_CAPTURE=1 opts the tree back in.
+    // The commit baseline is left untouched, so opting back in re-scans the
+    // skipped range — nothing is lost, exactly the lock-refusal discipline.
+    // Lazy + guarded: a stale bundle without the module behaves as before.
+    try {
+        const q = await import('./brain-quiet.mjs');
+        const quiet = q.brainQuiet({ projectDir: CWD });
+        const eph = quiet.quiet ? null : q.ephemeralCheckout({ projectDir: CWD });
+        if (quiet.quiet || eph?.ephemeral) {
+            try { process.stderr.write(q.quietSkipLine('git commit capture', quiet.quiet ? quiet.source : eph.reason)); } catch { /* */ }
+            return;
+        }
+    } catch { /* stale bundle without brain-quiet.mjs — capture as before */ }
     let head = ''; try { head = git('rev-parse HEAD'); } catch { return; }
     if (!head) return;
     const prev = readPrev();

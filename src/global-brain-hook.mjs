@@ -50,6 +50,37 @@ const STATE = path.resolve(CWD, '.claude', 'brain-capture-state.json');
 //                  instead of asserting the claim as current. Emit PS-5.1-safe
 //                  commands (no && chaining; use `;` or separate lines).
 const MARKER = /🧠\s*BRAIN\s*(?:\[([^\]]+)\])?\s*([?!✓~+]?)\s*:\s*(.+)$/i;
+// ── Quiet mode + ephemeral-checkout awareness (2026-08-18) ───────────────────
+// ONE opt-out every automatic writer honors (KLYPIX_BRAIN_QUIET=1 or a
+// .klypix-brain-quiet marker in the project root — env wins). Quiet means:
+// reads/stdout are untouched, every write into THIS CHECKOUT is skipped with a
+// single debug line. Home-directory coordination state (presence lane, health
+// log, npm-currency cache) is not repo state and keeps working.
+// ephemeralCheckout() additionally tells registration that a linked git
+// worktree / OS-temp tree is not an independent project (field incident: every
+// release worktree self-registered and was write-touched by the reconcile).
+// Lazy + cached (≤ one git call per hook run) + guarded: a stale bundle
+// without brain-quiet.mjs behaves exactly as before (fail-open, never broken).
+let QUIET_STATE = null;
+async function quietState() {
+    if (QUIET_STATE) return QUIET_STATE;
+    try {
+        const q = await import(new URL('./brain-quiet.mjs', import.meta.url).href);
+        const quiet = q.brainQuiet({ projectDir: CWD });
+        QUIET_STATE = {
+            ...quiet,
+            ephemeral: () => q.ephemeralCheckout({ projectDir: CWD }),
+            line: (what, why) => q.quietSkipLine(what, why),
+        };
+    } catch {
+        QUIET_STATE = {
+            quiet: false, source: null,
+            ephemeral: () => ({ ephemeral: false, reason: null }),
+            line: (what, why) => `[brain] quiet: skipped ${what} (${why})\n`,
+        };
+    }
+    return QUIET_STATE;
+}
 const sha = (s) => crypto.createHash('sha1').update(s).digest('hex').slice(0, 16);
 // Numeric semver compare (major.minor.patch; pre-release tags ignored). <0 if
 // a<b, 0 equal, >0 if a>b. Shared by the version-currency footer below.
@@ -2519,6 +2550,15 @@ async function capture(lib) {
     // Keep this session's coordination lane warm at every Stop (a turn ended; the
     // session lives on between turns). Files/ships are set after the transcript scan.
     touchSession(input.session_id, { branch: gitBranch() });
+    // Quiet tree → capture is a read-only no-op: no brain write, no state/ledger
+    // advance, no AGENTS.md refresh. Baselines stay put, so removing the marker
+    // re-gathers everything from the transcript — nothing is silently lost.
+    const quiet = await quietState();
+    if (quiet.quiet) {
+        try { process.stderr.write(quiet.line('Stop-hook capture', quiet.source)); } catch { /* */ }
+        appendJsonl(HEALTH, { ts: nowIso(), project: path.basename(CWD), mode: 'capture', ok: true, quiet: quiet.source }, 500);
+        return;
+    }
     const tp = input.transcript_path || '';
     if (!tp || !fs.existsSync(tp)) return;
     let transcriptBuffer, lines;
@@ -3124,15 +3164,23 @@ async function refreshAgentsBrief(lib, buffer) {
     const agentsPath = path.resolve(CWD, 'AGENTS.md');
     if (!fs.existsSync(agentsPath)
         || (typeof lib.structToUltraBrief !== 'function' && typeof lib.structToBrief !== 'function')) return;
+    // Defense in depth — the capture gate already returns before reaching this,
+    // but AGENTS.md is a committed file, so it gets its own quiet check too.
+    if ((await quietState()).quiet) return;
     const { struct } = await lib.parseKlypix(buffer);
     // detailRecent: 0 — this block is committed into adopters' AGENTS.md and read
     // by every hookless agent each session; it stays headlines-only by contract
     // (the SessionStart brief is where the detailed-newest tier lives).
-    const brief = (typeof lib.structToUltraBrief === 'function'
-        ? lib.structToUltraBrief(struct, { briefPath: '.claude/brain-brief.md', budgetChars: 3200 })
-        : lib.structToBrief(struct, { recentDays: 7, maxRecent: 4, maxMilestones: 2, maxConnections: 3, detailRecent: 0 }).slice(0, 3200)).trim();
+    // Prefer the engine's CANONICAL block builder (shared with agent-rules'
+    // compactAgentsBrief, stable counters — same struct ⇒ same bytes, so an
+    // unchanged brain never rewrites AGENTS.md). The legacy construction below
+    // only serves a stale klypix-format without the export (version skew).
     const START = '<!-- klypix-brain-brief:start -->', END = '<!-- klypix-brain-brief:end -->';
-    const block = `${START}\n<!-- auto-refreshed by the brain hook on capture · compact fallback only; brain_sync supplies task-ranked context -->\n${brief}\n${END}`;
+    const block = typeof lib.agentsBriefBlock === 'function'
+        ? lib.agentsBriefBlock(struct, { budgetChars: 3200 })
+        : `${START}\n<!-- auto-refreshed by the brain hook on capture · compact fallback only; brain_sync supplies task-ranked context -->\n${(typeof lib.structToUltraBrief === 'function'
+            ? lib.structToUltraBrief(struct, { briefPath: '.claude/brain-brief.md', budgetChars: 3200 })
+            : lib.structToBrief(struct, { recentDays: 7, maxRecent: 4, maxMilestones: 2, maxConnections: 3, detailRecent: 0 }).slice(0, 3200)).trim()}\n${END}`;
     const txt = fs.readFileSync(agentsPath, 'utf8');
     const re = new RegExp(`${START}[\\s\\S]*?${END}`);
     const next = re.test(txt) ? txt.replace(re, block) : (txt.trimEnd() + '\n\n' + block + '\n');
@@ -3352,12 +3400,15 @@ async function promptRetrieve(lib) {
     // Rule-draft nudge — the same-session promote-me push. Gated on struct so the
     // "already covered by a live 🛠️ skill" filter always runs (a token-less prompt
     // leaves struct null; SessionStart's own draft surface + count line cover that
-    // case) and so a terse prompt pays zero extra parse cost.
-    const drafts = struct ? ruleDraftsFooter(sid, struct, { markShown: true }) : '';
+    // case) and so a terse prompt pays zero extra parse cost. In a QUIET tree the
+    // nudges still print but markShown stays false — the shown-receipt lives in
+    // the repo's .claude sidecar, and quiet means no checkout writes.
+    const promptQuiet = (await quietState()).quiet;
+    const drafts = struct ? ruleDraftsFooter(sid, struct, { markShown: !promptQuiet }) : '';
     // Routed cross-lane findings — NOT gated on struct: a routed finding is about
     // the LANE (who declared which path), never about brain content, so a
     // token-less prompt must still surface it. Same markShown contract as above.
-    const findings = await findingDraftsFooter(sid, { markShown: true });
+    const findings = await findingDraftsFooter(sid, { markShown: !promptQuiet });
     if (!repeats.length && !freshHits.length && !peers && !inflight && !messages && !drafts && !findings && !statusMd) return; // nothing → zero output, zero added context
     const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
     const day = (ts) => ts ? new Date(ts).toISOString().slice(0, 10) : '';
@@ -3853,16 +3904,22 @@ async function read(lib) {
     // on demand through brain_doctor; neither acknowledgement nor a receiving-
     // agent consumption receipt proves a human read the note.
     const receiptLine = await receiptFooter(input.session_id || '');
+    // Quiet tree: the read path stays a READ — skip its three checkout writers
+    // (ship-observation sidecar, git-hook auto-install, the brief file below).
+    // stdout context is unaffected; one debug line says what was skipped.
+    const quiet = await quietState();
+    if (quiet.quiet) { try { process.stderr.write(quiet.line('session-start checkout writes (ship sidecar, git-hook install, brief file)', quiet.source)); } catch { /* */ } }
     // Class-C decay leg: notice ships that happened while no hooked session was
     // watching (tag/version drift vs the per-project sidecar) and queue them
     // for the Stop capture. The line rides BOTH emit tiers.
-    const shipObsLine = observeOutOfSessionShips(lib);
+    const shipObsLine = quiet.quiet ? '' : observeOutOfSessionShips(lib);
     // Commit-capture completeness (2026-08-07): the Stop hook's commit walk is
     // blind to commits authored in OTHER worktrees/branches and to non-hooked
     // agents. Ensure the agent-neutral git post-commit/post-merge hook is wired
     // — writes only files we fully own (absent or marker-fenced ours), never a
     // foreign hook. Dynamic + guarded so a stale bundle degrades to a no-op.
     const gitHookNotice = await (async () => {
+        if (quiet.quiet) return '';
         try {
             const ghl = await import(new URL('./git-capture-install.mjs', import.meta.url).href);
             return typeof ghl.ensureGitCaptureHook === 'function' ? (ghl.ensureGitCaptureHook(CWD).notice || '') : '';
@@ -3882,9 +3939,10 @@ async function read(lib) {
         appendJsonl(HEALTH, { ts: nowIso(), project: path.basename(CWD), mode: 'read', ok: true, briefBytes: Buffer.byteLength(full), cards: struct?.counts?.cards ?? null }, 500);
     };
     // --full = everything to stdout (manual runs); also the fallback when the
-    // live klypix-format predates the ultra tier (version skew) or the brief
-    // file can't be written (stdout is then the only channel).
-    if (process.argv.includes('--full') || typeof lib.structToUltraBrief !== 'function') return emitFull();
+    // live klypix-format predates the ultra tier (version skew), the brief file
+    // can't be written, or the tree is QUIET (no checkout writes — stdout is
+    // then the only channel, so it carries everything).
+    if (process.argv.includes('--full') || quiet.quiet || typeof lib.structToUltraBrief !== 'function') return emitFull();
     // Default = ULTRA tier. The harness persists hook stdout and shows only a
     // ~2KB preview, so a 13KB brief was mostly invisible — write the FULL brief
     // to a stable project-local file and print a tier that fits the preview
@@ -3934,6 +3992,21 @@ async function read(lib) {
 // ("what did I decide about auth — in ANY project?"). Zero-config data gravity:
 // just having worked in a brain project makes it searchable. Never throws.
 async function registerBrain() {
+    // Quiet trees and ephemeral checkouts (linked git worktrees, OS-temp trees)
+    // are not independent projects — registering them polluted the machine
+    // registry with one entry per release worktree, and the 24h reconcile then
+    // write-touched every one of them. KLYPIX_BRAIN_WORKTREE_CAPTURE=1 opts a
+    // deliberate long-lived worktree back in.
+    const quiet = await quietState();
+    if (quiet.quiet) {
+        try { process.stderr.write(quiet.line('brain registry registration', quiet.source)); } catch { /* */ }
+        return;
+    }
+    const eph = quiet.ephemeral();
+    if (eph.ephemeral) {
+        try { process.stderr.write(quiet.line('brain registry registration', eph.reason)); } catch { /* */ }
+        return;
+    }
     // Current runtimes share the same locked+atomic registry writer as
     // brain_sync, so simultaneous Claude/Codex/other-host starts cannot lose a
     // project. Keep the legacy body below as a compatibility fallback for an
@@ -3942,7 +4015,9 @@ async function registerBrain() {
         const registry = await import('./mcp-auto-update.mjs');
         if (typeof registry.registerProjectBrain === 'function') {
             const result = registry.registerProjectBrain({ brainPath: BRAIN });
-            if (result?.registered || result?.reason === 'busy') return;
+            // `skipped` = the shared writer's own quiet/ephemeral verdict — the
+            // legacy fallback below must not re-register what it refused.
+            if (result?.registered || result?.skipped || result?.reason === 'busy') return;
         }
     } catch { /* legacy fallback below */ }
     try {

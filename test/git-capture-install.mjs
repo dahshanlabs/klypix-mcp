@@ -167,8 +167,10 @@ installGitCaptureHook(repo);
   fs.mkdirSync(path.join(repo, '.claude'), { recursive: true });
   fs.writeFileSync(path.join(repo, '.claude', 'brain-last-commit-git'),
     `HEAD; echo pwned > "${marker.replace(/\\/g, '/')}"`);
+  // KLYPIX_BRAIN_WORKTREE_CAPTURE=1: the fixture repo lives under os.tmpdir(),
+  // which the hook now treats as an ephemeral checkout by default.
   execFileSync(process.execPath, [path.join(root, 'src', 'brain-git-hook.mjs'), repo],
-    { cwd: repo, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000 });
+    { cwd: repo, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000, env: { ...process.env, KLYPIX_BRAIN_WORKTREE_CAPTURE: '1' } });
   ok(!fs.existsSync(marker),
     'a poisoned .claude/brain-last-commit-git cannot execute a shell command');
   const rebaselined = fs.readFileSync(path.join(repo, '.claude', 'brain-last-commit-git'), 'utf8').trim();
@@ -180,7 +182,10 @@ installGitCaptureHook(repo);
 git(['add', '.']); try { git(['commit', '-m', 'chore: hooks state']); } catch { /* may be clean */ }
 git(['worktree', 'add', '-b', 'feat/wt-branch', wt]);
 const gitHookScript = path.join(root, 'src', 'brain-git-hook.mjs');
-const runCapture = (cwd) => execFileSync(process.execPath, [gitHookScript, cwd], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000 });
+// KLYPIX_BRAIN_WORKTREE_CAPTURE=1 opts the linked worktree (and the tmpdir
+// location) back into commit capture — the default now skips ephemeral
+// checkouts; test/hook-quiet.mjs covers that default.
+const runCapture = (cwd) => execFileSync(process.execPath, [gitHookScript, cwd], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 60_000, env: { ...process.env, KLYPIX_BRAIN_WORKTREE_CAPTURE: '1' } });
 runCapture(wt);   // first run BASELINES to HEAD, captures nothing
 fs.writeFileSync(path.join(wt, 'feature.txt'), 'feature\n');
 git(['add', '.'], wt);

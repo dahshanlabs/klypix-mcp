@@ -1,7 +1,11 @@
 // git-capture-install — wire the agent-neutral commit-capture hook
 // (brain-git-hook.mjs) into a repo's git hooks, so rationale-bearing
 // feat/fix/perf commits card into ./brain.klypix from ANY agent (Cursor, Cline,
-// Codex, a human terminal), on ANY branch, in ANY worktree — at commit time.
+// Codex, a human terminal), on ANY branch — at commit time. The hook installs
+// into the COMMON hooks dir, so it fires in linked worktrees too, but its
+// runtime SKIPS ephemeral checkouts (linked worktrees / OS-temp trees) and
+// quiet trees by default — see brain-quiet.mjs (opt a worktree back in with
+// KLYPIX_BRAIN_WORKTREE_CAPTURE=1).
 //
 // Why this exists (2026-08-07 field diagnosis): brain-git-hook.mjs shipped for
 // months but was installed NOWHERE — the desktop's installer path had zero UI

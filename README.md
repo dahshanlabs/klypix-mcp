@@ -35,6 +35,41 @@ Your agents may run independently. Their project understanding should not.
 
 ---
 
+## When NOT to use this
+
+Honest scoping first, because a coordination layer you don't need is pure overhead:
+
+- **Solo dev, one agent, small project?** You don't need this package. A `decisions.md`
+  convention plus a 15-line git hook captures most of the value with zero moving parts —
+  we wrote that guide for you: **[docs/BUILD_YOUR_OWN.md](docs/BUILD_YOUR_OWN.md)**. It
+  teaches the capture conventions, the correction-supersedes rule, the merge problem, and
+  ships a working flat-markdown starter. If you build it and never hit its boundaries, you
+  never need us.
+- **This tool earns its keep** where the flat file breaks: several concurrent agent
+  sessions on one checkout (silent last-writer-wins clobbering — the guide states the
+  problem precisely, and `npx klypix-mcp bench` measures it), several hosts/providers
+  needing one current understanding, or a memory grown past the point where grep finds
+  the entry that matters. If none of that is you yet, start flat and come back.
+
+**What connecting costs.** Measured, not hand-waved: the server registers **22 tools**
+(count them yourself: `grep -c "server.registerTool('" bin/klypix-worker.mjs`), and the
+serialized `tools/list` result we measured is ~36 KB of JSON — roughly **9k tokens** at
+the ~4-chars-per-token rule of thumb. That is an estimate (hosts serialize and re-send
+schemas differently), but it is context your host spends on every model request whether
+or not a tool gets called. If that is too much for your sessions, run the server with
+`KLYPIX_MCP_PROFILE=minimal` (env var) or `--minimal` (flag): it registers only the **7**
+coordination/recall tools the workflow itself depends on — `brain_sync`, `brain_note`,
+`brain_ask`, `brain_message`, `brain_message_receipt`, `brain_doctor`, `read_canvas` —
+measured at ~15 KB, roughly 3.7k tokens. Full profile stays the default.
+
+And before installing anything: `npx klypix-mcp install --dry-run` prints every file the
+install would write and every standing behavior it would enable (the 24h auto-updater,
+the session git-hook auto-install) without writing a byte, and
+**[docs/WHAT_RUNS_ON_YOUR_MACHINE.md](docs/WHAT_RUNS_ON_YOUR_MACHINE.md)** documents the
+full process tree and how to stop or remove all of it.
+
+---
+
 ## 60 seconds: two agents, one project
 
 Session A — Claude Code, in your repo:
@@ -511,7 +546,7 @@ The MCP verbs below are what agents call. These are what **you** call:
 | Command | What it does |
 |---|---|
 | `npx klypix-mcp init` | Seed a starter `brain.klypix` here and print an MCP config |
-| `npx klypix-mcp install` | Set up everything: machine engine + hooks, then this project — brain, config for the editors you have, merge driver, verified (see Quick start) |
+| `npx klypix-mcp install` | Set up everything: machine engine + hooks, then this project — brain, config for the editors you have, merge driver, verified (see Quick start). `--dry-run` (alias `--check`) previews every write and every standing behavior first, writing nothing |
 | `npx klypix-mcp link` | Re-project all 14 managed files regardless of what is installed (`--check` audits) |
 | `npx klypix-mcp doctor` | One verdict: version, hosts, live sessions, tool count, drift. Exits non-zero — usable as a CI gate |
 | `npx klypix-mcp runtime` | Passive per-connection process/RAM attribution (`--json`, optional `--watch seconds`); never kills or deduplicates |
@@ -525,7 +560,10 @@ The MCP verbs below are what agents call. These are what **you** call:
 
 ---
 
-## The 26 verbs
+## The 22 tools
+
+*(This heading previously said 26 — a drift bug: the table below has always listed 22,
+and 22 is what the code registers and what `install` verifies. Corrected 2026-08-18.)*
 
 | Tool | What it does |
 |---|---|
@@ -552,11 +590,20 @@ The MCP verbs below are what agents call. These are what **you** call:
 | `add_to_canvas` | Append cards/connections (positions preserved) |
 | `list_canvases` | List every `.klypix` in the vault |
 
-Exactly 26, machine-verifiable with `npx klypix-mcp doctor`.
+Exactly 22, machine-verifiable with `npx klypix-mcp doctor`.
 
 > **`canvas_view`:** no MCP Apps host has been observed rendering the UI resource yet — there is no
 > screenshot and no host-level test. Hosts without the extension get clean text, which is the path
 > that is actually verified.
+
+**Minimal profile.** Set `KLYPIX_MCP_PROFILE=minimal` in the server's environment (or add
+`--minimal` to its launch args) to register only 7 of the 22: `brain_sync`, `brain_note`,
+`brain_ask`, `brain_message`, `brain_message_receipt`, `brain_doctor`, `read_canvas`. The
+selection is the workflow's own dependency set — the Context Gateway call, durable capture,
+deeper retrieval, peer notes and their receipts, the self-check, and the full-brief fallback
+the server instructions point to. Everything else (create/add/search/list, the analysis
+lenses, `project_map_*`, `canvas_view`) needs the full profile. Schema-size numbers are in
+*When NOT to use this*; the registration contract is locked by `test/tool-profile.mjs`.
 
 `brain_doctor`, `brain_lens`, `brain_insights` and `brain_reconcile` are read-only introspection.
 `brain_garden`, `brain_reconcile` and `brain_connect` always propose before they apply.
@@ -685,6 +732,12 @@ keep lazy first-use indexing instead.
   writes `<cwd>/.codex/config.toml` **inside the project** you run it in, and removes any KLYPIX
   entry from the global `~/.codex/config.toml`. **`link` writes 14 files inside the project** you
   run it in; `link --check` audits them without writing.
+- **Install honesty:** `install --dry-run` (alias `--check`) prints exactly what would be
+  written — files, `settings.json` hook entries, dependency copies — plus the standing
+  behaviors an install enables (the 24h auto-updater and the session git-hook auto-install,
+  with their off switches), and writes nothing. A real install prints the same one-screen
+  summary **before** acting. The complete process inventory, lifecycle and removal path is
+  documented in [docs/WHAT_RUNS_ON_YOUR_MACHINE.md](docs/WHAT_RUNS_ON_YOUR_MACHINE.md).
 - **Codex hooks require Codex's own trust approval** and are opt-in via `--codex-hooks`.
 
 ## Current limitations
@@ -759,7 +812,9 @@ npx klypix-mcp uninstall unlink    # run inside a project: removes the files `li
 
 It strips only KLYPIX's own entries — every other hook and setting in
 `~/.claude/settings.json` stays — backs up each file it edits, and **never deletes a `.klypix`**.
-`--yes` skips the prompt for scripted removal.
+`--yes` skips the prompt for scripted removal. What is there to remove in the first place —
+every process, its lifecycle, and every standing behavior's off switch — is documented in
+[docs/WHAT_RUNS_ON_YOUR_MACHINE.md](docs/WHAT_RUNS_ON_YOUR_MACHINE.md).
 
 Your `brain.klypix` is yours — it is a plain ZIP and stays readable with or without this package.
 
@@ -768,11 +823,12 @@ Your `brain.klypix` is yours — it is a plain ZIP and stays readable with or wi
 Issues and pull requests: [github.com/dahshanlabs/klypix-mcp](https://github.com/dahshanlabs/klypix-mcp).
 Questions or feedback: [hello@klypix.com](mailto:hello@klypix.com).
 
-The repository carries 68 test files: 62 listed directly in `scripts.test`, plus the
-`pretest` workflow gate. Together they cover the presence
+The repository carries 89 test files: 83 listed directly in `scripts.test`, plus the
+`pretest` workflow gate (the bench, opt-in soak, shared harness and snapshot helpers run
+separately). *(Counts re-measured 2026-08-18 — the previous "68/62" had drifted.)* Together they cover the presence
 lane and its cross-machine relay, the Context Gateway, supervisor hot-swap, auto-update, retrieval
 quality, decay, challenge, lenses, the format guard, the git tools (including a real `git merge`
-through the merge driver), uninstall, and conformance. Run them with `npm test` from a clone — they
+through the merge driver), uninstall, the tool profiles, the install dry-run, and conformance. Run them with `npm test` from a clone — they
 are not in the published tarball, though the publish workflow does run them as a gate. There is a known intermittent Windows `EPERM` flake on rename in
 `test/mcp-supervisor.mjs`.
 

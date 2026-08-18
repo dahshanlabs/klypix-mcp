@@ -106,6 +106,14 @@ const clean = (text, message) => ok(scanText(text).length === 0, message);
   ok(redacted.startsWith('mail ') && redacted.endsWith(' stays here'), 'prose around findings is untouched');
   const benign = 'Decision: ship v1.77.0 from commit 1779b95 — see brain.klypix, hello@klypix.com';
   ok(redactText(benign) === benign, 'text with no findings round-trips byte-identical (no prose mangling)');
+
+  // Capture-time contract: the Stop hook redacts ONLY the unambiguous secret
+  // kinds and leaves softer PII for brain_doctor's human-reviewed layer.
+  const hard = redactText(source, { kinds: ['private-key', 'api-token', 'jwt'] });
+  ok(!hard.includes('sk-proj-Ab12Cd34Ef56Gh78Ij90Kl12') && hard.includes('[REDACTED:api-token]'),
+    'kinds-filtered redaction strips the API token');
+  ok(hard.includes('dr.karim.hassan@gmail.com') && !hard.includes('[REDACTED:email]'),
+    'kinds-filtered redaction leaves emails for the doctor layer — capture never over-redacts prose context');
 }
 
 // ── scanBrainStruct (the brain_doctor seam) ──────────────────────────────────

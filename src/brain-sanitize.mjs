@@ -169,10 +169,14 @@ export function scanText(text) {
   }));
 }
 
-/** Replace every finding with [REDACTED:<kind>]. Non-findings are untouched. */
-export function redactText(text) {
+/** Replace every finding with [REDACTED:<kind>]. Non-findings are untouched.
+ *  `kinds` narrows redaction to those kinds only (capture-time uses this to
+ *  strip unambiguous secrets while leaving softer kinds — emails, paths —
+ *  for brain_doctor's human-reviewed privacy layer). Default: all kinds. */
+export function redactText(text, { kinds } = {}) {
   const input = String(text ?? '');
-  const spans = scanSpans(input);
+  const wanted = kinds ? new Set(kinds) : null;
+  const spans = scanSpans(input).filter((span) => !wanted || wanted.has(span.kind));
   let out = '';
   let cursor = 0;
   for (const span of spans) {

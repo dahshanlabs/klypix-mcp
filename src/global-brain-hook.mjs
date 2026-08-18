@@ -2874,6 +2874,26 @@ async function capture(lib) {
         cards.push(cc);
         ledger.push({ action: /🛠/.test(cc.text) ? 'commit-skill' : 'commit', area: cc.area, preview: (cc.text.split('\n')[0] || '').slice(0, 90) });
     }
+    // PRIVACY GATE — captured text is about to become a durable, git-tracked,
+    // shareable card; scan it before it does. Only the unambiguous secret
+    // kinds are redacted at capture time (a pasted API token has no
+    // legitimate life inside a brain card); softer kinds (emails, paths,
+    // fingerprints) are deliberately left for brain_doctor's privacy layer,
+    // where a human reviews context. Fail-open: a missing or broken
+    // sanitizer (version skew) must never cost a capture. Runs before the
+    // DRY-RUN return so previews show exactly what would be written.
+    try {
+        const sanitize = await import('./brain-sanitize.mjs');
+        const HARD_KINDS = ['private-key', 'api-token', 'jwt'];
+        const hardSet = new Set(HARD_KINDS);
+        for (const c of cards) {
+            const hits = (sanitize.scanText(c.text) || []).filter(f => hardSet.has(f.kind));
+            if (!hits.length) continue;
+            c.text = sanitize.redactText(c.text, { kinds: HARD_KINDS });
+            ledger.push({ action: 'privacy-redact', area: c.area, preview: hits.map(f => f.kind).join(', ') });
+            try { process.stderr.write(`[brain] privacy: redacted ${hits.length} secret-looking value(s) (${hits.map(f => f.kind).join(', ')}) from a captured card\n`); } catch { /* */ }
+        }
+    } catch { /* sanitizer unavailable — brain_doctor still scans the brain */ }
     // DRY-RUN: show exactly what WOULD be captured (and what was skipped, and
     // why) without touching the brain or the dedup state. The inspection seam
     // the audit asked for — `node global-brain-hook.mjs --capture --dry-run < hook.json`.

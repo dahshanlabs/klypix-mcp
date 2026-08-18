@@ -16,7 +16,7 @@
 import fs from 'fs';
 import path from 'path';
 import { execSync } from 'child_process';
-import { inspect, render, inspectAll } from '../src/brain-doctor.mjs';
+import { inspect, inspectPrivacy, render, inspectAll } from '../src/brain-doctor.mjs';
 
 // ARGV: same dual shape as klypix-link — this file is both `klypix-doctor` and the
 // target of `klypix-mcp doctor` (the dispatcher splices its verb out first, see
@@ -39,7 +39,13 @@ try {
     catch { npmLatest = '(offline)'; }
   }
 
-  const report = inspect({ projectDir, npmLatest });
+  // PII/secret scan over the brain's text (async: parseKlypix unzips) — the
+  // result feeds the PRIVACY layer. A scan failure is reported, never fatal.
+  let privacy = null;
+  try { privacy = await inspectPrivacy(projectDir); }
+  catch (e) { privacy = { scanned: false, reason: String(e?.message || e).slice(0, 160) }; }
+
+  const report = inspect({ projectDir, npmLatest, privacy });
 
   if (has('--json')) {
     const all = has('--all') ? inspectAll() : undefined;

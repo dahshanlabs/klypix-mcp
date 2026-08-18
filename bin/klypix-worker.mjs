@@ -1019,7 +1019,7 @@ server.registerTool('brain_sync', {
 
 server.registerTool('brain_doctor', {
   title: 'Brain doctor — is this brain current, wired, and in sync?',
-  description: 'Read-only self-check of the installed klypix brain, as ONE verdict: VERSION (deployed brain-core + optional npm currency), CLAUDE (existing 4-hook capture readiness), CODEX (automatic MCP presence plus optional enhanced-hook status), TOOLS (discoverable MCP verbs), SESSIONS (all active presence-adapter sessions across hosts, never recent-chat history), and HARNESS (projection drift). Use to answer "is my brain current, correctly installed, in sync, and who is actually live?" without file-spelunking. Never writes. SCOPE: only CLAUDE and CODEX get behavioural verdicts. HARNESS classifies the projected config/rules FILES on disk — a project can read fully ok while no other host has ever actually loaded them, so do not report a clean HARNESS as "Cursor/Cline/Windsurf/Copilot is working". The MCP-callable twin of `npx klypix-mcp doctor`.',
+  description: 'Read-only self-check of the installed klypix brain, as ONE verdict: VERSION (deployed brain-core + optional npm currency), CLAUDE (existing 4-hook capture readiness), CODEX (automatic MCP presence plus optional enhanced-hook status), TOOLS (discoverable MCP verbs), SESSIONS (all active presence-adapter sessions across hosts, never recent-chat history), HARNESS (projection drift), and PRIVACY (conservative PII/secret scan over the brain’s text — counts + kinds with redacted previews; reports only, never auto-edits). Use to answer "is my brain current, correctly installed, in sync, and who is actually live?" without file-spelunking. Never writes. SCOPE: only CLAUDE and CODEX get behavioural verdicts. HARNESS classifies the projected config/rules FILES on disk — a project can read fully ok while no other host has ever actually loaded them, so do not report a clean HARNESS as "Cursor/Cline/Windsurf/Copilot is working". The MCP-callable twin of `npx klypix-mcp doctor`.',
   inputSchema: {
     project: z.string().optional().describe('Project dir to audit harness + peers for. Defaults to the server\'s working directory.'),
     check_npm: z.boolean().optional().describe('Also fetch npm latest to flag a stale brain (default false — this one does a network `npm view`).'),
@@ -1028,7 +1028,7 @@ server.registerTool('brain_doctor', {
   try {
     // Lazy import so a flat runtime missing brain-doctor.mjs can't crash server STARTUP —
     // the tool degrades gracefully (errors only when called) instead of taking the server down.
-    const { inspect, render } = await import('../src/brain-doctor.mjs');
+    const { inspect, inspectPrivacy, render } = await import('../src/brain-doctor.mjs');
     let npmLatest = null;
     if (check_npm) {
       try { const { execSync } = await import('child_process'); npmLatest = execSync('npm view klypix-mcp version', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 8000 }).trim(); }
@@ -1037,9 +1037,18 @@ server.registerTool('brain_doctor', {
     // self = THIS running server (the process answering this very call). Passing it
     // makes the RUNNING check report the caller's actual server version, never a
     // phantom another session's heartbeat wrote to the shared registry.
+    const doctorProject = project ? path.resolve(project) : mcpPresence.vault;
+    // PII/secret scan over the brain's text (async seam; guarded so an older
+    // brain-doctor bundle without inspectPrivacy keeps the verb alive).
+    let privacy = null;
+    if (typeof inspectPrivacy === 'function') {
+      try { privacy = await inspectPrivacy(doctorProject); }
+      catch (e) { privacy = { scanned: false, reason: String(e?.message || e).slice(0, 160) }; }
+    }
     const report = inspect({
-      projectDir: project ? path.resolve(project) : mcpPresence.vault,
+      projectDir: doctorProject,
       npmLatest,
+      privacy,
       self: { pid: process.pid, version: PKG_VERSION, id: mcpPresence.id },
     });
     return { content: [{ type: 'text', text: render(report, { color: false }) }] };

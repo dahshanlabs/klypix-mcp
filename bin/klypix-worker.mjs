@@ -197,6 +197,40 @@ const VAULT = resolveVault(vaultArgIdx >= 0 ? process.argv[vaultArgIdx + 1] : un
 if (vaultArgIdx < 0 && !process.env.KLYPIX_VAULT) {
   log(`DEFAULT ROOT: no --vault/KLYPIX_VAULT — vault fell back to ${VAULT}. Pass the project root via brain_sync {project} (or configure --vault) so this connection serves a real project.`);
 }
+
+// ── Tool profiles (KLYPIX_MCP_PROFILE=minimal | --minimal) ────────────────────
+// Every registered tool's schema rides EVERY request the host sends to its
+// model, so the honest way to respect a context budget is to not register what
+// a session doesn't need. `minimal` keeps only the tools the coordination
+// contract itself depends on:
+//   brain_sync            — the Context Gateway (task capsule, peers, overlap,
+//                           note delivery); the one call the AGENTS.md guidance
+//                           and the server instructions require.
+//   brain_note            — durable capture; without it a minimal session could
+//                           read but never record a decision.
+//   brain_ask             — the deeper-retrieval verb the instructions point to
+//                           when the sync capsule is insufficient.
+//   brain_message         — send one-time coordination notes to live peers.
+//   brain_message_receipt — the instructions direct a receiving session to call
+//                           this after incorporating a note; shipping the
+//                           contract without the verb would be a lie.
+//   brain_doctor          — "is this brain current and wired?" self-check.
+//   read_canvas           — the full-brief fallback the instructions name when
+//                           compact context is not enough.
+// Everything else (create/add/search/list, insights/lens/challenge/connect/
+// reconcile/garden, project_map_*, canvas_view) is full-profile only. The
+// filter lives in the ONE registration choke point below, so a tool can never
+// half-register; unknown profile values fall back to full (never fail a boot).
+const MINIMAL_PROFILE_TOOLS = new Set([
+  'brain_sync', 'brain_note', 'brain_ask', 'brain_message', 'brain_message_receipt',
+  'brain_doctor', 'read_canvas',
+]);
+const TOOL_PROFILE = (String(process.env.KLYPIX_MCP_PROFILE || '').trim().toLowerCase() === 'minimal'
+  || process.argv.includes('--minimal')) ? 'minimal' : 'full';
+const profileAllows = (name) => TOOL_PROFILE !== 'minimal' || MINIMAL_PROFILE_TOOLS.has(name);
+if (TOOL_PROFILE === 'minimal') {
+  log(`tool profile: minimal — registering only ${MINIMAL_PROFILE_TOOLS.size} coordination/recall tools (KLYPIX_MCP_PROFILE=minimal / --minimal; omit both for the full set).`);
+}
 const server = new McpServer(
   { name: 'klypix-canvas', version: PKG_VERSION },
   {
@@ -295,7 +329,7 @@ const projectChangedToolResult = () => ({
 // Contradictory identity fails closed: the handler does not run and no queued
 // message is offered or acknowledged.
 const registerToolRaw = server.registerTool.bind(server);
-server.registerTool = (name, config, handler) => registerToolRaw(name, config, async (args, extra) => {
+server.registerTool = (name, config, handler) => profileAllows(name) && registerToolRaw(name, config, async (args, extra) => {
   // brain_sync's project and exact-file declarations are routing authority.
   // Validate them before generic request identity adoption so a rejected call
   // cannot rekey a session, touch a lane, register a project, self-heal a
@@ -1130,7 +1164,11 @@ const canvasViewHandler = async ({ canvas }) => {
 };
 const CANVAS_VIEW_SCHEMA = { canvas: z.string().optional().describe('Canvas filename/path. Defaults to the project brain ("brain").') };
 let canvasViewAsApp = false;
+// The App path registers through ext-apps' own helper, not only the wrapped
+// choke point above — gate it here too so a minimal profile never loads the
+// ext-apps machinery for a tool it will not expose.
 try {
+  if (!profileAllows('canvas_view')) throw new Error('canvas_view excluded by tool profile');
   const apps = await import('@modelcontextprotocol/ext-apps/server');
   // The HTML sits next to src/ siblings in the flat bundle deploy, ../src in the repo.
   let html = null;

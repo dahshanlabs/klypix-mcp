@@ -71,6 +71,22 @@ const removeItem = async (buffer, id) => {
     'G3: no bogus conflict twin or negative delete accounting');
 }
 
+// G3b: editedAt is volatile like updatedAt — an edit-then-undo cycle (or two
+// apps stamping at different moments) leaves content identical while the
+// authored-edit stamp differs. On a null-base first sync (the exact shape that
+// spawned the historical updatedAt twins) that must not create a conflict twin.
+{
+  const ours = await changeItem(base, 'txt_A', (item) => ({ ...item, editedAt: 1900000000001 }));
+  const theirs = await changeItem(base, 'txt_A', (item) => ({ ...item, editedAt: 1900000000777 }));
+  const result = await mergeBrains({ base: null, ours, theirs });
+  const { struct } = await parseKlypix(result.buffer);
+
+  ok(struct.cards.filter((card) => card.id === 'txt_A' || (card.text || '').includes('A — original')).length === 1,
+    'G3b: editedAt-only divergence keeps a single card, no conflict twin');
+  ok(result.conflicts.length === 0,
+    'G3b: editedAt-only divergence is not reported as a conflict');
+}
+
 // G4: deletion provenance and type-aware previews survive the merge and are
 // available before restore. Unknown callers stay unknown rather than being
 // mislabeled as human.

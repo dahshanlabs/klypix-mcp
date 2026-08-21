@@ -83,9 +83,15 @@ function sanitizeDeletionReceipt(raw) {
 //
 // VOLATILE = written by the act of saving, not by a human/agent decision:
 //   updatedAt — touch timestamp        zIndex — display order derived from zKey
+//   editedAt  — the desktop app's authored-edit stamp (2026-08-22): advances on
+//               content-level edits only, but an edit-then-undo cycle leaves the
+//               content identical while the stamp differs — exactly the
+//               same-meaning-different-bytes shape that spawned the updatedAt
+//               twins above. A card whose only difference is WHEN it was last
+//               edited has not diverged.
 // Everything else (content, colors, geometry, evidence, author…) stays load-
 // bearing: a real edit to any of them is still a real conflict.
-const VOLATILE_ITEM_FIELDS = ['updatedAt', 'zIndex'];
+const VOLATILE_ITEM_FIELDS = ['updatedAt', 'zIndex', 'editedAt'];
 
 const sortedStable = (v) => JSON.stringify(v, (_k, val) =>
   (val && typeof val === 'object' && !Array.isArray(val))

@@ -1161,6 +1161,46 @@ export async function tidyBrain(buffer, opts = {}) {
 const normTitleKey = (t) => String(t || '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
 const normTextKey = (t) => String(t || '').toLowerCase().replace(/\s+/g, ' ').trim();
 const connDupKey = (c) => `${c.fromId}|${c.toId}|${c.relationship || ''}|${c.label || ''}`;
+// Merge-engine conflict twins ("<id>__agconf_<rand>") whose text is IDENTICAL
+// to their original are serialization residue (the pre-1.49.0 byte-compare
+// merge), never a deliberate placement — so unlike ordinary same-text cards
+// they collapse ACROSS areas. The live twin of an archived/superseded original
+// is exactly the zombie that outranked its own CORRECTION with no overlay
+// (AgentLit, 2026-08-23: 37 such pairs; 518 twins in total). The original is
+// the survivor; the twin's edges re-point onto it. Text that DIFFERS (a real
+// two-sided edit) is untouched — that twin is a genuine conflict record.
+const AGCONF_TWIN_RE = /^(.+?)__agconf_[a-z0-9]+$/i;
+export const isAgconfTwinId = (id) => AGCONF_TWIN_RE.test(String(id || ''));
+// Engine-authored RETIREMENT stamps — the exact formats the lifecycle writers
+// put on a card: "↩︎ superseded <date>\n" / "⤵ consolidated <date>\n" prepended,
+// "\n✅ <date>: …" / "\n✔ partial <date>: …" appended (the ✅ text itself wraps
+// across lines, so the suffix runs to the end of the card). A twin born BEFORE
+// its original was retired carries the original's pre-retirement text exactly —
+// the AgentLit zombie was this: "Capability Forge proposal" superseded on
+// 2026-08-22, its live twin byte-identical minus the "↩︎ superseded" line.
+// Comparing with the stamps stripped recognizes that pair; the stamped copy is
+// the survivor so the lifecycle record is never lost.
+const RETIRE_PREFIX_RE = /^(?:↩︎? superseded|⤵ consolidated) \d{4}-\d{2}-\d{2}[ \t]*\n?/u;
+const RETIRE_SUFFIX_RE = /\s(?:✅|✔ partial) \d{4}-\d{2}-\d{2}:[\s\S]*$/u;
+const stripRetirement = (t) => String(t || '').replace(RETIRE_PREFIX_RE, '').replace(RETIRE_SUFFIX_RE, '');
+const hasRetirementStamp = (t) => RETIRE_PREFIX_RE.test(String(t || '')) || RETIRE_SUFFIX_RE.test(String(t || ''));
+const retiredTextKey = (t) => normTextKey(stripRetirement(t));
+function foldIdenticalTwins(cardGroups, items, byId, keyOf) {
+    for (const c of items) {
+        if (c.type !== 'text') continue;
+        const m = AGCONF_TWIN_RE.exec(String(c.id || ''));
+        if (!m) continue;
+        const orig = byId.get(m[1]);
+        if (!orig || orig.type !== 'text' || !retiredTextKey(orig.text) || retiredTextKey(orig.text) !== retiredTextKey(c.text)) continue;
+        const ok = keyOf(orig), tk = keyOf(c);
+        if (!ok || !tk || ok === tk) continue;                  // same area → the plain same-text rule already groups them
+        const rest = (cardGroups.get(tk) || []).filter(id => id !== c.id);
+        if (rest.length) cardGroups.set(tk, rest); else cardGroups.delete(tk);
+        if (!cardGroups.has(ok)) cardGroups.set(ok, [orig.id]);
+        if (!cardGroups.get(ok).includes(orig.id)) cardGroups.get(ok).unshift(orig.id);
+        if (!cardGroups.get(ok).includes(c.id)) cardGroups.get(ok).push(c.id);
+    }
+}
 
 // Read-only layout report over a parsed brain: duplicate containers/cards,
 // overlapping boxes (same layer: roots together, siblings per container),
@@ -1181,14 +1221,14 @@ function layoutReportOf({ canvas, struct }) {
     const dupContainers = [...ctnGroups.entries()].filter(([, ids]) => ids.length > 1).map(([key, ids]) => ({ key, ids }));
 
     const cardGroups = new Map();
+    const cardKeyOf = (c) => { const tk = normTextKey(c.text); if (!tk) return ''; const ak = c.parentId ? normTitleKey(byId.get(c.parentId)?.title) : ''; return ak + '|' + tk; };
     for (const c of items) {
         if (c.type !== 'text') continue;
-        const tk = normTextKey(c.text); if (!tk) continue;
-        const ak = c.parentId ? normTitleKey(byId.get(c.parentId)?.title) : '';
-        const k = ak + '|' + tk;
+        const k = cardKeyOf(c); if (!k) continue;
         if (!cardGroups.has(k)) cardGroups.set(k, []);
         cardGroups.get(k).push(c.id);
     }
+    foldIdenticalTwins(cardGroups, items, byId, cardKeyOf);
     const dupCards = [...cardGroups.values()].filter(ids => ids.length > 1).map(ids => ({ ids, text: labelOf(byId.get(ids[0])) }));
 
     // Overlaps within each layer (root layer + one layer per container).
@@ -1304,17 +1344,21 @@ export async function arrangeBrain(buffer, opts = {}) {
         // container → one survivor. Same text in DIFFERENT areas is kept — that
         // placement may be deliberate.
         const cardGroups = new Map();
+        const dedupeKeyOf = (c) => { const tk = normTextKey(c.text); if (!tk) return ''; const parent = c.parentId ? (remap.get(c.parentId) || c.parentId) : ''; return parent + '|' + tk; };
         for (const c of struct.cards) {
             if (c.type !== 'text' || removed.has(c.id)) continue;
-            const tk = normTextKey(c.text); if (!tk) continue;
-            const parent = c.parentId ? (remap.get(c.parentId) || c.parentId) : '';
-            const k = parent + '|' + tk;
+            const k = dedupeKeyOf(c); if (!k) continue;
             if (!cardGroups.has(k)) cardGroups.set(k, []);
             cardGroups.get(k).push(c.id);
         }
+        // Identical __agconf twins fold onto their original across areas (see
+        // foldIdenticalTwins); the original always survives the collapse.
+        foldIdenticalTwins(cardGroups, struct.cards.filter(c => !removed.has(c.id)), byId, dedupeKeyOf);
         for (const ids of cardGroups.values()) {
             if (ids.length < 2) continue;
-            const survivor = pickSurvivor(ids);
+            // Survivor: a copy carrying a retirement stamp (the lifecycle record)
+            // beats a bare one; the original id beats a twin id.
+            const survivor = pickSurvivor(ids, (id) => (hasRetirementStamp(byId.get(id)?.text) ? 2 : 0) + (isAgconfTwinId(id) ? 0 : 1));
             for (const loser of ids) { if (loser !== survivor) { remap.set(loser, survivor); removed.add(loser); } }
             stats.collapsedCards.push({ kept: survivor, removed: ids.filter(id => id !== survivor), text: String(byId.get(survivor)?.text || '').split('\n')[0].slice(0, 60) });
         }
@@ -1376,7 +1420,11 @@ export async function arrangeBrain(buffer, opts = {}) {
     if (afterReport.items < beforeReport.items - collapsedCount)
         throw new Error(`arrange lost items (${beforeReport.items} before − ${collapsedCount} collapsed > ${afterReport.items} after) — aborted, original untouched`);
     const afterTexts = new Set(after.struct.cards.filter(c => c.type === 'text').map(c => normTextKey(c.text)).filter(Boolean));
-    for (const t of beforeTexts) if (!afterTexts.has(t)) throw new Error(`arrange lost a unique card text ("${t.slice(0, 60)}…") — aborted, original untouched`);
+    // A folded twin's text may survive only INSIDE its stamped original (the
+    // pre-retirement text plus a "↩︎ superseded" / "✅ closed by" stamp) — that
+    // is content preserved, not lost. Everything else must still be verbatim.
+    const afterRetiredKeys = new Set(after.struct.cards.filter(c => c.type === 'text').map(c => retiredTextKey(c.text)).filter(Boolean));
+    for (const t of beforeTexts) if (!afterTexts.has(t) && !afterRetiredKeys.has(retiredTextKey(t))) throw new Error(`arrange lost a unique card text ("${t.slice(0, 60)}…") — aborted, original untouched`);
     const afterTitles = new Set(after.struct.cards.filter(c => c.type === 'container').map(c => normTitleKey(c.title)).filter(Boolean));
     for (const t of beforeTitles) if (!afterTitles.has(t)) throw new Error(`arrange lost an area container ("${t}") — aborted, original untouched`);
     if (beforeReport.focusPresent && !afterReport.focusPresent) throw new Error('arrange lost the 📌 Focus container — aborted, original untouched');
@@ -1435,6 +1483,33 @@ export const isMilestoneCard = (c) => lifecycleEligible(c) && !isSkillCard(c) &&
 // "Open AND not already resolved in prose" — the status surfaces carry this
 // extra guard so a ✅/↩/⤵-stamped card is never reported as plainly still-open.
 export const isUnresolvedOpenCard = (c) => isOpenCard(c) && !RESOLVED_GLYPH.test(String(c?.text || ''));
+
+// ── Plan-shaped plain cards (2026-08-23 AgentLit incident) ──────────────────
+// A proposal / plan / "design decided" card written WITHOUT a ❓/🎯 glyph sits
+// outside every lifecycle mechanism above — no close-pass, no fulfillment
+// pairing, no self-heal, no ⏳ hint. So when the thing it describes ships under
+// a 🏁 (often RENAMED: "Capability Forge proposal" → "🏁 Capability builder
+// shipped", same day), the plan keeps rendering as current intent and an agent
+// answers "it's only a proposal" about a feature that is live. Measured before
+// this landed: 61 such cards in the KLYPIX brain, 9 in AgentLit, most with a
+// real later 🏁. This classifier admits them to the SAME pairing machinery as
+// ❓ cards — as hedged HINTS, never as a close.
+// PRECISION-FIRST like every sibling: the HEADLINE (area prefix stripped,
+// wrap-normalized, first ~220 chars) must carry a future-work cue AND no ship
+// pin ("Phase 1 BUILT + verified" is an event, not a plan — "not built" / "not
+// yet built" stay plan cues via the negation lookbehind). Glyphed cards keep
+// their own lifecycle; correction-cue cards assert present truth, never plans.
+const PLAN_CUE_RE = /\b(?:proposals?|proposed|proposes?|planned|plan(?:ning)?(?!\s+doc)|roadmap|next\s+steps?|to\s+be\s+(?:built|shipped|implemented|wired|added)|not\s+(?:yet\s+)?(?:built|designed|implemented|shipped|started|wired)|will\s+(?:build|ship|implement|wire|add|land)|should\s+(?:be|go|default|use|become|move|live|ship|land)|design\s*:|design\b[^.\n]{0,30}?\b(?:decided|locked|approved|agreed|chosen)|(?:decided|approved|locked|agreed)\b[^.\n]{0,20}?\b(?:build|ship|implement|wire)|spec(?:ification)?\s+(?:written|drafted|locked))\b/i;
+const PLAN_SHIP_PIN_RE = /(?<!\bnot\s)(?<!\bnot\s+yet\s)\b(?:shipped|merged|published|released|deployed|landed|built|implemented|went\s+live|is\s+live|now\s+live)\b/i;
+const planHeadline = (text) => normalizeWrappedProse(String(text || '')).replace(/^[^:\n]{1,40}:\s*/, '').slice(0, 220);
+export const isPlanCard = (c) => {
+    if (!lifecycleEligible(c) || c?.type === 'container') return false;
+    const t = String(c?.text || '');
+    if (!t.trim() || STATE_GLYPH.test(t) || SKILL_GLYPH.test(t) || RESOLVED_GLYPH.test(t)) return false;
+    if (hasCorrectionCue(t)) return false;
+    const head = planHeadline(t);
+    return PLAN_CUE_RE.test(head) && !PLAN_SHIP_PIN_RE.test(head);
+};
 
 // ── Per-area status digest (2026-07-23 field incident) ───────────────────────
 // ONE computed current-state line per ACTIVE area: newest 🏁 headline + open
@@ -2085,7 +2160,9 @@ export function rankForQuestion(struct, question, { semantic = null, k = 10, as_
     // the ⏳ overlay as an UNCONFIRMED hint — suggestion-only, hedged wording.
     if (!timeTravel) {
         try {
-            const openHits = hits.filter(h => !h.correction && !h.fulfillment && !h.archived && isUnresolvedOpenCard(h.card));
+            // Plan-shaped plain cards (isPlanCard) ride the same in-answer pass
+            // as ❓ cards — their ship is the same "newer 🏁 covers it" shape.
+            const openHits = hits.filter(h => !h.correction && !h.fulfillment && !h.archived && (isUnresolvedOpenCard(h.card) || isPlanCard(h.card)));
             const mileHits = hits.filter(h => isMilestoneCard(h.card) && !/^archive$/i.test(h.card.area || ''));
             if (openHits.length && mileHits.length) {
                 const settled = new Set();
@@ -2115,11 +2192,34 @@ export function rankForQuestion(struct, question, { semantic = null, k = 10, as_
                     }
                     if (best) {
                         const head = String(best.text || '').replace(/\s+/g, ' ').trim().slice(0, 100);
-                        oh.fulfillment = { by: head, byId: best.id, unconfirmed: true };
+                        oh.fulfillment = { by: head, byId: best.id, unconfirmed: true, ...(isPlanCard(oh.card) ? { kind: 'plan' } : {}) };
                     }
                 }
             }
         } catch { /* pairing is a best-effort overlay — never fail the answer */ }
+        // PLAN↔🏁 BRAIN-WIDE FALLBACK + DEMOTION (2026-08-23 AgentLit incident):
+        // a proposal's ship card is usually RENAMED ("Capability Forge proposal"
+        // → "🏁 Capability builder shipped"), so for a question phrased in the
+        // plan's words it is often NOT in this hit set at all — the in-answer
+        // pass above cannot see it. Unpaired plan hits are therefore checked
+        // against every live newer 🏁 at the strict brain tier. Then, when the
+        // pairing 🏁 IS in the answer but ranks BELOW the plan it fulfilled, it
+        // is lifted to just above it: the newest truth takes the slot, the plan
+        // stays (it is history), and its hint names the ship. Still a hedged
+        // hint; still never retires anything.
+        try {
+            const planLeft = hits.filter(h => !h.correction && !h.fulfillment && !h.archived && isPlanCard(h.card));
+            if (planLeft.length) {
+                const hints = planFulfillmentFor(struct, planLeft.map(h => h.card), { pairSim, scope: 'brain' });
+                for (const h of planLeft) if (hints.has(h.card.id)) h.fulfillment = hints.get(h.card.id);
+            }
+            for (let i = 0; i < hits.length; i++) {
+                const h = hits[i];
+                if (!h.fulfillment || h.fulfillment.kind !== 'plan' || !h.fulfillment.byId) continue;
+                const j = hits.findIndex(x => x.card.id === h.fulfillment.byId);
+                if (j > i) { const [m] = hits.splice(j, 1); hits.splice(i, 0, m); i++; }
+            }
+        } catch { /* best-effort — never fail the answer */ }
     }
     // SERVE-TIME 🛠️↔🏁 OBSOLESCENCE (2026-08-01 incident): the ❓ pass above
     // cannot see the class where a SKILL encodes a since-removed limitation —
@@ -2207,6 +2307,13 @@ export function questionContextToMarkdown(question, result, { mode = 'lexical', 
         let block = `## [${flat(c.area) || 'Notes'}] ${day(c.createdAt)}${status}${rel}\n${flat(c.text)}`;
         if (h.correction) {
             block += `\n\n  ⚠️ CORRECTED — this card is STALE; the current truth is:\n  ${flat(h.correction.by.text).slice(0, 600)}`;
+        } else if (h.fulfillment && (h.fulfillment.kind === 'plan' || isPlanCard(c))) {
+            // A PLAN/PROPOSAL card a newer 🏁 appears to have shipped (2026-08-23
+            // incident: "it's only a proposal" answered about a live feature).
+            // The direction of trust differs from an open item: the reader must
+            // NOT report the plan as unbuilt — and must not assert it built
+            // either. Verify, then confirm or dismiss.
+            block += `\n\n  ⏳ POSSIBLY BUILT${h.fulfillment.unconfirmed ? ' (hint — no confirmed link)' : ''}: this card reads as a PLAN/PROPOSAL, and a newer 🏁 appears to have shipped it: “${flat(h.fulfillment.by).slice(0, 200)}”. Do NOT answer "only a proposal" or "still to do" from this card — for current state trust the newer card and VERIFY against the repo. If built: confirm with a ✓ marker (archives the plan as fulfilled history; it stays retrievable here) or add closes: to the milestone; if not: dismiss via brain_connect relationship:"not_fulfilled".`;
         } else if (h.fulfillment) {
             // Precedence: a correction outranks a fulfills-hint (never stack both).
             // Serve-time pairs (detected inside THIS answer's hit set, no
@@ -4680,6 +4787,99 @@ const SERVE_MIN_STEMS = 3;
 export const serveTimeAccepts = (lex, sameArea) =>
     anchorsSufficient(lex.anchors, sameArea, lex.cov)
     || ((lex.size || 0) >= SERVE_MIN_STEMS && lex.cov >= SERVE_COV_BAR);
+// ── Plan↔🏁 pairing (2026-08-23) — ONE scorer for every plan-card surface ───
+// Two acceptance tiers, because the surfaces differ in how much the QUESTION
+// already constrains the pair:
+//   · 'answer' — inside one brain_ask hit set, where both cards already matched
+//     the same question: the ❓ pass's own bars (embedding ≥ PLAN_PAIR_SIM_ANSWER
+//     plus any lexical corroboration, or lexical alone at the serve bars).
+//   · 'brain'  — against EVERY live newer 🏁 (per-prompt recall, brain_sync
+//     context, SessionStart self-heal, reconcile), where nothing constrains the
+//     pair but the two texts: near-duplicate similarity (PLAN_PAIR_SIM_BRAIN)
+//     plus lexical corroboration, or the self-heal's strict lexical bars
+//     (coverage ≥ 0.6, or rare shared anchors) without embeddings.
+// MEASURED on the KLYPIX brain (2026-08-23, 61 plan-shaped cards × 890 🏁,
+// BGE-small cosines): true plan→ship pairs sat at 0.81–0.93; the false pairs
+// the looser answer tier admitted brain-wide sat at 0.68–0.77 ("Marketing piece
+// #2 planned" ↔ an npm publish, a lock-plan doc ↔ an image-decode fix). The
+// incident pair itself — a RENAMED feature: cov 0.20, zero anchors — measures
+// 0.811 against its ship card, so 0.80 is the floor this tier must keep, and
+// the 0.77→0.81 gap is thin: the constant is exported for RE-MEASUREMENT
+// (scripts/brain-eval in the KLYPIX repo), never tuned by feel.
+// Best milestone = highest score, a near-tie (≤ 0.1) broken toward the EARLIEST
+// 🏁: a plan ships once, and later 🏁s that reuse its vocabulary are follow-ups
+// (the Forge feasibility card's top-score pair was a later unrelated ship
+// until this rule). Bounded O(plans × milestones) with milestones tokenized
+// once; returns Map<planId, { kind:'plan', by, byId, cov, sim, via, unconfirmed }>.
+// Suggestion-only by construction — nothing here writes or retires.
+export const PLAN_PAIR_SIM_ANSWER = 0.55;
+export const PLAN_PAIR_SIM_BRAIN = 0.80;
+export function planFulfillmentFor(struct, cards, { pairSim = null, scope = 'brain', milestones = null, df = null } = {}) {
+    const out = new Map();
+    if (!struct || !Array.isArray(struct.cards) || !Array.isArray(cards) || !cards.length) return out;
+    const isArchived = (c) => /^archive$/i.test(c.area || '');
+    const plans = cards.filter(c => c && isPlanCard(c) && !isArchived(c));
+    if (!plans.length) return out;
+    const miles = Array.isArray(milestones) ? milestones
+        : struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim() && !isArchived(c) && isMilestoneCard(c));
+    if (!miles.length) return out;
+    const settled = new Set();
+    for (const cn of struct.connections || []) {
+        if (cn.label === 'likely closed by' || cn.label === 'closed by' || DISMISSAL_RELS.has(cn.relationship)) settled.add(`${cn.fromId}|${cn.toId}`);
+    }
+    const dfMap = () => (df ??= buildStemDf(struct));
+    const simBar = scope === 'answer' ? PLAN_PAIR_SIM_ANSWER : PLAN_PAIR_SIM_BRAIN;
+    const mPre = miles.map(m => ({ m, idx: stemIndex(tokenSet(m.text)) })).map(x => ({ ...x, keys: new Set(x.idx.keys()) }));
+    const structural = new Map();
+    const excludeFor = (a, b) => { const k = `${a || ''}|${b || ''}`; if (!structural.has(k)) structural.set(k, structuralStems(a, b)); return structural.get(k); };
+    for (const o of plans) {
+        const oIdx = stemIndex(claimTokens(normalizeWrappedProse(o.text)));
+        const oKeys = new Set(oIdx.keys());
+        if (oKeys.size < SERVE_MIN_STEMS) continue;                         // too vague to pair safely
+        let best = null, bestScore = 0, bestLex = null, bestSim = null, bestVia = null;
+        for (const { m, idx: mIdx, keys: mKeys } of mPre) {
+            if (!m || m.id === o.id || (m.createdAt || 0) <= (o.createdAt || 0)) continue;   // a ship must post-date the plan
+            if (settled.has(`${o.id}|${m.id}`)) continue;
+            const sim = typeof pairSim === 'function' ? pairSim(o.id, m.id) : null;
+            const cov = coverageOf(oKeys, mKeys);
+            const sameArea = (o.area || '') === (m.area || '');
+            // Rare shared anchors are only worth computing when a tier can use them.
+            const wantAnchors = (sim != null && sim >= simBar) || scope === 'answer' || cov >= ANCHOR_COV_FLOOR;
+            const anchors = wantAnchors ? sharedAnchors(oIdx, mIdx, dfMap(), { exclude: excludeFor(o.area, m.area) }) : [];
+            const lex = { cov: Math.round(cov * 100) / 100, anchors, size: oKeys.size };
+            // Corroboration reads the ROUNDED coverage the receipt reports (the
+            // incident pair measures 0.20 = 10 of 51 stems; a raw 0.196 must not
+            // fail a bar that was set from the rounded measurement).
+            const corroborated = anchors.length >= 1 || lex.cov >= 0.2;
+            // A MEASURED cosine decides the brain tier. The lexical bars exist
+            // for hosts with no vectors; when the embedding has already
+            // measured a pair as NOT near-duplicate, rare shared words must not
+            // overrule it. Measured on the KLYPIX brain sweep (23 pairs): four
+            // of the five false pairs came through the anchor path at cosines
+            // 0.64–0.74 ("core roadmap" ↔ a desktop build, a freeze plan ↔ the
+            // emoji picker); the veto costs one true pair at 0.748 (the single-
+            // writer architecture ↔ the one-write-lock release) — precision-
+            // first, as every sibling surface. The answer tier keeps its own
+            // question-constrained lexical acceptance.
+            const lexOk = scope === 'answer'
+                ? serveTimeAccepts(lex, sameArea)
+                : (sim == null && (cov >= 0.6 || anchorsSufficient(anchors, sameArea, cov)));
+            const embedOk = sim != null && sim >= simBar && corroborated;
+            if (!embedOk && !lexOk) continue;
+            const score = (sim ?? 0) + cov + anchors.length * 0.2;
+            const via = embedOk ? 'embed' : (cov >= 0.6 || lex.cov >= SERVE_COV_BAR ? 'coverage' : 'anchor');
+            if (!best || score > bestScore + 0.1) { best = m; bestScore = score; bestLex = lex; bestSim = sim; bestVia = via; continue; }
+            if (Math.abs(score - bestScore) <= 0.1 && (m.createdAt || 0) < (best.createdAt || 0)) {
+                best = m; bestScore = Math.max(bestScore, score); bestLex = lex; bestSim = sim; bestVia = via;
+            }
+        }
+        if (best) {
+            const head = String(best.text || '').replace(/\s+/g, ' ').trim().slice(0, 100);
+            out.set(o.id, { kind: 'plan', by: head, byId: best.id, cov: bestLex.cov, sim: bestSim == null ? null : Math.round(bestSim * 1000) / 1000, via: bestVia, unconfirmed: true, scope });
+        }
+    }
+    return out;
+}
 // Imperative-ask cue (2026-07-29): a narrative ❓ card often carries no
 // colon-anchored "remaining:" clause — its ask is an imperative sentence
 // ("Narrow the prune … and verify a packaged answer E2E"). For OPEN-shaped
@@ -4763,7 +4963,10 @@ export function findFulfillmentCandidates(struct, milestones, { coverAt = 0.6, r
         const clauses = extractOpenClauses(o.text);
         // A whole ❓/🎯 card with no prose clause IS the claim (glyph-gated
         // path; never for 🏁 cards — their claim is only the explicit clause).
-        if (!clauses.length && /❓|🎯/.test(o.text) && !/🏁/.test(o.text)) {
+        // A plan-shaped plain card (isPlanCard, 2026-08-23) is the same claim
+        // shape without the glyph: "we will build X" is fulfilled by "🏁 X".
+        const planShaped = isPlanCard(o);
+        if (!clauses.length && (/❓|🎯/.test(o.text) || planShaped) && !/🏁/.test(o.text)) {
             const tk = claimTokens(o.text);
             if (tk.size >= 4) clauses.push({ clause: null, items: [{ text: flat(o.text).slice(0, 120), tokens: tk }] });
         }
@@ -4791,7 +4994,7 @@ export function findFulfillmentCandidates(struct, milestones, { coverAt = 0.6, r
                         viaAnchor = true;
                     }
                     const uncovered = cl.items.filter(x => x !== it && coverageOf(stemSet(x.tokens), mTok) < coverAt).map(x => x.text);
-                    out.push({ open: o, clause: cl.clause, item: it.text, uncovered, milestone: m, cov: Math.round(cov * 100) / 100, resolvable: !viaAnchor && it.tokens.size >= 4, ...(viaAnchor ? { via: 'anchor' } : {}) });
+                    out.push({ open: o, clause: cl.clause, item: it.text, uncovered, milestone: m, cov: Math.round(cov * 100) / 100, resolvable: !viaAnchor && it.tokens.size >= 4, ...(viaAnchor ? { via: 'anchor' } : {}), ...(planShaped ? { kind: 'plan' } : {}) });
                 }
             }
         }
@@ -5087,14 +5290,20 @@ export function corpseRate(struct, { k = 5, maxPairs = 40 } = {}) {
 // the human to close them — never auto-archives (precision-first, suggestion-only,
 // like the migration tripwire). Requires the milestone to post-date the goal so a
 // pre-existing milestone can't "fulfil" a newer goal. No I/O, node-runnable.
-export function findStaleOpenCards(struct, { coverAt = 0.6, max = 5 } = {}) {
-    const empty = { gaps: [], total: 0 };
+export function findStaleOpenCards(struct, { coverAt = 0.6, max = 5, pairSim = null } = {}) {
+    const empty = { gaps: [], total: 0, plans: [], plansTotal: 0 };
     if (!struct || !Array.isArray(struct.cards)) return empty;
     const isArchived = (c) => /^archive$/i.test(c.area || '');
     const live = struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim() && !isArchived(c) && !/↩|✅/.test(c.text));
     const opens = live.filter(isOpenCard);
     const miles = live.filter(isMilestoneCard);
-    if (!opens.length || !miles.length) return empty;
+    // Plan-shaped plain cards (2026-08-23) ask the same "looks done?" question
+    // for proposals that never carried a ❓ — listed separately (plans) so the
+    // footer can word them as BUILT, embedding-first when the caller can pay for
+    // card↔card similarity (pairSim from the warm vector cache), strict lexical
+    // bars without it.
+    const plansLive = live.filter(isPlanCard);
+    if ((!opens.length && !plansLive.length) || !miles.length) return empty;
     // Human dismissals + existing hint edges suppress a pair here exactly as in
     // findFulfillmentCandidates — a rejected hint must never resurface in the
     // self-heal footer either (parity fix, 2026-07-29).
@@ -5145,7 +5354,29 @@ export function findStaleOpenCards(struct, { coverAt = 0.6, max = 5 } = {}) {
         if (best) out.push({ open: o, by: best, cov: Math.round(bestCov * 100) / 100, ...(bestVia === 'anchor' ? { via: 'anchor' } : {}) });
     }
     out.sort((a, b) => b.cov - a.cov);
-    return { gaps: out.slice(0, max), total: out.length };
+    const plans = [];
+    if (plansLive.length) {
+        try {
+            const byId = new Map(live.map(c => [c.id, c]));
+            const hints = planFulfillmentFor(struct, plansLive, { pairSim, scope: 'brain', milestones: miles, df });
+            for (const [id, h] of hints) {
+                const o = byId.get(id), by = byId.get(h.byId);
+                if (o && by) plans.push({ open: o, by, cov: h.cov, sim: h.sim, via: h.via, kind: 'plan' });
+            }
+            // Identical-text twins (merge residue) collapse to ONE row — the
+            // original's id when both exist — so a brain awaiting its Arrange
+            // heal does not list the same plan twice.
+            const byText = new Map();
+            for (const p of plans) {
+                const k = String(p.open.text || '').toLowerCase().replace(/\s+/g, ' ').trim();
+                const prev = byText.get(k);
+                if (!prev || (isAgconfTwinId(prev.open.id) && !isAgconfTwinId(p.open.id))) byText.set(k, p);
+            }
+            plans.length = 0; plans.push(...byText.values());
+            plans.sort((a, b) => ((b.sim ?? 0) + b.cov) - ((a.sim ?? 0) + a.cov));
+        } catch { /* best-effort — the open-card report stands on its own */ }
+    }
+    return { gaps: out.slice(0, max), total: out.length, plans: plans.slice(0, max), plansTotal: plans.length };
 }
 
 // ── Open-question deadline awareness ─────────────────────────────────────────

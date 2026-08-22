@@ -632,9 +632,9 @@ server.registerTool('brain_reconcile', {
   inputSchema: {
     canvas: z.string().optional().describe('Brain canvas filename/path. Defaults to the project brain ("brain").'),
     root: z.string().optional().describe("Project root holding the migrations dir (default: the brain file's folder)."),
-    mode: z.enum(['all', 'contradictions', 'migrations', 'legacy', 'claims']).optional().describe('Which pass to run (default "all"): contradictions · migrations · legacy (pre-v1.15 raw-bash ship cards to tidy) · claims (open "remaining:/next:" clauses a later milestone likely fulfilled — receipts + ✓ markers, never auto-archived).'),
+    mode: z.enum(['all', 'contradictions', 'migrations', 'legacy', 'claims', 'plans']).optional().describe('Which pass to run (default "all"): contradictions · migrations · legacy (pre-v1.15 raw-bash ship cards to tidy) · claims (open "remaining:/next:" clauses a later milestone likely fulfilled — receipts + ✓ markers, never auto-archived) · plans (plan / proposal / "design decided" cards a LATER 🏁 appears to have built — embedding-first because the ship is usually renamed; receipts + ✓ markers, never auto-archived).'),
   },
-}, async ({ canvas, root, mode }) => toContent(await opBrainReconcile({ vault: mcpPresence.vault, canvas: boundBrainCanvas(canvas), root, mode })));
+}, async ({ canvas, root, mode }) => toContent(await opBrainReconcile({ vault: mcpPresence.vault, canvas: boundBrainCanvas(canvas), root, mode, log })));
 
 server.registerTool('brain_garden', {
   title: 'Garden the brain — consolidate over-grown areas (sleep-time compute)',

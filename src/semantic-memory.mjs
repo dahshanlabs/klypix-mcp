@@ -624,6 +624,26 @@ ${extra}` : base;
   return map;
 }
 
+// READ-ONLY card vectors from the warm cache: never loads the model, never
+// embeds a missing card, never writes. For fast paths (brain_sync task context)
+// that may USE card↔card similarity when it is already paid for — plan ↔ 🏁
+// pairing — and must degrade to lexical bars when it is not. Cards whose text
+// changed since they were embedded are simply absent from the result.
+export function cachedVectorsForBrain(brainPath, cards) {
+  const map = new Map();
+  try {
+    const want = (cards || []).filter((card) => card && card.type !== 'container' && (card.text || '').trim());
+    if (!want.length) return map;
+    const desiredHashes = new Map(want.map((card) => [card.id, sha1(String(card.text))]));
+    const loaded = readCache(brainPath, desiredHashes);
+    for (const card of want) {
+      const entry = loaded?.cache?.cards?.[card.id];
+      if (entry?.v && entry.h === desiredHashes.get(card.id)) map.set(card.id, entry.v);
+    }
+  } catch { /* cache is best-effort — lexical stays the floor */ }
+  return map;
+}
+
 export async function vectorsForBrain(pipe, brainPath, cards) {
   if (!BOUNDED) return vectorsForBrainUnlocked(pipe, brainPath, cards);
   const key = canonicalBrainKey(brainPath);

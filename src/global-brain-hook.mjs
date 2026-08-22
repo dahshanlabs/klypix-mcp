@@ -3399,6 +3399,21 @@ async function promptRetrieve(lib) {
             try { mergeOv = lib.mergeOverlaysFor(struct, freshHits.map(h => h.card)); } catch { /* best-effort */ }
         }
         const mergeTag = (id) => { const m = mergeOv.get(id); return m ? `\n  ↳ ⚠️ PR #${m.num} is since MERGED${m.date ? ` (ship event ${m.date})` : ''} — this "awaits merge" note is stale; nothing to do.` : ''; };
+        // Plan→🏁 decay (2026-08-23 AgentLit incident): a recalled PLAN/PROPOSAL
+        // card whose feature a newer 🏁 appears to have shipped gets a hedged
+        // POSSIBLY BUILT line. Brain-wide — the ship card is usually RENAMED, so
+        // it is rarely in this hit set — embedding-first from the READ-ONLY warm
+        // vector cache (cards only; this one-shot process never loads the model),
+        // strict lexical bars without it. Paid only when a plan-shaped card is a
+        // hit. Never retires anything. Version-skew guarded like every lib call.
+        let planOv = new Map();
+        if (struct && typeof lib.planFulfillmentFor === 'function' && typeof lib.isPlanCard === 'function') {
+            try {
+                const planCards = freshHits.map(h => h.card).filter(c => lib.isPlanCard(c));
+                if (planCards.length) planOv = lib.planFulfillmentFor(struct, planCards, { pairSim: await cachedPairSimFor(struct), scope: 'brain' });
+            } catch { planOv = new Map(); }
+        }
+        const planTag = (id) => { const p = planOv.get(id); return p ? `\n  ↳ ⏳ POSSIBLY BUILT — this card reads as a plan/proposal, but a newer 🏁 appears to have shipped it: “${head({ text: p.by }, 110)}”. Do NOT report it as "only a proposal" or still-to-do without checking the repo; if built, confirm with a ✓ marker (or \`closes:\` on the milestone); if not, dismiss via brain_connect relationship:"not_fulfilled".` : ''; };
         // Per-session injection dedup: a card already shown full-text this session
         // renders as one headline, not another ~600 words of context. LARGE cards
         // (>1KB) are tracked in a separate, deep-capped ledger so the 100-entry
@@ -3439,7 +3454,7 @@ async function promptRetrieve(lib) {
                 continue;
             }
             if (wasInjected(h.card)) {
-                lines.push(`- (already shown this session) ${head(h.card, 110)}${mergeTag(h.card.id)}`);
+                lines.push(`- (already shown this session) ${head(h.card, 110)}${mergeTag(h.card.id)}${planTag(h.card.id)}`);
                 shownNow.add(h.card.id);
                 continue;
             }
@@ -3452,7 +3467,7 @@ async function promptRetrieve(lib) {
             // reads this as "uncapped" and overstates it. Clipping here also
             // breaks the contract F5a asserts — first sight must be complete, or
             // the one chance to deliver a long decision intact is lost.
-            lines.push(`- ${flat(h.card.text)}${mergeTag(h.card.id)}`);
+            lines.push(`- ${flat(h.card.text)}${mergeTag(h.card.id)}${planTag(h.card.id)}`);
             shownNow.add(h.card.id);
             noteInjected(h.card);
         }
@@ -3710,19 +3725,50 @@ function doctorFooter() {
 // surfaced so the agent CLOSES them (✓ / closes:) instead of recall surfacing
 // already-done goals as "next". Never auto-archives (precision-first; the human
 // confirms). Version-skew guarded like the migration footer.
-function staleOpenFooter(lib, struct) {
+// Card↔card similarity from the READ-ONLY warm vector cache the MCP host fills
+// (never loads the model, never embeds, never writes): lets the one-shot hook
+// pair a plan card with its RENAMED ship ("Capability Forge proposal" ↔ "🏁
+// Capability builder shipped" — cosine 0.81, lexical coverage 0.20). Null when
+// there is no cache → the engine's strict lexical bars apply. One cache read per
+// process; the read is skipped entirely when nothing plan-shaped needs it.
+let _pairSim;
+async function cachedPairSimFor(struct) {
+    if (_pairSim !== undefined) return _pairSim;
+    _pairSim = null;
+    try {
+        const semlib = await import(new URL('./brain-semantic.mjs', import.meta.url).href);
+        if (typeof semlib.cachedCardVecs !== 'function') return null;
+        const vecs = semlib.cachedCardVecs(BRAIN, (struct && struct.cards) || []);
+        if (!vecs || !vecs.size) return null;
+        _pairSim = (a, b) => { const va = vecs.get(a), vb = vecs.get(b); return va && vb ? semlib.dot(va, vb) : null; };
+    } catch { _pairSim = null; }
+    return _pairSim;
+}
+function staleOpenFooter(lib, struct, pairSim = null) {
     try {
         if (typeof lib.findStaleOpenCards !== 'function') return '';   // version-skew guard (stale live klypix-format)
-        const { gaps, total } = lib.findStaleOpenCards(struct, { max: 5 });
-        if (!gaps || !gaps.length) return '';
+        const { gaps, total, plans = [], plansTotal = 0 } = lib.findStaleOpenCards(struct, { max: 5, pairSim });
         const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
-        const lines = ['', '---',
-            `## 🔧 Self-heal — ${total} open card(s) look DONE (a later milestone covers them)`,
-            `These ❓/🎯 cards still read as open, but a shipped 🏁 milestone appears to fulfil them — so recall keeps surfacing already-done goals as "next". Confirm + close each:`,
-            '· done → `🧠 BRAIN [Area] ✓: <what it resolved to>` — stamps ✅ + archives the open card (or add `closes: <its title>` to the milestone marker).',
-        ];
-        for (const g of gaps) lines.push(`- ⚠️ [${flat(g.open.area) || '?'}] ${flat(g.open.text).slice(0, 90)}  ·  likely closed by → ${flat(g.by.text).slice(0, 70)}`);
-        return '\n' + lines.join('\n') + '\n';
+        const lines = [];
+        if (gaps && gaps.length) {
+            lines.push('', '---',
+                `## 🔧 Self-heal — ${total} open card(s) look DONE (a later milestone covers them)`,
+                `These ❓/🎯 cards still read as open, but a shipped 🏁 milestone appears to fulfil them — so recall keeps surfacing already-done goals as "next". Confirm + close each:`,
+                '· done → `🧠 BRAIN [Area] ✓: <what it resolved to>` — stamps ✅ + archives the open card (or add `closes: <its title>` to the milestone marker).');
+            for (const g of gaps) lines.push(`- ⚠️ [${flat(g.open.area) || '?'}] ${flat(g.open.text).slice(0, 90)}  ·  likely closed by → ${flat(g.by.text).slice(0, 70)}`);
+        }
+        // Plan-shaped cards (2026-08-23): the same leak for proposals that never
+        // carried a ❓ — recall serves them as current intent ("only a proposal")
+        // while the feature is live. Hedged: verify, then ✓ or dismiss.
+        if (plans && plans.length) {
+            lines.push('', '---',
+                `## 🔧 Self-heal — ${plansTotal} plan/proposal card(s) look BUILT (a later 🏁 appears to ship them)`,
+                `These cards read as plans, so recall keeps serving them as current intent — but a shipped 🏁 appears to cover each (the ship is often RENAMED, which is why no link exists). Verify against the repo, then:`,
+                '· built → `🧠 BRAIN [Area] ✓: <what shipped>` — archives the plan as fulfilled history (still retrievable, flagged), or add `closes: <its title>` to the milestone marker.',
+                '· not built → `brain_connect` the pair with relationship:"not_fulfilled" — dismissed for good.');
+            for (const p of plans) lines.push(`- ⏳ [${flat(p.open.area) || '?'}] ${flat(p.open.text).slice(0, 90)}  ·  likely built by → ${flat(p.by.text).slice(0, 70)}${p.sim != null ? ` (sim ${p.sim})` : ''}`);
+        }
+        return lines.length ? '\n' + lines.join('\n') + '\n' : '';
     } catch { return ''; }
 }
 
@@ -3870,11 +3916,15 @@ async function read(lib) {
     })();
     const { struct } = await lib.parseKlypix(fs.readFileSync(BRAIN));
     const { freshness, drifted } = computeFreshness(struct);
+    // Card↔card similarity from the warm vector cache (read-only, no model) —
+    // lets the self-heal pair plan cards with their RENAMED ships. Null → the
+    // engine's strict lexical bars.
+    const pairSim = await cachedPairSimFor(struct);
     // The FULL brief: tiered brief + every self-heal/health footer. Messages are
     // deliberately NOT part of it: messageFooter advances durable offer/ack state
     // and must only go to stdout where the receiving model can see the exact token.
     const full = ((typeof lib.structToBrief === 'function') ? lib.structToBrief(struct, { freshness }) : lib.structToMarkdown(struct))
-        + inflightFooter(input.session_id, struct) + selfHealFooter(drifted) + reconcileFooter(lib, struct) + staleOpenFooter(lib, struct)
+        + inflightFooter(input.session_id, struct) + selfHealFooter(drifted) + reconcileFooter(lib, struct) + staleOpenFooter(lib, struct, pairSim)
         + ruleDraftsFooter(input.session_id, struct, { markShown: false })
         + receiptLine + selfCheckFooter() + doctorFooter() + versionCurrencyFooter() + legendFooter() + memoryFooter();
     const emitFull = () => {
@@ -3909,7 +3959,13 @@ async function read(lib) {
             if (files.length) { const { total } = lib.findUnrecordedMigrations(struct, files, { max: 6 }); if (total) heals.push(`${total} unrecorded migration(s)`); }
         }
     } catch { /* */ }
-    try { if (typeof lib.findStaleOpenCards === 'function') { const { total } = lib.findStaleOpenCards(struct, { max: 5 }); if (total) heals.push(`${total} open card(s) look already done`); } } catch { /* */ }
+    try {
+        if (typeof lib.findStaleOpenCards === 'function') {
+            const { total, plansTotal } = lib.findStaleOpenCards(struct, { max: 5, pairSim });
+            if (total) heals.push(`${total} open card(s) look already done`);
+            if (plansTotal) heals.push(`${plansTotal} plan/proposal card(s) look BUILT`);
+        }
+    } catch { /* */ }
     const healLine = heals.length ? `\n🔧 Self-heal: ${heals.join(' · ')} — detail + fix markers in ${briefRel}.` : '';
     // Rule-draft nudge (capture-coverage): a one-line count in the preview; the full
     // promote-markers live in the brief file (read-only here — no shown-mark).

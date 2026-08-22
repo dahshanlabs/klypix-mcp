@@ -33,6 +33,7 @@ import {
   statusContextToMarkdown, findFulfillmentCandidates,
   splitQueryTokens, scoreCardsAgainstQuery, correctionOverlaysFor,
   isFastDecayCard, isUnresolvedOpenCard, DECAY_STALE_MS, formatDecayAge,
+  isPlanCard, planFulfillmentFor, PLAN_PAIR_SIM_BRAIN, isAgconfTwinId,
   readPendingShips, clearPendingShips, pendingShipCards, formatCaptureReceipts,
 } from './klypix-format.mjs';
 import { findProjectBrain, postPresenceMessage } from './agent-presence.mjs';
@@ -41,6 +42,7 @@ import {
   dot, embedTexts, getEmbedder, getEmbedderForUse, withRerankerForUse,
   rerankHits, semanticFallbackNotice, semanticMemorySnapshot,
   semanticRuntimeInstalled, shouldPrewarmSemantic, vectorsForBrain,
+  cachedVectorsForBrain,
 } from './semantic-memory.mjs';
 
 // The MCP and A2A faces prewarm through this protocol-neutral module. Bounded
@@ -443,6 +445,23 @@ export async function opBrainTaskContext({
   let overlays = new Map();
   try { overlays = correctionOverlaysFor(struct, hits.map((hit) => hit.card)); }
   catch { /* context remains useful without overlays */ }
+  // Plan→🏁 hints (2026-08-23): a recalled PLAN/PROPOSAL whose feature a newer
+  // 🏁 appears to have shipped. Brain-wide (the ship card is usually renamed
+  // and not in this hit set), embedding-first from the READ-ONLY warm vector
+  // cache — this fast path never loads the model — strict lexical bars when
+  // no cache exists. Only paid when a plan-shaped card is among the hits.
+  let planHints = new Map();
+  try {
+    const planCards = hits.map((hit) => hit.card).filter((card) => isPlanCard(card));
+    if (planCards.length) {
+      let pairSim = null;
+      try {
+        const vecs = cachedVectorsForBrain(t.file, struct.cards);
+        if (vecs && vecs.size) pairSim = (a, b) => { const va = vecs.get(a), vb = vecs.get(b); return va && vb ? dot(va, vb) : null; };
+      } catch { pairSim = null; }
+      planHints = planFulfillmentFor(struct, planCards, { pairSim, scope: 'brain' });
+    }
+  } catch { planHints = new Map(); }
 
   const flat = (value) => String(value || '').replace(/\s+/g, ' ').trim();
   const clip = (value, limit) => {
@@ -457,6 +476,7 @@ export async function opBrainTaskContext({
   const nowTs = Date.now();
   const entries = hits.map((hit) => {
     const correction = overlays.get(hit.card.id)?.by || null;
+    const plan = planHints.get(hit.card.id) || null;
     let decayAge = null;
     try {
       const ageMs = (hit.card.createdAt || 0) > 0 ? nowTs - hit.card.createdAt : 0;
@@ -470,6 +490,7 @@ export async function opBrainTaskContext({
       correctedBy: correction ? clip(correction.text, 420) : null,
       ...(recentOpenIds.has(hit.card.id) ? { recentOpen: true } : {}),
       ...(decayAge ? { lastKnown: true, age: decayAge } : {}),
+      ...(plan ? { possiblyBuilt: { by: clip(plan.by, 200), byId: plan.byId, ...(plan.sim != null ? { sim: plan.sim } : {}) } } : {}),
     };
   });
   const maxChars = Math.max(800, Math.min(5000, Number(budgetChars) || 2800));
@@ -486,7 +507,10 @@ export async function opBrainTaskContext({
       // (v1.32.0 law — a claim may truncate, its warning may not).
       const stamp = entry.lastKnown ? ` ⏱️ LAST KNOWN (${entry.age} old — verify live before reporting):` : '';
       const openStamp = entry.recentOpen ? ' ❓ RECENT OPEN:' : '';
-      lines.push(`- [${entry.area}]${entry.correctedBy ? ' superseded context:' : ''}${openStamp}${stamp} ${entry.text}`);
+      // Same prefix discipline as LAST KNOWN: the hint can never be the part a
+      // budget cut removes. It names the ship so the reader can verify it.
+      const planStamp = entry.possiblyBuilt ? ` ⏳ POSSIBLY BUILT (a newer 🏁 appears to ship this plan: “${entry.possiblyBuilt.by}” — verify before treating it as only a plan/proposal):` : '';
+      lines.push(`- [${entry.area}]${entry.correctedBy ? ' superseded context:' : ''}${openStamp}${stamp}${planStamp} ${entry.text}`);
       if (lines.join('\n').length >= maxChars) break;
     }
     lines.push('This is a bounded start-of-task capsule, not the whole brain; use brain_ask for broad status/history questions.');
@@ -707,7 +731,7 @@ export function collectMigrationFiles(root) {
   }
   return out;
 }
-export async function opBrainReconcile({ vault, canvas, root, mode = 'all' }) {
+export async function opBrainReconcile({ vault, canvas, root, mode = 'all', log = () => {} }) {
   const t = brainTarget(vault, canvas);
   if (t.ambiguous) return ambiguousBrainErr(t.ambiguous);
   if (!t.file) return err(`No brain found — looked for ./brain.klypix in the project, then ${vault}. Pass canvas: "<name>".`);
@@ -780,6 +804,60 @@ export async function opBrainReconcile({ vault, canvas, root, mode = 'all' }) {
     } else if (mode === 'claims') {
       sections.push('✓ No fulfilled-claim candidates — no live open clause is covered by a later milestone.');
     }
+  }
+
+  // (1d) PLANS (2026-08-23, AgentLit incident) — plan / proposal / "design
+  // decided" cards that never carried a ❓, reconciled against LATER live 🏁
+  // milestones — embedding-first (the ship is usually RENAMED, so lexical
+  // coverage alone misses it: the incident pair measured cov 0.20, 0 anchors,
+  // cosine 0.81), strict lexical bars when no model is installed. The retro-
+  // active plan-vs-shipped sweep: every hit is a suggestion with its receipt;
+  // the ✓ is a human act and archives the plan as fulfilled HISTORY (still
+  // retrievable, flagged) — nothing is deleted or hidden.
+  if (mode === 'all' || mode === 'plans') {
+    try {
+      const isArchived = (c) => /^archive$/i.test(c.area || '');
+      const planCards = struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim() && !isArchived(c) && isPlanCard(c));
+      if (!planCards.length) {
+        if (mode === 'plans') sections.push('✓ No plan-shaped cards (proposal / planned / design decided …) are live — nothing to reconcile against the ships.');
+      } else {
+        let pairSim = null, how = 'lexical strict bars (no on-device model — coverage ≥ 0.6 or rare shared anchors)';
+        try {
+          const pipe = await getEmbedderForUse(log, 20_000);
+          if (pipe) {
+            const vecs = await vectorsForBrain(pipe, file, struct.cards);
+            if (vecs && vecs.size) { pairSim = (a, b) => { const va = vecs.get(a), vb = vecs.get(b); return va && vb ? dot(va, vb) : null; }; how = `on-device embedding ≥ ${PLAN_PAIR_SIM_BRAIN} + lexical corroboration, or lexical strict bars`; }
+          }
+        } catch { pairSim = null; }
+        const hints = planFulfillmentFor(struct, planCards, { pairSim, scope: 'brain' });
+        if (!hints.size) {
+          if (mode === 'plans') sections.push(`✓ No plan/proposal card looks built by a later milestone (${planCards.length} plan-shaped card(s) checked · ${how}).`);
+        } else {
+          const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+          const byId = new Map(struct.cards.map(c => [c.id, c]));
+          // Identical-text twins (pre-1.49 merge residue) collapse to one row,
+          // the original's id preferred — a brain awaiting its Arrange heal
+          // must not list the same plan twice.
+          const byText = new Map();
+          for (const [id, h] of hints) {
+            const plan = byId.get(id), by = byId.get(h.byId);
+            if (!plan || !by) continue;
+            const k = String(plan.text || '').toLowerCase().replace(/\s+/g, ' ').trim();
+            const prev = byText.get(k);
+            if (!prev || (isAgconfTwinId(prev.plan.id) && !isAgconfTwinId(plan.id))) byText.set(k, { plan, by, h });
+          }
+          const all = [...byText.values()].sort((a, b) => ((b.h.sim ?? 0) + b.h.cov) - ((a.h.sim ?? 0) + a.h.cov));
+          const rows = all.slice(0, 20);
+          const lines = rows.map((r, i) =>
+            `${i + 1}. [${r.plan.area || '?'}] (id ${r.plan.id}) PLAN: ${flat(r.plan.text).slice(0, 150)}\n`
+            + `   · looks BUILT by [${r.by.area || '?'}] (id ${r.by.id}) ${flat(r.by.text).slice(0, 150)}\n`
+            + `   · receipt: ${r.h.sim != null ? `sim ${r.h.sim} · ` : ''}coverage ${r.h.cov} · via ${r.h.via}\n`
+            + `   · if built: \`🧠 BRAIN [${r.plan.area || 'Notes'}] ✓: ${flat(r.plan.text).replace(/^[^:\n]{1,40}:\s*/, '').slice(0, 80)}\` · if not: brain_connect pairs:[{fromId:"${r.plan.id}", toId:"${r.by.id}"}] relationship:"not_fulfilled"`);
+          const more = all.length > rows.length ? `\n\n…and ${all.length - rows.length} more.` : '';
+          sections.push(`# 🧩 ${all.length} plan/proposal card(s) a later 🏁 appears to have BUILT\n_Suggestions with receipts (${how}) — nothing was changed. These cards read as plans, so recall keeps serving them as current intent ("it's only a proposal") while the feature is live. VERIFY each against the repo, then confirm with the ✓ marker (archives the plan as fulfilled history — it stays retrievable, flagged) or add \`closes: <plan title>\` to the milestone; dismiss a wrong pair permanently with the brain_connect call shown._\n\n${lines.join('\n')}${more}`);
+        }
+      }
+    } catch { /* best-effort section — the rest of reconcile stands */ }
   }
 
   // (2) MIGRATIONS — the brain reconciled against committed external state.

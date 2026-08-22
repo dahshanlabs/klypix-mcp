@@ -145,6 +145,13 @@ function readCachedVecs(brainPath, cards) {
     return map;
 }
 
+// Card vectors ONLY, from the warm cache — for card↔card pairing (plan ↔ 🏁)
+// that needs no query embedding and therefore no model at all. Same read-only
+// contract: never embeds, never writes, never throws; empty Map when no cache.
+export function cachedCardVecs(brainPath, cards) {
+    try { return readCachedVecs(brainPath, Array.isArray(cards) ? cards : []); } catch { return new Map(); }
+}
+
 // Entry point: embed the QUERY (needs the model) + read cached card vectors.
 // Returns { qv, vecsMap, dot } or null (not installed / timeout / any failure →
 // the hook keeps its exact lexical behavior). NEVER throws, NEVER embeds cards.

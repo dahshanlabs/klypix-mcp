@@ -1,0 +1,15 @@
+{
+  "artifacts": [
+    {
+      "path": ".release-evidence/v1.78.0/artifacts/run-a.json",
+      "sha256": "164fabd193ddf0ea1279f2f5d05a27f551858737b3e7aa89fd5519e990b6f2b4",
+      "kind": "evaluation-result"
+    },
+    {
+      "path": ".release-evidence/v1.78.0/artifacts/run-b.json",
+      "sha256": "fd40cd554a0bd26bdd751bd942aa7cd8be292a3d011003f05a9e90e9c8c6619a",
+      "kind": "evaluation-result"
+    }
+  ],
+  "publicClaims": []
+}

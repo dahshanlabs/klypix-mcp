@@ -3413,7 +3413,7 @@ async function promptRetrieve(lib) {
                 if (planCards.length) planOv = lib.planFulfillmentFor(struct, planCards, { pairSim: await cachedPairSimFor(struct), scope: 'brain' });
             } catch { planOv = new Map(); }
         }
-        const planTag = (id) => { const p = planOv.get(id); return p ? `\n  ↳ ⏳ POSSIBLY BUILT — this card reads as a plan/proposal, but a newer 🏁 appears to have shipped it: “${head({ text: p.by }, 110)}”. Do NOT report it as "only a proposal" or still-to-do without checking the repo; if built, confirm with a ✓ marker (or \`closes:\` on the milestone); if not, dismiss via brain_connect relationship:"not_fulfilled".` : ''; };
+        const planTag = (id) => { const p = planOv.get(id); return p ? `\n  ↳ ⏳ POSSIBLY BUILT — this card reads as a plan/proposal, but a newer 🏁 appears to have shipped it: “${head({ text: p.by }, 110)}”. Do NOT report it as "only a proposal" or still-to-do without checking the repo; if built, confirm with a ✓ marker (or \`closes:\` on the milestone); if not, dismiss via brain_connect pairs:[{fromId:"${id}", toId:"${p.byId}"}] relationship:"not_fulfilled".` : ''; };
         // Per-session injection dedup: a card already shown full-text this session
         // renders as one headline, not another ~600 words of context. LARGE cards
         // (>1KB) are tracked in a separate, deep-capped ledger so the 100-entry
@@ -3744,10 +3744,10 @@ async function cachedPairSimFor(struct) {
     } catch { _pairSim = null; }
     return _pairSim;
 }
-function staleOpenFooter(lib, struct, pairSim = null) {
+function staleOpenFooter(stale) {
     try {
-        if (typeof lib.findStaleOpenCards !== 'function') return '';   // version-skew guard (stale live klypix-format)
-        const { gaps, total, plans = [], plansTotal = 0 } = lib.findStaleOpenCards(struct, { max: 5, pairSim });
+        if (!stale) return '';
+        const { gaps = [], total = 0, plans = [], plansTotal = 0 } = stale;
         const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
         const lines = [];
         if (gaps && gaps.length) {
@@ -3759,14 +3759,15 @@ function staleOpenFooter(lib, struct, pairSim = null) {
         }
         // Plan-shaped cards (2026-08-23): the same leak for proposals that never
         // carried a ❓ — recall serves them as current intent ("only a proposal")
-        // while the feature is live. Hedged: verify, then ✓ or dismiss.
+        // while the feature is live. Hedged: verify, then ✓ or dismiss (the
+        // dismissal names the exact pair — the engine honours it either way).
         if (plans && plans.length) {
             lines.push('', '---',
                 `## 🔧 Self-heal — ${plansTotal} plan/proposal card(s) look BUILT (a later 🏁 appears to ship them)`,
                 `These cards read as plans, so recall keeps serving them as current intent — but a shipped 🏁 appears to cover each (the ship is often RENAMED, which is why no link exists). Verify against the repo, then:`,
                 '· built → `🧠 BRAIN [Area] ✓: <what shipped>` — archives the plan as fulfilled history (still retrievable, flagged), or add `closes: <its title>` to the milestone marker.',
-                '· not built → `brain_connect` the pair with relationship:"not_fulfilled" — dismissed for good.');
-            for (const p of plans) lines.push(`- ⏳ [${flat(p.open.area) || '?'}] ${flat(p.open.text).slice(0, 90)}  ·  likely built by → ${flat(p.by.text).slice(0, 70)}${p.sim != null ? ` (sim ${p.sim})` : ''}`);
+                '· not built → `brain_connect` with the pairs shown and relationship:"not_fulfilled" — dismissed for good.');
+            for (const p of plans) lines.push(`- ⏳ [${flat(p.open.area) || '?'}] ${flat(p.open.text).slice(0, 90)}  ·  likely built by → ${flat(p.by.text).slice(0, 70)}${p.sim != null ? ` (sim ${p.sim})` : ''}  ·  dismiss: pairs:[{fromId:"${p.open.id}", toId:"${p.by.id}"}]`);
         }
         return lines.length ? '\n' + lines.join('\n') + '\n' : '';
     } catch { return ''; }
@@ -3916,15 +3917,21 @@ async function read(lib) {
     })();
     const { struct } = await lib.parseKlypix(fs.readFileSync(BRAIN));
     const { freshness, drifted } = computeFreshness(struct);
-    // Card↔card similarity from the warm vector cache (read-only, no model) —
-    // lets the self-heal pair plan cards with their RENAMED ships. Null → the
-    // engine's strict lexical bars.
-    const pairSim = await cachedPairSimFor(struct);
+    // Plan↔🏁 self-heal (2026-08-23): card↔card similarity from the warm vector
+    // cache (read-only, no model) lets the self-heal pair plan cards with
+    // their RENAMED ships. Read ONLY when a plan-shaped card exists (review:
+    // an unconditional read cost every SessionStart ~150ms for nothing), and
+    // the stale-open/plan report is computed ONCE — shared by the brief's
+    // footer and the preview's heal line.
+    const hasPlans = typeof lib.isPlanCard === 'function' && (struct.cards || []).some(c => lib.isPlanCard(c));
+    const pairSim = hasPlans ? await cachedPairSimFor(struct) : null;
+    let stale = null;
+    try { if (typeof lib.findStaleOpenCards === 'function') stale = lib.findStaleOpenCards(struct, { max: 5, pairSim }); } catch { stale = null; }
     // The FULL brief: tiered brief + every self-heal/health footer. Messages are
     // deliberately NOT part of it: messageFooter advances durable offer/ack state
     // and must only go to stdout where the receiving model can see the exact token.
     const full = ((typeof lib.structToBrief === 'function') ? lib.structToBrief(struct, { freshness }) : lib.structToMarkdown(struct))
-        + inflightFooter(input.session_id, struct) + selfHealFooter(drifted) + reconcileFooter(lib, struct) + staleOpenFooter(lib, struct, pairSim)
+        + inflightFooter(input.session_id, struct) + selfHealFooter(drifted) + reconcileFooter(lib, struct) + staleOpenFooter(stale)
         + ruleDraftsFooter(input.session_id, struct, { markShown: false })
         + receiptLine + selfCheckFooter() + doctorFooter() + versionCurrencyFooter() + legendFooter() + memoryFooter();
     const emitFull = () => {
@@ -3959,13 +3966,10 @@ async function read(lib) {
             if (files.length) { const { total } = lib.findUnrecordedMigrations(struct, files, { max: 6 }); if (total) heals.push(`${total} unrecorded migration(s)`); }
         }
     } catch { /* */ }
-    try {
-        if (typeof lib.findStaleOpenCards === 'function') {
-            const { total, plansTotal } = lib.findStaleOpenCards(struct, { max: 5, pairSim });
-            if (total) heals.push(`${total} open card(s) look already done`);
-            if (plansTotal) heals.push(`${plansTotal} plan/proposal card(s) look BUILT`);
-        }
-    } catch { /* */ }
+    if (stale) {
+        if (stale.total) heals.push(`${stale.total} open card(s) look already done`);
+        if (stale.plansTotal) heals.push(`${stale.plansTotal} plan/proposal card(s) look BUILT`);
+    }
     const healLine = heals.length ? `\n🔧 Self-heal: ${heals.join(' · ')} — detail + fix markers in ${briefRel}.` : '';
     // Rule-draft nudge (capture-coverage): a one-line count in the preview; the full
     // promote-markers live in the brief file (read-only here — no shown-mark).

@@ -810,25 +810,43 @@ export async function opBrainReconcile({ vault, canvas, root, mode = 'all', log 
   // decided" cards that never carried a ❓, reconciled against LATER live 🏁
   // milestones — embedding-first (the ship is usually RENAMED, so lexical
   // coverage alone misses it: the incident pair measured cov 0.20, 0 anchors,
-  // cosine 0.81), strict lexical bars when no model is installed. The retro-
-  // active plan-vs-shipped sweep: every hit is a suggestion with its receipt;
-  // the ✓ is a human act and archives the plan as fulfilled HISTORY (still
+  // cosine 0.81), strict lexical bars when no vectors exist. The retroactive
+  // plan-vs-shipped sweep: every hit is a suggestion with its receipt; the ✓
+  // is a human act and archives the plan as fulfilled HISTORY (still
   // retrievable, flagged) — nothing is deleted or hidden.
+  // Mode 'all' (the default) stays READ-ONLY and side-effect free: cached
+  // vectors only — no model load, no cross-process cache lock, no cache write
+  // (review 2026-08-23). Only an explicit mode:"plans" may embed, with the
+  // bounded model load; a cold cache is reported as such, never as "no model".
   if (mode === 'all' || mode === 'plans') {
     try {
       const isArchived = (c) => /^archive$/i.test(c.area || '');
-      const planCards = struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim() && !isArchived(c) && isPlanCard(c));
+      const textCards = struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim());
+      const planCards = textCards.filter(c => !isArchived(c) && isPlanCard(c));
       if (!planCards.length) {
         if (mode === 'plans') sections.push('✓ No plan-shaped cards (proposal / planned / design decided …) are live — nothing to reconcile against the ships.');
       } else {
-        let pairSim = null, how = 'lexical strict bars (no on-device model — coverage ≥ 0.6 or rare shared anchors)';
-        try {
-          const pipe = await getEmbedderForUse(log, 20_000);
-          if (pipe) {
-            const vecs = await vectorsForBrain(pipe, file, struct.cards);
-            if (vecs && vecs.size) { pairSim = (a, b) => { const va = vecs.get(a), vb = vecs.get(b); return va && vb ? dot(va, vb) : null; }; how = `on-device embedding ≥ ${PLAN_PAIR_SIM_BRAIN} + lexical corroboration, or lexical strict bars`; }
-          }
-        } catch { pairSim = null; }
+        let vecs = null, embedErr = null;
+        try { vecs = cachedVectorsForBrain(file, struct.cards); } catch { vecs = null; }
+        const installed = (() => { try { return semanticRuntimeInstalled(); } catch { return false; } })();
+        const cold = !vecs || vecs.size < Math.ceil(0.5 * textCards.length);
+        if (mode === 'plans' && cold && installed) {
+          try {
+            const pipe = await getEmbedderForUse(log, 20_000);
+            if (pipe) vecs = await vectorsForBrain(pipe, file, struct.cards);
+          } catch (e) { embedErr = e; }
+        }
+        let pairSim = null, how;
+        if (vecs && vecs.size) {
+          pairSim = (a, b) => { const va = vecs.get(a), vb = vecs.get(b); return va && vb ? dot(va, vb) : null; };
+          how = `on-device embedding ≥ ${PLAN_PAIR_SIM_BRAIN} + lexical corroboration (${vecs.size} of ${textCards.length} cards vectorized), lexical strict bars for the rest`;
+        } else if (!installed) {
+          how = 'lexical strict bars (no on-device model installed — coverage ≥ 0.6 or rare shared anchors)';
+        } else if (mode === 'plans') {
+          how = `lexical strict bars (embedding unavailable${embedErr ? `: ${embedErr.code || embedErr.message}` : ' — model still warming or the inference queue is saturated; retry shortly'})`;
+        } else {
+          how = 'lexical strict bars (vector cache cold — run brain_ask once, or mode:"plans", to vectorize this brain)';
+        }
         const hints = planFulfillmentFor(struct, planCards, { pairSim, scope: 'brain' });
         if (!hints.size) {
           if (mode === 'plans') sections.push(`✓ No plan/proposal card looks built by a later milestone (${planCards.length} plan-shaped card(s) checked · ${how}).`);

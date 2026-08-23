@@ -141,7 +141,10 @@ function readCachedVecs(brainPath, cards) {
         } catch { /* try next variant */ }
     }
     const map = new Map();
-    if (cache && cache.cards) for (const c of cards) { const e = cache.cards[c.id]; if (e && e.v) map.set(c.id, e.v); }
+    // A vector is accepted only for the text it was embedded from (the cache
+    // stores sha1(text) as `h`) — an edited card must fall back to lexical, never
+    // pair on a stale embedding (parity with semantic-memory.cachedVectorsForBrain).
+    if (cache && cache.cards) for (const c of cards) { const e = cache.cards[c.id]; if (e && e.v && (!e.h || e.h === sha1(String(c.text)))) map.set(c.id, e.v); }
     return map;
 }
 

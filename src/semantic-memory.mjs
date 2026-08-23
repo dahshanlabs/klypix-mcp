@@ -629,17 +629,30 @@ ${extra}` : base;
 // that may USE card↔card similarity when it is already paid for — plan ↔ 🏁
 // pairing — and must degrade to lexical bars when it is not. Cards whose text
 // changed since they were embedded are simply absent from the result.
+// Single-entry memo for the fast path (review 2026-08-23: brain_sync re-parsed
+// a ~36 MB cache on every plan-shaped hit). Keyed by the canonical cache file
+// + mtime + size + the card-hash digest, so a changed card or a rewritten
+// cache invalidates it; ONE brain at a time, vectors only (no parsed JSON
+// retained), so the long-lived worker's heap grows by one vector map, not by
+// every brain it ever touched.
+let _cachedVecMemo = null;
 export function cachedVectorsForBrain(brainPath, cards) {
   const map = new Map();
   try {
     const want = (cards || []).filter((card) => card && card.type !== 'container' && (card.text || '').trim());
     if (!want.length) return map;
     const desiredHashes = new Map(want.map((card) => [card.id, sha1(String(card.text))]));
+    const file = cacheCandidates(brainPath)[0].file;
+    let stamp = null;
+    try { const st = fs.statSync(file); stamp = `${st.mtimeMs}|${st.size}`; } catch { stamp = null; }
+    const digest = sha1([...desiredHashes.entries()].map(([id, h]) => `${id}:${h}`).sort().join('\n'));
+    if (stamp && _cachedVecMemo && _cachedVecMemo.file === file && _cachedVecMemo.stamp === stamp && _cachedVecMemo.digest === digest) return _cachedVecMemo.map;
     const loaded = readCache(brainPath, desiredHashes);
     for (const card of want) {
       const entry = loaded?.cache?.cards?.[card.id];
       if (entry?.v && entry.h === desiredHashes.get(card.id)) map.set(card.id, entry.v);
     }
+    if (stamp) _cachedVecMemo = { file, stamp, digest, map };
   } catch { /* cache is best-effort — lexical stays the floor */ }
   return map;
 }

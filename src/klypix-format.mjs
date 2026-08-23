@@ -1174,23 +1174,41 @@ export const isAgconfTwinId = (id) => AGCONF_TWIN_RE.test(String(id || ''));
 // Engine-authored RETIREMENT stamps — the exact formats the lifecycle writers
 // put on a card: "↩︎ superseded <date>\n" / "⤵ consolidated <date>\n" prepended,
 // "\n✅ <date>: …" / "\n✔ partial <date>: …" appended (the ✅ text itself wraps
-// across lines, so the suffix runs to the end of the card). A twin born BEFORE
-// its original was retired carries the original's pre-retirement text exactly —
-// the AgentLit zombie was this: "Capability Forge proposal" superseded on
-// 2026-08-22, its live twin byte-identical minus the "↩︎ superseded" line.
-// Comparing with the stamps stripped recognizes that pair; the stamped copy is
-// the survivor so the lifecycle record is never lost.
+// across lines, so the suffix runs to the end of the card; it must START a
+// line — a dated ✅ cited mid-sentence is prose, not a stamp). A twin born
+// BEFORE its original was retired carries the original's pre-retirement text
+// exactly — the AgentLit zombie was this: "Capability Forge proposal"
+// superseded on 2026-08-22, its live twin byte-identical minus the "↩︎
+// superseded" line. Comparing with the stamps stripped recognizes that pair;
+// the stamped copy is the survivor so the lifecycle record is never lost.
+// Measured on AgentLit (518 twins): 3 live cross-area zombies of this shape,
+// 34 same-area stamped twins beside their original in Archive, 481 plain
+// byte-identical twins the same-area rule already folded.
 const RETIRE_PREFIX_RE = /^(?:↩︎? superseded|⤵ consolidated) \d{4}-\d{2}-\d{2}[ \t]*\n?/u;
-const RETIRE_SUFFIX_RE = /\s(?:✅|✔ partial) \d{4}-\d{2}-\d{2}:[\s\S]*$/u;
+const RETIRE_SUFFIX_RE = /\n(?:✅|✔ partial) \d{4}-\d{2}-\d{2}:[\s\S]*$/u;
 const stripRetirement = (t) => String(t || '').replace(RETIRE_PREFIX_RE, '').replace(RETIRE_SUFFIX_RE, '');
 const hasRetirementStamp = (t) => RETIRE_PREFIX_RE.test(String(t || '')) || RETIRE_SUFFIX_RE.test(String(t || ''));
 const retiredTextKey = (t) => normTextKey(stripRetirement(t));
+// The ROOT a twin folds onto: strip trailing __agconf_<rand> segments to the
+// deepest EXISTING ancestor. A nested twin (X__agconf_a__agconf_b) folds onto
+// X, never onto the intermediate twin — grouping by the immediate parent put
+// one card in two collapse groups and dropped a valid edge as "dangling"
+// (review 2026-08-23).
+const agconfRootOf = (id, byId) => {
+    let cur = String(id || ''), root = null;
+    for (let guard = 0; guard < 8; guard++) {
+        const m = AGCONF_TWIN_RE.exec(cur);
+        if (!m) break;
+        cur = m[1];
+        if (byId.has(cur)) root = cur;
+    }
+    return root;
+};
 function foldIdenticalTwins(cardGroups, items, byId, keyOf) {
     for (const c of items) {
-        if (c.type !== 'text') continue;
-        const m = AGCONF_TWIN_RE.exec(String(c.id || ''));
-        if (!m) continue;
-        const orig = byId.get(m[1]);
+        if (c.type !== 'text' || !isAgconfTwinId(c.id)) continue;
+        const rootId = agconfRootOf(c.id, byId);
+        const orig = rootId ? byId.get(rootId) : null;
         if (!orig || orig.type !== 'text' || !retiredTextKey(orig.text) || retiredTextKey(orig.text) !== retiredTextKey(c.text)) continue;
         const ok = keyOf(orig), tk = keyOf(c);
         if (!ok || !tk || ok === tk) continue;                  // same area → the plain same-text rule already groups them
@@ -1287,6 +1305,8 @@ export async function arrangeBrain(buffer, opts = {}) {
     const beforeReport = layoutReportOf(first);
     // Lossless baselines, snapshotted BEFORE any mutation.
     const beforeTexts = new Set(first.struct.cards.filter(c => c.type === 'text').map(c => normTextKey(c.text)).filter(Boolean));
+    const beforeById = new Map(first.struct.cards.map(c => [c.id, c]));
+    const beforeRetiredOf = new Map(first.struct.cards.filter(c => c.type === 'text').map(c => [normTextKey(c.text), retiredTextKey(c.text)]));
     const beforeTitles = new Set(first.struct.cards.filter(c => c.type === 'container').map(c => normTitleKey(c.title)).filter(Boolean));
     const stats = {
         before: { items: beforeReport.items, containers: beforeReport.containers, connections: beforeReport.connections, overlaps: beforeReport.overlaps.length, dupCardGroups: beforeReport.dupCards.length, dupContainerGroups: beforeReport.dupContainers.length },
@@ -1367,9 +1387,12 @@ export async function arrangeBrain(buffer, opts = {}) {
         // duplicates, self-loops born from the collapse, and (already-broken)
         // dangling edges. Everything else is preserved verbatim.
         const seen = new Set(); const conns = [];
+        // Transitive: a loser may itself be the survivor another loser mapped to
+        // (a nested twin chain) — follow the chain to the final survivor.
+        const resolve = (id) => { let cur = id; for (let guard = 0; guard < 16 && remap.has(cur); guard++) cur = remap.get(cur); return cur; };
         for (const cn of (canvas.connections || [])) {
-            const fromId = remap.get(cn.fromId) || cn.fromId;
-            const toId = remap.get(cn.toId) || cn.toId;
+            const fromId = resolve(cn.fromId);
+            const toId = resolve(cn.toId);
             if (fromId !== cn.fromId || toId !== cn.toId) stats.connectionsRepointed++;
             if (!byId.has(fromId) || !byId.has(toId) || removed.has(fromId) || removed.has(toId)) { stats.danglingConnectionsDropped++; continue; }
             if (fromId === toId) { stats.selfLoopConnectionsDropped++; continue; }
@@ -1422,15 +1445,29 @@ export async function arrangeBrain(buffer, opts = {}) {
     const afterTexts = new Set(after.struct.cards.filter(c => c.type === 'text').map(c => normTextKey(c.text)).filter(Boolean));
     // A folded twin's text may survive only INSIDE its stamped original (the
     // pre-retirement text plus a "↩︎ superseded" / "✅ closed by" stamp) — that
-    // is content preserved, not lost. Everything else must still be verbatim.
+    // is content preserved, not lost. The escape is tied to the ids THIS pass
+    // logged as collapsed (review 2026-08-23: an open-ended retired-key
+    // escape would have hidden any other loss that happened to alias a
+    // stamped survivor). Everything else must still be verbatim.
+    const removedIds = new Set(stats.collapsedCards.flatMap(g => g.removed));
+    const removedTexts = new Set([...removedIds].map(id => beforeById.get(id)).filter(c => c && c.type === 'text').map(c => normTextKey(c.text)).filter(Boolean));
     const afterRetiredKeys = new Set(after.struct.cards.filter(c => c.type === 'text').map(c => retiredTextKey(c.text)).filter(Boolean));
-    for (const t of beforeTexts) if (!afterTexts.has(t) && !afterRetiredKeys.has(retiredTextKey(t))) throw new Error(`arrange lost a unique card text ("${t.slice(0, 60)}…") — aborted, original untouched`);
+    for (const t of beforeTexts) {
+        if (afterTexts.has(t)) continue;
+        if (removedTexts.has(t) && afterRetiredKeys.has(beforeRetiredOf.get(t))) continue;
+        throw new Error(`arrange lost a unique card text ("${t.slice(0, 60)}…") — aborted, original untouched`);
+    }
     const afterTitles = new Set(after.struct.cards.filter(c => c.type === 'container').map(c => normTitleKey(c.title)).filter(Boolean));
     for (const t of beforeTitles) if (!afterTitles.has(t)) throw new Error(`arrange lost an area container ("${t}") — aborted, original untouched`);
     if (beforeReport.focusPresent && !afterReport.focusPresent) throw new Error('arrange lost the 📌 Focus container — aborted, original untouched');
     if (afterReport.overlaps.length) throw new Error(`arrange left ${afterReport.overlaps.length} overlapping pair(s) (e.g. ${afterReport.overlaps[0].aLabel} × ${afterReport.overlaps[0].bLabel}) — aborted`);
     if (afterReport.outOfBounds.length) throw new Error(`arrange left ${afterReport.outOfBounds.length} card(s) outside their container — aborted`);
     if (afterReport.danglingConnections) throw new Error(`arrange produced ${afterReport.danglingConnections} dangling connection(s) — aborted`);
+    // No edge may vanish except as a logged duplicate / self-loop or a
+    // pre-existing dangling edge (review 2026-08-23: a nested twin's edges were
+    // being dropped as "dangling" with nothing to notice).
+    const minConnections = beforeReport.connections - stats.duplicateConnectionsDropped - stats.selfLoopConnectionsDropped - beforeReport.danglingConnections;
+    if (afterReport.connections < minConnections) throw new Error(`arrange lost ${minConnections - afterReport.connections} connection(s) beyond the logged duplicates/self-loops — aborted, original untouched`);
     if (dedupe && (afterReport.dupCards.length || afterReport.dupContainers.length || afterReport.dupConnections))
         throw new Error(`arrange left duplicates behind (${afterReport.dupContainers.length} container group(s), ${afterReport.dupCards.length} card group(s), ${afterReport.dupConnections} twin edge(s)) — aborted`);
     stats.after = { items: afterReport.items, containers: afterReport.containers, connections: afterReport.connections, overlaps: 0 };
@@ -1491,23 +1528,38 @@ export const isUnresolvedOpenCard = (c) => isOpenCard(c) && !RESOLVED_GLYPH.test
 // a 🏁 (often RENAMED: "Capability Forge proposal" → "🏁 Capability builder
 // shipped", same day), the plan keeps rendering as current intent and an agent
 // answers "it's only a proposal" about a feature that is live. Measured before
-// this landed: 61 such cards in the KLYPIX brain, 9 in AgentLit, most with a
-// real later 🏁. This classifier admits them to the SAME pairing machinery as
+// this landed (with the shipped classifier, 2026-08-23): 25 such cards in the
+// KLYPIX brain, 10 distinct in AgentLit, most with a real later 🏁 (a wider
+// draft regex had counted 61/9). This classifier admits them to the SAME pairing machinery as
 // ❓ cards — as hedged HINTS, never as a close.
 // PRECISION-FIRST like every sibling: the HEADLINE (area prefix stripped,
 // wrap-normalized, first ~220 chars) must carry a future-work cue AND no ship
 // pin ("Phase 1 BUILT + verified" is an event, not a plan — "not built" / "not
 // yet built" stay plan cues via the negation lookbehind). Glyphed cards keep
 // their own lifecycle; correction-cue cards assert present truth, never plans.
-const PLAN_CUE_RE = /\b(?:proposals?|proposed|proposes?|planned|plan(?:ning)?(?!\s+doc)|roadmap|next\s+steps?|to\s+be\s+(?:built|shipped|implemented|wired|added)|not\s+(?:yet\s+)?(?:built|designed|implemented|shipped|started|wired)|will\s+(?:build|ship|implement|wire|add|land)|should\s+(?:be|go|default|use|become|move|live|ship|land)|design\s*:|design\b[^.\n]{0,30}?\b(?:decided|locked|approved|agreed|chosen)|(?:decided|approved|locked|agreed)\b[^.\n]{0,20}?\b(?:build|ship|implement|wire)|spec(?:ification)?\s+(?:written|drafted|locked))\b/i;
-const PLAN_SHIP_PIN_RE = /(?<!\bnot\s)(?<!\bnot\s+yet\s)\b(?:shipped|merged|published|released|deployed|landed|built|implemented|went\s+live|is\s+live|now\s+live)\b/i;
-const planHeadline = (text) => normalizeWrappedProse(String(text || '')).replace(/^[^:\n]{1,40}:\s*/, '').slice(0, 220);
+// Cue shapes (review 2026-08-23 tightened the bare nouns): "plan"/"proposal"
+// fire only as the card's own intent — not inside an identifier (users.plan),
+// a pipeline arrow (plan→act), a pricing tier (paid plan), a quotation, or a
+// negation ("don't plan to"). "to be built" is exempt from the ship pin, and
+// "Design:" may be followed by a space (both were dead alternatives before).
+const PLAN_NOUN_GUARD = String.raw`(?<![.\w\/_-])(?<!\b(?:don'?t|do not|no|never|not|paid|free|pricing|subscription|beta|pro|cloud|billing|current)\s)`;
+const PLAN_CUE_RE = new RegExp(String.raw`\b(?:${PLAN_NOUN_GUARD}(?:proposals?|proposed|proposes?|plan(?:ned|ning)?(?![→\/.\-]))|roadmap|next\s+steps?|to\s+be\s+(?:built|shipped|implemented|wired|added)|not\s+(?:yet\s+)?(?:built|designed|implemented|shipped|started|wired)|will\s+(?:build|ship|implement|wire|add|land)|will\s+be\s+(?:built|shipped|implemented|wired|added)|should\s+(?:be|go|default|use|become|move|live|ship|land)|design\b[^.\n]{0,30}?\b(?:decided|locked|approved|agreed|chosen)|(?:decided|approved|locked|agreed)\b[^.\n]{0,20}?\b(?:build|ship|implement|wire)|spec(?:ification)?\s+(?:written|drafted|locked))\b|\bdesign\s*:(?=\s|$)`, 'i');
+const PLAN_SHIP_PIN_RE = /(?<!\bnot\s)(?<!\bnot\s+yet\s)(?<!\bto\s+be\s)(?<!\bwill\s+be\s)\b(?:shipped|merged|published|released|deployed|landed|built|implemented|went\s+live|is\s+live|now\s+live)\b/i;
+// An UPPERCASE verdict that the plan is dead (the same deliberate-signal casing
+// as CORRECTION): a rejected proposal is history, never a plan awaiting a ship.
+const PLAN_DEAD_RE = /\b(?:REJECTED|DECLINED|DROPPED|ABANDONED|WITHDRAWN|CANCELLED|CANCELED)\b/;
+const planHeadline = (text) => normalizeWrappedProse(String(text || ''))
+    .replace(/^[^:\n]{1,40}:\s*/, '')
+    .slice(0, 220)
+    .replace(/`[^`]*`/g, ' ')                                  // code spans carry identifiers, not intent
+    .replace(/["“”„][^"“”„]{0,120}["“”„]/g, ' ');              // quoted strings are someone else's words
 export const isPlanCard = (c) => {
     if (!lifecycleEligible(c) || c?.type === 'container') return false;
     const t = String(c?.text || '');
     if (!t.trim() || STATE_GLYPH.test(t) || SKILL_GLYPH.test(t) || RESOLVED_GLYPH.test(t)) return false;
     if (hasCorrectionCue(t)) return false;
     const head = planHeadline(t);
+    if (PLAN_DEAD_RE.test(head)) return false;
     return PLAN_CUE_RE.test(head) && !PLAN_SHIP_PIN_RE.test(head);
 };
 
@@ -2160,9 +2212,7 @@ export function rankForQuestion(struct, question, { semantic = null, k = 10, as_
     // the ⏳ overlay as an UNCONFIRMED hint — suggestion-only, hedged wording.
     if (!timeTravel) {
         try {
-            // Plan-shaped plain cards (isPlanCard) ride the same in-answer pass
-            // as ❓ cards — their ship is the same "newer 🏁 covers it" shape.
-            const openHits = hits.filter(h => !h.correction && !h.fulfillment && !h.archived && (isUnresolvedOpenCard(h.card) || isPlanCard(h.card)));
+            const openHits = hits.filter(h => !h.correction && !h.fulfillment && !h.archived && isUnresolvedOpenCard(h.card));
             const mileHits = hits.filter(h => isMilestoneCard(h.card) && !/^archive$/i.test(h.card.area || ''));
             if (openHits.length && mileHits.length) {
                 const settled = new Set();
@@ -2192,30 +2242,41 @@ export function rankForQuestion(struct, question, { semantic = null, k = 10, as_
                     }
                     if (best) {
                         const head = String(best.text || '').replace(/\s+/g, ' ').trim().slice(0, 100);
-                        oh.fulfillment = { by: head, byId: best.id, unconfirmed: true, ...(isPlanCard(oh.card) ? { kind: 'plan' } : {}) };
+                        oh.fulfillment = { by: head, byId: best.id, unconfirmed: true };
                     }
                 }
             }
         } catch { /* pairing is a best-effort overlay — never fail the answer */ }
-        // PLAN↔🏁 BRAIN-WIDE FALLBACK + DEMOTION (2026-08-23 AgentLit incident):
-        // a proposal's ship card is usually RENAMED ("Capability Forge proposal"
-        // → "🏁 Capability builder shipped"), so for a question phrased in the
-        // plan's words it is often NOT in this hit set at all — the in-answer
-        // pass above cannot see it. Unpaired plan hits are therefore checked
-        // against every live newer 🏁 at the strict brain tier. Then, when the
-        // pairing 🏁 IS in the answer but ranks BELOW the plan it fulfilled, it
-        // is lifted to just above it: the newest truth takes the slot, the plan
-        // stays (it is history), and its hint names the ship. Still a hedged
-        // hint; still never retires anything.
+        // PLAN↔🏁 (2026-08-23 AgentLit incident) — ONE scorer for plan cards.
+        // In-answer first (planFulfillmentFor scope 'answer': the ❓ pass's bars
+        // plus the order-independent near-tie → EARLIEST-ship rule), then the
+        // strict brain-wide tier for plan hits still unpaired: a proposal's
+        // ship is usually RENAMED ("Capability Forge proposal" → "🏁 Capability
+        // builder shipped"), so for a question phrased in the plan's words it
+        // is often not in this hit set at all. Then, when the pairing card IS
+        // in the answer but ranks BELOW the plan it fulfilled — whether the
+        // pairing came from these passes or from a persisted 'likely closed
+        // by' edge (the renderer's own predicate; review 2026-08-23 found the
+        // lift silently off once an edge existed) — it is lifted to directly
+        // above it: the newest truth takes the slot, the plan stays (history),
+        // and its hint names the ship. Hedged; never retires anything.
         try {
-            const planLeft = hits.filter(h => !h.correction && !h.fulfillment && !h.archived && isPlanCard(h.card));
-            if (planLeft.length) {
-                const hints = planFulfillmentFor(struct, planLeft.map(h => h.card), { pairSim, scope: 'brain' });
-                for (const h of planLeft) if (hints.has(h.card.id)) h.fulfillment = hints.get(h.card.id);
+            const mileCards = hits.filter(h => isMilestoneCard(h.card) && !/^archive$/i.test(h.card.area || '')).map(h => h.card);
+            const unpairedPlans = () => hits.filter(h => !h.correction && !h.fulfillment && !h.archived && isPlanCard(h.card));
+            let left = unpairedPlans();
+            if (left.length && mileCards.length) {
+                const inAnswer = planFulfillmentFor(struct, left.map(h => h.card), { pairSim, scope: 'answer', milestones: mileCards });
+                for (const h of left) if (inAnswer.has(h.card.id)) h.fulfillment = inAnswer.get(h.card.id);
+                left = unpairedPlans();
+            }
+            if (left.length) {
+                const brainWide = planFulfillmentFor(struct, left.map(h => h.card), { pairSim, scope: 'brain' });
+                for (const h of left) if (brainWide.has(h.card.id)) h.fulfillment = brainWide.get(h.card.id);
             }
             for (let i = 0; i < hits.length; i++) {
                 const h = hits[i];
-                if (!h.fulfillment || h.fulfillment.kind !== 'plan' || !h.fulfillment.byId) continue;
+                const isPlanHint = h.fulfillment && h.fulfillment.byId && (h.fulfillment.kind === 'plan' || isPlanCard(h.card));
+                if (!isPlanHint) continue;
                 const j = hits.findIndex(x => x.card.id === h.fulfillment.byId);
                 if (j > i) { const [m] = hits.splice(j, 1); hits.splice(i, 0, m); i++; }
             }
@@ -4798,8 +4859,10 @@ export const serveTimeAccepts = (lex, sameArea) =>
 //     pair but the two texts: near-duplicate similarity (PLAN_PAIR_SIM_BRAIN)
 //     plus lexical corroboration, or the self-heal's strict lexical bars
 //     (coverage ≥ 0.6, or rare shared anchors) without embeddings.
-// MEASURED on the KLYPIX brain (2026-08-23, 61 plan-shaped cards × 890 🏁,
-// BGE-small cosines): true plan→ship pairs sat at 0.81–0.93; the false pairs
+// MEASURED on the KLYPIX brain (2026-08-23, 61 plan-shaped cards under the
+// wider draft classifier × 890 🏁, BGE-small cosines; the shipped classifier
+// keeps 25 of them and reproduces 18 pairs at 0.80–0.93): true plan→ship
+// pairs sat at 0.81–0.93; the false pairs
 // the looser answer tier admitted brain-wide sat at 0.68–0.77 ("Marketing piece
 // #2 planned" ↔ an npm publish, a lock-plan doc ↔ an image-decode fix). The
 // incident pair itself — a RENAMED feature: cov 0.20, zero anchors — measures
@@ -4820,23 +4883,32 @@ export function planFulfillmentFor(struct, cards, { pairSim = null, scope = 'bra
     const isArchived = (c) => /^archive$/i.test(c.area || '');
     const plans = cards.filter(c => c && isPlanCard(c) && !isArchived(c));
     if (!plans.length) return out;
-    const miles = Array.isArray(milestones) ? milestones
+    const miles = Array.isArray(milestones) ? milestones.filter(Boolean)
         : struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim() && !isArchived(c) && isMilestoneCard(c));
     if (!miles.length) return out;
+    // Settled pairs: an existing hint edge or close (plan → ship), and human
+    // dismissals in EITHER direction — a person draws "this ship is not that
+    // plan" as naturally as the reverse (review 2026-08-23).
     const settled = new Set();
     for (const cn of struct.connections || []) {
-        if (cn.label === 'likely closed by' || cn.label === 'closed by' || DISMISSAL_RELS.has(cn.relationship)) settled.add(`${cn.fromId}|${cn.toId}`);
+        if (cn.label === 'likely closed by' || cn.label === 'closed by') settled.add(`${cn.fromId}|${cn.toId}`);
+        if (DISMISSAL_RELS.has(cn.relationship)) { settled.add(`${cn.fromId}|${cn.toId}`); settled.add(`${cn.toId}|${cn.fromId}`); }
     }
     const dfMap = () => (df ??= buildStemDf(struct));
     const simBar = scope === 'answer' ? PLAN_PAIR_SIM_ANSWER : PLAN_PAIR_SIM_BRAIN;
-    const mPre = miles.map(m => ({ m, idx: stemIndex(tokenSet(m.text)) })).map(x => ({ ...x, keys: new Set(x.idx.keys()) }));
+    const mPre = miles.map(m => { const idx = stemIndex(tokenSet(m.text)); return { m, idx, keys: new Set(idx.keys()) }; });
     const structural = new Map();
     const excludeFor = (a, b) => { const k = `${a || ''}|${b || ''}`; if (!structural.has(k)) structural.set(k, structuralStems(a, b)); return structural.get(k); };
     for (const o of plans) {
         const oIdx = stemIndex(claimTokens(normalizeWrappedProse(o.text)));
         const oKeys = new Set(oIdx.keys());
         if (oKeys.size < SERVE_MIN_STEMS) continue;                         // too vague to pair safely
-        let best = null, bestScore = 0, bestLex = null, bestSim = null, bestVia = null;
+        // TWO-PASS selection (order-independent — review 2026-08-23 showed the
+        // single-pass near-tie rule picked a different ship per card order):
+        // collect every accepted candidate, take the top score, then among the
+        // candidates within 0.1 of it choose the EARLIEST ship; remaining ties
+        // → the original id over a twin id, then the higher score, then the id.
+        const accepted = [];
         for (const { m, idx: mIdx, keys: mKeys } of mPre) {
             if (!m || m.id === o.id || (m.createdAt || 0) <= (o.createdAt || 0)) continue;   // a ship must post-date the plan
             if (settled.has(`${o.id}|${m.id}`)) continue;
@@ -4866,17 +4938,19 @@ export function planFulfillmentFor(struct, cards, { pairSim = null, scope = 'bra
                 : (sim == null && (cov >= 0.6 || anchorsSufficient(anchors, sameArea, cov)));
             const embedOk = sim != null && sim >= simBar && corroborated;
             if (!embedOk && !lexOk) continue;
-            const score = (sim ?? 0) + cov + anchors.length * 0.2;
             const via = embedOk ? 'embed' : (cov >= 0.6 || lex.cov >= SERVE_COV_BAR ? 'coverage' : 'anchor');
-            if (!best || score > bestScore + 0.1) { best = m; bestScore = score; bestLex = lex; bestSim = sim; bestVia = via; continue; }
-            if (Math.abs(score - bestScore) <= 0.1 && (m.createdAt || 0) < (best.createdAt || 0)) {
-                best = m; bestScore = Math.max(bestScore, score); bestLex = lex; bestSim = sim; bestVia = via;
-            }
+            accepted.push({ m, score: (sim ?? 0) + cov + anchors.length * 0.2, lex, sim, via });
         }
-        if (best) {
-            const head = String(best.text || '').replace(/\s+/g, ' ').trim().slice(0, 100);
-            out.set(o.id, { kind: 'plan', by: head, byId: best.id, cov: bestLex.cov, sim: bestSim == null ? null : Math.round(bestSim * 1000) / 1000, via: bestVia, unconfirmed: true, scope });
-        }
+        if (!accepted.length) continue;
+        const top = Math.max(...accepted.map(a => a.score));
+        const band = accepted.filter(a => a.score >= top - 0.1);
+        band.sort((a, b) => ((a.m.createdAt || 0) - (b.m.createdAt || 0))
+            || ((isAgconfTwinId(a.m.id) ? 1 : 0) - (isAgconfTwinId(b.m.id) ? 1 : 0))
+            || (b.score - a.score)
+            || String(a.m.id).localeCompare(String(b.m.id)));
+        const best = band[0];
+        const head = String(best.m.text || '').replace(/\s+/g, ' ').trim().slice(0, 100);
+        out.set(o.id, { kind: 'plan', by: head, byId: best.m.id, cov: best.lex.cov, sim: best.sim == null ? null : Math.round(best.sim * 1000) / 1000, via: best.via, unconfirmed: true, scope });
     }
     return out;
 }

@@ -265,5 +265,105 @@ const Q = 'what is Capability Forge and is it built?';
     ok(after.filter(c => c.type === 'text').length === before.filter(c => c.type === 'text').length - 3, 'arrange: exactly the three identical twins were removed, nothing else');
 }
 
+// ── Review fixes (2026-08-23 adversarial review, every item CONFIRMED twice) ──
+{
+    // #1 — a persisted 'likely closed by' edge on the plan must not switch the lift off.
+    const struct = mkStruct([PLAN, SHIP1, SHIP2, ...NOISE], [{ fromId: PLAN.id, toId: SHIP1.id, label: 'likely closed by', hintVia: 'machine' }]);
+    const semantic = new Map([[PLAN.id, 0.75], [SHIP1.id, 0.70], [SHIP2.id, 0.69]]);
+    const r = rankForQuestion(struct, Q, { semantic, k: 6, pairSim });
+    const ids = r.hits.map(h => h.card.id);
+    const planHit = r.hits.find(h => h.card.id === PLAN.id);
+    ok(planHit && planHit.fulfillment && planHit.fulfillment.byId === SHIP1.id, 'fix#1: the persisted edge supplies the hint');
+    ok(ids.indexOf(SHIP1.id) === ids.indexOf(PLAN.id) - 1, `fix#1: the ship is still lifted above the plan with a persisted edge (order ${ids.join(' > ')})`);
+    ok(/POSSIBLY BUILT/.test(questionContextToMarkdown(Q, r, { mode: 'test' })), 'fix#1: the plan wording renders for an edge-sourced hint');
+}
+{
+    // #15/#3 — near-tie selection is order-INDEPENDENT: three identical-text later ships,
+    // cosines 0.84 (earliest) / 0.91 / 0.99 (latest); the band within 0.1 of the top holds
+    // the two later ones, so the EARLIEST of those (0.91, 08-04) wins in every card order.
+    const shipText = 'Product: 🏁 Capability builder shipped: sandboxed coding agent builds a verified tool, preview, approval, merge into the worker.';
+    const m1 = card('m_early', 'Product', shipText, T('2026-08-03T12:00:00Z'));
+    const m2 = card('m_mid', 'Product', shipText, T('2026-08-04T12:00:00Z'));
+    const m3 = card('m_late', 'Product', shipText, T('2026-08-05T12:00:00Z'));
+    const sims = { m_early: 0.84, m_mid: 0.91, m_late: 0.99 };
+    const ps = (a, b) => sims[b] ?? sims[a] ?? 0.1;
+    const picks = new Set();
+    for (const order of [[m1, m2, m3], [m3, m2, m1], [m2, m3, m1], [m3, m1, m2], [m1, m3, m2], [m2, m1, m3]]) {
+        const struct = mkStruct([PLAN, ...order, ...NOISE]);
+        picks.add(planFulfillmentFor(struct, [PLAN], { pairSim: ps, scope: 'brain' }).get(PLAN.id)?.byId);
+    }
+    ok(picks.size === 1 && picks.has('m_mid'), `fix#15: one answer for every card order — the earliest ship inside the 0.1 band (got ${[...picks].join(',')})`);
+}
+{
+    // #16 — previously dead cue alternatives now classify.
+    ok(isPlanCard(card('d1', 'Product', 'Product: Phase 2 export flow to be built next sprint, after the audit lands.', 1)), 'fix#16: "to be built" is a plan (the ship pin exempts the "to be" form)');
+    ok(isPlanCard(card('d2', 'Product', 'Product: Design: three-column layout with a sticky sidebar and a collapsible rail.', 1)), 'fix#16: "Design: …" followed by a space is a plan');
+    ok(isPlanCard(card('d3', 'Product', 'Product: the runner will be implemented behind a flag once the spec is agreed.', 1)), 'fix#16: "will be implemented" is a plan');
+}
+{
+    // #17 — bare-noun cues no longer misclassify real-brain shapes.
+    ok(!isPlanCard(card('n1', 'Release', "Release: App Store decision — ship worldwide, or I don't plan to distribute in the EU at all this year.", 1)), 'fix#17: "don\'t plan to" is not a plan');
+    ok(!isPlanCard(card('n2', 'redeem', 'redeem: The paid plan was renamed to "KLYPIX Cloud" on the landing page; the redeem confirmation shows the tier.', 1)), 'fix#17: a pricing "paid plan" is not a plan');
+    ok(!isPlanCard(card('n3', 'Capabilities', 'Capabilities: Autonomous Agent — one loop of plan→act→validate, ~29 tools behind permission gates.', 1)), 'fix#17: "plan→act" is not a plan');
+    ok(!isPlanCard(card('n4', 'Analytics', 'Analytics: 2026-08-02 audit: users.plan defaults to free; /admin exposes only aggregates.', 1)), 'fix#17: "users.plan" is not a plan');
+    ok(!isPlanCard(card('n5', 'Product', 'Product: bug report quoting “Plan summary is too long.” — the wizard truncates at 200 chars.', 1)), 'fix#17: a quoted "Plan summary" is not a plan');
+    ok(!isPlanCard(card('n6', 'Brain', 'Brain: Single-writer memory architecture — proposed by three commenters, DELIBERATELY REJECTED: the lock already serializes.', 1)), 'fix#17: a REJECTED proposal is not a plan');
+    ok(isPlanCard(PLAN) && isPlanCard(card('p1', 'Release', 'Release: v1.3.88 PLANNED — payload = six unreleased master commits.', 1)), 'fix#17: real plans still classify');
+}
+{
+    // #10 — a dismissal drawn ship→plan (the natural human direction) also settles the pair.
+    const struct = mkStruct([PLAN, SHIP1, ...NOISE], [{ fromId: SHIP1.id, toId: PLAN.id, relationship: 'not_fulfilled', label: 'not fulfilled' }]);
+    ok(!planFulfillmentFor(struct, [PLAN], { pairSim, scope: 'brain' }).has(PLAN.id), 'fix#10: a not_fulfilled edge in either direction dismisses the pair');
+}
+{
+    // #2/#18 — in-answer pairing goes through the one scorer: a later follow-up ship that
+    // scores 0.05 higher must not beat the earlier real ship inside one answer.
+    const early = card('s_early', 'Product', SHIP1.text, T('2026-08-03T12:00:00Z'));
+    const late = card('s_late', 'Product', SHIP1.text + ' Follow-up polish.', T('2026-08-10T12:00:00Z'));
+    const struct = mkStruct([PLAN, early, late, ...NOISE]);
+    const semantic = new Map([[PLAN.id, 0.75], [early.id, 0.70], [late.id, 0.71]]);
+    const ps = (a, b) => (b === 's_late' || a === 's_late') ? 0.75 : 0.70;
+    const r = rankForQuestion(struct, Q, { semantic, k: 6, pairSim: ps });
+    const planHit = r.hits.find(h => h.card.id === PLAN.id);
+    ok(planHit && planHit.fulfillment && planHit.fulfillment.byId === 's_early', `fix#18: in-answer pairing picks the EARLIEST ship in the near-tie band (got ${planHit && planHit.fulfillment && planHit.fulfillment.byId})`);
+    ok(planHit && planHit.fulfillment && planHit.fulfillment.scope === 'answer' && typeof planHit.fulfillment.cov === 'number', 'fix#18: the in-answer hint carries the receipt (scope/cov)');
+}
+{
+    // #4 — a NESTED twin chain folds onto the root; both twins' edges survive on the root.
+    const buf = await buildKlypixMap({
+        title: 'brain',
+        areas: [
+            { title: 'Product', cards: [{ text: 'Product: filler card that stays put.' }] },
+            { title: 'Desktop', cards: [{ text: 'Desktop: another filler that stays put.' }] },
+            { title: 'Archive', cards: [{ text: '↩︎ superseded 2026-08-22 Product: Capability Forge proposal: spawn a sandboxed coding agent to build a tool.' }] },
+        ],
+    });
+    const p = await parseKlypix(buf);
+    const byTitle = (t) => p.struct.cards.find(c => c.type === 'container' && c.title === t);
+    const root = p.struct.cards.find(c => c.type === 'text' && /Forge proposal/.test(c.text));
+    const filler = p.struct.cards.find(c => c.type === 'text' && /filler card that stays/.test(c.text));
+    const bare = String(JSON.parse(await p.zip.file(`items/${shard(root.id)}/${root.id}.json`).async('string')).content).replace(/^↩︎ superseded \d{4}-\d{2}-\d{2}\s*/u, '');
+    const put = async (id, parent, dx) => {
+        const json = JSON.parse(await p.zip.file(`items/${shard(root.id)}/${root.id}.json`).async('string'));
+        p.zip.file(`items/${shard(id)}/${id}.json`, JSON.stringify({ ...json, content: bare }));
+        p.canvas.positions[id] = { ...p.canvas.positions[root.id], parentId: parent.id, x: (p.canvas.positions[root.id].x || 0) + dx };
+        p.canvas.order = [...(p.canvas.order || []), id];
+    };
+    const a = `${root.id}__agconf_aa1`, b = `${root.id}__agconf_aa1__agconf_bb2`;
+    await put(a, byTitle('Product'), 400);
+    await put(b, byTitle('Desktop'), 800);
+    p.canvas.connections = [...(p.canvas.connections || []),
+        { id: 'cn_a', fromId: a, toId: filler.id, relationship: 'relates_to', label: 'from a' },
+        { id: 'cn_b', fromId: b, toId: filler.id, relationship: 'relates_to', label: 'from b' }];
+    p.zip.file('canvas.json', JSON.stringify(p.canvas));
+    const twinned = await p.zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+    const { buffer, stats } = await arrangeBrain(twinned);
+    const after = await parseKlypix(buffer);
+    ok(!after.struct.cards.some(c => c.id === a || c.id === b), 'fix#4: both links of a nested twin chain are folded');
+    ok(after.struct.cards.some(c => c.id === root.id), 'fix#4: the stamped root survives');
+    const toFiller = (after.struct.connections || []).filter(cn => cn.toId === filler.id && cn.fromId === root.id);
+    ok(toFiller.length === 2, `fix#4: both twins' edges re-point onto the root (transitive remap), none dropped as dangling (got ${toFiller.length}, dangling dropped ${stats.danglingConnectionsDropped})`);
+    ok(stats.danglingConnectionsDropped === 0, 'fix#4: no edge was dropped as dangling');
+}
 console.log(failures ? `\n${failures} failure(s)` : '\nall plan-fulfillment checks passed');
 process.exit(failures ? 1 : 0);

@@ -519,6 +519,12 @@ export async function buildKlypix(spec) {
         if (card.type === 'text') {
             return {
                 type: 'text', locked: false, createdAt: now, createdBy: 'agent', ...authorField(),
+                // Machine-field parity with the other writers (2026-08-24) —
+                // additive, ignored by older readers.
+                ...(card.createdVia ? { createdVia: String(card.createdVia) } : {}),
+                ...(Array.isArray(card.evidence) && card.evidence.length ? { evidence: card.evidence } : {}),
+                ...(typeof card.verify === 'string' && card.verify.trim() ? { verify: card.verify.trim() } : {}),
+                ...(card.guard && typeof card.guard === 'object' ? { guard: card.guard } : {}),
                 content: String(card.text ?? ''), fontSize: FONT,
                 // PLAIN text (no border) renders at max-content width unless
                 // authoredWidth pins the wrap — without it a long single line
@@ -1411,6 +1417,31 @@ export async function arrangeBrain(buffer, opts = {}) {
         canvas.connections = conns;
 
         // 4. Physically remove the losers (item file + position + order slot).
+        // 3.5 Machine-field rescue (adversarial review 2026-08-24): a loser
+        // twin can be the ONLY carrier of guard/evidence/verify — a ~ amendment
+        // bumps createdAt and the survivor tiebreak prefers OLDEST, so the
+        // amended, guard-carrying copy is exactly the copy that loses. The
+        // lossless post-verify checks TEXTS, not machine fields, so this loss
+        // shipped green. Merge absent machine fields onto the survivor before
+        // the loser's bytes are deleted; prose is untouched.
+        const readItemJson = async (id) => {
+            const f = zip.file(`items/${shard(id)}/${id}.json`);
+            if (!f) return null;
+            try { return JSON.parse(await f.async('string')); } catch { return null; }
+        };
+        for (const loser of removed) {
+            const sid = resolve(loser);
+            if (!byId.has(sid) || removed.has(sid)) continue;
+            const li = await readItemJson(loser);
+            if (!li || (!li.guard && !li.evidence && !li.verify)) continue;
+            const si = await readItemJson(sid);
+            if (!si) continue;
+            let changed = false;
+            if (li.guard && typeof li.guard === 'object' && !si.guard) { si.guard = li.guard; changed = true; }
+            if (Array.isArray(li.evidence) && li.evidence.length && !si.evidence) { si.evidence = li.evidence; changed = true; }
+            if (typeof li.verify === 'string' && li.verify.trim() && !si.verify) { si.verify = li.verify; changed = true; }
+            if (changed) zip.file(`items/${shard(sid)}/${sid}.json`, JSON.stringify(si));
+        }
         for (const id of removed) {
             delete canvas.positions[id];
             try { zip.remove(`items/${shard(id)}/${id}.json`); } catch { /* */ }
@@ -4089,7 +4120,13 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
             const cands = [];
             for (const c of liveTextCards()) {
                 if (r.area && (c.area || '').toLowerCase() !== r.area.toLowerCase()) continue;
-                if (/🛠/.test(c.text)) continue; // skills are standing reference — a ✓ must never archive one (mirror the supersede guard)
+                // Skills are standing reference — a ✓ must never archive one
+                // (mirror the supersede guard). EXCEPTION (2026-08-24): a card
+                // carrying a machine guard documents "✓-resolve retires the
+                // guard" as its lifecycle contract, and the deny message sends
+                // agents here — without this carve-out the advertised remedy
+                // was impossible and the unmatched ✓ minted a junk 🏁 fallback.
+                if (/🛠/.test(c.text) && !c.guard) continue;
                 // A ✓ closes opens/claims, never a pure milestone — without this
                 // a ✓ for a fulfilled claim could near-tie the very 🏁 that
                 // fulfilled it (item text ⊆ milestone) and archive the milestone
@@ -4197,14 +4234,28 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                     // verifiedAt), so confirming/correcting a drifted fact marks it ✅.
                     if (Array.isArray(u.evidence) && u.evidence.length) j.evidence = u.evidence;
                     if (typeof u.verify === 'string' && u.verify.trim()) j.verify = u.verify.trim();
-                    if (u.guard && typeof u.guard === 'object') j.guard = u.guard;
+                    // guard: replace, DISARM ({remove:true} deletes the machine
+                    // field — the only authorable off-switch), or preserve.
+                    if (u.guard && typeof u.guard === 'object') {
+                        if (u.guard.remove === true) delete j.guard; else j.guard = u.guard;
+                    }
+                    // A surviving/incoming guard must keep its 🛠 glyph — an
+                    // amendment that dropped it demoted the card out of every
+                    // skill-card lifecycle shield while it kept guarding
+                    // (gardener consolidation would then kill it silently).
+                    if (j.guard && !/🛠/.test(j.content)) j.content = `🛠️ ${j.content}`;
                 });
                 best.text = isTerseConfirm ? `${best.text}\n(re-affirmed ${today}: ${u.text})` : u.text;
                 stats.updated++;
             } else if (!nearDupExists(u.text)) {
                 // ~ fallback add is guarded like ✓'s: an unmatched ~ re-harvested
                 // from the transcript tail must not stack a copy every turn.
-                cards.push({ text: (u.area ? `${u.area}: ` : '') + u.text + (u.area ? `\n#${u.area.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : ''), area: u.area, createdVia: u.createdVia, ...(Array.isArray(u.evidence) && u.evidence.length ? { evidence: u.evidence } : {}), ...(typeof u.verify === 'string' && u.verify.trim() ? { verify: u.verify.trim() } : {}), ...(u.guard && typeof u.guard === 'object' ? { guard: u.guard } : {}) });
+                // A ~ fallback that carries a live guard mints a SKILL card —
+                // the 🛠 glyph is what grants gardener/supersede immunity, and
+                // a glyph-less guard card was silently consolidatable while
+                // still enforcing (review 2026-08-24). remove-sentinels add no
+                // glyph and no field: an unmatched disarm is inert by design.
+                cards.push({ text: (u.area ? `${u.area}: ` : '') + (u.guard && u.guard.remove !== true && !/🛠/.test(u.text) ? '🛠️ ' : '') + u.text + (u.area ? `\n#${u.area.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : ''), area: u.area, createdVia: u.createdVia, ...(Array.isArray(u.evidence) && u.evidence.length ? { evidence: u.evidence } : {}), ...(typeof u.verify === 'string' && u.verify.trim() ? { verify: u.verify.trim() } : {}), ...(u.guard && typeof u.guard === 'object' && u.guard.remove !== true ? { guard: u.guard } : {}) });
             }
         }
 
@@ -5566,7 +5617,13 @@ const GUARD_PATHS_MAX = 20;
 // mirrors global-brain-hook.mjs's cache keying (sha1-16 of the normalized
 // brain path) — test/guard-cards.mjs asserts the two derivations agree.
 export function guardSidecarPathFor(brainPath, home = os.homedir()) {
-    const norm = String(brainPath).replace(/\\/g, '/').replace(/^[a-zA-Z]:/, (m) => m.toLowerCase());
+    // On Windows the WHOLE path is case-folded, not just the drive letter —
+    // hosts reach the same brain through differently-cased CWDs (e:/ vs E:/,
+    // observed live in this project's own doctor output), and a case-split key
+    // would give each host its own half-blind sidecar (review 2026-08-24).
+    // POSIX paths keep their case: there, distinct casings ARE distinct files.
+    let norm = String(brainPath).replace(/\\/g, '/');
+    norm = process.platform === 'win32' ? norm.toLowerCase() : norm.replace(/^[a-zA-Z]:/, (m) => m.toLowerCase());
     const key = crypto.createHash('sha1').update(norm).digest('hex').slice(0, 16);
     return path.join(home, '.claude', 'project-brain', `.guards-${key}.json`);
 }
@@ -5577,7 +5634,15 @@ const compileGuardRegex = (source) => {
 };
 export function validateGuard(value) {
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
-        return { ok: false, reason: 'guard must be an object: { when: {…}, severity?, message }' };
+        return { ok: false, reason: 'guard must be an object: { when: {…}, severity?, message } — or { remove: true } to disarm' };
+    }
+    // Disarm sentinel (adversarial review 2026-08-24): a plain ~ amendment
+    // rewrites prose but PRESERVES the machine field, so without this there was
+    // no authorable way to switch a guard off short of archiving the card.
+    if (value.remove === true) {
+        const extra = Object.keys(value).filter((k) => k !== 'remove');
+        if (extra.length) return { ok: false, reason: 'guard.remove takes no other fields — pass exactly { remove: true } to disarm, or a full guard to replace' };
+        return { ok: true, guard: { remove: true } };
     }
     const when = value.when;
     if (!when || typeof when !== 'object' || Array.isArray(when)) {
@@ -5629,8 +5694,13 @@ export function compileGuards(struct) {
     const out = [];
     for (const c of struct.cards) {
         if (c.type === 'container' || !c.guard) continue;
+        if (c.guard.remove === true) continue;              // disarmed via ~ amendment
         if (/^archive$/i.test(c.area || '')) continue;
-        if (/↩|✅|⤵/.test(c.text || '')) continue;          // resolved/superseded/consolidated
+        // Retirement test uses the ANCHORED stamp shapes, never a bare glyph
+        // scan — a live guard whose prose merely mentions ✅ must keep guarding
+        // (the glyph-in-prose trap this file already defends against elsewhere;
+        // adversarial review 2026-08-24 caught the bare /↩|✅|⤵/ version).
+        if (hasRetirementStamp(c.text)) continue;
         const v = validateGuard(c.guard);
         if (!v.ok) continue;
         out.push({ id: c.id, area: c.area || null, title: c.title || null, ...v.guard });
@@ -5649,19 +5719,34 @@ export function compileGuards(struct) {
 //     block→warn and SAYS what could not be verified.
 export function evaluateGuards(guards, { toolName = '', command = '', files = null, worktreeCount = null } = {}) {
     const results = [];
-    const cmd = String(command || '').slice(0, 4096);
+    const CMD_CAP = 16384;
+    const raw = String(command || '');
+    const cmd = raw.slice(0, CMD_CAP);
+    const cmdTruncated = raw.length > CMD_CAP;
     const tool = String(toolName || '').slice(0, 200);
     for (const g of Array.isArray(guards) ? guards : []) {
         try {
             const unverified = [];
             let fired = true;
+            // A trigger whose stored pattern fails to COMPILE at eval time
+            // (hand-edited sidecar, corrupt entry) is an UNVERIFIABLE trigger,
+            // never a silent drop — three review layers collapsed cannot-check
+            // into checked-and-clear before this (2026-08-24).
             if (g.when.tool) {
                 const re = compileGuardRegex(g.when.tool);
-                if (!re || !re.test(tool)) fired = false;
+                if (!re) unverified.push('tool-pattern');
+                else if (!re.test(tool)) fired = false;
             }
             if (fired && g.when.command) {
                 const re = compileGuardRegex(g.when.command);
-                if (!re || !re.test(cmd)) fired = false;
+                if (!re) unverified.push('command-pattern');
+                // A match on the truncated prefix is a real match; a NO-match on
+                // a truncated command proves nothing — report it unverifiable
+                // rather than letting truncation become exemption.
+                else if (!re.test(cmd)) {
+                    if (cmdTruncated) unverified.push('command-truncated');
+                    else fired = false;
+                }
             }
             if (fired && g.when.paths) {
                 if (!Array.isArray(files)) unverified.push('paths');
@@ -5678,6 +5763,54 @@ export function evaluateGuards(guards, { toolName = '', command = '', files = nu
         } catch { /* one bad guard never breaks the rest */ }
     }
     return results;
+}
+
+// Live worktree probe — bounded, call-time. The count changes independently of
+// the brain, so a compiled snapshot can false-deny (worktree removed) or
+// silently exempt (worktree added); callers probe AT the moment a
+// multiWorktree guard is actually in play. null = could not verify.
+export function probeWorktreeCount(dir) {
+    try {
+        const out = execFileSync('git', ['worktree', 'list', '--porcelain'], {
+            cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 1500,
+        });
+        return out.split('\n').filter((l) => l.startsWith('worktree ')).length;
+    } catch { return null; }
+}
+// ONE currency-checked reader/rebuilder for the compiled-guard sidecar, shared
+// by every enforcement surface (Claude --guard, Codex advisory, brain_note's
+// post-write refresh). The adversarial review's two criticals were both "the
+// sidecar never learns the brain changed": a resolved guard kept denying with
+// a recovery message that could not work. This closes it at the read site —
+// stale (mtime mismatch) or missing ⇒ parse + recompile + ATOMIC write.
+//   returns { guards, worktreeCount, mtimeMs, rebuilt } on success
+//   returns { guards: null, stale: true } when the brain exists but the
+//     rebuild failed — the caller must treat every guard as UNVERIFIABLE
+//     (degrade block→warn), never as absent.
+//   returns { guards: [] } when the brain itself is gone.
+export async function ensureGuardSidecar(brainPath, { home = os.homedir(), buildIfMissing = true } = {}) {
+    const sidecarPath = guardSidecarPathFor(brainPath, home);
+    let mtimeMs = 0;
+    try { mtimeMs = fs.statSync(brainPath).mtimeMs; } catch { return { guards: [], worktreeCount: null, mtimeMs: 0, rebuilt: false }; }
+    try {
+        const cur = JSON.parse(fs.readFileSync(sidecarPath, 'utf8'));
+        if (cur && cur.mtimeMs === mtimeMs && Array.isArray(cur.guards)) {
+            return { guards: cur.guards, worktreeCount: Number.isFinite(cur.worktreeCount) ? cur.worktreeCount : null, mtimeMs, rebuilt: false };
+        }
+    } catch { /* absent or unreadable → rebuild below */ }
+    if (!buildIfMissing) return { guards: null, stale: true };
+    try {
+        const { struct } = await parseKlypix(fs.readFileSync(brainPath));
+        const guards = compileGuards(struct);
+        const worktreeCount = guards.some((g) => g.when && g.when.multiWorktree)
+            ? probeWorktreeCount(path.dirname(brainPath)) : null;
+        const payload = JSON.stringify({ v: 1, mtimeMs, builtAt: Date.now(), brainPath, worktreeCount, guards });
+        fs.mkdirSync(path.dirname(sidecarPath), { recursive: true });
+        const tmp = `${sidecarPath}.${process.pid}.tmp`;
+        fs.writeFileSync(tmp, payload);
+        fs.renameSync(tmp, sidecarPath);
+        return { guards, worktreeCount, mtimeMs, rebuilt: true };
+    } catch { return { guards: null, stale: true }; }
 }
 
 export function noteToCaptureInput({ text = '', area = '', marker = '', closes = '', evidence = null, verify = null, guard = null, createdVia = 'mcp' } = {}) {

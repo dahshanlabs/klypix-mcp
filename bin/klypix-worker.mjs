@@ -686,13 +686,14 @@ server.registerTool('brain_note', {
     guard: z.object({
       when: z.object({
         tool: z.string().max(200).optional().describe('Regex matched against the tool name (e.g. "Bash", "Edit|Write").'),
-        command: z.string().max(200).optional().describe('Regex matched against the command string, for shell tools (e.g. "\\\\bgit\\\\s+stash\\\\b").'),
+        command: z.string().max(200).optional().describe('Regex matched against the command string, for shell tools (e.g. "\\\\bgit\\\\s+stash\\\\b"). Anchor deliberately — an unanchored pattern also matches the words inside echo/commit-message text.'),
         paths: z.array(z.string().max(200)).max(20).optional().describe('Path PREFIXES (forward-slash, project-relative) — the guard fires when the session\'s touched files match one. Prefixes, not regexes.'),
-        multiWorktree: z.literal(true).optional().describe('Fire only when the repo has more than one git worktree (evaluated from a cached count).'),
-      }).describe('When to interrupt — triggers are AND-ed; at least one required.'),
+        multiWorktree: z.literal(true).optional().describe('Fire only when the repo has more than one git worktree (probed live when the guard is in play).'),
+      }).optional().describe('When to interrupt — triggers are AND-ed; at least one required.'),
       severity: z.enum(['warn', 'block']).optional().describe("warn (default) injects the message as context and the call proceeds; block DENIES the tool call with the message. 'block' is for irreversible actions and HUMAN-DIRECTED authoring only — never author block without explicit user instruction."),
-      message: z.string().max(500).describe('What the interrupted session reads — say the trap and the safe alternative.'),
-    }).optional().describe("GUARD CARDS: make this '+' skill fire BEFORE a matching tool call runs (Claude Code PreToolUse; advisory on other hosts), not just resurface in briefs. The card stays a normal 🛠️ rule — ✓-resolving it retires the guard."),
+      message: z.string().max(500).optional().describe('What the interrupted session reads — say the trap and the safe alternative. Required unless remove:true.'),
+      remove: z.literal(true).optional().describe("Disarm: pass exactly { remove: true } with marker '~' matching the card to delete its machine trigger while keeping the prose rule."),
+    }).optional().describe("GUARD CARDS: make this '+' skill fire BEFORE a matching tool call runs (Claude Code PreToolUse denies on severity block; other hosts warn), not just resurface in briefs. The card stays a normal 🛠️ rule — ✓-resolving it retires the guard, ~ with {remove:true} disarms it."),
     canvas: z.string().optional().describe('Brain canvas filename/path. Defaults to the project brain ("brain").'),
   },
 }, async ({ text, marker, area, closes, guard, canvas }, extra) => {

@@ -259,21 +259,26 @@ function formatConflictWarning(conflicts, event, sessions = []) {
 // klypix-format predates guards degrades to silence, never a throw. This lane
 // only ever WARNS: block-severity guards are named as such so the model treats
 // them as a hard stop, but no mechanism here denies anything.
-function guardWarnings(projectDir, brainPath, input) {
+async function guardWarnings(projectDir, brainPath, input) {
   try {
     if (typeof brainFormat.evaluateGuards !== 'function'
-      || typeof brainFormat.guardSidecarPathFor !== 'function') return '';
-    let sidecar = null;
-    try { sidecar = JSON.parse(fs.readFileSync(brainFormat.guardSidecarPathFor(brainPath), 'utf8')); } catch { return ''; }
-    const guards = Array.isArray(sidecar?.guards) ? sidecar.guards : [];
+      || typeof brainFormat.ensureGuardSidecar !== 'function') return '';
+    // ensureGuardSidecar is currency-checked and BUILDS when absent — on a
+    // Codex-only machine no Claude lane ever compiles the sidecar, and before
+    // this the advisory tier was silently dead there (review 2026-08-24). This
+    // hook already pays the heavy import, so the occasional rebuild is fine.
+    const ensured = await brainFormat.ensureGuardSidecar(brainPath);
+    const guards = Array.isArray(ensured.guards) ? ensured.guards : [];
     if (!guards.length) return '';
     const files = touchedFiles(input, projectDir);
     const cmd = toolInput(input).command;
+    const needWt = guards.some((g) => g?.when?.multiWorktree);
     const fired = brainFormat.evaluateGuards(guards, {
       toolName: toolName(input),
       command: typeof cmd === 'string' ? cmd : '',
       files: files.length ? files : null,
-      worktreeCount: Number.isFinite(sidecar.worktreeCount) ? sidecar.worktreeCount : null,
+      worktreeCount: needWt && typeof brainFormat.probeWorktreeCount === 'function'
+        ? brainFormat.probeWorktreeCount(projectDir) : null,
     });
     if (!fired.length) return '';
     const lines = fired.map((f) => {
@@ -441,7 +446,7 @@ async function main() {
       // call — Codex hook output is `continue: true` by design — so a matching
       // guard renders as a warning; a block-severity guard says it should be
       // treated as a hard stop, without claiming a mechanism this lane lacks.
-      ...(event === 'PreToolUse' ? [guardWarnings(projectDir, brainPath, input)] : []),
+      ...(event === 'PreToolUse' ? [await guardWarnings(projectDir, brainPath, input)] : []),
       stampReceivedMessages(messages, Date.now(), undefined, sessionId),
     ], event);
     return;

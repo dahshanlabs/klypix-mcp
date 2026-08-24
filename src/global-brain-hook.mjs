@@ -3175,16 +3175,23 @@ async function cachedStruct(lib) {
     return struct;
 }
 // ── Guard cards: sidecar compiler (2026-08-24) ───────────────────────────────
-// The PreToolUse --guard lane must NEVER parse the brain (~1s measured on the
-// live brain) or spawn git — so guards are COMPILED here, in the lanes where
-// the struct is already warm (--prompt retrieval, Stop capture, SessionStart
-// read), into a tiny per-brain sidecar the fast path reads with one stat+read.
-// worktreeCount (the one cached repo predicate) is refreshed only on rebuild;
-// a failed probe stores null, which the evaluator reports as UNVERIFIED — the
-// caller then degrades block→warn rather than silently exempting (2026-08-18
-// field rule) or false-blocking.
-const GUARDS_SIDECAR = path.join(os.homedir(), '.claude', 'project-brain', `.guards-${sha(normBrainPath(BRAIN))}.json`);
-const GUARDS_SEEN = path.join(os.homedir(), '.claude', 'project-brain', `.guards-seen-${sha(normBrainPath(BRAIN))}.json`);
+// The PreToolUse --guard lane avoids parsing the brain (~1s measured on the
+// live brain) on its COMMON path — guards are COMPILED into a tiny per-brain
+// sidecar wherever the struct is already warm: every lane that goes through
+// cachedStruct (--prompt retrieval, status queries) plus the Stop capture lane
+// (wired in main() — the brain just changed there). The fast path adds a
+// currency stat: a stale/missing sidecar pays ONE rebuild via the shared
+// lib.ensureGuardSidecar, so a ✓-resolved guard stops firing on the very next
+// call, not at the next lucky prompt. worktreeCount stored here is a snapshot
+// fallback only — guardCheck probes LIVE when a multiWorktree guard is in play.
+// Key derivation MUST byte-match klypix-format.guardSidecarPathFor (asserted
+// by test/guard-cards.mjs G5): win32 folds the WHOLE path — hosts reach one
+// brain through differently-cased CWDs and a case-split key half-blinds them.
+const guardKeyNorm = (p) => (process.platform === 'win32'
+    ? String(p).replace(/\\/g, '/').toLowerCase()
+    : normBrainPath(p));
+const GUARDS_SIDECAR = path.join(os.homedir(), '.claude', 'project-brain', `.guards-${sha(guardKeyNorm(BRAIN))}.json`);
+const GUARDS_SEEN = path.join(os.homedir(), '.claude', 'project-brain', `.guards-seen-${sha(guardKeyNorm(BRAIN))}.json`);
 function refreshGuardSidecar(lib, struct, mtimeMs) {
     try {
         if (typeof lib.compileGuards !== 'function') return;           // version-skew: older format lib
@@ -3203,8 +3210,12 @@ function refreshGuardSidecar(lib, struct, mtimeMs) {
             } catch { worktreeCount = null; }                           // unknown, never 0/1
         }
         fs.mkdirSync(path.dirname(GUARDS_SIDECAR), { recursive: true });
-        fs.writeFileSync(GUARDS_SIDECAR, JSON.stringify({ v: 1, mtimeMs, builtAt: Date.now(), brainPath: BRAIN, worktreeCount, guards }));
-    } catch { /* the sidecar is best-effort — a failed build means the guard lane stays silent, never broken */ }
+        // Atomic (tmp+rename): several sessions' hooks read this concurrently —
+        // a torn half-write must never be readable as an empty guard set.
+        const tmp = `${GUARDS_SIDECAR}.${process.pid}.tmp`;
+        fs.writeFileSync(tmp, JSON.stringify({ v: 1, mtimeMs, builtAt: Date.now(), brainPath: BRAIN, worktreeCount, guards }));
+        fs.renameSync(tmp, GUARDS_SIDECAR);
+    } catch { /* best-effort here — guardCheck's own currency check rebuilds via ensureGuardSidecar when this lane failed */ }
 }
 // --guard (PreToolUse): the fast path. Budget discipline: stat + one tiny JSON
 // read on the common no-guards case; the heavy klypix-format import is paid
@@ -3216,15 +3227,39 @@ async function guardCheck() {
         const input = readHookInput();
         const toolName = String(input.tool_name || '');
         if (!toolName) return;
+        // CURRENCY FIRST (adversarial review 2026-08-24, both criticals): a
+        // sidecar that predates the brain's mtime may be denying from a card
+        // the user already ✓-resolved — the advertised recovery loop was
+        // impossible while this lane trusted stale compiled state. One statSync
+        // (~0.03ms) keeps the common current-path fast; a mismatch (or missing
+        // sidecar) pays ONE rebuild via the shared ensureGuardSidecar, after
+        // which this brain is fast again until its next edit.
+        let brainMtime = 0;
+        try { brainMtime = fs.statSync(BRAIN).mtimeMs; } catch { return; }
         let sidecar = null;
-        try { sidecar = JSON.parse(fs.readFileSync(GUARDS_SIDECAR, 'utf8')); } catch { return; }   // no compiled guards → no-op
-        const guards = Array.isArray(sidecar?.guards) ? sidecar.guards : [];
+        try { sidecar = JSON.parse(fs.readFileSync(GUARDS_SIDECAR, 'utf8')); } catch { sidecar = null; }
+        let guards = (sidecar && sidecar.mtimeMs === brainMtime && Array.isArray(sidecar.guards)) ? sidecar.guards : null;
+        let sidecarUnverifiable = false;
+        if (!guards) {
+            const lib = await import('./klypix-format.mjs');
+            if (typeof lib.ensureGuardSidecar !== 'function') return;    // version-skew: older format lib
+            const ensured = await lib.ensureGuardSidecar(BRAIN);
+            if (ensured.guards) { guards = ensured.guards; sidecar = ensured; }
+            else if (sidecar && Array.isArray(sidecar.guards)) {
+                // Rebuild failed but stale guards exist: they are UNVERIFIABLE
+                // as current — blocks degrade to warn (refuse-not-exempt), and
+                // warns still fire (a stale warn is at worst noise).
+                guards = sidecar.guards; sidecarUnverifiable = true;
+            } else return;                                               // no guards ever compiled and rebuild failed → silent
+        }
         if (!guards.length) return;
-        // Inline tool prefilter (regex compile is cheap; the LIB import is not).
+        // Inline tool prefilter (regex compile is cheap; the LIB import is
+        // not). A pattern that fails to COMPILE stays in — the evaluator
+        // reports it unverifiable rather than this filter silently dropping it.
         const might = guards.filter((g) => {
             const t = g?.when?.tool;
             if (!t) return true;
-            try { return new RegExp(String(t).slice(0, 200), 'i').test(toolName); } catch { return false; }
+            try { return new RegExp(String(t).slice(0, 200), 'i').test(toolName); } catch { return true; }
         });
         if (!might.length) return;
         const lib = await import('./klypix-format.mjs');
@@ -3234,48 +3269,69 @@ async function guardCheck() {
         // paths input: the direct target for file tools; this session's
         // observed/declared scope (the live lane row) for shell commands —
         // `git push` names no paths, but the session's touched files do.
+        // null = COULD NOT DETERMINE (out-of-project target, empty/absent lane
+        // row): an empty list must never read as verified-no-match (review
+        // 2026-08-24 — files:[] silently exempted paths guards).
         let files = null;
         const direct = [ti.file_path, ti.path, ti.notebook_path].find((v) => typeof v === 'string' && v);
-        if (direct) { const rel = projRelPath(direct); files = rel ? [rel] : []; }
+        if (direct) { const rel = projRelPath(direct); files = rel ? [rel] : null; }
         else {
             try {
                 const me = readSessions().find((s) => s.id === input.session_id);
-                if (me && Array.isArray(me.files)) files = me.files;
+                if (me && Array.isArray(me.files) && me.files.length) files = me.files;
             } catch { files = null; }
         }
-        const fired = lib.evaluateGuards(might, {
-            toolName, command, files,
-            worktreeCount: Number.isFinite(sidecar.worktreeCount) ? sidecar.worktreeCount : null,
-        });
+        // multiWorktree is probed LIVE when a candidate needs it — the count
+        // changes independently of the brain, so a snapshot both false-denies
+        // (worktree removed since compile) and silently exempts (added since).
+        // Rare path: only pays the bounded git spawn when such a guard survived
+        // the tool prefilter. Probe failure → null → unverified → degrade.
+        const worktreeCount = might.some((g) => g?.when?.multiWorktree)
+            ? (typeof lib.probeWorktreeCount === 'function' ? lib.probeWorktreeCount(CWD) : null)
+            : null;
+        let fired = lib.evaluateGuards(might, { toolName, command, files, worktreeCount });
+        if (sidecarUnverifiable) fired = fired.map((f) => ({ ...f, unverified: [...new Set([...f.unverified, 'sidecarCurrency'])] }));
         if (!fired.length) return;
         // A verified block denies. An UNVERIFIED block (an input was
         // unavailable) degrades to warn and says so — never silently exempt,
-        // never false-block. Warns fire once per session per card.
+        // never false-block.
         const blocks = fired.filter((f) => f.guard.severity === 'block' && !f.unverified.length);
         if (blocks.length) {
             const b = blocks[0].guard;
+            const title = String(b.title || '').slice(0, 80);
             process.stdout.write(JSON.stringify({
                 hookSpecificOutput: {
                     hookEventName: 'PreToolUse',
                     permissionDecision: 'deny',
-                    permissionDecisionReason: `🛡️ KLYPIX guard [${b.area || 'brain'}]: ${b.message} (guard card ${b.id} — if this block is wrong, ✓-resolve or ~-amend that card)`,
+                    permissionDecisionReason: `🛡️ KLYPIX guard [${b.area || 'brain'}]: ${b.message} (standing rule${title ? ` “${title}”` : ''} — if this block is wrong, retire it with brain_note marker '✓'${title ? ` text "${title}"` : ''}, or disarm with marker '~' and guard {remove:true}; the change takes effect on the next call)`,
                 },
             }));
             return;
         }
+        // Once-per-session dedup applies ONLY to plain warns. A degraded BLOCK
+        // is standing in for a deny — it must keep firing on every matching
+        // call, or the second dangerous command sails through in silence
+        // (review 2026-08-24).
+        const degraded = fired.filter((f) => f.guard.severity === 'block');
+        const plainWarns = fired.filter((f) => f.guard.severity !== 'block');
         const sid = String(input.session_id || '');
         let seen = {};
         try { seen = JSON.parse(fs.readFileSync(GUARDS_SEEN, 'utf8')) || {}; } catch { seen = {}; }
         const mine = (seen[sid] && typeof seen[sid] === 'object') ? seen[sid] : {};
-        const fresh = fired.filter((f) => !mine[f.guard.id]);
-        if (!fresh.length) return;
-        const lines = fresh.map((f) => {
-            const note = f.unverified.length ? ` (severity block degraded to warn — could not verify: ${f.unverified.join(', ')})` : '';
+        const freshWarns = plainWarns.filter((f) => !mine[f.guard.id]);
+        const show = [...degraded, ...freshWarns];
+        if (!show.length) return;
+        const lines = show.map((f) => {
+            const note = f.unverified.length
+                ? (f.guard.severity === 'block'
+                    ? ` (BLOCK-severity rule degraded to a warning — could not verify: ${f.unverified.join(', ')}; treat as a hard stop)`
+                    : ` (could not verify: ${f.unverified.join(', ')})`)
+                : '';
             return `- [${f.guard.area || 'brain'}] ${f.guard.message}${note}`;
         });
         try {
             const now = Date.now();
-            for (const f of fresh) mine[f.guard.id] = now;
+            for (const f of freshWarns) mine[f.guard.id] = now;
             const pruned = {};                                          // drop sessions idle >24h
             for (const [k, v] of Object.entries({ ...seen, [sid]: mine })) {
                 const newest = Math.max(0, ...Object.values(v && typeof v === 'object' ? v : {}));
@@ -4171,6 +4227,11 @@ async function main() {
         // try/finally so the clear runs across capture()'s early returns AND a throw
         // (on throw, ship/milestone re-capture next Stop; a version is on disk — no loss).
         try { await capture(lib); } finally { clearLiveLedgerForSession(readHookInput().session_id); }
+        // The capture just changed the brain — recompile the guard sidecar now
+        // (off the critical path) so the next PreToolUse reads current state
+        // without paying the rebuild itself. Best-effort; guardCheck's currency
+        // stat is the backstop.
+        try { if (typeof lib.ensureGuardSidecar === 'function') await lib.ensureGuardSidecar(BRAIN); } catch { /* backstopped */ }
         // Ambient version-currency: piggyback the post-session Stop hook to refresh the
         // npm-latest cache (≤ once/day, best-effort, failure-silent) so the next
         // SessionStart footer can surface a stale install with ZERO network. Awaited so

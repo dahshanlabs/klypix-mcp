@@ -16,8 +16,8 @@ import path from 'path';
 import { execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import {
-    buildKlypixMap, parseKlypix,
-    validateGuard, compileGuards, evaluateGuards, guardSidecarPathFor,
+    buildKlypixMap, parseKlypix, captureIntoBrain, noteToCaptureInput,
+    validateGuard, compileGuards, evaluateGuards, guardSidecarPathFor, ensureGuardSidecar,
 } from '../src/klypix-format.mjs';
 
 const HOOK = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src', 'global-brain-hook.mjs');
@@ -47,7 +47,7 @@ const ok = (cond, label) => { console.log(`${cond ? '✓' : '✗'} ${label}`); i
         cards: [
             { id: 'a', type: 'text', area: 'CI', text: 'CI: 🛠️ never re-push', guard: { when: { command: 'git push' }, message: 'amend instead' } },
             { id: 'b', type: 'text', area: 'Archive', text: '🛠️ old', guard: { when: { command: 'x' }, message: 'retired' } },
-            { id: 'c', type: 'text', area: 'CI', text: '🛠️ resolved ✅ done', guard: { when: { command: 'x' }, message: 'resolved' } },
+            { id: 'c', type: 'text', area: 'CI', text: '🛠️ old rule\n✅ 2026-08-24: resolved — superseded by branch protection', guard: { when: { command: 'x' }, message: 'resolved' } },
             { id: 'd', type: 'text', area: 'CI', text: '🛠️ malformed', guard: { when: {}, message: 'invalid' } },
             { id: 'e', type: 'text', area: 'CI', text: 'plain card, no guard' },
         ],
@@ -103,11 +103,46 @@ const ok = (cond, label) => { console.log(`${cond ? '✓' : '✗'} ${label}`); i
 // ── G5: sidecar keying parity with the hook ──────────────────────────────────
 {
     const brain = 'E:\\Some\\Project\\brain.klypix';
-    const norm = String(brain).replace(/\\/g, '/').replace(/^[a-zA-Z]:/, (m) => m.toLowerCase());
+    const norm = process.platform === 'win32'
+        ? String(brain).replace(/\\/g, '/').toLowerCase()
+        : String(brain).replace(/\\/g, '/').replace(/^[a-zA-Z]:/, (m) => m.toLowerCase());
     const hookFormula = path.join(os.homedir(), '.claude', 'project-brain',
         `.guards-${crypto.createHash('sha1').update(norm).digest('hex').slice(0, 16)}.json`);
     ok(guardSidecarPathFor(brain) === hookFormula,
         'G5: guardSidecarPathFor matches the hook\'s own sha1-16(normalized) derivation');
+    if (process.platform === 'win32') {
+        ok(guardSidecarPathFor('e:/some/project/brain.klypix') === guardSidecarPathFor('E:\\Some\\PROJECT\\brain.klypix'),
+            'G5: on win32, differently-cased routes to one brain share one sidecar key');
+    }
+    ok(validateGuard({ remove: true }).ok && validateGuard({ remove: true }).guard.remove === true,
+        'G5b: the disarm sentinel { remove: true } validates');
+    ok(!validateGuard({ remove: true, message: 'x' }).ok,
+        'G5b: remove with extra fields is rejected — disarm or replace, never both');
+    ok(compileGuards({ cards: [{ id: 'x', type: 'text', area: 'CI', text: '🛠️ g', guard: { remove: true } }] }).length === 0,
+        'G5b: a disarmed card never compiles');
+    ok(compileGuards({ cards: [{ id: 'y', type: 'text', area: 'CI', text: '🛠️ verified ✅ in prod, still applies', guard: { when: { command: 'x' }, message: 'live' } }] }).length === 1,
+        'G5c: a live guard whose PROSE mentions ✅ keeps guarding (anchored retirement stamps only)');
+    const trunc = evaluateGuards(
+        [{ id: 't', when: { command: '\\bnever-in-prefix\\b' }, severity: 'block', message: 'm' }],
+        { toolName: 'Bash', command: 'a'.repeat(20000) });
+    ok(trunc.length === 1 && trunc[0].unverified.includes('command-truncated'),
+        'G5d: a no-match on a truncated command reports UNVERIFIED, never exemption');
+}
+
+// ── G5e: ✓ retires a guard card (the deny\'s advertised remedy must work) ─────
+{
+    const buf = await buildKlypixMap({
+        title: 'brain',
+        areas: [{ title: 'CI', cards: [{
+            text: 'CI: 🛠️ never force-push shared branches',
+            guard: { when: { command: 'git\\s+push\\s+--force' }, severity: 'block', message: 'no force-push' },
+        }] }],
+    });
+    const input = noteToCaptureInput({ text: 'never force-push shared branches — rule retired, branch protection now enforces it server-side', marker: '✓', area: 'CI' });
+    const res = await captureIntoBrain(buf, input);
+    const { struct } = await parseKlypix(res.buffer);
+    ok(compileGuards(struct).length === 0,
+        'G5e: a ✓ resolution matching a guard card retires the guard (the skill-card ✓ shield has a guard carve-out)');
 }
 
 // ── G6: E2E through the real hook ────────────────────────────────────────────
@@ -167,24 +202,55 @@ const ok = (cond, label) => { console.log(`${cond ? '✓' : '✗'} ${label}`); i
     const deny = JSON.parse(run(['--guard'], { session_id: 'sess-g', tool_name: 'Bash', tool_input: { command: 'git push --force origin main' } }));
     ok(deny.hookSpecificOutput?.permissionDecision === 'deny'
         && /Force-push/.test(deny.hookSpecificOutput?.permissionDecisionReason || '')
-        && /guard card/.test(deny.hookSpecificOutput?.permissionDecisionReason || ''),
-    'G6: a verified block guard denies, and the reason names the card so a wrong block is correctable');
+        && /standing rule/.test(deny.hookSpecificOutput?.permissionDecisionReason || '')
+        && /brain_note marker '✓'/.test(deny.hookSpecificOutput?.permissionDecisionReason || ''),
+    'G6: a verified block guard denies, and the reason gives a WORKING remedy (✓ by title / ~ remove)');
 
-    // An UNVERIFIABLE block (worktree count unknown — fixture is not a git repo)
-    // degrades to warn and says what it could not verify. Never a silent allow,
-    // never a false deny.
+    // An UNVERIFIABLE block (worktree count unknown — fixture is not a git repo,
+    // probed LIVE) degrades to warn and says what it could not verify. Never a
+    // silent allow, never a false deny.
     const degraded = JSON.parse(run(['--guard'], { session_id: 'sess-g', tool_name: 'Bash', tool_input: { command: 'git stash' } }));
     ok(degraded.hookSpecificOutput?.permissionDecision === undefined
-        && /degraded to warn/.test(degraded.hookSpecificOutput?.additionalContext || '')
+        && /degraded to a warning/.test(degraded.hookSpecificOutput?.additionalContext || '')
         && /worktreeCount/.test(degraded.hookSpecificOutput?.additionalContext || ''),
     'G6: a block guard with an unverifiable predicate degrades to warn and names the missing input');
+    // …and a degraded BLOCK keeps firing — it is standing in for a deny, so the
+    // once-per-session dedup must never silence the second dangerous call.
+    ok(/degraded to a warning/.test(JSON.parse(run(['--guard'], { session_id: 'sess-g', tool_name: 'Bash', tool_input: { command: 'git stash pop' } })).hookSpecificOutput?.additionalContext || ''),
+        'G6: a degraded block re-fires on the next matching call (no dedup for block-severity)');
 
-    // Non-matching tools and absent sidecars stay silent.
+    // Non-matching tools stay silent.
     ok(run(['--guard'], { session_id: 'sess-g', tool_name: 'Read', tool_input: { file_path: 'x.ts' } }).trim() === '',
         'G6: a non-matching tool produces no output at all');
+
+    // ── G7: currency — the review's two criticals ────────────────────────────
+    // (a) A MISSING sidecar is no longer an exemption: --guard rebuilds it via
+    // ensureGuardSidecar and enforces in the same call.
     fs.rmSync(sidecarPath, { force: true });
-    ok(run(['--guard'], { session_id: 'sess-g', tool_name: 'Bash', tool_input: { command: 'git push' } }).trim() === '',
-        'G6: a missing sidecar is the true exemption — silent no-op');
+    const rebuilt = JSON.parse(run(['--guard'], { session_id: 'sess-r1', tool_name: 'Bash', tool_input: { command: 'git push --force origin main' } }));
+    ok(rebuilt.hookSpecificOutput?.permissionDecision === 'deny',
+        'G7: a missing sidecar is rebuilt in-call — the block still denies (missing ≠ exempt)');
+    ok(fs.existsSync(sidecarPath), 'G7: the rebuild persisted the sidecar');
+    // (b) The deny\'s advertised remedy works IN the same turn: overwrite the
+    // brain WITHOUT the force-push guard (simulating the ✓ resolve) and the
+    // very next --guard call must allow — no --prompt lane in between.
+    fs.writeFileSync(brainFile, await buildKlypixMap({
+        title: 'brain',
+        areas: [{ title: 'CI', cards: [{ text: 'CI: plain decision, no guards any more' }] }],
+    }));
+    ok(run(['--guard'], { session_id: 'sess-r1', tool_name: 'Bash', tool_input: { command: 'git push --force origin main' } }).trim() === '',
+        'G7: resolving the card lifts the block on the NEXT call — stale compiled state never outlives the brain edit');
+    // (c) And the reverse: a guard AUTHORED via a brain write (no --prompt run)
+    // enforces on the next call too.
+    fs.writeFileSync(brainFile, await buildKlypixMap({
+        title: 'brain',
+        areas: [{ title: 'CI', cards: [{
+            text: 'CI: 🛠️ new rule authored mid-turn',
+            guard: { when: { tool: 'Bash', command: '\\brm\\s+-rf\\b' }, severity: 'block', message: 'No recursive force-delete.' },
+        }] }],
+    }));
+    ok(/No recursive force-delete/.test(JSON.parse(run(['--guard'], { session_id: 'sess-r1', tool_name: 'Bash', tool_input: { command: 'rm -rf build' } })).hookSpecificOutput?.permissionDecisionReason || ''),
+        'G7: a guard authored by a brain write enforces on the next call with no prompt lane in between');
 
     for (const d of [home, proj]) fs.rmSync(d, { recursive: true, force: true });
 }

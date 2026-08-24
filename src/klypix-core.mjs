@@ -32,7 +32,7 @@ import {
   brainLensData, lensToMarkdown, deathDateOfCard,
   statusContextToMarkdown, findFulfillmentCandidates,
   splitQueryTokens, scoreCardsAgainstQuery, correctionOverlaysFor,
-  isFastDecayCard, isUnresolvedOpenCard, isSkillCard, validateGuard, DECAY_STALE_MS, formatDecayAge,
+  isFastDecayCard, isUnresolvedOpenCard, isSkillCard, validateGuard, guardSidecarPathFor, ensureGuardSidecar, DECAY_STALE_MS, formatDecayAge,
   isPlanCard, planFulfillmentFor, PLAN_PAIR_SIM_BRAIN, isAgconfTwinId,
   readPendingShips, clearPendingShips, pendingShipCards, formatCaptureReceipts,
 } from './klypix-format.mjs';
@@ -1292,6 +1292,14 @@ export async function opBrainNote({ vault, canvas, text: noteText, area, marker 
     // write-side ⏳/⚠️ nudges existed only on one host brand.
     const receipts = formatCaptureReceipts(s);
     const rc = receipts.length ? `\n${receipts.join('\n')}` : '';
+    // Guard sidecar refresh (2026-08-24 review): this verb is the surface that
+    // AUTHORS and RETIRES guards, and on a hookless machine (Codex/Cursor-only)
+    // nothing else ever compiles them. Refresh when a guard was passed OR a
+    // sidecar already exists for this brain (a guard system is in use — a
+    // ✓/~ note may have just retired one). Guard-less projects pay nothing.
+    try {
+      if (guardField || fs.existsSync(guardSidecarPathFor(file))) await ensureGuardSidecar(file);
+    } catch { /* best-effort — the hook's currency check is the backstop */ }
     return { blocks: [text(`✓ brain_note → ${path.basename(file)} (via ${t.how}) · ${bits.join(' · ')}. Reopen the brain in the KLYPIX app to see it.${corr}${rc}`)] };
   } catch (e) {
     return err(`brain_note failed (brain unchanged): ${e.message}`);

@@ -568,7 +568,14 @@ export function inspect(opts = {}) {
     autoUpdate: !autoUpdate.enabled
       ? 'off'
       : (autoUpdate.result === 'failed' || Number(autoUpdate.harness?.failed || 0) > 0 ? 'warning' : 'ok'),
-    hooks: !hooks.settingsPresent ? 'absent' : (hooks.missing.length ? 'drift' : 'ok'),
+    // Grace for the 1.81 hook addition (adversarial review 2026-08-24): a
+    // machine whose only missing event is the NEW PreToolUse guard lane is a
+    // valid pre-guard install, not a drifted one — hard-failing every existing
+    // machine the day the event ships teaches people to ignore the doctor.
+    // Any OTHER missing event still reads as drift.
+    hooks: !hooks.settingsPresent ? 'absent'
+      : (hooks.missing.some((e) => e !== 'PreToolUse') ? 'drift'
+        : (hooks.missing.length ? 'warning' : 'ok')),
     // Codex MCP presence is the automatic baseline. Hooks are an OPTIONAL
     // enrichment layer, so off/unverified must never make the brain "drifted".
     codexHooks: codexHooks.error
@@ -767,6 +774,7 @@ export function render(r, opts = {}) {
   // Host adapters
   const hmark = r.layers.hooks === 'ok' ? ok : warn;
   if (!r.hooks.settingsPresent) L.push(`${hmark} ${c.bold}CLAUDE${c.rst}   no ~/.claude/settings.json found`);
+  else if (r.hooks.missing.length === 1 && r.hooks.missing[0] === 'PreToolUse') L.push(`${hmark} ${c.bold}CLAUDE${c.rst}   capture path intact; ${c.yel}guard lane not wired yet${c.rst} — \`npx klypix-mcp install\` adds the PreToolUse hook (guard cards)`);
   else if (r.hooks.missing.length) L.push(`${hmark} ${c.bold}CLAUDE${c.rst}   half-wired — missing: ${c.yel}${r.hooks.missing.join(', ')}${c.rst}  ${c.dim}(liveness up, readiness no)${c.rst}`);
   else L.push(`${hmark} ${c.bold}CLAUDE${c.rst}   existing 5-hook capture path intact: ${r.hooks.wired.join(', ')}`);
   const chmark = r.layers.codexHooks === 'warning' ? warn : ok;

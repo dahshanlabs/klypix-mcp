@@ -1,0 +1,207 @@
+{
+  "schemaVersion": 1,
+  "package": {
+    "name": "klypix-mcp",
+    "version": "1.81.0"
+  },
+  "gitCommit": "2d0af79cabda4a9878408789b77752294baf0772",
+  "generatedAt": 1787605165416,
+  "resultReceipt": {
+    "schemaVersion": 2,
+    "generatedAt": 1787605165377,
+    "status": "corroborated",
+    "publicationEligible": true,
+    "machineLocal": true,
+    "ledgerFreshMs": 86400000,
+    "claims": [
+      {
+        "claimKey": "brain.core.v1.81.0.release",
+        "status": "corroborated",
+        "submitted": {
+          "manifestSchemaVersion": 2,
+          "runId": "klypix-mcp-1.81.0-qualification-run-b",
+          "gitCommit": "2d0af79cabda4a9878408789b77752294baf0772",
+          "manifestHash": "c20a526f729116ed43d6a90fec44da0500d58c7f635aa91e02a466dff8ef6aa3",
+          "reportSha256": "a161a4e4f60a8a68e7f139f856e65e562e925f8f297302af48d30c3cdd35a025",
+          "inputFingerprint": "8e777441c500eaa838ebb5a89eb65ffb83d02726c258fc90e4a2fa7916190804",
+          "configurationFingerprint": "dbf707889b8bdf503b7fb9e7b385184962121e4dbc09af7f8c96304c2b8a1237",
+          "scopeFingerprint": "c7fac62fed413d048f4c7e001f91ec7d8bb4e84d1559df0a15447a2005ce2473",
+          "artifactFingerprint": "c5525c5713053d70f099ea7f8325545e1bc552d2d6669a4a0671fdf12f8f429b",
+          "evaluationFingerprint": "c51f6f13354c21018637caae06f3e8189b165eeadbc117354ae3120f17257bbd",
+          "publicClaimsFingerprint": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        },
+        "compared": [
+          {
+            "manifest": {
+              "schemaVersion": 2,
+              "claimKey": "brain.core.v1.81.0.release",
+              "report": {
+                "path": ".release-evidence/v1.81.0/artifacts/run-a.json",
+                "sha256": "1a5a5e8452b700ff1ec9d23401d63531d3da1c3815db39dd6b8e4aa60b756298"
+              },
+              "provenance": {
+                "producer": "scripts/build-release-evidence.mjs (real npm-test execution)",
+                "runId": "klypix-mcp-1.81.0-qualification-run-a",
+                "gitCommit": "2d0af79cabda4a9878408789b77752294baf0772",
+                "dirtyDigest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+              },
+              "input": {
+                "fingerprint": "8e777441c500eaa838ebb5a89eb65ffb83d02726c258fc90e4a2fa7916190804",
+                "details": {
+                  "cases": 1,
+                  "suite": "npm test (full chain)"
+                }
+              },
+              "configuration": {
+                "fingerprint": "dbf707889b8bdf503b7fb9e7b385184962121e4dbc09af7f8c96304c2b8a1237",
+                "details": {
+                  "command": "npm test",
+                  "node": "24.13.1",
+                  "policy": "corroborated"
+                }
+              },
+              "metrics": {
+                "suite_pass": {
+                  "value": 1,
+                  "count": 1,
+                  "tolerance": 0,
+                  "unit": "ratio",
+                  "numerator": 1
+                },
+                "suites_passed": {
+                  "value": 1,
+                  "count": 83,
+                  "tolerance": 0,
+                  "unit": "ratio",
+                  "numerator": 83
+                }
+              },
+              "scope": {
+                "intent": "qualify klypix-mcp v1.81.0 for publication",
+                "files": [
+                  ".release-evidence/v1.81.0/artifacts/run-a.json",
+                  ".release-evidence/v1.81.0/artifacts/run-b.json"
+                ]
+              },
+              "artifacts": [
+                {
+                  "path": ".release-evidence/v1.81.0/artifacts/run-a.json",
+                  "sha256": "1a5a5e8452b700ff1ec9d23401d63531d3da1c3815db39dd6b8e4aa60b756298",
+                  "kind": "evaluation-result"
+                }
+              ],
+              "evaluations": [
+                {
+                  "name": "full-suite-qualification",
+                  "artifact": {
+                    "path": ".release-evidence/v1.81.0/artifacts/run-a.json",
+                    "sha256": "1a5a5e8452b700ff1ec9d23401d63531d3da1c3815db39dd6b8e4aa60b756298"
+                  },
+                  "metricKeys": [
+                    "suite_pass",
+                    "suites_passed"
+                  ],
+                  "resultFingerprint": "dede836ef2654bd67318bdee3a9b715f040c409cb35041c1ebee765eba4699b0"
+                }
+              ],
+              "publicClaims": []
+            },
+            "runId": "klypix-mcp-1.81.0-qualification-run-a",
+            "manifestSchemaVersion": 2,
+            "gitCommit": "2d0af79cabda4a9878408789b77752294baf0772",
+            "manifestHash": "cef1273cb63d68c106dc721d47aeb4d1837b79827d2d72c4da48dbab0d7b8be8",
+            "reportSha256": "1a5a5e8452b700ff1ec9d23401d63531d3da1c3815db39dd6b8e4aa60b756298",
+            "inputFingerprint": "8e777441c500eaa838ebb5a89eb65ffb83d02726c258fc90e4a2fa7916190804",
+            "configurationFingerprint": "dbf707889b8bdf503b7fb9e7b385184962121e4dbc09af7f8c96304c2b8a1237",
+            "scopeFingerprint": "c7fac62fed413d048f4c7e001f91ec7d8bb4e84d1559df0a15447a2005ce2473",
+            "artifactFingerprint": "c7ecb5aefda4f5d4a530cb1bdb4d880c2c5ed8a1c572dc2dd511f07b784982a7",
+            "evaluationFingerprint": "c51f6f13354c21018637caae06f3e8189b165eeadbc117354ae3120f17257bbd",
+            "publicClaimsFingerprint": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+          }
+        ]
+      }
+    ],
+    "conflicts": []
+  },
+  "resultReceiptHash": "93f739d18d79396786ee3865cfed4235baa8c5dde3e389a7fbe3cdf5ffebfbc1",
+  "manifests": [
+    {
+      "manifest": {
+        "schemaVersion": 2,
+        "claimKey": "brain.core.v1.81.0.release",
+        "report": {
+          "path": ".release-evidence/v1.81.0/artifacts/run-b.json",
+          "sha256": "a161a4e4f60a8a68e7f139f856e65e562e925f8f297302af48d30c3cdd35a025"
+        },
+        "provenance": {
+          "producer": "scripts/build-release-evidence.mjs (real npm-test execution)",
+          "runId": "klypix-mcp-1.81.0-qualification-run-b",
+          "gitCommit": "2d0af79cabda4a9878408789b77752294baf0772",
+          "dirtyDigest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "input": {
+          "fingerprint": "8e777441c500eaa838ebb5a89eb65ffb83d02726c258fc90e4a2fa7916190804",
+          "details": {
+            "cases": 1,
+            "suite": "npm test (full chain)"
+          }
+        },
+        "configuration": {
+          "fingerprint": "dbf707889b8bdf503b7fb9e7b385184962121e4dbc09af7f8c96304c2b8a1237",
+          "details": {
+            "command": "npm test",
+            "node": "24.13.1",
+            "policy": "corroborated"
+          }
+        },
+        "metrics": {
+          "suite_pass": {
+            "value": 1,
+            "count": 1,
+            "tolerance": 0,
+            "unit": "ratio",
+            "numerator": 1
+          },
+          "suites_passed": {
+            "value": 1,
+            "count": 83,
+            "tolerance": 0,
+            "unit": "ratio",
+            "numerator": 83
+          }
+        },
+        "scope": {
+          "intent": "qualify klypix-mcp v1.81.0 for publication",
+          "files": [
+            ".release-evidence/v1.81.0/artifacts/run-a.json",
+            ".release-evidence/v1.81.0/artifacts/run-b.json"
+          ]
+        },
+        "artifacts": [
+          {
+            "path": ".release-evidence/v1.81.0/artifacts/run-b.json",
+            "sha256": "a161a4e4f60a8a68e7f139f856e65e562e925f8f297302af48d30c3cdd35a025",
+            "kind": "evaluation-result"
+          }
+        ],
+        "evaluations": [
+          {
+            "name": "full-suite-qualification",
+            "artifact": {
+              "path": ".release-evidence/v1.81.0/artifacts/run-b.json",
+              "sha256": "a161a4e4f60a8a68e7f139f856e65e562e925f8f297302af48d30c3cdd35a025"
+            },
+            "metricKeys": [
+              "suite_pass",
+              "suites_passed"
+            ],
+            "resultFingerprint": "7e9aeecb61f87fe4bd9659aa1a808a82ed3e8d3568a87f6c311b8029425a5868"
+          }
+        ],
+        "publicClaims": []
+      },
+      "manifestHash": "c20a526f729116ed43d6a90fec44da0500d58c7f635aa91e02a466dff8ef6aa3"
+    }
+  ],
+  "receiptHash": "7e740ebd86f82b4916a07e77c241757ab8d31da3ed150f9929b926e805558b50"
+}

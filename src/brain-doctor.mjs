@@ -781,7 +781,7 @@ export function render(r, opts = {}) {
     L.push(`${chmark} ${c.bold}CODEX${c.rst}    automatic MCP presence + ${smart} · ${c.yel}native hooks configured but execution not verified${c.rst}`);
     L.push(`        ${c.dim}Context Gateway memory/coordination already works. Once trusted, native hooks auto-inject task memory and warn before exact overlapping edits.${c.rst}`);
   } else {
-    L.push(`${chmark} ${c.bold}CODEX${c.rst}    automatic MCP presence + ${smart} · native auto-context + pre-edit guard active ${c.dim}(last observed ${r.codexHooks.lastExecutedAt})${c.rst}`);
+    L.push(`${chmark} ${c.bold}CODEX${c.rst}    automatic MCP presence + ${smart} · native auto-context + pre-edit overlap warning active ${c.dim}(last observed ${r.codexHooks.lastExecutedAt})${c.rst}`);
   }
   // Commit-capture git hook — per-repo, informational (auto-installed at
   // session start where safe; foreign hooks are never edited automatically).

@@ -395,10 +395,15 @@ const preToolOutput = runHook({
   tool_input: { patch: '*** Update File: src/example.mjs\n@@\n-old\n+new\n' },
 });
 const preToolJson = JSON.parse(preToolOutput);
-ok(/BLOCKING exact-file overlap/.test(preToolJson.systemMessage)
+ok(/WARNING — exact-file overlap/.test(preToolJson.systemMessage)
   && /src\/example\.mjs/.test(preToolJson.systemMessage)
-  && /BLOCKING exact-file overlap/.test(preToolJson.hookSpecificOutput?.additionalContext || ''),
+  && /WARNING — exact-file overlap/.test(preToolJson.hookSpecificOutput?.additionalContext || ''),
   'PreToolUse warns the later Codex session in model-visible context before an exact overlapping edit');
+// Claims discipline (2026-08-24): the hook is advisory (continue: true, no
+// permission decision) — its banner must never claim to BLOCK. This is the
+// regression lock for the wording, not just a rename.
+ok(!/BLOCKING/.test(preToolJson.systemMessage) && preToolJson.continue === true,
+  'PreToolUse overlap banner says WARNING, never BLOCKING — the mechanism is advisory and the output must not claim otherwise');
 
 runHook({
   session_id: 'codex-real-b',

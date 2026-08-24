@@ -236,8 +236,12 @@ function formatConflictWarning(conflicts, event, sessions = []) {
   // Grow each shown id (floor 12) until unique — same-window UUIDv7 peers
   // otherwise render as one ambiguous prefix.
   const shortId = (id) => shortestUniqueSessionPrefix(sessions, id, 12) || String(id).slice(0, 12);
+  // Claims discipline (2026-08-24 audit): this hook is ADVISORY — the output
+  // envelope hardcodes `continue: true` and never denies a tool call — so the
+  // banner must say WARNING, never BLOCKING. Urgency comes from the imperative
+  // closing line, not from claiming a mechanism that does not exist.
   return [
-    `KLYPIX BLOCKING exact-file overlap detected ${moment}:`,
+    `KLYPIX ⚠️ WARNING — exact-file overlap detected ${moment}:`,
     ...conflicts.map((peer) => {
       // Observed/declared distinction (1.70.0): a `*` marks a path whose claim
       // was adopted from live edits, not declared — real overlap, unconfirmed

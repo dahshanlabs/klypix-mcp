@@ -178,5 +178,33 @@ function fixture(tag) {
     f.cleanup();
 }
 
+// ── P10: standing rules reach the ultra tier — and never starve a deadline ───
+// 2026-08-24: the ultra brief rendered skills only as a COUNT, so standing
+// rules reached no session; the first fix then starved ⏰ OVERDUE opens at the
+// 1800-char SessionStart default (caught by adversarial review of 10f43e1).
+// This pins BOTH invariants: rules render, and every overdue ITEM line still
+// lands (the header's "N ⏰ overdue" count alone must not satisfy this — the
+// assertion targets the `- ⏰ OVERDUE` line shape, not the ⏰ glyph).
+{
+    const f = fixture('rules');
+    const skills = Array.from({ length: 12 }, (_, i) => ({ text: `🛠️ Rule ${i}: never do the dangerous thing ${i} without its guard — a field-proven trap with a deliberately long body so a handful of rules consume realistic ultra-brief budget together.` }));
+    fs.writeFileSync(path.join(f.proj, 'brain.klypix'), await buildKlypixMap({
+        title: 'brain',
+        areas: [
+            { title: 'Rules', cards: skills },
+            { title: 'Open questions', cards: [
+                { text: '❓ Overdue item: ship the licensing fix — due by 2020-01-01, still unshipped after the audit?' },
+                { text: '❓ Regular open one: do we need a second reviewer for hook changes?' },
+                { text: '❓ Regular open two: should the exporter keep legacy v2 support?' },
+            ] },
+        ],
+    }));
+    const out = f.run([], { session_id: 'sess-rules' });
+    ok(/## 🛠️ Standing rules \(12/.test(out), 'P10: standing-rules tier present in the SessionStart ultra brief, with the true total');
+    ok(/- .*🛠️ Rule \d+:/.test(out), 'P10: at least one actual rule line is delivered (not just a count)');
+    ok(/^- ⏰ OVERDUE .*licensing fix/m.test(out), 'P10: the ⏰ OVERDUE open ITEM line survives the skills tier (budget fence)');
+    f.cleanup();
+}
+
 console.log(failures ? `\n✗ ${failures} assertion(s) failed` : '\n✓ brief-and-recall: all assertions passed');
 process.exit(failures ? 1 : 0);

@@ -1915,23 +1915,36 @@ export function structToUltraBrief(struct, { freshness = null, briefPath = '.cla
         for (const c of conflicts.slice(0, 4)) { if (!pushIf(`- ${clip(c.from, 70)} ⚔️ ${clip(c.to, 70)}`)) break; shown++; }
         if (shown < conflicts.length) pushIf(`- …and ${conflicts.length - shown} more conflict(s) — in the full brief.`);
     }
+    // Overdue opens lead (and get a ⏰ prefix) so a passed deadline is never the
+    // line that falls off the bottom of the preview-sized budget.
+    const overdueById = findOverdueOpenCards(struct).byId;
+    const openSorted = open.slice().sort((a, b) => (overdueById.has(b.id) ? 1 : 0) - (overdueById.has(a.id) ? 1 : 0));
     // 🛠️ Standing rules tier (2026-08-24): the ultra brief used to render
     // skills as a COUNT in the tail — so the one surface every session reads
     // carried zero of the rules that are supposed to "fire every session".
     // Newest first (the most recently learned trap is the likeliest live one),
     // BEFORE the open list: opens are greedy to the budget floor, so anything
     // placed after them never lands. Small cap — this is a reminder tier, the
-    // full set stays in the brief file.
-    if (skills.length && pushIf('') && pushIf(`## 🛠️ Standing rules (${skills.length} — newest first, apply always)`)) {
-        const newest = skills.slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-        let shown = 0;
-        for (const c of newest.slice(0, 5)) { if (!pushIf(`- ${fr(c)}${head(c)}`)) break; shown++; }
-        if (shown < skills.length) pushIf(`- …and ${skills.length - shown} more standing rule(s) — in the full brief.`);
+    // full set stays in the brief file. BUDGET FENCE (adversarial review of
+    // 10f43e1, reproduced live at the 1800-char SessionStart default): this
+    // tier must never be the reason a ⏰ OVERDUE line fell off — price the
+    // opens header, every overdue line, and the overflow line FIRST, and hold
+    // that budget back from the skills tier. Rules yield to deadlines.
+    if (skills.length) {
+        const openHeader = `## Open questions & goals (${open.length}${overdueById.size ? `, ${overdueById.size} ⏰ overdue` : ''})`;
+        const overdueLines = openSorted.filter(c => overdueById.has(c.id)).map(c => `- ⏰ OVERDUE ${fr(c)}${head(c)}`);
+        const reserve = open.length
+            ? ['', openHeader, ...overdueLines, `- …and ${open.length} more — in the full brief.`]
+                .reduce((s, l) => s + l.length + 1, 0)
+            : 0;
+        const pushIfFenced = (l) => (used + l.length + 1 > budget - reserve) ? false : (push(l), true);
+        if (pushIfFenced('') && pushIfFenced(`## 🛠️ Standing rules (${skills.length} — newest first, apply always)`)) {
+            const newest = skills.slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+            let shown = 0;
+            for (const c of newest.slice(0, 5)) { if (!pushIfFenced(`- ${fr(c)}${head(c)}`)) break; shown++; }
+            if (shown < skills.length) pushIfFenced(`- …and ${skills.length - shown} more standing rule(s) — in the full brief.`);
+        }
     }
-    // Overdue opens lead (and get a ⏰ prefix) so a passed deadline is never the
-    // line that falls off the bottom of the preview-sized budget.
-    const overdueById = findOverdueOpenCards(struct).byId;
-    const openSorted = open.slice().sort((a, b) => (overdueById.has(b.id) ? 1 : 0) - (overdueById.has(a.id) ? 1 : 0));
     if (open.length && pushIf('') && pushIf(`## Open questions & goals (${open.length}${overdueById.size ? `, ${overdueById.size} ⏰ overdue` : ''})`)) {
         let shown = 0;
         for (const c of openSorted) { if (!pushIf(`- ${overdueById.has(c.id) ? '⏰ OVERDUE ' : ''}${fr(c)}${head(c)}`)) break; shown++; }

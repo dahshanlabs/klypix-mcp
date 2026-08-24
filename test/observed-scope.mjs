@@ -299,18 +299,21 @@ const now = 2_000_000_000_000;
     .find((session) => session.id === 'codex-obs');
   ok(row.files.length === 0 && row.observedFiles.includes('src/touched.mjs'),
     'O9: a human turn resets declared scope but keeps what was actually observed');
-  // A second session declaring the same file gets the BLOCKING warning with
-  // the observed mark on the first session's claim.
+  // A second session declaring the same file gets the overlap WARNING with
+  // the observed mark on the first session's claim. (Claims discipline
+  // 2026-08-24: the banner says WARNING — the lane is advisory, continue:true —
+  // and this assertion locks the honest wording the same way agent-presence does.)
   const warnOut = runCodex({
     session_id: 'codex-obs-b', cwd: codexProj, hook_event_name: 'PreToolUse',
     turn_id: 'turn-2', tool_name: 'apply_patch',
     tool_input: { patch: '*** Update File: src/touched.mjs\n@@\n-old\n+other\n' },
   });
   const warnJson = JSON.parse(warnOut);
-  ok(/BLOCKING exact-file overlap/.test(warnJson.systemMessage)
+  ok(/WARNING — exact-file overlap/.test(warnJson.systemMessage)
+    && !/BLOCKING/.test(warnJson.systemMessage)
     && /src\/touched\.mjs\*/.test(warnJson.systemMessage)
     && /observed from live edits, scope not declared/.test(warnJson.systemMessage),
-    'O9: the Codex blocking warning states the observed/declared confidence of the overlap');
+    'O9: the Codex overlap warning states the observed/declared confidence — and never claims to BLOCK');
   fs.rmSync(codexHome, { recursive: true, force: true });
   fs.rmSync(codexProj, { recursive: true, force: true });
 }

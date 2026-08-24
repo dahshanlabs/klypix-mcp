@@ -32,7 +32,7 @@ import {
   brainLensData, lensToMarkdown, deathDateOfCard,
   statusContextToMarkdown, findFulfillmentCandidates,
   splitQueryTokens, scoreCardsAgainstQuery, correctionOverlaysFor,
-  isFastDecayCard, isUnresolvedOpenCard, DECAY_STALE_MS, formatDecayAge,
+  isFastDecayCard, isUnresolvedOpenCard, isSkillCard, DECAY_STALE_MS, formatDecayAge,
   isPlanCard, planFulfillmentFor, PLAN_PAIR_SIM_BRAIN, isAgconfTwinId,
   readPendingShips, clearPendingShips, pendingShipCards, formatCaptureReceipts,
 } from './klypix-format.mjs';
@@ -494,9 +494,29 @@ export async function opBrainTaskContext({
     };
   });
   const maxChars = Math.max(800, Math.min(5000, Number(budgetChars) || 2800));
+  // Standing rules (2026-08-24 audit): 🛠️ skills are "apply every session",
+  // but the ranker's `score <= 0` gate drops a zero-overlap rule BEFORE its +1
+  // skill boost applies — so the capsule delivered task hits and zero standing
+  // rules, and the rule that would have warned the founder about a same-day
+  // billing trap never reached any session. This block is UNCONDITIONAL:
+  // relevance-ordered when the ranker scored a rule, newest-first otherwise,
+  // deduped against the hit list, and prepended so the maxChars tail-cut can
+  // never be the reason a rule silently vanished.
+  const skillPool = struct.cards.filter((c) => c.type !== 'container'
+    && !/^archive$/i.test(c.area || '') && isSkillCard(c));
+  const scoreById = new Map(candidatePool.map((hit) => [hit.card.id, hit.score]));
+  const standing = skillPool
+    .filter((c) => !hitIds.has(c.id))
+    .sort((a, b) => (scoreById.get(b.id) || 0) - (scoreById.get(a.id) || 0)
+      || (b.createdAt || 0) - (a.createdAt || 0))
+    .slice(0, 3);
   const lines = [
     `## Compact task context (${entries.length} relevant brain card${entries.length === 1 ? '' : 's'} · lexical-fast)`,
   ];
+  if (standing.length) {
+    lines.push(`### 🛠️ Standing rules (${skillPool.length} in the brain — apply always; full set in the brief)`);
+    for (const c of standing) lines.push(`- [${flat(c.area) || 'Notes'}] ${clip(c.text, 220)}`);
+  }
   if (!entries.length) {
     lines.push('No high-confidence task-specific card matched. Continue from repository evidence; use brain_ask only if deeper project history is needed.');
   } else {
@@ -521,6 +541,9 @@ export async function opBrainTaskContext({
     context: {
       mode: 'lexical-fast',
       hits: entries,
+      ...(standing.length ? {
+        standingRules: standing.map((c) => ({ id: c.id, area: flat(c.area) || 'Notes', text: clip(c.text, 220) })),
+      } : {}),
       sufficient: entries.length > 0,
       durationMs,
       brain: path.basename(t.file),

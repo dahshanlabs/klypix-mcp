@@ -1630,8 +1630,11 @@ export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMile
     // 🛠️ Skills — reusable how-tos / gotchas / procedures (the '+' marker).
     // Standing reference, NOT a point-in-time event: always shown, never
     // recency-decayed, and excluded from open/milestones/recent so a skill never
-    // masquerades as (or ages out like) a decision.
-    const skills = rest.filter(isSkillCard);
+    // masquerades as (or ages out like) a decision. Newest first: the render
+    // below can only show maxSkills of them, and an unsorted slice pinned the
+    // OLDEST rules forever while every rule learned since reached no session
+    // (2026-08-24 audit — the founder's same-day billing rule was invisible).
+    const skills = rest.filter(isSkillCard).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
     const open = rest.filter(isOpenCard);
     const miles = rest.filter(isMilestoneCard);
     const plain = rest.filter(c => !open.includes(c) && !miles.includes(c) && !skills.includes(c));
@@ -1911,6 +1914,19 @@ export function structToUltraBrief(struct, { freshness = null, briefPath = '.cla
         let shown = 0;
         for (const c of conflicts.slice(0, 4)) { if (!pushIf(`- ${clip(c.from, 70)} ⚔️ ${clip(c.to, 70)}`)) break; shown++; }
         if (shown < conflicts.length) pushIf(`- …and ${conflicts.length - shown} more conflict(s) — in the full brief.`);
+    }
+    // 🛠️ Standing rules tier (2026-08-24): the ultra brief used to render
+    // skills as a COUNT in the tail — so the one surface every session reads
+    // carried zero of the rules that are supposed to "fire every session".
+    // Newest first (the most recently learned trap is the likeliest live one),
+    // BEFORE the open list: opens are greedy to the budget floor, so anything
+    // placed after them never lands. Small cap — this is a reminder tier, the
+    // full set stays in the brief file.
+    if (skills.length && pushIf('') && pushIf(`## 🛠️ Standing rules (${skills.length} — newest first, apply always)`)) {
+        const newest = skills.slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+        let shown = 0;
+        for (const c of newest.slice(0, 5)) { if (!pushIf(`- ${fr(c)}${head(c)}`)) break; shown++; }
+        if (shown < skills.length) pushIf(`- …and ${skills.length - shown} more standing rule(s) — in the full brief.`);
     }
     // Overdue opens lead (and get a ⏰ prefix) so a passed deadline is never the
     // line that falls off the bottom of the preview-sized budget.

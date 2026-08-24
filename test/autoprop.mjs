@@ -269,9 +269,12 @@ function runInstall(home, projectCwd, args = []) {
     && mcp.mcpServers['klypix-canvas'].args[1].includes('klypix-mcp-server.mjs'),
   'D: existing .mcp.json migrated npx → portable local bundle');
   ok(fs.existsSync(path.join(proj, '.mcp.json.klypix-bak')), 'D: the original .mcp.json was backed up before migration');
-  // settings.json wired 4 hooks
+  // settings.json wired 5 hooks (PreToolUse = guard cards, 2026-08-24)
   const settings = JSON.parse(fs.readFileSync(path.join(home, '.claude', 'settings.json'), 'utf8'));
-  ok(['SessionStart', 'UserPromptSubmit', 'Stop', 'PostToolUse'].every(e => Array.isArray(settings.hooks?.[e])), 'D: all 4 Claude Code hooks wired');
+  ok(['SessionStart', 'UserPromptSubmit', 'Stop', 'PostToolUse', 'PreToolUse'].every(e => Array.isArray(settings.hooks?.[e])), 'D: all 5 Claude Code hooks wired');
+  ok(settings.hooks.PreToolUse.some((g) => g.matcher === 'Bash|PowerShell|Edit|Write'
+    && g.hooks?.some((h) => h.command?.includes('--guard'))),
+  'D: the PreToolUse entry runs the --guard fast path on shell + file tools');
   const globalCodexConfig = fs.readFileSync(path.join(home, '.codex', 'config.toml'), 'utf8');
   ok(!globalCodexConfig.includes('[mcp_servers.klypix-canvas]'), 'D: obsolete wrong-vault global Codex KLYPIX entry is removed');
   ok(globalCodexConfig.includes('model = "gpt-test"') && globalCodexConfig.includes('[mcp_servers.docs]'), 'D: global Codex cleanup preserves user settings + sibling servers');

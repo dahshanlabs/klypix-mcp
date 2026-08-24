@@ -669,7 +669,7 @@ keep lazy first-use indexing instead.
   file paths involved). The scope is versioned: an older metadata-only grant does not authorize note
   text and must be granted again. No current consent, no frames.
 - **`install` writes to your home directory:** `~/.claude/project-brain` (engine + runtime),
-  `~/.claude/settings.json` (four hooks — written even if Claude Code is not installed),
+  `~/.claude/settings.json` (five hooks — written even if Claude Code is not installed),
   `~/.codex/AGENTS.md` (guidance block), and with `--codex-hooks`, `~/.codex/hooks.json`. It also
   writes `<cwd>/.codex/config.toml` **inside the project** you run it in, and removes any KLYPIX
   entry from the global `~/.codex/config.toml`. **`link` writes 14 files inside the project** you

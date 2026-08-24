@@ -32,7 +32,7 @@ import {
   brainLensData, lensToMarkdown, deathDateOfCard,
   statusContextToMarkdown, findFulfillmentCandidates,
   splitQueryTokens, scoreCardsAgainstQuery, correctionOverlaysFor,
-  isFastDecayCard, isUnresolvedOpenCard, isSkillCard, DECAY_STALE_MS, formatDecayAge,
+  isFastDecayCard, isUnresolvedOpenCard, isSkillCard, validateGuard, DECAY_STALE_MS, formatDecayAge,
   isPlanCard, planFulfillmentFor, PLAN_PAIR_SIM_BRAIN, isAgconfTwinId,
   readPendingShips, clearPendingShips, pendingShipCards, formatCaptureReceipts,
 } from './klypix-format.mjs';
@@ -1222,14 +1222,25 @@ export async function opAddToCanvas({ vault, canvas, cards, connections, via }) 
 // open file any agent reads AND writes": a hookless client (Cursor/Cline/Desktop)
 // can now record a decision, ask an open question, mark a milestone, resolve a card,
 // or correct one — with the full lifecycle, not just a flat append.
-export async function opBrainNote({ vault, canvas, text: noteText, area, marker = '', closes, via, enrichmentQuestion = '' }) {
+export async function opBrainNote({ vault, canvas, text: noteText, area, marker = '', closes, via, guard = null, enrichmentQuestion = '' }) {
   const t = brainTarget(vault, canvas);
   if (t.ambiguous) return ambiguousBrainErr(t.ambiguous);
   if (!t.file) return err(`No brain found — looked for ./brain.klypix in the project, then ${vault}. Pass canvas: "<name>".`);
   const file = t.file;
   if (!noteText || !String(noteText).trim()) return err('brain_note needs a non-empty text.');
   if (!['', '?', '!', '✓', '~', '+'].includes(marker)) return err(`Invalid marker "${marker}" — use: (none)=decision · ?=open question · !=milestone · +=skill (reusable how-to) · ✓=resolve a matching card · ~=update a matching card.`);
-  const input = noteToCaptureInput({ text: noteText, area, marker, closes: closes || '', createdVia: via || 'mcp' });
+  // Guard cards (2026-08-24): a guard is authored on a '+' skill (or amended
+  // via '~'). Validation is FAIL-LOUD — a malformed guard is an error naming
+  // the defect, never a silently-dropped field (the exact bug class this
+  // subsystem's audit found in the evidence/verify plumbing).
+  let guardField = null;
+  if (guard !== null && guard !== undefined) {
+    if (marker !== '+' && marker !== '~') return err("guard rides a '+' skill card (or a '~' amendment of one) — pass marker: '+' with the guard.");
+    const v = validateGuard(guard);
+    if (!v.ok) return err(`Invalid guard: ${v.reason}`);
+    guardField = v.guard;
+  }
+  const input = noteToCaptureInput({ text: noteText, area, marker, closes: closes || '', guard: guardField, createdVia: via || 'mcp' });
   // Deliver any queued out-of-session ship observations on THIS write. The
   // Claude Stop hook is not the only writer — an MCP-only or Codex-driven
   // project would otherwise queue observations that never drain (2026-07-29

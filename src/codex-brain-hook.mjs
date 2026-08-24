@@ -253,6 +253,38 @@ function formatConflictWarning(conflicts, event, sessions = []) {
   ].join('\n');
 }
 
+// Guard cards, Codex advisory tier (2026-08-24): read the compiled sidecar the
+// Claude-side lanes build (one keying rule — brainFormat.guardSidecarPathFor)
+// and evaluate against this tool event. Typeof-guarded so a bundle whose
+// klypix-format predates guards degrades to silence, never a throw. This lane
+// only ever WARNS: block-severity guards are named as such so the model treats
+// them as a hard stop, but no mechanism here denies anything.
+function guardWarnings(projectDir, brainPath, input) {
+  try {
+    if (typeof brainFormat.evaluateGuards !== 'function'
+      || typeof brainFormat.guardSidecarPathFor !== 'function') return '';
+    let sidecar = null;
+    try { sidecar = JSON.parse(fs.readFileSync(brainFormat.guardSidecarPathFor(brainPath), 'utf8')); } catch { return ''; }
+    const guards = Array.isArray(sidecar?.guards) ? sidecar.guards : [];
+    if (!guards.length) return '';
+    const files = touchedFiles(input, projectDir);
+    const cmd = toolInput(input).command;
+    const fired = brainFormat.evaluateGuards(guards, {
+      toolName: toolName(input),
+      command: typeof cmd === 'string' ? cmd : '',
+      files: files.length ? files : null,
+      worktreeCount: Number.isFinite(sidecar.worktreeCount) ? sidecar.worktreeCount : null,
+    });
+    if (!fired.length) return '';
+    const lines = fired.map((f) => {
+      const hard = f.guard.severity === 'block' ? ' (BLOCK-severity rule — this host cannot enforce it; treat as a hard stop)' : '';
+      const note = f.unverified.length ? ` (could not verify: ${f.unverified.join(', ')})` : '';
+      return `- [${f.guard.area || 'brain'}]${hard} ${f.guard.message}${note}`;
+    });
+    return `🛡️ KLYPIX guard — a standing rule matches this action:\n${lines.join('\n')}\nApply the rule, or proceed deliberately if it does not fit this case.`;
+  } catch { return ''; }
+}
+
 function queueConflictAlerts({ brainPath, sessionId, intent, conflicts, turnId, sessions = [] }) {
   const queued = [];
   const selfShortId = shortestUniqueSessionPrefix(sessions, sessionId, 12) || String(sessionId).slice(0, 12);
@@ -405,6 +437,11 @@ async function main() {
   if (event === 'PreToolUse' || event === 'PostToolUse') {
     emitSystemMessage([
       formatConflictWarning(conflicts, event, sessions),
+      // Guard cards, advisory tier (2026-08-24): this host cannot deny a tool
+      // call — Codex hook output is `continue: true` by design — so a matching
+      // guard renders as a warning; a block-severity guard says it should be
+      // treated as a hard stop, without claiming a mechanism this lane lacks.
+      ...(event === 'PreToolUse' ? [guardWarnings(projectDir, brainPath, input)] : []),
       stampReceivedMessages(messages, Date.now(), undefined, sessionId),
     ], event);
     return;

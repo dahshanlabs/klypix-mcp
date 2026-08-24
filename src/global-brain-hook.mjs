@@ -3165,10 +3165,131 @@ function pruneCacheDir(keep = 40) {
 // mtime-keyed parse cache so we don't unzip the brain on every prompt.
 async function cachedStruct(lib) {
     let mtimeMs = 0; try { mtimeMs = fs.statSync(BRAIN).mtimeMs; } catch { /* */ }
-    try { const c = JSON.parse(fs.readFileSync(CACHE, 'utf8')); if (c && c.mtimeMs === mtimeMs && c.struct) return c.struct; } catch { /* miss */ }
+    try {
+        const c = JSON.parse(fs.readFileSync(CACHE, 'utf8'));
+        if (c && c.mtimeMs === mtimeMs && c.struct) { refreshGuardSidecar(lib, c.struct, mtimeMs); return c.struct; }
+    } catch { /* miss */ }
     const { struct } = await lib.parseKlypix(fs.readFileSync(BRAIN));
     try { fs.writeFileSync(CACHE, JSON.stringify({ mtimeMs, struct })); pruneCacheDir(); } catch { /* cache is best-effort */ }
+    refreshGuardSidecar(lib, struct, mtimeMs);
     return struct;
+}
+// ── Guard cards: sidecar compiler (2026-08-24) ───────────────────────────────
+// The PreToolUse --guard lane must NEVER parse the brain (~1s measured on the
+// live brain) or spawn git — so guards are COMPILED here, in the lanes where
+// the struct is already warm (--prompt retrieval, Stop capture, SessionStart
+// read), into a tiny per-brain sidecar the fast path reads with one stat+read.
+// worktreeCount (the one cached repo predicate) is refreshed only on rebuild;
+// a failed probe stores null, which the evaluator reports as UNVERIFIED — the
+// caller then degrades block→warn rather than silently exempting (2026-08-18
+// field rule) or false-blocking.
+const GUARDS_SIDECAR = path.join(os.homedir(), '.claude', 'project-brain', `.guards-${sha(normBrainPath(BRAIN))}.json`);
+const GUARDS_SEEN = path.join(os.homedir(), '.claude', 'project-brain', `.guards-seen-${sha(normBrainPath(BRAIN))}.json`);
+function refreshGuardSidecar(lib, struct, mtimeMs) {
+    try {
+        if (typeof lib.compileGuards !== 'function') return;           // version-skew: older format lib
+        try {
+            const cur = JSON.parse(fs.readFileSync(GUARDS_SIDECAR, 'utf8'));
+            if (cur && cur.mtimeMs === mtimeMs) return;                 // current — nothing to do
+        } catch { /* absent/stale → rebuild */ }
+        const guards = lib.compileGuards(struct);
+        let worktreeCount = null;
+        if (guards.some((g) => g.when && g.when.multiWorktree)) {
+            try {
+                const out = execFileSync('git', ['worktree', 'list', '--porcelain'], {
+                    cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 1500,
+                });
+                worktreeCount = out.split('\n').filter((l) => l.startsWith('worktree ')).length;
+            } catch { worktreeCount = null; }                           // unknown, never 0/1
+        }
+        fs.mkdirSync(path.dirname(GUARDS_SIDECAR), { recursive: true });
+        fs.writeFileSync(GUARDS_SIDECAR, JSON.stringify({ v: 1, mtimeMs, builtAt: Date.now(), brainPath: BRAIN, worktreeCount, guards }));
+    } catch { /* the sidecar is best-effort — a failed build means the guard lane stays silent, never broken */ }
+}
+// --guard (PreToolUse): the fast path. Budget discipline: stat + one tiny JSON
+// read on the common no-guards case; the heavy klypix-format import is paid
+// ONLY when a compiled guard's tool pattern could match this call. Never
+// throws, never blocks on its own failure (the harness is fail-open on hook
+// errors anyway — only a deliberate deny blocks).
+async function guardCheck() {
+    try {
+        const input = readHookInput();
+        const toolName = String(input.tool_name || '');
+        if (!toolName) return;
+        let sidecar = null;
+        try { sidecar = JSON.parse(fs.readFileSync(GUARDS_SIDECAR, 'utf8')); } catch { return; }   // no compiled guards → no-op
+        const guards = Array.isArray(sidecar?.guards) ? sidecar.guards : [];
+        if (!guards.length) return;
+        // Inline tool prefilter (regex compile is cheap; the LIB import is not).
+        const might = guards.filter((g) => {
+            const t = g?.when?.tool;
+            if (!t) return true;
+            try { return new RegExp(String(t).slice(0, 200), 'i').test(toolName); } catch { return false; }
+        });
+        if (!might.length) return;
+        const lib = await import('./klypix-format.mjs');
+        if (typeof lib.evaluateGuards !== 'function') return;
+        const ti = input.tool_input && typeof input.tool_input === 'object' ? input.tool_input : {};
+        const command = typeof ti.command === 'string' ? ti.command : '';
+        // paths input: the direct target for file tools; this session's
+        // observed/declared scope (the live lane row) for shell commands —
+        // `git push` names no paths, but the session's touched files do.
+        let files = null;
+        const direct = [ti.file_path, ti.path, ti.notebook_path].find((v) => typeof v === 'string' && v);
+        if (direct) { const rel = projRelPath(direct); files = rel ? [rel] : []; }
+        else {
+            try {
+                const me = readSessions().find((s) => s.id === input.session_id);
+                if (me && Array.isArray(me.files)) files = me.files;
+            } catch { files = null; }
+        }
+        const fired = lib.evaluateGuards(might, {
+            toolName, command, files,
+            worktreeCount: Number.isFinite(sidecar.worktreeCount) ? sidecar.worktreeCount : null,
+        });
+        if (!fired.length) return;
+        // A verified block denies. An UNVERIFIED block (an input was
+        // unavailable) degrades to warn and says so — never silently exempt,
+        // never false-block. Warns fire once per session per card.
+        const blocks = fired.filter((f) => f.guard.severity === 'block' && !f.unverified.length);
+        if (blocks.length) {
+            const b = blocks[0].guard;
+            process.stdout.write(JSON.stringify({
+                hookSpecificOutput: {
+                    hookEventName: 'PreToolUse',
+                    permissionDecision: 'deny',
+                    permissionDecisionReason: `🛡️ KLYPIX guard [${b.area || 'brain'}]: ${b.message} (guard card ${b.id} — if this block is wrong, ✓-resolve or ~-amend that card)`,
+                },
+            }));
+            return;
+        }
+        const sid = String(input.session_id || '');
+        let seen = {};
+        try { seen = JSON.parse(fs.readFileSync(GUARDS_SEEN, 'utf8')) || {}; } catch { seen = {}; }
+        const mine = (seen[sid] && typeof seen[sid] === 'object') ? seen[sid] : {};
+        const fresh = fired.filter((f) => !mine[f.guard.id]);
+        if (!fresh.length) return;
+        const lines = fresh.map((f) => {
+            const note = f.unverified.length ? ` (severity block degraded to warn — could not verify: ${f.unverified.join(', ')})` : '';
+            return `- [${f.guard.area || 'brain'}] ${f.guard.message}${note}`;
+        });
+        try {
+            const now = Date.now();
+            for (const f of fresh) mine[f.guard.id] = now;
+            const pruned = {};                                          // drop sessions idle >24h
+            for (const [k, v] of Object.entries({ ...seen, [sid]: mine })) {
+                const newest = Math.max(0, ...Object.values(v && typeof v === 'object' ? v : {}));
+                if (now - newest < 24 * 60 * 60 * 1000) pruned[k] = v;
+            }
+            fs.writeFileSync(GUARDS_SEEN, JSON.stringify(pruned));
+        } catch { /* dedup is best-effort — worst case a warn repeats */ }
+        process.stdout.write(JSON.stringify({
+            hookSpecificOutput: {
+                hookEventName: 'PreToolUse',
+                additionalContext: `🛡️ KLYPIX guard — a standing rule matches what you are about to do:\n${lines.join('\n')}\nApply the rule, or proceed deliberately if it does not fit this case.`,
+            },
+        }));
+    } catch { /* never throw — the guard lane must not be able to break a tool call by failing */ }
 }
 // Generic directory names anchor to a huge fraction of the brain, so they drown
 // out the prompt's real intent — keep precise basenames, drop the generic dirs.
@@ -3710,7 +3831,7 @@ function doctorFooter() {
             return Array.isArray(groups) && groups.some(g => Array.isArray(g?.hooks)
                 && g.hooks.some(h => typeof h?.command === 'string' && h.command.includes('global-brain-hook')));
         };
-        const missing = [['UserPromptSubmit', 'per-prompt recall'], ['Stop', 'decision capture'], ['PostToolUse', 'live sync']]
+        const missing = [['UserPromptSubmit', 'per-prompt recall'], ['Stop', 'decision capture'], ['PostToolUse', 'live sync'], ['PreToolUse', 'guard cards (pre-action warnings)']]
             .filter(([evt]) => !wiredFor(evt));
         if (!missing.length) return '';
         return '\n\n---\n## ⚠️ Brain half-wired — readiness\n'
@@ -4035,6 +4156,10 @@ async function main() {
     // one tiny locked append. It must NOT pay the lazy klypix-format import, so it
     // runs BEFORE everything else and returns. (Fires on Bash|PowerShell|Edit|Write.)
     if (process.argv.includes('--live')) { liveCapture(); return; }
+    // --guard (PreToolUse) is the second fast path: stat + sidecar read on the
+    // common case; it lazy-imports the lib itself only when a compiled guard's
+    // tool pattern could match this call. Runs before the unconditional import.
+    if (process.argv.includes('--guard')) { await guardCheck(); return; }
     const lib = await import('./klypix-format.mjs');    // lazy: only when a brain exists
     // Per-prompt retrieval runs on EVERY prompt — skip the registry write and
     // go straight to the (mtime-cached) ranked lookup to keep it cheap.
@@ -4064,7 +4189,7 @@ if (!process.env.KLYPIX_BRAIN_NO_MAIN) {
         // here. Now it leaves a breadcrumb — without breaking the never-throw,
         // always-exit-0 contract.
         try {
-            const mode = process.argv.includes('--prompt') ? 'prompt' : process.argv.includes('--capture') ? 'capture' : 'read';
+            const mode = process.argv.includes('--prompt') ? 'prompt' : process.argv.includes('--capture') ? 'capture' : process.argv.includes('--guard') ? 'guard' : 'read';
             appendJsonl(HEALTH, { ts: nowIso(), project: path.basename(CWD), mode, ok: false, err: String((e && e.message) || e).slice(0, 200) }, 500);
         } catch { /* even the breadcrumb is best-effort */ }
     }).finally(() => process.exit(EXIT_CODE));

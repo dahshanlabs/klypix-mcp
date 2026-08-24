@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // klypix-install — lay the project-brain down into ~/.claude/project-brain from THIS
-// package and wire the 4 Claude Code hooks into ~/.claude/settings.json. This makes
+// package and wire the 5 Claude Code hooks into ~/.claude/settings.json. This makes
 // npm the SINGLE delivery for the WHOLE brain (hook + engine + local MCP/A2A
 // servers), so one `gh release create` (OIDC auto-publish) + `npx klypix-mcp install`
 // updates every brain on a machine — the global ~/.claude/project-brain copy serves
@@ -427,7 +427,7 @@ try {
         type: 'module',
     }, null, 2));
 
-    // 5) wire the 4 hooks into settings.json (refuse on invalid JSON; back up;
+    // 5) wire the 5 hooks into settings.json (refuse on invalid JSON; back up;
     // atomic). A background runtime-only update refreshes the scripts while
     // deliberately preserving every host/project config byte.
     const brainCmd = (arg) => `node "${fwd(path.join(BRAIN_DIR, 'global-brain-hook.mjs'))}"${arg ? ' ' + arg : ''}`;
@@ -436,6 +436,10 @@ try {
         ['UserPromptSubmit', { hooks: [{ type: 'command', command: brainCmd('--prompt'), timeout: 10 }] }],
         ['Stop', { hooks: [{ type: 'command', command: brainCmd('--capture') }] }],
         ['PostToolUse', { matcher: 'Bash|PowerShell|Edit|Write', hooks: [{ type: 'command', command: brainCmd('--live'), timeout: 10 }] }],
+        // Guard cards (2026-08-24): pre-action lane. Fast path — reads only the
+        // compiled guard sidecar; 'warn' injects context, 'block' denies with
+        // the card's message. Absent guards = stat + one tiny read, then no-op.
+        ['PreToolUse', { matcher: 'Bash|PowerShell|Edit|Write', hooks: [{ type: 'command', command: brainCmd('--guard'), timeout: 10 }] }],
     ];
     const stripOurs = (arr) => (Array.isArray(arr) ? arr : [])
         .map(g => (g && Array.isArray(g.hooks)) ? { ...g, hooks: g.hooks.filter(h => !(typeof h?.command === 'string' && h.command.includes(HOOK_MARK))) } : g)
@@ -506,12 +510,12 @@ try {
     // Codex needs native MCP tools, conditional guidance, and lifecycle presence.
     const codex = RUNTIME_ONLY ? null : wireCodex();
 
-    // 8) READINESS check — re-read what we just wrote and confirm all 4 hooks actually
+    // 8) READINESS check — re-read what we just wrote and confirm all 5 hooks actually
     //    took (a malformed pre-existing group, a partial merge, or a later hand-edit can
     //    leave the brain LIVE but not LEARNING — liveness ≠ readiness). Warn, don't fail.
     const verify = RUNTIME_ONLY ? null : (() => { try { return JSON.parse(fs.readFileSync(SETTINGS, 'utf8')); } catch { return null; } })();
     const wiredFor = (evt) => Array.isArray(verify?.hooks?.[evt]) && verify.hooks[evt].some(g => Array.isArray(g?.hooks) && g.hooks.some(h => typeof h?.command === 'string' && h.command.includes(HOOK_MARK)));
-    const notWired = ['SessionStart', 'UserPromptSubmit', 'Stop', 'PostToolUse'].filter(e => !wiredFor(e));
+    const notWired = ['SessionStart', 'UserPromptSubmit', 'Stop', 'PostToolUse', 'PreToolUse'].filter(e => !wiredFor(e));
 
     releaseInstallLockSync(installLock);
     // Users who already enabled the optional local semantic runtime should not
@@ -538,7 +542,7 @@ try {
     if (!RUNTIME_ONLY) reportCodex(codex);
     console.log(`✓ installed klypix brain v${VERSION} → ${BRAIN_DIR}  (${n} scripts, ${deps} dep packages)`);
     if (RUNTIME_ONLY) console.log('✓ runtime-only update: host settings and project files were preserved');
-    else if (!notWired.length) console.log('✓ wired 4 hooks: SessionStart · UserPromptSubmit (--prompt) · Stop (--capture) · PostToolUse (--live) → settings.json');
+    else if (!notWired.length) console.log('✓ wired 5 hooks: SessionStart · UserPromptSubmit (--prompt) · Stop (--capture) · PostToolUse (--live) · PreToolUse (--guard) → settings.json');
     else console.error(`⚠ readiness: ${notWired.length} hook(s) did NOT take (${notWired.join(', ')}) — the brain will read but not capture/sync. Re-run \`npx klypix-mcp install --force\` or check ${SETTINGS}.`);
     console.log(`✓ MCP supervisor runs from the local bundle (node ${fwd(path.join(BRAIN_DIR, 'klypix-mcp-server.mjs'))}) — compatible core updates activate without restarting the host.`);
     if (migrated) console.log(`✓ migrated ${migrated.file} klypix-canvas server: ${migrated.from} → ${migrated.to} (backup: .mcp.json.klypix-bak). Reconnect (/mcp) or restart to pick it up.`);

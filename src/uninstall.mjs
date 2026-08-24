@@ -309,7 +309,7 @@ export function planUnlink(projectDir, { sidecars = false } = {}) {
 }
 
 /**
- * MACHINE-GLOBAL plan — the engine bundle, the 4 Claude Code hooks, and the
+ * MACHINE-GLOBAL plan — the engine bundle, the 5 Claude Code hooks, and the
  * three Codex host files. Zero writes.
  */
 export function planUninstall({ home = os.homedir(), installDir, keepRegistry = false, keepSemantic = false } = {}) {

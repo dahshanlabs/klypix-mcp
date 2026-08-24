@@ -103,7 +103,7 @@ await runVerb('install', './klypix-install.mjs');
 await runVerb('link', './klypix-link.mjs');
 
 // `npx klypix-mcp doctor` — the brain's READ-ONLY self-check: is this machine's brain
-// current, are the 4 hooks wired, what verbs does it expose, who's live, is the harness
+// current, are the 5 hooks wired, what verbs does it expose, who's live, is the harness
 // projection in sync? One verdict, one reconcile block. Exits 1 on drift (CI gate).
 await runVerb('doctor', './klypix-doctor.mjs');
 
@@ -683,12 +683,22 @@ server.registerTool('brain_note', {
     marker: z.enum(['', '?', '!', '+', '✓', '~']).optional().describe('(none)=decision · ?=open question · !=milestone · +=🛠️ skill (reusable how-to/gotcha; always resurfaces, never ages out) · ✓=resolve+archive the best-matching card · ~=update the matching card in place. Default: decision.'),
     area: z.string().optional().describe('Area/topic — routes the card into that titled container and becomes a #tag (e.g. "Auth", "Release").'),
     closes: z.string().optional().describe('Title or [[wikilink]] of a strategy/question card this note fulfils — resolves+archives it and draws a "closed by" arrow.'),
+    guard: z.object({
+      when: z.object({
+        tool: z.string().max(200).optional().describe('Regex matched against the tool name (e.g. "Bash", "Edit|Write").'),
+        command: z.string().max(200).optional().describe('Regex matched against the command string, for shell tools (e.g. "\\\\bgit\\\\s+stash\\\\b").'),
+        paths: z.array(z.string().max(200)).max(20).optional().describe('Path PREFIXES (forward-slash, project-relative) — the guard fires when the session\'s touched files match one. Prefixes, not regexes.'),
+        multiWorktree: z.literal(true).optional().describe('Fire only when the repo has more than one git worktree (evaluated from a cached count).'),
+      }).describe('When to interrupt — triggers are AND-ed; at least one required.'),
+      severity: z.enum(['warn', 'block']).optional().describe("warn (default) injects the message as context and the call proceeds; block DENIES the tool call with the message. 'block' is for irreversible actions and HUMAN-DIRECTED authoring only — never author block without explicit user instruction."),
+      message: z.string().max(500).describe('What the interrupted session reads — say the trap and the safe alternative.'),
+    }).optional().describe("GUARD CARDS: make this '+' skill fire BEFORE a matching tool call runs (Claude Code PreToolUse; advisory on other hosts), not just resurface in briefs. The card stays a normal 🛠️ rule — ✓-resolving it retires the guard."),
     canvas: z.string().optional().describe('Brain canvas filename/path. Defaults to the project brain ("brain").'),
   },
-}, async ({ text, marker, area, closes, canvas }, extra) => {
+}, async ({ text, marker, area, closes, guard, canvas }, extra) => {
   // Both 1.77 and 1.78 ride this call: the enrichment question (the asker's
   // vocabulary for retrieval) AND the per-session capture receipt below.
-  const result = await opBrainNote({ vault: mcpPresence.vault, canvas: boundBrainCanvas(canvas), text, area, marker: marker || '', closes, via: extra.klypixClientName, enrichmentQuestion: mcpPresence.declaredIntent });
+  const result = await opBrainNote({ vault: mcpPresence.vault, canvas: boundBrainCanvas(canvas), text, area, marker: marker || '', closes, guard, via: extra.klypixClientName, enrichmentQuestion: mcpPresence.declaredIntent });
   // Per-session capture receipt — this is what stops the uncaptured-work nudge
   // from firing at a session that DID record its reasoning, just through MCP
   // rather than a 🧠 marker. The Stop hook and this server share one session-id
@@ -1019,7 +1029,7 @@ server.registerTool('brain_sync', {
 
 server.registerTool('brain_doctor', {
   title: 'Brain doctor — is this brain current, wired, and in sync?',
-  description: 'Read-only self-check of the installed klypix brain, as ONE verdict: VERSION (deployed brain-core + optional npm currency), CLAUDE (existing 4-hook capture readiness), CODEX (automatic MCP presence plus optional enhanced-hook status), TOOLS (discoverable MCP verbs), SESSIONS (all active presence-adapter sessions across hosts, never recent-chat history), and HARNESS (projection drift). Use to answer "is my brain current, correctly installed, in sync, and who is actually live?" without file-spelunking. Never writes. SCOPE: only CLAUDE and CODEX get behavioural verdicts. HARNESS classifies the projected config/rules FILES on disk — a project can read fully ok while no other host has ever actually loaded them, so do not report a clean HARNESS as "Cursor/Cline/Windsurf/Copilot is working". The MCP-callable twin of `npx klypix-mcp doctor`.',
+  description: 'Read-only self-check of the installed klypix brain, as ONE verdict: VERSION (deployed brain-core + optional npm currency), CLAUDE (existing 5-hook capture readiness), CODEX (automatic MCP presence plus optional enhanced-hook status), TOOLS (discoverable MCP verbs), SESSIONS (all active presence-adapter sessions across hosts, never recent-chat history), and HARNESS (projection drift). Use to answer "is my brain current, correctly installed, in sync, and who is actually live?" without file-spelunking. Never writes. SCOPE: only CLAUDE and CODEX get behavioural verdicts. HARNESS classifies the projected config/rules FILES on disk — a project can read fully ok while no other host has ever actually loaded them, so do not report a clean HARNESS as "Cursor/Cline/Windsurf/Copilot is working". The MCP-callable twin of `npx klypix-mcp doctor`.',
   inputSchema: {
     project: z.string().optional().describe('Project dir to audit harness + peers for. Defaults to the server\'s working directory.'),
     check_npm: z.boolean().optional().describe('Also fetch npm latest to flag a stale brain (default false — this one does a network `npm view`).'),

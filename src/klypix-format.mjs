@@ -10,6 +10,7 @@ import JSZip from 'jszip';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
+import crypto from 'crypto';
 import { execFileSync } from 'child_process';
 import { generateKeyBetween } from 'fractional-indexing';
 
@@ -381,6 +382,9 @@ export async function parseKlypix(buffer) {
             // else parsed from prose so non-hook-authored cards count too.
             verify: (typeof it.verify === 'string' && it.verify.trim()) ? it.verify.trim()
                 : (it.type === 'text' ? parseVerifySuffix(it.content) : null),
+            // Guard trigger (guard cards, 2026-08-24) — additive machine field;
+            // exposed so compileGuards can read it off the parsed struct.
+            ...(it.guard && typeof it.guard === 'object' ? { guard: it.guard } : {}),
             // Machine death-date (epoch ms) written by the gardener at
             // consolidation — the prose "⤵ consolidated" stamp's reliable twin,
             // so as_of time-travel never depends on parsing prose.
@@ -613,6 +617,7 @@ export async function appendToKlypix(buffer, addition) {
         zip.file(`items/${shard(a.id)}/${a.id}.json`, JSON.stringify({
             type: 'text', locked: false, createdAt: now, createdBy: 'agent', ...authorField(),
             ...(a.card.createdVia ? { createdVia: String(a.card.createdVia) } : {}),
+            ...(a.card.guard && typeof a.card.guard === 'object' ? { guard: a.card.guard } : {}),
             content: String(a.card.text), fontSize: FONT,
             color: a.card.color || '#1a1a1f', border: !!a.card.border, borderColor: '#1e1e2e',
             heading: !!a.card.heading, fontFamily: 'Thmanyah Sans',
@@ -793,6 +798,8 @@ export async function appendIntoContainers(buffer, addition) {
             ...(Array.isArray(card.evidence) && card.evidence.length ? { evidence: card.evidence } : {}),
             // Live-probe command for a fast-decay claim — additive, ignored by older readers.
             ...(typeof card.verify === 'string' && card.verify.trim() ? { verify: card.verify.trim() } : {}),
+            // Guard trigger — additive, ignored by older readers (guard cards).
+            ...(card.guard && typeof card.guard === 'object' ? { guard: card.guard } : {}),
             content: wrapped, fontSize: G.FONT,
             color: card.color || '#e8e8ed', border: true, borderColor: card.borderColor || card.color || 'rgba(16,185,129,0.45)',
             fillColor: 'rgba(18,18,26,0.85)', heading: !!card.heading, fontFamily: 'Thmanyah Sans',
@@ -4190,13 +4197,14 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                     // verifiedAt), so confirming/correcting a drifted fact marks it ✅.
                     if (Array.isArray(u.evidence) && u.evidence.length) j.evidence = u.evidence;
                     if (typeof u.verify === 'string' && u.verify.trim()) j.verify = u.verify.trim();
+                    if (u.guard && typeof u.guard === 'object') j.guard = u.guard;
                 });
                 best.text = isTerseConfirm ? `${best.text}\n(re-affirmed ${today}: ${u.text})` : u.text;
                 stats.updated++;
             } else if (!nearDupExists(u.text)) {
                 // ~ fallback add is guarded like ✓'s: an unmatched ~ re-harvested
                 // from the transcript tail must not stack a copy every turn.
-                cards.push({ text: (u.area ? `${u.area}: ` : '') + u.text + (u.area ? `\n#${u.area.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : ''), area: u.area, createdVia: u.createdVia, ...(Array.isArray(u.evidence) && u.evidence.length ? { evidence: u.evidence } : {}), ...(typeof u.verify === 'string' && u.verify.trim() ? { verify: u.verify.trim() } : {}) });
+                cards.push({ text: (u.area ? `${u.area}: ` : '') + u.text + (u.area ? `\n#${u.area.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : ''), area: u.area, createdVia: u.createdVia, ...(Array.isArray(u.evidence) && u.evidence.length ? { evidence: u.evidence } : {}), ...(typeof u.verify === 'string' && u.verify.trim() ? { verify: u.verify.trim() } : {}), ...(u.guard && typeof u.guard === 'object' ? { guard: u.guard } : {}) });
             }
         }
 
@@ -4222,6 +4230,7 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                     if (card.createdVia) j.createdVia = String(card.createdVia);
                     if (Array.isArray(card.evidence) && card.evidence.length) j.evidence = card.evidence;
                     if (typeof card.verify === 'string' && card.verify.trim()) j.verify = card.verify.trim();
+                    if (card.guard && typeof card.guard === 'object') j.guard = card.guard;
                 });
                 best.text = String(card.text);
                 cards.splice(i, 1);
@@ -5530,17 +5539,158 @@ export function findOverdueOpenCards(struct, { now = Date.now() } = {}) {
 // (milestone) | '✓' (resolve+archive a match) | '~' (update a match in place) |
 // '+' (skill — a REUSABLE how-to/gotcha/procedure, standing reference that always
 // surfaces and never ages out, distinct from a point-in-time decision).
-export function noteToCaptureInput({ text = '', area = '', marker = '', closes = '', evidence = null, verify = null, createdVia = 'mcp' } = {}) {
+// ── Guard cards (2026-08-24, founder go after the 13-agent audit) ────────────
+// A guard is a standing 🛠️ card that also declares WHEN it should interrupt a
+// tool call: { when: {tool?, command?, paths?, multiWorktree?}, severity, message }.
+// The card's prose is the human render; this structured field is the machine
+// half. Everything here is PURE — validation, compilation from a parsed
+// struct, and evaluation against one tool event — so the PreToolUse hook can
+// stay a stat+sidecar+regex fast path (never parses the brain, never spawns
+// git; measured brain parse is ~1s on the live brain, far over any hook budget).
+//
+// Trigger grammar is DELIBERATELY the honest expressible surface only
+// (audit §5): tool/command regexes, path PREFIXES, and one cached repo
+// predicate (multiWorktree). Staleness detection, response-shape checks and
+// semantic intent are NOT expressible here and must not be pretended in.
+//
+// Severity contract: 'warn' injects context; 'block' denies the call with the
+// card's message. Authoring 'block' is a deliberate human-directed act — an
+// agent must never author severity 'block' without explicit user instruction
+// (the deny names the card id, so a wrong block is corrected by ✓-resolving
+// or ~-amending that card).
+const GUARD_RE_MAX = 200;
+const GUARD_MSG_MAX = 500;
+const GUARD_PATHS_MAX = 20;
+// ONE keying rule for the compiled-guard sidecar, shared by every consumer
+// (the Claude --guard fast path, the Codex advisory lane, tests). The formula
+// mirrors global-brain-hook.mjs's cache keying (sha1-16 of the normalized
+// brain path) — test/guard-cards.mjs asserts the two derivations agree.
+export function guardSidecarPathFor(brainPath, home = os.homedir()) {
+    const norm = String(brainPath).replace(/\\/g, '/').replace(/^[a-zA-Z]:/, (m) => m.toLowerCase());
+    const key = crypto.createHash('sha1').update(norm).digest('hex').slice(0, 16);
+    return path.join(home, '.claude', 'project-brain', `.guards-${key}.json`);
+}
+const compileGuardRegex = (source) => {
+    const s = String(source || '').trim();
+    if (!s || s.length > GUARD_RE_MAX) return null;
+    try { return new RegExp(s, 'i'); } catch { return null; }
+};
+export function validateGuard(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        return { ok: false, reason: 'guard must be an object: { when: {…}, severity?, message }' };
+    }
+    const when = value.when;
+    if (!when || typeof when !== 'object' || Array.isArray(when)) {
+        return { ok: false, reason: 'guard.when must be an object with at least one trigger (tool, command, paths, multiWorktree)' };
+    }
+    const out = { when: {}, severity: 'warn', message: '' };
+    if (when.tool !== undefined) {
+        if (typeof when.tool !== 'string' || !compileGuardRegex(when.tool)) {
+            return { ok: false, reason: `guard.when.tool must be a valid regex source string (≤${GUARD_RE_MAX} chars)` };
+        }
+        out.when.tool = when.tool.trim();
+    }
+    if (when.command !== undefined) {
+        if (typeof when.command !== 'string' || !compileGuardRegex(when.command)) {
+            return { ok: false, reason: `guard.when.command must be a valid regex source string (≤${GUARD_RE_MAX} chars)` };
+        }
+        out.when.command = when.command.trim();
+    }
+    if (when.paths !== undefined) {
+        if (!Array.isArray(when.paths) || !when.paths.length || when.paths.length > GUARD_PATHS_MAX
+            || !when.paths.every((p) => typeof p === 'string' && p.trim() && p.length <= GUARD_RE_MAX)) {
+            return { ok: false, reason: `guard.when.paths must be 1–${GUARD_PATHS_MAX} non-empty path-prefix strings (≤${GUARD_RE_MAX} chars each) — prefixes, not regexes` };
+        }
+        out.when.paths = when.paths.map((p) => p.trim().replace(/\\/g, '/'));
+    }
+    if (when.multiWorktree !== undefined) {
+        if (when.multiWorktree !== true) return { ok: false, reason: 'guard.when.multiWorktree accepts only true (omit it otherwise)' };
+        out.when.multiWorktree = true;
+    }
+    if (!Object.keys(out.when).length) {
+        return { ok: false, reason: 'guard.when needs at least one trigger: tool, command, paths, or multiWorktree' };
+    }
+    if (value.severity !== undefined && value.severity !== 'warn' && value.severity !== 'block') {
+        return { ok: false, reason: "guard.severity must be 'warn' or 'block' (default warn). 'block' is for irreversible actions and human-directed authoring only" };
+    }
+    if (value.severity === 'block') out.severity = 'block';
+    const msg = String(value.message || '').trim();
+    if (!msg || msg.length > GUARD_MSG_MAX) {
+        return { ok: false, reason: `guard.message is required (≤${GUARD_MSG_MAX} chars) — it is what the interrupted session reads` };
+    }
+    out.message = msg;
+    return { ok: true, guard: out };
+}
+// Live cards carrying a VALID guard field → the compiled list the sidecar
+// stores. Invalid guards are skipped (they still exist as prose cards); a
+// resolved/superseded/archived card stops guarding without any extra step.
+export function compileGuards(struct) {
+    if (!struct || !Array.isArray(struct.cards)) return [];
+    const out = [];
+    for (const c of struct.cards) {
+        if (c.type === 'container' || !c.guard) continue;
+        if (/^archive$/i.test(c.area || '')) continue;
+        if (/↩|✅|⤵/.test(c.text || '')) continue;          // resolved/superseded/consolidated
+        const v = validateGuard(c.guard);
+        if (!v.ok) continue;
+        out.push({ id: c.id, area: c.area || null, title: c.title || null, ...v.guard });
+    }
+    return out;
+}
+// Evaluate compiled guards against ONE tool event. Pure; every regex test is
+// try/caught and inputs are sliced so a hostile pattern or a huge command can
+// never hang the hook. Verdict per guard:
+//   fired:false                        — a verifiable trigger said no
+//   fired:true, unverified:[]          — fire at the declared severity
+//   fired:true, unverified:['paths']   — verifiable triggers passed but an
+//     input was unavailable. Per the 2026-08-18 field rule ("a probe that
+//     fails must refuse, never exempt") this NEVER silently exempts — but a
+//     deny on unverified input would false-block, so the caller degrades
+//     block→warn and SAYS what could not be verified.
+export function evaluateGuards(guards, { toolName = '', command = '', files = null, worktreeCount = null } = {}) {
+    const results = [];
+    const cmd = String(command || '').slice(0, 4096);
+    const tool = String(toolName || '').slice(0, 200);
+    for (const g of Array.isArray(guards) ? guards : []) {
+        try {
+            const unverified = [];
+            let fired = true;
+            if (g.when.tool) {
+                const re = compileGuardRegex(g.when.tool);
+                if (!re || !re.test(tool)) fired = false;
+            }
+            if (fired && g.when.command) {
+                const re = compileGuardRegex(g.when.command);
+                if (!re || !re.test(cmd)) fired = false;
+            }
+            if (fired && g.when.paths) {
+                if (!Array.isArray(files)) unverified.push('paths');
+                else if (!files.some((f) => {
+                    const file = String(f || '').replace(/\\/g, '/').toLowerCase();
+                    return g.when.paths.some((p) => file.startsWith(p.toLowerCase()));
+                })) fired = false;
+            }
+            if (fired && g.when.multiWorktree) {
+                if (!Number.isFinite(worktreeCount)) unverified.push('worktreeCount');
+                else if (worktreeCount <= 1) fired = false;
+            }
+            if (fired) results.push({ guard: g, unverified });
+        } catch { /* one bad guard never breaks the rest */ }
+    }
+    return results;
+}
+
+export function noteToCaptureInput({ text = '', area = '', marker = '', closes = '', evidence = null, verify = null, guard = null, createdVia = 'mcp' } = {}) {
     const body = String(text).trim();
     if (!body) return { cards: [], resolutions: [], updates: [] };
     const a = String(area || '').trim();
     if (marker === '✓') return { cards: [], resolutions: [{ area: a, text: body }], updates: [] };
-    if (marker === '~') return { cards: [], resolutions: [], updates: [{ area: a, text: body, createdVia, ...(evidence ? { evidence } : {}), ...(verify ? { verify } : {}) }] };
+    if (marker === '~') return { cards: [], resolutions: [], updates: [{ area: a, text: body, createdVia, ...(evidence ? { evidence } : {}), ...(verify ? { verify } : {}), ...(guard ? { guard } : {}) }] };
     const prefix = marker === '?' ? '❓ ' : marker === '!' ? '🏁 ' : marker === '+' ? '🛠️ ' : '';
     const borderColor = marker === '?' ? 'rgba(245,166,35,0.8)' : marker === '!' ? 'rgba(59,130,246,0.8)' : marker === '+' ? 'rgba(139,92,246,0.85)' : 'rgba(16,185,129,0.6)';
     const tag = a ? `\n#${a.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : '';
     const cardText = (a ? `${a}: ${prefix}${body}` : `${prefix}${body}`) + tag;
-    return { cards: [{ text: cardText, area: a, color: '#e8e8ed', borderColor, createdVia, ...(closes ? { closes } : {}), ...(evidence ? { evidence } : {}), ...(verify ? { verify } : {}) }], resolutions: [], updates: [] };
+    return { cards: [{ text: cardText, area: a, color: '#e8e8ed', borderColor, createdVia, ...(closes ? { closes } : {}), ...(evidence ? { evidence } : {}), ...(verify ? { verify } : {}), ...(guard ? { guard } : {}) }], resolutions: [], updates: [] };
 }
 
 /**
@@ -5624,6 +5774,8 @@ export async function buildKlypixMap(spec) {
             const h = measured[ci];
             items[id] = {
                 type: 'text', locked: false, createdAt: now, createdBy: 'agent', ...authorField(),
+                // Guard trigger — additive machine field (guard cards, 2026-08-24).
+                ...(c.guard && typeof c.guard === 'object' ? { guard: c.guard } : {}),
                 content: String(c.text), fontSize: FONT,
                 color: c.color || '#e8e8ed', border: true,
                 borderColor: c.color || 'rgba(16,185,129,0.35)',

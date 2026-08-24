@@ -68,7 +68,7 @@ const readText = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch { ret
 const cmpSemver = (a, b) => { const pa = String(a || '').split('.').map(n => parseInt(n, 10) || 0), pb = String(b || '').split('.').map(n => parseInt(n, 10) || 0); for (let i = 0; i < 3; i++) { if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) - (pb[i] || 0); } return 0; };
 
 const HOOK_MARK = 'global-brain-hook';
-const HOOK_EVENTS = ['SessionStart', 'UserPromptSubmit', 'Stop', 'PostToolUse'];
+const HOOK_EVENTS = ['SessionStart', 'UserPromptSubmit', 'Stop', 'PostToolUse', 'PreToolUse'];
 // Liveness windows imported from the canonical rule; literals are the LAST
 // RESORT for a bundle whose agent-presence predates the exports.
 const SESSION_FRESH_MS = Number(presenceLib?.SESSION_FRESH_MS) > 0
@@ -768,7 +768,7 @@ export function render(r, opts = {}) {
   const hmark = r.layers.hooks === 'ok' ? ok : warn;
   if (!r.hooks.settingsPresent) L.push(`${hmark} ${c.bold}CLAUDE${c.rst}   no ~/.claude/settings.json found`);
   else if (r.hooks.missing.length) L.push(`${hmark} ${c.bold}CLAUDE${c.rst}   half-wired — missing: ${c.yel}${r.hooks.missing.join(', ')}${c.rst}  ${c.dim}(liveness up, readiness no)${c.rst}`);
-  else L.push(`${hmark} ${c.bold}CLAUDE${c.rst}   existing 4-hook capture path intact: ${r.hooks.wired.join(', ')}`);
+  else L.push(`${hmark} ${c.bold}CLAUDE${c.rst}   existing 5-hook capture path intact: ${r.hooks.wired.join(', ')}`);
   const chmark = r.layers.codexHooks === 'warning' ? warn : ok;
   const smart = r.codexSmart?.globalInstructions
     ? 'approval-free Context Gateway active (task memory + clean peers + proactive/guaranteed alerts)'

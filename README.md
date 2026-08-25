@@ -16,6 +16,15 @@ Klypix does not launch, run, supervise, or replace your agents. It is not an age
 router, a worktree manager, or a replacement for Git. It is the layer underneath them that holds
 what the project currently believes.
 
+## See the shared project brain in action
+
+[![Watch the 2 minute 21 second KLYPIX Brain product walkthrough](https://raw.githubusercontent.com/dahshanlabs/klypix-mcp/master/docs/assets/klypix-brain-showcase-readme.jpg)](https://klypix.com/developers#demo)
+
+Watch how current decisions, corrections, evidence, and active work stay visible to people and
+carry forward into supported coding-agent sessions.
+
+**[Watch the 2:21 showcase with sound](https://klypix.com/developers#demo)**
+
 ---
 
 ## The problem
@@ -93,10 +102,10 @@ Run this **inside your project**:
 npx klypix-mcp install
 ```
 
-One command, every editor. It finds the project root (walking up, so running it from `src/` is
-fine), gives the project a brain if it doesn't have one, wires the agent tools you actually have
-installed, registers the lossless `.klypix` merge driver if it's a git repo, and then **proves the
-result** before it exits:
+One command for supported editors detected on this machine. It finds the project root (walking up,
+so running it from `src/` is fine), gives the project a brain if it doesn't have one, wires the
+agent tools you actually have installed, registers the lossless `.klypix` merge driver if it's a
+git repo, and then **proves the result** before it exits:
 
 ```text
   project   E:\work\api  (git repository root)
@@ -114,7 +123,7 @@ broken entry dies in ~100ms with `Connection closed` and is reported, not shippe
 
 What goes where:
 
-- **Machine-global, once** — the engine + runtime in `~/.claude/project-brain`, Claude Code's four
+- **Machine-global, once** — the engine + runtime in `~/.claude/project-brain`, Claude Code's five
   lifecycle hooks in `~/.claude/settings.json`, and the `~/.codex/AGENTS.md` guidance block. Claude
   Code is therefore covered in every project on that machine that has a `./brain.klypix`.
 - **Per project** — MCP config and rules for Cursor, Codex, Cline, Windsurf, Copilot, Gemini CLI /
@@ -269,7 +278,7 @@ behaviour is unverified.
 
 | Host | Level | Wired by | Brief into context | Decision capture | Live presence |
 |---|---|---|---|---|---|
-| **Claude Code** | Full automatic (4 lifecycle hooks) | `install` | Automatic at session start, task-ranked retrieval per prompt | **Automatic** at turn end | Yes |
+| **Claude Code** | Full automatic (5 lifecycle hooks) | `install` | Automatic at session start, task-ranked retrieval per prompt | **Automatic** at turn end | Yes |
 | **Codex** | Native MCP + presence + Context Gateway; optional `--codex-hooks` | `install` | Via `brain_sync`; per-prompt injection only with `--codex-hooks` | **Explicit only** (`brain_note`) — never automatic | Yes |
 | **Cursor** | MCP config + always-on rules file | `link` | Model must call `brain_sync` | Model must call `brain_note` | For the MCP connection |
 | **Cline** | MCP config + always-on rules file | `link` | Model must call `brain_sync` | Model must call `brain_note` | For the MCP connection |
@@ -279,9 +288,10 @@ behaviour is unverified.
 | **Aider** | Rules file only (no MCP) | `link` | CLI path: `npx klypix-read` | CLI path: `npx klypix-append` | — |
 | **Claude Desktop** | One-time manual config edit | you | Model must call `brain_sync` | Model must call `brain_note` | For the MCP connection |
 
-`install` and `link` are different things and are not interchangeable: `install` only touches Claude
-Code and Codex, and is machine-global for everything except Codex's MCP connection, which it writes
-per project (see *Quick start*); `link` is per project and is what wires everything else.
+`install` and `link` are different things and are not interchangeable: `install` sets up the
+machine engine and hooks, then wires supported hosts detected for this project (see *Quick start*).
+`link` is the explicit per-project repair/projection path for all 14 managed files, regardless of
+which hosts are installed.
 
 **Claude Desktop** — add this to `claude_desktop_config.json` by hand; nothing writes that file
 for you:
@@ -301,8 +311,8 @@ for you:
 
 ## Task briefing
 
-Every Claude Code session starts already knowing the project: a bounded ~5KB brief in context, with
-the full brief written to disk for when broad history or status work needs it.
+Every Claude Code session starts already knowing the project: a bounded brief of at most 2KB in
+context, with the full brief written to disk for when broad history or status work needs it.
 
 Every other host gets a bounded ~2.8KB task capsule from one `brain_sync` call, plus a compact
 always-loaded `AGENTS.md` block that tells the agent to make that call at task start, when scope
@@ -323,8 +333,8 @@ dedup, supersession, round-trip re-adoption receipts, `✓` resolve, `~` update 
 `closes:` — and stamps which agent wrote the card. A `✓` question preference ranks only candidates
 that already clear raw lexical overlap and two subject-identity anchors; generic lifecycle wording
 cannot turn weak overlap into a closure.
-(If you install the git commit hook from the KLYPIX app, commit messages also capture automatically,
-for any agent. That hook has no CLI installer.)
+(If you install the git commit hook from the KLYPIX app or run `npx klypix-mcp git-hook install`,
+commit messages also capture automatically for any agent.)
 
 `brain_challenge` is the other direction: propose a decision and the brain answers with receipts —
 prior decisions that deterministically contradict it, standing rules that dispute it, and
@@ -525,7 +535,7 @@ The MCP verbs below are what agents call. These are what **you** call:
 
 ---
 
-## The 26 verbs
+## The 22 verbs
 
 | Tool | What it does |
 |---|---|
@@ -552,7 +562,7 @@ The MCP verbs below are what agents call. These are what **you** call:
 | `add_to_canvas` | Append cards/connections (positions preserved) |
 | `list_canvases` | List every `.klypix` in the vault |
 
-Exactly 26, machine-verifiable with `npx klypix-mcp doctor`.
+Exactly 22, machine-verifiable with `npx klypix-mcp doctor`.
 
 > **`canvas_view`:** no MCP Apps host has been observed rendering the UI resource yet — there is no
 > screenshot and no host-level test. Hosts without the extension get clean text, which is the path
@@ -757,7 +767,7 @@ Your `brain.klypix` is yours — it is a plain ZIP and stays readable with or wi
 Issues and pull requests: [github.com/dahshanlabs/klypix-mcp](https://github.com/dahshanlabs/klypix-mcp).
 Questions or feedback: [hello@klypix.com](mailto:hello@klypix.com).
 
-The repository carries 68 test files: 62 listed directly in `scripts.test`, plus the
+The repository carries 89 test files: 83 listed directly in `scripts.test`, plus the
 `pretest` workflow gate. Together they cover the presence
 lane and its cross-machine relay, the Context Gateway, supervisor hot-swap, auto-update, retrieval
 quality, decay, challenge, lenses, the format guard, the git tools (including a real `git merge`

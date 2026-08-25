@@ -1,6 +1,6 @@
 {
   "name": "klypix-mcp",
-  "version": "1.81.0",
+  "version": "1.81.1",
   "description": "Active state management for multi-agent coding: a shared, versioned project brain over MCP.",
   "type": "module",
   "license": "Apache-2.0",

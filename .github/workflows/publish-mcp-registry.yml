@@ -84,14 +84,14 @@ jobs:
           VERSION: ${{ steps.v.outputs.version }}
         run: |
           set -euo pipefail
-          for i in $(seq 1 30); do
+          for i in $(seq 1 45); do
             MARKER="$(curl -sSL --max-time 20 \
               "https://registry.npmjs.org/klypix-mcp/${VERSION}" 2>/dev/null \
               | jq -r '.mcpName // empty')"
             if [ "$MARKER" = "io.github.dahshanlabs/klypix-mcp" ]; then
               echo "npm carries mcpName for ${VERSION}"; exit 0
             fi
-            echo "npm not ready (attempt $i) — waiting"; sleep 10
+            echo "npm not ready (attempt $i) — waiting"; sleep 20
           done
           echo "::error::klypix-mcp@${VERSION} is not on npm with mcpName. The npm publish gate must go green first; re-run this workflow afterwards."
           exit 1

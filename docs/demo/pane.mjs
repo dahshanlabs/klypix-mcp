@@ -39,7 +39,7 @@ const out = (s = '') => process.stdout.write(s + '\n');
 // Word-wrap to a fixed width so lines printed before a tmux split are not
 // clipped when the pane narrows (tmux does not rewrap existing rows). Layout
 // only — the characters are untouched.
-const WRAP = Number(arg('wrap', '106'));
+const WRAP = Number(arg('wrap', '78'));
 function wrapLine(line) {
   if (line.length <= WRAP) return [line];
   const outLines = [];

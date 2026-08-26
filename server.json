@@ -13,6 +13,7 @@
   "packages": [
     {
       "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "klypix-mcp",
       "version": "1.81.1",
       "runtimeHint": "npx",
@@ -23,10 +24,20 @@
         {
           "type": "named",
           "name": "--vault",
-          "description": "Absolute path to the folder holding your .klypix canvases. Defaults to the current project.",
+          "description": "Folder holding your .klypix canvases. Omit it and the server serves the project root you pass to brain_sync.",
           "format": "filepath",
           "isRequired": false,
+          "isRepeated": false,
           "placeholder": "/absolute/path/to/canvases"
+        }
+      ],
+      "environmentVariables": [
+        {
+          "name": "KLYPIX_VAULT",
+          "description": "Alternative to --vault: absolute path to the folder holding your .klypix canvases. The --vault argument takes precedence.",
+          "format": "filepath",
+          "isRequired": false,
+          "isSecret": false
         }
       ]
     }

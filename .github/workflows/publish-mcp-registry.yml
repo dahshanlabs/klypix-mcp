@@ -1,0 +1,127 @@
+name: Publish to MCP Registry
+
+# Registers this server in the official MCP Registry
+# (registry.modelcontextprotocol.io) after each npm release, so PulseMCP, the
+# VS Code MCP gallery, and every other registry-backed surface pick it up
+# automatically. One publish cascades.
+#
+# DELIBERATELY A SEPARATE FILE from publish.yml — test/publish-workflow.mjs
+# (the pretest gate) slices publish.yml from its `publish:` job to end-of-file
+# and asserts that block contains exactly 2 SHA-pinned action refs. Any job
+# appended there turns `npm test` red. This file also keeps publish.yml's
+# permission split intact: the npm OIDC grant and the MCP-registry OIDC grant
+# never share a job.
+#
+# The registry's npm validator fetches https://registry.npmjs.org/<pkg>/<ver>
+# and requires that version's metadata to carry `mcpName` equal to our server
+# name. So this workflow WAITS for npm to serve the released version before
+# publishing, and fails cleanly if the npm publish never landed (a red gate in
+# publish.yml means this job times out at the wait step — nothing is
+# half-registered).
+#
+# TRIGGER SAFETY: `release: published` + `workflow_dispatch` only — never
+# pull_request / pull_request_target. The OIDC token minted here is scoped to
+# the MCP registry (audience: registry.modelcontextprotocol.io), not npm, but
+# it can overwrite every server under io.github.dahshanlabs/* — fork code must
+# never reach it.
+#
+# mcp-publisher is installed from /releases/latest deliberately, not pinned:
+# the CLI derives its OIDC audience from the registry deployment, and a stale
+# binary fails with `invalid audience` when the registry moves. A failure here
+# is loud and retryable via workflow_dispatch; a silently-pinned stale binary
+# would fail every release until someone re-read this file.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  registry:
+    name: Publish server.json to the official MCP Registry
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      id-token: write   # mints the OIDC token the MCP registry exchanges
+      contents: read    # checkout only
+    steps:
+      - name: Assert the trigger is release-only
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" != "release" ] && [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+            echo "::error::Unexpected trigger '${{ github.event_name }}' — refusing to mint an OIDC token."
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Resolve the version from package.json
+        id: v
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Pin server.json to the released version
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          set -euo pipefail
+          jq --arg v "$VERSION" '.version = $v | .packages[0].version = $v' \
+            server.json > server.tmp && mv server.tmp server.json
+          jq -e --arg n "$(node -p "require('./package.json').mcpName")" \
+            'select(.name == $n)' server.json > /dev/null \
+            || { echo "::error::server.json name != package.json mcpName"; exit 1; }
+
+      - name: Wait for npm to carry the ownership marker
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            MARKER="$(curl -sSL --max-time 20 \
+              "https://registry.npmjs.org/klypix-mcp/${VERSION}" 2>/dev/null \
+              | jq -r '.mcpName // empty')"
+            if [ "$MARKER" = "io.github.dahshanlabs/klypix-mcp" ]; then
+              echo "npm carries mcpName for ${VERSION}"; exit 0
+            fi
+            echo "npm not ready (attempt $i) — waiting"; sleep 10
+          done
+          echo "::error::klypix-mcp@${VERSION} is not on npm with mcpName. The npm publish gate must go green first; re-run this workflow afterwards."
+          exit 1
+
+      - name: Install mcp-publisher
+        run: |
+          set -euo pipefail
+          curl -sSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz" \
+            | tar xz mcp-publisher
+          ./mcp-publisher --version
+
+      - name: Authenticate (GitHub OIDC — no secret to leak or rotate)
+        run: ./mcp-publisher login github-oidc
+
+      - name: Validate then publish
+        run: |
+          set -euo pipefail
+          ./mcp-publisher validate
+          ./mcp-publisher publish
+
+      - name: Verify a stranger can see it
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          set -euo pipefail
+          FOUND="$(curl -sSL --max-time 20 \
+            "https://registry.modelcontextprotocol.io/v0/servers?search=io.github.dahshanlabs/klypix-mcp" \
+            | jq -r '.servers[0].server.version // empty')"
+          if [ "$FOUND" = "$VERSION" ]; then
+            echo "registry serves io.github.dahshanlabs/klypix-mcp@${VERSION}"
+          else
+            echo "::warning::Registry search does not yet return ${VERSION} (got '${FOUND}') — indexing may lag; check manually."
+          fi

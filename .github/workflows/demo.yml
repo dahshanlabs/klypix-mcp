@@ -1,0 +1,69 @@
+name: Render README demo GIF
+
+# Renders docs/demo/demo.gif from docs/demo/demo.tape with VHS — a scripted,
+# reproducible recording of the REAL server: two MCP sessions in a tmux split,
+# the second one receiving the genuine file-overlap warning, then a correction
+# captured through brain_note. No hand-recording, no staged output; re-render
+# any time the product's real responses change.
+#
+# Manual trigger only. The GIF is uploaded as an artifact — download it, look
+# at it, and commit it deliberately. This job never writes to the repository:
+# permissions are read-only, so a bad render can be thrown away, not reverted.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  render:
+    name: Render demo.gif (VHS · ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24.13.1'
+          package-manager-cache: false
+
+      - name: Install (npm ci — lockfile enforced)
+        run: npm ci
+
+      - name: Install tmux
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq tmux
+
+      - name: Seed the fictional demo repository
+        run: node docs/demo/setup.mjs
+
+      - name: Render with VHS
+        uses: charmbracelet/vhs-action@f6d7db07a432fcd3b06772628d36a57f96d95dcf # v2
+        with:
+          path: docs/demo/demo.tape
+
+      - name: Assert the render is plausible
+        run: |
+          set -euo pipefail
+          SIZE=$(stat -c%s docs/demo/demo.gif)
+          echo "demo.gif: ${SIZE} bytes"
+          # A tape that crashed early renders a near-empty GIF; a runaway one
+          # bloats past what a README should carry. Both fail here, not in review.
+          [ "$SIZE" -gt 200000 ] || { echo "::error::demo.gif is suspiciously small — the tape likely crashed"; exit 1; }
+          [ "$SIZE" -lt 12000000 ] || { echo "::error::demo.gif exceeds 12MB — tighten the tape before shipping it"; exit 1; }
+
+      - name: Upload the GIF
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: demo-gif
+          path: docs/demo/demo.gif
+          retention-days: 14

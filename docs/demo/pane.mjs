@@ -99,7 +99,7 @@ if (note) {
   out('');
   const n = await call('brain_note', { project: demoRepo, text: note });
   render(n.split('\n').slice(0, 6).join('\n'));
-  out(paint('2', '  a correction supersedes its stale card — the next session inherits the fix'));
+  for (const l of wrapLine('  a correction supersedes its stale card — the next session inherits the fix')) out(paint('2', l));
 }
 
 if (has('hold')) {

@@ -1,0 +1,67 @@
+name: CI
+
+# Runs the full test suite on every push and pull request, so the CI badge in
+# README.md reflects the state of the DEFAULT BRANCH — not a release.
+#
+# Why this file exists: `publish.yml` only triggers on `release: published`, so its
+# runs attach to tag refs. A shields.io workflow-status badge pointed at it finds no
+# run on the default branch and renders "build: failing" even when every release run
+# succeeded. A badge is a claim; this workflow is what makes the claim true.
+#
+# The configuration deliberately mirrors publish.yml's `gate` job — same runner, same
+# pinned Node, same `npm ci` + `npm test` — because that combination is already proven
+# green on every release. Do not let the two drift.
+#
+# TRIGGER SAFETY: `push` + `pull_request` only. There is NO `pull_request_target`, and
+# there must never be one — publish.yml mints an npm OIDC token, and a fork PR must not
+# be able to reach a privileged context. This workflow holds `contents: read` and
+# nothing else; it can run untrusted fork code precisely because it can do nothing with it.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same ref supersedes an in-flight run. The default branch is
+# exempt so the badge always reflects a completed run rather than a cancelled one.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    name: Test suite (Node 24 · ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # fetch-depth 0 + tags: several suites (released-tag-guard, repo-state,
+      # version-currency) read real git history and tags. A shallow clone makes them
+      # fail for reasons that have nothing to do with the code under test.
+      - name: Checkout (full history + tags)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24.13.1'
+          package-manager-cache: false
+
+      - name: Install (npm ci — lockfile enforced)
+        run: npm ci
+
+      # `pretest` (test/publish-workflow.mjs) runs first automatically and lints the
+      # release workflow's shell blocks. `npm test` is the same 83-suite chain the
+      # release gate runs.
+      - name: npm test (full suite, conformance included)
+        run: npm test

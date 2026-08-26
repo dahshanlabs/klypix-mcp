@@ -1,0 +1,34 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.dahshanlabs/klypix-mcp",
+  "title": "KLYPIX Project Brain",
+  "description": "Active state management for multi-agent coding: a shared, versioned project brain over MCP.",
+  "version": "1.81.1",
+  "websiteUrl": "https://klypix.com",
+  "repository": {
+    "url": "https://github.com/dahshanlabs/klypix-mcp",
+    "source": "github",
+    "id": "1263204125"
+  },
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "klypix-mcp",
+      "version": "1.81.1",
+      "runtimeHint": "npx",
+      "transport": {
+        "type": "stdio"
+      },
+      "packageArguments": [
+        {
+          "type": "named",
+          "name": "--vault",
+          "description": "Absolute path to the folder holding your .klypix canvases. Defaults to the current project.",
+          "format": "filepath",
+          "isRequired": false,
+          "placeholder": "/absolute/path/to/canvases"
+        }
+      ]
+    }
+  ]
+}

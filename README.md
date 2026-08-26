@@ -3,6 +3,20 @@
 **Active state management for multi-agent coding — a local-first active context engine with a shared brain.**
 *One project. One shared understanding.*
 
+[![CI](https://img.shields.io/github/actions/workflow/status/dahshanlabs/klypix-mcp/ci.yml?branch=master&style=flat-square&label=CI)](https://github.com/dahshanlabs/klypix-mcp/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/klypix-mcp?style=flat-square)](https://www.npmjs.com/package/klypix-mcp)
+[![License](https://img.shields.io/github/license/dahshanlabs/klypix-mcp?style=flat-square)](LICENSE)
+[![Node](https://img.shields.io/node/v/klypix-mcp?style=flat-square)](package.json)
+[![MCP](https://img.shields.io/badge/MCP-server-blue?style=flat-square)](https://modelcontextprotocol.io)
+
+[![Claude Code](https://img.shields.io/badge/Claude_Code-automatic-10b981?style=flat-square)](#supported-hosts-and-their-integration-level)
+[![Codex](https://img.shields.io/badge/Codex-native_MCP-10b981?style=flat-square)](#supported-hosts-and-their-integration-level)
+[![Cursor](https://img.shields.io/badge/Cursor-MCP_%2B_rules-10b981?style=flat-square)](#supported-hosts-and-their-integration-level)
+[![Gemini CLI](https://img.shields.io/badge/Gemini_CLI-MCP_%2B_rules-10b981?style=flat-square)](#supported-hosts-and-their-integration-level)
+
+<sub>Host badges name the **integration level**, not a flat "compatible" — the levels and what is
+actually tested are in [Supported hosts](#supported-hosts-and-their-integration-level).</sub>
+
 **One actively managed project brain for multi-agent coding.** `klypix-mcp` keeps one versioned
 `brain.klypix` in your repo: the project's active state — current decisions, corrections, evidence
 anchors, open questions, active work, and handoffs. Corrections supersede stale decisions,

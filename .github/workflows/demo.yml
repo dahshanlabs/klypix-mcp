@@ -51,6 +51,16 @@ jobs:
         with:
           path: docs/demo/demo.tape
 
+      # A timelapse of real output is still real output; dead air is not
+      # content. The speed-up is disclosed in docs/demo/README.md.
+      - name: Play back at 1.4x
+        run: |
+          set -euo pipefail
+          ffmpeg -y -loglevel error -i docs/demo/demo.gif \
+            -filter_complex "[0:v]setpts=PTS/1.4,fps=15,split[a][b];[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=4" \
+            docs/demo/demo-fast.gif
+          mv docs/demo/demo-fast.gif docs/demo/demo.gif
+
       - name: Assert the render is plausible
         run: |
           set -euo pipefail

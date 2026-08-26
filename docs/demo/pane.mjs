@@ -36,11 +36,29 @@ const RESET = '\x1b[0m';
 const paint = (code, s) => `\x1b[${code}m${s}${RESET}`;
 const out = (s = '') => process.stdout.write(s + '\n');
 
+// Word-wrap to a fixed width so lines printed before a tmux split are not
+// clipped when the pane narrows (tmux does not rewrap existing rows). Layout
+// only — the characters are untouched.
+const WRAP = Number(arg('wrap', '106'));
+function wrapLine(line) {
+  if (line.length <= WRAP) return [line];
+  const outLines = [];
+  let rest = line;
+  while (rest.length > WRAP) {
+    let cut = rest.lastIndexOf(' ', WRAP);
+    if (cut < WRAP - 40) cut = WRAP; // no near space — hard cut
+    outLines.push(rest.slice(0, cut));
+    rest = '  ' + rest.slice(cut).trimStart();
+  }
+  outLines.push(rest);
+  return outLines;
+}
+
 // Colorize the server's brief by section, without altering a single character
 // of its content. Sections are recognised by their real headings.
 function render(text) {
   let mode = 'plain';
-  for (const line of text.split('\n')) {
+  for (const raw of text.split('\n')) for (const line of wrapLine(raw)) {
     if (/^KLYPIX exact file-overlap warning/.test(line)) { mode = 'overlap'; out(paint('1;31', line)); continue; }
     if (/^KLYPIX task presence/.test(line)) { mode = 'peers'; out(paint('1', line)); continue; }
     if (/^## Compact task context/.test(line)) { mode = 'context'; out(paint('1;32', line)); continue; }

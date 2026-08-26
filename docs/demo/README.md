@@ -44,7 +44,13 @@ alive with `--hold`) and the second one shows the real overlap warning.
 
 ## Timing in `demo.tape`
 
-Pane A starts immediately and holds; pane B starts at ~8s so A is a live,
-declared peer by then; A's correction fires at ~17s so it lands after B's
-overlap warning is on screen. Total ~28s. If you retune the pacing, keep
-B after A and the note after B.
+Session A opens full-width and declares its task; at ~6s the screen splits —
+the split itself is Session B arriving. B's overlap warning lands, then A's
+correction fires at ~15s so it lands after the warning is on screen. If you
+retune the pacing, keep B after A and the note after B.
+
+**Playback is sped up 1.4× by the workflow's ffmpeg step** — a timelapse of a
+real run, disclosed here on purpose: every frame is genuine output; only the
+dead air between server responses is compressed. The pane driver word-wraps
+its output at ~106 columns so lines printed before the split are not clipped
+when the pane narrows (tmux does not rewrap existing rows).

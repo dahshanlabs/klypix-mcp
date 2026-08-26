@@ -7,12 +7,13 @@
 [![npm](https://img.shields.io/npm/v/klypix-mcp?style=flat-square)](https://www.npmjs.com/package/klypix-mcp)
 [![License](https://img.shields.io/github/license/dahshanlabs/klypix-mcp?style=flat-square)](LICENSE)
 [![Node](https://img.shields.io/node/v/klypix-mcp?style=flat-square)](package.json)
-[![MCP](https://img.shields.io/badge/MCP-server-blue?style=flat-square)](https://modelcontextprotocol.io)
+[![MCP](https://img.shields.io/badge/MCP-server-475569?style=flat-square)](https://modelcontextprotocol.io)
+[![bench](https://img.shields.io/badge/npx_klypix--mcp_bench-10_writers_%C2%B7_0_lost-475569?style=flat-square)](BENCHMARKS.md)
 
-[![Claude Code](https://img.shields.io/badge/Claude_Code-automatic-10b981?style=flat-square)](#supported-hosts-and-their-integration-level)
-[![Codex](https://img.shields.io/badge/Codex-native_MCP-10b981?style=flat-square)](#supported-hosts-and-their-integration-level)
-[![Cursor](https://img.shields.io/badge/Cursor-MCP_%2B_rules-10b981?style=flat-square)](#supported-hosts-and-their-integration-level)
-[![Gemini CLI](https://img.shields.io/badge/Gemini_CLI-MCP_%2B_rules-10b981?style=flat-square)](#supported-hosts-and-their-integration-level)
+[![Claude Code](https://img.shields.io/badge/Claude_Code-5_lifecycle_hooks-475569?style=flat-square)](#supported-hosts-and-their-integration-level)
+[![Codex](https://img.shields.io/badge/Codex-native_MCP_%2B_presence-475569?style=flat-square)](#supported-hosts-and-their-integration-level)
+[![Cursor](https://img.shields.io/badge/Cursor-MCP_config_%2B_rules-475569?style=flat-square)](#supported-hosts-and-their-integration-level)
+[![Gemini CLI](https://img.shields.io/badge/Gemini_CLI-MCP_config_%2B_rules-475569?style=flat-square)](#supported-hosts-and-their-integration-level)
 
 <sub>Host badges name the **integration level**, not a flat "compatible" — the levels and what is
 actually tested are in [Supported hosts](#supported-hosts-and-their-integration-level).</sub>

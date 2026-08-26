@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Question or idea
+    url: https://github.com/dahshanlabs/klypix-mcp/discussions
+    about: Open-ended questions and ideas live in Discussions.
+  - name: Security report (private)
+    url: https://github.com/dahshanlabs/klypix-mcp/security/advisories/new
+    about: Please never open a public issue for a vulnerability.

@@ -5,3 +5,4 @@ node_modules/
 .claude/brain-rule-drafts.json
 .claude/brain-pending-ships.jsonl
 klypix-map/
+.demo-repo/

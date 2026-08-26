@@ -39,7 +39,7 @@ const out = (s = '') => process.stdout.write(s + '\n');
 // Word-wrap to a fixed width so lines printed before a tmux split are not
 // clipped when the pane narrows (tmux does not rewrap existing rows). Layout
 // only — the characters are untouched.
-const WRAP = Number(arg('wrap', '78'));
+const WRAP = Number(arg('wrap', '72'));
 function wrapLine(line) {
   if (line.length <= WRAP) return [line];
   const outLines = [];
@@ -88,14 +88,14 @@ const call = async (name, args) => {
 out(paint('1;36', `● ${label}`));
 out(paint('2', `  declaring the task before touching code`));
 out('');
-out(`${paint('2', '▸')} brain_sync ${paint('2', JSON.stringify({ intent, files }))}`);
+for (const l of wrapLine(`▸ brain_sync ${JSON.stringify({ intent, files })}`)) out(paint('2', l));
 out('');
 render(await call('brain_sync', { project: demoRepo, intent, files, phase: 'start' }));
 
 if (note) {
   await new Promise((r) => setTimeout(r, noteAfter));
   out('');
-  out(`${paint('2', '▸')} brain_note ${paint('2', JSON.stringify({ text: note.slice(0, 44) + '…' }))}`);
+  for (const l of wrapLine(`▸ brain_note ${JSON.stringify({ text: note.slice(0, 44) + '…' })}`)) out(paint('2', l));
   out('');
   const n = await call('brain_note', { project: demoRepo, text: note });
   render(n.split('\n').slice(0, 6).join('\n'));

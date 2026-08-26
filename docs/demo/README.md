@@ -52,5 +52,5 @@ retune the pacing, keep B after A and the note after B.
 **Playback is sped up 1.4× by the workflow's ffmpeg step** — a timelapse of a
 real run, disclosed here on purpose: every frame is genuine output; only the
 dead air between server responses is compressed. The pane driver word-wraps
-its output at ~78 columns (the real post-split pane width at the tape font) so lines printed before the split are not clipped
+its output at ~72 columns (the ~77-col post-split pane minus slack for wide glyphs like — and ·) so lines printed before the split are not clipped
 when the pane narrows (tmux does not rewrap existing rows).

@@ -1,0 +1,40 @@
+name: Bug report
+description: Something behaved differently than documented
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what you got instead.
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: npx klypix-mcp doctor output
+      description: Paste it verbatim — it answers most of what we would ask next (version, hosts, sessions, tool count, drift).
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: host
+    attributes:
+      label: MCP host
+      placeholder: Claude Code / Codex / Cursor / Gemini CLI / …
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      placeholder: Windows 11 / macOS 15 / Ubuntu 24.04
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Smallest reproduction
+      description: The fewest steps that show it. A partial reproduction is worth filing.
+    validations:
+      required: false

@@ -27,6 +27,12 @@ write to it over MCP. You read it and correct it in the [KLYPIX app](https://kly
 
 > **One project. Many agents. One current understanding.**
 
+![Two real MCP sessions on one project: Session B declares a file Session A already declared, and the server's exact-file-overlap warning fires; Session A then records a correction that supersedes its stale card](docs/demo/demo.gif)
+
+<sub>Real output, not a mockup: both panes run a real MCP client against this server
+([docs/demo/](docs/demo/) — the GIF is re-rendered by CI from a scripted tape, so it can never
+drift from what the product actually does).</sub>
+
 Klypix does not launch, run, supervise, or replace your agents. It is not an agent runtime, a model
 router, a worktree manager, or a replacement for Git. It is the layer underneath them that holds
 what the project currently believes.

@@ -1,0 +1,90 @@
+# Install smoke — the path a new user actually takes, on the OSes they actually use.
+#
+# ci.yml tests the working tree and publish.yml smokes the packed tarball's bins, but
+# neither runs the real onboarding (`init` → `install` → `doctor`) from the PUBLISHED npm
+# package, and nothing runs on macOS at all. This workflow does exactly that, in a
+# throwaway HOME, so "does `npx klypix-mcp install` work on a clean Mac?" has an answer
+# that is a green run rather than a belief. Dispatch it before any launch post.
+name: install-smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "npm dist-tag or version to smoke (default: latest)"
+        required: false
+        default: "latest"
+  schedule:
+    - cron: "17 6 * * 1" # Mondays 06:17 UTC — catches a broken `latest` before a human does
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: init → install → doctor (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    timeout-minutes: 20
+    env:
+      KLYPIX_AUTO_UPDATE: "0"
+      PKG: klypix-mcp@${{ github.event.inputs.version || 'latest' }}
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Fresh HOME + a small git repo (what a new user has)
+        shell: bash
+        run: |
+          set -euo pipefail
+          export HOME="$RUNNER_TEMP/home"; mkdir -p "$HOME"
+          echo "HOME=$HOME" >> "$GITHUB_ENV"
+          REPO="$RUNNER_TEMP/demo-repo"; mkdir -p "$REPO/src"
+          echo "REPO=$REPO" >> "$GITHUB_ENV"
+          cd "$REPO"
+          git init -q -b main
+          git config user.email smoke@example.com; git config user.name smoke
+          printf 'export const a = 1;\n' > src/a.ts
+          git add . && git commit -q -m "init"
+          node -v; npm -v; git --version; uname -a
+
+      - name: npx ${{ env.PKG }} init
+        shell: bash
+        working-directory: ${{ env.REPO }}
+        run: |
+          set -euo pipefail
+          npx -y "$PKG" init
+          test -f brain.klypix || { echo "::error::init did not create brain.klypix"; exit 1; }
+          git add brain.klypix && git commit -q -m "chore: add project brain"
+
+      - name: npx ${{ env.PKG }} install
+        shell: bash
+        working-directory: ${{ env.REPO }}
+        run: |
+          set -euo pipefail
+          npx -y "$PKG" install
+          echo "--- what install wrote ---"
+          test -f "$HOME/.claude/settings.json" || { echo "::error::no ~/.claude/settings.json"; exit 1; }
+          grep -q SessionStart "$HOME/.claude/settings.json" || { echo "::error::SessionStart hook not wired"; exit 1; }
+          test -d "$HOME/.claude/project-brain" || { echo "::error::no ~/.claude/project-brain"; exit 1; }
+          ls "$HOME/.claude/project-brain" | head -20
+
+      - name: npx ${{ env.PKG }} doctor (must exit 0)
+        shell: bash
+        working-directory: ${{ env.REPO }}
+        run: npx -y "$PKG" doctor
+
+      - name: npx ${{ env.PKG }} link --check (no drift right after install)
+        shell: bash
+        working-directory: ${{ env.REPO }}
+        run: npx -y "$PKG" link --check
+
+      - name: npx ${{ env.PKG }} conformance (two real MCP clients)
+        shell: bash
+        working-directory: ${{ env.REPO }}
+        timeout-minutes: 8
+        run: npx -y "$PKG" conformance

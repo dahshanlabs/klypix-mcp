@@ -395,5 +395,56 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
   fs.rmSync(vault, { recursive: true, force: true });
 }
 
+// ── PART F — write and audit share ONE editor filter (1.82.1) ────────────────
+// Field finding 2026-09-01 (install-smoke on clean ubuntu + macos runners): `install`
+// projected 3 files for the 2 hosts present, then `doctor` audited all 14 and printed
+// "11 of 14 drifted — MISSING" for editors nobody had, exiting 1 on a new user's first
+// command. auditProject must accept the same `editors` set linkProject wrote with, and
+// inspect() must pass the detected set (opts.editors is the test seam).
+{
+  const proj = path.join(os.tmpdir(), 'klypix-doctor-test-editors');
+  fs.rmSync(proj, { recursive: true, force: true });
+  fs.mkdirSync(proj, { recursive: true });
+  fs.writeFileSync(path.join(proj, 'brain.klypix'), 'stub');
+  const present = new Set(['claude-code', 'codex']);          // what a fresh CI runner has after install
+  const wrote = linkProject(proj, { version: '1.2.3', editors: present });
+  const written = [...wrote.rules, ...wrote.mcp].map((f) => f.file).sort();
+  ok(written.join(',') === ['.codex/config.toml', '.mcp.json', 'AGENTS.md'].join(','),
+    `F1 install-style link for {claude-code, codex} writes exactly 3 files (${written.join(', ')})`);
+
+  const unfiltered = auditProject(proj, { version: '1.2.3' });
+  ok(!unfiltered.ok && unfiltered.drift.length === 11,
+    `F2 the OLD unfiltered audit of that project reports 11 MISSING (the bug: ${unfiltered.drift.length})`);
+
+  const filtered = auditProject(proj, { version: '1.2.3', editors: present });
+  ok(filtered.ok && filtered.drift.length === 0 && filtered.files.length === 3,
+    `F3 auditing with the same editor set is clean: ${filtered.files.length} files, ${filtered.drift.length} drift`);
+  const notHere = (filtered.skipped || []).filter((x) => /not installed/.test(x.why || ''));
+  ok(notHere.length === 11, `F4 the 11 not-applicable targets are REPORTED as skipped, not silently dropped (${notHere.length})`);
+
+  // A file a teammate committed stays audited even though this machine lacks that editor.
+  fs.mkdirSync(path.join(proj, '.cursor', 'rules'), { recursive: true });
+  fs.writeFileSync(path.join(proj, '.cursor', 'rules', 'klypix-brain.mdc'), 'hand-written, no fence');
+  const teammate = auditProject(proj, { version: '1.2.3', editors: present });
+  ok(teammate.files.some((f) => f.file === '.cursor/rules/klypix-brain.mdc') && !teammate.ok,
+    'F5 a committed Cursor rule is still audited (and its missing fence is real drift) without Cursor installed');
+  fs.rmSync(path.join(proj, '.cursor'), { recursive: true, force: true });
+
+  // inspect(): the seam pins the set; null forces the legacy unfiltered audit.
+  const home = path.join(os.tmpdir(), 'klypix-doctor-test-editors-home');
+  fs.rmSync(home, { recursive: true, force: true }); fs.mkdirSync(home, { recursive: true });
+  const rFiltered = inspect({ home, projectDir: proj, editors: present });
+  ok(rFiltered.harness.ok && rFiltered.layers.harness === 'ok',
+    `F6 doctor with the detected-editor set → HARNESS ok (${rFiltered.harness.files.length} audited)`);
+  const rLegacy = inspect({ home, projectDir: proj, editors: null });
+  ok(!rLegacy.harness.ok && rLegacy.layers.harness === 'drift',
+    'F7 doctor with editors:null reproduces the old all-14 verdict (seam works both ways)');
+  const text = render(rFiltered);
+  ok(/HARNESS.*all 3 projected file\(s\) in sync/.test(text) && /11 host file\(s\) not audited/.test(text),
+    'F8 the rendered HARNESS line says what was audited AND what was not applicable');
+  fs.rmSync(proj, { recursive: true, force: true }); fs.rmSync(home, { recursive: true, force: true });
+}
+
+
 console.log(failures ? `\n✗ ${failures} assertion(s) failed` : '\n✓ brain-doctor: all assertions passed');
 process.exit(failures ? 1 : 0);

@@ -26,6 +26,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { auditProject, codexGlobalInstructionsInstalled, resolveVersion } from './agent-rules.mjs';
+import { detectEditors } from './editor-detect.mjs';
 import { codexPresenceHookStatus } from './codex-hooks.mjs';
 import { inspectAutoUpdate } from './mcp-auto-update.mjs';
 import { renderReceiptSummary, summarizeReceipts } from './finding-routing.mjs';
@@ -528,7 +529,17 @@ export function inspect(opts = {}) {
   // Harness drift only counts toward the verdict for a real brain project; auditProject
   // against the BAKED brain version (the deployed truth) when available.
   const harnessVer = version.baked || resolveVersion();
-  const harness = hasBrain ? auditProject(projectDir, { version: harnessVer }) : { files: [], drift: [], ok: true, version: harnessVer };
+  // Audit ONLY what a host on this machine would read — the same detected-editor set
+  // `install` projects with (setup.mjs). Field finding 2026-09-01 (install-smoke on a
+  // clean ubuntu + macos runner): install wrote 3 files for the 2 hosts present, then
+  // doctor audited all 14 and reported "11 of 14 drifted — MISSING" for Cursor,
+  // Windsurf, Cline, Copilot, Gemini and Aider config nobody had installed, exiting 1
+  // on a brand-new user's very first command. Write and audit must share one filter.
+  // Files a teammate already committed stay audited regardless (targetJustified rule 3).
+  // opts.editors is a test seam: a Set/array to pin, or null to force the unfiltered audit.
+  const harnessEditors = opts.editors !== undefined ? opts.editors
+    : detectEditors({ env }).present.keys();
+  const harness = hasBrain ? auditProject(projectDir, { version: harnessVer, editors: harnessEditors }) : { files: [], drift: [], ok: true, version: harnessVer, skipped: [] };
 
   // npm currency (caller fetches it; we just compare to the baked truth).
   // Three honest states, not two (G4/G5/G6, 2026-08-14): `matches` collapsed
@@ -879,9 +890,11 @@ export function render(r, opts = {}) {
   if (!r.project.hasBrain) L.push(`${c.dim}· HARNESS  no ./brain.klypix in ${r.project.dir} — projection n/a${c.rst}`);
   else {
     const cmark = r.layers.harness === 'ok' ? ok : warn;
-    if (r.harness.ok) L.push(`${cmark} ${c.bold}HARNESS${c.rst}  all ${r.harness.files.length} projected file(s) in sync`);
+    const notHere = (r.harness.skipped || []).filter((x) => /not installed/.test(x.why || '')).length;
+    const notHereNote = notHere ? `${c.dim} · ${notHere} host file(s) not audited — that editor is not installed here${c.rst}` : '';
+    if (r.harness.ok) L.push(`${cmark} ${c.bold}HARNESS${c.rst}  all ${r.harness.files.length} projected file(s) in sync${notHereNote}`);
     else {
-      L.push(`${cmark} ${c.bold}HARNESS${c.rst}  ${r.harness.drift.length} of ${r.harness.files.length} drifted:`);
+      L.push(`${cmark} ${c.bold}HARNESS${c.rst}  ${r.harness.drift.length} of ${r.harness.files.length} drifted:${notHereNote}`);
       for (const h of r.harness.drift) L.push(`        · ${h.file} — ${c.yel}${h.status.toUpperCase()}${c.rst}${h.stampedVersion ? ` (stamped v${h.stampedVersion})` : ''}`);
     }
   }

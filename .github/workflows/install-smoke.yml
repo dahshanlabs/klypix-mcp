@@ -78,10 +78,13 @@ jobs:
         working-directory: ${{ env.REPO }}
         run: npx -y "$PKG" doctor
 
-      - name: npx ${{ env.PKG }} link --check (no drift right after install)
+      - name: npx ${{ env.PKG }} link, then link --check (write-all path audits clean)
         shell: bash
         working-directory: ${{ env.REPO }}
-        run: npx -y "$PKG" link --check
+        run: |
+          set -euo pipefail
+          npx -y "$PKG" link
+          npx -y "$PKG" link --check
 
       - name: npx ${{ env.PKG }} conformance (two real MCP clients)
         shell: bash

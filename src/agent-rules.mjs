@@ -820,11 +820,14 @@ export function linkProject(projectDir, opts = {}) {
  * @returns {{ files, drift, unprojected, ok, version }}
  */
 export function auditProject(projectDir, opts = {}) {
-  const { rules, mcp, version } = linkProject(projectDir, { ...opts, check: true });
+  const { rules, mcp, version, skipped } = linkProject(projectDir, { ...opts, check: true });
   const files = [...rules, ...mcp];
   const ACTIONABLE = new Set(['missing', 'stale', 'hand-edited']);
   const drift = files.filter((f) => ACTIONABLE.has(f.status));
-  return { files, drift, ok: drift.length === 0, version };
+  // `skipped` (1.82.1): targets the caller's editor filter excluded — hosts this machine
+  // does not have. Reported so a verdict can SAY what it did not audit instead of
+  // silently narrowing; drift is judged only over what a present host would read.
+  return { files, drift, ok: drift.length === 0, version, skipped: skipped || [] };
 }
 
 export { BRAIN_INSTRUCTIONS, INSTRUCTIONS_HASH, FENCE_RE, parseFence, cmpSemver };

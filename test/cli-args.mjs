@@ -25,7 +25,7 @@ import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
 import { spawnSync } from 'child_process';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 import { findPresenceConflicts, isSuspectedTwin } from '../src/mcp-presence.mjs';
 import { laneFileFor, upsertSession } from '../src/agent-presence.mjs';
 
@@ -221,6 +221,33 @@ const run = (args, { cwd = REPO, home = HOME_ROOT, timeout = 60_000 } = {}) => {
     });
   ok(unresolvedSrcImports.length === 0,
     'G: installed executable modules contain no unresolved ../src/*.mjs imports');
+
+  // The flat bundle is a CLOSURE or it is nothing: every './sibling.mjs' a staged
+  // module imports (static or lazy) must itself be staged, or the deployed runtime
+  // dies with ERR_MODULE_NOT_FOUND at the first call that touches it. 1.82.1 shipped
+  // brain-doctor.mjs importing ./editor-detect.mjs while the copy list did not carry
+  // it — the KLYPIX bundler's own guard caught it; nothing here did. Now this does.
+  const staged = new Set(fs.readdirSync(bundleDir));
+  const unresolvedSiblings = [...staged]
+    .filter((file) => file.endsWith('.mjs'))
+    .flatMap((file) => {
+      const executable = fs.readFileSync(path.join(bundleDir, file), 'utf8')
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .replace(/\/\/.*$/gm, '');
+      const refs = [
+        ...executable.matchAll(/from\s+['"]\.\/([^'"]+\.mjs)['"]/g),
+        ...executable.matchAll(/import\(\s*['"]\.\/([^'"]+\.mjs)['"]\s*\)/g),
+      ].map((m) => m[1]);
+      return [...new Set(refs)].filter((ref) => !staged.has(ref)).map((ref) => `${file} -> ./${ref}`);
+    });
+  ok(unresolvedSiblings.length === 0,
+    `G: every sibling import inside the flat bundle is staged (${unresolvedSiblings.join('; ') || 'closure complete'})`);
+  // And prove it dynamically for the module that broke: import the staged doctor for real.
+  const doctorImport = spawnSync(process.execPath, ['--input-type=module', '-e',
+    `import(${JSON.stringify(pathToFileURL(path.join(bundleDir, 'brain-doctor.mjs')).href)}).then(m => { if (typeof m.inspect !== 'function') throw new Error('no inspect export'); console.log('ok'); })`],
+    { encoding: 'utf8', timeout: 60_000 });
+  ok(doctorImport.status === 0 && /^ok/m.test(doctorImport.stdout),
+    `G: the staged brain-doctor.mjs imports cleanly from the flat bundle${doctorImport.status === 0 ? '' : ` (${(doctorImport.stderr || '').split('\n').find((l) => /Error|Cannot find/.test(l)) || 'exit ' + doctorImport.status})`}`);
 
   // The flat bundle stages the worker but NOT the link/doctor/install bins, so its
   // dispatch used to die with a raw ERR_MODULE_NOT_FOUND stack trace.

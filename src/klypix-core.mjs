@@ -31,12 +31,13 @@ import {
   challengeBrain, challengeContextToMarkdown, buildRenderSpec, structToBrief,
   brainLensData, lensToMarkdown, deathDateOfCard,
   statusContextToMarkdown, findFulfillmentCandidates,
-  splitQueryTokens, scoreCardsAgainstQuery, correctionOverlaysFor,
+  splitQueryTokens, scoreCardsAgainstQuery, correctionOverlaysFor, currentGuidanceFor, currentGuidancePrefix,
   isFastDecayCard, isUnresolvedOpenCard, isSkillCard, validateGuard, guardSidecarPathFor, ensureGuardSidecar, DECAY_STALE_MS, formatDecayAge,
   isPlanCard, planFulfillmentFor, PLAN_PAIR_SIM_BRAIN, isAgconfTwinId,
   readPendingShips, clearPendingShips, pendingShipCards, formatCaptureReceipts,
 } from './klypix-format.mjs';
 import { findProjectBrain, postPresenceMessage } from './agent-presence.mjs';
+import { inspectCardEvidence, formatCardEvidence } from './brain-evidence.mjs';
 import { brainCaptureLockPath, vaultCreateLockPath, withAdvisoryWriteLock } from './brain-write-lock.mjs';
 import {
   dot, embedTexts, getEmbedder, getEmbedderForUse, withRerankerForUse,
@@ -442,8 +443,16 @@ export async function opBrainTaskContext({
     if (hits.length >= hitLimit) break;
   }
   const recentOpenIds = new Set(recentOpen.map((hit) => hit.card.id));
+  const skillPool = struct.cards.filter((c) => c.type !== 'container'
+    && !/^archive$/i.test(c.area || '') && isSkillCard(c));
+  const scoreById = new Map(candidatePool.map((hit) => [hit.card.id, hit.score]));
+  const standing = skillPool
+    .filter((c) => !hitIds.has(c.id))
+    .sort((a, b) => (scoreById.get(b.id) || 0) - (scoreById.get(a.id) || 0)
+      || (b.createdAt || 0) - (a.createdAt || 0))
+    .slice(0, 3);
   let overlays = new Map();
-  try { overlays = correctionOverlaysFor(struct, hits.map((hit) => hit.card)); }
+  try { overlays = currentGuidanceFor(struct, [...hits.map((hit) => hit.card), ...standing]); }
   catch { /* context remains useful without overlays */ }
   // Plan→🏁 hints (2026-08-23): a recalled PLAN/PROPOSAL whose feature a newer
   // 🏁 appears to have shipped. Brain-wide (the ship card is usually renamed
@@ -474,8 +483,11 @@ export async function opBrainTaskContext({
   // never calls statusContextToMarkdown) gets the warning from the engine,
   // not from model judgment. Best-effort: classification failure → no stamp.
   const nowTs = Date.now();
+  const evidenceCache = new Map();
+  const evidenceFor = card => inspectCardEvidence(card, { projectRoot: path.dirname(t.file), cache: evidenceCache });
   const entries = hits.map((hit) => {
-    const correction = overlays.get(hit.card.id)?.by || null;
+    const correction = overlays.get(hit.card.id)?.correction?.by || null;
+    const obsolescence = overlays.get(hit.card.id)?.obsolescence || null;
     const plan = planHints.get(hit.card.id) || null;
     let decayAge = null;
     try {
@@ -484,10 +496,13 @@ export async function opBrainTaskContext({
     } catch { decayAge = null; }
     return {
       id: hit.card.id,
+      evidence: evidenceFor(hit.card),
       area: flat(hit.card.area) || 'Notes',
       text: clip(hit.card.text, 420),
       score: Number(hit.score.toFixed(2)),
       correctedBy: correction ? clip(correction.text, 420) : null,
+      ...(correction ? { correctedById: correction.id } : {}),
+      ...(obsolescence ? { possiblyObsolete: { by: clip(obsolescence.by, 100), byId: obsolescence.byId, unconfirmed: true } } : {}),
       ...(recentOpenIds.has(hit.card.id) ? { recentOpen: true } : {}),
       ...(decayAge ? { lastKnown: true, age: decayAge } : {}),
       ...(plan ? { possiblyBuilt: { by: clip(plan.by, 200), byId: plan.byId, ...(plan.sim != null ? { sim: plan.sim } : {}) } } : {}),
@@ -502,26 +517,24 @@ export async function opBrainTaskContext({
   // relevance-ordered when the ranker scored a rule, newest-first otherwise,
   // deduped against the hit list, and prepended so the maxChars tail-cut can
   // never be the reason a rule silently vanished.
-  const skillPool = struct.cards.filter((c) => c.type !== 'container'
-    && !/^archive$/i.test(c.area || '') && isSkillCard(c));
-  const scoreById = new Map(candidatePool.map((hit) => [hit.card.id, hit.score]));
-  const standing = skillPool
-    .filter((c) => !hitIds.has(c.id))
-    .sort((a, b) => (scoreById.get(b.id) || 0) - (scoreById.get(a.id) || 0)
-      || (b.createdAt || 0) - (a.createdAt || 0))
-    .slice(0, 3);
   const lines = [
     `## Compact task context (${entries.length} relevant brain card${entries.length === 1 ? '' : 's'} · lexical-fast)`,
   ];
   if (standing.length) {
-    lines.push(`### 🛠️ Standing rules (${skillPool.length} in the brain — apply always; full set in the brief)`);
-    for (const c of standing) lines.push(`- [${flat(c.area) || 'Notes'}] ${clip(c.text, 220)}`);
+    lines.push(`### 🛠️ Standing rules (${skillPool.length} in the brain — heed correction and review warnings; full set in the brief)`);
+    for (const c of standing) {
+      lines.push(`- [${flat(c.area) || 'Notes'}] ${currentGuidancePrefix(overlays.get(c.id))}${clip(c.text, 220)}`);
+      const evidence = formatCardEvidence(evidenceFor(c), { maxChars: 420 });
+      if (evidence) lines.push(evidence);
+    }
   }
   if (!entries.length) {
     lines.push('No high-confidence task-specific card matched. Continue from repository evidence; use brain_ask only if deeper project history is needed.');
   } else {
     for (const entry of entries) {
-      if (entry.correctedBy) lines.push(`- [${entry.area}] CURRENT CORRECTION: ${entry.correctedBy}`);
+      const guidanceStamp = entry.correctedBy
+        ? ` CURRENT CORRECTION: [${entry.correctedById}] ${entry.correctedBy} — superseded context:`
+        : entry.possiblyObsolete ? ` ${currentGuidancePrefix({ obsolescence: entry.possiblyObsolete })}` : '';
       // The LAST KNOWN stamp is a PREFIX: the final .slice(0, maxChars) can cut
       // a line's tail, and the warning must never be the part that gets cut
       // (v1.32.0 law — a claim may truncate, its warning may not).
@@ -530,7 +543,9 @@ export async function opBrainTaskContext({
       // Same prefix discipline as LAST KNOWN: the hint can never be the part a
       // budget cut removes. It names the ship so the reader can verify it.
       const planStamp = entry.possiblyBuilt ? ` ⏳ POSSIBLY BUILT (a newer 🏁 appears to ship this plan: “${entry.possiblyBuilt.by}” — verify before treating it as only a plan/proposal):` : '';
-      lines.push(`- [${entry.area}]${entry.correctedBy ? ' superseded context:' : ''}${openStamp}${stamp}${planStamp} ${entry.text}`);
+      lines.push(`- [${entry.area}]${guidanceStamp}${openStamp}${stamp}${planStamp} ${entry.text}`);
+      const evidence = formatCardEvidence(entry.evidence, { maxChars: 420 });
+      if (evidence) lines.push(evidence);
       if (lines.join('\n').length >= maxChars) break;
     }
     lines.push('This is a bounded start-of-task capsule, not the whole brain; use brain_ask for broad status/history questions.');
@@ -542,7 +557,13 @@ export async function opBrainTaskContext({
       mode: 'lexical-fast',
       hits: entries,
       ...(standing.length ? {
-        standingRules: standing.map((c) => ({ id: c.id, area: flat(c.area) || 'Notes', text: clip(c.text, 220) })),
+        standingRules: standing.map((c) => {
+          const guidance = overlays.get(c.id);
+          return { id: c.id, area: flat(c.area) || 'Notes', text: clip(c.text, 220), evidence: evidenceFor(c),
+            ...(guidance?.correction ? { correctedBy: clip(guidance.correction.by.text, 420), correctedById: guidance.correction.by.id } : {}),
+            ...(guidance?.obsolescence ? { possiblyObsolete: { ...guidance.obsolescence, unconfirmed: true } } : {}),
+          };
+        }),
       } : {}),
       sufficient: entries.length > 0,
       durationMs,

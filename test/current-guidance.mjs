@@ -43,7 +43,7 @@ const makeBrain = async (cards, connections = []) => {
 const task = async (intent = 'Evaluate the eval harness numbers', options = {}) => opBrainTaskContext({ vault: project, canvas: target, intent, files: [], ...options });
 
 try {
-  // Fixture frozen BEFORE editing runtime. The repair is outside the task-hit
+  // Synthetic replacement of the pre-fix regression. The repair is outside the task-hit
   // set (k=1) but it must still accompany the old skill on a fresh session.
   const struct = await makeBrain([oldRule, fix]);
   const before = fs.readFileSync(target);

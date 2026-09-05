@@ -11,7 +11,11 @@ const KINDS = new Set(['file', 'pr', 'url', 'commit', 'run']);
 const INPUT_FIELDS = new Set(['kind', 'ref', 'oid', 'verifiedAt']);
 const SHA_RE = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i;
 const READ_BUDGET = Symbol('brain-evidence-read-budget');
-const flat = value => String(value || '').replace(/[\r\n\t]+/g, ' ').trim();
+// Read-side metadata can come from imported JSON, not the capture schema.
+// Never coerce objects (an own toString field can throw); bound string work
+// before normalization so oversized metadata cannot monopolize a recall call.
+const flat = (value, max = 1000) => typeof value === 'string'
+  ? value.slice(0, max).replace(/[\r\n\t]+/g, ' ').trim() : '';
 const inside = (root, target) => {
   const rel = path.relative(root, target);
   return rel !== '' && rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
@@ -128,17 +132,28 @@ export function inspectCardEvidence(card, { projectRoot, cache = new Map(), maxR
   const limit = Math.max(1, Math.min(16, Number(maxRefs) || 4));
   const refs = Array.isArray(card?.evidence) ? card.evidence : [];
   const sources = refs.slice(0, limit).map(item => {
-    const source = { kind: flat(item?.kind).slice(0, 20), ref: flat(item?.ref).slice(0, 1000), status: 'unverified' };
-    if (typeof item?.capturedAt === 'string') source.capturedAt = flat(item.capturedAt).slice(0, 30);
-    if (typeof item?.verifiedAt === 'string') source.reportedVerifiedAt = flat(item.verifiedAt).slice(0, 30);
+    const source = { kind: flat(item?.kind, 20), ref: flat(item?.ref, 1000), status: 'unverified' };
+    if (typeof item?.capturedAt === 'string') source.capturedAt = flat(item.capturedAt, 30);
+    if (typeof item?.verifiedAt === 'string') source.reportedVerifiedAt = flat(item.verifiedAt, 30);
     if (typeof item?.headRevision === 'string' && SHA_RE.test(item.headRevision)) source.headRevision = item.headRevision;
-    if (source.kind !== 'file') return source;
-    if (Date.now() >= budget.deadline || budget.probes >= 24) { source.reason = 'inspection budget exhausted'; return source; }
-    const file = resolveEvidenceFile(projectRoot, source.ref);
+    // Never resolve a truncated reference as if it were the authored path.
+    if (item?.kind !== 'file' || typeof item?.ref !== 'string' || item.ref.length > 1000) return source;
+    const root = typeof projectRoot === 'string' && projectRoot ? path.resolve(projectRoot) : null;
+    if (!root) return source;
+    const exhausted = () => Date.now() >= budget.deadline || budget.probes >= 24;
+    // Remember containment-checked path resolutions separately from snapshots.
+    // A repeated reference can then reuse its observation after the deadline
+    // without even repeating filesystem-based path/symlink validation.
+    const pathKey = root + '\0path\0' + source.ref;
+    if (!cache.has(pathKey)) {
+      if (exhausted()) { source.reason = 'inspection budget exhausted'; return source; }
+      cache.set(pathKey, resolveEvidenceFile(root, source.ref));
+    }
+    const file = cache.get(pathKey);
     if (!file) return source;
-    const key = `${path.resolve(projectRoot)}\0${file.relative}`;
+    const key = root + '\0' + file.relative;
     if (!cache.has(key)) {
-      if (Date.now() >= budget.deadline) { source.reason = 'inspection budget exhausted'; return source; }
+      if (exhausted()) { source.reason = 'inspection budget exhausted'; return source; }
       budget.probes++;
       cache.set(key, readSnapshot(file.target));
     }
@@ -155,6 +170,7 @@ export function inspectCardEvidence(card, { projectRoot, cache = new Map(), maxR
     if (typeof item.oid === 'string' && SHA_RE.test(item.oid)) {
       const gitKey = `${key}\0legacy`;
       if (!cache.has(gitKey)) {
+        if (exhausted()) { source.reason = 'inspection budget exhausted'; return source; }
         const oid = git(projectRoot, ['rev-parse', '--verify', `HEAD:${file.relative}`], budget.deadline - Date.now());
         const working = oid ? workingTreeStatus(projectRoot, file.relative, budget.deadline) : 'unverified';
         cache.set(gitKey, { oid, working });
@@ -167,11 +183,12 @@ export function inspectCardEvidence(card, { projectRoot, cache = new Map(), maxR
     }
     return source;
   });
+  const verification = typeof card?.verify === 'string' ? card.verify.slice(0, 2000).trim() : '';
   return {
     sources,
     omitted: Math.max(0, refs.length - sources.length),
-    verify: typeof card?.verify === 'string' && card.verify.trim() ? { text: card.verify.trim().slice(0, 2000), status: 'not-executed' } : null,
-    recordedVia: flat(card?.createdVia).slice(0, 80) || null,
+    verify: verification ? { text: verification, status: 'not-executed' } : null,
+    recordedVia: flat(card?.createdVia, 80) || null,
     recordedAt: Number.isFinite(card?.createdAt) && Math.abs(card.createdAt) <= 8.64e15 ? new Date(card.createdAt).toISOString() : null,
   };
 }

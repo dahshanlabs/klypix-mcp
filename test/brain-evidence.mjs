@@ -42,6 +42,50 @@ try {
   check(original.evidence[0].sha256?.length === 64 && original.evidence[0].sourceBasis === 'working-tree' && original.evidence[0].headRevision === head && original.verify === verify, 'serialized brain preserves working-file fingerprint, HEAD revision and verification text');
   check(original.createdVia === 'codex' && inspect(original).recordedVia === 'codex', 'recorded provenance survives capture and inspection');
   check(inspect(original).sources[0].status === 'source-unchanged' && inspect(original).sources[1].status === 'unverified', 'only the unchanged local source is unchanged; external references remain unverified');
+  const malformedScalar = JSON.parse('{"toString":1}');
+  const malformed = inspectCardEvidence({
+    evidence: [{ kind: malformedScalar, ref: malformedScalar }, { kind: 'file', ref: malformedScalar }, null],
+    createdVia: malformedScalar, verify: malformedScalar,
+  }, { projectRoot: project });
+  check(malformed.sources.every(item => item.status === 'unverified') && !malformed.recordedVia && !malformed.verify,
+    'malformed imported JSON scalars cannot throw or impersonate source references');
+  const largeMetadata = inspectCardEvidence({ evidence: [{ kind: 'url', ref: 'r'.repeat(100_000) }], createdVia: 'a'.repeat(100_000), verify: 'v'.repeat(100_000) });
+  check(largeMetadata.sources[0].ref.length === 1000 && largeMetadata.recordedVia.length === 80 && largeMetadata.verify.text.length === 2000,
+    'read-side string work and output are bounded before normalization');
+
+  // The same response renders evidence and returns structured metadata at
+  // different instants. Expiring its I/O budget must not contradict an already
+  // observed source, nor trigger path validation or Git probes on a cache hit.
+  const realNow = Date.now;
+  const ioNames = ['realpathSync', 'existsSync', 'lstatSync', 'statSync', 'openSync', 'readSync', 'fstatSync'];
+  const realIo = new Map(ioNames.map(name => [name, fs[name]]));
+  const realExec = childProcess.execFileSync;
+  let forbiddenIo = 0, clock = realNow();
+  try {
+    Date.now = () => clock;
+    const cache = new Map();
+    const first = inspectCardEvidence(original, { projectRoot: project, cache, budgetMs: 1000 });
+    const legacyCard = { evidence: [{ kind: 'file', ref: 'source.txt', oid }] };
+    const firstLegacy = inspectCardEvidence(legacyCard, { projectRoot: project, cache });
+    clock += 1001;
+    for (const name of ioNames) fs[name] = () => { forbiddenIo++; throw new Error('I/O after response deadline'); };
+    childProcess.execFileSync = () => { forbiddenIo++; throw new Error('Git after response deadline'); };
+    syncBuiltinESMExports();
+    const cached = inspectCardEvidence(original, { projectRoot: project, cache });
+    const cachedLegacy = inspectCardEvidence(legacyCard, { projectRoot: project, cache });
+    const uncached = inspectCardEvidence({ evidence: [{ kind: 'file', ref: 'never-inspected.txt' }] }, { projectRoot: project, cache });
+    check(first.sources[0].status === 'source-unchanged' && cached.sources[0].status === first.sources[0].status,
+      'cached working-file evidence stays consistent after its response deadline');
+    check(firstLegacy.sources[0].status === 'source-unchanged' && cachedLegacy.sources[0].status === firstLegacy.sources[0].status,
+      'cached legacy Git evidence stays consistent after its response deadline');
+    check(forbiddenIo === 0 && uncached.sources[0].reason === 'inspection budget exhausted',
+      'expired caches reuse observed results but never start filesystem or Git work for new references');
+  } finally {
+    Date.now = realNow;
+    for (const [name, fn] of realIo) fs[name] = fn;
+    childProcess.execFileSync = realExec;
+    syncBuiltinESMExports();
+  }
   const noBudget = inspectCardEvidence(original, { projectRoot: project, budgetMs: 0 });
   check(noBudget.sources[0].status === 'unverified' && noBudget.sources[0].reason === 'inspection budget exhausted' && noBudget.verify.text === verify, 'exhausted read budgets retain provenance and verification text without inspecting files');
   const multiline = formatCardEvidence({ sources: [], verify: { text: 'node test/a.mjs\nnode test/b.mjs' } });

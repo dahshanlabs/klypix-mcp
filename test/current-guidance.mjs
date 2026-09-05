@@ -50,14 +50,14 @@ try {
   const start = performance.now();
   const context = await task('The eval harness is broken and its numbers invalid', { k: 1 });
   const rendered = textOf(context);
-  check(/RULE MAY BE OBSOLETE/.test(rendered), 'task capsule qualifies the real old-eval standing rule');
+  check(/RULE MAY BE OBSOLETE/.test(rendered), 'task capsule qualifies the synthetic old-eval standing rule');
   check(/EVAL HARNESS FIXED/.test(rendered), 'task capsule carries the repair even outside the hit set');
   check(!/CURRENT CORRECTION/.test(rendered), 'unconfirmed candidate is never called a confirmed correction');
   check(/THE EVAL HARNESS IS BROKEN/.test(rendered), 'protected rule remains inspectable with its warning');
   check(context.context.hits.some(hit => hit.possiblyObsolete?.byId), 'task hit exposes candidate identity for a receiving host');
   check(rendered.length <= 2800, 'task output stays within the default character budget');
   check(performance.now() - start < 1000, 'task guidance remains a lexical fast path under one second');
-  check(fs.readFileSync(target).equals(before), 'serving guidance leaves the real-pair fixture byte-identical');
+  check(fs.readFileSync(target).equals(before), 'serving guidance leaves the synthetic-pair fixture byte-identical');
 
   // Standalone fallback rules, including the ultra brief written into AGENTS,
   // must apply the same warning even when the task itself is unrelated.
@@ -116,7 +116,7 @@ try {
   // may be doing the work, and a retracted milestone must not vouch for a rule.
   const directCards = fixture.cards.map(c => ({ ...c, type: 'text' }));
   const direct = { title: 'Direct pair', cards: directCards, connections: [], counts: { cards: 2, connections: 0 } };
-  check(currentGuidanceFor(direct, [directCards[0]]).get(oldRule.id)?.obsolescence?.byId === fix.id, 'unlinked real incident pair is detected without a capture-side hint');
+  check(currentGuidanceFor(direct, [directCards[0]]).get(oldRule.id)?.obsolescence?.byId === fix.id, 'unlinked synthetic incident pair is detected without a capture-side hint');
   const archived = { ...direct, cards: directCards.map(c => c.id === fix.id ? { ...c, area: 'Archive' } : c) };
   check(!currentGuidanceFor(archived, [directCards[0]]).has(oldRule.id), 'archived repair no longer vouches for obsolete-rule guidance');
   const evergreen = { id: 'evergreen', type: 'text', area: 'Brain', createdAt: oldRule.createdAt, text: '🛠️ Always import production primitives when writing evaluation harness tests.' };
@@ -124,7 +124,7 @@ try {
   const quoted = { ...directCards[1], text: '🛠️ Keep an evaluation example for reference.\n' + directCards[1].text };
   check(!currentGuidanceFor({ ...direct, cards: [directCards[0], quoted] }, [directCards[0]]).has(oldRule.id), 'quoted milestone body does not turn standing advice into a shipment');
   const mixedContext = structToUltraBrief(direct);
-  check(/RULE MAY BE OBSOLETE/.test(mixedContext) && /EVAL HARNESS FIXED/.test(mixedContext), 'verbatim mixed milestone and skill remains useful in the ultra preview');
+  check(/RULE MAY BE OBSOLETE/.test(mixedContext) && /EVAL HARNESS FIXED/.test(mixedContext), 'mixed synthetic milestone and skill remains useful in the ultra preview');
 
   // Evidence from the shared helper reaches startup without executing verify.
   fs.writeFileSync(path.join(project, 'proof.txt'), 'source evidence');

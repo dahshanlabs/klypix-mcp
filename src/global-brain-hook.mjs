@@ -92,7 +92,9 @@ function parseEvidence(s) {
     const refs = [];
     for (const tokRaw of String(s).split(',')) {
         const ref = tokRaw.trim(); if (!ref) continue;
-        if (/^(?:pr|gh|issue)?\s*#?\d+$/i.test(ref) || /\b(?:PR|GH)\s*#?\d+/i.test(ref)) { refs.push({ ref, kind: 'pr' }); continue; }
+        // A shorthand must occupy the whole reference: GH3/PR123 embedded in
+        // a directory or filename is still file evidence.
+        if (/^(?:pr|gh|issue)?\s*#?\d+$/i.test(ref)) { refs.push({ ref, kind: 'pr' }); continue; }
         const oid = gitBlobOid(ref);
         const anchor = ref.match(/#L\d+(?:-L?\d+)?$|:\d+(?::\d+)?$/i)?.[0] || '';
         const normalizedRef = evidenceGitPath(ref);

@@ -113,6 +113,12 @@ If a write (`make_board`/`remember`) returns `input-required`, reply with a mess
 carrying the same `taskId` plus the missing input to **continue that task** (the
 server resumes it with a stable id and accumulated history).
 
+For `remember` or `learn_skill`, one-card requests may also provide `args.evidence`
+and `args.verify` using the [brain capture schema](README.md#capture-and-corrections).
+Such requests use the shared capture engine even without a marker. References and
+verification text are preserved; malformed metadata is rejected instead of discarded.
+Verification text is never executed.
+
 ## Notes
 
 - Tasks complete synchronously (the work is local file I/O), so `message/send`

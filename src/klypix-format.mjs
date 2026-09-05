@@ -2385,7 +2385,7 @@ export function rankForQuestion(struct, question, { semantic = null, k = 10, as_
 // instructs the agent to answer the question directly (cite cards, honor
 // corrections, admit gaps), then each hit full-text with provenance + lifecycle +
 // its correction. Char-budgeted so a huge brain can't blow the tool result.
-export function questionContextToMarkdown(question, result, { mode = 'lexical', as_of = null, budgetChars = 9000 } = {}) {
+export function questionContextToMarkdown(question, result, { mode = 'lexical', as_of = null, budgetChars = 9000, evidenceForCard = null } = {}) {
     const { hits, total } = result;
     const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
     const day = (ts) => ts ? new Date(ts).toISOString().slice(0, 10) : '';
@@ -2427,6 +2427,14 @@ export function questionContextToMarkdown(question, result, { mode = 'lexical', 
             // reader to verify, never to inherit the machine's guess — but the
             // DIRECTION flips: for current capability, trust the NEWER card.
             block += `\n\n  ⚠️ RULE MAY BE OBSOLETE${h.obsolescence.unconfirmed ? ' (serve-time hint — no confirmed link)' : ''}: this skill asserts a limitation${h.obsolescence.clause ? ` — “${flat(h.obsolescence.clause).slice(0, 140)}”` : ''} that a newer milestone appears to REMOVE: “${flat(h.obsolescence.by).slice(0, 200)}”. For current capability trust the newer card; VERIFY before citing this limitation as still true. If obsolete, amend the skill (~ marker), or retire it deliberately by NAMING it in a closes: (fuzzy ✓/supersede never touch a 🛠️); if it still holds, dismiss via brain_connect relationship:"not_fulfilled".`;
+        }
+        if (typeof evidenceForCard === 'function') {
+            const evidence = evidenceForCard(c);
+            if (evidence) block += `\n\n${evidence}`;
+            if (h.correction?.by) {
+                const correctionEvidence = evidenceForCard(h.correction.by);
+                if (correctionEvidence) block += `\n\nCorrection ${correctionEvidence}`;
+            }
         }
         if (used + block.length + 2 > budgetChars && shown > 0) { out.push(`\n_…and ${hits.length - shown} more matched card(s) omitted for length — narrow the question or use search for the rest._`); break; }
         out.push(block, '');
@@ -4201,10 +4209,9 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                     j.createdAt = now;
                     j.borderColor = 'rgba(16,185,129,0.6)';
                     if (u.createdVia) j.createdVia = String(u.createdVia);
-                    // Self-heal: a ~ update re-stamps the evidence (fresh OID +
-                    // verifiedAt), so confirming/correcting a drifted fact marks it ✅.
-                    if (Array.isArray(u.evidence) && u.evidence.length) j.evidence = u.evidence;
-                    if (typeof u.verify === 'string' && u.verify.trim()) j.verify = u.verify.trim();
+                    // Omission preserves metadata; explicit empties clear stale anchors.
+                    if (Array.isArray(u.evidence)) { if (u.evidence.length) j.evidence = u.evidence; else delete j.evidence; }
+                    if (typeof u.verify === 'string') { if (u.verify.trim()) j.verify = u.verify.trim(); else delete j.verify; }
                     // guard: replace, DISARM ({remove:true} deletes the machine
                     // field — the only authorable off-switch), or preserve.
                     if (u.guard && typeof u.guard === 'object') {
@@ -5870,7 +5877,7 @@ export function noteToCaptureInput({ text = '', area = '', marker = '', closes =
     if (!body) return { cards: [], resolutions: [], updates: [] };
     const a = String(area || '').trim();
     if (marker === '✓') return { cards: [], resolutions: [{ area: a, text: body }], updates: [] };
-    if (marker === '~') return { cards: [], resolutions: [], updates: [{ area: a, text: body, createdVia, ...(evidence ? { evidence } : {}), ...(verify ? { verify } : {}), ...(guard ? { guard } : {}) }] };
+    if (marker === '~') return { cards: [], resolutions: [], updates: [{ area: a, text: body, createdVia, ...(Array.isArray(evidence) ? { evidence } : {}), ...(typeof verify === 'string' ? { verify } : {}), ...(guard ? { guard } : {}) }] };
     const prefix = marker === '?' ? '❓ ' : marker === '!' ? '🏁 ' : marker === '+' ? '🛠️ ' : '';
     const borderColor = marker === '?' ? 'rgba(245,166,35,0.8)' : marker === '!' ? 'rgba(59,130,246,0.8)' : marker === '+' ? 'rgba(139,92,246,0.85)' : 'rgba(16,185,129,0.6)';
     const tag = a ? `\n#${a.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : '';

@@ -683,6 +683,13 @@ server.registerTool('brain_note', {
     marker: z.enum(['', '?', '!', '+', '✓', '~']).optional().describe('(none)=decision · ?=open question · !=milestone · +=🛠️ skill (reusable how-to/gotcha; always resurfaces, never ages out) · ✓=resolve+archive the best-matching card · ~=update the matching card in place. Default: decision.'),
     area: z.string().optional().describe('Area/topic — routes the card into that titled container and becomes a #tag (e.g. "Auth", "Release").'),
     closes: z.string().optional().describe('Title or [[wikilink]] of a strategy/question card this note fulfils — resolves+archives it and draws a "closed by" arrow.'),
+    evidence: z.array(z.object({
+      kind: z.enum(['file', 'pr', 'url', 'commit', 'run']),
+      ref: z.string().min(1).max(1000).describe('A project-relative file path (optional :line or #Lline), or an external reference. External references are stored without fetching them.'),
+      oid: z.string().optional().describe('Optional full file blob hash from Git; a caller-supplied anchor, not proof of the claim.'),
+      verifiedAt: z.string().optional().describe('Optional caller-reported ISO verification date/time; not independently verified.'),
+    }).strict()).max(16).optional().describe('Supporting references. File bytes are fingerprinted as captured working-tree sources; hashes only detect source changes. On ~, [] clears evidence. Not accepted on resolve; use a milestone with closes to attach new evidence.'),
+    verify: z.string().max(2000).optional().describe('Verification instructions or command text to retain and display. Never executed by KLYPIX. On ~, an empty string clears it.'),
     guard: z.object({
       when: z.object({
         tool: z.string().max(200).optional().describe('Regex matched against the tool name (e.g. "Bash", "Edit|Write").'),
@@ -696,10 +703,10 @@ server.registerTool('brain_note', {
     }).optional().describe("GUARD CARDS: make this '+' skill fire BEFORE a matching tool call runs (Claude Code PreToolUse denies on severity block; other hosts warn), not just resurface in briefs. The card stays a normal 🛠️ rule — ✓-resolving it retires the guard, ~ with {remove:true} disarms it."),
     canvas: z.string().optional().describe('Brain canvas filename/path. Defaults to the project brain ("brain").'),
   },
-}, async ({ text, marker, area, closes, guard, canvas }, extra) => {
+}, async ({ text, marker, area, closes, evidence, verify, guard, canvas }, extra) => {
   // Both 1.77 and 1.78 ride this call: the enrichment question (the asker's
   // vocabulary for retrieval) AND the per-session capture receipt below.
-  const result = await opBrainNote({ vault: mcpPresence.vault, canvas: boundBrainCanvas(canvas), text, area, marker: marker || '', closes, guard, via: extra.klypixClientName, enrichmentQuestion: mcpPresence.declaredIntent });
+  const result = await opBrainNote({ vault: mcpPresence.vault, canvas: boundBrainCanvas(canvas), text, area, marker: marker || '', closes, evidence, verify, guard, via: extra.klypixClientName, enrichmentQuestion: mcpPresence.declaredIntent });
   // Per-session capture receipt — this is what stops the uncaptured-work nudge
   // from firing at a session that DID record its reasoning, just through MCP
   // rather than a 🧠 marker. The Stop hook and this server share one session-id
@@ -707,7 +714,7 @@ server.registerTool('brain_note', {
   // hook reads. Best-effort: a receipt failure must never fail the note.
   try {
     const { recordSessionCapture } = await import('../src/capture-gap.mjs');
-    recordSessionCapture(extra?.klypixRequestIdentity?.sessionId || mcpPresence.id);
+    if (!result.isError) recordSessionCapture(extra?.klypixRequestIdentity?.sessionId || mcpPresence.id, undefined, Date.now(), { project: mcpPresence.vault });
   } catch { /* receipt is best-effort */ }
   return toContent(result);
 });

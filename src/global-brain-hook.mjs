@@ -21,6 +21,7 @@
 // controlled); it is copied to ~/.claude/project-brain/ alongside
 // klypix-format.mjs (+ a node_modules with jszip) where it actually runs.
 
+import { inspectCardEvidence, prepareBrainEvidence } from './brain-evidence.mjs';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -89,14 +90,18 @@ function gitBlobOid(relPath) {
 // are recorded for display (auto-stale on PR merge would need the GitHub API).
 function parseEvidence(s) {
     const refs = [];
-    const today = new Date().toISOString().slice(0, 10);
     for (const tokRaw of String(s).split(',')) {
         const ref = tokRaw.trim(); if (!ref) continue;
         if (/^(?:pr|gh|issue)?\s*#?\d+$/i.test(ref) || /\b(?:PR|GH)\s*#?\d+/i.test(ref)) { refs.push({ ref, kind: 'pr' }); continue; }
         const oid = gitBlobOid(ref);
-        refs.push(oid ? { ref, kind: 'file', oid, verifiedAt: today } : { ref, kind: 'file' });
+        const anchor = ref.match(/#L\d+(?:-L?\d+)?$|:\d+(?::\d+)?$/i)?.[0] || '';
+        const normalizedRef = evidenceGitPath(ref);
+        const normalized = normalizedRef ? normalizedRef + anchor : ref;
+        refs.push(oid ? { ref: normalized, kind: 'file', oid } : { ref: normalized, kind: 'file' });
     }
-    return refs.length ? refs : null;
+    if (!refs.length) return null;
+    const prepared = prepareBrainEvidence({ projectRoot: CWD, evidence: refs });
+    return prepared.ok ? prepared.evidence : refs; // legacy malformed refs remain unverified
 }
 // Pull optional `closes:` / `ev:` / `verify:` suffixes off the END of a marker
 // body (any order), returning the cleaned body + parsed extras. The suffix
@@ -120,37 +125,29 @@ function splitMarkerSuffixes(body) {
     };
 }
 // ── Self-healing brain (decision lifecycle, part 3) ──────────────────────────
-// computeFreshness() is the git-backed TRUST read: every code-anchored card gets
-// ✅ verified / ⚠️ drifted / 🌱 unverified (badged inline in the brief), and the
+// Source fingerprints detect drift, never factual truth: code-anchored cards get
+// source-unchanged / changed / unverified labels (inline in the brief), and the
 // drifted ones become an ACTIONABLE re-verify directive — not a passive nag. The
 // agent repairs each via the SAME ~ / ✓ markers, so a confirmed-or-corrected fact
 // re-stamps itself fresh. The human approves the change in chat (co-owned brain).
-function computeFreshness(struct) {
-    const freshness = {}, drifted = [];
-    try {
-        const isArchived = (c) => /^archive$/i.test(c.area || '');
-        const oidCache = new Map();
-        for (const c of (struct?.cards || [])) {
-            if (isArchived(c) || !Array.isArray(c.evidence) || !c.evidence.length) continue;
-            const fileRefs = c.evidence.filter(e => e?.kind === 'file' && e.oid);
-            if (!fileRefs.length) { freshness[c.id] = '🌱'; continue; }
-            let isDrift = false;
-            const missingRefs = [];
-            for (const ev of fileRefs) {
-                const clean = evidenceGitPath(ev.ref);
-                const cacheKey = clean || `invalid:${ev.ref}`;
-                if (!oidCache.has(cacheKey)) oidCache.set(cacheKey, clean ? gitBlobOid(clean) : null);
-                const cur = oidCache.get(cacheKey);
-                if (!cur) { isDrift = true; missingRefs.push(ev.ref); }
-                else if (cur !== ev.oid) isDrift = true;
-            }
-            if (isDrift) {
-                freshness[c.id] = missingRefs.length ? '⚠️ missing' : '⚠️';
-                drifted.push({ area: c.area, text: c.text, refs: fileRefs.map(e => e.ref), missingRefs });
-            }
-            else freshness[c.id] = '✅';
-        }
-    } catch { /* best-effort */ }
+function computeFreshness(struct, { budgetMs = 150 } = {}) {
+    const freshness = {}, drifted = [], cache = new Map();
+    for (const c of (struct?.cards || [])) {
+        if (/^archive$/i.test(c.area || '') || !Array.isArray(c.evidence) || !c.evidence.length) continue;
+        // Normalize legacy hook absolute paths only after evidenceGitPath's
+        // project check; the shared reader still checks symlink containment.
+        const normalized = { ...c, evidence: c.evidence.map(ev => ev?.kind === 'file'
+            ? { ...ev, ref: evidenceGitPath(ev.ref) || ev.ref } : ev) };
+        const summary = inspectCardEvidence(normalized, { projectRoot: CWD, cache, maxRefs: 16, budgetMs });
+        const sources = summary.sources;
+        const missingRefs = sources.filter(ev => ev.status === 'missing').map(ev => ev.ref);
+        const changed = sources.some(ev => ev.status === 'changed' || ev.status === 'missing');
+        if (changed) {
+            freshness[c.id] = missingRefs.length ? '⚠️ missing' : '⚠️ source changed';
+            drifted.push({ area: c.area, text: c.text, refs: c.evidence.map(ev => ev?.ref).filter(ref => typeof ref === 'string'), missingRefs });
+        } else freshness[c.id] = !summary.omitted && sources.length && sources.every(ev => ev.status === 'source-unchanged')
+            ? '✅ source unchanged' : '🌱 unverified';
+    }
     return { freshness, drifted };
 }
 function selfHealFooter(drifted) {
@@ -159,7 +156,7 @@ function selfHealFooter(drifted) {
     const lines = ['', '---',
         `## 🔧 Self-heal — ${drifted.length} fact(s) cite code that CHANGED or went MISSING; re-verify before trusting them`,
         `For each below: re-read the cited file, decide, then emit ONE marker (the human approves the change in chat):`,
-        '· still true → `🧠 BRAIN [Area] ~: <same claim> ev: <file>` — re-stamps it ✅ fresh',
+        '· still true → `🧠 BRAIN [Area] ~: <same claim> ev: <file>` — records a new source fingerprint; the claim still needs verification',
         '· now wrong → `🧠 BRAIN [Area] ~: <corrected claim> ev: <file>` — rewrites + re-stamps',
         '· obsolete → `🧠 BRAIN [Area] ✓: <what it resolved to>` — closes + archives',
     ];

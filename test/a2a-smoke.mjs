@@ -140,6 +140,19 @@ try {
   ok(!!appendedCard, 'normal-canvas append round-trips on disk');
   ok(appendedCard?.createdVia === 'a2a:claude-code', 'claimed agentName is visibly namespaced as untrusted A2A provenance');
 
+  // Supporting evidence uses the same capture engine even without a marker.
+  fs.writeFileSync(path.join(vault, 'evidence.txt'), 'A2A source fixture\n');
+  const evidenceReply = await rpc('message/send', { message: dataMessage('evidence-capture', 'remember', {
+    canvas: 'brain', cards: [{ text: 'A2A supporting evidence round trip' }],
+    evidence: [{ kind: 'file', ref: 'evidence.txt' }], verify: 'node test/evidence.mjs',
+  }) });
+  const evidenceBrainPath = path.join(vault, 'brain.klypix');
+  const evidenceCard = (await parseKlypix(fs.readFileSync(evidenceBrainPath))).struct.cards.find(c => String(c.text || '').replace(/\s+/g, ' ').includes('A2A supporting evidence round trip'));
+  ok(evidenceReply.json.result?.status?.state === 'completed' && evidenceCard?.evidence?.[0]?.sha256?.length === 64 && evidenceCard.verify === 'node test/evidence.mjs', 'A2A remember preserves evidence and verification without requiring a lifecycle marker');
+  const beforeBadEvidence = fs.readFileSync(evidenceBrainPath);
+  const badEvidence = await rpc('message/send', { message: dataMessage('evidence-invalid', 'remember', { canvas: 'brain', cards: [{ text: 'Bad evidence must not be dropped' }], evidence: [{ kind: 'file', ref: '../outside.txt' }] }) });
+  ok(badEvidence.json.result?.status?.state !== 'completed' && fs.readFileSync(evidenceBrainPath).equals(beforeBadEvidence), 'A2A rejects malformed metadata without writing the brain');
+
   // 5. Concurrent HTTP handlers stay correct up to the explicit in-flight cap.
   const parallelN = 4;
   const beforeParallel = roadmap.counts.cards;

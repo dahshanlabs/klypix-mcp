@@ -20,6 +20,8 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
+import { prepareBrainEvidence, inspectCardEvidence, formatCardEvidence } from './brain-evidence.mjs';
+import { looksLikeUnfilledDraft } from './capture-gap.mjs';
 import { z } from 'zod';
 import {
   parseKlypix, buildKlypix, buildKlypixMap, appendToKlypix, structToMarkdown,
@@ -37,7 +39,7 @@ import {
   readPendingShips, clearPendingShips, pendingShipCards, formatCaptureReceipts,
 } from './klypix-format.mjs';
 import { findProjectBrain, postPresenceMessage } from './agent-presence.mjs';
-import { inspectCardEvidence, formatCardEvidence } from './brain-evidence.mjs';
+
 import { brainCaptureLockPath, vaultCreateLockPath, withAdvisoryWriteLock } from './brain-write-lock.mjs';
 import {
   dot, embedTexts, getEmbedder, getEmbedderForUse, withRerankerForUse,
@@ -642,7 +644,9 @@ export async function opBrainAsk({ vault, canvas, question, as_of, k = 10, log =
     try { statusMd = statusContextToMarkdown(struct); mode += ' + status-mode'; } catch { statusMd = ''; }
   }
   const noticeMd = fallbackNotice ? `> ${fallbackNotice}\n\n` : '';
-  return { blocks: [text(stamp + noticeMd + statusMd + questionContextToMarkdown(q, result, { mode, as_of: timeTravel ? as_of : null }))] };
+  const evidenceCache = new Map();
+  const evidenceForCard = (card) => formatCardEvidence(inspectCardEvidence(card, { projectRoot: path.dirname(t.file), cache: evidenceCache }));
+  return { blocks: [text(stamp + noticeMd + statusMd + questionContextToMarkdown(q, result, { mode, as_of: timeTravel ? as_of : null, evidenceForCard }))] };
 }
 
 // ── brain_challenge — the adversarial brain ───────────────────────────────────
@@ -1243,12 +1247,13 @@ export async function opAddToCanvas({ vault, canvas, cards, connections, via }) 
 // open file any agent reads AND writes": a hookless client (Cursor/Cline/Desktop)
 // can now record a decision, ask an open question, mark a milestone, resolve a card,
 // or correct one — with the full lifecycle, not just a flat append.
-export async function opBrainNote({ vault, canvas, text: noteText, area, marker = '', closes, via, guard = null, enrichmentQuestion = '' }) {
+export async function opBrainNote({ vault, canvas, text: noteText, area, marker = '', closes, via, evidence, verify, guard = null, enrichmentQuestion = '' }) {
   const t = brainTarget(vault, canvas);
   if (t.ambiguous) return ambiguousBrainErr(t.ambiguous);
   if (!t.file) return err(`No brain found — looked for ./brain.klypix in the project, then ${vault}. Pass canvas: "<name>".`);
   const file = t.file;
   if (!noteText || !String(noteText).trim()) return err('brain_note needs a non-empty text.');
+  if (looksLikeUnfilledDraft(noteText)) return err('Complete or discard the draft rationale before capturing it; the brain cannot record an unfilled WHY THIS MATTERS placeholder.');
   if (!['', '?', '!', '✓', '~', '+'].includes(marker)) return err(`Invalid marker "${marker}" — use: (none)=decision · ?=open question · !=milestone · +=skill (reusable how-to) · ✓=resolve a matching card · ~=update a matching card.`);
   // Guard cards (2026-08-24): a guard is authored on a '+' skill (or amended
   // via '~'). Validation is FAIL-LOUD — a malformed guard is an error naming
@@ -1261,7 +1266,9 @@ export async function opBrainNote({ vault, canvas, text: noteText, area, marker 
     if (!v.ok) return err(`Invalid guard: ${v.reason}`);
     guardField = v.guard;
   }
-  const input = noteToCaptureInput({ text: noteText, area, marker, closes: closes || '', guard: guardField, createdVia: via || 'mcp' });
+  const metadata = prepareBrainEvidence({ projectRoot: path.dirname(file), evidence, verify, marker, text: noteText });
+  if (!metadata.ok) return err(`Invalid brain note metadata: ${metadata.error}`);
+  const input = noteToCaptureInput({ text: noteText, area, marker, closes: closes || '', evidence: metadata.evidence, verify: metadata.verify, guard: guardField, createdVia: via || 'mcp' });
   // Deliver any queued out-of-session ship observations on THIS write. The
   // Claude Stop hook is not the only writer — an MCP-only or Codex-driven
   // project would otherwise queue observations that never drain (2026-07-29

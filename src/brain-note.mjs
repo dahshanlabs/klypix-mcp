@@ -16,9 +16,12 @@
 //
 // --marker:  (none)=decision · ?/question · !/milestone · ✓/resolve · ~/update
 // --area X   route into the [Area] container (also a #tag) · --closes "<title>"
+// --evidence '<JSON array>' · --verify '<inert verification text>' (also JSON stdin)
 // Optional trailing path picks a different .klypix (default ./brain.klypix).
 import fs from 'fs';
 import path from 'path';
+import { prepareBrainEvidence } from './brain-evidence.mjs';
+import { looksLikeUnfilledDraft } from './capture-gap.mjs';
 import { captureIntoBrain, tidyBrain, atomicWrite, noteToCaptureInput, formatCaptureReceipts } from './klypix-format.mjs';
 import { brainCaptureLockPath, withAdvisoryWriteLock } from './brain-write-lock.mjs';
 
@@ -33,6 +36,13 @@ function parseArgs(argv) {
         if (a === '--area') out.area = argv[++i] || '';
         else if (a === '--marker' || a === '-m') out.marker = normMarker(argv[++i]);
         else if (a === '--closes') out.closes = argv[++i] || '';
+        else if (a === '--verify') {
+            if (argv[i + 1] === undefined) throw new Error('--verify needs a text argument.');
+            out.verify = argv[++i];
+        }
+        else if (a === '--evidence') {
+            try { out.evidence = JSON.parse(argv[++i]); } catch { throw new Error('--evidence needs a JSON array of references.'); }
+        }
         else rest.push(a);
     }
     // A trailing .klypix/.any token is the target file; the rest is the note text.
@@ -45,19 +55,27 @@ function readStdin() {
     try { if (process.stdin.isTTY) return ''; return fs.readFileSync(0, 'utf8'); } catch { return ''; }
 }
 
-let opts = parseArgs(process.argv.slice(2));
+let opts;
+try { opts = parseArgs(process.argv.slice(2)); }
+catch (e) { console.error(`brain-note: ${e.message}`); process.exit(1); }
 if (!opts.text) {
     const raw = readStdin().trim();
     if (raw) {
         try { const j = JSON.parse(raw); opts = { ...opts, ...j, marker: normMarker(j.marker ?? opts.marker) }; }
-        catch { opts.text = raw; }
+        catch {
+            if (/^[\[{]/.test(raw)) { console.error('brain-note refused (brain unchanged): malformed JSON input.'); process.exit(1); }
+            opts.text = raw;
+        }
     }
 }
 const file = path.resolve(opts.file || 'brain.klypix');
 if (!opts.text) { console.error('brain-note: nothing to write — pass a note as an arg, or JSON/text on stdin.'); process.exit(1); }
 if (!fs.existsSync(file)) { console.error(`brain-note: no brain at ${file} (run from a project with ./brain.klypix, or pass a path).`); process.exit(1); }
 
-const input = noteToCaptureInput({ text: opts.text, area: opts.area, marker: opts.marker, closes: opts.closes, createdVia: 'cli' });
+if (looksLikeUnfilledDraft(opts.text)) { console.error('brain-note refused (brain unchanged): complete or discard the draft rationale before capturing it.'); process.exit(1); }
+const metadata = prepareBrainEvidence({ projectRoot: path.dirname(file), evidence: opts.evidence, verify: opts.verify, marker: opts.marker, text: opts.text });
+if (!metadata.ok) { console.error(`brain-note refused (brain unchanged): ${metadata.error}`); process.exit(1); }
+const input = noteToCaptureInput({ text: opts.text, area: opts.area, marker: opts.marker, closes: opts.closes, evidence: metadata.evidence, verify: metadata.verify, createdVia: 'cli' });
 try {
     // Same cross-process lock as the MCP engine, hooks, and desktop app: an
     // unlocked read-modify-write racing any of them is silent last-writer-wins

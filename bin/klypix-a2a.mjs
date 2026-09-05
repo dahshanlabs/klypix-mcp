@@ -324,14 +324,15 @@ async function runSkill(skill, args, text, via) {
       if (skill === 'learn_skill') marker = '+';
       const single = (!args.cards && text.trim()) ? stripVerb(text) : null;
       if (!marker && single && looksLikeSkill(single)) marker = '+';   // NL "remember this gotcha: always…" → skill
-      if (marker) {
+      if (marker || args.evidence !== undefined || args.verify !== undefined) {
         const noteText = single ?? (Array.isArray(args.cards) && args.cards[0]?.text) ?? '';
         if (!String(noteText).trim()) return needInput('Nothing to capture — send text or a card to remember.');
         if (String(noteText).length > 20_000) return needInput('Captured text must be 20,000 characters or fewer.');
         const requested = args.canvas ?? 'brain';
         const target = confinedCanvas(requested);
         if (!target.ok) return refusedCanvas(requested);
-        return await opBrainNote({ vault: VAULT, canvas: target.canvas, text: noteText, area: args.area, marker, closes: args.closes, via });
+        if (Array.isArray(args.cards) && args.cards.length !== 1) return needInput('Evidence capture requires exactly one card per request.');
+        return await opBrainNote({ vault: VAULT, canvas: target.canvas, text: noteText, area: args.area, marker, closes: args.closes, evidence: args.evidence, verify: args.verify, via });
       }
       // NL convenience: a bare "remember: X" becomes a single card on the brain.
       const cards = args.cards ?? (text.trim() ? [{ text: stripVerb(text) }] : null);

@@ -106,7 +106,7 @@ try {
   // recordEnrichment inside opBrainNote uses the DEFAULT home — the assertion
   // reads the real sidecar path for brain2 under the actual home dir.
   const noteText = 'Retrieval: the enrichment sidecar records the asker vocabulary for every MCP-captured card';
-  const res = await opBrainNote({ vault: proj2, text: noteText, area: 'Retrieval', via: 'test', enrichmentQuestion: 'how do MCP-captured cards learn the words people actually use?' });
+  const res = await opBrainNote({ vault: proj2, canvas: brain2, text: noteText, area: 'Retrieval', via: 'test', enrichmentQuestion: 'how do MCP-captured cards learn the words people actually use?' });
   ok(!res.isError, 'EN4: the note lands');
   const sidecar2 = readEnrichment(brain2, {});
   ok(sidecar2.some((entry) => entry.key === enrichmentKeyFor(noteText)

@@ -5,6 +5,7 @@
 import crypto from 'crypto';
 import fs from 'fs';
 import http from 'http';
+import net from 'net';
 import os from 'os';
 import path from 'path';
 import { spawn } from 'child_process';
@@ -18,9 +19,21 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, '..');
 const BIN = path.join(ROOT, 'bin', 'klypix-a2a.mjs');
 const CORE = path.join(ROOT, 'src', 'klypix-core.mjs');
-const PORT = 41299;
+// Tests on the same host must never connect to another run's fixture. Reserve
+// an ephemeral loopback port, then prove the child identity via its unique token
+// fingerprint before making any write. A bind race fails loudly instead of
+// accepting another healthy server.
+const PORT = await new Promise((resolve, reject) => {
+  const probe = net.createServer();
+  probe.once('error', reject);
+  probe.listen(0, '127.0.0.1', () => {
+    const port = probe.address().port;
+    probe.close(error => error ? reject(error) : resolve(port));
+  });
+});
 const BASE = `http://127.0.0.1:${PORT}`;
-const TEST_TOKEN = 'a2a-smoke-test-token';
+const TEST_TOKEN = `a2a-smoke-${crypto.randomUUID()}`;
+const TOKEN_FINGERPRINT = crypto.createHash('sha256').update(TEST_TOKEN).digest('hex').slice(0, 16);
 
 let failures = 0;
 const ok = (cond, label) => { console.log(`${cond ? '✓' : '✗'} ${label}`); if (!cond) failures++; };
@@ -57,7 +70,12 @@ async function rpc(method, params, { stream = false, headers = {} } = {}) {
 }
 const waitUp = async () => {
   for (let i = 0; i < 50; i++) {
-    try { await getJson('/health'); return; } catch { await sleep(100); }
+    if (srv.exitCode !== null || srv.signalCode !== null) throw new Error(`A2A fixture exited before readiness: ${serverStderr}`);
+    try {
+      const health = await getJson('/health');
+      if (health.json?.auth?.tokenFingerprint === TOKEN_FINGERPRINT && srv.exitCode === null && srv.signalCode === null) return;
+    } catch { /* only our child with our token fingerprint may become ready */ }
+    await sleep(100);
   }
   throw new Error('server never came up');
 };

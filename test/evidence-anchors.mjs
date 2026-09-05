@@ -3,6 +3,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 
@@ -21,6 +22,9 @@ try {
   git('config', 'user.email', 'evidence@example.test');
   fs.writeFileSync(path.join(root, 'kept.txt'), 'v1\n');
   fs.writeFileSync(path.join(root, 'gone.txt'), 'present\n');
+  fs.mkdirSync(path.join(root, 'src', 'GH3OL1'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'src', 'GH3OL1', 'kept.txt'), 'synthetic directory reference\n');
+  fs.writeFileSync(path.join(root, 'src', 'PR123-notes.txt'), 'synthetic filename reference\n');
   git('add', '.');
   git('commit', '-qm', 'fixture');
 
@@ -42,6 +46,23 @@ try {
   ok(gitBlobOid(path.join(root, '..', 'outside.txt')) === null, 'absolute path outside the repository is rejected');
   const parsed = splitMarkerSuffixes(`claim ev: ${absolute}:42`);
   ok(parsed.evidence?.[0]?.oid === keptOid, 'capture stamps an absolute in-repo evidence ref');
+
+  // PR/GH tokens inside real paths must not masquerade as shorthand references.
+  // Exercise both path forms and both anchor styles with actual committed bytes.
+  for (const [relative, anchor] of [['src/GH3OL1/kept.txt', ':42'], ['src/PR123-notes.txt', '#L7']]) {
+    const expectedOid = gitBlobOid(relative);
+    const expectedSha = crypto.createHash('sha256').update(fs.readFileSync(path.join(root, relative))).digest('hex');
+    for (const [form, ref] of [['relative', relative + anchor], ['absolute', path.join(root, relative) + anchor]]) {
+      const captured = splitMarkerSuffixes(`claim ev: ${ref}`).evidence?.[0];
+      ok(Boolean(expectedOid) && captured?.kind === 'file' && captured.ref === relative + anchor
+        && captured.oid === expectedOid && captured.sha256 === expectedSha,
+        `${form} ${relative} remains file evidence with its OID, working fingerprint and anchor`);
+    }
+  }
+  for (const ref of ['PR#123', 'PR 123', 'GH3', 'issue#3', '#3', '123']) {
+    const captured = splitMarkerSuffixes(`claim ev: ${ref}`).evidence?.[0];
+    ok(captured?.kind === 'pr' && captured.ref === ref, `whole-reference shorthand ${ref} remains a PR reference`);
+  }
 
   let result = computeFreshness({ cards: [
     { id: 'fresh', area: 'Test', text: 'fresh fact', evidence: [{ kind: 'file', ref: `${absolute}:42`, oid: keptOid }] },

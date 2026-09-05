@@ -1,6 +1,6 @@
 {
   "name": "klypix-mcp",
-  "version": "1.83.0",
+  "version": "1.84.0",
   "mcpName": "io.github.dahshanlabs/klypix-mcp",
   "description": "Active state management for multi-agent coding: a shared, versioned project brain over MCP.",
   "type": "module",

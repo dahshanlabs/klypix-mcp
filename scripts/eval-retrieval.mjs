@@ -2,6 +2,11 @@
 // Evaluate a frozen project question set through the actual production ranker
 // and semantic runtime. This measures evidence retrieval, not agent task success.
 // Private brains/question sets are supplied by the caller and never bundled.
+// Semantic mode also uses the production machine-local enrichment sidecar: the
+// receipt pins its presence, raw bytes, and TTL-filtered effective entries without
+// disclosing private text. Keep that sidecar unchanged for a comparison; verify
+// both enrichment hashes match. Any mid-run change rejects the output. Lexical
+// mode records enrichment as unused.
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -10,6 +15,12 @@ import { execFileSync } from 'node:child_process';
 
 const hash = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex');
 const flat = (text) => String(text || '').replace(/\s+/g, ' ').trim();
+// Absence is an input state too. Permission/read errors must not be mislabeled
+// absent, and an appearing/disappearing sidecar invalidates a frozen receipt.
+const optionalFileHash = file => {
+  try { return hash(fs.readFileSync(file)); }
+  catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+};
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const usage = 'node scripts/eval-retrieval.mjs --brain PATH --questions PATH --out PATH [--engine PATH] [--mode lexical|semantic]';
 function options(argv) {
@@ -39,16 +50,37 @@ async function main() {
   const { struct } = await lib.parseKlypix(brainBytes);
   const cards = new Map(struct.cards.map(card => [card.id, card]));
   const inputs = { brainSha256: hash(brainBytes), questionsSha256: hash(questionBytes), cards: struct.cards.length, authoredQuestions: questions.length };
-  const sourceFiles = ['klypix-format.mjs', 'semantic-memory.mjs', 'klypix-core.mjs'];
+  const sourceFiles = ['klypix-format.mjs', 'semantic-memory.mjs', 'klypix-core.mjs', 'enrichment.mjs'];
   const sourceHashes = Object.fromEntries(sourceFiles.map(name => [name, hash(fs.readFileSync(moduleFile(name)))]));
   let commit = null;
   try { commit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: args.engine, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { /* hashes remain sufficient to identify source bytes */ }
   const rows = [];
-  let runtime = null, pipe = null, vectors = null;
+  let runtime = null, pipe = null, vectors = null, enrichmentInput = null;
+  inputs.enrichment = { used: false };
   const started = performance.now();
   const configuration = { mode: args.mode, ranker: 'rankForQuestion', k: 20, rerank: false, engineCommit: commit, sourceHashes };
   try {
     if (args.mode === 'semantic') {
+      // Production card vectors include machine-local question enrichment.
+      // Prime that same module/reader before inference, pin raw bytes AND its
+      // TTL-filtered effective entries, then reject any sidecar change. Calling
+      // the shared reader also ensures vectorsForBrain sees this exact array
+      // while the file is unchanged; no hand-copied enrichment algorithm.
+      const enrichment = await import(pathToFileURL(moduleFile('enrichment.mjs')).href);
+      const enrichmentFile = enrichment.enrichmentFileFor(args.brain);
+      const sidecarSha256 = optionalFileHash(enrichmentFile);
+      const enrichmentAt = Date.now();
+      let effectiveEntries = [], readStatus = 'ok';
+      try { effectiveEntries = enrichment.readEnrichment(args.brain, { now: enrichmentAt }); }
+      catch { readStatus = 'fallback-empty'; } // same fallback as production vectors
+      if (!Array.isArray(effectiveEntries)) throw new Error('Production enrichment reader returned invalid input.');
+      if (optionalFileHash(enrichmentFile) !== sidecarSha256) throw new Error('Enrichment input changed while being read; result rejected. Use an immutable snapshot.');
+      enrichmentInput = { file: enrichmentFile, sha256: sidecarSha256 };
+      inputs.enrichment = {
+        used: true, sidecarState: sidecarSha256 === null ? 'absent' : 'present', sidecarSha256,
+        effectiveSha256: hash(JSON.stringify(effectiveEntries)), effectiveEntries: effectiveEntries.length,
+        readStatus, evaluatedAt: new Date(enrichmentAt).toISOString(),
+      };
       runtime = await import(pathToFileURL(moduleFile('semantic-memory.mjs')).href);
       configuration.embedding = { model: runtime.EMBEDDING_MODEL_ID, pooling: runtime.EMBEDDING_POOLING, queryPrefix: runtime.EMBEDDING_QUERY_PREFIX, cacheKey: runtime.EMBEDDING_CACHE_KEY };
       pipe = await runtime.getEmbedderForUse((...items) => console.error(...items), 20_000);
@@ -95,6 +127,9 @@ async function main() {
     const summary = { recallAt1: metric(retrievalAt(1)), recallAt5: metric(retrievalAt(5)), recallAt10: metric(retrievalAt(10)), recallAt20: metric(retrievalAt(20)), mrr: answered.reduce((sum, row) => sum + (row.rank ? 1 / row.rank : 0), 0) / count, excluded: rows.filter(row => row.excluded).length, unknownZeroHits: metric(unknown.filter(row => !row.hitIds.length).length, unknown.length), byStrategy: Object.fromEntries([...new Set(answered.map(row => row.strategy))].map(strategy => { const subset = answered.filter(row => row.strategy === strategy); return [strategy, metric(subset.filter(row => row.rank !== null && row.rank <= 5).length, subset.length)]; })) };
     for (const [file, expected] of [[args.brain, inputs.brainSha256], [args.questions, inputs.questionsSha256], ...sourceFiles.map(name => [moduleFile(name), sourceHashes[name]])]) {
       if (hash(fs.readFileSync(file)) !== expected) throw new Error('An input or engine file changed during evaluation; result rejected. Use an immutable snapshot.');
+    }
+    if (enrichmentInput && optionalFileHash(enrichmentInput.file) !== enrichmentInput.sha256) {
+      throw new Error('Enrichment input changed during evaluation; result rejected. Use an immutable snapshot.');
     }
     const report = { schemaVersion: 1, generatedAt: new Date().toISOString(), scope: 'Frozen project evidence retrieval only; not LLM answer accuracy or agent task success. Unknown-answer labels require human revalidation as the corpus evolves.', inputs, configuration, summary, durationMs: Math.round(performance.now() - started), rows };
     fs.mkdirSync(path.dirname(args.out), { recursive: true });

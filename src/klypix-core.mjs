@@ -526,8 +526,7 @@ export async function opBrainTaskContext({
     lines.push(`### 🛠️ Standing rules (${skillPool.length} in the brain — heed correction and review warnings; full set in the brief)`);
     for (const c of standing) {
       lines.push(`- [${flat(c.area) || 'Notes'}] ${currentGuidancePrefix(overlays.get(c.id))}${clip(c.text, 220)}`);
-      const evidence = formatCardEvidence(evidenceFor(c), { maxChars: 420 });
-      if (evidence) lines.push(evidence);
+
     }
   }
   if (!entries.length) {
@@ -546,11 +545,18 @@ export async function opBrainTaskContext({
       // budget cut removes. It names the ship so the reader can verify it.
       const planStamp = entry.possiblyBuilt ? ` ⏳ POSSIBLY BUILT (a newer 🏁 appears to ship this plan: “${entry.possiblyBuilt.by}” — verify before treating it as only a plan/proposal):` : '';
       lines.push(`- [${entry.area}]${guidanceStamp}${openStamp}${stamp}${planStamp} ${entry.text}`);
-      const evidence = formatCardEvidence(entry.evidence, { maxChars: 420 });
-      if (evidence) lines.push(evidence);
+
       if (lines.join('\n').length >= maxChars) break;
     }
     lines.push('This is a bounded start-of-task capsule, not the whole brain; use brain_ask for broad status/history questions.');
+  }
+  // Optional evidence must never displace the rules or retrieved task facts.
+  // Keep complete, identified blocks only; full metadata remains structured.
+  for (const item of [...entries, ...standing.map(c => ({ id: c.id, evidence: evidenceFor(c) }))]) {
+    const evidence = formatCardEvidence(item.evidence, { maxChars: 420 });
+    if (!evidence) continue;
+    const block = 'Recorded evidence [' + item.id + ']:\n' + evidence;
+    if (lines.join('\n').length + block.length + 1 <= maxChars) lines.push(block);
   }
   const durationMs = Math.max(0, Date.now() - startedAt);
   return {

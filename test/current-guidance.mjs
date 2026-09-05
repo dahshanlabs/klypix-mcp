@@ -136,6 +136,24 @@ try {
   check(evidence.context.hits.some(c => c.evidence?.sources?.some(source => source.ref === 'proof.txt')), 'task capsule carries structured source evidence');
   check(/proof.txt/.test(textOf(evidence)), 'task capsule displays its source evidence');
 
+  // Long optional evidence on unrelated standing rules cannot push the
+  // relevant handoff fact out of the default capsule's text budget.
+  const priorityFact = 'Zebraform parser rollback requires reason code R17 and a retained parser snapshot.';
+  const crowdedRules = Array.from({ length: 3 }, (_, index) => ({
+    id: 'crowded-rule-' + index, text: '🛠️ Historical policy ' + index + ' ' + 'old policy details '.repeat(20),
+    evidence: [{ kind: 'pr', ref: 'PR#' + index }], verify: 'Recorded manual verification instruction '.repeat(40),
+  }));
+  const successors = crowdedRules.map((card, index) => ({ id: 'current-policy-' + index,
+    text: 'Updated policy ' + index + ' ' + 'supported policy detail '.repeat(8) }));
+  fs.writeFileSync(target, await buildKlypix({ title: 'Priority handoff',
+    cards: [...crowdedRules, ...successors, { id: 'task-fact', text: priorityFact }],
+    connections: crowdedRules.map((card, index) => ({ from: card.id, to: successors[index].id, label: 'superseded by' })),
+  }));
+  const priorityContext = await task('Zebraform parser rollback reason code', { k: 1 });
+  check(textOf(priorityContext).includes(priorityFact), 'long evidence cannot starve the relevant task fact');
+  check(textOf(priorityContext).length <= 2800, 'evidence appendix respects the same capsule budget');
+  check(priorityContext.context.standingRules.every(card => card.evidence.verify.text.length > 100), 'omitted optional text remains available as structured evidence');
+
   await makeBrain([oldRule, fix]);
   // The pipeline survives a serialized brain and a fresh operation invocation.
   const restartBefore = await task('The eval harness is broken and its numbers invalid', { k: 1 });

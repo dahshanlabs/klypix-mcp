@@ -420,10 +420,14 @@ const REL = new Set(['leads_to', 'depends_on', 'relates_to', 'conflicts_with', '
 
 /**
  * Build a real .klypix v4 file (nodebuffer) from a simple spec:
- *   { title, cards: [{id?, type?, text, heading?, color?, x?, y?, w?}], connections: [{from, to, relationship?, label?}] }
- * from/to reference a card by INDEX, generated id, or its title (first line).
- * Cards are content-sized and laid out on a BFS-ordered grid so linked cards
- * land near each other.
+ *   { title, cards: [{id?, type?, text, heading?, color?, group?, x?, y?, w?}],
+ *     connections: [{from, to, relationship?, label?}],
+ *     groups?: [{title, cards: [ref…], color?, columns?, width?}], layout?: {groupsPerRow?} }
+ * from/to (and group member refs) reference a card by INDEX, generated id, or
+ * its title (first line). Loose cards are content-sized and laid out on a
+ * BFS-ordered grid so linked cards land near each other. Grouped cards render
+ * inside a titled container in the ORDER LISTED, boxes left-to-right — use
+ * groups for anything read in sequence (steps, phases, sections).
  */
 export async function buildKlypix(spec) {
     if (!spec || !Array.isArray(spec.cards) || spec.cards.length === 0) {
@@ -458,14 +462,62 @@ export async function buildKlypix(spec) {
         };
     }).filter(Boolean);
 
-    // BFS order so connected cards land near each other.
-    const adj = new Map(idByIndex.map(id => [id, []]));
-    for (const c of connections) { adj.get(c.fromId)?.push(c.toId); adj.get(c.toId)?.push(c.fromId); }
-    const indeg = new Map(idByIndex.map(id => [id, 0]));
-    for (const c of connections) indeg.set(c.toId, (indeg.get(c.toId) || 0) + 1);
+    // ── Groups (2026-09-05): titled boxes whose cards stack IN THE ORDER GIVEN.
+    // The BFS grid below is the right shape for a mind-map and the wrong shape
+    // for anything a person reads in sequence — the founder's 27-step App
+    // Review checklist came out with step 1 at the bottom-left, Part 2's steps
+    // scattered, and arrows crossing the whole board, because BFS follows
+    // arrows, not reading order. A group renders as a KLYPIX container (the
+    // same item shape the brain's areas use) with its member cards laid out
+    // top-to-bottom in the order the spec lists them, boxes left-to-right in
+    // spec order. Cards may also name their group inline (`group: "Part 1"`),
+    // which appends them to that box in card order. Ungrouped cards keep the
+    // BFS grid, placed as a band ABOVE the boxes (title card, links, legend).
+    const groupDefs = [];
+    const groupByKey = new Map();
+    const groupOf = new Map(); // cardId → index into groupDefs
+    const groupKey = (t) => String(t ?? '').trim().toLowerCase();
+    const ensureGroup = (g) => {
+        const key = groupKey(g.title);
+        if (!key) throw new Error('every group needs a non-empty "title"');
+        if (groupByKey.has(key)) return groupByKey.get(key);
+        const def = { title: String(g.title).trim(), color: g.color, columns: g.columns, width: g.width, kids: [], _id: `ctn_${rand()}_${groupDefs.length}` };
+        groupByKey.set(key, groupDefs.length);
+        groupDefs.push(def);
+        return groupDefs.length - 1;
+    };
+    // First membership wins — a card listed in two groups stays in the first.
+    const joinGroup = (gi, id) => { if (groupOf.has(id)) return; groupOf.set(id, gi); groupDefs[gi].kids.push(id); };
+    if (spec.groups != null && !Array.isArray(spec.groups)) throw new Error('"groups" must be an array of { title, cards: [...] }');
+    (spec.groups || []).forEach((g, gi0) => {
+        if (!g || typeof g !== 'object') throw new Error(`groups[${gi0}] must be an object with a title and cards`);
+        const gi = ensureGroup(g);
+        (Array.isArray(g.cards) ? g.cards : []).forEach((ref, ci) => {
+            const id = resolveRef(ref);
+            // Loud, not silent: a typo'd ref would otherwise drop the step out of
+            // its box onto the loose grid and the reader would never know.
+            if (!id) throw new Error(`groups[${gi0}] ("${g.title}").cards[${ci}] = ${JSON.stringify(ref)} does not match any card — use its index, id, or exact title`);
+            joinGroup(gi, id);
+        });
+    });
+    cards.forEach(c => { if (c.group != null && String(c.group).trim()) joinGroup(ensureGroup({ title: c.group }), c._id); });
+    const hasGroups = groupDefs.length > 0;
+
+    // BFS order so connected LOOSE cards land near each other. Grouped cards are
+    // excluded from both the walk and the degree count — with no groups this is
+    // byte-for-byte the previous behaviour.
+    const loose = idByIndex.filter(id => !groupOf.has(id));
+    const looseSet = new Set(loose);
+    const adj = new Map(loose.map(id => [id, []]));
+    const indeg = new Map(loose.map(id => [id, 0]));
+    for (const c of connections) {
+        if (!looseSet.has(c.fromId) || !looseSet.has(c.toId)) continue;
+        adj.get(c.fromId).push(c.toId); adj.get(c.toId).push(c.fromId);
+        indeg.set(c.toId, indeg.get(c.toId) + 1);
+    }
     const visited = new Set();
     const order = [];
-    const starts = [...idByIndex].sort((a, b) => (indeg.get(a) - indeg.get(b)) || (idByIndex.indexOf(a) - idByIndex.indexOf(b)));
+    const starts = [...loose].sort((a, b) => (indeg.get(a) - indeg.get(b)) || (idByIndex.indexOf(a) - idByIndex.indexOf(b)));
     for (const s of starts) {
         if (visited.has(s)) continue;
         const q = [s];
@@ -478,11 +530,13 @@ export async function buildKlypix(spec) {
     }
 
     const FONT = 20, PAD = 28, LINE_H = FONT * 1.35;
-    const sizeFor = (card) => {
-        if (card.x != null && card.w != null) return { w: card.w, h: card.h ?? 40 };
+    // forcedW: a grouped card takes its box's column width so the column reads
+    // as one aligned list (and so a one-line step doesn't shrink to a stub).
+    const sizeFor = (card, forcedW = null) => {
+        if (forcedW == null && card.x != null && card.w != null) return { w: card.w, h: card.h ?? 40 };
         const lines = String(card.text ?? '').split('\n');
         const longest = lines.reduce((m, l) => Math.max(m, l.length), 0);
-        const w = Math.max(160, Math.min(360, Math.round(longest * (FONT * 0.55)) + PAD));
+        const w = forcedW ?? Math.max(160, Math.min(360, Math.round(longest * (FONT * 0.55)) + PAD));
         // Wrap-aware height (76eea3f contract): the app renders at width w and
         // wraps at ~0.5em/char; its observer only GROWS an under-estimate, so a
         // long single-line card used to measure 40px and render 150+ → overlap.
@@ -514,6 +568,49 @@ export async function buildKlypix(spec) {
             w, h, zKey: nextZKey(), zIndex: zi++, parentId: null,
         };
     });
+
+    // Group boxes: below the loose band, left-to-right in spec order, wrapping
+    // after `layout.groupsPerRow` (default 4). Inside a box the kids fill one
+    // column top-to-bottom; a long list (>12) or an explicit `columns` splits
+    // into N columns filled column-major, so reading order survives (finish
+    // column 1, then column 2) — never the row-major/masonry orders that put
+    // step 2 beside step 1 instead of under it.
+    const containerItems = new Map(); // ctnId → item json
+    if (hasGroups) {
+        const G = { TITLE_BAR: 44, PAD: 16, GAP: 12, KID_W: 340, COL_GAP: 60, ROW_GAP: 80 };
+        const perRow = Math.max(1, Math.min(8, Math.round(Number(spec.layout?.groupsPerRow)) || 4));
+        const looseBottom = order.length ? Math.max(...order.map(id => positions[id].y + positions[id].h)) : START;
+        let gx = START, gy = order.length ? looseBottom + G.ROW_GAP : START, rowH = 0, inRow = 0;
+        for (const g of groupDefs) {
+            const n = g.kids.length;
+            const kidW = Math.max(200, Math.min(640, Math.round(Number(g.width)) || G.KID_W));
+            const gcols = Math.max(1, Math.min(4, Math.round(Number(g.columns)) || (n > 12 ? 2 : 1)));
+            const perCol = Math.max(1, Math.ceil(n / gcols));
+            const kidSizes = g.kids.map(id => sizeFor(cards[idByIndex.indexOf(id)], kidW));
+            const colHs = new Array(gcols).fill(0);
+            kidSizes.forEach((sz, i) => { colHs[Math.floor(i / perCol)] += sz.h + G.GAP; });
+            const bodyH = Math.max(0, Math.max(0, ...colHs) - G.GAP);
+            const w = G.PAD * 2 + gcols * kidW + (gcols - 1) * G.GAP;
+            const h = G.TITLE_BAR + G.PAD + bodyH + G.PAD;
+            if (inRow >= perRow) { gx = START; gy += rowH + G.ROW_GAP; rowH = 0; inRow = 0; }
+            positions[g._id] = { x: gx, y: gy, w, h, zKey: nextZKey(), zIndex: zi++, parentId: null };
+            order.push(g._id);
+            containerItems.set(g._id, {
+                type: 'container', locked: false, createdAt: now, createdBy: 'agent', ...authorField(),
+                title: g.title, collapsed: false, scopeLocked: false,
+                borderColor: (typeof g.color === 'string' && g.color.trim()) ? g.color.trim() : '#10b981',
+            });
+            const colY = new Array(gcols).fill(gy + G.TITLE_BAR + G.PAD);
+            g.kids.forEach((id, i) => {
+                const c = Math.floor(i / perCol);
+                const { w: kw, h: kh } = kidSizes[i];
+                positions[id] = { x: gx + G.PAD + c * (kidW + G.GAP), y: colY[c], w: kw, h: kh, zKey: nextZKey(), zIndex: zi++, parentId: g._id };
+                colY[c] += kh + G.GAP;
+                order.push(id);
+            });
+            gx += w + G.COL_GAP; rowH = Math.max(rowH, h); inRow++;
+        }
+    }
 
     const itemJson = (card, w) => {
         if (card.type === 'text') {
@@ -562,6 +659,7 @@ export async function buildKlypix(spec) {
     zip.file('manifest.json', JSON.stringify(manifest));
     zip.file('canvas.json', JSON.stringify(canvasJson));
     for (const id of order) {
+        if (containerItems.has(id)) { zip.file(`items/${shard(id)}/${id}.json`, JSON.stringify(containerItems.get(id))); continue; }
         const card = cards[idByIndex.indexOf(id)];
         zip.file(`items/${shard(id)}/${id}.json`, JSON.stringify(itemJson(card, positions[id]?.w)));
     }

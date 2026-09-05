@@ -32,7 +32,7 @@ import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { z } from 'zod';
 import {
-  resolveVault, resolveCanvas, getEmbedder, shouldPrewarmSemantic, cardSchema, connSchema,
+  resolveVault, resolveCanvas, getEmbedder, shouldPrewarmSemantic, cardSchema, connSchema, groupSchema,
   opListCanvases, opReadCanvas, opSearchCanvases, opSearchAllBrains,
   opBrainInsights, opBrainConnect, opCreateCanvas, opAddToCanvas, opBrainNote,
 } from '../src/klypix-core.mjs';
@@ -221,6 +221,7 @@ const a2aCardSchema = cardSchema.extend({
 });
 const cardsArg = z.array(a2aCardSchema).min(1).max(500);
 const connsArg = z.array(connSchema).max(1_000).optional();
+const groupsArg = z.array(groupSchema).max(100).optional();
 
 // Compatibility spellings accepted by the dispatcher but deliberately omitted
 // from the Agent Card. The smoke test asserts every switch case is either
@@ -312,7 +313,9 @@ async function runSkill(skill, args, text, via) {
       }
       const conns = connsArg.safeParse(args.connections);
       if (!conns.success) return needInput('connections must be `[{ "from": <index|title>, "to": <index|title> }]`.');
-      return await opCreateCanvas({ vault: VAULT, title: args.title ?? 'Untitled board', cards: parsed.data, connections: conns.data, filename: args.filename });
+      const groups = groupsArg.safeParse(args.groups);
+      if (!groups.success) return needInput('groups must be `[{ "title": "…", "cards": [<index|title|id>, …] }]` — cards listed in reading order.');
+      return await opCreateCanvas({ vault: VAULT, title: args.title ?? 'Untitled board', cards: parsed.data, connections: conns.data, groups: groups.data, filename: args.filename });
     }
     case 'remember':
     case 'learn_skill': {

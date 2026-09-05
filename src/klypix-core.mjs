@@ -55,12 +55,24 @@ export const cardSchema = z.object({
   text: z.string().describe('Card text. First line is the card title.'),
   heading: z.boolean().optional().describe('Bold title card for the main goal/topic.'),
   color: z.string().optional().describe('Hex color, e.g. #ef4444 for a risk/blocker.'),
+  group: z.string().optional().describe('Put this card inside the titled box of that name (created if missing), in card order. Alternative to listing it in `groups`.'),
 });
 export const connSchema = z.object({
   from: z.union([z.number(), z.string()]).describe('Source card: index (0-based), title, or id.'),
   to: z.union([z.number(), z.string()]).describe('Target card: index, title, or id.'),
   relationship: z.string().optional().describe('leads_to|depends_on|relates_to|conflicts_with|supports|questions|costs|blocks'),
   label: z.string().optional(),
+});
+// Groups (2026-09-05): a titled box whose cards stack top-to-bottom IN THE ORDER
+// GIVEN, boxes left-to-right. The plain grid follows arrows, not reading order,
+// which scatters step 1 far from step 2 — for anything a reader follows in
+// sequence, put the cards in groups.
+export const groupSchema = z.object({
+  title: z.string().describe('Box header, e.g. "Part 1 · Get ready". Also the card\'s area.'),
+  cards: z.array(z.union([z.number(), z.string()])).min(1).describe('Member cards IN READING ORDER — index (0-based), title, or id. They stack top-to-bottom inside the box.'),
+  color: z.string().optional().describe('Hex border color for the box (default emerald).'),
+  columns: z.number().int().min(1).max(4).optional().describe('Split a long list into N columns, filled top-to-bottom then next column. Default 1 (2 when more than 12 cards).'),
+  width: z.number().int().min(200).max(640).optional().describe('Card width inside the box in px (default 340). Use ~520 for long prose cards so they do not become skyscrapers.'),
 });
 
 // ── Vault discovery / resolution ─────────────────────────────────────────────
@@ -1154,21 +1166,22 @@ export async function opBrainConnect({ vault, canvas, apply = false, max = 24, t
   }, { brain: true });
 }
 
-export async function opCreateCanvas({ vault, title, cards, connections, filename }) {
+export async function opCreateCanvas({ vault, title, cards, connections, groups, filename }) {
   if (!fs.existsSync(vault)) { try { fs.mkdirSync(vault, { recursive: true }); } catch { /* ignore */ } }
   // Locked on the VAULT: safeName picks a free name by probing the directory, so
   // two concurrent creates of the same title would both see it free and the second
   // atomicWrite would silently replace the first canvas.
   return withVaultCreateLock(vault, async () => {
     try {
-      const buf = await buildKlypix({ title, cards, connections });
+      const buf = await buildKlypix({ title, cards, connections, groups });
       const name = filename ? safeName(vault, filename.replace(IS_CANVAS, '')) : safeName(vault, title);
       const out = path.join(vault, name);
       await atomicWrite(out, buf);
       let detail = '', struct;
       try { ({ struct } = await parseKlypix(buf)); detail = cardDetailBlock(struct); } catch { /* detail is optional */ }
+      const groupNote = Array.isArray(groups) && groups.length ? `, ${groups.length} group box${groups.length === 1 ? '' : 'es'}` : '';
       return {
-        blocks: [text(`Created ${out} — ${cards.length} cards, ${(connections || []).length} connections. Open it in the KLYPIX app (Canvas → Open).${detail}`)],
+        blocks: [text(`Created ${out} — ${cards.length} cards, ${(connections || []).length} connections${groupNote}. Open it in the KLYPIX app (Canvas → Open).${detail}`)],
         file: { name, buffer: buf }, struct,
       };
     } catch (e) {

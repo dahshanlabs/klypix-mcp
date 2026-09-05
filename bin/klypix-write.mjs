@@ -9,11 +9,15 @@
 //   cat spec.json | node scripts/write-klypix.mjs --out board.klypix
 //
 // Spec:
-//   { "title": "...", "cards": [{ "text": "...", "heading"?, "color"? }],
-//     "connections": [{ "from": 0, "to": 1, "relationship"? }] }
-//   from/to reference a card by INDEX, generated id, or its title (first line).
-//   relationship ∈ leads_to | depends_on | relates_to | conflicts_with |
-//   supports | questions | costs | blocks.
+//   { "title": "...", "cards": [{ "text": "...", "heading"?, "color"?, "group"? }],
+//     "connections": [{ "from": 0, "to": 1, "relationship"? }],
+//     "groups": [{ "title": "Part 1", "cards": [0, 1, 2], "color"?, "columns"?, "width"? }] }
+//   from/to (and group members) reference a card by INDEX, id, or its title
+//   (first line). relationship ∈ leads_to | depends_on | relates_to |
+//   conflicts_with | supports | questions | costs | blocks.
+//   groups: anything read IN ORDER (steps, phases, sections) — each becomes a
+//   titled box with its cards stacked in the order listed, boxes left-to-right.
+//   Loose cards keep the connection-driven grid, as a band above the boxes.
 
 import fs from 'fs';
 import { buildKlypix, atomicWrite } from '../src/klypix-format.mjs';
@@ -41,5 +45,6 @@ const outPath = outArg || `${(spec.title || 'untitled').replace(/[^\w\- ]+/g, ''
 await atomicWrite(outPath, buf);
 const cardCount = spec.cards.length;
 const connCount = Array.isArray(spec.connections) ? spec.connections.length : 0;
-console.log(`Wrote ${outPath} — ${cardCount} cards, ${connCount} connections.`);
+const groupCount = Array.isArray(spec.groups) ? spec.groups.length : 0;
+console.log(`Wrote ${outPath} — ${cardCount} cards, ${connCount} connections${groupCount ? `, ${groupCount} group box${groupCount === 1 ? '' : 'es'}` : ''}.`);
 console.log(`Open it in the KLYPIX app (Canvas → Open), or verify: node scripts/read-klypix.mjs "${outPath}"`);

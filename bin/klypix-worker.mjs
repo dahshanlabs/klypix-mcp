@@ -25,7 +25,7 @@ import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
-  resolveVault, getEmbedder, shouldPrewarmSemantic, buildKlypixMap, cardSchema, connSchema,
+  resolveVault, getEmbedder, shouldPrewarmSemantic, buildKlypixMap, cardSchema, connSchema, groupSchema,
   opListCanvases, opReadCanvas, opSearchCanvases, opSearchAllBrains,
   opBrainInsights, opBrainConnect, opBrainReconcile, opBrainGarden, opCreateCanvas, opAddToCanvas, opBrainNote, opBrainMessage, opBrainAsk, opBrainChallenge, opCanvasView, opBrainLens,
   opBrainTaskContext,
@@ -652,14 +652,15 @@ server.registerTool('brain_garden', {
 
 server.registerTool('create_canvas', {
   title: 'Create a KLYPIX canvas',
-  description: 'Create a new .klypix canvas from cards + connections and save it to the vault. The user opens it in the KLYPIX app (Canvas → Open). Prefer short, titled cards (one idea each) connected by meaningful arrows.',
+  description: 'Create a new .klypix canvas from cards + connections and save it to the vault. The user opens it in the KLYPIX app (Canvas → Open). Prefer short, titled cards (one idea each) connected by meaningful arrows. For anything a person reads IN ORDER — steps, phases, checklists, sections — put the cards in `groups`: each group becomes a titled box with its cards stacked in the order given, boxes left-to-right; the loose grid follows arrows, not reading order, and scatters a sequence.',
   inputSchema: {
     title: z.string().describe('Canvas title (also the filename).'),
-    cards: z.array(cardSchema).min(1).describe('The cards. 5-12 atomic cards is ideal.'),
+    cards: z.array(cardSchema).min(1).describe('The cards. 5-12 atomic cards is ideal for a mind-map; a checklist can be longer when grouped.'),
     connections: z.array(connSchema).optional().describe('Arrows between cards.'),
+    groups: z.array(groupSchema).optional().describe('Titled boxes, each listing its member cards in reading order (index, title, or id). Ungrouped cards form a band above the boxes — good for the title card, a link, a legend.'),
     filename: z.string().optional().describe('Override the output filename (without extension).'),
   },
-}, async ({ title, cards, connections, filename }) => toContent(await opCreateCanvas({ vault: mcpPresence.vault, title, cards, connections, filename })));
+}, async ({ title, cards, connections, groups, filename }) => toContent(await opCreateCanvas({ vault: mcpPresence.vault, title, cards, connections, groups, filename })));
 
 server.registerTool('add_to_canvas', {
   title: 'Add cards to an existing canvas',

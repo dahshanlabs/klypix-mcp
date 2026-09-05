@@ -1,0 +1,50 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
+import { buildKlypixMap, parseKlypix } from '../src/klypix-format.mjs';
+
+const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-retrieval-eval-'));
+const script = fileURLToPath(new URL('../scripts/eval-retrieval.mjs', import.meta.url));
+try {
+  const brain = path.join(tmp, 'brain.klypix');
+  const questions = path.join(tmp, 'questions.json');
+  const out = path.join(tmp, 'result.json');
+  const bytes = await buildKlypixMap({ title: 'evaluation fixture', areas: [{ title: 'Auth', cards: [{ text: 'Auth: refresh token rotation uses a seven day interval for tenant isolation.' }] }] });
+  fs.writeFileSync(brain, bytes);
+  const { struct } = await parseKlypix(bytes);
+  const card = struct.cards.find(item => /seven day/.test(item.text));
+  const q = { q: 'How does auth refresh token rotation work?', strategy: 'paraphrase', goldIds: [card.id], goldTexts: [card.text] };
+  fs.writeFileSync(questions, JSON.stringify({ version: 2, questions: [q, { ...q, goldIds: ['removed-card'] }, { ...q, goldTexts: ['obsolete pinned text'] }, { q: 'zqxv fictional measurement?', strategy: 'unanswerable', goldIds: [], goldTexts: [] }] }));
+  const run = (...more) => spawnSync(process.execPath, [script, '--brain', brain, '--questions', questions, '--out', out, ...more], { encoding: 'utf8', timeout: 30_000 });
+  let result = run();
+  assert.equal(result.status, 0, result.stderr);
+  const report = JSON.parse(fs.readFileSync(out, 'utf8'));
+  assert.equal(report.configuration.mode, 'lexical');
+  assert.equal(report.summary.recallAt1.numerator, 1);
+  assert.equal(report.summary.recallAt1.count, 1);
+  assert.equal(report.summary.excluded, 2);
+  assert.equal(report.summary.unknownZeroHits.count, 1);
+  assert.equal(report.rows[1].excluded, 'all-golds-missing');
+  assert.equal(report.rows[2].excluded, 'all-surviving-golds-drifted');
+  assert.match(report.inputs.brainSha256, /^[a-f0-9]{64}$/);
+  assert.match(report.configuration.sourceHashes['klypix-format.mjs'], /^[a-f0-9]{64}$/);
+  assert.deepEqual(fs.readFileSync(brain), bytes, 'evaluation cannot modify the brain');
+  assert.ok(!fs.readFileSync(out, 'utf8').includes('seven day interval'), 'report omits source contents');
+  const saved = fs.readFileSync(out);
+  result = run();
+  assert.notEqual(result.status, 0, 'existing evidence must not be overwritten');
+  assert.deepEqual(fs.readFileSync(out), saved);
+  result = spawnSync(process.execPath, [script, '--brain', brain, '--questions', questions, '--out', brain], { encoding: 'utf8', timeout: 30_000 });
+  assert.notEqual(result.status, 0);
+  assert.deepEqual(fs.readFileSync(brain), bytes);
+  fs.writeFileSync(questions, JSON.stringify({ questions: [{ ...q, goldTexts: [] }] }));
+  result = run('--out', path.join(tmp, 'invalid.json'));
+  assert.notEqual(result.status, 0, 'invalid gold pin shape fails closed');
+  assert.ok(!fs.existsSync(path.join(tmp, 'invalid.json')));
+  console.log('PASS: production retrieval evaluation pins inputs, separates missing/drifted golds, preserves inputs and refuses overwritten or invalid receipts.');
+} finally {
+  fs.rmSync(tmp, { recursive: true, force: true });
+}

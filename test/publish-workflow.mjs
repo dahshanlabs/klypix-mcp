@@ -1,5 +1,7 @@
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
+import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 
 let failures = 0;
@@ -92,6 +94,87 @@ ok(body(testChain).includes('test/semantic-security.mjs'),
   'the load-bearing suite gate pins the semantic security suite');
 ok(body(tarball).includes('.release-evidence'),
   'release evidence is explicitly forbidden from the consumer tarball');
+
+
+// Exercise the real registry wait block offline: curl and sleep are mocked,
+// while Bash set -e/pipefail and jq parsing run unchanged. Ubuntu CI provides
+// both executables; Windows developers may set BASH_BIN and JQ_BIN explicitly.
+const registryWorkflow = fs.readFileSync(path.join(projectRoot, '.github', 'workflows', 'publish-mcp-registry.yml'), 'utf8').replace(/\r/g, '');
+const registryWait = registryWorkflow.match(/      - name: Wait for npm to carry the ownership marker\n[\s\S]*?        run: \|\n([\s\S]*?)(?=\n      - name:)/)?.[1]
+  .split('\n').map((line) => line.replace(/^          /, '')).join('\n');
+ok(Boolean(registryWait), 'the real MCP Registry ownership wait block is available for execution');
+let bashBin = process.env.BASH_BIN || 'bash';
+if (process.platform === 'win32' && !process.env.BASH_BIN) {
+  const gitBin = spawnSync('where.exe', ['git'], { encoding: 'utf8' }).stdout?.trim().split(/\r?\n/)[0];
+  const gitBash = gitBin && path.resolve(path.dirname(gitBin), '..', 'bin', 'bash.exe');
+  if (gitBash && fs.existsSync(gitBash)) bashBin = gitBash;
+}
+const jqBin = process.env.JQ_BIN || 'jq';
+const bashAvailable = spawnSync(bashBin, ['--version'], { encoding: 'utf8' }).status === 0;
+const jqAvailable = spawnSync(jqBin, ['--version'], { encoding: 'utf8' }).status === 0;
+if (!bashAvailable || !jqAvailable) {
+  if (process.platform !== 'win32' || process.env.CI) ok(false, 'Bash and jq are required for registry wait regressions in CI');
+  else console.log('[skip] registry wait execution needs Bash and jq (set BASH_BIN/JQ_BIN on Windows)');
+} else if (registryWait) {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-registry-wait-'));
+  const shQuote = (value) => "'" + String(value).replace(/'/g, "'\\''") + "'";
+  const marker = 'io.github.dahshanlabs/klypix-mcp';
+  const ready = { body: JSON.stringify({ mcpName: marker }), code: 0 };
+  const scenarios = [
+    { name: 'exact marker succeeds immediately', replies: [ready], attempts: 1, success: true },
+    { name: 'npm 404 JSON string retries until published', replies: [{ body: '"version not found: 1.84.0"', code: 22 }, ready], attempts: 2, success: true },
+    { name: 'transport and HTTP errors cannot pass with matching bodies', replies: [{ ...ready, code: 28 }, { ...ready, code: 22 }, ready], attempts: 3, success: true },
+    { name: 'empty, malformed and scalar metadata retry', replies: ['', '<html>unavailable</html>', 'null', 'true', '42', '"not ready"', '[]'].map((body) => ({ body, code: 0 })).concat(ready), attempts: 8, success: true },
+    { name: 'only the exact top-level string marker passes', replies: [{}, { mcpName: marker.toUpperCase() }, { mcpName: marker + ' ' }, { mcpName: [marker] }, { mcpName: { value: marker } }, { nested: { mcpName: marker } }].map((value) => ({ body: JSON.stringify(value), code: 0 })).concat(ready), attempts: 7, success: true },
+    { name: 'malformed tail after matching metadata retries', replies: [{ body: ready.body + '\nnot JSON', code: 0 }, ready], attempts: 2, success: true },
+    { name: 'multiple JSON values are not one metadata object', replies: [{ body: 'null\n' + ready.body, code: 0 }, { body: ready.body + '\n' + ready.body, code: 0 }, ready], attempts: 3, success: true },
+    { name: 'wrong marker exhausts bounded retries', replies: [{ body: '{"mcpName":"someone-else"}', code: 0 }], attempts: 45, success: false },
+    { name: 'persistent transport failure exhausts bounded retries', replies: [{ body: '', code: 28 }], attempts: 45, success: false },
+  ];
+  try {
+    for (const [index, scenario] of scenarios.entries()) {
+      const countFile = path.join(fixtureRoot, index + '-attempts');
+      const sleepFile = path.join(fixtureRoot, index + '-sleeps');
+      const argsFile = path.join(fixtureRoot, index + '-args');
+      const branches = scenario.replies.map((reply, n) =>
+        '    ' + (n === scenario.replies.length - 1 ? '*' : n + 1) + ') printf %s ' + shQuote(reply.body) + '; return ' + reply.code + ';;'
+      ).join('\n');
+      const script = [
+        'curl() {',
+        '  local count=0',
+        '  if [ -f "$COUNT_FILE" ]; then read -r count < "$COUNT_FILE"; fi',
+        '  count=$((count + 1))',
+        '  printf "%s\\n" "$count" > "$COUNT_FILE"',
+        '  printf "%s\\n" "$*" >> "$ARGS_FILE"',
+        '  case "$count" in', branches, '  esac', '}',
+        'sleep() { printf "%s\\n" "$1" >> "$SLEEP_FILE"; }',
+        'jq() { command "$JQ_BIN" "$@"; }',
+        registryWait,
+      ].join('\n');
+      const result = spawnSync(bashBin, ['--noprofile', '--norc', '-c', script], {
+        encoding: 'utf8', timeout: 20_000,
+        env: { ...process.env, VERSION: '1.84.0', JQ_BIN: jqBin.replace(/\\/g, '/'),
+          COUNT_FILE: countFile.replace(/\\/g, '/'), SLEEP_FILE: sleepFile.replace(/\\/g, '/'), ARGS_FILE: argsFile.replace(/\\/g, '/') },
+      });
+      const attempts = fs.existsSync(countFile) ? Number(fs.readFileSync(countFile, 'utf8').trim()) : 0;
+      const sleeps = fs.existsSync(sleepFile) ? fs.readFileSync(sleepFile, 'utf8').trim().split('\n') : [];
+      ok(result.status === (scenario.success ? 0 : 1) && attempts === scenario.attempts,
+        'registry: ' + scenario.name);
+      ok(sleeps.length === scenario.attempts - (scenario.success ? 1 : 0) && sleeps.every((value) => value === '20'),
+        'registry: ' + scenario.name + ' preserves retry delays');
+      const args = fs.existsSync(argsFile) ? fs.readFileSync(argsFile, 'utf8').trim().split('\n') : [];
+      ok(args.length === scenario.attempts && args.every((value) =>
+        /(?:^| )--fail(?: |$)/.test(value) && value.includes('--max-time 20')
+        && value.includes('https://registry.npmjs.org/klypix-mcp/1.84.0')),
+      'registry: ' + scenario.name + ' bounds version-specific requests and rejects HTTP errors');
+      if (!scenario.success) ok(result.stdout.includes('::error::klypix-mcp@1.84.0'),
+        'registry: retry exhaustion reports the publication prerequisite');
+      if (result.error) console.error(result.error.message);
+    }
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+}
 
 if (failures) {
   console.error(`\n[x] publish-workflow: ${failures} assertion(s) failed`);

@@ -27,7 +27,8 @@ try {
   process.chdir(root);
   process.env.KLYPIX_BRAIN_NO_MAIN = '1';
   const hookUrl = pathToFileURL(path.join(sourceRoot, 'src', 'global-brain-hook.mjs')).href;
-  const { computeFreshness, evidenceGitPath, gitBlobOid, selfHealFooter, splitMarkerSuffixes } = await import(hookUrl);
+  const { computeFreshness: computeBoundedFreshness, evidenceGitPath, gitBlobOid, selfHealFooter, splitMarkerSuffixes } = await import(hookUrl);
+  const computeFreshness = struct => computeBoundedFreshness(struct, { budgetMs: 1000 });
 
   const keptOid = gitBlobOid('kept.txt');
   const goneOid = gitBlobOid('gone.txt');
@@ -45,8 +46,18 @@ try {
   let result = computeFreshness({ cards: [
     { id: 'fresh', area: 'Test', text: 'fresh fact', evidence: [{ kind: 'file', ref: `${absolute}:42`, oid: keptOid }] },
   ] });
-  ok(result.freshness.fresh === '✅' && result.drifted.length === 0,
-    'unchanged absolute evidence remains verified');
+  ok(result.freshness.fresh === '✅ source unchanged' && result.drifted.length === 0,
+    'unchanged absolute evidence is labeled source unchanged, not fact verified');
+
+  fs.writeFileSync(path.join(root, 'kept.txt'), 'working copy changed before commit\n');
+  const dirtyCapture = splitMarkerSuffixes('claim ev: kept.txt:7');
+  ok(Boolean(dirtyCapture.evidence?.[0]?.sha256), 'hook capture fingerprints the actual working file');
+  result = computeFreshness({ cards: [{ id: 'dirty-capture', text: 'working snapshot', evidence: dirtyCapture.evidence }] });
+  ok(result.freshness['dirty-capture'] === '✅ source unchanged', 'a newly captured dirty file compares against its working snapshot, not HEAD');
+  result = computeFreshness({ cards: [{ id: 'legacy-dirty', text: 'old HEAD anchor', evidence: [{ kind: 'file', ref: 'kept.txt', oid: keptOid }] }] });
+  ok(result.freshness['legacy-dirty'] === '⚠️ source changed', 'legacy HEAD evidence does not hide uncommitted source changes');
+  result = computeFreshness({ cards: [{ id: 'malformed', text: 'old malformed metadata', evidence: [null, { kind: 'file', ref: 'missing.txt', oid: keptOid }] }] });
+  ok(result.freshness.malformed === '⚠️ missing', 'malformed historical entries do not crash missing-source recall');
 
   git('mv', 'gone.txt', 'renamed.txt');
   fs.writeFileSync(path.join(root, 'kept.txt'), 'v2\n');
@@ -57,8 +68,8 @@ try {
     { id: 'changed', area: 'Test', text: 'changed-file fact', evidence: [{ kind: 'file', ref: 'kept.txt', oid: keptOid }] },
   ] });
   ok(result.freshness.missing === '⚠️ missing', 'renamed/deleted evidence is badged missing, never verified');
-  ok(result.freshness.changed === '⚠️', 'content-changed evidence remains badged drifted');
-  ok(result.drifted.find((entry) => entry.text === 'renamed-file fact')?.missingRefs?.[0] === 'gone.txt:9',
+  ok(result.freshness.changed === '⚠️ source changed', 'content-changed evidence remains badged drifted');
+  ok(result.drifted.find((entry) => entry.text === 'renamed-file fact')?.missingRefs?.[0] === 'gone.txt',
     'missing reference is carried into the repair receipt');
   const footer = selfHealFooter(result.drifted);
   ok(/CHANGED or went MISSING/.test(footer) && /⚠️ missing/.test(footer),

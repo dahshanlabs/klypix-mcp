@@ -23,13 +23,16 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { spawnSync } from 'child_process';
+import { spawnSync, execFileSync } from 'child_process';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { fileURLToPath } from 'url';
 import { buildKlypixMap } from '../src/klypix-format.mjs';
 import {
     captureGapDecision, captureGapReason, draftCaptureMarker, inferArea, WHY_SLOT,
     looksLikeUnfilledDraft, readCaptureGapState, recordCaptureGapNudge, recordSessionCapture,
     sessionHasCaptured, recordTaskBaseline, readTaskBaseline, clearTaskBaseline,
+    sessionCaptureReceipt, outcomeWasNudged, captureTranscriptWindow, recordTranscriptWindow,
 } from '../src/capture-gap.mjs';
 
 process.env.KLYPIX_BRAIN_NO_MAIN = '1';
@@ -124,9 +127,51 @@ ok(/brain_note/.test(advice) && !/Stop hook/.test(advice), 'advise mode (no life
     fs.rmSync(dir, { recursive: true, force: true });
 }
 
+// Outcome receipts stay scoped, bounded, and never store transcript prose.
+{
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-outcomes-'));
+    const file = path.join(dir, 'state.json');
+    recordTaskBaseline('same', { head: 'aaa', project: dir }, file, 100);
+    recordSessionCapture('same', file, 110, { project: dir, head: 'bbb' });
+    ok(sessionCaptureReceipt('same', dir, file)?.head === 'bbb', 'capture checkpoints the observed HEAD');
+    ok(sessionCaptureReceipt('peer', dir, file) === null, 'peer captures cannot cover this session');
+    ok(sessionCaptureReceipt('same', path.join(dir, 'other'), file) === null, 'same session in another project has no capture receipt');
+    recordCaptureGapNudge('same', file, 'outcome-a');
+    ok(outcomeWasNudged('same', 'outcome-a', file), 'an outcome has its own reminder receipt');
+    ok(!outcomeWasNudged('same', 'outcome-b', file), 'later outcomes remain nudgeable');
+    const lines = ['private transcript line'];
+    const first = captureTranscriptWindow('same', dir, lines, file, 120);
+    recordTranscriptWindow('same', dir, first, file);
+    ok(captureTranscriptWindow('same', dir, [...lines, 'new line'], file).start === 1, 'append-only reminder scan resumes after the prior outcome');
+    ok(captureTranscriptWindow('same', dir, ['replacement'], file).start === 0, 'replacement transcript starts a fresh outcome');
+    ok(!fs.readFileSync(file, 'utf8').includes('private transcript line'), 'reminder bookkeeping stores hashes, never transcript text');
+    const crowded = readCaptureGapState(file);
+    for (let i = 0; i < 305; i++) {
+        crowded.receipts['prior-' + i] = { at: i, head: 'abc', project: dir };
+        crowded.windows['prior-' + i] = { count: 1, digest: 'abc', at: i };
+    }
+    fs.writeFileSync(file, JSON.stringify(crowded));
+    recordSessionCapture('newest', file, 600, { project: dir, head: 'abc' });
+    recordTranscriptWindow('newest', dir, { count: 1, digest: 'abc', at: 600 }, file);
+    const state = readCaptureGapState(file);
+    ok(Object.keys(state.receipts).length === 300 && Object.keys(state.windows).length === 300, 'outcome receipt storage is bounded');
+    fs.rmSync(dir, { recursive: true, force: true });
+}
+ok(captureGapDecision({ commitTotal: 3, commitCards: 1, env: {} }) !== null,
+    'one rationale commit does not hide two undocumented commits');
+ok(captureGapDecision({ commitTotal: 3, commitCards: 3, env: {} }) === null,
+    'an outcome covered by rationale commits stays silent');
+ok(/cause/.test(WHY_SLOT) && /attempts rejected/.test(WHY_SLOT) && /working solution/.test(WHY_SLOT)
+    && /verification/.test(WHY_SLOT) && /ONLY where observed/.test(WHY_SLOT),
+    'solution draft asks for grounded experience and omits unknown parts');
+ok(/never invent/.test(captureGapReason({ draft })), 'draft instructs against invented rationale or test results');
+const untrustedDraft = draftCaptureMarker({ area: 'Unsafe]\n[other', commits: [{ subject: 'fix: literal $(do-not-run)\nsecond line' }] });
+ok(!untrustedDraft.line.includes('\n') && !/\[other\]/.test(untrustedDraft.line), 'artifact facts and area cannot inject extra draft lines');
+ok(untrustedDraft.line.includes('$(do-not-run)'), 'command-shaped artifact prose stays literal data in the review draft');
+
 // ── E2E — the real hook ──────────────────────────────────────────────────────
-const home = path.join(os.tmpdir(), 'klypix-gap-home');
-const proj = path.join(os.tmpdir(), 'klypix-gap-proj');
+const home = path.join(os.tmpdir(), `klypix-gap-home-${process.pid}`);
+const proj = path.join(os.tmpdir(), `klypix-gap-proj-${process.pid}`);
 for (const d of [home, proj]) fs.rmSync(d, { recursive: true, force: true });
 fs.mkdirSync(path.join(home, '.claude', 'project-brain'), { recursive: true });
 fs.mkdirSync(path.join(proj, '.claude'), { recursive: true });
@@ -162,7 +207,9 @@ ok(/🧠 BRAIN \[/.test(shipped.stderr) && shipped.stderr.includes(WHY_SLOT),
    'the refusal hands over a ready-to-emit DRAFT, not homework');
 
 const again = runStop([TXT('Nothing durable here.'), SHELL('t2', 'gh pr merge 407 --squash')], 's-gap-1');
-ok(again.code === 0, `the SAME session is never nudged twice (exit ${again.code}, want 0)`);
+ok(again.code === 2, `a NEW ship in the same session is a new outcome (exit ${again.code}, want 2)`);
+const replay = runStop([TXT('Nothing durable here.'), SHELL('t2', 'gh pr merge 407 --squash')], 's-gap-1');
+ok(replay.code === 0, 'replaying unchanged work does not repeat the outcome reminder');
 
 const active = runStop([TXT('still nothing'), SHELL('t3', 'gh pr merge 408 --squash')], 's-gap-2', { stop_hook_active: true });
 ok(active.code === 0, `stop_hook_active suppresses the nudge (exit ${active.code}, want 0)`);
@@ -174,7 +221,13 @@ ok(captured.code === 0, `a session that captured is never nudged (exit ${capture
 ok(sessionHasCaptured('s-gap-3', path.join(home, '.claude', 'project-brain', '.capture-gap.json')),
    'an authored capture writes this session\'s receipt');
 const laterTurn = runStop([TXT('shipping the follow-up'), SHELL('t5', 'gh pr merge 410 --squash')], 's-gap-3');
-ok(laterTurn.code === 0, `a later turn of a session that already captured stays quiet (exit ${laterTurn.code}, want 0)`);
+ok(laterTurn.code === 2, `an earlier capture does not hide a later outcome (exit ${laterTurn.code}, want 2)`);
+const appendHistory = [TXT('🧠 BRAIN [Format]: initial rationale worth retaining for this test.'), SHELL('history1', 'gh pr merge 510 --squash')];
+runStop(appendHistory, 's-gap-history');
+const appended = runStop([...appendHistory, TXT('shipping follow-up silently'), SHELL('history2', 'gh pr merge 511 --squash')], 's-gap-history');
+ok(appended.code === 2, 'an old marker in an append-only transcript cannot silence a new ship');
+const appendedAgain = runStop([...appendHistory, TXT('shipping follow-up silently'), SHELL('history2', 'gh pr merge 511 --squash'), TXT('No further durable detail.')], 's-gap-history');
+ok(appendedAgain.code === 0, 'a reply to an outcome reminder without new artifacts stays quiet');
 
 // A PEER writing the shared brain must NOT buy silence for a session that
 // shipped and said nothing — the defect the mtime-based first cut had.
@@ -211,6 +264,46 @@ ok(quiet.code === 0, `a session with no artifacts exits 0 as always (exit ${quie
     runStop([TXT(filledLine)], 's-gap-filled');
     ok((await cardsIn()).some((t) => /permanent and binds every future schema change/.test(t)),
        'the FILLED draft round-trips through the real marker parser into a real card');
+}
+
+// MCP completion: task boundaries and a capture's HEAD checkpoint, exercised
+// through the real worker. git arguments are arrays; no draft text is executed.
+{
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-outcome-mcp-'));
+    const project = path.join(root, 'project'), workerHome = path.join(root, 'home');
+    fs.mkdirSync(project, { recursive: true });
+    fs.mkdirSync(workerHome, { recursive: true });
+    fs.writeFileSync(path.join(project, 'brain.klypix'), await buildKlypixMap({ title: 'brain', areas: [{ title: 'Test', cards: [{ text: 'fixture' }] }] }));
+    const git = (...args) => execFileSync('git', args, { cwd: project, stdio: 'ignore' });
+    git('init', '-q'); git('config', 'user.name', 'Outcome test'); git('config', 'user.email', 'outcome@example.test');
+    git('add', 'brain.klypix'); git('commit', '-qm', 'fixture');
+    let commit = 0;
+    const land = (body = '') => {
+        fs.writeFileSync(path.join(project, 'work.txt'), String(++commit));
+        git('add', 'work.txt');
+        git('commit', '-qm', 'fix: outcome ' + commit, ...(body ? ['-m', body] : []));
+    };
+    const client = new Client({ name: 'outcome-test', version: '1.0' }, { capabilities: {} });
+    const transport = new StdioClientTransport({ command: process.execPath,
+        args: [path.join(path.dirname(HOOK), '..', 'bin', 'klypix-worker.mjs'), '--vault', project], cwd: project,
+        env: { ...process.env, HOME: workerHome, USERPROFILE: workerHome, KLYPIX_SESSION_ID: 'outcome-test', KLYPIX_AUTO_UPDATE: '0' }, stderr: 'pipe' });
+    const text = (r) => r.content?.map(c => c.text || '').join('\n') || '';
+    const sync = (phase) => client.callTool({ name: 'brain_sync', arguments: { project, phase, ...(phase === 'start' ? { intent: 'Test outcome capture', files: ['work.txt'], include_context: false } : {}) } });
+    const note = () => client.callTool({ name: 'brain_note', arguments: { area: 'Test', text: 'Earlier verified outcome ' + commit + ': record why this result matters for future tasks.' } });
+    try {
+        await client.connect(transport);
+        await sync('start'); await note(); land(); land();
+        ok(/UNCAPTURED WORK/.test(text(await sync('complete'))), 'MCP: early note cannot hide two later commits in the same task');
+        ok(!/UNCAPTURED WORK/.test(text(await sync('complete'))), 'MCP: repeated completion without new work stays quiet');
+        await sync('start'); land(); land();
+        ok(/UNCAPTURED WORK/.test(text(await sync('complete'))), 'MCP: the next task in the same session remains nudgeable');
+        await sync('start'); land(); land(); await note();
+        ok(!/UNCAPTURED WORK/.test(text(await sync('complete'))), 'MCP: a successful note after the commits covers that outcome');
+        await sync('start'); land('The causal change is documented here so future work can reuse the fix.'); land('The verification and applicability are documented for this second outcome.');
+        ok(!/UNCAPTURED WORK/.test(text(await sync('complete'))), 'MCP: rationale-bearing commits remain valid capture');
+        await sync('start'); land('One rationale exists but it does not describe the following fixes.'); land(); land();
+        ok(/UNCAPTURED WORK/.test(text(await sync('complete'))), 'MCP: one rationale commit does not cover two later undocumented commits');
+    } finally { await client.close(); fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 }
 
 // The gap is also durably observable, per-project, for anyone auditing later.

@@ -89,12 +89,12 @@ const skillCard = { id: 's1', type: 'text', area: 'Chat', createdAt: D0, text: I
 {
     const struct = mkStruct([skillCard, INCIDENT_MILE]);
     const brief = structToBrief(struct);
-    ok(/a newer 🏁 may have removed this limitation/.test(brief), 'brief: flagged skill carries the ⚠️ suffix');
+    ok(/RULE MAY BE OBSOLETE/.test(brief), 'brief: flagged skill carries the ⚠️ prefix');
 }
 {
     const advice = { id: 's3', type: 'text', area: 'Canvas', createdAt: D0, text: '🛠️ never white-stroke selected items — boost width/opacity instead' };
     const brief = structToBrief(mkStruct([advice, INCIDENT_MILE]));
-    ok(!/a newer 🏁 may have removed this limitation/.test(brief), 'brief: evergreen advice stays unflagged');
+    ok(!/RULE MAY BE OBSOLETE/.test(brief), 'brief: evergreen advice stays unflagged');
 }
 
 // ── capture-time: receipt + persisted edge, and the skill survives ───────────

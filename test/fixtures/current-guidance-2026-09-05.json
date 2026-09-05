@@ -1,0 +1,17 @@
+{
+  "description": "Entirely synthetic regression data. Invented identifiers, dates, and narratives model a stale evaluation limitation followed by a repair milestone that also contains reusable skill advice. No project-memory records or measured results are included.",
+  "cards": [
+    {
+      "id": "synthetic-eval-limitation",
+      "text": "Brain: 🛠️ THE EVAL HARNESS IS BROKEN AND ITS NUMBERS ARE INVALID.\nIn this invented example, scripts/eval-semantic.mjs cannot run the evaluation harness embedding checks. Its local embedding helper has no production query-prefix normalization. The synthetic harness keeps a separate implementation of pooling and batch selection, so its example rankings do not describe the production semantic-memory.mjs path. Before relying on this fictional limitation, check for a later repair milestone.",
+      "createdAt": 1704067200000,
+      "area": "Brain"
+    },
+    {
+      "id": "synthetic-eval-repair",
+      "text": "Brain: 🏁 EVAL HARNESS FIXED AND EXAMPLE CHECKS NOW RUN.\nThe fictional scripts/eval-semantic.mjs evaluation harness now runs its embedding checks through the production semantic-memory.mjs path. The harness imports the production helper for query-prefix normalization, pooling, and batch selection instead of maintaining another implementation. This is a synthetic repair record with no measured performance result.\n🛠️ Reusable lesson for this example: evaluation harnesses should import the primitive they intend to measure.",
+      "createdAt": 1704153600000,
+      "area": "Brain"
+    }
+  ]
+}

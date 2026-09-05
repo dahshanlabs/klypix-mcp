@@ -1828,7 +1828,9 @@ export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMile
     if (focus.length) {
         push('', '## 📌 Human focus (cards the human placed here — act on these first)');
         let shown = 0;
-        for (const c of focus.slice(0, 20)) { push(`- ${fr(c)}${flat(c.text)}${odBadge(c)}`); shown++; }
+        let guidance = new Map();
+        try { guidance = currentGuidanceFor(struct, focus.slice(0, 20)); } catch { /* optional overlay */ }
+        for (const c of focus.slice(0, 20)) { push(`- ${fr(c)}${currentGuidancePrefix(guidance.get(c.id))}${flat(c.text)}${odBadge(c)}`); shown++; }
         if (shown < focus.length) push(`- ⚠️ …and ${focus.length - shown} MORE focus card(s) — read them (MCP search) before acting; this list is NOT complete.`);
     }
     if (open.length) {
@@ -1867,49 +1869,14 @@ export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMile
         // the SHOWN clause-bearing skills × milestones newer than the oldest
         // of them (milestone token sets built once, lazily — most briefs have
         // zero clause-bearing skills and pay nothing).
-        const staleBySkill = new Map();
-        try {
-            const shownSkills = skills.slice(0, maxSkills);
-            const persisted = obsolescenceOverlaysFor(struct, shownSkills);
-            for (const [id, o] of persisted) staleBySkill.set(id, o.by);
-            const clauseSkills = shownSkills
-                .filter(c => !staleBySkill.has(c.id))
-                .map(c => ({ c, claims: extractLimitationClaims(c.text) }))
-                .filter(x => x.claims.length);
-            if (clauseSkills.length) {
-                const oldest = Math.min(...clauseSkills.map(x => x.c.createdAt || 0));
-                const newerMiles = miles.filter(m => (m.createdAt || 0) > oldest);
-                if (newerMiles.length) {
-                    const settled = new Set();
-                    for (const cn of struct.connections || []) {
-                        if (cn.label === 'may obsolete' || DISMISSAL_RELS.has(cn.relationship)) settled.add(`${cn.fromId}|${cn.toId}`);
-                    }
-                    const mPre = newerMiles.map(m => ({ m, idx: stemIndex(tokenSet(m.text)) }));
-                    let df = null;
-                    const dfMap = () => (df ??= buildStemDf(struct));
-                    for (const { c, claims } of clauseSkills) {
-                        let best = null, bestScore = 0;
-                        for (const { m, idx: mIdx } of mPre) {
-                            if ((m.createdAt || 0) <= (c.createdAt || 0) || settled.has(`${c.id}|${m.id}`)) continue;
-                            for (const cl of claims) {
-                                const clIdx = stemIndex(cl.tokens);
-                                const cov = coverageOf(new Set(clIdx.keys()), new Set(mIdx.keys()));
-                                const anchors = sharedAnchors(clIdx, mIdx, dfMap(), { exclude: structuralStems(c.area, m.area) });
-                                if (!serveTimeAccepts({ cov, anchors, size: clIdx.size }, (c.area || '') === (m.area || ''))) continue;
-                                const score = cov + anchors.length * 0.2;
-                                if (score > bestScore) { bestScore = score; best = m; }
-                            }
-                        }
-                        if (best) staleBySkill.set(c.id, flat(best.text).slice(0, 70));
-                    }
-                }
-            }
-        } catch { /* staleness suffix is best-effort — never break the brief */ }
+        let guidance = new Map();
+        try { guidance = currentGuidanceFor(struct, skills.slice(0, maxSkills)); }
+        catch { /* optional guidance must not break the brief */ }
         let shown = 0;
         for (const c of skills.slice(0, maxSkills)) {
             if (used > BUDGET_CHARS * 0.85) break;
-            const ob = staleBySkill.get(c.id);
-            push(`- ${fr(c)}${flat(c.text)}${ob ? ` ⚠️ a newer 🏁 may have removed this limitation (“${ob}…”) — verify before applying; ~ amend, closes:<its title> to retire, or dismiss via brain_connect not_fulfilled` : ''}`);
+            const status = guidance.get(c.id);
+            push(`- ${fr(c)}${currentGuidancePrefix(status)}${flat(c.text)}`);
             shown++;
         }
         if (shown < skills.length) push(`- …and ${skills.length - shown} more skill(s) — search the brain.`);
@@ -2042,7 +2009,9 @@ export function structToUltraBrief(struct, { freshness = null, briefPath = '.cla
     const clip = (s, n) => { const t = flat(s); return t.length > n ? safeCut(t, n - 1) : t; };
     if (focus.length && pushIf('') && pushIf('## 📌 Human focus (act on these first)')) {
         let shown = 0;
-        for (const c of focus) { if (!pushIf(`- ${fr(c)}${head(c, 400)}`)) break; shown++; }
+        let guidance = new Map();
+        try { guidance = currentGuidanceFor(struct, focus); } catch { /* optional overlay */ }
+        for (const c of focus) { if (!pushIf(`- ${fr(c)}${currentGuidancePrefix(guidance.get(c.id))}${head(c, 400)}`)) break; shown++; }
         // Never present a truncated "act on these first" list as complete.
         if (shown < focus.length) push(`- ⚠️ …and ${focus.length - shown} MORE focus card(s) — read the full brief before acting.`);
     }
@@ -2074,10 +2043,12 @@ export function structToUltraBrief(struct, { freshness = null, briefPath = '.cla
                 .reduce((s, l) => s + l.length + 1, 0)
             : 0;
         const pushIfFenced = (l) => (used + l.length + 1 > budget - reserve) ? false : (push(l), true);
-        if (pushIfFenced('') && pushIfFenced(`## 🛠️ Standing rules (${skills.length} — newest first, apply always)`)) {
-            const newest = skills.slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+        if (pushIfFenced('') && pushIfFenced(`## 🛠️ Standing rules (${skills.length} — newest first; heed correction and review warnings)`)) {
+            const newest = skills.slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)).slice(0, 5);
+            let guidance = new Map();
+            try { guidance = currentGuidanceFor(struct, newest); } catch { /* optional overlay */ }
             let shown = 0;
-            for (const c of newest.slice(0, 5)) { if (!pushIfFenced(`- ${fr(c)}${head(c)}`)) break; shown++; }
+            for (const c of newest) { if (!pushIfFenced(`- ${fr(c)}${currentGuidancePrefix(guidance.get(c.id))}${head(c)}`)) break; shown++; }
             if (shown < skills.length) pushIfFenced(`- …and ${skills.length - shown} more standing rule(s) — in the full brief.`);
         }
     }
@@ -2512,7 +2483,7 @@ export function rankForQuestion(struct, question, { semantic = null, k = 10, as_
 // instructs the agent to answer the question directly (cite cards, honor
 // corrections, admit gaps), then each hit full-text with provenance + lifecycle +
 // its correction. Char-budgeted so a huge brain can't blow the tool result.
-export function questionContextToMarkdown(question, result, { mode = 'lexical', as_of = null, budgetChars = 9000 } = {}) {
+export function questionContextToMarkdown(question, result, { mode = 'lexical', as_of = null, budgetChars = 9000, evidenceForCard = null } = {}) {
     const { hits, total } = result;
     const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
     const day = (ts) => ts ? new Date(ts).toISOString().slice(0, 10) : '';
@@ -2554,6 +2525,14 @@ export function questionContextToMarkdown(question, result, { mode = 'lexical', 
             // reader to verify, never to inherit the machine's guess — but the
             // DIRECTION flips: for current capability, trust the NEWER card.
             block += `\n\n  ⚠️ RULE MAY BE OBSOLETE${h.obsolescence.unconfirmed ? ' (serve-time hint — no confirmed link)' : ''}: this skill asserts a limitation${h.obsolescence.clause ? ` — “${flat(h.obsolescence.clause).slice(0, 140)}”` : ''} that a newer milestone appears to REMOVE: “${flat(h.obsolescence.by).slice(0, 200)}”. For current capability trust the newer card; VERIFY before citing this limitation as still true. If obsolete, amend the skill (~ marker), or retire it deliberately by NAMING it in a closes: (fuzzy ✓/supersede never touch a 🛠️); if it still holds, dismiss via brain_connect relationship:"not_fulfilled".`;
+        }
+        if (typeof evidenceForCard === 'function') {
+            const evidence = evidenceForCard(c);
+            if (evidence) block += `\n\n${evidence}`;
+            if (h.correction?.by) {
+                const correctionEvidence = evidenceForCard(h.correction.by);
+                if (correctionEvidence) block += `\n\nCorrection ${correctionEvidence}`;
+            }
         }
         if (used + block.length + 2 > budgetChars && shown > 0) { out.push(`\n_…and ${hits.length - shown} more matched card(s) omitted for length — narrow the question or use search for the rest._`); break; }
         out.push(block, '');
@@ -4328,10 +4307,9 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                     j.createdAt = now;
                     j.borderColor = 'rgba(16,185,129,0.6)';
                     if (u.createdVia) j.createdVia = String(u.createdVia);
-                    // Self-heal: a ~ update re-stamps the evidence (fresh OID +
-                    // verifiedAt), so confirming/correcting a drifted fact marks it ✅.
-                    if (Array.isArray(u.evidence) && u.evidence.length) j.evidence = u.evidence;
-                    if (typeof u.verify === 'string' && u.verify.trim()) j.verify = u.verify.trim();
+                    // Omission preserves metadata; explicit empties clear stale anchors.
+                    if (Array.isArray(u.evidence)) { if (u.evidence.length) j.evidence = u.evidence; else delete j.evidence; }
+                    if (typeof u.verify === 'string') { if (u.verify.trim()) j.verify = u.verify.trim(); else delete j.verify; }
                     // guard: replace, DISARM ({remove:true} deletes the machine
                     // field — the only authorable off-switch), or preserve.
                     if (u.guard && typeof u.guard === 'object') {
@@ -5489,6 +5467,87 @@ export function formatCaptureReceipts(stats, { maxEach = 3 } = {}) {
     return lines;
 }
 
+// One serve-time overlay for selected standing rules. Only limitation-bearing
+// skills pay for the brain-wide scan; thresholds match the existing recall/brief
+// path. This changes delivery, never ranking, capture, retirement, or stored data.
+export function skillObsolescenceFor(struct, cards, { milestones = null, pairSim = null } = {}) {
+    const skills = (cards || []).filter(c => isSkillCard(c) && !/^archive$/i.test(c.area || '') && !/↩|⤵/.test(c.text || ''));
+    const out = obsolescenceOverlaysFor(struct, skills);
+    const fresh = skills.filter(c => !out.has(c.id))
+        .map(c => ({ c, claims: extractLimitationClaims(c.text) })).filter(x => x.claims.length);
+    if (!fresh.length) return out;
+    const oldest = Math.min(...fresh.map(x => x.c.createdAt || 0));
+    // A milestone may ALSO teach a protected rule (the real repaired-eval
+    // card does). Keep its skill status; only recognize its headline shipment
+    // as evidence here. Quoted milestone glyphs inside advice cannot qualify.
+    const recordsMilestone = m => isMilestoneCard(m) || (isSkillCard(m)
+        && MILE_GLYPH.test(String(m.text || '').split('\n', 1)[0])
+        && !OPEN_GLYPH.test(String(m.text || '').split('\n', 1)[0]));
+    const miles = (milestones || struct.cards).filter(m => recordsMilestone(m)
+        && !/^archive$/i.test(m.area || '') && !/↩|⤵/.test(m.text || '') && (m.createdAt || 0) > oldest);
+    if (!miles.length) return out;
+    const settled = new Set();
+    for (const cn of struct.connections || []) {
+        if (cn.label === 'may obsolete' || DISMISSAL_RELS.has(cn.relationship)) {
+            settled.add(cn.fromId + '|' + cn.toId);
+            if (DISMISSAL_RELS.has(cn.relationship)) settled.add(cn.toId + '|' + cn.fromId);
+        }
+    }
+    const mPre = miles.map(m => ({ m, idx: stemIndex(tokenSet(m.text)) }));
+    let df = null;
+    const dfMap = () => (df ??= buildStemDf(struct));
+    for (const { c, claims } of fresh) {
+        let best = null, bestScore = 0, bestClause = null;
+        const claimIndices = claims.map(cl => ({ cl, idx: stemIndex(cl.tokens) }));
+        for (const { m, idx: mIdx } of mPre) {
+            if (m.id === c.id || (m.createdAt || 0) <= (c.createdAt || 0) || settled.has(c.id + '|' + m.id)) continue;
+            const sim = typeof pairSim === 'function' ? pairSim(c.id, m.id) : null;
+            for (const { cl, idx: clIdx } of claimIndices) {
+                const cov = coverageOf(new Set(clIdx.keys()), new Set(mIdx.keys()));
+                const anchors = sharedAnchors(clIdx, mIdx, dfMap(), { exclude: structuralStems(c.area, m.area) });
+                const lex = { cov, anchors, size: clIdx.size };
+                const accept = (sim != null && sim >= 0.55 && lex.size >= SERVE_MIN_STEMS && (anchors.length >= 1 || cov >= 0.2))
+                    || serveTimeAccepts(lex, (c.area || '') === (m.area || ''));
+                if (!accept) continue;
+                const score = (sim ?? 0) + cov + anchors.length * 0.2;
+                if (score > bestScore) { bestScore = score; best = m; bestClause = cl.clause; }
+            }
+        }
+        if (best) out.set(c.id, { by: String(best.text || '').replace(/\s+/g, ' ').trim().slice(0, 100), byId: best.id, clause: bestClause, unconfirmed: true });
+    }
+    return out;
+}
+
+// Confirmed graph edges outrank candidate obsolescence, across context tiers.
+export function currentGuidanceFor(struct, cards) {
+    const out = new Map();
+    const corrections = correctionOverlaysFor(struct, cards);
+    for (const [id, correction] of corrections) out.set(id, { correction });
+    const hints = skillObsolescenceFor(struct, (cards || []).filter(c => !out.has(c.id)));
+    for (const [id, obsolescence] of hints) out.set(id, { obsolescence });
+    return out;
+}
+
+// Prefix before old text: clipping must never leave an unqualified stale rule.
+export function currentGuidancePrefix(guidance, { excerptChars = 100 } = {}) {
+    if (!guidance) return '';
+    const clip = value => {
+        const text = String(value || '').replace(/\s+/g, ' ').trim();
+        let excerpt = text.slice(0, excerptChars);
+        if (/[\uD800-\uDBFF]$/.test(excerpt)) excerpt = excerpt.slice(0, -1);
+        return excerpt + (text.length > excerpt.length ? '…' : '');
+    };
+    if (guidance.correction) {
+        const by = guidance.correction.by;
+        return 'CURRENT CORRECTION [' + by.id + ']: ' + clip(by.text) + ' — superseded guidance: ';
+    }
+    if (guidance.obsolescence) {
+        const by = guidance.obsolescence;
+        return '⚠️ RULE MAY BE OBSOLETE (candidate; verify before applying; newer milestone [' + by.byId + ']: “' + clip(by.by) + '”) — original rule: ';
+    }
+    return '';
+}
+
 // Persisted-edge overlay reader for 'may obsolete' hints — the 🛠️ twin of
 // fulfillmentOverlaysFor, same rules: dismissals win, a since-archived
 // milestone no longer vouches, machine-written hints stay hedged forever.
@@ -5916,7 +5975,7 @@ export function noteToCaptureInput({ text = '', area = '', marker = '', closes =
     if (!body) return { cards: [], resolutions: [], updates: [] };
     const a = String(area || '').trim();
     if (marker === '✓') return { cards: [], resolutions: [{ area: a, text: body }], updates: [] };
-    if (marker === '~') return { cards: [], resolutions: [], updates: [{ area: a, text: body, createdVia, ...(evidence ? { evidence } : {}), ...(verify ? { verify } : {}), ...(guard ? { guard } : {}) }] };
+    if (marker === '~') return { cards: [], resolutions: [], updates: [{ area: a, text: body, createdVia, ...(Array.isArray(evidence) ? { evidence } : {}), ...(typeof verify === 'string' ? { verify } : {}), ...(guard ? { guard } : {}) }] };
     const prefix = marker === '?' ? '❓ ' : marker === '!' ? '🏁 ' : marker === '+' ? '🛠️ ' : '';
     const borderColor = marker === '?' ? 'rgba(245,166,35,0.8)' : marker === '!' ? 'rgba(59,130,246,0.8)' : marker === '+' ? 'rgba(139,92,246,0.85)' : 'rgba(16,185,129,0.6)';
     const tag = a ? `\n#${a.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : '';

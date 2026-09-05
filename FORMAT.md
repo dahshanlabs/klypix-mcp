@@ -132,6 +132,18 @@ strings: `text`, `box`, `image`, `file`, `container`, `approval`, `link`,
 `createdBy` (`user` | `agent`) and the optional `createdVia` (which agent/channel
 captured it) are the provenance bits the brain surfaces as badges and lenses.
 
+Brain cards may also carry `evidence` and `verify`. An evidence reference has `kind`
+(`file`, `pr`, `url`, `commit`, or `run`), `ref`, optional caller-supplied file blob `oid`,
+and optional caller-reported ISO `verifiedAt`. The host-neutral capture API rejects
+unknown input fields, unsafe file paths, and malformed metadata before writing.
+It adds `capturedAt`; readable local files up to 2 MiB also receive a SHA-256 `sha256`
+and `sourceBasis: "working-tree"`. Optional `headRevision` identifies HEAD at capture,
+which does not imply the captured working bytes were committed. Legacy `oid`-only
+references are read with both HEAD and working-file changes considered. These fields
+describe source provenance and change detection, never factual verification.
+`verify` is retained text, not executable configuration. All these optional fields
+survive the format codec and capture lifecycle; an explicit empty amendment clears them.
+
 The optional **`author`** answers the question a team actually asks: `createdBy` says
 *what* wrote a card, `author` says *whose*. It is resolved from `git config user.name`
 so brain attribution matches commit attribution with no configuration (override with

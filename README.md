@@ -346,6 +346,30 @@ there are no lifecycle hooks on those hosts.
 
 ## Capture and corrections
 
+`brain_note` accepts structured supporting references and inert verification text:
+
+```json
+{
+  "text": "Retry failed uploads with a bounded backoff to preserve queued work.",
+  "area": "Storage",
+  "evidence": [{ "kind": "file", "ref": "src/uploads.mjs:42" }],
+  "verify": "node test/uploads.mjs"
+}
+```
+
+File references must stay inside the project. The capture records a fingerprint of the
+working file and, when available, the repository HEAD revision. An unchanged fingerprint
+means **source unchanged**, not that the remembered claim is correct or that tests passed.
+Dirty working files are fingerprinted as they are; HEAD alone does not describe those bytes.
+Read results distinguish changed, missing, and unverified sources. External references
+(`pr`, `url`, `commit`, `run`) are retained without fetching or verifying them. `verify` is
+shown as recorded text and never executed. Optional `verifiedAt` is explicitly caller-reported.
+
+On an amendment (`marker: "~"`), omitted metadata is preserved; `evidence: []` and
+`verify: ""` clear obsolete metadata. A resolve (`✓`) archives existing evidence; attach
+new evidence with a milestone and `closes`, or amend before resolving. The CLI accepts the
+same JSON on stdin, or `--evidence '<JSON array>'` and `--verify '<text>'`.
+
 On Claude Code, decisions are captured automatically at turn end from inline `🧠 BRAIN [Area]:`
 markers in the transcript, deduped, under a capture lock.
 

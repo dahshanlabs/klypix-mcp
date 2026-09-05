@@ -938,32 +938,34 @@ server.registerTool('brain_sync', {
         if (head) gap.recordTaskBaseline(sid, { head, project: projectDir });
       } else if (phase === 'complete' && projectDir && sid) {
         const baseline = gap.readTaskBaseline(sid);
-        if (baseline?.head) {
-          // An ancestry check first: a rebase/reset makes the range meaningless,
-          // and reporting a rewritten history as "commits you didn't record" is
-          // exactly the cry-wolf that gets a nudge switched off.
-          const reachable = gitOk(['merge-base', '--is-ancestor', baseline.head, 'HEAD']);
-          const count = reachable ? Number(gitOut(['rev-list', '--count', '--no-merges', `${baseline.head}..HEAD`]) || 0) : 0;
+        const sameProject = baseline?.project && path.resolve(baseline.project) === path.resolve(projectDir);
+        if (sameProject && baseline?.head) {
+          // A successful note checkpoints the observed HEAD only. Work committed
+          // after that note belongs to a new outcome even in the same task/session.
+          const receipt = gap.sessionCaptureReceipt(sid, projectDir);
+          let from = baseline.head;
+          if (receipt?.head && receipt.at >= baseline.at
+              && gitOk(['merge-base', '--is-ancestor', baseline.head, receipt.head])
+              && gitOk(['merge-base', '--is-ancestor', receipt.head, 'HEAD'])) from = receipt.head;
+          const reachable = gitOk(['merge-base', '--is-ancestor', from, 'HEAD']);
+          const range = from + '..HEAD';
+          const count = reachable ? Number(gitOut(['rev-list', '--count', '--no-merges', range]) || 0) : 0;
           if (count > 0) {
-            const subjects = gitOut(['log', '--no-merges', '--format=%s', `${baseline.head}..HEAD`])
+            const subjects = gitOut(['log', '--no-merges', '--format=%s', range])
               .split('\n').map((s) => s.trim()).filter(Boolean).slice(0, 5);
-            // Bodies decide whether ANY rationale was recorded — the same rule
-            // the hook uses, so the two halves never disagree about one session.
-            const withRationale = gitOut(['log', '--no-merges', '--format=%x1e%b', `${baseline.head}..HEAD`])
+            const withRationale = gitOut(['log', '--no-merges', '--format=%x1e%b', range])
               .split('\x1e').map((b) => b.replace(/\s+/g, ' ').trim()).filter((b) => b.length >= 12).length;
+            const outcome = projectDir + ':' + gitOut(['rev-parse', 'HEAD']);
             const decision = gap.captureGapDecision({
               commitTotal: count,
               commitCards: withRationale,
-              sessionCaptured: gap.sessionHasCaptured(sid),
+              alreadyNudged: gap.outcomeWasNudged(sid, outcome),
             });
             if (decision) {
-              const changed = gitOut(['diff', '--name-only', `${baseline.head}..HEAD`]).split('\n').filter(Boolean).slice(0, 20);
-              const draft = gap.draftCaptureMarker({
-                commits: subjects.map((subject) => ({ subject })),
-                filesTouched: changed,
-              });
+              const changed = gitOut(['diff', '--name-only', range]).split('\n').filter(Boolean).slice(0, 20);
+              const draft = gap.draftCaptureMarker({ commits: subjects.map((subject) => ({ subject })), filesTouched: changed });
               captureGapText = gap.captureGapReason({ ...decision, draft, mode: 'advise' });
-              gap.recordCaptureGapNudge(sid);
+              gap.recordCaptureGapNudge(sid, undefined, outcome);
             }
           }
         }

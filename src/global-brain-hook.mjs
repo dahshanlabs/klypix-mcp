@@ -1885,10 +1885,10 @@ async function gatherCommitCards(prevCommit) {
 //     rationale-bearing commit card either. A good commit body IS capture.
 //   • needs a real artifact: a ship event (PR merge / release / publish / tag),
 //     a push, ≥2 new commits, or ≥6 files edited this session.
-//   • silent if brain.klypix itself changed inside the session window — brain_note,
-//     an MCP verb, or a peer already fed it. A busy multi-session project therefore
-//     nudges rarely, which is the right direction: false silence beats false nagging.
-//   • at most ONCE per session (stop_hook_active, plus a durable session list for
+//   • silent when this outcome carries authored rationale, or a successful note
+//     from this session covers its latest observed artifact. A peer's capture
+//     and an earlier outcome never exempt later work.
+//   • at most ONCE per observed outcome (stop_hook_active plus a bounded cursor for
 //     hosts that don't set it), and off entirely with KLYPIX_BRAIN_NUDGE=off.
 // The decision, the draft and the per-session bookkeeping live in
 // src/capture-gap.mjs so the Stop hook and brain_sync(complete) answer the same
@@ -2546,6 +2546,15 @@ async function capture(lib) {
     }
     const scopeStartedAt = Number(scopeRow.scopeStartedAt || 0);
     const hasScopeBoundary = Number(scopeRow.scopeGeneration || 0) > 0 || scopeStartedAt > 0;
+    // Reminder accounting uses only the new transcript suffix; marker capture
+    // below still scans the complete history to recover uncaptured notes.
+    let gapLib = null, gapWindow = null;
+    try {
+        gapLib = await import(new URL('./capture-gap.mjs', import.meta.url).href);
+        gapWindow = gapLib.captureTranscriptWindow(String(input.session_id || ''), CWD, lines);
+    } catch { /* older flat bundle: reminder stays best-effort */ }
+    const gapPaths = new Set(), gapShellCmds = [], gapErrorIds = new Set();
+    let gapAuthored = 0, gapLatestArtifactAt = 0;
     const seen = readState();
     const cards = [];
     const resolutions = [];
@@ -2603,6 +2612,18 @@ async function capture(lib) {
                 : (!hasScopeBoundary || (Number.isFinite(entryAt) && entryAt >= scopeStartedAt))
         );
         if (entryInScope) noteFiles(filesInEntry(e));
+        const entryInGap = gapWindow && transcriptIndex >= gapWindow.start;
+        if (entryInGap) {
+            const paths = filesInEntry(e).map(projRelPath).filter(Boolean);
+            for (const p of paths) if (gapPaths.size < 100) gapPaths.add(p);
+            const oldShellCount = gapShellCmds.length;
+            scanToolBlocks(e, gapShellCmds, gapErrorIds);
+            if (paths.length || gapShellCmds.length > oldShellCount) {
+                // No timestamp is unknown coverage, never proof a prior MCP note
+                // covers this artifact. The new marker count remains usable.
+                gapLatestArtifactAt = Number.isFinite(entryAt) ? Math.max(gapLatestArtifactAt, entryAt) : Infinity;
+            }
+        }
         scanToolBlocks(e, shellCmds, errorIds);
         const um = e?.message ?? e;
         if (um?.role === 'user') {
@@ -2701,6 +2722,7 @@ async function capture(lib) {
                 if (seen.has(key)) { ledger.push({ action: 'skipped-seen', area, preview }); continue; }
                 seen.add(key);
             }
+            if (entryInGap) gapAuthored++;
             // ✓ resolves an EXISTING card (stamped ✅ + archived) — not a new card.
             if (type === '✓') { resolutions.push({ area, text: body }); ledger.push({ action: 'resolve', area, preview }); continue; }
             // ~ updates the matching card in place (small corrections).
@@ -2862,32 +2884,42 @@ async function capture(lib) {
     // writes stderr + sets the exit code, so the rest of capture() proceeds
     // untouched. Lazy, typeof-guarded import: a stale flat deployment without
     // capture-gap.mjs simply doesn't nudge.
-    const AUTHORED_ACTIONS = new Set(['add-decision', 'add-question', 'add-milestone', 'add-skill', 'resolve', 'update', 'skipped-seen']);
-    const authoredCount = ledger.filter(d => AUTHORED_ACTIONS.has(d.action)).length;
     if (!DRY) {
         try {
             const gapLib = await import(new URL('./capture-gap.mjs', import.meta.url).href);
             if (typeof gapLib.captureGapDecision === 'function') {
                 const sid = String(input.session_id || '');
-                const state = gapLib.readCaptureGapState();
+                const newShipSummaries = [];
+                for (const { id, cmd } of gapShellCmds) {
+                    if (errorIds.has(id) || gapErrorIds.has(id)) continue;
+                    for (const pattern of SHIP_PATTERNS) {
+                        const match = pattern.re.exec(cmd); if (!match) continue;
+                        let detail = (match[1] || '').trim();
+                        if (!detail && pattern.num) { const num = pattern.num.exec(cmd); if (num) detail = '#' + num[1]; }
+                        newShipSummaries.push(pattern.kind + (detail ? ' ' + detail : ''));
+                    }
+                }
+                const receipt = gapLib.sessionCaptureReceipt?.(sid, CWD);
+                const capturedThisOutcome = receipt && gapLatestArtifactAt > 0
+                    && Number.isFinite(gapLatestArtifactAt) && receipt.at >= gapLatestArtifactAt
+                    && (!newLastCommit || receipt.head === newLastCommit);
                 const gap = gapLib.captureGapDecision({
-                    authored: authoredCount,
+                    authored: gapAuthored,
                     commitTotal,
                     commitCards: commitCards.length,
-                    shipped: shipSummaries,
-                    pushed: shellCmds.some(({ id, cmd }) => !errorIds.has(id) && /\bgit\s+push\b/i.test(cmd)),
-                    filesTouched: recentPaths.length,
-                    // Per-SESSION, not per-file: a peer writing the shared brain
-                    // must never silence the session that shipped and said nothing.
-                    sessionCaptured: Boolean(sid && state.captured[sid]),
+                    shipped: newShipSummaries,
+                    pushed: gapShellCmds.some(({ id, cmd }) => !errorIds.has(id) && /\bgit\s+push\b/i.test(cmd)),
+                    filesTouched: gapPaths.size,
+                    sessionCaptured: Boolean(capturedThisOutcome),
                     stopHookActive: input.stop_hook_active === true,
-                    alreadyNudged: Boolean(sid && state.nudged.includes(sid)),
+                    alreadyNudged: gapWindow ? gapLib.outcomeWasNudged?.(sid, gapWindow.outcome) : true,
                 });
+                if (gapWindow) gapLib.recordTranscriptWindow(sid, CWD, gapWindow);
                 if (gap) {
                     const draft = typeof gapLib.draftCaptureMarker === 'function'
-                        ? gapLib.draftCaptureMarker({ shipped: shipSummaries, commits: commitEntries, filesTouched: recentPaths })
+                        ? gapLib.draftCaptureMarker({ shipped: newShipSummaries, commits: commitEntries, filesTouched: [...gapPaths] })
                         : null;
-                    gapLib.recordCaptureGapNudge(sid);
+                    gapLib.recordCaptureGapNudge(sid, undefined, gapWindow.outcome);
                     // fs.writeSync, not process.stderr.write — this is followed by
                     // an immediate exit, and a piped stderr write can be async.
                     try { fs.writeSync(2, gapLib.captureGapReason({ ...gap, draft, mode: 'refuse' })); } catch { /* */ }
@@ -3102,14 +3134,14 @@ async function capture(lib) {
     }
     appendJsonl(LEDGER, { ts: nowIso(), mode: 'capture', stats, decisions: ledger }, 1000);
     appendJsonl(HEALTH, { ts: nowIso(), project: path.basename(CWD), mode: 'capture', ok: true, brainBytes: brainBytes(), added: stats.added, skipped: ledger.filter(d => d.action.startsWith('skipped')).length }, 500);
-    // Per-session capture receipt — the silence rule for a LATER turn of this same
-    // session. Only AUTHORED capture counts: a session whose only cards were
+    // Per-outcome capture receipt. Only newly AUTHORED capture counts: a session
+    // whose only cards were
     // machine-harvested ships/commits has still recorded no reasoning, and must
     // stay nudgeable. brain_note (MCP) writes the same receipt for the same id.
-    if (authoredCount > 0 && stats.added + (stats.resolved || 0) + (stats.updated || 0) > 0) {
+    if (gapAuthored > 0 && stats.added + (stats.resolved || 0) + (stats.updated || 0) > 0) {
         try {
             const gapLib = await import(new URL('./capture-gap.mjs', import.meta.url).href);
-            gapLib.recordSessionCapture?.(String(input.session_id || ''));
+            gapLib.recordSessionCapture?.(String(input.session_id || ''), undefined, Date.now(), { project: CWD, head: newLastCommit || '' });
         } catch { /* receipt is best-effort */ }
     }
 }

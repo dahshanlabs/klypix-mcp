@@ -85,10 +85,14 @@ jobs:
         run: |
           set -euo pipefail
           for i in $(seq 1 45); do
-            MARKER="$(curl -sSL --max-time 20 \
+            # Missing versions may be JSON strings; failed HTTP/transport or
+            # invalid metadata is not ready. Keep the whole pipeline inside
+            # the condition so set -e cannot abort before the next attempt.
+            if curl --fail -sSL --max-time 20 \
               "https://registry.npmjs.org/klypix-mcp/${VERSION}" 2>/dev/null \
-              | jq -r '.mcpName // empty')"
-            if [ "$MARKER" = "io.github.dahshanlabs/klypix-mcp" ]; then
+              | jq -se 'length == 1 and (.[0] | if type == "object" then
+                  .mcpName == "io.github.dahshanlabs/klypix-mcp" else false end)' \
+                  >/dev/null 2>&1; then
               echo "npm carries mcpName for ${VERSION}"; exit 0
             fi
             echo "npm not ready (attempt $i) — waiting"; sleep 20

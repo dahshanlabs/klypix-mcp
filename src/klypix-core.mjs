@@ -659,7 +659,9 @@ export async function opBrainAsk({ vault, canvas, question, as_of, k = 10, log =
   // so this call inherits them with no options needed (now defaults inside).
   let statusMd = '';
   if (result.statusStrong && !timeTravel) {
-    try { statusMd = statusContextToMarkdown(struct); mode += ' + status-mode'; } catch { statusMd = ''; }
+    // Area scope (1.85.0): rankForQuestion HAS the struct and resolved the
+    // prompt's area families to exact titles; null keeps the whole-brain render.
+    try { statusMd = statusContextToMarkdown(struct, { areas: result.areas || null }); mode += ' + status-mode'; } catch { statusMd = ''; }
   }
   const noticeMd = fallbackNotice ? `> ${fallbackNotice}\n\n` : '';
   const evidenceCache = new Map();

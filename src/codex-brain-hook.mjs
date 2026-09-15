@@ -2,6 +2,7 @@
 // Codex lifecycle adapter for the agent-neutral KLYPIX presence lane.
 // It never reads Codex's unstable transcript format and never modifies the brain.
 import { execFileSync } from 'child_process';
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import {
@@ -310,6 +311,51 @@ function queueConflictAlerts({ brainPath, sessionId, intent, conflicts, turnId, 
   return queued;
 }
 
+// ── Status digest, Codex lane (1.85.0) ───────────────────────────────────────
+// Parity with the Claude hook's T8 injection: a STRONG status-shaped prompt
+// ("do i need to update the desk? ios? or web?", "ما تبقى") gets the engine's
+// COMPUTED current-state digest INSTEAD of card retrieval — same detector
+// (splitQueryTokens), same area scoping (areaHintsFromPrompt, resolved only
+// once the struct is loaded), same renderer and header, and the same
+// per-session sha1 dedup (a repeat gets a one-line pointer). Every engine
+// export is typeof-guarded so a stale bundle degrades to the task-context
+// path below, never a throw. Returns null when the prompt is not a status
+// question — the caller then runs today's retrieval unchanged.
+async function statusDigestContext({ brainPath, sessionId, prompt, sessions, cwd }) {
+  const lib = brainFormat;
+  if (!prompt || typeof lib.splitQueryTokens !== 'function' || typeof lib.areaStatusDigest !== 'function'
+    || typeof lib.parseKlypix !== 'function') return null;
+  let sp = null;
+  try { sp = lib.splitQueryTokens(String(prompt)); } catch { return null; }
+  if (!sp || !sp.strong) return null;
+  let struct = null;
+  try { ({ struct } = await lib.parseKlypix(fs.readFileSync(brainPath))); } catch { return null; }
+  if (!struct) return null;
+  let areas = null;
+  if (Array.isArray(sp.areaFamilies) && sp.areaFamilies.length && typeof lib.areaHintsFromPrompt === 'function') {
+    try { areas = lib.areaHintsFromPrompt(struct, String(prompt)); } catch { areas = null; }
+  }
+  let digest = [];
+  try { digest = lib.areaStatusDigest(struct, { maxAreas: 12, areas }); } catch { return null; }
+  if (!Array.isArray(digest) || !digest.length) return null;
+  let body = null;
+  if (typeof lib.statusContextToMarkdown === 'function') {
+    try {
+      const md = lib.statusContextToMarkdown(struct, { budgetChars: 5200, areas });
+      // Drop its own H1; the hook's stronger header replaces it (Claude-lane parity).
+      if (md && md.trim()) body = md.split('\n').slice(1).join('\n').trimEnd();
+    } catch { body = null; }
+  }
+  const content = body || digest.join('\n');
+  const h = crypto.createHash('sha1').update(content).digest('hex').slice(0, 12);
+  const me = (Array.isArray(sessions) ? sessions : []).find((session) => session.id === sessionId);
+  if (me && me.statusDigestHash === h) {
+    return '## 📊 Current state — unchanged since the digest shown earlier this session (`brain_ask` gives the full computed status view).';
+  }
+  try { upsertSession({ brainPath, id: sessionId, client: 'codex', cwd, statusDigestHash: h }); } catch { /* best-effort */ }
+  return ['## 📊 Computed current state (status-shaped question detected — answer from THIS + `brain_ask`, never from memory of past sessions)', content].join('\n');
+}
+
 async function compactTaskContext(projectDir, prompt, files) {
   if (!prompt) return '';
   try {
@@ -430,7 +476,10 @@ async function main() {
   }
   if (event === 'UserPromptSubmit') {
     const me = sessions.find((session) => session.id === sessionId);
-    const context = await compactTaskContext(projectDir, prompt,
+    // A STRONG status question is answered from computed state and REPLACES
+    // card retrieval (never additive) — the Claude hook's `freshHits = []`.
+    const statusMd = await statusDigestContext({ brainPath, sessionId, prompt, sessions, cwd });
+    const context = statusMd ?? await compactTaskContext(projectDir, prompt,
       [...new Set([...(me?.files || []), ...(me?.observedFiles || [])])]);
     emitSystemMessage([
       context,

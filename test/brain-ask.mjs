@@ -9,7 +9,7 @@
 //   • the output is a synthesis INSTRUCTION, not a raw dump
 //
 // Run:  node test/brain-ask.mjs        (exit 0 = pass, 1 = fail)
-import { buildKlypixMap, parseKlypix, rankForQuestion, questionContextToMarkdown } from '../src/klypix-format.mjs';
+import { buildKlypixMap, parseKlypix, rankForQuestion, questionContextToMarkdown, statusContextToMarkdown } from '../src/klypix-format.mjs';
 
 let failures = 0;
 const ok = (cond, label) => { console.log(`${cond ? '✓' : '✗'} ${label}`); if (!cond) failures++; };
@@ -195,6 +195,33 @@ const brainWith = async (areas) => (await parseKlypix(await buildKlypixMap({ tit
     const md = questionContextToMarkdown('widget pipeline?', r, { budgetChars: 2000 });
     ok(md.length <= 2600, `ask: output respects the char budget (${md.length} chars)`);
     ok(/omitted for length/.test(md) || r.hits.length <= 3, 'ask: over-budget hits are elided with a note');
+}
+
+// ── area-scoped status (1.85.0): the ranker HAS the struct, so it resolves the
+// prompt's area families to exact titles and the status renderer honours them.
+{
+    const struct = await brainWith([
+        { title: 'desktop', cards: [{ text: '❓ desktop: the installer still needs the silent relaunch check' }] },
+        { title: 'iOS', cards: [{ text: '❓ iOS: pairing must survive an account switch' }] },
+        { title: 'Website', cards: [{ text: '❓ Website: the viewer lacks the compaction notice' }] },
+        { title: 'Brain', cards: [{ text: '❓ Brain: the gardener skips orphan skills' }] },
+    ]);
+    const r = rankForQuestion(struct, "what's remaining for ios");
+    ok(r.statusStrong === true, 'ask/status: "what\'s remaining for ios" is a strong status question');
+    ok(Array.isArray(r.areaFamilies) && r.areaFamilies.join(',') === 'ios', 'ask/status: static family = ios');
+    ok(Array.isArray(r.areas) && r.areas.length === 1 && r.areas[0] === 'iOS', `ask/status: family resolves to the exact title "iOS" (got ${JSON.stringify(r.areas)})`);
+    const scoped = statusContextToMarkdown(struct, { areas: r.areas });
+    ok(/_Scoped to: iOS \(1 of 4 areas · 1 open\)/.test(scoped), 'ask/status: the scoped digest names the kept area and its counts');
+    ok(/pairing must survive/.test(scoped) && !/silent relaunch/.test(scoped) && !/gardener skips/.test(scoped), 'ask/status: only the iOS open card renders in scope');
+    ok(/## Open \(1\)/.test(scoped), 'ask/status: the open header counts the scoped opens only');
+    const whole = rankForQuestion(struct, 'what is remaining');
+    ok(whole.statusStrong === true && whole.areas === null, 'ask/status: a prompt naming no area is unscoped (areas null)');
+    const unscoped = statusContextToMarkdown(struct, { areas: whole.areas });
+    ok(/## Open \(4\)/.test(unscoped) && !/Scoped to:/.test(unscoped), 'ask/status: null areas renders the whole brain, no scope line');
+    const miss = rankForQuestion(struct, "what's remaining for drive");
+    ok(Array.isArray(miss.areas) && miss.areas.includes('drive'), 'ask/status: a family with no area on this brain returns the hint token');
+    const fallback = statusContextToMarkdown(struct, { areas: miss.areas });
+    ok(/_No area matched “drive”; showing the whole brain\._/.test(fallback) && /## Open \(4\)/.test(fallback), 'ask/status: zero-match says so and falls back to the whole brain');
 }
 
 console.log(failures ? `\n✗ ${failures} assertion(s) failed` : '\n✓ brain-ask: all assertions passed');

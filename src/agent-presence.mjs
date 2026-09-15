@@ -766,6 +766,11 @@ export function upsertSession({
   identitySource = null,
   aliases,
   home,
+  // Status-digest dedup hash (1.85.0): sha1[0:12] of the last computed status
+  // digest this session was shown, so a repeat status prompt gets a one-line
+  // pointer instead of the same ~5k chars. ADDITIVE — written only when a
+  // writer passes it; kept verbatim by every other touch (…previous spread).
+  statusDigestHash,
   now = Date.now(),
 }) {
   if (!brainPath || !id) return withWriteVerdict([], false, 'no-brain-or-id');
@@ -926,6 +931,7 @@ export function upsertSession({
           ...(previous.scopeStartedAt ? { scopeStartedAt: previous.scopeStartedAt } : {}),
           ...(taskCompleted ? { completedAt: now } : (previous.completedAt ? { completedAt: previous.completedAt } : {})),
         }),
+      ...(statusDigestHash !== undefined ? { statusDigestHash: String(statusDigestHash || '').slice(0, 16) } : {}),
       lastSeen: now,
     };
     const kept = sessions.filter((session) => session.id !== id);

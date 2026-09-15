@@ -1705,24 +1705,60 @@ export const isPlanCard = (c) => {
 // win a "what is remaining?" answer — the freshest milestone had fallen out of
 // the brief while the corpse stayed in the Open tier. O(areas), bounded, pure;
 // also the seed of the future brain_ask status mode (one digest assembler).
-export function areaStatusDigest(struct, { activeDays = 30, maxAreas = 20, now = Date.now() } = {}) {
+//
+// `areas` (1.85.0, area-scoped digest): exact area titles to keep (as resolved
+// by areaHintsFromPrompt). Non-empty → only those areas, the dormancy cutoff is
+// BYPASSED (a named area is wanted even if quiet), and a structural
+// `_Scoped to: …_` line leads the rows; when none of the named areas exists on
+// this brain the digest says so and renders the whole brain instead. `summary`
+// is reserved for the shared openStatusSummary() (additive; ignored when null).
+export function resolveAreaScope(struct, areas) {
+    if (!Array.isArray(areas) || !areas.length || !struct || !Array.isArray(struct.cards)) return null;
+    const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+    const wanted = new Set(areas.map(a => normTitleKey(a)).filter(Boolean));
+    const keep = new Set();
+    let total = 0;
+    const seen = new Set();
+    for (const c of struct.cards) {
+        const title = c.type === 'container' ? flat(c.title) : flat(c.area);
+        if (!title || /^archive$/i.test(title)) continue;
+        const key = normTitleKey(title);
+        if (seen.has(key)) continue;
+        seen.add(key); total++;
+        if (wanted.has(key)) keep.add(key);
+    }
+    return { keep, total, hint: areas.map(flat).filter(Boolean).join(', ') };
+}
+export function areaStatusDigest(struct, { activeDays = 30, maxAreas = 20, now = Date.now(), areas = null, summary = null } = {}) {
     if (!struct || !Array.isArray(struct.cards)) return [];
+    void summary;
     const cutoff = now - activeDays * 86_400_000;
     const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
     const day = (ts) => ts ? new Date(ts).toISOString().slice(0, 10) : '';
     const cut = (t, n) => { let s = String(t).slice(0, n); if (/[\uD800-\uDBFF]$/.test(s)) s = s.slice(0, -1); return s.trimEnd() + (String(t).length > n ? '…' : ''); };
+    const scope = resolveAreaScope(struct, areas);
+    const scoped = !!(scope && scope.keep.size);
     const byArea = new Map();
     for (const c of struct.cards) {
         if (c.type === 'container' || !(c.text || '').trim()) continue;
         const area = flat(c.area);
         if (!area || /^archive$/i.test(area)) continue;
+        if (scoped && !scope.keep.has(normTitleKey(area))) continue;
         if (!byArea.has(area)) byArea.set(area, []);
         byArea.get(area).push(c);
+    }
+    const lead = [];
+    if (scoped) {
+        const kept = [...byArea.keys()];
+        const openN = [...byArea.values()].flat().filter(isUnresolvedOpenCard).length;
+        lead.push(`_Scoped to: ${kept.join(', ')} (${kept.length} of ${scope.total} areas · ${openN} open) — ask without an area name for the whole brain_`);
+    } else if (scope) {
+        lead.push(`_No area matched “${scope.hint}”; showing the whole brain._`);
     }
     const rows = [];
     for (const [area, cs] of byArea) {
         const newest = Math.max(...cs.map(c => c.createdAt || 0));
-        if (newest < cutoff) continue;                                  // dormant area — not "current state"
+        if (!scoped && newest < cutoff) continue;                       // dormant area — not "current state" (a NAMED area is never dormant)
         const miles = cs.filter(isMilestoneCard).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
         const opens = cs.filter(isOpenCard);
         const m = miles[0];
@@ -1738,7 +1774,7 @@ export function areaStatusDigest(struct, { activeDays = 30, maxAreas = 20, now =
         rows.push({ newest, line: `- ${area} — ${mileTxt} · ${opens.length} open · latest ${day(newest)}` });
     }
     rows.sort((a, b) => b.newest - a.newest);
-    const out = rows.slice(0, maxAreas).map(r => r.line);
+    const out = [...lead, ...rows.slice(0, maxAreas).map(r => r.line)];
     if (rows.length > maxAreas) out.push(`- …and ${rows.length - maxAreas} more active area(s) — search the brain.`);
     return out;
 }
@@ -2071,9 +2107,139 @@ export function structToUltraBrief(struct, { freshness = null, briefPath = '.cla
 // tiebreak. Pure + node-runnable (no embeddings / network) so the Stop/prompt
 // hooks can call it with zero extra deps. `#file-…`/`#dir-…` tags (added at
 // capture) are what make a git-diff token match a card precisely.
-const STOPWORDS = new Set(['the', 'and', 'for', 'that', 'this', 'with', 'from', 'have', 'has', 'was', 'were', 'are', 'you', 'your', 'not', 'but', 'its', 'into', 'out', 'can', 'will', 'use', 'using', 'about', 'what', 'when', 'why', 'how', 'add', 'fix', 'make', 'need', 'want', 'let', 'see', 'get', 'got', 'now', 'all', 'any', 'via', 'per', 'etc', 'should', 'could', 'would', 'does', 'did', 'still', 'just', 'like', 'also', 'then', 'than', 'them', 'they']);
+// ── Arabic folding (1.85.0) ──────────────────────────────────────────────────
+// Applied to every QUERY string before tokenizing and before any status regex
+// runs: strip combining marks (shadda/tashkeel — 'تبقّى' otherwise tokenizes to
+// 'تبق' because \p{M} is not \p{L}), fold the alef variants أ/إ/آ → ا, ة → ه and
+// ى → ي. Vocab, stopwords, aliases and the Arabic regex sources are stored in
+// the SAME folded spelling, so one normalizer decides every match. ASCII is a
+// fixed point of this function — English tokens are byte-identical to 1.84.0.
+export function foldArabic(s) {
+    return String(s || '')
+        .replace(/\p{M}+/gu, '')
+        .replace(/[أإآ]/g, 'ا')   // أ إ آ → ا
+        .replace(/ة/g, 'ه')                  // ة → ه
+        .replace(/ى/g, 'ي');                 // ى → ي
+}
+const foldAll = (list) => list.map(foldArabic);
+// 'anything' joined STOPWORDS in 1.85.0: it is the shape word of "anything
+// left / anything remaining", never a subject. Arabic function words follow —
+// most are two letters and never tokenize anyway; listed for the ones that do.
+const STOPWORDS = new Set(['the', 'and', 'for', 'that', 'this', 'with', 'from', 'have', 'has', 'was', 'were', 'are', 'you', 'your', 'not', 'but', 'its', 'into', 'out', 'can', 'will', 'use', 'using', 'about', 'what', 'when', 'why', 'how', 'add', 'fix', 'make', 'need', 'want', 'let', 'see', 'get', 'got', 'now', 'all', 'any', 'via', 'per', 'etc', 'should', 'could', 'would', 'does', 'did', 'still', 'just', 'like', 'also', 'then', 'than', 'them', 'they', 'anything',
+    ...foldAll(['في', 'على', 'من', 'هل', 'الى', 'عن', 'مع', 'هذا', 'هذه', 'او',
+        // Arabic question words — the shape of a question, never its subject (as 'what/when/why/how' above).
+        'ماذا', 'ايش', 'وش', 'شو', 'كيف', 'متى', 'اين', 'وين', 'فين', 'لماذا', 'ليش'])]);
+// Unicode tokenizer with the SAME minimum length (3) as the ASCII class it
+// replaced — `{2,}`, deliberately not `{1,}`: the shorter class emitted ar/en/
+// ui/db/js/go/ok as new tokens and shifted every English ranking (measured).
+// ASCII output is byte-identical to the old `[a-z0-9][a-z0-9_-]{2,}` class
+// (test-locked on 30 prompts in test/status-shape.mjs).
 export function queryTokens(s) {
-    return [...new Set(String(s || '').toLowerCase().match(/[a-z0-9][a-z0-9_-]{2,}/g) || [])].filter(t => !STOPWORDS.has(t));
+    return [...new Set(foldArabic(s).toLowerCase().match(/[\p{L}\p{N}][\p{L}\p{N}_-]{2,}/gu) || [])].filter(t => !STOPWORDS.has(t));
+}
+// ── Area families (1.85.0) — static alias sets a prompt can name ─────────────
+// STATIC by design: splitQueryTokens has no struct, so it can only return
+// family NAMES; areaHintsFromPrompt(struct, text) resolves them to exact
+// container titles once a struct is loaded. Matching is WHOLE-TOKEN on folded,
+// lower-cased tokens with Arabic clitic stripping — never substring (substring
+// matched 'approval'→desktop, 'scenarios'→ios, 'dashboard'→canvas, 'webhook
+// driver'→web+drive and container 'Chat/Window'→desktop via 'win'; measured).
+// 'update'/'version' are NOT aliases: they are verbs the status phrases consume.
+export const AREA_FAMILIES = Object.freeze({
+    desktop: Object.freeze(foldAll(['desk', 'desktop', 'electron', 'installer', 'build', 'windows', 'win', 'ديسكتوب', 'سطح-المكتب'])),
+    ios: Object.freeze(foldAll(['ios', 'iphone', 'phone', 'appstore', 'testflight', 'ايفون'])),
+    web: Object.freeze(foldAll(['web', 'website', 'site', 'landing', 'viewer', 'portal', 'vercel', 'الموقع', 'ويب'])),
+    canvas: Object.freeze(['canvas', 'board']),
+    brain: Object.freeze(['brain', 'memory', 'mcp']),
+    drive: Object.freeze(['drive']),
+    release: Object.freeze(['release']),
+});
+// normTokens splits on EVERYTHING that is not a letter or digit (hyphens too,
+// unlike queryTokens) — the alias test wants bare words.
+export const normTokens = (s) => foldArabic(s).toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+// Leading Arabic clitics (definite article, prepositions, conjunctions) are
+// stripped ONLY when a ≥3-letter stem remains: 'للديسكتوب' → 'ديسكتوب',
+// 'الموقع' → 'موقع'. Longest prefix first; one strip per token.
+const AR_CLITICS = ['وال', 'بال', 'لل', 'ال', 'ب', 'و', 'ف', 'ل', 'ك'];
+export function stripArabicClitic(tok) {
+    const t = String(tok || '');
+    if (!/^[؀-ۿ]/u.test(t)) return t;
+    for (const p of AR_CLITICS) {
+        if (t.length - p.length >= 3 && t.startsWith(p)) return t.slice(p.length);
+    }
+    return t;
+}
+// Alias sets pre-folded + pre-stripped so a token matches in either spelling.
+const FAMILY_ALIAS_SETS = new Map(Object.entries(AREA_FAMILIES).map(([fam, aliases]) => {
+    const set = new Set();
+    for (const a of aliases) for (const part of normTokens(a)) { set.add(part); set.add(stripArabicClitic(part)); }
+    // Multi-token aliases ('سطح-المكتب') also register as a joined bigram key.
+    for (const a of aliases) { const parts = normTokens(a); if (parts.length > 1) set.add(parts.join(' ')); }
+    return [fam, set];
+}));
+const ALL_ALIASES = new Set([...FAMILY_ALIAS_SETS.values()].flatMap(s => [...s]));
+// Family names a token list names, in AREA_FAMILIES order. 'app' belongs to
+// ios when the prompt also says store/appstore, else to desktop — and
+// 'appstore' is explicitly NOT a desktop alias.
+export function areaFamiliesFromTokens(tokens) {
+    const toks = (Array.isArray(tokens) ? tokens : normTokens(tokens)).map(t => String(t).toLowerCase());
+    const stripped = new Set(toks.flatMap(t => [t, stripArabicClitic(t)]));
+    for (let i = 0; i + 1 < toks.length; i++) stripped.add(`${toks[i]} ${toks[i + 1]}`);
+    const hasStore = stripped.has('store') || stripped.has('appstore');
+    const out = [];
+    for (const [fam, set] of FAMILY_ALIAS_SETS) {
+        let hit = [...stripped].some(t => set.has(t));
+        if (!hit && stripped.has('app')) hit = fam === (hasStore ? 'ios' : 'desktop');
+        if (hit) out.push(fam);
+    }
+    return out;
+}
+const isAliasToken = (t) => ALL_ALIASES.has(t) || ALL_ALIASES.has(stripArabicClitic(t)) || t === 'app';
+// THE RESIDUAL RULE: a loose status phrase is a status QUESTION only when
+// nothing else is being asked — every token left after removing the matched
+// phrase, stopwords and status vocab must be an area alias. Tokens shorter than
+// 3 characters are ignored exactly as queryTokens ignores them ('or', 'v4').
+export function residualIsAreaOnly(tokens) {
+    const toks = Array.isArray(tokens) ? tokens : normTokens(tokens);
+    for (const raw of toks) {
+        const t = String(raw).toLowerCase();
+        if (t.length < 3 || STOPWORDS.has(t) || isStatusVocab(t)) continue;
+        if (!isAliasToken(t)) return false;
+    }
+    return true;
+}
+// Exact `c.area` titles the prompt's families resolve to on THIS struct —
+// whole-token intersection between each area's normTokens and the family's
+// aliases ('Canvas UX ✅' → canvas; 'Chat/Window' → nothing). null when the
+// prompt names no family (unscoped); when a family is named but no area on
+// this brain carries it, the matched alias tokens come back instead so the
+// digest can say which hint found nothing and fall back to the whole brain.
+export function areaHintsFromPrompt(struct, text) {
+    const ptoks = normTokens(text);
+    const fams = areaFamiliesFromTokens(ptoks);
+    if (!fams.length) return null;
+    const wanted = new Set(fams.flatMap(f => [...FAMILY_ALIAS_SETS.get(f)]));
+    const areaMatches = (title) => {
+        const at = normTokens(title);
+        const bag = new Set(at.flatMap(t => [t, stripArabicClitic(t)]));
+        for (let i = 0; i + 1 < at.length; i++) bag.add(`${at[i]} ${at[i + 1]}`);
+        return [...bag].some(t => wanted.has(t));
+    };
+    const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+    const titles = [];
+    const seen = new Set();
+    for (const c of (struct && Array.isArray(struct.cards) ? struct.cards : [])) {
+        const title = c.type === 'container' ? flat(c.title) : flat(c.area);
+        if (!title || /^archive$/i.test(title)) continue;
+        const key = normTitleKey(title);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        if (areaMatches(title)) titles.push(title);
+    }
+    if (titles.length) return titles;
+    const hint = [];
+    for (const t of ptoks) if (isAliasToken(t) && !hint.includes(t)) hint.push(t);
+    return hint.length ? hint : fams.slice();
 }
 // ── Status-vocab quarantine (2026-07-23 field incident) ──────────────────────
 // Words that describe the SHAPE of a status question ("what is remaining?"),
@@ -2088,22 +2254,88 @@ export function queryTokens(s) {
 // 'status'/'progress' are NOT here — "sync status indicator" / "progress bar"
 // are real subjects (adversarial review 2026-07-23); the phrase regex below
 // still catches "current status"-style question shapes.
-export const STATUS_VOCAB = new Set(['remaining', 'remains', 'pending', 'outstanding', 'todo', 'todos', 'unfinished', 'awaits', 'awaiting']);
+// Arabic entries are stored in FOLDED spelling (foldArabic) — the tokenizer
+// folds the prompt the same way, so 'تبقّى', 'تبقى' and 'تبقي' all land here.
+export const STATUS_VOCAB = new Set(['remaining', 'remains', 'pending', 'outstanding', 'todo', 'todos', 'unfinished', 'awaits', 'awaiting',
+    ...foldAll(['تبقى', 'بقي', 'باقي', 'المتبقي', 'متبقي', 'متبقيه', 'معلق', 'معلقه', 'ناقص', 'ينقص', 'عالق'])]);
 // No bare \bto-?do\b — it matched the word "TODO" anywhere ("remove the TODO:
 // refactor X" is a work request, review-caught); to-do only counts inside a
 // question shape ("what's still to do").
+//
+// ── STRICT vs LOOSE families (1.85.0) ────────────────────────────────────────
+// STRICT: today's four English families + the Arabic 'where are we' / 'current
+// state' / 'what is left' shapes — strong on the phrase alone.
+// LOOSE: the shapes people actually type ("do i need to update the desk? ios?
+// or web?", "anything left", "what now", "are we up to date?") — strong ONLY
+// under the residual rule (residualIsAreaOnly). Measured against these very
+// regexes, 14 of 17 ordinary coding questions ("should we bump zod to v4?",
+// "what is now the correct import path?") fired without it, and a strong hit
+// REPLACES card retrieval in the hook — so a false positive costs recall.
+// 'missing' is in NO family (code-review word). 'status'/'progress' stay out.
 const STATUS_QUERY_RE = /\bwhat(?:'?s| is| are)\s+(?:still\s+)?(?:left|remaining|next|open|pending|outstanding|to\s*do|the status)\b|\bstill\s+(?:open|left|pending|remaining|to\s*do)\b|\bwhere (?:are we|do we stand)\b|\bcurrent (?:state|status)\b/i;
+export const STATUS_FAMILIES_EN = Object.freeze({
+    DO_NEED: /\b(?:do|does|should|must|need)\s+(?:i|we|you)\s+(?:still\s+)?(?:need\s+to\s+)?(?:update|upgrade|bump|rebuild|re-?release|ship|publish|deploy|push|cut)\b/i,
+    IS_THERE: /\b(?:is|are)\s+(?:there\s+)?(?:anything|something|stuff|work|items?|bugs?)\s+(?:still\s+)?(?:left|remaining|pending|open|outstanding|to\s*do)\b/i,
+    ANYTHING: /\banything\s+(?:else\s+)?(?:left|remaining|pending|open|outstanding|to\s*do)\b/i,
+    WHAT_NOW: /\bwhat(?:'?s| is)?\s+now\b/i,
+    WHAT_TODOS: /\bwhat(?:'?s| is| are)?\s+(?:the\s+)?(?:remaining|leftover|todo|to-?do)s?\b/i,
+    BEHIND: /\b(?:is|are)\s+(?:we|the\s+\S+(?:\s+\S+)?)\s+(?:up[\s-]?to[\s-]?date|behind|stale|current)\s*\?/i,
+    WHAT_NEED: /\bwhat\s+(?:do\s+)?(?:we|i)\s+(?:still\s+)?(?:have|need)\s+(?:left|to\s+do)\b/i,
+});
+// Arabic regexes use NO `\b`: JS `\b` is ASCII-\w based even under /u and never
+// matches beside an Arabic letter (measured: every Arabic positive failed with
+// it). Word edges are `(?<![\p{L}\p{N}])` / `(?![\p{L}\p{N}])`. Sources are
+// written in natural spelling and FOLDED at construction so they match the
+// folded prompt (test/status-shape.mjs asserts no `\b` in any source).
+const arRe = (src) => new RegExp(foldArabic(src), 'u');
+export const STATUS_FAMILIES_AR = Object.freeze({
+    // STRICT — the phrase alone is a status question.
+    STRICT_AR: arRe('(?<![\\p{L}\\p{N}])(?:وين|اين|فين)\\s+وصلنا(?![\\p{L}\\p{N}])|(?<![\\p{L}\\p{N}])(?:الوضع|الحاله)\\s+(?:الحالي|الحاليه|الان)(?![\\p{L}\\p{N}])'),
+    WHAT_LEFT_AR: arRe('(?<![\\p{L}\\p{N}])(?:ما|ماذا|ايش|وش|شو)\\s*(?:الذي|اللي)?\\s*(?:تبقى|بقي|باقي|ناقص|المتبقي|متبقي)(?![\\p{L}\\p{N}])'),
+    // LOOSE — a leading هل OR a trailing ؟/? is REQUIRED ('لازم ننشر النسخة
+    // الجديدة' is a work statement, measured firing without it), then the
+    // residual rule decides.
+    NEED_AR: arRe('(?:^|\\s)هل\\s+(?:نحتاج|لازم|يلزم|ضروري)\\s+(?:ان\\s+)?(?:ن?حدث|تحديث|نرفع|ننشر|نطلق|نبني)(?![\\p{L}\\p{N}])|(?:نحتاج|لازم|يلزم|ضروري)\\s+(?:ان\\s+)?(?:ن?حدث|تحديث|نرفع|ننشر|نطلق|نبني)[^؟?]{0,40}[؟?]'),
+});
+// A status noun wearing a definite article ('الباقي' = 'the remainder') is the
+// same vocab — checked in the stripped form too.
+const isStatusVocab = (t) => STATUS_VOCAB.has(t) || STATUS_VOCAB.has(stripArabicClitic(t));
+const STRICT_FAMILIES = [STATUS_QUERY_RE, STATUS_FAMILIES_AR.STRICT_AR, STATUS_FAMILIES_AR.WHAT_LEFT_AR];
+const LOOSE_FAMILIES = [...Object.values(STATUS_FAMILIES_EN), STATUS_FAMILIES_AR.NEED_AR];
+// Every span a loose family matches is blanked out (all occurrences, so a
+// repeated shape cannot smuggle its own words into the residual).
+const blankMatches = (text, re) => {
+    const g = new RegExp(re.source, re.flags.includes('g') ? re.flags : re.flags + 'g');
+    return text.replace(g, ' ');
+};
 export function splitQueryTokens(s) {
-    const all = queryTokens(s);
-    const content = all.filter(t => !STATUS_VOCAB.has(t));
-    const statusShaped = content.length < all.length || STATUS_QUERY_RE.test(String(s || ''));
-    // strong = the prompt IS a status question (phrase-shape match, or nothing
-    // but status words). Loose statusShaped merely quarantines tokens; only
-    // STRONG may replace retrieval with the computed digest — "remove the
+    const raw = foldArabic(s);
+    const all = queryTokens(raw);
+    const content = all.filter(t => !isStatusVocab(t));
+    const strictHit = STRICT_FAMILIES.some(re => re.test(raw));
+    const looseHits = LOOSE_FAMILIES.filter(re => re.test(raw));
+    const vocabHit = content.length < all.length;
+    // strong = the prompt IS a status question: a STRICT phrase, or a LOOSE
+    // phrase / bare status vocab whose RESIDUAL — the prompt minus the matched
+    // phrase, stopwords and status vocab — names nothing but area aliases.
+    // Only STRONG may replace retrieval with the computed digest — "remove the
     // TODO: refactor App.tsx" is a work request, not a status question
     // (review: one incidental 'pending'/'todo' token wiped targeted recall).
-    const strong = STATUS_QUERY_RE.test(String(s || '')) || (statusShaped && content.length === 0);
-    return { content, status: all.filter(t => STATUS_VOCAB.has(t)), statusShaped, strong };
+    let strong = strictHit;
+    if (!strong && (vocabHit || looseHits.length)) {
+        let rest = raw;
+        for (const re of looseHits) rest = blankMatches(rest, re);
+        strong = residualIsAreaOnly(normTokens(rest));
+    }
+    // statusShaped keeps its 1.84.0 meaning (status vocab or a strict phrase —
+    // it quarantines tokens and suppresses the file-token fallback) plus every
+    // strong hit; a loose phrase that FAILS the residual rule is an ordinary
+    // coding question and must behave exactly as it did before.
+    const statusShaped = vocabHit || strictHit || strong;
+    // STATIC family names only — no struct here; areaHintsFromPrompt(struct,
+    // text) turns them into container titles where a struct exists.
+    const areaFamilies = areaFamiliesFromTokens(normTokens(raw));
+    return { content, status: all.filter(t => isStatusVocab(t)), statusShaped, strong, areaFamilies };
 }
 const wordsOf = (s) => new Set(String(s || '').toLowerCase().match(/[a-z0-9][a-z0-9_-]{1,}/g) || []);
 export function scoreCardsAgainstQuery(struct, query, { topK = 6, minScore = 2, recentDays = 30 } = {}) {
@@ -2177,8 +2409,11 @@ export const deathDateOfCard = (card) => {
 export function rankForQuestion(struct, question, { semantic = null, k = 10, as_of = null, now = Date.now(), recentDays = 30, pairSim = null } = {}) {
     // Status-shaped questions score by their CONTENT tokens only — "remaining"
     // must never lexically select the stale cards that say "remaining:".
-    const { content: tokens, statusShaped, strong: statusStrong } = splitQueryTokens(question);
-    if (!struct || !Array.isArray(struct.cards) || (!tokens.length && !semantic)) return { hits: [], total: 0, tokens, statusShaped, statusStrong };
+    const { content: tokens, statusShaped, strong: statusStrong, areaFamilies = [] } = splitQueryTokens(question);
+    // Area scope (1.85.0): this function HAS the struct, so it resolves the
+    // prompt's static families to exact area titles for the status renderer.
+    const areas = statusStrong ? areaHintsFromPrompt(struct, question) : null;
+    if (!struct || !Array.isArray(struct.cards) || (!tokens.length && !semantic)) return { hits: [], total: 0, tokens, statusShaped, statusStrong, areaFamilies, areas };
     const isArchived = (c) => /^archive$/i.test(c.area || '');
     const asOfTs = as_of ? Date.parse(as_of) : null;
     const timeTravel = asOfTs != null && Number.isFinite(asOfTs);
@@ -2476,7 +2711,7 @@ export function rankForQuestion(struct, question, { semantic = null, k = 10, as_
             }
         } catch { /* best-effort overlay — never fail the answer */ }
     }
-    return { hits, total: scored.length, tokens, statusShaped, statusStrong };
+    return { hits, total: scored.length, tokens, statusShaped, statusStrong, areaFamilies, areas };
 }
 
 // Assemble the ranked hits into a SYNTHESIS-READY markdown context: a header that
@@ -2661,9 +2896,17 @@ export const decayMessageStamp = (ageMs) =>
 // maxOpen defaults to NO cap: the open list is the answer to a status question,
 // so it is sized to fit (per-card width adapts) rather than sliced. Callers can
 // still pass a cap explicitly.
-export function statusContextToMarkdown(struct, { maxOpen = Infinity, budgetChars = 4200, now = Date.now() } = {}) {
+export function statusContextToMarkdown(struct, { maxOpen = Infinity, budgetChars = 4200, now = Date.now(), areas = null, summary = null } = {}) {
     if (!struct || !Array.isArray(struct.cards)) return '';
+    void summary;   // reserved for the shared openStatusSummary() — additive contract
     const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+    // Area scope (1.85.0): when the prompt named areas that exist on this brain,
+    // opens and newest milestones are filtered to them — the digest prints the
+    // `_Scoped to: …_` line. A named area that does not exist falls back to the
+    // whole brain (the digest says so); `areas` null/empty is today's render.
+    const scope = resolveAreaScope(struct, areas);
+    const scoped = !!(scope && scope.keep.size);
+    const inScope = (c) => !scoped || scope.keep.has(normTitleKey(flat(c.area)));
     const day = (ts) => ts ? new Date(ts).toISOString().slice(0, 10) : '';
     // ⏱️ LAST KNOWN (decay-aware status, 2026-07-28): a fast-decay claim older
     // than 6h renders as last-known observation + live probe, NEVER as current
@@ -2680,7 +2923,7 @@ export function statusContextToMarkdown(struct, { maxOpen = Infinity, budgetChar
         } catch { return null; }
     };
     const isArchived = (c) => /^archive$/i.test(c.area || '');
-    const live = struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim() && !isArchived(c));
+    const live = struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim() && !isArchived(c) && inScope(c));
     const out = [];
     let used = 0;
     // A truncation notice must NEVER be subject to the budget it is warning
@@ -2706,7 +2949,7 @@ export function statusContextToMarkdown(struct, { maxOpen = Infinity, budgetChar
     // prints its own honest "…and N more active area(s)" line when it trims.
     const openReserve = opens.length ? Math.floor(budgetChars * 0.6) : 0;
     const maxAreas = Math.max(4, Math.min(14, Math.floor((budgetChars - openReserve - used) / 100)));
-    for (const l of areaStatusDigest(struct, { maxAreas })) pushAlways(l);
+    for (const l of areaStatusDigest(struct, { maxAreas, areas })) pushAlways(l);
     if (opens.length) {
         const overdueById = findOverdueOpenCards(struct).byId;
         // Overdue first, then OLDEST first. Age IS an open item's urgency signal,

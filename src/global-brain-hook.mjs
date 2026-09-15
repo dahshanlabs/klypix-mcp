@@ -3415,7 +3415,7 @@ async function promptRetrieve(lib) {
     // (adversarial review traced the side door). The brief's computed "Area
     // status" section carries the current-state answer instead.
     let ptoks = lib.queryTokens(humanText || '');
-    let statusShaped = false, statusStrong = false;
+    let statusShaped = false, statusStrong = false, statusAreaFamilies = null;
     if (typeof lib.splitQueryTokens === 'function') {
         const sp = lib.splitQueryTokens(humanText || '');
         ptoks = sp.content;
@@ -3426,6 +3426,8 @@ async function promptRetrieve(lib) {
         // refactor X" is a work request (review fix). Older engine without
         // `strong` degrades to content-empty as the strong signal.
         statusStrong = sp.strong !== undefined ? sp.strong : (statusShaped && sp.content.length === 0);
+        // Static area families (1.85.0) — undefined on an older engine ⇒ unscoped.
+        statusAreaFamilies = Array.isArray(sp.areaFamilies) ? sp.areaFamilies : null;
     } else if (lib.STATUS_VOCAB instanceof Set) {
         const filtered = ptoks.filter(t => !lib.STATUS_VOCAB.has(t));
         statusShaped = filtered.length < ptoks.length;
@@ -3514,7 +3516,16 @@ async function promptRetrieve(lib) {
         if (!struct) { try { struct = await cachedStruct(lib); } catch { struct = null; } }
         if (struct) {
             try {
-                const digest = lib.areaStatusDigest(struct, { maxAreas: 12 });
+                // Area scope (1.85.0): resolve the prompt's static families to
+                // exact area titles AFTER the struct is loaded — the engine
+                // owns the matching (whole-token, never substring). typeof-
+                // guarded: an older engine renders the unscoped digest, and a
+                // prompt naming no family passes null (today's behaviour).
+                let areas = null;
+                if (statusAreaFamilies && statusAreaFamilies.length && typeof lib.areaHintsFromPrompt === 'function') {
+                    try { areas = lib.areaHintsFromPrompt(struct, humanText || ''); } catch { areas = null; }
+                }
+                const digest = lib.areaStatusDigest(struct, { maxAreas: 12, areas });
                 // The digest alone is per-area COUNTS ("· 8 open ·") — it never
                 // names a single open card, yet this block also clears freshHits,
                 // so a status prompt used to arrive with the instruction "answer
@@ -3534,7 +3545,7 @@ async function promptRetrieve(lib) {
                         // hash-deduped per session, and it replaces freshHits
                         // rather than adding to them. Paying ~1.2k tokens once
                         // per status conversation beats answering it wrong.
-                        const md = lib.statusContextToMarkdown(struct, { budgetChars: 5200 });
+                        const md = lib.statusContextToMarkdown(struct, { budgetChars: 5200, areas });
                         // Drop its own H1; the hook's stronger header replaces it.
                         if (md && md.trim()) body = md.split('\n').slice(1).join('\n').trimEnd();
                     } catch { body = null; }

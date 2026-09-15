@@ -3205,6 +3205,41 @@ async function cachedStruct(lib) {
     refreshGuardSidecar(lib, struct, mtimeMs);
     return struct;
 }
+// ── ONE honest open count (1.85.0) ──────────────────────────────────────────
+// The open-status summary (open · look already done · ⏰ overdue · created
+// >45 d ago) that every surface prints — SessionStart heal line, T8 status
+// digest, brief and ultra-brief headers — comes from the engine's ONE
+// openStatusSummary, persisted per brain next to the struct cache
+// (`.brief-cache-<key>.status.json`, keyed on mtime + size, tmp + rename,
+// parse failure = miss). The hook is a fresh process per prompt, so this
+// disk record is what lets a status prompt skip the ~0.5 s detector that
+// SessionStart already paid for. typeof-guarded: an older engine falls back
+// to the uncached pure function, then to null (renderers compute their own).
+const STATUS_CACHE = CACHE.replace(/\.json$/, '.status.json');
+function cachedOpenStatusSummary(lib, struct, opts = {}) {
+    if (!struct) return null;
+    try {
+        if (typeof lib.cachedOpenStatusSummary === 'function') {
+            return lib.cachedOpenStatusSummary(struct, { brainPath: BRAIN, cacheFile: STATUS_CACHE, ...opts }).summary || null;
+        }
+        if (typeof lib.openStatusSummary === 'function') return lib.openStatusSummary(struct, opts) || null;
+    } catch { /* best-effort — renderers derive their own summary */ }
+    return null;
+}
+// Shape the summary into the { gaps, total, plans, plansTotal } report the
+// SessionStart footer renders — so the footer's "N look DONE" is the SAME N
+// the status header prints, not a second detector's answer.
+function staleReportFromSummary(summary, struct) {
+    if (!summary || !struct) return null;
+    const byId = new Map((struct.cards || []).map(c => [c.id, c]));
+    const gaps = [...(summary.likelyDoneById || [])]
+        .map(([id, e]) => ({ open: byId.get(id), by: (e && e.byId && byId.get(e.byId)) || { id: (e && e.byId) || null, text: (e && e.by) || '' }, cov: e && e.cov, via: e && e.via }))
+        .filter(g => g.open);
+    const plans = (summary.plans || [])
+        .map(p => ({ open: byId.get(p.openId), by: (p.byId && byId.get(p.byId)) || { id: p.byId || null, text: p.by || '' }, cov: p.cov, sim: p.sim, via: p.via, kind: 'plan' }))
+        .filter(p => p.open);
+    return { gaps: gaps.slice(0, 5), total: summary.likelyDone || 0, plans: plans.slice(0, 5), plansTotal: summary.plansTotal || 0 };
+}
 // ── Guard cards: sidecar compiler (2026-08-24) ───────────────────────────────
 // The PreToolUse --guard lane avoids parsing the brain (~1s measured on the
 // live brain) on its COMMON path — guards are COMPILED into a tiny per-brain
@@ -3525,7 +3560,12 @@ async function promptRetrieve(lib) {
                 if (statusAreaFamilies && statusAreaFamilies.length && typeof lib.areaHintsFromPrompt === 'function') {
                     try { areas = lib.areaHintsFromPrompt(struct, humanText || ''); } catch { areas = null; }
                 }
-                const digest = lib.areaStatusDigest(struct, { maxAreas: 12, areas });
+                // ONE count (1.85.0): the per-brain cached summary feeds the
+                // area rows, the header and the ⏳/⏰ flags — the same numbers
+                // SessionStart's heal line quoted. A miss (brain changed since)
+                // recomputes and rewrites the record here.
+                const summary = cachedOpenStatusSummary(lib, struct);
+                const digest = lib.areaStatusDigest(struct, { maxAreas: 12, areas, summary });
                 // The digest alone is per-area COUNTS ("· 8 open ·") — it never
                 // names a single open card, yet this block also clears freshHits,
                 // so a status prompt used to arrive with the instruction "answer
@@ -3545,7 +3585,7 @@ async function promptRetrieve(lib) {
                         // hash-deduped per session, and it replaces freshHits
                         // rather than adding to them. Paying ~1.2k tokens once
                         // per status conversation beats answering it wrong.
-                        const md = lib.statusContextToMarkdown(struct, { budgetChars: 5200, areas });
+                        const md = lib.statusContextToMarkdown(struct, { budgetChars: 5200, areas, summary });
                         // Drop its own H1; the hook's stronger header replaces it.
                         if (md && md.trim()) body = md.split('\n').slice(1).join('\n').trimEnd();
                     } catch { body = null; }
@@ -4144,12 +4184,17 @@ async function read(lib) {
     // footer and the preview's heal line.
     const hasPlans = typeof lib.isPlanCard === 'function' && (struct.cards || []).some(c => lib.isPlanCard(c));
     const pairSim = hasPlans ? await cachedPairSimFor(struct) : null;
-    let stale = null;
-    try { if (typeof lib.findStaleOpenCards === 'function') stale = lib.findStaleOpenCards(struct, { max: 5, pairSim }); } catch { stale = null; }
+    // ONE count (1.85.0): SessionStart is where the detector runs and the
+    // per-brain summary record is WRITTEN — the heal line, the brief header,
+    // the ultra header and the stale footer below all read this one object,
+    // and every later status prompt in the session reads the cached record.
+    const summary = cachedOpenStatusSummary(lib, struct, { pairSim });
+    let stale = summary ? staleReportFromSummary(summary, struct) : null;
+    if (!stale) { try { if (typeof lib.findStaleOpenCards === 'function') stale = lib.findStaleOpenCards(struct, { max: 5, pairSim }); } catch { stale = null; } }
     // The FULL brief: tiered brief + every self-heal/health footer. Messages are
     // deliberately NOT part of it: messageFooter advances durable offer/ack state
     // and must only go to stdout where the receiving model can see the exact token.
-    const full = ((typeof lib.structToBrief === 'function') ? lib.structToBrief(struct, { freshness }) : lib.structToMarkdown(struct))
+    const full = ((typeof lib.structToBrief === 'function') ? lib.structToBrief(struct, { freshness, summary }) : lib.structToMarkdown(struct))
         + inflightFooter(input.session_id, struct) + selfHealFooter(drifted) + reconcileFooter(lib, struct) + staleOpenFooter(stale)
         + ruleDraftsFooter(input.session_id, struct, { markShown: false })
         + receiptLine + selfCheckFooter() + doctorFooter() + versionCurrencyFooter() + legendFooter() + memoryFooter();
@@ -4174,7 +4219,7 @@ async function read(lib) {
         fs.writeFileSync(path.resolve(CWD, briefRel),
             `<!-- auto-generated by the brain hook at session start (${nowIso()}) — read it, don't edit it; regenerated next session. Presence/in-flight/session lines are a snapshot of that instant — query brain_sync or \`npx klypix-mcp doctor\` for live peers before reporting them. -->\n` + full, 'utf8');
     } catch { return emitFull(); }
-    const ultra = lib.structToUltraBrief(struct, { freshness, briefPath: briefRel });
+    const ultra = lib.structToUltraBrief(struct, { freshness, briefPath: briefRel, summary });
     // Self-heal tiers compress to ONE line up here; the actionable detail (which
     // cards, which markers to emit) lives in the brief file.
     const heals = [];
@@ -4186,7 +4231,9 @@ async function read(lib) {
         }
     } catch { /* */ }
     if (stale) {
-        if (stale.total) heals.push(`${stale.total} open card(s) look already done`);
+        // The number here IS the status header's "look already done" — one
+        // summary, one count (1.85.0); say so, so nobody reconciles two figures.
+        if (stale.total) heals.push(`${stale.total} open card(s) look already done (the same ${stale.total} counted in the status header)`);
         if (stale.plansTotal) heals.push(`${stale.plansTotal} plan/proposal card(s) look BUILT`);
     }
     const healLine = heals.length ? `\n🔧 Self-heal: ${heals.join(' · ')} — detail + fix markers in ${briefRel}.` : '';

@@ -1731,7 +1731,11 @@ export function resolveAreaScope(struct, areas) {
 }
 export function areaStatusDigest(struct, { activeDays = 30, maxAreas = 20, now = Date.now(), areas = null, summary = null } = {}) {
     if (!struct || !Array.isArray(struct.cards)) return [];
-    void summary;
+    // ONE count (1.85.0): the per-area "(K look done)" reads the same
+    // openStatusSummary the header prints; a caller that already has it
+    // passes it, otherwise it is computed here.
+    const sum = summary || openStatusSummary(struct, { now });
+    const likelyDoneById = (sum && sum.likelyDoneById) || new Map();
     const cutoff = now - activeDays * 86_400_000;
     const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
     const day = (ts) => ts ? new Date(ts).toISOString().slice(0, 10) : '';
@@ -1760,7 +1764,10 @@ export function areaStatusDigest(struct, { activeDays = 30, maxAreas = 20, now =
         const newest = Math.max(...cs.map(c => c.createdAt || 0));
         if (!scoped && newest < cutoff) continue;                       // dormant area — not "current state" (a NAMED area is never dormant)
         const miles = cs.filter(isMilestoneCard).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-        const opens = cs.filter(isOpenCard);
+        // Parity with the status header: a ✅/↩/⤵-stamped card is not open here
+        // either (this row used to count isOpenCard while the header did not).
+        const opens = cs.filter(isUnresolvedOpenCard);
+        const done = opens.filter(c => likelyDoneById.has(c.id)).length;
         const m = miles[0];
         // Decay-aware headline (2026-07-28 post-mortem): a fast-decay milestone
         // older than DECAY_STALE_MS never leads an area as bare current state.
@@ -1771,7 +1778,7 @@ export function areaStatusDigest(struct, { activeDays = 30, maxAreas = 20, now =
         const mileStale = m && mAge >= DECAY_STALE_MS && isFastDecayCard(m)
             ? ` (${formatDecayAge(mAge)} — verify live)` : '';
         const mileTxt = m ? `last 🏁 ${day(m.createdAt)}${mileStale} “${cut(flat(m.text).replace(/^[^:\n]{1,40}:\s*/, '').replace(/^🏁\s*/, ''), 70)}”` : 'no 🏁 yet';
-        rows.push({ newest, line: `- ${area} — ${mileTxt} · ${opens.length} open · latest ${day(newest)}` });
+        rows.push({ newest, line: `- ${area} — ${mileTxt} · ${opens.length} open${done ? ` (${done} look done)` : ''} · latest ${day(newest)}` });
     }
     rows.sort((a, b) => b.newest - a.newest);
     const out = [...lead, ...rows.slice(0, maxAreas).map(r => r.line)];
@@ -1784,7 +1791,7 @@ export function areaStatusDigest(struct, { activeDays = 30, maxAreas = 20, now =
 // decisions + milestones. Everything older stays in the file, reachable via the
 // klypix-canvas MCP search or `--full`. Keeps the session-start cost flat as
 // the brain grows (the full markdown scales with history; this doesn't).
-export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMilestones = 8, maxConnections = 30, maxSkills = 24, detailRecent = 8, freshness = null } = {}) {
+export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMilestones = 8, maxConnections = 30, maxSkills = 24, detailRecent = 8, freshness = null, summary = null } = {}) {
     const cutoff = Date.now() - recentDays * 86_400_000;
     const texts = struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim());
     const containers = struct.cards.filter(c => c.type === 'container');
@@ -1807,7 +1814,10 @@ export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMile
     // OLDEST rules forever while every rule learned since reached no session
     // (2026-08-24 audit — the founder's same-day billing rule was invisible).
     const skills = rest.filter(isSkillCard).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-    const open = rest.filter(isOpenCard);
+    // ONE count (1.85.0): the brief's open tier lists exactly what the status
+    // header counts — a ✅/↩/⤵-stamped card is resolved, not open, on every
+    // surface (it used to be listed here while the status digest excluded it).
+    const open = rest.filter(isUnresolvedOpenCard);
     const miles = rest.filter(isMilestoneCard);
     const plain = rest.filter(c => !open.includes(c) && !miles.includes(c) && !skills.includes(c));
     const recent = plain.filter(c => c.createdAt >= cutoff).sort((a, b) => b.createdAt - a.createdAt).slice(0, maxRecent);
@@ -1852,7 +1862,13 @@ export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMile
 
     // Overdue open cards (self-declared deadline passed) — badged inline so a
     // stale-dated reminder is flagged the next session instead of decaying silently.
-    const overdueById = findOverdueOpenCards(struct).byId;
+    // Both read the ONE openStatusSummary (1.85.0): `baseSummary` is whole-brain
+    // (focus cards keep their ⏰ badge), `openSummary` is narrowed to the open
+    // tier below so its header equals its bullets by construction. The hook
+    // passes the cached summary; a bare call computes it once here.
+    const baseSummary = summary || openStatusSummary(struct);
+    const openSummary = narrowOpenStatusSummary(baseSummary, open);
+    const overdueById = baseSummary.overdueById;
     const odBadge = (c) => { const o = overdueById.get(c.id); return o ? `  ·  ⏰ OVERDUE — deadline ${o.date} passed ${o.daysOverdue}d ago; verify or close (✓)` : ''; };
     push(`# ${struct.title} — brain brief`);
     push(`*${struct.format} · ${struct.counts.cards} cards · ${struct.counts.connections} connections · tiered brief (focus + open + last ${recentDays}d headlines); full cards via klypix-canvas MCP search*`);
@@ -1870,7 +1886,7 @@ export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMile
         if (shown < focus.length) push(`- ⚠️ …and ${focus.length - shown} MORE focus card(s) — read them (MCP search) before acting; this list is NOT complete.`);
     }
     if (open.length) {
-        push('', `## Open questions & goals (${open.length}${overdueById.size ? `, ${overdueById.size} ⏰ overdue` : ''})`);
+        push('', openStatusHeader(openSummary, 'brief'));
         // Overdue first, then OLDEST first. This tier used to render every open
         // in FULL TEXT while every other tier rendered 160-char headlines, so a
         // handful of verbose cards spent the whole allowance: 14,401 chars of
@@ -1921,22 +1937,17 @@ export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMile
     // shipped 🏁 covers a live open claim. Suggestion-only: the open card stays
     // live until a human ✓; this section exists so the hint is SEEN (the
     // incident: a fulfilled claim kept surfacing as still-to-do for a week).
+    // ONE count (1.85.0): the rows are the summary's likelyDoneById — the same
+    // set the header's "N look already done" counts (edges ∪ detector, ∩ the
+    // opens listed above), so this section and the header can never disagree.
     {
         const byId = new Map(struct.cards.map(c => [c.id, c]));
-        const likely = [];
-        for (const cn of struct.connections || []) {
-            if (cn.label !== 'likely closed by') continue;
-            const o = byId.get(cn.fromId), m = byId.get(cn.toId);
-            // BOTH endpoints must be live: a since-archived/superseded milestone
-            // no longer vouches (mirror fulfillmentOverlaysFor — a reverted ship
-            // must not keep whispering "likely done" in the brief).
-            if (!o || !m || /^archive$/i.test(o.area || '') || /↩|✅|⤵/.test(o.text || '')) continue;
-            if (/^archive$/i.test(m.area || '') || /↩|⤵/.test(m.text || '')) continue;
-            likely.push({ o, m });
-        }
+        const likely = [...openSummary.likelyDoneById]
+            .map(([id, e]) => ({ o: byId.get(id), m: e && e.byId ? byId.get(e.byId) : null, by: e && e.by }))
+            .filter(x => x.o);
         if (likely.length) {
             push('', '## ⏳ Likely fulfilled — a milestone appears to cover these opens (confirm with a ✓ marker, or ignore)');
-            for (const { o, m } of likely.slice(0, 5)) push(`- ${headline(o, 90)}  ← likely closed by →  “${headline(m, 90)}”`);
+            for (const { o, m, by } of likely.slice(0, 5)) push(`- ${headline(o, 90)}  ← likely closed by →  “${m ? headline(m, 90) : flat(by)}”`);
             if (likely.length > 5) push(`- …and ${likely.length - 5} more — \`brain_reconcile\` mode:"claims" lists all with coverage receipts.`);
         }
     }
@@ -1953,7 +1964,7 @@ export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMile
     // the "where does each area stand today" answer (the 2026-07-23 incident:
     // the portal-shipped 🏁 fell out of the milestone tier and a week-old
     // "remaining:" claim answered a status question).
-    const digest = areaStatusDigest(struct);
+    const digest = areaStatusDigest(struct, { summary: baseSummary });
     if (digest.length) { push('', '## Area status (computed — newest 🏁 + open count per active area)'); for (const l of digest) push(l); }
     if (miles.length) {
         push('', '## Milestones');
@@ -2014,13 +2025,14 @@ export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMile
 // open questions + a pointer to the FULL brief file the hook writes alongside.
 // The pointer + marker legend are reserved OUT of the budget so they always fit.
 export const ULTRA_BUDGET_CHARS = 1_800;   // sibling of BUDGET_CHARS above — sized for the harness preview, not token cost
-export function structToUltraBrief(struct, { freshness = null, briefPath = '.claude/brain-brief.md', budgetChars = ULTRA_BUDGET_CHARS } = {}) {
+export function structToUltraBrief(struct, { freshness = null, briefPath = '.claude/brain-brief.md', budgetChars = ULTRA_BUDGET_CHARS, summary = null } = {}) {
     const texts = struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim());
     const isArchived = (c) => /^archive$/i.test(c.area || '');
     const isFocus = (c) => /(^|\s)focus\b/i.test(c.area || '');
     const live = texts.filter(c => !isArchived(c));
     const focus = live.filter(isFocus);
-    const open = live.filter(c => isOpenCard(c) && !isFocus(c));
+    // ONE count (1.85.0): same predicate as the status header and the brief.
+    const open = live.filter(c => isUnresolvedOpenCard(c) && !isFocus(c));
     const skills = live.filter(c => isSkillCard(c) && !isFocus(c));
     const conflicts = (struct.connections || []).filter(c => c.relationship === 'conflicts_with');
     const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
@@ -2058,7 +2070,11 @@ export function structToUltraBrief(struct, { freshness = null, briefPath = '.cla
     }
     // Overdue opens lead (and get a ⏰ prefix) so a passed deadline is never the
     // line that falls off the bottom of the preview-sized budget.
-    const overdueById = findOverdueOpenCards(struct).byId;
+    // ONE count (1.85.0): header numbers and ⏰ prefixes from the same summary
+    // (the hook passes its cached one; a bare call computes it once here).
+    const openSummary = narrowOpenStatusSummary(summary || openStatusSummary(struct), open);
+    const overdueById = openSummary.overdueById;
+    const openHeaderLine = openStatusHeader(openSummary, 'brief');
     const openSorted = open.slice().sort((a, b) => (overdueById.has(b.id) ? 1 : 0) - (overdueById.has(a.id) ? 1 : 0));
     // 🛠️ Standing rules tier (2026-08-24): the ultra brief used to render
     // skills as a COUNT in the tail — so the one surface every session reads
@@ -2072,7 +2088,7 @@ export function structToUltraBrief(struct, { freshness = null, briefPath = '.cla
     // opens header, every overdue line, and the overflow line FIRST, and hold
     // that budget back from the skills tier. Rules yield to deadlines.
     if (skills.length) {
-        const openHeader = `## Open questions & goals (${open.length}${overdueById.size ? `, ${overdueById.size} ⏰ overdue` : ''})`;
+        const openHeader = openHeaderLine;
         const overdueLines = openSorted.filter(c => overdueById.has(c.id)).map(c => `- ⏰ OVERDUE ${fr(c)}${head(c)}`);
         const reserve = open.length
             ? ['', openHeader, ...overdueLines, `- …and ${open.length} more — in the full brief.`]
@@ -2088,7 +2104,7 @@ export function structToUltraBrief(struct, { freshness = null, briefPath = '.cla
             if (shown < skills.length) pushIfFenced(`- …and ${skills.length - shown} more standing rule(s) — in the full brief.`);
         }
     }
-    if (open.length && pushIf('') && pushIf(`## Open questions & goals (${open.length}${overdueById.size ? `, ${overdueById.size} ⏰ overdue` : ''})`)) {
+    if (open.length && pushIf('') && pushIf(openHeaderLine)) {
         let shown = 0;
         for (const c of openSorted) { if (!pushIf(`- ${overdueById.has(c.id) ? '⏰ OVERDUE ' : ''}${fr(c)}${head(c)}`)) break; shown++; }
         if (shown < open.length) pushIf(`- …and ${open.length - shown} more — in the full brief.`);
@@ -2898,7 +2914,6 @@ export const decayMessageStamp = (ageMs) =>
 // still pass a cap explicitly.
 export function statusContextToMarkdown(struct, { maxOpen = Infinity, budgetChars = 4200, now = Date.now(), areas = null, summary = null } = {}) {
     if (!struct || !Array.isArray(struct.cards)) return '';
-    void summary;   // reserved for the shared openStatusSummary() — additive contract
     const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
     // Area scope (1.85.0): when the prompt named areas that exist on this brain,
     // opens and newest milestones are filtered to them — the digest prints the
@@ -2941,6 +2956,15 @@ export function statusContextToMarkdown(struct, { maxOpen = Infinity, budgetChar
     // Resolved-but-not-archived cards (✅/↩/⤵ in text) are NOT open — every
     // sibling lifecycle matcher carries this guard (review parity fix).
     const opens = live.filter(isUnresolvedOpenCard);
+    // ONE COUNT (1.85.0): the header, the per-item ⏳/⏰ flags and the area
+    // rows all read the same openStatusSummary — narrowed to the opens THIS
+    // render lists, so the header can never claim more than the bullets flag.
+    // A caller-supplied summary (the hook's per-brain disk cache, written at
+    // SessionStart) skips the ~0.5 s detector; null computes it here. This
+    // replaced the serve-time lexical re-detect (40 miles × ≤80 opens per
+    // render) that produced a THIRD number for the same brain.
+    const base = summary || openStatusSummary(struct, { now });
+    const sum = narrowOpenStatusSummary(base, opens);
     // OPENS ARE THE PRIORITY TIER — reserve their share BEFORE the area digest
     // spends it. The digest used to run first and unbounded at 14 areas, eating
     // 1,886 of 3,200 chars (59%) before a single open card printed, so `maxOpen`
@@ -2949,51 +2973,25 @@ export function statusContextToMarkdown(struct, { maxOpen = Infinity, budgetChar
     // prints its own honest "…and N more active area(s)" line when it trims.
     const openReserve = opens.length ? Math.floor(budgetChars * 0.6) : 0;
     const maxAreas = Math.max(4, Math.min(14, Math.floor((budgetChars - openReserve - used) / 100)));
-    for (const l of areaStatusDigest(struct, { maxAreas, areas })) pushAlways(l);
+    for (const l of areaStatusDigest(struct, { maxAreas, areas, now, summary: base })) pushAlways(l);
     if (opens.length) {
-        const overdueById = findOverdueOpenCards(struct).byId;
+        const overdueById = sum.overdueById;
         // Overdue first, then OLDEST first. Age IS an open item's urgency signal,
         // and the newest opens already appear in the brief's Recent tier — so if
         // anything must be cut it should be the newest, never the long-deferred.
         // (The brief evicted oldest-first: every dropped card was older than
         // every printed one, hiding a founder-ranked #1 bug for two weeks.)
         const sorted = opens.slice().sort((a, b) => (overdueById.has(b.id) ? 1 : 0) - (overdueById.has(a.id) ? 1 : 0) || (a.createdAt || 0) - (b.createdAt || 0));
-        // Slice FIRST, overlay the slice — running correction/fulfillment
-        // overlays across ALL opens was a cards×cards-shaped pass per status
-        // question (review scale finding).
+        // Slice FIRST, overlay the slice — running correction overlays across
+        // ALL opens was a cards×cards-shaped pass per status question.
         const top = sorted.slice(0, maxOpen);
-        const fulfills = fulfillmentOverlaysFor(struct, top);
-        // Serve-time augmentation (2026-07-29): edge-lookup alone renders a
-        // fulfilled ❓ plain when the one capture-time check missed the pair.
-        // Re-detect lexically against the newest milestones for the opens THIS
-        // render will show — bounded (top × ≤40 miles), suggestion-only, and
-        // flagged '?' so an unconfirmed hint never reads as a settled one.
-        try {
-            const newestMiles = live.filter(isMilestoneCard)
-                .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)).slice(0, 40);
-            if (newestMiles.length && top.length && top.length <= 80) {
-                const settled = new Set();
-                for (const cn of struct.connections || []) {
-                    if (cn.relationship === 'not_fulfilled') settled.add(`${cn.fromId}|${cn.toId}`);
-                }
-                let df = null;
-                const dfMap = () => (df ??= buildStemDf(struct));
-                for (const o of top) {
-                    if (fulfills.has(o.id)) continue;
-                    for (const m of newestMiles) {
-                        if (m.id === o.id || (m.createdAt || 0) <= (o.createdAt || 0) || settled.has(`${o.id}|${m.id}`)) continue;
-                        const lex = likelyFulfillsLexical(o, m, dfMap());
-                        if (!serveTimeAccepts(lex, (o.area || '') === (m.area || ''))) continue;
-                        fulfills.set(o.id, { by: String(m.text || '').replace(/\s+/g, ' ').trim().slice(0, 100), byId: m.id, unconfirmed: true });
-                        break;
-                    }
-                }
-            }
-        } catch { /* augmentation is best-effort — the base render stands */ }
+        // Fulfillment flags come from the summary (edges ∪ detector, ∩ opens) —
+        // machine hints keep their '?' so an unconfirmed hint never reads settled.
+        const fulfills = sum.likelyDoneById;
         let overlays = new Map();
         try { overlays = correctionOverlaysFor(struct, top); } catch { /* best-effort */ }
         pushAlways('');
-        pushAlways(`## Open (${opens.length})`);
+        pushAlways(openStatusHeader(sum, 'status'));
         // COMPLETENESS OVER DEPTH: scale each line to fit rather than dropping
         // items. A 60-char headline still proves an item EXISTS and can be
         // pulled in full; a missing line asserts it doesn't. Only if every open
@@ -3490,13 +3488,20 @@ export function insightsAreasToMarkdown(ins, title = 'brain') {
     ].join('\n') + '\n';
 }
 
-export function insightsStatusToMarkdown(digest, ins, title = 'brain') {
+// `summary` (1.85.0): the ONE openStatusSummary — prints the same honest open
+// header every other surface prints, plus the per-area table (this view and
+// brain_ask are the only places that table appears; the hook digest never
+// duplicates its area rows).
+export function insightsStatusToMarkdown(digest, ins, title = 'brain', { summary = null } = {}) {
     const lines = Array.isArray(digest) ? digest : [];
+    const table = summary ? perAreaTableToMarkdown(summary, { cap: 12 }).trimEnd() : '';
     return [
         `# ${title} — area status`,
         `*${ins.totals.live} live cards · newest milestone and open count per active area*`,
+        ...(summary ? ['', openStatusHeader(summary, 'status')] : []),
         '',
         lines.length ? lines.join('\n') : '_No area has moved recently._',
+        ...(table ? ['', table] : []),
         '',
         '_Status map only. `brain_ask` answers a question; this says where the project stands._',
     ].join('\n') + '\n';
@@ -5979,6 +5984,268 @@ export function findOverdueOpenCards(struct, { now = Date.now() } = {}) {
     }
     out.sort((a, b) => b.daysOverdue - a.daysOverdue);
     return { overdue: out, total: out.length, byId: new Map(out.map(o => [o.card.id, o])) };
+}
+
+// ── One honest open count (1.85.0) ───────────────────────────────────────────
+// Every number a human sees about open work — the status digest header, the
+// per-item ⏳/⏰ flags, the brief and ultra-brief headers, the insights status
+// view, the SessionStart self-heal line, the Codex lane — comes from THIS one
+// pure function. Before it, the header said "Open (67)", the SessionStart heal
+// line said "34 look already done", the digest flagged 7 bullets and the brief
+// listed 5 hints: four surfaces, four detectors, four numbers for one brain.
+//
+//   open        = live ∧ !archived ∧ isUnresolvedOpenCard (✅/↩/⤵ never count)
+//   likelyDone  = (persisted 'likely closed by' edges ∪ findStaleOpenCards gaps)
+//                 ∩ openIds — the intersection is MANDATORY: findStaleOpenCards
+//                 filters ↩|✅ only, so without it a ⤵-deferred card could make
+//                 the header count exceed the flagged bullets.
+//   overdue     = findOverdueOpenCards ∩ openIds
+//   untouched   = open ∧ age(createdAt) > untouchedDays ∧ !likelyDone ∧ !overdue
+//                 Struct cards carry createdAt only, so the wording is
+//                 "created >45 d ago" — never "untouched" in prose.
+//
+// Pure, no model load, no I/O. Maps serialize to arrays for the disk cache
+// (serialize/deserialize below) because the hook is a fresh process per prompt
+// and findStaleOpenCards is the expensive half (~0.5 s on the real brain).
+export const STATUS_UNTOUCHED_DAYS = 45;
+export function openStatusSummary(struct, { now = Date.now(), untouchedDays = STATUS_UNTOUCHED_DAYS, pairSim = null, areas = null } = {}) {
+    const empty = {
+        open: 0, openIds: [], overdue: 0, overdueById: new Map(), likelyDone: 0, likelyDoneById: new Map(),
+        untouched: 0, untouchedIds: [], perArea: [], plans: [], plansTotal: 0, untouchedDays, computedAt: now,
+    };
+    if (!struct || !Array.isArray(struct.cards)) return empty;
+    const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+    const isArchived = (c) => /^archive$/i.test(c.area || '');
+    const scope = resolveAreaScope(struct, areas);
+    const scoped = !!(scope && scope.keep.size);
+    const live = struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim() && !isArchived(c));
+    const opens = live.filter(c => isUnresolvedOpenCard(c) && (!scoped || scope.keep.has(normTitleKey(flat(c.area)))));
+    const openIds = opens.map(c => c.id);
+    const openSet = new Set(openIds);
+    const head = (t) => flat(t).slice(0, 100);
+    // Overdue ∩ open (findOverdueOpenCards skips ↩|✅ but not ⤵ — intersect).
+    const overdueById = new Map();
+    try {
+        for (const [id, o] of findOverdueOpenCards(struct, { now }).byId) {
+            if (openSet.has(id)) overdueById.set(id, { date: o.date, daysOverdue: o.daysOverdue });
+        }
+    } catch { /* deadline parsing is best-effort */ }
+    // Likely done: persisted hint edges first (they carry the human/machine
+    // provenance), then the fresh detector for pairs no capture ever linked.
+    const likelyDoneById = new Map();
+    try {
+        for (const [id, f] of fulfillmentOverlaysFor(struct, opens)) {
+            if (!openSet.has(id)) continue;
+            likelyDoneById.set(id, { byId: f.byId ?? null, by: f.by || '', via: 'edge', cov: null, unconfirmed: f.unconfirmed !== false });
+        }
+    } catch { /* edge overlay is best-effort */ }
+    let stale = null;
+    try { stale = findStaleOpenCards(struct, { max: Infinity, pairSim }); } catch { stale = null; }
+    for (const g of (stale && stale.gaps) || []) {
+        const id = g.open && g.open.id;
+        if (!openSet.has(id) || likelyDoneById.has(id)) continue;
+        likelyDoneById.set(id, {
+            byId: (g.by && g.by.id) ?? null, by: head(g.by && g.by.text),
+            via: g.via === 'anchor' ? 'anchor' : 'coverage',
+            cov: Number.isFinite(g.cov) ? g.cov : null, unconfirmed: true,
+        });
+    }
+    // Plan-shaped plain cards ride along so the SessionStart footer needs no
+    // second detector run; they are NOT opens and never touch the counts.
+    const plans = ((stale && stale.plans) || []).map(p => ({
+        openId: p.open && p.open.id, byId: (p.by && p.by.id) ?? null, by: head(p.by && p.by.text),
+        cov: Number.isFinite(p.cov) ? p.cov : null, sim: Number.isFinite(p.sim) ? p.sim : null, via: p.via || null,
+    })).filter(p => p.openId);
+    const ageMs = untouchedDays * 86_400_000;
+    const untouchedIds = opens
+        .filter(c => (c.createdAt || 0) > 0 && now - c.createdAt > ageMs && !likelyDoneById.has(c.id) && !overdueById.has(c.id))
+        .map(c => c.id);
+    const untouchedSet = new Set(untouchedIds);
+    const lastMile = new Map();
+    for (const c of live) {
+        if (!isMilestoneCard(c)) continue;
+        const a = flat(c.area);
+        if (a && (c.createdAt || 0) > (lastMile.get(a) || 0)) lastMile.set(a, c.createdAt);
+    }
+    const byArea = new Map();
+    for (const c of opens) {
+        const a = flat(c.area) || 'Notes';
+        let r = byArea.get(a);
+        if (!r) byArea.set(a, r = { area: a, open: 0, likelyDone: 0, overdue: 0, untouched: 0, lastMilestoneAt: lastMile.get(a) || null });
+        r.open++;
+        if (likelyDoneById.has(c.id)) r.likelyDone++;
+        if (overdueById.has(c.id)) r.overdue++;
+        if (untouchedSet.has(c.id)) r.untouched++;
+    }
+    const perArea = [...byArea.values()].sort((a, b) => b.open - a.open || a.area.localeCompare(b.area));
+    return {
+        open: openIds.length, openIds, overdue: overdueById.size, overdueById,
+        likelyDone: likelyDoneById.size, likelyDoneById, untouched: untouchedIds.length, untouchedIds,
+        perArea, plans, plansTotal: (stale && stale.plansTotal) || 0, untouchedDays, computedAt: now,
+    };
+}
+// Narrow a summary to the open cards a renderer is actually about to list
+// (an area-scoped digest, the brief's non-focus tier). Header numbers and
+// per-item flags then come from the SAME maps by construction, so the header
+// can never claim more than the bullets show. `cards` are struct cards.
+export function narrowOpenStatusSummary(sum, cards) {
+    if (!sum) return sum;
+    const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+    const list = Array.isArray(cards) ? cards.filter(Boolean) : [];
+    const ids = list.map(c => c.id);
+    const keep = new Set(ids);
+    const overdueById = new Map([...(sum.overdueById || [])].filter(([id]) => keep.has(id)));
+    const likelyDoneById = new Map([...(sum.likelyDoneById || [])].filter(([id]) => keep.has(id)));
+    const untouchedIds = (sum.untouchedIds || []).filter(id => keep.has(id));
+    const untouchedSet = new Set(untouchedIds);
+    const lastMile = new Map((sum.perArea || []).map(r => [r.area, r.lastMilestoneAt || null]));
+    const byArea = new Map();
+    for (const c of list) {
+        const a = flat(c.area) || 'Notes';
+        let r = byArea.get(a);
+        if (!r) byArea.set(a, r = { area: a, open: 0, likelyDone: 0, overdue: 0, untouched: 0, lastMilestoneAt: lastMile.get(a) || null });
+        r.open++;
+        if (likelyDoneById.has(c.id)) r.likelyDone++;
+        if (overdueById.has(c.id)) r.overdue++;
+        if (untouchedSet.has(c.id)) r.untouched++;
+    }
+    return {
+        ...sum, open: ids.length, openIds: ids, overdue: overdueById.size, overdueById,
+        likelyDone: likelyDoneById.size, likelyDoneById, untouched: untouchedIds.length, untouchedIds,
+        perArea: [...byArea.values()].sort((a, b) => b.open - a.open || a.area.localeCompare(b.area)),
+    };
+}
+// The header grammar, applied everywhere an open count is printed. Parts are
+// omitted when zero so a tidy brain still reads "## Open (3)".
+//   status: `## Open (67) · 34 look already done · 1 ⏰ overdue · 26 created >45 d ago`
+//   brief:  `## Open questions & goals (67 · 34 look already done · 1 ⏰ overdue · 26 created >45 d ago)`
+export function openStatusHeaderParts(sum) {
+    if (!sum) return [];
+    const days = Number.isFinite(sum.untouchedDays) ? sum.untouchedDays : STATUS_UNTOUCHED_DAYS;
+    const parts = [];
+    if (sum.likelyDone) parts.push(`${sum.likelyDone} look already done`);
+    if (sum.overdue) parts.push(`${sum.overdue} ⏰ overdue`);
+    if (sum.untouched) parts.push(`${sum.untouched} created >${days} d ago`);
+    return parts;
+}
+export function openStatusHeader(sum, style = 'status') {
+    const n = sum ? sum.open : 0;
+    const parts = openStatusHeaderParts(sum);
+    if (style === 'brief') return `## Open questions & goals (${[String(n), ...parts].join(' · ')})`;
+    return `## Open (${n})${parts.map(p => ` · ${p}`).join('')}`;
+}
+// Per-area table — brain_ask and brain_insights only. The hook digest never
+// prints it: its area rows already carry "N open (K look done)", and a second
+// table costs ~1,100 budget-exempt chars on a 5,842-char injection.
+export function perAreaTableToMarkdown(sum, { cap = 12, areas = null } = {}) {
+    if (!sum || !Array.isArray(sum.perArea) || !sum.perArea.length) return '';
+    const days = Number.isFinite(sum.untouchedDays) ? sum.untouchedDays : STATUS_UNTOUCHED_DAYS;
+    const day = (ts) => ts ? new Date(ts).toISOString().slice(0, 10) : '';
+    const wanted = Array.isArray(areas) && areas.length ? new Set(areas.map(a => normTitleKey(a)).filter(Boolean)) : null;
+    const rows = sum.perArea.filter(r => r.open > 0 && (!wanted || wanted.has(normTitleKey(r.area))));
+    if (!rows.length) return '';
+    const out = [`## By area (${rows.length})`];
+    for (const r of rows.slice(0, cap)) {
+        out.push(`- ${r.area} — ${r.open} open`
+            + (r.likelyDone ? ` · ${r.likelyDone} look done` : '')
+            + (r.overdue ? ` · ${r.overdue} ⏰ overdue` : '')
+            + (r.untouched ? ` · ${r.untouched} created >${days} d ago` : '')
+            + (r.lastMilestoneAt ? ` · last 🏁 ${day(r.lastMilestoneAt)}` : ''));
+    }
+    if (rows.length > cap) out.push(`- …and ${rows.length - cap} more area(s) — brain_ask for the whole brain`);
+    return out.join('\n') + '\n';
+}
+// Disk-cache codec. Maps → arrays; a record that is not the shape we wrote
+// (missing openIds / maps) deserializes to null — the reader treats that as a
+// MISS and rewrites, never throws.
+export function serializeOpenStatusSummary(sum) {
+    if (!sum) return null;
+    return { ...sum, overdueById: [...(sum.overdueById || [])], likelyDoneById: [...(sum.likelyDoneById || [])] };
+}
+export function deserializeOpenStatusSummary(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    if (!Number.isFinite(raw.open) || !Array.isArray(raw.openIds)) return null;
+    if (!Array.isArray(raw.overdueById) || !Array.isArray(raw.likelyDoneById)) return null;
+    if (!Array.isArray(raw.untouchedIds) || !Array.isArray(raw.perArea)) return null;
+    return {
+        ...raw,
+        overdueById: new Map(raw.overdueById.filter(e => Array.isArray(e) && e.length === 2)),
+        likelyDoneById: new Map(raw.likelyDoneById.filter(e => Array.isArray(e) && e.length === 2)),
+        plans: Array.isArray(raw.plans) ? raw.plans : [],
+        plansTotal: Number.isFinite(raw.plansTotal) ? raw.plansTotal : 0,
+        untouchedDays: Number.isFinite(raw.untouchedDays) ? raw.untouchedDays : STATUS_UNTOUCHED_DAYS,
+    };
+}
+// Cache file beside the hook's struct cache: same key formula
+// (sha1-16 of the separator/drive-normalized brain path) so the Claude lane,
+// the Codex lane and any MCP call on one brain share ONE record, and the
+// hook's existing `.brief-cache-*.json` pruning covers it.
+export function statusSummaryCachePathFor(brainPath, home = os.homedir()) {
+    const norm = String(brainPath).replace(/\\/g, '/').replace(/^[a-zA-Z]:/, (m) => m.toLowerCase());
+    const key = crypto.createHash('sha1').update(norm).digest('hex').slice(0, 16);
+    return path.join(home, '.claude', 'project-brain', `.brief-cache-${key}.status.json`);
+}
+// Cached summary for one brain, keyed on BOTH mtimeMs AND size: the desktop's
+// append-only incremental saves can change bytes between two writes with a
+// coarse mtime. Written tmp + rename so two parallel sessions on one brain
+// never interleave a partial file; a JSON parse failure or shape mismatch is a
+// MISS (recomputed and rewritten), never a throw. On a hit the cheap
+// now-dependent fields (overdue, created >N d) are refreshed against the
+// struct so a brain nobody edited for a week still reports today's ages —
+// only the expensive detector result is what the cache actually saves.
+// KLYPIX_STATUS_CACHE_TRACE=<file> appends 'hit'/'miss' lines (tests only).
+export function cachedOpenStatusSummary(struct, { brainPath = null, cacheFile = null, now = Date.now(), pairSim = null, write = true } = {}) {
+    const file = cacheFile || (brainPath ? statusSummaryCachePathFor(brainPath) : null);
+    let st = null;
+    try { const s = fs.statSync(brainPath); st = { mtimeMs: s.mtimeMs, size: s.size }; } catch { st = null; }
+    const trace = (what) => {
+        const t = process.env.KLYPIX_STATUS_CACHE_TRACE;
+        if (!t) return;
+        try { fs.appendFileSync(t, what + '\n'); } catch { /* tests only */ }
+    };
+    if (file && st) {
+        try {
+            const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+            if (raw && raw.mtimeMs === st.mtimeMs && raw.size === st.size) {
+                const cached = deserializeOpenStatusSummary(raw.summary);
+                if (cached) { trace('hit'); return { summary: refreshOpenStatusSummary(cached, struct, { now }), cached: true, file }; }
+            }
+        } catch { /* miss */ }
+    }
+    trace('miss');
+    const summary = openStatusSummary(struct, { now, pairSim });
+    if (file && st && write) {
+        const tmp = `${file}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+        try {
+            fs.mkdirSync(path.dirname(file), { recursive: true });
+            fs.writeFileSync(tmp, JSON.stringify({ mtimeMs: st.mtimeMs, size: st.size, summary: serializeOpenStatusSummary(summary) }));
+            fs.renameSync(tmp, file);
+        } catch { try { fs.rmSync(tmp, { force: true }); } catch { /* */ } }
+    }
+    return { summary, cached: false, file };
+}
+// Re-derive the now-dependent halves of a cached summary from the struct.
+// likelyDoneById (the detector output) is kept; overdue / untouched / perArea
+// are O(opens) and recomputed so the cache never serves yesterday's ages.
+export function refreshOpenStatusSummary(sum, struct, { now = Date.now() } = {}) {
+    if (!sum || !struct || !Array.isArray(struct.cards)) return sum;
+    try {
+        const byId = new Map(struct.cards.map(c => [c.id, c]));
+        const opens = (sum.openIds || []).map(id => byId.get(id)).filter(Boolean);
+        const keep = new Set(opens.map(c => c.id));
+        const overdueById = new Map();
+        for (const [id, o] of findOverdueOpenCards(struct, { now }).byId) {
+            if (keep.has(id)) overdueById.set(id, { date: o.date, daysOverdue: o.daysOverdue });
+        }
+        const days = Number.isFinite(sum.untouchedDays) ? sum.untouchedDays : STATUS_UNTOUCHED_DAYS;
+        const ageMs = days * 86_400_000;
+        const likely = sum.likelyDoneById || new Map();
+        const untouchedIds = opens
+            .filter(c => (c.createdAt || 0) > 0 && now - c.createdAt > ageMs && !likely.has(c.id) && !overdueById.has(c.id))
+            .map(c => c.id);
+        const base = { ...sum, overdue: overdueById.size, overdueById, untouched: untouchedIds.length, untouchedIds, computedAt: now };
+        return narrowOpenStatusSummary(base, opens);
+    } catch { return sum; }
 }
 
 // ── Deliberate note → capture input ──────────────────────────────────────────

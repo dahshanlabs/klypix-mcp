@@ -335,13 +335,23 @@ async function statusDigestContext({ brainPath, sessionId, prompt, sessions, cwd
   if (Array.isArray(sp.areaFamilies) && sp.areaFamilies.length && typeof lib.areaHintsFromPrompt === 'function') {
     try { areas = lib.areaHintsFromPrompt(struct, String(prompt)); } catch { areas = null; }
   }
+  // ONE count (1.85.0): the same per-brain summary cache the Claude lane
+  // reads (keyed on brain mtime + size, written by whichever lane misses
+  // first), so both hosts print identical header numbers for one brain and a
+  // status prompt pays ~0 for the detector. typeof-guarded: an older engine
+  // computes nothing here and the renderers derive the summary themselves.
+  let summary = null;
+  try {
+    if (typeof lib.cachedOpenStatusSummary === 'function') summary = lib.cachedOpenStatusSummary(struct, { brainPath }).summary;
+    else if (typeof lib.openStatusSummary === 'function') summary = lib.openStatusSummary(struct);
+  } catch { summary = null; }
   let digest = [];
-  try { digest = lib.areaStatusDigest(struct, { maxAreas: 12, areas }); } catch { return null; }
+  try { digest = lib.areaStatusDigest(struct, { maxAreas: 12, areas, summary }); } catch { return null; }
   if (!Array.isArray(digest) || !digest.length) return null;
   let body = null;
   if (typeof lib.statusContextToMarkdown === 'function') {
     try {
-      const md = lib.statusContextToMarkdown(struct, { budgetChars: 5200, areas });
+      const md = lib.statusContextToMarkdown(struct, { budgetChars: 5200, areas, summary });
       // Drop its own H1; the hook's stronger header replaces it (Claude-lane parity).
       if (md && md.trim()) body = md.split('\n').slice(1).join('\n').trimEnd();
     } catch { body = null; }

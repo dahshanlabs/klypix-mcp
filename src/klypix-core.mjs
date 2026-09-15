@@ -32,7 +32,7 @@ import {
   rankForQuestion, questionContextToMarkdown, findLegacyShipCards,
   challengeBrain, challengeContextToMarkdown, buildRenderSpec, structToBrief,
   brainLensData, lensToMarkdown, deathDateOfCard,
-  statusContextToMarkdown, findFulfillmentCandidates,
+  statusContextToMarkdown, findFulfillmentCandidates, openStatusSummary, perAreaTableToMarkdown,
   splitQueryTokens, scoreCardsAgainstQuery, correctionOverlaysFor, currentGuidanceFor, currentGuidancePrefix,
   isFastDecayCard, isUnresolvedOpenCard, isSkillCard, validateGuard, guardSidecarPathFor, ensureGuardSidecar, DECAY_STALE_MS, formatDecayAge,
   isPlanCard, planFulfillmentFor, PLAN_PAIR_SIM_BRAIN, isAgconfTwinId,
@@ -661,7 +661,17 @@ export async function opBrainAsk({ vault, canvas, question, as_of, k = 10, log =
   if (result.statusStrong && !timeTravel) {
     // Area scope (1.85.0): rankForQuestion HAS the struct and resolved the
     // prompt's area families to exact titles; null keeps the whole-brain render.
-    try { statusMd = statusContextToMarkdown(struct, { areas: result.areas || null }); mode += ' + status-mode'; } catch { statusMd = ''; }
+    // ONE count (1.85.0): the summary computed here feeds the renderer's header
+    // and flags AND the per-area table appended below — one detector run, one
+    // set of numbers. The table is an MCP-only surface (the hook digest's area
+    // rows already carry the counts and its budget cannot afford a twin).
+    try {
+      const summary = openStatusSummary(struct, { pairSim });
+      statusMd = statusContextToMarkdown(struct, { areas: result.areas || null, summary });
+      const table = perAreaTableToMarkdown(summary, { cap: 12, areas: result.areas || null });
+      if (table) statusMd += table + '\n';
+      mode += ' + status-mode';
+    } catch { statusMd = ''; }
   }
   const noticeMd = fallbackNotice ? `> ${fallbackNotice}\n\n` : '';
   const evidenceCache = new Map();
@@ -765,10 +775,13 @@ export async function opBrainInsights({ vault, canvas, staleDays, view = 'full' 
     // before deciding what to retrieve. Both are a fraction of the full report,
     // and 'status' is the first time areaStatusDigest is reachable from any MCP
     // host rather than only through the Claude-Code prompt hook.
+    // ONE count (1.85.0): the status view prints the same honest open header as
+    // the hook digest and brain_ask, plus the per-area table — from one summary.
+    const summary = view === 'status' ? openStatusSummary(struct) : null;
     const body = view === 'areas'
       ? insightsAreasToMarkdown(ins, struct.title)
       : view === 'status'
-        ? insightsStatusToMarkdown(areaStatusDigest(struct), ins, struct.title)
+        ? insightsStatusToMarkdown(areaStatusDigest(struct, { summary }), ins, struct.title, { summary })
         : insightsToMarkdown(ins, struct.title);
     return { blocks: [text(brainStamp(t.file, struct, t.how) + body)] };
   } catch (e) {

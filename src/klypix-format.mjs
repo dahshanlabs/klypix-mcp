@@ -1703,6 +1703,17 @@ export function declaredLifecycleGlyph(card) {
 // lowercase equality meant every ✓ written with area "Canvas UX" silently
 // matched nothing in it (measured 2026-09-15).
 export const sameAreaKey = (a, b) => normTitleKey(a) === normTitleKey(b);
+// One normalizer for BOTH sides of a `closes:` comparison — the [[wikilink]]
+// brackets, the `Area:` prefix and any leading lifecycle glyph removed, then
+// whitespace collapsed and lowercased. Card titles are derived from prose, so
+// comparing a raw title against a raw target was comparing "canvas ux:" with a
+// sentence; and the `Area:` half is why a bare stub matched everything.
+export const closeTargetKey = (s) => String(s || '')
+    .replace(/^\s*\[\[/, '').replace(/\]\]\s*$/, '')
+    .replace(AREA_PREFIX_RE, '')
+    .replace(/^[\s"'“”*_>-]*[❓🎯🏁🛠✅✔↩⤵️]+\s*/u, '')
+    .replace(/\s+/g, ' ')
+    .trim().toLowerCase();
 
 // ── Plan-shaped plain cards (2026-08-23 AgentLit incident) ──────────────────
 // A proposal / plan / "design decided" card written WITHOUT a ❓/🎯 glyph sits
@@ -4927,16 +4938,30 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
         for (const card of cards) {
             const target = (card.closes || '').toString().trim();
             if (!target) continue;
-            const wantTitle = target.replace(/^\[\[/, '').replace(/\]\]$/, '').trim().toLowerCase();
+            // Both sides are normalized the SAME way (2026-09-15): strip the
+            // [[wikilink]] brackets, the `Area:` prefix and any lifecycle glyph,
+            // then collapse. Card titles are derived from prose, so an
+            // unnormalized comparison was really comparing "canvas ux:" against
+            // a full sentence.
+            const wantTitle = closeTargetKey(target);
             const tTok = tokenSet(target);
             // Collect EVERY live card the close-target covers — near-duplicate ❓
             // twins score together, and the old first-match-and-break resolved one
             // while its twin stayed "open" in every brief forever. Capped for
             // safety: a close-target is deliberate, so >4 matches means it was too
-            // generic to trust beyond the strongest few.
+            // generic to trust at all.
             const matches = [];
             for (const c of liveTextCards()) {
-                const ct = (c.title || '').trim().toLowerCase();
+                // The STRIPPED card title. The ≥10 floor on the prefix paths is
+                // the fix for the worst close-link failure mode: many titles are
+                // the bare area stub ("Canvas UX:"), which strips to a handful of
+                // characters, and `wantTitle.startsWith(core)` then matched every
+                // one of them. Simulated against the real brain, the target
+                // "Brain: The 🏁-doesn't-close-❓ gap" produced 21 live matches.
+                // Exact equality keeps the old ≥6 bar — naming a short title
+                // exactly is a deliberate act, a shared prefix is not.
+                const core = closeTargetKey(c.title);
+                const longEnough = core.length >= 10;
                 // A 🛠️ retires ONLY by being NAMED: exact/prefix match of its
                 // glyph-and-area-stripped title. Never the contains path (titles
                 // are derived from prose, so a skill that merely MENTIONS the
@@ -4944,25 +4969,50 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                 // trap), and never token coverage (2026-08-01: naming is a
                 // deliberate human act; overlap is not).
                 if (/🛠/.test(c.text)) {
-                    const core = ct.replace(/^[^:\n]{1,40}:\s*/, '').replace(/^[🛠️❓🎯🏁✅\s]+/u, '');
-                    if (core && wantTitle.length >= 6 && (core === wantTitle || core.startsWith(wantTitle) || wantTitle.startsWith(core))) matches.push({ c, cov: 1 });
+                    if (core && wantTitle.length >= 6 && core === wantTitle) matches.push({ c, cov: 1, overlap: core.length });
+                    else if (core && longEnough && wantTitle.length >= 6 && (core.startsWith(wantTitle) || wantTitle.startsWith(core))) {
+                        matches.push({ c, cov: 1, overlap: Math.min(core.length, wantTitle.length) });
+                    }
                     continue;
                 }
-                // Title fast-path: exact / prefix (≥6 chars), or the card title
-                // CONTAINS the target — the contains variant needs a LONGER target
-                // (≥10) because a short generic word ("sandbox") appears in many
-                // unrelated titles and the multi-close below would sweep them all.
-                if (ct && wantTitle.length >= 6 && (ct === wantTitle || ct.startsWith(wantTitle) || wantTitle.startsWith(ct))) { matches.push({ c, cov: 1 }); continue; }
-                if (ct && wantTitle.length >= 10 && ct.includes(wantTitle)) { matches.push({ c, cov: 1 }); continue; }
+                // Title fast-path: exact (≥6 chars), prefix in either direction
+                // (≥6 target AND ≥10 stripped card title), or the card title
+                // CONTAINS the target — the contains variant needs a LONGER
+                // target (≥10) because a short generic word ("sandbox") appears
+                // in many unrelated titles.
+                if (core && wantTitle.length >= 6 && core === wantTitle) { matches.push({ c, cov: 1, overlap: core.length }); continue; }
+                if (core && longEnough && wantTitle.length >= 6 && (core.startsWith(wantTitle) || wantTitle.startsWith(core))) {
+                    matches.push({ c, cov: 1, overlap: Math.min(core.length, wantTitle.length) }); continue;
+                }
+                if (core && longEnough && wantTitle.length >= 10 && core.includes(wantTitle)) { matches.push({ c, cov: 1, overlap: wantTitle.length }); continue; }
                 // Else target-coverage (≥2 tokens, no floor): a short deliberate
                 // close-target whose tokens are present in a card is a precise hit.
-                if (tTok.size >= 2) { const cov = coverageOf(tTok, tokenSet(c.text)); if (cov >= CLOSE_COVER_AT) matches.push({ c, cov }); }
+                if (tTok.size >= 2) {
+                    const cov = coverageOf(tTok, tokenSet(c.text));
+                    if (cov >= CLOSE_COVER_AT) matches.push({ c, cov, overlap: Math.round(cov * tTok.size) });
+                }
             }
-            matches.sort((a, b) => b.cov - a.cov);
-            // >4 matches means the target was too GENERIC to trust a sweep —
-            // fall back to the single best match (the pre-1.17 behavior) rather
-            // than archive four semi-related cards in iteration order.
-            const chosen = matches.length > 4 ? matches.slice(0, 1) : matches;
+            // Ties break on the LONGER overlap and then on id — never on
+            // iteration order, which is what made the old `matches[0]` fallback
+            // archive an arbitrary card with cov 1.00 and no warning.
+            matches.sort((a, b) => (b.cov - a.cov) || ((b.overlap || 0) - (a.overlap || 0)) || String(a.c.id).localeCompare(String(b.c.id)));
+            // >4 matches means the target was too GENERIC to trust — and the old
+            // fallback of archiving `matches[0]` was silent loss, the one thing
+            // this engine may never do. REFUSE, keep the note as an ordinary
+            // card, and hand back the top candidates so the author can name a
+            // longer target or close by id.
+            if (matches.length > 4) {
+                (stats.closeRefused ||= []).push({
+                    target: target.slice(0, 80),
+                    total: matches.length,
+                    candidates: matches.slice(0, 5).map(m => ({
+                        id: m.c.id, area: m.c.area || null, cov: Math.round(m.cov * 100) / 100,
+                        title: String(m.c.title || m.c.text || '').replace(/\s+/g, ' ').trim().slice(0, 90),
+                    })),
+                });
+                continue;
+            }
+            const chosen = matches;
             if (!chosen.length) continue;
             const ship = String(card.text).replace(/\s+/g, ' ').replace(/^[^:\n]{1,40}:\s*/, '').replace(/^🏁\s*/, '').trim().slice(0, 80);
             card.__closesIds = [];
@@ -5966,6 +6016,12 @@ export function formatCaptureReceipts(stats, { maxEach = 3 } = {}) {
     }
     for (const f of (Array.isArray(s.skillStale) ? s.skillStale : []).slice(0, maxEach)) {
         lines.push(`⚠️ rule may be obsolete (${f.cov}): skill "${String(f.skill).slice(0, 70)}" asserts "${String(f.clause || '').slice(0, 60)}" — this ship appears to remove it. If so, amend: ${f.marker} (retire by naming it in closes:, or dismiss via brain_connect relationship:"not_fulfilled")`);
+    }
+    // A `closes:` target that matched too many live cards ARCHIVED NOTHING. It
+    // used to archive matches[0] in iteration order with cov 1.00 and no
+    // warning, which is silent loss; the refusal has to be visible instead.
+    for (const f of (Array.isArray(s.closeRefused) ? s.closeRefused : []).slice(0, maxEach)) {
+        lines.push(`⛔ closes: "${f.target}" matched ${f.total} live cards — too generic to trust, so NOTHING was archived and your note was kept as an ordinary card. Name a longer target, or close the exact card with brain_reconcile mode:"claims" confirm:[{ id, milestoneId }]. Top candidates: ${f.candidates.map(c => `(id ${c.id}) "${c.title}"${c.area ? ` [${c.area}]` : ''} cov ${c.cov}`).join(' · ')}`);
     }
     return lines;
 }

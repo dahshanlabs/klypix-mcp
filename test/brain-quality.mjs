@@ -591,12 +591,24 @@ for (const [name, C] of [
     const { struct } = await parseKlypix(buffer);
     ok(struct.connections.filter(c => c.label === 'auto').length === 0, 'review-C: the shared #auto tag draws NO auto-links between unrelated harvested cards');
 }
-// (G) a too-generic close target collapses to the single best match
+// (G) a too-generic close target archives NOTHING and says why.
+// AMENDED 2026-09-15: this used to assert "collapses to the single best match".
+// That single match was `matches[0]` in ITERATION ORDER, stamped with cov 1.00
+// and no warning — an arbitrary card archived on a target the engine had just
+// judged too generic to trust. Silent loss is the one thing this engine may
+// never do, so the >4 case now REFUSES and hands back the candidates.
 {
     const areas = [{ title: 'Sandbox', cards: Array.from({ length: 6 }, (_, i) => ({ text: `sandbox concern ${i} — the runner quota and approval dialog behavior for case ${i}` })) }];
     const buf = await buildKlypixMap({ title: 'brain', areas });
-    const { stats } = await captureIntoBrain(buf, { cards: [{ text: 'Ship: 🏁 sandbox hardening pass\n#ship', area: 'Ship', closes: 'sandbox' }] });
-    ok(stats.closed === 1, `review-G: a generic 7-char target archives exactly ONE best match, not a 4-card sweep (closed=${stats.closed})`);
+    const { stats, buffer: gBuf } = await captureIntoBrain(buf, { cards: [{ text: 'Ship: 🏁 sandbox hardening pass\n#ship', area: 'Ship', closes: 'sandbox' }] });
+    ok(!stats.closed, `review-G: a generic 7-char target archives NOTHING (closed=${stats.closed || 0})`);
+    ok((stats.closeRefused || []).length === 1, 'review-G: the refusal is recorded, not swallowed');
+    ok((stats.closeRefused || [])[0]?.total === 6, `review-G: the receipt says how many it matched (${(stats.closeRefused || [])[0]?.total})`);
+    ok(((stats.closeRefused || [])[0]?.candidates || []).length === 5, 'review-G: the receipt names the top candidates so a longer target can be chosen');
+    ok(formatCaptureReceipts(stats).some(l => /NOTHING was archived/.test(l)), 'review-G: the refusal reaches the printed receipt');
+    const { struct: gStruct } = await parseKlypix(gBuf);
+    ok(!gStruct.cards.some(c => c.type !== 'container' && /^archive$/i.test(c.area || '')), 'review-G: not one sandbox card was archived');
+    ok(gStruct.cards.some(c => /sandbox hardening pass/.test(String(c.text || ''))), 'review-G: the note is still captured as an ordinary card');
 }
 // (I) polarity matching is word-level: deadline/delivery never flag dead↔live; blocked↔unblocked CAN fire
 {

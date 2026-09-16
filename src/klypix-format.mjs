@@ -1657,6 +1657,53 @@ export const isMilestoneCard = (c) => lifecycleEligible(c) && !isSkillCard(c) &&
 // extra guard so a ✅/↩/⤵-stamped card is never reported as plainly still-open.
 export const isUnresolvedOpenCard = (c) => isOpenCard(c) && !RESOLVED_GLYPH.test(String(c?.text || ''));
 
+// ── DECLARED vs QUOTED lifecycle (1.85.0 field incident) ────────────────────
+// The classifiers above answer "does this card CARRY a lifecycle glyph", which
+// is the right question for a read-side tier: over-including a card costs a
+// render, never data. The WRITE-side guards ask a different question — "may a
+// ✓ archive this card?" — and there the same test is a trap. `/🏁/.test(text)`
+// fires on a card that merely QUOTES the glyph, so a decision card titled
+// "Brain: The 🏁-doesn't-close-❓ gap …" (txt_4ixgcxz1 on the real brain) was
+// unresolvable by any ✓: the marker silently minted a junk fallback milestone
+// instead and the card had to be closed with an explicit closes: target.
+//
+// This helper answers "which lifecycle glyph does this card DECLARE" — the one
+// in PREFIX position on its headline, after an optional `Area:` prefix. A
+// headline that mentions a glyph mid-sentence declares NONE (that is the fix).
+// A headline with no lifecycle glyph at all falls back to the first body line
+// that declares one, which is exactly lifecycleScope's documented fallback, so
+// a brain that writes its marker under a title line is unaffected.
+//
+// It is deliberately NOT retro-fitted onto isSkillCard / isPlanCard /
+// isMilestoneCard. Those are additive classifications where over-inclusion is
+// the safe direction and narrowing them has a measured cost: applying headline
+// precedence to 🛠 demoted 7 live skill cards to milestones, silently retiring
+// 7 standing rules. Same glyphs, opposite risk — one helper would be wrong for
+// one of them.
+const LIFECYCLE_GLYPH_RE = /[❓🎯🏁🛠✅✔↩⤵]/u;
+const AREA_PREFIX_RE = /^[^:\n]{1,40}:\s*/;
+const DECLARED_GLYPH_RE = /^[\s"'“”*_>-]*([❓🎯🏁🛠✅✔↩⤵])/u;
+export function declaredLifecycleGlyph(card) {
+    const t = String(card?.text ?? card ?? '');
+    if (!t.trim()) return null;
+    const lines = t.split('\n');
+    const head = lines[0].replace(AREA_PREFIX_RE, '');
+    const m = DECLARED_GLYPH_RE.exec(head);
+    if (m) return m[1];
+    // The headline QUOTES a glyph but leads with none — it declares nothing.
+    if (LIFECYCLE_GLYPH_RE.test(head)) return null;
+    for (const line of lines.slice(1)) {
+        const b = DECLARED_GLYPH_RE.exec(line.replace(AREA_PREFIX_RE, ''));
+        if (b) return b[1];
+    }
+    return null;
+}
+// Areas are compared with lifecycle glyphs and punctuation stripped from BOTH
+// sides: this project has an area literally titled "Canvas UX ✅", and strict
+// lowercase equality meant every ✓ written with area "Canvas UX" silently
+// matched nothing in it (measured 2026-09-15).
+export const sameAreaKey = (a, b) => normTitleKey(a) === normTitleKey(b);
+
 // ── Plan-shaped plain cards (2026-08-23 AgentLit incident) ──────────────────
 // A proposal / plan / "design decided" card written WITHOUT a ❓/🎯 glyph sits
 // outside every lifecycle mechanism above — no close-pass, no fulfillment
@@ -4636,7 +4683,7 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
             const rTok = tokenSet(r.text);
             const cands = [];
             for (const c of liveTextCards()) {
-                if (r.area && (c.area || '').toLowerCase() !== r.area.toLowerCase()) continue;
+                if (r.area && !sameAreaKey(c.area, r.area)) continue;
                 // Skills are standing reference — a ✓ must never archive one
                 // (mirror the supersede guard). EXCEPTION (2026-08-24): a card
                 // carrying a machine guard documents "✓-resolve retires the
@@ -4649,7 +4696,11 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                 // fulfilled it (item text ⊆ milestone) and archive the milestone
                 // too (review-traced). 🏁 cards that CARRY an open clause stay
                 // eligible — they resolve via the partial path below.
-                if (/🏁/.test(c.text) && !extractOpenClauses(c.text).length) continue;
+                // DECLARED, not quoted (2026-09-15): the old `/🏁/.test(text)`
+                // also skipped a decision card that merely MENTIONS the glyph —
+                // "Brain: The 🏁-doesn't-close-❓ gap" was unresolvable by any ✓
+                // and the marker minted a junk fallback milestone instead.
+                if (declaredLifecycleGlyph(c) === '🏁' && !extractOpenClauses(c.text).length) continue;
                 const cardTokens = tokenSet(c.text);
                 const lexical = overlapScore(rTok, cardTokens);
                 if (lexical < RESOLVE_AT) continue;
@@ -4726,7 +4777,7 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
             const uTok = tokenSet(u.text);
             let best = null, bestScore = 0;
             for (const c of liveTextCards()) {
-                if (u.area && (c.area || '').toLowerCase() !== u.area.toLowerCase()) continue;
+                if (u.area && !sameAreaKey(c.area, u.area)) continue;   // glyph-tolerant: the area "Canvas UX ✅" is the area "Canvas UX"
                 const s = overlapScore(uTok, tokenSet(c.text));
                 if (s > bestScore) { bestScore = s; best = c; }
             }
@@ -4833,7 +4884,7 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
             const nTokCmp = isCorrection ? stripCueMeta(nTok) : nTok;   // cue meta words dilute the denominator
             let best = null, bestScore = 0;
             for (const c of liveTextCards()) {
-                if (!isCorrection && area && (c.area || '').toLowerCase() !== area) continue;
+                if (!isCorrection && area && !sameAreaKey(c.area, area)) continue;
                 if (/🛠/.test(c.text)) continue; // never auto-archive a 🛠️ skill via a decision's supersede — skills are standing reference (correct with ~)
                 // cueMatch returns 0 unless it clears the widened bar (ratio OR
                 // absolute subject mass) — so for corrections, any non-zero fires.
@@ -4850,7 +4901,7 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                     j.borderColor = 'rgba(120,120,135,0.5)';
                 });
                 await archiveCard(best.id);
-                const wasCross = isCorrection && (bestScore < SUPERSEDE_AT || (area && (best.area || '').toLowerCase() !== area));
+                const wasCross = isCorrection && (bestScore < SUPERSEDE_AT || (area && !sameAreaKey(best.area, area)));
                 best.text = `↩︎ ${best.text}`;
                 card.__supersedes = best.id;
                 if (readopted) {

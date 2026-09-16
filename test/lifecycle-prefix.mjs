@@ -44,6 +44,16 @@ ok(declaredLifecycleGlyph('Brain: The 🏁 gap\n🏁 this is a body milestone li
 ok(declaredLifecycleGlyph('') === null && declaredLifecycleGlyph(null) === null, 'L1 empty input is null, never a throw');
 ok(declaredLifecycleGlyph({ text: 'Canvas: 🛠️ never white-stroke a selected item' }) === '🛠',
   'L1 it accepts a card object as well as a string');
+// A DOUBLE `Area:` prefix is a live shape (brain.klypix carries 5 cards reading
+// `iOS: iOS: 🏁 …`). Stripping once left `iOS: 🏁 …`, which declares nothing, so
+// real milestones lost the RESOLVE guard and a ✓ could archive the very 🏁 that
+// fulfilled its claim — the incident the guard exists for, in reverse.
+ok(declaredLifecycleGlyph('iOS: iOS: 🏁 x') === '🏁', 'L1 a DOUBLE Area: prefix still declares its glyph');
+ok(declaredLifecycleGlyph('iOS: iOS: 🏁 Phone self-chat deletion scroll fix SHIPPED to TestFlight — commit eb3d457') === '🏁',
+  'L1 …on the real headline shape');
+// …and the stripping stays bounded: it may not eat a prose headline.
+ok(declaredLifecycleGlyph('Brain: the fix: the gap: 🏁 buried four colons deep') === null,
+  'L1 the repeated strip is bounded — it cannot chew through prose to find a glyph');
 
 // ── L4 — the read-side classifiers are deliberately untouched ───────────────
 {
@@ -87,6 +97,21 @@ ok(declaredLifecycleGlyph({ text: 'Canvas: 🛠️ never white-stroke a selected
   const { struct } = await parseKlypix(res.buffer);
   ok(!res.stats.resolved, 'L3 a ✓ that echoes a declared milestone still resolves nothing');
   ok(!struct.cards.some(c => /^archive$/i.test(c.area || '') && c.type !== 'container'), 'L3 the milestone is not archived');
+}
+{
+  // L3b — the same guard, on the DOUBLE-prefixed shape the engine itself writes.
+  // 2026-09-16 review: `iOS: iOS: 🏁 …` lost the guard after 6623577 (one strip
+  // left `iOS: 🏁 …`, which declares nothing), so a ✓ archived the very 🏁 that
+  // fulfilled its claim. Five such cards are live on brain.klypix.
+  const MILE = 'iOS: iOS: 🏁 Phone self-chat deletion scroll fix SHIPPED to TestFlight — commit eb3d457';
+  const buf = await buildKlypix({ title: 'double-prefix', cards: [{ text: MILE }] });
+  const res = await captureIntoBrain(buf, {
+    resolutions: [{ text: 'phone self-chat deletion scroll fix shipped to testflight build 28' }],
+  });
+  const { struct } = await parseKlypix(res.buffer);
+  ok(!res.stats.resolved, `L3b a DOUBLE-prefixed milestone is still refused by a ✓ (resolved ${res.stats.resolved || 0})`);
+  ok(!struct.cards.some(c => /^archive$/i.test(c.area || '') && c.type !== 'container'),
+    'L3b THE REGRESSION: it is not archived and not ✅-stamped');
 }
 
 // ── L5 — glyph-tolerant area comparison ─────────────────────────────────────

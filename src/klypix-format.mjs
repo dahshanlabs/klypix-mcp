@@ -1687,14 +1687,31 @@ export function declaredLifecycleGlyph(card) {
     const t = String(card?.text ?? card ?? '');
     if (!t.trim()) return null;
     const lines = t.split('\n');
-    const head = lines[0].replace(AREA_PREFIX_RE, '');
-    const m = DECLARED_GLYPH_RE.exec(head);
-    if (m) return m[1];
+    // The prefix is stripped REPEATEDLY (bounded), testing for the glyph after
+    // each strip. A DOUBLE `Area:` prefix is a shape the engine's own
+    // fallback-milestone writer produces — `(r.area ? `${r.area}: ` : '') + '🏁 '`
+    // over a cleanR that already begins with the area — and brain.klypix carries
+    // live cards reading `iOS: iOS: 🏁 …`. Stripping once left `iOS: 🏁 …`, which
+    // declares nothing, so those real milestones lost the RESOLVE guard and a ✓
+    // could archive the very 🏁 that fulfilled its claim (2026-09-16 review).
+    // Bounded at 3 so a prose headline full of colons cannot be stripped away.
+    let head = lines[0];
+    for (let i = 0; i < 3; i++) {
+        const m = DECLARED_GLYPH_RE.exec(head);
+        if (m) return m[1];
+        if (!AREA_PREFIX_RE.test(head)) break;
+        head = head.replace(AREA_PREFIX_RE, '');
+    }
     // The headline QUOTES a glyph but leads with none — it declares nothing.
     if (LIFECYCLE_GLYPH_RE.test(head)) return null;
     for (const line of lines.slice(1)) {
-        const b = DECLARED_GLYPH_RE.exec(line.replace(AREA_PREFIX_RE, ''));
-        if (b) return b[1];
+        let body = line;
+        for (let i = 0; i < 3; i++) {
+            const b = DECLARED_GLYPH_RE.exec(body);
+            if (b) return b[1];
+            if (!AREA_PREFIX_RE.test(body)) break;
+            body = body.replace(AREA_PREFIX_RE, '');
+        }
     }
     return null;
 }

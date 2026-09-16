@@ -3110,7 +3110,18 @@ async function capture(lib) {
     // ledger exactly as it was.
     let partialSkipped = 0;
     if (Array.isArray(stats.resolutionOutcomes) && stats.resolutionOutcomes.length) {
-        const byIdx = new Map(stats.resolutionOutcomes.map(o => [o.i, o.outcome]));
+        // One ✓ can produce SEVERAL outcomes: the engine resolves up to three
+        // near-tie twins and calls outcomeOf() once per candidate, so several
+        // entries can share an `i`. Building the map by overwrite kept the LAST,
+        // so a ✓ that ARCHIVED twin A while twin B already carried its note was
+        // reported as `resolve-partial-skipped` — "nothing was re-stamped" about
+        // a card that was archived. Rank instead: the strongest outcome wins.
+        const OUTCOME_RANK = { archived: 4, partial: 3, 'fallback-milestone': 2, 'no-match': 1, 'partial-skipped': 0 };
+        const byIdx = new Map();
+        for (const o of stats.resolutionOutcomes) {
+            const prev = byIdx.get(o.i);
+            if (prev === undefined || (OUTCOME_RANK[o.outcome] ?? 0) > (OUTCOME_RANK[prev] ?? 0)) byIdx.set(o.i, o.outcome);
+        }
         for (const d of ledger) {
             if (d.action !== 'resolve' || d.rIdx == null) continue;
             const outcome = byIdx.get(d.rIdx);
@@ -3151,8 +3162,15 @@ async function capture(lib) {
         }
     }
     if (partialSkipped || stats.partialSkipped) {
+        // `partialSkipped` counts MARKERS whose strongest outcome was a skip;
+        // the engine's stat counts CARDS. They differ when one ✓ hit near-tie
+        // twins and did real work on one of them, so name the right unit rather
+        // than implying the whole marker did nothing.
         const n = partialSkipped || stats.partialSkipped;
-        process.stderr.write(`[brain] ✔ partial already noted: ${n} ✓ marker(s) matched a card that already carries that note — nothing was re-stamped. A partial resolve leaves its card OPEN by design, so the marker keeps matching; that is expected, not a failure.\n`);
+        const what = partialSkipped
+            ? `${n} ✓ marker(s) matched a card that already carries that note`
+            : `${n} card(s) the ✓ matched already carried that note`;
+        process.stderr.write(`[brain] ✔ partial already noted: ${what} — nothing was re-stamped there. A partial resolve leaves its card OPEN by design, so the marker keeps matching; that is expected, not a failure.\n`);
     }
     if (stats.added > 0 && !stats.linked) process.stderr.write(`[brain] note: ${stats.added} card(s) landed unlinked — \`brain_connect\` (or [[wikilinks]] next time) wires them into the graph\n`);
     // Fulfillment receipts (claim engine): a captured 🏁 that appears to cover a

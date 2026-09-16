@@ -299,6 +299,22 @@ npm view klypix-mcp@<version> --json | grep -A3 attestations
 3. `npx klypix-mcp doctor` in a linked project — it should report aligned.
 4. Machines pick the new build up through the auto-propagation path; a fresh
    `npx klypix-mcp install` forces it.
+5. **Re-sync the DESKTOP bundle and prove it boots.** The KLYPIX repo carries its own
+   flattener, `scripts/sync-bundled-mcp.mjs`, whose import-rewrite alternation is a
+   SECOND copy of the one in [`bin/klypix-install.mjs`](../bin/klypix-install.mjs) —
+   and nothing in this repo can see it drift. Whenever a file in `bin/` starts
+   importing a new `../src/*.mjs`, BOTH lists need the module, or the flat bundle keeps
+   an unresolvable `../src/…` path and the installed worker crash-loops at startup (the
+   pre-1.72.0 `mcp-presence` incident, and `repo-state` in 1.85). Diff the two
+   alternations, run `npm run sync:mcp` in KLYPIX, then
+   `node test/verify-bundled-mcp.mjs <KLYPIX>/scripts/klypix-mcp-server.mjs`.
+   `test/cli-args.mjs` assertion G covers this repo's half only.
+   That verifier runs fine with an explicit path, but it diffs against
+   `test/baseline.json`, which is **stale** — it still lists the four `remote_*`
+   tools removed in 1.73.x, so it reports one tool-list difference on any current
+   bundle and cannot be read as a gate until the baseline is regenerated
+   (`node test/snapshot.mjs baseline` against the canonical server, reviewed as a
+   deliberate change, not a by-product of a release).
 
 ## 6. Manual re-runs
 

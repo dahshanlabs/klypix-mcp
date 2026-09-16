@@ -1772,6 +1772,13 @@ const advanceShipBaseline = (lib) => {
         lib.writeShipObsState(CWD, lib.readShipSignals(CWD, git));
     } catch { /* best-effort */ }
 };
+// Conventional-commit subjects worth carding. The DEFINITION lives in the
+// engine (klypix-format.mjs `CC_RE`) so the release-cut reconcile advisory and
+// this capture path can never disagree about what counts as a ship. It is
+// MIRRORED here rather than imported because this hook loads the engine lazily
+// — only when a brain exists — and a static import would pay the whole engine
+// plus jszip on every prompt of every session. test/release-reconcile.mjs (RR8)
+// asserts the two literals are identical, so the mirror cannot drift.
 const CC_RE = /^(feat|fix|perf)(?:\(([^)]+)\))?!?:\s*(.+)$/i;
 function parseCommitLog(raw) {
     return String(raw).split('\x1e').map(s => s.trim()).filter(Boolean).map(rec => {

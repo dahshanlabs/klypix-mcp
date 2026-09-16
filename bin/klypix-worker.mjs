@@ -34,6 +34,7 @@ import { compareProjectGraphResults, projectGraphContextMarkdown, queryProjectGr
 import { auditProject, compactAgentsBrief, linkProject, mcpServerEntry } from '../src/agent-rules.mjs';
 import { createMcpPresence, KLYPIX_MCP_INSTRUCTIONS } from '../src/mcp-presence.mjs';
 import { consumeMessageReceipt, findProjectBrain } from '../src/agent-presence.mjs';
+import { collectRepoState, commitsInRange, makeContainmentProbe } from '../src/repo-state.mjs';
 import {
   reconcileRegisteredProjects,
   registerProjectBrain,
@@ -219,6 +220,10 @@ const mcpPresence = createMcpPresence({
     formatDecayAge: typeof brainFormat.formatDecayAge === 'function' ? brainFormat.formatDecayAge : undefined,
   } : {},
 });
+// Release-cut reconcile: the ref each lane last scanned, so a checkpoint that
+// merely REFRESHES the same lease does not re-walk the range. In-memory only —
+// a worker restart rescans once, which costs one bounded git log.
+const lastReconcileRef = new Map();
 // Once brain_sync binds this connection to an exact project brain, all
 // project-brain-default tools must use that same file. Leaving canvas undefined
 // lets klypix-core's intentional cwd/env precedence substitute an ambient brain
@@ -908,6 +913,65 @@ server.registerTool('brain_sync', {
       }
     } catch { /* observation is best-effort — never fail a sync */ }
   }
+  // ── Release-cut reconcile advisory (1.85.0) ─────────────────────────────────
+  // A release lease was just GRANTED, so this session is about to cut a build.
+  // The one question nobody ever asked at that moment: does anything still open
+  // in the brain look like it ALREADY SHIPPED in this ref? Advisory only — it
+  // never blocks, never writes, never joins the refusal object, and any git or
+  // brain failure degrades to `{ skipped }` rather than failing a sync.
+  //
+  // Recomputed only on a NEW lease or a CHANGED ref (the worker is long-lived;
+  // a restart rescans once, which is acceptable) so a checkpoint refresh every
+  // few minutes does not re-walk 500 commits.
+  let releaseReconcileText = '';
+  {
+    const lease = report.structured?.releaseLease;
+    const granted = lease && (lease.status === 'taken' || lease.status === 'refreshed');
+    const ref = granted ? String(lease.holder?.ref || '').trim() : '';
+    const laneKey = `${String(report.structured?.project || mcpPresence.vault || '').toLowerCase()}|${String(mcpPresence.id || '')}`;
+    if (granted && ref && lastReconcileRef.get(laneKey) !== ref) {
+      lastReconcileRef.set(laneKey, ref);
+      const projectDir = report.structured?.project || mcpPresence.vault;
+      const brainPath = report.structured?.brain;
+      try {
+        const { execFileSync } = await import('child_process');
+        const repoState = (() => { try { return collectRepoState(projectDir); } catch { return null; } })();
+        const sinceRef = repoState?.latestReleaseTag?.tag
+          || (() => {
+            try {
+              return brainFormat.readShipSignals(projectDir, (args) => execFileSync('git', String(args).split(/\s+/).filter(Boolean), {
+                cwd: projectDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 4000,
+              })).tag || '';
+            } catch { return ''; }
+          })()
+          || `${ref}~50`;
+        const range = commitsInRange(projectDir, sinceRef, ref);
+        if (range.status !== 'ok' || !brainPath) {
+          lease.reconcile = { skipped: true, reason: range.status !== 'ok' ? (range.reason || 'git-unreadable') : 'no-brain' };
+          if (range.status !== 'ok') releaseReconcileText = brainFormat.releaseReconcileNotice({ ref, skipped: true });
+        } else {
+          const { struct } = await brainFormat.parseKlypix(fs.readFileSync(brainPath));
+          const { candidates, truncated } = brainFormat.releaseFulfilledOpens(struct, range.commits, {
+            ref, containedFn: makeContainmentProbe(projectDir, ref),
+          });
+          // Zero candidates → NO key at all (RL10 parity): an absent advisory
+          // and an empty one must not look the same to a reader.
+          if (candidates.length) {
+            lease.reconcile = {
+              kind: 'open-cards-likely-fulfilled-by-release', severity: 'advisory',
+              ref, sinceRef, commitsScanned: range.commits.length, scanCapped: range.capped,
+              candidates, truncated,
+              confirmWith: brainFormat.releaseReconcileConfirmTemplate(ref),
+            };
+          }
+          releaseReconcileText = brainFormat.releaseReconcileNotice({ ref, sinceRef, candidates });
+        }
+      } catch {
+        try { lease.reconcile = { skipped: true, reason: 'error' }; } catch { /* lease is frozen — advisory only */ }
+        releaseReconcileText = brainFormat.releaseReconcileNotice({ ref, skipped: true });
+      }
+    }
+  }
   // ── Uncaptured-work check, host-neutral half ────────────────────────────────
   // The Stop hook can REFUSE a stop; every other host has no lifecycle hook at
   // all, so brain_sync is the only place the same question can be asked. Stamp
@@ -1031,7 +1095,7 @@ server.registerTool('brain_sync', {
   return {
     content: [{
       type: 'text',
-      text: [report.text, harnessText, shipNotice, captureGapText, contextText, timingText].filter(Boolean).join('\n\n'),
+      text: [report.text, harnessText, shipNotice, releaseReconcileText, captureGapText, contextText, timingText].filter(Boolean).join('\n\n'),
     }],
     structuredContent,
     ...(report.isError ? { isError: true } : {}),

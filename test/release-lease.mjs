@@ -448,6 +448,28 @@ try {
   ok(/expires in ~\d+ min/.test(nearly.text || ''),
     'RL12e: the warning rides the text channel the holder actually reads');
 
+  // RL10 — the release-cut reconcile advisory (1.85.0) is computed by the
+  // WORKER, never by the lease itself. mcp-presence must keep emitting a lease
+  // record with no `reconcile` key at all: an absent advisory and an empty one
+  // must not look the same to any reader, and a refused lease must carry no
+  // advisory whatsoever (it never joins the refusal object).
+  ok(!('reconcile' in (declared.structured?.releaseLease || {})),
+    'RL10a: a granted lease record carries no reconcile key (the worker attaches it)');
+  ok(!('reconcile' in (nearly.structured?.releaseLease || {})),
+    'RL10b: a refreshed lease record carries no reconcile key either');
+  const rl10Rival = createMcpPresence({
+    server: {}, initialVault: warnProject, env: { KLYPIX_SESSION_ID: 'rival-declarer' },
+    home, now: () => clock.value, setIntervalFn: timer, clearIntervalFn: () => {},
+  });
+  const refused = rl10Rival.sync({
+    project: warnProject, phase: 'start', intent: 'cut the same release',
+    releaseIntent: { version: '9.9.9', ref: 'release/9.9.9' },
+  });
+  ok(refused.structured?.releaseLease?.status === 'conflict',
+    'RL10c: a second declarer is refused');
+  ok(!('reconcile' in (refused.structured?.releaseLease || {})),
+    'RL10d: a REFUSED lease carries no reconcile key — the advisory never joins a refusal');
+
   try { fs.rmSync(warnProject, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch { /* best-effort */ }
 } finally {
   for (const target of [home, project, deadProject, unitProject, completeProject, lostProject, aheadRepo, alignedRepo]) {

@@ -222,6 +222,81 @@ export function commitFiles(projectDir, shas, { execGit = defaultExecGit, timeou
   return out;
 }
 
+/**
+ * The commits a release ref carries since the last one — subject AND body.
+ *
+ * The release-cut reconcile advisory (1.85.0) asks "does anything still OPEN in
+ * the brain look like it already shipped in this build?", and the only evidence
+ * a cut has is its own commits. `commitFiles` above answers "which files", which
+ * is the wrong axis: a card is closed by what a commit SAID, not what it
+ * touched. The body matters as much as the subject — a 5-token subject almost
+ * never covers a card's claim, and `commitToCard` has always required a ≥12-char
+ * body before a commit is worth carding at all.
+ *
+ * Bounded twice over (500 commits, 4 s) because this runs inside a brain_sync
+ * that must never become slow, and `capped` is REPORTED rather than hidden: a
+ * truncated scan that reads as a complete one would let "nothing looks done"
+ * mean two different things.
+ *
+ * @returns {{commits: Array<{sha, subject, body, ts}>, capped: boolean,
+ *            status: 'ok'|'unknown', reason?: string}}
+ */
+export function commitsInRange(projectDir, sinceRef, ref, { execGit = defaultExecGit, timeoutMs = 4000, max = 500 } = {}) {
+  const git = makeGit(execGit);
+  const dir = String(projectDir || '');
+  const target = String(ref || '').trim();
+  const since = String(sinceRef || '').trim();
+  if (!dir || !target) return { commits: [], capped: false, status: 'unknown', reason: 'no-ref' };
+  const REC = '\x1e', UNIT = '\x1f';
+  // `sinceRef..ref` when a baseline exists, else just the ref's own tip window.
+  // A bad/unknown sinceRef makes git exit non-zero — that is reported, never
+  // silently retried against the whole history (a 50k-commit scan inside a sync).
+  const range = since ? `${since}..${target}` : target;
+  const raw = git(dir, ['log', '--no-merges', `--max-count=${max + 1}`, `--format=${REC}%H${UNIT}%s${UNIT}%b${UNIT}%ct`, range], timeoutMs);
+  if (raw === null) return { commits: [], capped: false, status: 'unknown', reason: since ? 'bad-range' : 'bad-ref' };
+  const all = [];
+  for (const rec of String(raw).split(REC)) {
+    if (!rec.trim()) continue;
+    const p = rec.split(UNIT);
+    const sha = String(p[0] || '').trim();
+    if (!/^[0-9a-f]{7,40}$/i.test(sha)) continue;
+    const ts = Number(String(p[3] || '').trim());
+    all.push({
+      sha: sha.toLowerCase(),
+      subject: String(p[1] || '').trim().slice(0, 200),
+      body: String(p[2] || '').trim().slice(0, 2000),
+      ts: Number.isFinite(ts) ? ts : 0,
+    });
+  }
+  const capped = all.length > max;
+  return { commits: capped ? all.slice(0, max) : all, capped, status: 'ok' };
+}
+
+/**
+ * "Is this sha in that ref?" — the one containment question, asked at most
+ * `maxChecks` times per probe and cached per sha.
+ *
+ * Built on `settleClaimsAgainstRef` rather than beside it so there is exactly
+ * one place in this package that decides what `contained` means. Anything the
+ * budget could not reach answers FALSE: a capped probe must never be read as
+ * evidence that work shipped.
+ */
+export function makeContainmentProbe(projectDir, ref, { execGit = defaultExecGit, maxChecks = 64 } = {}) {
+  const cache = new Map();
+  let checks = 0;
+  return (sha) => {
+    const s = String(sha || '').trim().toLowerCase();
+    if (!/^[0-9a-f]{7,40}$/.test(s)) return false;
+    if (cache.has(s)) return cache.get(s);
+    if (checks >= maxChecks) return false;
+    checks++;
+    const [settled] = settleClaimsAgainstRef(projectDir, ref, [{ shas: [s] }], { execGit, maxChecks: 1 });
+    const contained = !!(settled && settled.contained);
+    cache.set(s, contained);
+    return contained;
+  };
+}
+
 // ── Committed claims — the promise that travels with the repository ─────────
 //
 // A lane claim protects a machine; a COMMITTED claim protects a team. The file

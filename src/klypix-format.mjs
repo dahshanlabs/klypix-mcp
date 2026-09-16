@@ -6248,6 +6248,164 @@ export function refreshOpenStatusSummary(sum, struct, { now = Date.now() } = {})
     } catch { return sum; }
 }
 
+// ── Release-cut reconcile (1.85.0) ───────────────────────────────────────────
+// Conventional-commit subjects worth carding. The hook's commitToCard has used
+// this exact shape since 1.15; it lives HERE now so the release advisory below
+// and the capture path can never drift apart. (The hook mirrors the literal
+// rather than importing it — it loads this module lazily, only when a brain
+// exists, and a static import would pay the whole engine on every prompt.
+// test/release-reconcile.mjs asserts the two sources are identical.)
+export const CC_RE = /^(feat|fix|perf)(?:\(([^)]+)\))?!?:\s*(.+)$/i;
+
+// Which OPEN cards look fulfilled by the commits a release ref is about to
+// carry? Pure — the caller supplies the commits and the containment oracle.
+//
+// Three sources of evidence, strongest first:
+//   commit-tag / commit-evidence  the card itself names a sha (#commit-1a2b3c4
+//                                 or evidence [{kind:'commit'}]) that IS in the
+//                                 ref. The card's own receipt; always confirmable.
+//   edge                          a 'likely closed by' hint or a current
+//                                 findStaleOpenCards gap whose MILESTONE card
+//                                 carries a contained #commit- tag.
+//   coverage / anchor             the shared claim extractor run against the
+//                                 commits themselves as pseudo-milestones.
+//
+// `confirmable` is the honesty flag, and it is deliberately conservative: with
+// `ref` defaulting to the branch being cut, "contained" is TRUE BY CONSTRUCTION
+// for every commit in the range, so containment alone proves nothing about a
+// coverage match. A coverage candidate earns confirmable only at cov ≥ 0.6 from
+// a commit with a real body (≥12 chars — the same bar commitToCard uses);
+// anchor-grade pairs never do. Measured expectation: the commits that never
+// became cards are the body-less ones, and a 5–8-token subject rarely covers a
+// card clause, so recall on that class is LOW. This advisory names what it can
+// prove and says nothing about the rest.
+export const RELEASE_RECONCILE_MAX = 40;
+const COMMIT_TAG_RE = /#commit-([0-9a-f]{7,40})\b/gi;
+export function releaseFulfilledOpens(struct, commits, { ref = '', containedFn = null, maxCandidates = RELEASE_RECONCILE_MAX, summary = null, now = Date.now() } = {}) {
+    const empty = { candidates: [], truncated: false };
+    if (!struct || !Array.isArray(struct.cards)) return empty;
+    const list = Array.isArray(commits) ? commits.filter(c => c && c.sha && c.subject) : [];
+    const contained = typeof containedFn === 'function' ? containedFn : () => false;
+    const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+    const isArchived = (c) => /^archive$/i.test(c.area || '');
+    const live = struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim() && !isArchived(c));
+    const opens = live.filter(isUnresolvedOpenCard);
+    if (!opens.length) return empty;
+    const openById = new Map(opens.map(c => [c.id, c]));
+    const byId = new Map(live.map(c => [c.id, c]));
+    const bySha = new Map(list.map(c => [String(c.sha).toLowerCase(), c]));
+    // A short sha on a card resolves against the range's full shas by prefix —
+    // #commit- tags are 7 hex, the range carries 40.
+    const resolveSha = (short) => {
+        const s = String(short || '').toLowerCase();
+        if (bySha.has(s)) return bySha.get(s);
+        for (const [full, c] of bySha) if (full.startsWith(s)) return c;
+        return null;
+    };
+    const shasOn = (card) => {
+        const out = [];
+        for (const m of String(card.text || '').matchAll(COMMIT_TAG_RE)) out.push({ sha: m[1].toLowerCase(), via: 'commit-tag' });
+        for (const t of (card.tags || [])) {
+            const m = /^#?commit-([0-9a-f]{7,40})$/i.exec(String(t));
+            if (m) out.push({ sha: m[1].toLowerCase(), via: 'commit-tag' });
+        }
+        for (const e of (card.evidence || [])) {
+            if (e && e.kind === 'commit' && typeof e.ref === 'string' && /^[0-9a-f]{7,40}$/i.test(e.ref.trim())) {
+                out.push({ sha: e.ref.trim().toLowerCase(), via: 'commit-evidence' });
+            }
+        }
+        return out;
+    };
+    const cands = new Map();                                     // openId → best candidate
+    const rank = { 'commit-tag': 5, 'commit-evidence': 4, edge: 3, coverage: 2, anchor: 1 };
+    const offer = (c) => {
+        const prev = cands.get(c.openId);
+        if (!prev || rank[c.via] > rank[prev.via] || (rank[c.via] === rank[prev.via] && (c.cov || 0) > (prev.cov || 0))) cands.set(c.openId, c);
+    };
+    const head = (card) => flat(card.text).replace(/^[^:\n]{1,40}:\s*/, '').slice(0, 110);
+
+    // (1) the card's own commit receipt
+    for (const o of opens) {
+        for (const { sha, via } of shasOn(o)) {
+            if (!contained(sha)) continue;
+            const c = resolveSha(sha);
+            offer({ openId: o.id, area: o.area || null, headline: head(o), via, cov: null, by: { sha, subject: c ? flat(c.subject).slice(0, 120) : '', cardId: null }, confirmable: true, unconfirmed: true });
+        }
+    }
+
+    // (2) coverage / anchor against the commits themselves
+    const pseudo = [];
+    for (const c of list) {
+        if (!CC_RE.test(c.subject)) continue;
+        const body = String(c.body || '').trim();
+        pseudo.push({
+            id: `commit:${c.sha}`, text: `🏁 ${c.subject}${body ? `\n${body}` : ''}`,
+            createdAt: Number.isFinite(c.ts) && c.ts > 0 ? c.ts * 1000 : now,
+            __sha: c.sha, __subject: flat(c.subject).slice(0, 120), __bodyLen: body.length,
+        });
+    }
+    if (pseudo.length) {
+        try {
+            for (const f of findFulfillmentCandidates(struct, pseudo, { maxPerMilestone: 2 })) {
+                if (!openById.has(f.open.id)) continue;
+                const m = f.milestone;
+                const via = f.via === 'anchor' ? 'anchor' : 'coverage';
+                const confirmable = via === 'coverage' && (f.cov || 0) >= 0.6 && (m.__bodyLen || 0) >= 12;
+                offer({
+                    openId: f.open.id, area: f.open.area || null, headline: head(f.open), via,
+                    cov: Number.isFinite(f.cov) ? f.cov : null,
+                    by: { sha: m.__sha, subject: m.__subject, cardId: null },
+                    confirmable, unconfirmed: true,
+                });
+            }
+        } catch { /* the advisory stands on the evidence it did gather */ }
+    }
+
+    // (3) an existing hint edge / current gap whose MILESTONE carries a
+    //     contained commit tag — the ship is already carded, and the release
+    //     is what proves the card's commit is in the build.
+    try {
+        const sum = summary || openStatusSummary(struct, { now });
+        for (const [openId, f] of (sum.likelyDoneById || new Map())) {
+            if (!openById.has(openId) || !f.byId) continue;
+            const mile = byId.get(f.byId);
+            if (!mile) continue;
+            for (const { sha } of shasOn(mile)) {
+                if (!contained(sha)) continue;
+                const c = resolveSha(sha);
+                offer({
+                    openId, area: openById.get(openId).area || null, headline: head(openById.get(openId)), via: 'edge',
+                    cov: Number.isFinite(f.cov) ? f.cov : null,
+                    by: { sha, subject: c ? flat(c.subject).slice(0, 120) : flat(f.by).slice(0, 120), cardId: f.byId },
+                    confirmable: true, unconfirmed: true,
+                });
+                break;
+            }
+        }
+    } catch { /* summary is best-effort — sources 1 and 2 stand alone */ }
+
+    const all = [...cands.values()].sort((a, b) => (rank[b.via] - rank[a.via]) || ((b.cov || 0) - (a.cov || 0)) || String(a.openId).localeCompare(String(b.openId)));
+    return { candidates: all.slice(0, maxCandidates), truncated: all.length > maxCandidates };
+}
+// The confirm call the advisory hands back — PLACEHOLDERS, never the candidate
+// ids. Prefilling them turns "paste this" into a one-keystroke mass close of
+// text-matched cards with nothing read; an agent has to name each pair it
+// actually verified. Lives here (not inline in the worker) so the placeholder
+// contract is test-locked rather than a convention.
+export const releaseReconcileConfirmTemplate = (ref) => ({
+    tool: 'brain_reconcile',
+    args: { mode: 'release', ref: String(ref || ''), confirm: [{ id: '<openId>', sha: '<sha>' }] },
+});
+// The one sentence a release-lease holder reads. Three honest shapes: found /
+// found nothing / could not look.
+export function releaseReconcileNotice({ ref, sinceRef = '', candidates = [], skipped = false } = {}) {
+    if (skipped) return `KLYPIX release reconcile skipped: git history for ${ref} could not be read.`;
+    if (!candidates.length) return `KLYPIX release reconcile: no open cards look fulfilled by commits in ${ref} since ${sinceRef}.`;
+    const confirmable = candidates.filter(c => c && c.confirmable).length;
+    return `KLYPIX release reconcile: ${candidates.length} open card(s) look fulfilled by commits already in ${ref} (${confirmable} confirmable)`
+        + ` — verify each, then confirm with brain_reconcile mode:"release" ref:"${ref}" confirm:[{ id, sha }] (or dismiss:[…]). Nothing was changed.`;
+}
+
 // ── Deliberate note → capture input ──────────────────────────────────────────
 // Turn ONE structured note into captureIntoBrain's input shape — the deliberate
 // twin of the Stop hook's transcript marker parser. This is what lets an ON-DEMAND

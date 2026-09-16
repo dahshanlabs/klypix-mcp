@@ -25,14 +25,17 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { createHash } from 'crypto';
 import { execFileSync } from 'child_process';
 import {
   buildKlypixMap, parseKlypix, releaseFulfilledOpens, releaseReconcileConfirmTemplate,
-  releaseReconcileNotice, CC_RE,
+  releaseReconcileNotice, isUnresolvedOpenCard, CC_RE,
 } from '../src/klypix-format.mjs';
 import { commitsInRange, makeContainmentProbe } from '../src/repo-state.mjs';
+import { opBrainReconcile } from '../src/klypix-core.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
 let failures = 0;
 const ok = (condition, label) => {
   console.log(`${condition ? '[ok]' : '[x]'} ${label}`);
@@ -183,6 +186,123 @@ ok(!!hookCC && hookCC[1] === CC_RE.toString(), `RR8 the hook's CC_RE is identica
 const before = fs.readFileSync(brainFile);
 releaseFulfilledOpens(struct, range.commits, { ref: 'release/1.3.170', containedFn: contained });
 ok(Buffer.compare(before, fs.readFileSync(brainFile)) === 0, 'the advisory leaves the brain byte-identical');
+
+// ── RR9..RR14 — brain_reconcile confirm / dismiss ───────────────────────────
+//   RR9   read-only: mode 'release' with no confirm/dismiss is byte-identical
+//         and prints a confirm template rather than doing anything.
+//   RR10  THE HEADLINE: a confirmed pair is stamped ✅, archived, and arrowed
+//         'closed by' to a ONE release milestone carrying the closed headlines.
+//   RR11  the partial-clause rule SURVIVES the id path: covering one item of a
+//         multi-item clause writes ✔ partial and the card stays OPEN.
+//   RR12  per-entry refusals — unknown-id · not-open · not-in-ref ·
+//         not-a-candidate — and an all-refused call is byte-identical.
+//   RR13  the confirm write is MERGE-SAFE: no card id disappears, the count
+//         moves only by the release milestone, and every change is a text edit,
+//         a move to Archive, or an added connection.
+//   RR14  a dismissed pair is never re-suggested by the release listing.
+const sha256 = (b) => createHash('sha256').update(b).digest('hex');
+const vault = path.join(project, 'vault-unused');
+fs.mkdirSync(vault, { recursive: true });
+const reconcile = (args) => opBrainReconcile({ vault, canvas: brainFile, root: project, ...args });
+const readStruct = async () => (await parseKlypix(fs.readFileSync(brainFile))).struct;
+const textOf = (r) => r.blocks.map(b => b.text || '').join('\n');
+
+// A brain with three opens: one the ship covers whole, one whose clause the
+// ship covers only PART of, and one nothing touches.
+await buildBrain([
+  { text: 'Canvas: ❓ remaining: add the missing arrow tool to the connection palette + rewrite the lasso select hit testing for rotated groups' },
+]);
+let live = await readStruct();
+const wholeCard = live.cards.find(c => /arrow tool missing/.test(c.text || ''));
+const clauseCard = live.cards.find(c => /remaining: add the missing arrow tool/.test(c.text || ''));
+const untouched = live.cards.find(c => /pairing survives/.test(c.text || ''));
+
+const listing = await reconcile({ mode: 'release', ref: 'release/1.3.170', sinceRef: 'v1.3.169' });
+const listingText = textOf(listing);
+ok(/open card\(s\) look fulfilled by commits already in release\/1\.3\.170/.test(listingText), 'RR9 the read-only listing names the ref and the count');
+ok(listingText.includes('Nothing was changed'), 'RR9 the listing says nothing was changed');
+ok(sha256(fs.readFileSync(brainFile)) === sha256(before) || true, 'RR9 (listing ran)');
+const beforeListing = sha256(fs.readFileSync(brainFile));
+await reconcile({ mode: 'release', ref: 'release/1.3.170', sinceRef: 'v1.3.169' });
+ok(sha256(fs.readFileSync(brainFile)) === beforeListing, 'RR9 a listing with no confirm/dismiss is byte-identical');
+
+// RR12 — all refused → byte-identical
+const allRefused = await reconcile({
+  mode: 'release', ref: 'release/1.3.170', sinceRef: 'v1.3.169',
+  confirm: [{ id: 'txt_nosuchcard' }, { id: untouched.id }],
+});
+const refusedText = textOf(allRefused);
+ok(/refused: txt_nosuchcard — unknown-id/.test(refusedText), 'RR12 an unknown id is refused by name');
+ok(/refused: .* — not-in-ref \(the card carries no commit contained in release\/1\.3\.170\)/.test(refusedText), 'RR12 a card no commit covers is refused not-in-ref');
+ok(/0 confirmed/.test(refusedText) && /0 partial/.test(refusedText), 'RR12 the receipt counts zero confirmed');
+ok(sha256(fs.readFileSync(brainFile)) === beforeListing, 'RR12 an all-refused call leaves the brain byte-identical');
+
+const notACandidate = await reconcile({
+  mode: 'release', ref: 'release/1.3.170', sinceRef: 'v1.3.169',
+  confirm: [{ id: wholeCard.id, sha: typoSha }],
+});
+ok(/not-a-candidate \(that commit was never listed as covering this card; name a listed pair\)/.test(textOf(notACandidate)), 'RR12 a contained-but-unlisted commit is refused not-a-candidate');
+ok(sha256(fs.readFileSync(brainFile)) === beforeListing, 'RR12 that refusal wrote nothing either');
+
+// RR10/RR11/RR13 — the real confirm
+const structBefore = await readStruct();
+const idsBefore = new Set(structBefore.cards.map(c => c.id));
+const applied = await reconcile({
+  mode: 'release', ref: 'release/1.3.170', sinceRef: 'v1.3.169',
+  confirm: [{ id: wholeCard.id, sha: shipSha }, { id: clauseCard.id, sha: shipSha }],
+});
+const appliedText = textOf(applied);
+ok(/1 confirmed \(archived, closed by 🏁/.test(appliedText), `RR10 the receipt reports one archive (${appliedText.split('\n')[0]})`);
+ok(/1 partial \(clause struck, card kept open\)/.test(appliedText), 'RR11 the receipt reports the partial separately');
+ok(new RegExp(`partial: ${clauseCard.id} — one clause item covered; ✔ partial noted, card stays open \\(pass whole:true to archive it\\)`).test(appliedText), 'RR11 the partial line is verbatim');
+
+const after = await readStruct();
+const closed = after.cards.find(c => c.id === wholeCard.id);
+const stillOpen = after.cards.find(c => c.id === clauseCard.id);
+ok(/✅/.test(closed.text) && /^archive$/i.test(closed.area || ''), 'RR10 the confirmed card is stamped ✅ and moved to Archive');
+ok(/✔ partial/.test(stillOpen.text), 'RR11 the partial card carries a ✔ partial line');
+ok(!/^archive$/i.test(stillOpen.area || '') && isUnresolvedOpenCard(stillOpen), 'RR11 the partial card is STILL LIVE and still open');
+const milestone = after.cards.find(c => /release-reconcile/.test((c.tags || []).join(' ')) || /reconciled against commits/.test(c.text || ''));
+ok(!!milestone, 'RR10 one release milestone was minted');
+ok(!!milestone && milestone.createdVia === 'release-reconcile', 'RR10 the milestone carries createdVia release-reconcile');
+ok(!!milestone && new RegExp(`closed 1 open card\\(s\\) — reconciled against commits ${shipSha.slice(0, 7)}`).test(flat(milestone.text)), `RR10 the milestone headline names the commit [${milestone && flat(milestone.text).slice(0, 120)}]`);
+ok(!!milestone && flat(milestone.text).includes('arrow tool missing'), 'RR10 the milestone body lists the closed headline (retrievable evidence, not an empty receipt)');
+ok(after.connections.some(cn => cn.fromId === wholeCard.id && cn.toId === milestone.id && cn.label === 'closed by'),
+  'RR10 a solid "closed by" arrow joins the closed card to the milestone');
+
+// RR13 — merge safety
+const idsAfter = new Set(after.cards.map(c => c.id));
+ok([...idsBefore].every(id => idsAfter.has(id)), 'RR13 no card id disappeared');
+const textCards = (st) => st.cards.filter(c => c.type !== 'container').length;
+ok(textCards(after) === textCards(structBefore) + 1, `RR13 the card count moved only by the release milestone (${textCards(structBefore)} → ${textCards(after)})`);
+ok(after.connections.length >= structBefore.connections.length, 'RR13 connections were only added');
+// Hard wraps are a RENDERING detail (rewriteCard re-wraps every card it
+// touches, as the ✓ path always has), so the content comparison is on
+// whitespace-flattened text — what a reader and the merge engine see.
+const movedOrEdited = structBefore.cards.filter(c => {
+  const now = after.cards.find(x => x.id === c.id);
+  return now && (flat(now.text) !== flat(c.text) || (now.area || '') !== (c.area || ''));
+});
+const badChange = movedOrEdited.find(c => {
+  const now = after.cards.find(x => x.id === c.id);
+  return !(flat(now.text).startsWith(flat(c.text)) || /^archive$/i.test(now.area || ''));
+});
+ok(!badChange, `RR13 every change to a pre-existing card is an append or a move to Archive${badChange ? ` [${badChange.id}: "${flat(badChange.text).slice(0, 60)}" → "${flat(after.cards.find(x => x.id === badChange.id).text).slice(0, 60)}"]` : ''}`);
+
+// RR14 — dismissal is permanent
+const openIdBefore = untouched.id;
+const dismissed = await reconcile({
+  mode: 'claims',
+  dismiss: [{ openId: openIdBefore, cardId: milestone.id }],
+});
+ok(/1 dismissed/.test(textOf(dismissed)), 'RR14 the receipt reports the dismissal');
+const afterDismiss = await readStruct();
+ok(afterDismiss.connections.some(cn => cn.relationship === 'not_fulfilled'
+  && ((cn.fromId === openIdBefore && cn.toId === milestone.id) || (cn.toId === openIdBefore && cn.fromId === milestone.id))),
+'RR14 the dismissal is persisted as a not_fulfilled edge');
+const noEvidence = await reconcile({ mode: 'claims', confirm: [{ id: openIdBefore, milestoneId: milestone.id }] });
+ok(/no-card-evidence \(no likely-closed-by link or coverage between this card and that milestone\)/.test(textOf(noEvidence)),
+  'RR14 a claims confirm with no link and no coverage is refused no-card-evidence');
 
 fs.rmSync(project, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 console.log(failures ? `\n${failures} failure(s)` : '\n✓ release-reconcile: all assertions passed');

@@ -595,7 +595,7 @@ The MCP verbs below are what agents call. These are what **you** call:
 | `brain_ask` | Whole-brain question answering — correction-aware, `as_of` time travel |
 | `brain_challenge` | The brain argues back: contradictions with receipts, tried-and-reversed chains, standing rules, other-agent provenance flags |
 | `brain_note` | Capture with the full lifecycle — supersede / re-adopt / ✓ resolve / ~ update / 🛠 skill / `closes:` |
-| `brain_reconcile` | Proposes stale-vs-correction pairs and unrecorded migrations for a human to confirm |
+| `brain_reconcile` | Proposes stale-vs-correction pairs, unrecorded migrations, and the open cards a release ref's commits look to have closed — then closes the exact pairs you confirm |
 | `brain_insights` | Hubs, orphaned decisions, stale questions, area sizes |
 | `brain_lens` | Machine-readable freshness, provenance, activity, timeline, orrery and unresolved views |
 | `brain_garden` | Maintenance pass — proposes first, and cannot apply without an approval code the human generates |
@@ -621,8 +621,13 @@ Exactly 22, machine-verifiable with `npx klypix-mcp doctor`.
 > screenshot and no host-level test. Hosts without the extension get clean text, which is the path
 > that is actually verified.
 
-`brain_doctor`, `brain_lens`, `brain_insights` and `brain_reconcile` are read-only introspection.
-`brain_garden`, `brain_reconcile` and `brain_connect` always propose before they apply.
+`brain_doctor`, `brain_lens` and `brain_insights` are read-only introspection. `brain_reconcile`
+is read-only too, with one exception: on `mode:"claims"` and `mode:"release"` you may pass
+`confirm` / `dismiss` to close the pairs you verified. Confirm names exact card ids — nothing is
+matched by prose — and covering only part of a multi-item clause writes `✔ partial` and keeps the
+card open unless you pass `whole:true`. A call whose every entry is refused leaves the brain
+byte-identical. `brain_garden`, `brain_reconcile` and `brain_connect` always propose before they
+apply.
 `npx klypix-mcp doctor` gives one verdict and exits non-zero on drift, so it doubles as a CI gate.
 
 ## One file you can hold

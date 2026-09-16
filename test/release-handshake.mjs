@@ -184,4 +184,23 @@ ok('H10 it only fires while a release is genuinely active — never ambient nois
 ok('H10 the text names the release and the remedy',
   /cannot be in that build[\s\S]{0,160}?brain_message/.test(PRESENCE));
 
+// ---- H11 — brain_reconcile confirm/dismiss survive the same schema layer ----
+// The H9 lesson, applied before it can bite again: a field the engine honours
+// but the worker's Zod schema never declares is silently stripped, and the
+// caller is refused forever with no way through. brain_reconcile's write path
+// is exactly that shape — structured objects inside arrays.
+ok('H11 mode "release" is declared, or the enum rejects it before the engine sees it',
+  /mode: z\.enum\(\[[^\]]*'release'[^\]]*\]\)/.test(WORKER));
+ok('H11 confirm is declared as an array of objects', /confirm: z\.array\(z\.object\(\{/.test(WORKER));
+ok('H11 every confirm field the engine reads is declared',
+  /confirm: z\.array\(z\.object\(\{[\s\S]{0,900}?id: z\.string\(\)[\s\S]{0,900}?milestoneId: z\.string\(\)[\s\S]{0,900}?sha: z\.string\(\)[\s\S]{0,900}?whole: z\.boolean\(\)/.test(WORKER));
+ok('H11 dismiss is declared with the openId/cardId pair the engine reads',
+  /dismiss: z\.array\(z\.object\(\{[\s\S]{0,600}?openId: z\.string\(\)[\s\S]{0,600}?cardId: z\.string\(\)/.test(WORKER));
+ok('H11 both lists are bounded like every other caller list',
+  /confirm: z\.array\(z\.object\(\{[\s\S]{0,900}?\}\)\)\.max\(64\)/.test(WORKER) && /dismiss: z\.array\(z\.object\(\{[\s\S]{0,600}?\}\)\)\.max\(64\)/.test(WORKER));
+ok('H11 the handler actually FORWARDS them (a declared field the handler drops is the same bug)',
+  /async \(\{ canvas, root, mode, ref, sinceRef, confirm, dismiss, note \}\)[\s\S]{0,300}?opBrainReconcile\(\{[\s\S]{0,300}?confirm, dismiss, note/.test(WORKER));
+ok('H11 the tool description states that only claims/release write',
+  /mode "claims" and mode "release" you may pass confirm\/dismiss/.test(WORKER));
+
 console.log(`✓ release handshake — ${pass}/${pass} assertions`);

@@ -73,3 +73,23 @@ recall-side overlay (`correctionOverlaysFor`), and `detectContradictions`.
 - `.claude/brain-brief.md`: the FULL brief + every self-heal/health footer + legend,
   rewritten each session start. Messages are stdout-only (delivery acks on read).
 - `--full`: everything to stdout (manual runs / stale-lib fallback).
+
+## Release-cut reconcile (1.85)
+
+- `commitsInRange`: 500 commits, 4 s, `--no-merges`; a capped scan reports `capped`
+  rather than reading as a complete one.
+- Containment probes: ≤ 64 unique shas per run, cached per sha, and **false past the
+  budget** — a capped probe must never read as proof that work shipped.
+- Candidate cap 40 (`RELEASE_RECONCILE_MAX`), `truncated` reported.
+- `confirmable`: true for a contained `#commit-`/commit-evidence receipt on the card
+  itself, for a hint edge whose milestone carries a contained receipt, and for
+  coverage at **cov ≥ 0.6 from a commit whose body is ≥ 12 chars** (the same bar
+  `commitToCard` uses). Anchor-grade and body-less commits are listed but never
+  confirmable. With `ref` being the branch under cut, containment is true by
+  construction for every commit in the range, so it is not evidence on its own.
+- The advisory is attached only on a NEW lease or a CHANGED ref; zero candidates
+  leaves the key absent entirely.
+- `brain_reconcile` confirm: the partial-clause rule is unchanged — a strict subset of
+  a multi-item clause writes `✔ partial` and the card stays live unless `whole:true`.
+  Refusals are per entry (`unknown-id` · `not-open` · `no-card-evidence` ·
+  `not-in-ref` · `not-a-candidate`), and an all-refused call writes nothing.

@@ -4440,7 +4440,81 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
         // for RANKING only — its bonus must never admit a lexically ineligible
         // card (the 2026-08-11 false-close incident was 0.174 + 0.15 = 0.324).
         const milestonesFallback = [];
+        // Cards the ID-ADDRESSED branch archived, reported in stats so a caller
+        // that wants to mint ONE closing milestone for them (brain_reconcile
+        // mode:'release') can pass those ids back as a card's `__closesIds` on a
+        // second capture — the same field pass 2 uses for `closes:` targets, so
+        // the arrows are identical whichever path drew them.
+        const idArchived = [];
         for (const r of resolutions) {
+            // ── ID-ADDRESSED RESOLVE (1.85.0) ───────────────────────────────
+            // brain_reconcile confirm names the EXACT card, so there is nothing
+            // to fuzzy-match and RESOLVE_AT is skipped. Everything else about a
+            // ✓ is kept: the 🛠 / pure-🏁 / already-resolved refusals, and above
+            // all the PARTIAL-CLAUSE rule. findStaleOpenCards is clause-keyed —
+            // its best coverage may come from ONE item of a multi-item
+            // "remaining: A + B + C" clause — so archiving the whole card on a
+            // one-clause hit is precisely the false close this engine promises
+            // never to do. `whole: true` is the explicit human override, and the
+            // outcome (archived | partial) is reported per id.
+            if (r && r.id) {
+                const record = (outcome, extra = {}) => { (stats.idResolutions ||= []).push({ id: r.id, outcome, ...extra }); };
+                const target = struct.cards.find(c => c.id === r.id && c.type !== 'container' && (c.text || '').trim());
+                if (!target) { record('refused', { reason: 'unknown-id' }); continue; }
+                const guarded = /🛠/.test(target.text) || /^archive$/i.test(target.area || '') || !isUnresolvedOpenCard(target);
+                if (guarded) { record('refused', { reason: 'not-open' }); continue; }
+                const rTokId = tokenSet(r.text || '');
+                const itemsId = extractOpenClauses(target.text).flatMap(cl => cl.items);
+                const coveredId = itemsId.filter(it => coverageOf(it.tokens, rTokId) >= 0.8);
+                const uncoveredId = itemsId.filter(it => coverageOf(it.tokens, rTokId) < 0.5);
+                const partialId = r.whole !== true
+                    && ((coveredId.length && uncoveredId.length) || (/🏁/.test(target.text) && itemsId.length > 0));
+                if (partialId) {
+                    const cleanR = stripLifecycleGlyphs(r.text);
+                    const still = uncoveredId.length ? ` — still open: ${uncoveredId.map(x => x.text.slice(0, 50)).join(' + ').slice(0, 160)}` : '';
+                    await rewriteCard(target.id, j => {
+                        j.content = `${j.content}\n✔ partial ${today}: ${cleanR.slice(0, 100)}${still}`;
+                        j.borderColor = 'rgba(16,185,129,0.45)';
+                    });
+                    target.text += `\n✔ partial ${today}: ${cleanR}`;
+                    stats.partialResolved = (stats.partialResolved || 0) + 1;
+                    record('partial', { uncovered: uncoveredId.map(x => x.text.slice(0, 60)) });
+                    continue;
+                }
+                await rewriteCard(target.id, j => {
+                    j.content = `${j.content}\n✅ ${today}: ${r.text || 'confirmed done'}`;
+                    j.borderColor = 'rgba(16,185,129,0.35)';
+                });
+                await archiveCard(target.id);
+                target.text += ` ✅ ${r.text || ''}`;
+                stats.resolved++;
+                idArchived.push(target.id);
+                stats.idArchived = idArchived;
+                record('archived');
+                // The evidence card becomes the CONFIRMED closer: an existing
+                // dashed 'likely closed by' hint is relabeled in place (so
+                // fulfillmentOverlaysFor stops rendering it as unconfirmed)
+                // rather than left beside a second solid arrow.
+                if (r.byId && struct.cards.some(c => c.id === r.byId)) {
+                    let already = false;
+                    for (const cn of canvas.connections) {
+                        const samePair = (cn.fromId === target.id && cn.toId === r.byId) || (cn.fromId === r.byId && cn.toId === target.id);
+                        if (!samePair) continue;
+                        if (cn.label === 'likely closed by') {
+                            cn.label = 'closed by'; cn.style = 'solid'; cn.width = 2; cn.color = '#10b981'; cn.hintVia = 'human';
+                            already = true;
+                        } else if (cn.label === 'closed by') already = true;
+                    }
+                    if (!already) {
+                        canvas.connections.push({
+                            id: `con_${rand()}`, fromId: target.id, toId: r.byId, relationship: 'relates_to',
+                            label: 'closed by', arrowHead: true, width: 2, color: '#10b981', style: 'solid', hintVia: 'human',
+                        });
+                    }
+                    stats.linked++;
+                }
+                continue;
+            }
             const rTok = tokenSet(r.text);
             const cands = [];
             for (const c of liveTextCards()) {

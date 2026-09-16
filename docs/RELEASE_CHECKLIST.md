@@ -16,11 +16,25 @@ declares `needs: gate`, so a red gate means npm never sees a tarball.
 | 1 | Working tree clean, on the source commit | `git status --short` |
 | 2 | Dependencies match the lockfile exactly | `npm ci` |
 | 3 | Full suite green | `npm test` |
+| 3b | Reconcile the brain against the ref you are cutting | `brain_reconcile mode:"release" ref:<release ref>` |
 | 4 | Bump the version and commit all source changes | edit `package.json` → commit |
 | 5 | Record the immutable source target | `SOURCE_COMMIT=$(git rev-parse HEAD)` |
 | 6 | Add the fixed, corroborated evidence bundle in one new commit | `.release-evidence/v<version>/` only |
 | 7 | Verify that committed bundle against the source target | command below |
 | 8 | Sanity-check what will ship | `npm pack --dry-run` |
+
+**Step 3b** lists the open cards whose claims the commits in this ref look to have
+fulfilled. Read each one against its commit, then close the pairs you verified with
+`confirm:[{ id, sha }]` (or retire a wrong hint with `dismiss:[…]`); re-running should
+then list nothing. Two rules:
+
+- **Run it with the KLYPIX desktop CLOSED** (or with `brain.klypix` not open in it) —
+  otherwise merge-on-save re-unions the pre-confirm state and the closes come back.
+- Covering one item of a multi-item clause writes `✔ partial` and keeps the card
+  **open**. That is correct; pass `whole:true` only when the whole card really is done.
+
+The confirm write is merge-safe by construction: it edits card text, moves cards to
+Archive and adds connections and one milestone. It never deletes a card or an id.
 
 The release tag does **not** point at the source commit. It points at the next,
 one-parent **evidence commit**. That commit may add only regular `100644` files under:

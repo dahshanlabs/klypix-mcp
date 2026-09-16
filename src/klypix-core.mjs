@@ -32,13 +32,14 @@ import {
   rankForQuestion, questionContextToMarkdown, findLegacyShipCards,
   challengeBrain, challengeContextToMarkdown, buildRenderSpec, structToBrief,
   brainLensData, lensToMarkdown, deathDateOfCard,
-  statusContextToMarkdown, findFulfillmentCandidates, openStatusSummary, perAreaTableToMarkdown,
+  statusContextToMarkdown, findFulfillmentCandidates, findStaleOpenCards, releaseFulfilledOpens, openStatusSummary, perAreaTableToMarkdown,
   splitQueryTokens, scoreCardsAgainstQuery, correctionOverlaysFor, currentGuidanceFor, currentGuidancePrefix,
   isFastDecayCard, isUnresolvedOpenCard, isSkillCard, validateGuard, guardSidecarPathFor, ensureGuardSidecar, DECAY_STALE_MS, formatDecayAge,
   isPlanCard, planFulfillmentFor, PLAN_PAIR_SIM_BRAIN, isAgconfTwinId,
   readPendingShips, clearPendingShips, pendingShipCards, formatCaptureReceipts,
 } from './klypix-format.mjs';
-import { findProjectBrain, postPresenceMessage } from './agent-presence.mjs';
+import { findProjectBrain, postPresenceMessage, readReleaseLease } from './agent-presence.mjs';
+import { collectRepoState, commitsInRange, makeContainmentProbe } from './repo-state.mjs';
 
 import { brainCaptureLockPath, vaultCreateLockPath, withAdvisoryWriteLock } from './brain-write-lock.mjs';
 import {
@@ -812,7 +813,31 @@ export function collectMigrationFiles(root) {
   }
   return out;
 }
-export async function opBrainReconcile({ vault, canvas, root, mode = 'all', log = () => {} }) {
+// ── Release-cut reconcile context (1.85.0) ──────────────────────────────────
+// The commits a release ref carries since the last one, joined to the open
+// cards they look like they fulfilled. Shared by the read-only listing and the
+// confirm path so a confirm can only ever accept a pair the listing SHOWED.
+function releaseReconcileContext(file, struct, { root, ref, sinceRef } = {}) {
+  const projectDir = root ? path.resolve(root) : path.dirname(file);
+  let leaseRef = '', version = '';
+  try {
+    const lease = readReleaseLease({ brainPath: file });
+    if (lease) { leaseRef = String(lease.ref || ''); version = String(lease.version || ''); }
+  } catch { /* no lane / no lease — ref falls back below */ }
+  const target = String(ref || leaseRef || 'HEAD').trim();
+  let base = String(sinceRef || '').trim();
+  if (!base) { try { base = collectRepoState(projectDir)?.latestReleaseTag?.tag || ''; } catch { base = ''; } }
+  const range = commitsInRange(projectDir, base, target);
+  if (range.status !== 'ok') return { ok: false, reason: range.reason || 'git-unreadable', ref: target, sinceRef: base, projectDir, version };
+  const containedFn = makeContainmentProbe(projectDir, target);
+  const { candidates, truncated } = releaseFulfilledOpens(struct, range.commits, { ref: target, containedFn });
+  return {
+    ok: true, ref: target, sinceRef: base, projectDir, version, containedFn,
+    commits: range.commits, scanCapped: range.capped, candidates, truncated,
+  };
+}
+
+export async function opBrainReconcile({ vault, canvas, root, mode = 'all', ref = '', sinceRef = '', confirm = [], dismiss = [], note = '', log = () => {} }) {
   const t = brainTarget(vault, canvas);
   if (t.ambiguous) return ambiguousBrainErr(t.ambiguous);
   if (!t.file) return err(`No brain found — looked for ./brain.klypix in the project, then ${vault}. Pass canvas: "<name>".`);
@@ -821,6 +846,18 @@ export async function opBrainReconcile({ vault, canvas, root, mode = 'all', log 
   try { ({ struct } = await parseKlypix(fs.readFileSync(file))); } catch (e) { return err(`Read failed: ${e.message}`); }
   const stamp = brainStamp(file, struct, t.how);
   const sections = [];
+
+  // (0) CONFIRM / DISMISS — the ONLY write path in this verb, and only on the
+  // two evidence-bearing modes. Everything else below reads and changes
+  // nothing. A call whose every entry is refused leaves the brain byte-identical.
+  const confirmList = Array.isArray(confirm) ? confirm.filter(e => e && typeof e === 'object' && e.id) : [];
+  const dismissList = Array.isArray(dismiss) ? dismiss.filter(e => e && typeof e === 'object' && e.openId) : [];
+  if (confirmList.length || dismissList.length) {
+    if (mode !== 'claims' && mode !== 'release') {
+      return err(`confirm/dismiss are honoured on mode "claims" (card evidence) and mode "release" (commit evidence) only — mode "${mode}" is read-only.`);
+    }
+    return applyBrainReconcile({ file, how: t.how, mode, root, ref, sinceRef, confirm: confirmList, dismiss: dismissList, note });
+  }
 
   // (1) CONTRADICTIONS — the brain reconciled against ITSELF. Same-subject live
   // pairs where one side carries an explicit correction cue (that side is the
@@ -884,6 +921,34 @@ export async function opBrainReconcile({ vault, canvas, root, mode = 'all', log 
       sections.push(`# ⏳ ${cands.length} open claim(s) a later milestone likely fulfilled\n_Candidates with receipts — nothing was changed, nothing auto-archives. A ✓ is only suggested for FULLY covered claims. Dismiss a wrong hint permanently: \`brain_connect\` with \`pairs:[{fromId:<open id>, toId:<milestone id>}]\` and \`relationship:"not_fulfilled"\` — it will never be re-suggested._\n\n${lines.join('\n')}`);
     } else if (mode === 'claims') {
       sections.push('✓ No fulfilled-claim candidates — no live open clause is covered by a later milestone.');
+    }
+  }
+
+  // (1e) RELEASE (1.85.0) — the same question asked of a BUILD instead of a
+  // card: which open cards look fulfilled by the commits this release ref
+  // already carries? Read-only like every sibling; the confirm path above is
+  // the only thing that writes. `confirmable` is conservative on purpose —
+  // with ref being the branch under cut, containment is true by construction,
+  // so a coverage match needs cov ≥ 0.6 from a commit with a real body before
+  // it may be confirmed at all.
+  if (mode === 'release') {
+    const ctx = releaseReconcileContext(file, struct, { root, ref, sinceRef });
+    if (!ctx.ok) {
+      sections.push(`⚠️ Release reconcile could not read git history for ${ctx.ref}${ctx.sinceRef ? ` since ${ctx.sinceRef}` : ''} (${ctx.reason}). Nothing was changed. Pass an explicit \`ref\` (and \`sinceRef\`) this checkout can resolve.`);
+    } else if (!ctx.candidates.length) {
+      sections.push(`✓ No open card looks fulfilled by the ${ctx.commits.length} commit(s) in ${ctx.ref}${ctx.sinceRef ? ` since ${ctx.sinceRef}` : ''}.`);
+    } else {
+      const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+      const confirmable = ctx.candidates.filter(c => c.confirmable).length;
+      const lines = ctx.candidates.map((c, i) =>
+        `${i + 1}. [${c.area || '?'}] (id ${c.openId}) ${flat(c.headline).slice(0, 120)}\n`
+        + `   · via ${c.via}${c.cov != null ? ` · coverage ${c.cov}` : ''} · commit ${c.by.sha.slice(0, 7)} ${flat(c.by.subject).slice(0, 90)}\n`
+        + (c.confirmable
+          ? `   · confirm: \`brain_reconcile mode:"release" ref:"${ctx.ref}" confirm:[{ id:"${c.openId}", sha:"${c.by.sha.slice(0, 7)}" }]\``
+          : '   · NOT confirmable (anchor-grade, or the commit carries no body) — read it and close by hand if it really shipped'));
+      sections.push(`# 🚢 ${ctx.candidates.length} open card(s) look fulfilled by commits already in ${ctx.ref} (${confirmable} confirmable)\n`
+        + `_Scanned ${ctx.commits.length} commit(s)${ctx.scanCapped ? ' (SCAN CAPPED — older commits were not read)' : ''}${ctx.sinceRef ? ` since ${ctx.sinceRef}` : ''}. Nothing was changed. Verify each against the commit, then confirm the pairs you checked — the ids below are NOT prefilled into one call on purpose. Dismiss a wrong hint with \`dismiss:[{ openId, cardId }]\`. Covering one item of a multi-item clause writes \`✔ partial\` and keeps the card OPEN unless you pass \`whole:true\`._\n\n${lines.join('\n')}`
+        + (ctx.truncated ? '\n\n…more candidates than the cap; confirm these, then re-run.' : ''));
     }
   }
 
@@ -980,6 +1045,188 @@ export async function opBrainReconcile({ vault, canvas, root, mode = 'all', log 
 
   if (!sections.length) sections.push('✓ Nothing to reconcile — no contradiction candidates, and no unrecorded migrations.');
   return { blocks: [text(stamp + sections.join('\n\n---\n\n'))] };
+}
+
+// ── brain_reconcile confirm / dismiss (1.85.0) ──────────────────────────────
+// The retroactive sweeps have always been suggestion-only, and every retirement
+// had to be re-typed as a fuzzy ✓ marker — which is how 34 open cards on the
+// real brain stayed open for weeks while their milestones sat right beside them.
+// This is the confirm half: the agent NAMES the pairs it verified and they are
+// resolved by id, so nothing is matched by prose and nothing is closed in bulk.
+//
+// Two evidence kinds, because the two gaps are different:
+//   claims   { id, milestoneId } — a live milestone card plus an existing
+//            'likely closed by' edge or a CURRENT findStaleOpenCards gap on that
+//            exact pair. No git needed. Measured: 0 of the 34 likely-done
+//            milestones on the real brain carry a #commit- tag, so this — not
+//            the release variant — is the path that closes that incident.
+//   release  { id, sha } — the open card's own contained commit receipt, or a
+//            sha that was LISTED as a coverage candidate at cov ≥ 0.6. The
+//            listing gate is what stops "contained is true by construction"
+//            from being mistaken for evidence.
+//
+// Three invariants: the partial-clause rule survives (a strict subset of a
+// multi-item clause writes `✔ partial` and keeps the card OPEN unless
+// `whole:true`); a call whose every entry is refused writes NOTHING; and the
+// write is merge-safe by construction — it edits card text, moves cards to
+// Archive and ADDS connections/milestones, and never removes a card or an id.
+const RECONCILE_REFUSALS = {
+  'unknown-id': () => 'unknown-id',
+  'not-open': () => 'not-open (card is a milestone, skill, deferred, or already archived)',
+  'no-card-evidence': () => 'no-card-evidence (no likely-closed-by link or coverage between this card and that milestone)',
+  'not-in-ref': (ref) => `not-in-ref (the card carries no commit contained in ${ref})`,
+  'not-a-candidate': () => 'not-a-candidate (that commit was never listed as covering this card; name a listed pair)',
+  'no-dismiss-target': () => 'no-dismiss-target (a dismissal is an edge between two cards — pass cardId)',
+};
+async function applyBrainReconcile({ file, how, mode, root, ref, sinceRef, confirm, dismiss, note }) {
+  return withCanvasWriteLock(file, async () => {
+    let struct;
+    try { ({ struct } = await parseKlypix(fs.readFileSync(file))); } catch (e) { return err(`Read failed: ${e.message}`); }
+    const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+    const byId = new Map(struct.cards.map(c => [c.id, c]));
+    const refused = [];
+    const resolutions = [];
+    const dismissEdges = [];
+    const closedShas = [];
+    let ctx = null;
+
+    if (mode === 'release') {
+      ctx = releaseReconcileContext(file, struct, { root, ref, sinceRef });
+      if (!ctx.ok) return err(`brain_reconcile release could not read git history for ${ctx.ref} (${ctx.reason}) — nothing was changed. Pass an explicit ref (and sinceRef) this checkout can resolve.`);
+    }
+    // Card evidence for mode 'claims': an existing hint/confirmed edge on the
+    // pair, or a CURRENT gap. The union matters — findStaleOpenCards suppresses
+    // pairs that already carry an edge, so neither half alone is the answer.
+    let gapPairs = null;
+    const claimsEvidence = (openId, mileId) => {
+      for (const cn of struct.connections || []) {
+        const pair = (cn.fromId === openId && cn.toId === mileId) || (cn.fromId === mileId && cn.toId === openId);
+        if (pair && (cn.label === 'likely closed by' || cn.label === 'closed by')) return true;
+      }
+      if (!gapPairs) {
+        gapPairs = new Set();
+        try {
+          for (const g of findStaleOpenCards(struct, { max: Infinity }).gaps || []) {
+            if (g?.open?.id && g?.by?.id) gapPairs.add(`${g.open.id}|${g.by.id}`);
+          }
+        } catch { /* no gaps readable — edges still stand as evidence */ }
+      }
+      return gapPairs.has(`${openId}|${mileId}`);
+    };
+
+    for (const entry of confirm) {
+      const id = String(entry.id);
+      const card = byId.get(id);
+      if (!card || card.type === 'container' || !(card.text || '').trim()) { refused.push({ id, reason: 'unknown-id' }); continue; }
+      if (mode === 'claims') {
+        const mile = byId.get(String(entry.milestoneId || ''));
+        if (!mile || /^archive$/i.test(mile.area || '') || !claimsEvidence(id, mile.id)) { refused.push({ id, reason: 'no-card-evidence' }); continue; }
+        resolutions.push({ id, byId: mile.id, whole: entry.whole === true, text: flat(mile.text).replace(/^[^:\n]{1,40}:\s*/, '').slice(0, 160) });
+        continue;
+      }
+      // mode 'release'
+      const listed = ctx.candidates.filter(c => c.openId === id);
+      const own = listed.find(c => c.via === 'commit-tag' || c.via === 'commit-evidence' || c.via === 'edge');
+      const sha = String(entry.sha || '').trim().toLowerCase();
+      let chosen = null;
+      if (sha) {
+        if (!ctx.containedFn(sha)) { refused.push({ id, reason: 'not-in-ref' }); continue; }
+        chosen = listed.find(c => c.by.sha.startsWith(sha) || sha.startsWith(c.by.sha));
+        if (!chosen || !chosen.confirmable) { refused.push({ id, reason: 'not-a-candidate' }); continue; }
+      } else if (own) {
+        chosen = own;
+      } else {
+        refused.push({ id, reason: 'not-in-ref' }); continue;
+      }
+      const commit = ctx.commits.find(c => c.sha === chosen.by.sha);
+      resolutions.push({
+        id, whole: entry.whole === true,
+        ...(chosen.by.cardId ? { byId: chosen.by.cardId } : {}),
+        text: flat(commit ? commit.subject : chosen.by.subject).slice(0, 160),
+        __sha: chosen.by.sha,
+      });
+      closedShas.push(chosen.by.sha);
+    }
+
+    for (const entry of dismiss) {
+      const openId = String(entry.openId);
+      const open = byId.get(openId);
+      if (!open) { refused.push({ id: openId, reason: 'unknown-id' }); continue; }
+      let target = String(entry.cardId || '');
+      if (!target && mode === 'release' && ctx) {
+        const listed = ctx.candidates.find(c => c.openId === openId && c.by.cardId);
+        if (listed) target = listed.by.cardId;
+      }
+      if (!target || !byId.has(target)) { refused.push({ id: openId, reason: 'no-dismiss-target' }); continue; }
+      dismissEdges.push({ fromId: openId, toId: target, relationship: 'not_fulfilled' });
+    }
+
+    // Nothing applies → NOTHING is written. An all-refused call must leave the
+    // brain byte-identical (sha256-asserted in test/release-reconcile.mjs).
+    if (!resolutions.length && !dismissEdges.length) {
+      return { blocks: [text(reconcileReceipt({ file, how, mode, ref: ctx?.ref || ref, confirmed: 0, partial: 0, dismissed: 0, refused, details: [], note }))] };
+    }
+
+    let buf = fs.readFileSync(file);
+    let outcomes = [];
+    try {
+      if (resolutions.length) {
+        const res = await captureIntoBrain(buf, { resolutions });
+        buf = res.buffer;
+        outcomes = res.stats?.idResolutions || [];
+        for (const o of outcomes) if (o.outcome === 'refused') refused.push({ id: o.id, reason: o.reason });
+        const archivedIds = res.stats?.idArchived || [];
+        // ONE milestone per release confirm, carrying the closed headlines so it
+        // is retrievable evidence rather than an empty receipt. mode 'claims'
+        // mints nothing — the existing milestone IS the target.
+        if (mode === 'release' && archivedIds.length) {
+          const shorts = [...new Set(closedShas.map(s => s.slice(0, 7)))];
+          const heads = archivedIds.map(id => flat(byId.get(id)?.text || '').replace(/^[^:\n]{1,40}:\s*/, '').slice(0, 90));
+          const body = heads.map(h => `- ${h}`).join('\n').slice(0, 400);
+          const version = ctx?.version ? `v${ctx.version} ` : '';
+          const milestone = {
+            text: `Release: 🏁 ${version}(${ctx.ref}) closed ${archivedIds.length} open card(s) — reconciled against commits ${shorts.join(', ')}\n${body}\n#release #auto #release-reconcile ${shorts.map(s => `#commit-${s}`).join(' ')}`,
+            area: 'Release', createdVia: 'release-reconcile', borderColor: 'rgba(59,130,246,0.8)',
+            evidence: [...new Set(closedShas)].map(s => ({ kind: 'commit', ref: s })),
+            // Pass 2 draws the solid 'closed by' arrow from every card this
+            // confirm archived — the same field a `closes:` target would fill.
+            __closesIds: archivedIds,
+          };
+          const mres = await captureIntoBrain(buf, { cards: [milestone] });
+          buf = mres.buffer;
+        }
+      }
+      if (dismissEdges.length) {
+        const dres = await addBrainConnections(buf, dismissEdges);
+        buf = dres.buffer;
+      }
+      try { buf = (await tidyBrain(buf)).buffer; } catch { /* keep the capture result if tidy fails */ }
+      await atomicWrite(file, buf);
+    } catch (e) {
+      return err(`brain_reconcile ${mode} failed (brain unchanged): ${e.message}`);
+    }
+    const confirmed = outcomes.filter(o => o.outcome === 'archived').length;
+    const partial = outcomes.filter(o => o.outcome === 'partial');
+    const details = partial.map(o => `partial: ${o.id} — one clause item covered; ✔ partial noted, card stays open (pass whole:true to archive it)`);
+    return { blocks: [text(reconcileReceipt({
+      file, how, mode, ref: ctx?.ref || ref, confirmed, partial: partial.length,
+      dismissed: dismissEdges.length, refused, details, note,
+      closedBy: mode === 'release' ? `🏁 ${ctx?.version ? `v${ctx.version}` : ctx?.ref}` : 'their milestones',
+    }))] };
+  }, { brain: true });
+}
+function reconcileReceipt({ file, how, mode, ref, confirmed, partial, dismissed, refused, details, note, closedBy = 'their milestones' }) {
+  const head = `✓ brain_reconcile ${mode} → ${path.basename(file)} (via ${how})`
+    + ` · ${confirmed} confirmed (archived, closed by ${closedBy})`
+    + ` · ${partial} partial (clause struck, card kept open)`
+    + ` · ${dismissed} dismissed`
+    + ` · ${refused.length} refused${refused.length ? `: ${refused.map(r => `${r.id} — ${r.reason}`).join(' · ')}` : ''}`;
+  const lines = [
+    ...details,
+    ...refused.map(r => `refused: ${r.id} — ${(RECONCILE_REFUSALS[r.reason] || (() => r.reason))(ref || 'the release ref')}`),
+  ];
+  const tail = note ? `\nnote: ${String(note).slice(0, 400)}` : '';
+  return head + (lines.length ? `\n${lines.join('\n')}` : '') + tail;
 }
 
 // ── Brain gardener (two-phase: select → agent synthesizes → apply) ───────────

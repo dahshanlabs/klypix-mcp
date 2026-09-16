@@ -254,7 +254,11 @@ const flatten = (code) => code
     // only thing standing between that and the field; it caught exactly this.
     // (remote-client deliberately absent: the Remote feature was removed in
     // 1.73.x, and this cherry-pick must not resurrect it — recorded rule.)
-    .replace(/\.\.\/src\/(bench|brain-doctor|agent-presence|agent-rules|capture-gap|enrichment|finding-routing|mcp-presence|mcp-supervisor|mcp-auto-update|presence-relay|semantic-memory|runtime-inspector|project-graph|git-capture-install)\.mjs/g, './$1.mjs')
+    // repo-state: the worker's release-cut reconcile advisory (1.85.0) imports
+    // commitsInRange / makeContainmentProbe from it. It was already STAGED in
+    // the flat bundle (mcp-presence needs it) but never flattened, because
+    // nothing in bin/ had imported it directly before.
+    .replace(/\.\.\/src\/(bench|brain-doctor|agent-presence|agent-rules|capture-gap|enrichment|finding-routing|mcp-presence|mcp-supervisor|mcp-auto-update|presence-relay|repo-state|semantic-memory|runtime-inspector|project-graph|git-capture-install)\.mjs/g, './$1.mjs')
     .replace(/klypix-worker\.mjs/g, 'klypix-mcp-worker.mjs')
     .replace(/const PKG_VERSION = \(\(\) => \{[\s\S]*?\}\)\(\);/, `const PKG_VERSION = '${VERSION}'; // baked at install (flat layout has no package.json)`);
 

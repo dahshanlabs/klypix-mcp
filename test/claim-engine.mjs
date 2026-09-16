@@ -354,5 +354,81 @@ ok(stemLight('notes') === stemLight('noting'), 'stemLight DOES collide notes/not
     ok(!(struct.connections || []).some(c => c.label === 'likely closed by'), 'an anchor-grade pair leaves no persisted hint edge');
 }
 
+// ── ID-ADDRESSED RESOLVE (1.85.0) ───────────────────────────────────────────
+// brain_reconcile confirm names the exact card, so RESOLVE_AT is skipped — but
+// NOTHING else about a ✓ is relaxed. These are the guards that make an
+// id-addressed close safe to expose as a tool argument.
+{
+    const buf = await buildKlypix({
+        title: 'id-resolve',
+        cards: [
+            { text: 'Canvas: ❓ remaining: ship the arrow tool for the connection palette + rewrite lasso hit testing for rotated groups', area: 'Canvas' },
+            { text: 'Canvas: ❓ the capsule header still clips its auto-fit text at 30% zoom', area: 'Canvas' },
+            { text: 'Canvas: 🛠️ never white-stroke a selected item — boost width and opacity instead', area: 'Canvas' },
+            { text: 'Canvas: 🏁 v1.3.170 shipped with the staged-update swap', area: 'Canvas' },
+            { text: 'Canvas: ⤵ deferred until after the release: the reference-mode design panel', area: 'Canvas' },
+        ],
+    });
+    const { struct: s0 } = await parseKlypix(buf);
+    const id = (re) => (s0.cards.find(c => re.test(c.text || '')) || {}).id;
+    const clauseId = id(/remaining: ship the arrow tool/);
+    const plainId = id(/capsule header still clips/);
+    const skillId = id(/never white-stroke/);
+    const mileId = id(/staged-update swap/);
+    const deferredId = id(/reference-mode design panel/);
+
+    // Refusals first — every one of them leaves the card exactly as it was.
+    const refusals = await captureIntoBrain(buf, {
+        resolutions: [
+            { id: 'txt_doesnotexist', text: 'x' },
+            { id: skillId, text: 'the stroke rule is retired' },
+            { id: mileId, text: 'v1.3.170 shipped' },
+            { id: deferredId, text: 'the design panel landed' },
+        ],
+    });
+    const reasons = Object.fromEntries((refusals.stats.idResolutions || []).map(r => [r.id, `${r.outcome}:${r.reason || ''}`]));
+    ok(reasons.txt_doesnotexist === 'refused:unknown-id', 'id-resolve: an unknown id is refused, not guessed at');
+    ok(reasons[skillId] === 'refused:not-open', 'id-resolve: a 🛠 skill can never be archived by an id-addressed confirm');
+    ok(reasons[mileId] === 'refused:not-open', 'id-resolve: a pure 🏁 milestone is refused');
+    ok(reasons[deferredId] === 'refused:not-open', 'id-resolve: a ⤵ deferred card is refused');
+    const { struct: sRef } = await parseKlypix(refusals.buffer);
+    ok(!sRef.cards.some(c => /^archive$/i.test(c.area || '') && c.type !== 'container'), 'id-resolve: an all-refused capture archived nothing');
+
+    // The partial-clause rule SURVIVES the id path: covering one item of a
+    // two-item clause writes ✔ partial and the card stays live.
+    const part = await captureIntoBrain(buf, {
+        resolutions: [{ id: clauseId, text: 'ship the arrow tool for the connection palette' }],
+    });
+    const { struct: sPart } = await parseKlypix(part.buffer);
+    const partCard = sPart.cards.find(c => c.id === clauseId);
+    ok((part.stats.idResolutions || []).some(r => r.id === clauseId && r.outcome === 'partial'), 'id-resolve: a strict subset of a clause reports `partial`');
+    ok(/✔ partial/.test(partCard.text) && !/^archive$/i.test(partCard.area || ''), 'id-resolve: the partially-covered card stays LIVE with a ✔ partial note');
+    ok(/still open: .*lasso/i.test(partCard.text.replace(/\s+/g, ' ')), 'id-resolve: the ✔ partial line names what is still open');
+
+    // whole:true is the explicit override — and only then.
+    const whole = await captureIntoBrain(buf, {
+        resolutions: [{ id: clauseId, text: 'ship the arrow tool for the connection palette', whole: true }],
+    });
+    const { struct: sWhole } = await parseKlypix(whole.buffer);
+    ok((whole.stats.idResolutions || []).some(r => r.id === clauseId && r.outcome === 'archived'), 'id-resolve: whole:true archives the same card');
+    ok(/^archive$/i.test((sWhole.cards.find(c => c.id === clauseId) || {}).area || ''), 'id-resolve: whole:true really moves it to Archive');
+
+    // A plain open card with no clause archives, and its hint edge is relabeled
+    // from the dashed machine guess to the solid human verdict.
+    const hinted = await addBrainConnections(buf, [{ fromId: plainId, toId: mileId, relationship: 'relates_to', label: 'likely closed by', style: 'dashed' }]);
+    const closed = await captureIntoBrain(hinted.buffer, {
+        resolutions: [{ id: plainId, byId: mileId, text: 'the capsule header auto-fit was fixed' }],
+    });
+    const { struct: sClosed, canvas: cClosed } = await parseKlypix(closed.buffer);
+    ok(/^archive$/i.test((sClosed.cards.find(c => c.id === plainId) || {}).area || ''), 'id-resolve: a confirmed plain open card is archived');
+    // The raw canvas carries the render fields the struct view drops.
+    const pair = (cClosed.connections || []).filter(c => (c.fromId === plainId && c.toId === mileId) || (c.fromId === mileId && c.toId === plainId));
+    const edge = pair[0];
+    ok(!!edge && edge.label === 'closed by', 'id-resolve: the dashed "likely closed by" hint becomes a solid "closed by" verdict');
+    ok(!!edge && edge.style === 'solid', 'id-resolve: a confirmed verdict never renders as a dashed guess');
+    ok(!!edge && edge.hintVia === 'human', 'id-resolve: the verdict records that a human confirmed it');
+    ok(pair.length === 1, 'id-resolve: the hint is relabeled IN PLACE, never doubled by a second arrow');
+}
+
 console.log(fail ? `✗ ${fail} assertion(s) failed` : '✓ claim-engine: all assertions passed');
 process.exit(fail ? 1 : 0);

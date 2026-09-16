@@ -203,6 +203,10 @@ ok(Buffer.compare(before, fs.readFileSync(brainFile)) === 0, 'the advisory leave
 //   RR15  the byte-identical promise also holds for refusals the ENGINE raises
 //         (not-open, and an already-carried ✔ partial), not just the ones
 //         klypix-core catches before the capture.
+//   RR16  the advisory END TO END through the real worker: a granted lease
+//         carries it to the client, a same-ref refresh re-walks nothing, a
+//         refused lease carries none, zero candidates omit the key, and a young
+//         repo is not reported as an unreadable checkout.
 const sha256 = (b) => createHash('sha256').update(b).digest('hex');
 const vault = path.join(project, 'vault-unused');
 fs.mkdirSync(vault, { recursive: true });
@@ -339,6 +343,110 @@ ok(/no-card-evidence \(no likely-closed-by link or coverage between this card an
   ok(shaNow() === beforeRepeat, 'RR15 re-confirming an already-noted partial writes nothing');
   ok(!/one clause item covered; ✔ partial noted/.test(repeatText) || /already on the card/.test(repeatText),
     'RR15 and the receipt does not claim a fresh ✔ partial stamp');
+}
+
+// ── RR16 — the advisory END TO END, through the real worker ─────────────────
+// 2026-09-16 review: RL10a-d only assert that mcp-presence's lease record
+// carries no `reconcile` key. Nothing drove brain_sync with a GRANTED lease
+// through the worker, so lastReconcileRef (a same-ref refresh must not re-walk
+// the range), the notice's presence in the joined text, the {skipped}
+// degradation, and the fact that the mutation reaches the client at all —
+// structuredContent spreads report.structured SHALLOWLY, and releaseLease is
+// the same object reference — were reviewed but never executed.
+{
+  const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
+  const { StdioClientTransport } = await import('@modelcontextprotocol/sdk/client/stdio.js');
+  const WORKER = path.join(__dirname, '..', 'bin', 'klypix-worker.mjs');
+
+  const drive = async (dir, calls) => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-rr16-home-'));
+    const env = {
+      ...process.env, HOME: home, USERPROFILE: home,
+      KLYPIX_AUTO_UPDATE: '0', KLYPIX_MCP_INBOX_POLL_MS: '60000',
+      KLYPIX_SESSION_ID: `rr16-${path.basename(dir)}`,
+    };
+    const client = new Client({ name: 'rr16-host', version: '1.0.0' }, { capabilities: {} });
+    const transport = new StdioClientTransport({
+      command: process.execPath, args: [WORKER, '--vault', dir], cwd: dir, env, stderr: 'pipe',
+    });
+    const out = [];
+    try {
+      await client.connect(transport);
+      for (const args of calls) out.push(await client.callTool({ name: 'brain_sync', arguments: args }));
+    } finally { try { await client.close(); } catch { /* best-effort */ } }
+    try { fs.rmSync(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch { /* best-effort */ }
+    return out;
+  };
+  const joined = (r) => (r.content || []).map(b => b.text || '').join('\n');
+  const lease = (r) => r.structuredContent?.releaseLease || {};
+
+  // A brain with one open card the release's commit covers.
+  await buildBrain();
+  const brainBefore = sha256(fs.readFileSync(brainFile));
+  const declare = (ref) => ({
+    project, intent: 'cut the release', phase: 'start',
+    releaseIntent: { version: '1.3.170', ref },
+  });
+  const [first, second] = await drive(project, [
+    declare('release/1.3.170'),
+    { project, intent: 'still cutting the release', phase: 'checkpoint', releaseIntent: { version: '1.3.170', ref: 'release/1.3.170' } },
+  ]);
+  const rec = lease(first).reconcile;
+  ok(!!rec && !rec.skipped, `RR16 THE HEADLINE: a granted lease carries the reconcile advisory [${JSON.stringify(rec && rec.kind)}]`);
+  ok(!!rec && rec.kind === 'open-cards-likely-fulfilled-by-release' && rec.severity === 'advisory',
+    'RR16 it is an advisory, kind and all — it never joins the refusal object');
+  ok(!!rec && rec.ref === 'release/1.3.170' && rec.sinceRef === 'v1.3.169',
+    `RR16 it names the ref it walked and the baseline it walked from [${rec && rec.sinceRef}]`);
+  ok(!!rec && Array.isArray(rec.candidates) && rec.candidates.length > 0 && rec.candidates.every(c => c.unconfirmed === true),
+    'RR16 every candidate reaches the client marked unconfirmed');
+  ok(!!rec && rec.confirmWith?.tool === 'brain_reconcile'
+    && JSON.stringify(rec.confirmWith.args.confirm) === JSON.stringify([{ id: '<openId>', sha: '<sha>' }]),
+  'RR16 the confirm template travels with it, placeholders intact');
+  ok(/look fulfilled by commits already in release\/1\.3\.170/.test(joined(first)),
+    `RR16 the notice is in the joined text a host actually reads [${joined(first).split('\n').find(l => /fulfilled by commits/.test(l)) || '—'}]`);
+  ok(sha256(fs.readFileSync(brainFile)) === brainBefore,
+    'RR16 the advisory leaves the brain byte-identical — it reads, it never writes');
+
+  // A refresh on the SAME ref must not re-walk the range.
+  ok(!lease(second).reconcile, 'RR16 a same-ref refresh re-walks nothing — no second advisory');
+  ok(!/look fulfilled by commits already in/.test(joined(second)), 'RR16 …and prints no second notice');
+
+  // A ref git cannot resolve never reaches the advisory at all: the lease's own
+  // ancestry guard refuses first. Worth locking — an advisory must never ride a
+  // lease that was not granted. (The { skipped } degradation itself is locked at
+  // the unit level: RR1 for the 'unknown' range status, RR7 for the notice.)
+  const [bad] = await drive(project, [declare('release/does-not-exist')]);
+  ok(bad.isError !== true, 'RR16 an unresolvable ref does not fail the sync');
+  ok(lease(bad).status === 'refused', `RR16 the lease itself is refused [${lease(bad).status}]`);
+  ok(!('reconcile' in lease(bad)), 'RR16 and NO advisory rides a refused lease');
+  ok(!/release reconcile/.test(joined(bad)), 'RR16 …and no reconcile notice is printed for one');
+
+  // Zero candidates → NO key at all: an absent advisory and an empty one must
+  // not look the same to a reader.
+  const quiet = path.join(os.tmpdir(), `klypix-rr16-quiet-${process.pid}`);
+  fs.rmSync(quiet, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  fs.mkdirSync(quiet, { recursive: true });
+  const qgit = (...a) => execFileSync('git', a, { cwd: quiet, encoding: 'utf8', stdio: 'pipe' });
+  qgit('init', '-q', '-b', 'master');
+  qgit('config', 'user.email', 'test@klypix.local');
+  qgit('config', 'user.name', 'KLYPIX Test');
+  fs.writeFileSync(path.join(quiet, 'README.md'), 'quiet');
+  qgit('add', '-A');
+  qgit('commit', '-q', '-m', 'chore: baseline');
+  fs.writeFileSync(path.join(quiet, 'brain.klypix'), await buildKlypixMap({
+    title: 'brain', areas: [{ title: 'Ops', cards: [{ text: 'Ops: ❓ nothing in this repo has shipped yet' }] }],
+  }));
+  const [none] = await drive(quiet, [{
+    project: quiet, intent: 'cut the first release', phase: 'start',
+    releaseIntent: { version: '0.1.0', ref: 'master' },
+  }]);
+  ok(!('reconcile' in lease(none)), `RR16 zero candidates omit the key entirely [${JSON.stringify(lease(none).reconcile)}]`);
+  // …and the young-repo case: no release tag and fewer than 50 commits used to
+  // take the `${ref}~50` fallback, which git refuses, so the FIRST release of
+  // any repo was told its history "could not be read".
+  ok(!/could not be read|reconcile skipped/.test(joined(none)),
+    `RR16 a young repo is not reported as an unreadable checkout [${joined(none).split('\n').find(l => /reconcile/.test(l)) || '—'}]`);
+  fs.rmSync(quiet, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 }
 
 fs.rmSync(project, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });

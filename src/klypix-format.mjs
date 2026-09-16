@@ -6811,7 +6811,10 @@ export const releaseReconcileConfirmTemplate = (ref) => ({
 // found nothing / could not look.
 export function releaseReconcileNotice({ ref, sinceRef = '', candidates = [], skipped = false } = {}) {
     if (skipped) return `KLYPIX release reconcile skipped: git history for ${ref} could not be read.`;
-    if (!candidates.length) return `KLYPIX release reconcile: no open cards look fulfilled by commits in ${ref} since ${sinceRef}.`;
+    // A young repo has no baseline to name (no release tag, no ship signal —
+    // the FIRST release), and "since ." reads like a bug. The wording is
+    // byte-identical whenever a baseline exists (RR7 locks it verbatim).
+    if (!candidates.length) return `KLYPIX release reconcile: no open cards look fulfilled by commits in ${ref}${sinceRef ? ` since ${sinceRef}` : ''}.`;
     const confirmable = candidates.filter(c => c && c.confirmable).length;
     return `KLYPIX release reconcile: ${candidates.length} open card(s) look fulfilled by commits already in ${ref} (${confirmable} confirmable)`
         + ` — verify each, then confirm with brain_reconcile mode:"release" ref:"${ref}" confirm:[{ id, sha }] (or dismiss:[…]). Nothing was changed.`;

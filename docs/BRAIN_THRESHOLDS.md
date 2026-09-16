@@ -88,7 +88,21 @@ recall-side overlay (`correctionOverlaysFor`), and `detectContradictions`.
   confirmable. With `ref` being the branch under cut, containment is true by
   construction for every commit in the range, so it is not evidence on its own.
 - The advisory is attached only on a NEW lease or a CHANGED ref; zero candidates
-  leaves the key absent entirely.
+  leaves the key absent entirely. It never rides a lease that was not GRANTED (a
+  refused one carries no `reconcile` key and prints no notice).
+- No `<ref>~50` baseline guess. A repo with no release-shaped tag and fewer than
+  50 commits — the FIRST release of anything — made `git log <ref>~50..<ref>`
+  exit non-zero and was told its history "could not be read". An empty baseline
+  is passed instead, and `commitsInRange` walks the ref's own tip window under
+  the same 500-commit / 4 s cap.
+- **Measured cost** (2026-09-16, the real 2,693-card KLYPIX brain, full
+  500-commit range, Windows): `collectRepoState` 1,128 ms · `commitsInRange`
+  938 ms · `parseKlypix` 434 ms · `releaseFulfilledOpens` 1,255 ms (16
+  candidates, 1 containment probe) — **≈3.8 s end to end**, once per lease/ref.
+  The variable term is the containment probe: 2 git spawns per unique sha, so a
+  run that spends its full 64-sha budget adds several seconds more. That is the
+  ceiling the budget exists to bound, and every failure degrades to `{ skipped }`
+  rather than slowing or failing the sync.
 - `brain_reconcile` confirm: the partial-clause rule is unchanged — a strict subset of
   a multi-item clause writes `✔ partial` and the card stays live unless `whole:true`.
   Refusals are per entry (`unknown-id` · `not-open` · `no-card-evidence` ·

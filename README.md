@@ -598,7 +598,7 @@ The MCP verbs below are what agents call. These are what **you** call:
 | `brain_reconcile` | Proposes stale-vs-correction pairs, unrecorded migrations, and the open cards a release ref's commits look to have closed — then closes the exact pairs you confirm |
 | `brain_insights` | Hubs, orphaned decisions, stale questions, area sizes |
 | `brain_lens` | Machine-readable freshness, provenance, activity, timeline, orrery and unresolved views |
-| `brain_garden` | Maintenance pass — proposes first, and cannot apply without an approval code the human generates |
+| `brain_garden` | Maintenance pass — proposes first; consolidation cannot apply without an approval code the human generates. The separate `repair:"duplicate-partials"` pass is dry-run first and needs no code (it removes only exact repeats and archives nothing) |
 | `brain_doctor` | Self-diagnosis: version, core/enhanced host adapters, active sessions, tool count, projection drift |
 | `brain_message` | Session-to-session coordination notes with a fixed send-time audience and per-recipient pending / offer / acknowledgement / consumption / failure receipts (24h TTL, never written into the brain) |
 | `brain_message_receipt` | Explicitly record model-side consumption using the exact message id and per-recipient offer token; acknowledgement alone never consumes a note |
@@ -626,7 +626,9 @@ is read-only too, with one exception: on `mode:"claims"` and `mode:"release"` yo
 `confirm` / `dismiss` to close the pairs you verified. Confirm names exact card ids — nothing is
 matched by prose — and covering only part of a multi-item clause writes `✔ partial` and keeps the
 card open unless you pass `whole:true`. A call whose every entry is refused leaves the brain
-byte-identical. `brain_garden`, `brain_reconcile` and `brain_connect` always propose before they
+byte-identical. A `dismiss` is recorded as a `not_fulfilled` edge between two CARDS, so a hint
+whose only evidence is a raw commit has nothing to point at — name a `cardId`, or resolve the open
+card itself. `brain_garden`, `brain_reconcile` and `brain_connect` always propose before they
 apply.
 `npx klypix-mcp doctor` gives one verdict and exits non-zero on drift, so it doubles as a CI gate.
 

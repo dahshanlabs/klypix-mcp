@@ -649,8 +649,8 @@ server.registerTool('brain_reconcile', {
     dismiss: z.array(z.object({
       openId: z.string().max(64).describe('The open card the hint was wrong about.'),
       cardId: z.string().max(64).optional().describe('The milestone/evidence card to dismiss it against (required unless the listing already named one).'),
-      sha: z.string().max(40).optional().describe('Informational — the commit that produced the wrong hint.'),
-    })).max(64).optional().describe('Wrong hints to retire permanently as "not_fulfilled" edges — never re-suggested by claims, release, or the self-heal.'),
+      sha: z.string().max(40).optional().describe('Informational only — the commit that produced the wrong hint. A dismissal is recorded against a CARD, so a hint whose only evidence is a raw commit (no milestone card) cannot be dismissed: pass a cardId, or retire the open card itself.'),
+    })).max(64).optional().describe('Wrong hints to retire permanently as "not_fulfilled" edges between two CARDS — never re-suggested by claims, release, or the self-heal. A card-to-card pair is what makes the dismissal durable; a coverage hint built straight from a commit has no card to point at and will be re-listed at the next release cut until the open card is resolved or the pair is named with a cardId.'),
     note: z.string().max(400).optional().describe('One line of why, echoed in the receipt.'),
   },
 }, async ({ canvas, root, mode, ref, sinceRef, confirm, dismiss, note }) => toContent(await opBrainReconcile({ vault: mcpPresence.vault, canvas: boundBrainCanvas(canvas), root, mode, ref, sinceRef, confirm, dismiss, note, log })));
@@ -958,8 +958,14 @@ server.registerTool('brain_sync', {
                 cwd: projectDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 4000,
               })).tag || '';
             } catch { return ''; }
-          })()
-          || `${ref}~50`;
+          })();
+        // NO `${ref}~50` guess. On a young repo — no release-shaped tag and
+        // fewer than 50 commits, i.e. the FIRST release — `git log <ref>~50..`
+        // exits non-zero, commitsInRange reports 'bad-range', and the lease
+        // holder is told "git history for <ref> could not be read", which reads
+        // as a broken checkout when the truth is "this repo is young".
+        // commitsInRange already walks the ref's own tip window on an empty
+        // baseline, capped at the same 500 commits / 4 s either way.
         const range = commitsInRange(projectDir, sinceRef, ref);
         if (range.status !== 'ok' || !brainPath) {
           lease.reconcile = { skipped: true, reason: range.status !== 'ok' ? (range.reason || 'git-unreadable') : 'no-brain' };

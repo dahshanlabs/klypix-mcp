@@ -789,19 +789,37 @@ Read this section before you build on any of it.
 Every number here is measured on our own project brain. Nothing below is published, benchmarked or
 independently validated.
 
-- **Dogfood scale.** KLYPIX itself is built with its own brain: **2,479 cards and 2,018
+- **Dogfood scale.** KLYPIX itself is built with its own brain: **2,695 cards and 2,333
   connections**, written by multiple concurrent agent sessions, receipts in the file. Current as of
-  2026-08-13.
+  2026-09-16.
 - **Recall.** 73% of past decisions recovered with one search round, 55% brief-only, 0% cold.
   Caveat that travels with it: n=20, our own brain, self-authored questions, LLM-judged.
-- **Ranker.** With the production embedder (the eval harness was fixed 2026-08-10 — it had been
-  measuring a vector space the product does not use): recall@5 **30%**, recall@10 35%, recall@20
-  45%, MRR 0.22 of the true source card on n=20 frozen human-paraphrase questions. Lexical-only
-  scores 0% on the same set. The previously published "15% → 40% with the reranker" is **retired**:
-  re-measured validly, the reranker *reduced* recall@5 to 25% and now ships off by default. At n=20
-  every one of these percentages carries a ±20-point 95% confidence interval — treat them as
-  directional until the larger frozen set lands. The regressions are recorded next to the wins:
-  contextual prefixes on short cards, and the reranker itself.
+- **Ranker (`brain_ask`).** Measured 2026-09-16 on the real 2,695-card brain with the production
+  embedder, n=107 frozen questions (agent-authored, adversarially verified, four strata), model-free
+  rank of the true source card: recall@5 **63%** (95% CI 53–71), recall@10 65%, recall@20 69%, MRR
+  0.43, top-1 33%. The stratum that matters most is the honest one: **paraphrase questions that share
+  no words with their card reach recall@5 44%**; status, temporal and multi-hop questions sit at
+  81–93% because they still share vocabulary. Lexical-only scores 0% on the same set.
+- **Second brain.** The same ranker on a different project's brain (1,601 cards, 19 hand-written
+  paraphrases, first cross-brain run): recall@5 **42%** (CI 23–64), top-1 11%, MRR 0.25. Paraphrase
+  recall transfers between brains; the ranker is not tuned to the brain it was built on. It is
+  simply weak on paraphrase everywhere — the embedder's ceiling, documented in `rankForQuestion`.
+- **Retired numbers.** "recall@5 30% (n=20)", "15% → 40% with the reranker" and the "5% → 15% →
+  40%" curve are all **retired**: the first was the n=20 set the larger set replaced, the others were
+  measured with a reranker that ships off by default (validly re-measured it *reduced* recall@5) or
+  by a harness that had drifted from the production vector space (fixed 2026-08-10). The
+  regressions are recorded next to the wins: contextual prefixes on short cards, and the reranker.
+- **The per-prompt hook lane** (the retrieval every Claude Code session receives on every prompt)
+  had never been measured before 1.86. `scripts/eval-hook-lane.mjs` now measures it through the
+  production rankers on a private capture-pair set built from the machine's own enrichment sidecar
+  (`scripts/build-hook-eval-set.mjs`). First measurement, 110 real prompts on our own brain: the
+  lexical lane fired on 97% of content-bearing prompts and held the right card in its top five 29%
+  of the time, and the lane as a whole injected cards on 93% of prompts that should inject nothing
+  (acknowledgements, console echoes, relayed machine turns). 1.86 raises the lexical bar so a
+  single title word no longer injects, and skips the uncorroborated semantic guess for prompts with
+  fewer than four content words: junk injection 93% → 35%, mean cards injected on junk 3.6 → 1.5,
+  at a one-question cost on the 35 real prompts (inside noise). The prompts stay private; the
+  sweep tables are in the source next to the bars they chose.
 - **What we do not publish.** No download count: this package's own 24-hour auto-updater generates
   most of it, so it is not a user count. No adoption, team or customer figures. No brief-token
   figure — the last one was measured at ~600 cards and is stale at 2,479.

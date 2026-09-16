@@ -26,6 +26,7 @@ import {
   ENRICHMENT_MAX_QUESTIONS,
   enrichmentFileFor,
   enrichmentKeyFor,
+  enrichmentQuestionQuality,
   enrichmentTextFor,
   readEnrichment,
   recordEnrichment,
@@ -121,6 +122,81 @@ try {
   fs.utimesSync(f, new Date(), new Date(Date.now() + 2000));
   const after = readEnrichment(brain, { home });
   ok(after !== before, 'EN5: touching the sidecar invalidates the memo');
+
+  // ── EN6 — the quality gate (1.86) ───────────────────────────────────────
+  // Every class below was found in a REAL sidecar on 2026-09-16, recorded as
+  // "the asker's language" and fed to the embedder.
+  const gate = (q) => enrichmentQuestionQuality(q);
+  ok(gate('done , what now').reason === 'low-content', 'EN6: an acknowledgement carries no askable vocabulary');
+  ok(gate('300mb is ok').reason === 'low-content', 'EN6: "300mb is ok" is not a question about anything');
+  ok(gate('ok do them and the recommendations').reason === 'low-content', 'EN6: a go-ahead with one content word is rejected');
+  ok(gate('> klypix@1.3.127 release:register > node scripts/register-release.mjs --rollout=100 ✔ releases row registered').reason === 'console',
+    'EN6: an npm script echo is console output, not a prompt');
+  ok(gate('Stop hook feedback: [node global-brain-hook.mjs --capture]: [brain] 🧠 uncaptured work — this outcome should be recorded').reason === 'machine',
+    'EN6: hook feedback re-injected as a user turn is a machine text');
+  ok(gate('another claude session sent a message: <agent-message from="a817"> [subagent hand-back] the report below').reason === 'machine',
+    'EN6: a peer message relayed into the prompt is a machine text');
+  ok(gate('# Workflow authoring reference — a workflow structures work across many agents').reason === 'pasted-doc',
+    'EN6: a pasted markdown document is not the asker speaking');
+  ok(gate('[Image: original 3200x1800, displayed at 2000x1125. Multiply coordinates by 1.60 to map to the original]').reason === 'machine',
+    'EN6: an image-attachment preamble is harness text');
+  ok(gate('Base directory for this skill: e:\\ANTIGRAVITY\\KLYPIX\\.claude\\skills\\impeccable Designs and audits interfaces').reason === 'machine',
+    'EN6: a skill-invocation preamble is harness text');
+  ok(gate('see this is competotor ? i posted jst question to check and he reached this way').ok === true,
+    'EN6: a real, typo-laden founder question passes — the gate is about vocabulary, not polish');
+  ok(gate('why the message not appear .. regarding the folder features what are they to be tested ?').ok === true,
+    'EN6: a terse but content-bearing question passes');
+  ok(gate('ليش ما تظهر الرسالة عند فتح المجلد الجديد في الكانفس؟').ok === true,
+    'EN6: an Arabic question passes — tokens are Unicode words, not [a-z]');
+  ok(gate('تمام طيب').reason === 'low-content', 'EN6: an Arabic acknowledgement is rejected');
+  ok(gate('').reason === 'too-short' && gate(null).reason === 'too-short', 'EN6: empty input is too short, never a throw');
+
+  // ── EN7 — the gate runs on BOTH sides ───────────────────────────────────
+  const gatedBody = 'The hook lane fallback is a production primitive so the harness can import it';
+  const r7 = recordEnrichment(brain, [
+    { body: gatedBody, question: 'how does the eval measure the same fallback ranking the hook actually runs?' },
+    { body: gatedBody, question: 'ok do it' },
+    { body: gatedBody, question: '> npm run test ✔ 12 passed' },
+  ], { home });
+  ok(r7.recorded === 1 && r7.rejected === 2, `EN7: record keeps the question and reports the two rejections (${r7.recorded}/${r7.rejected})`);
+  const r7entry = readEnrichment(brain, { home }).find((entry) => entry.key === enrichmentKeyFor(gatedBody));
+  ok(r7entry && r7entry.q.length === 1 && /eval measure/.test(r7entry.q[0]), 'EN7: only the question reached the sidecar');
+  // A legacy sidecar (pre-1.86 hook) carrying junk is cleaned ON READ.
+  const legacyBrain = path.join(path.dirname(brain), 'legacy.klypix');
+  fs.writeFileSync(legacyBrain, 'fixture');
+  const legacyFile = enrichmentFileFor(legacyBrain, home);
+  fs.mkdirSync(path.dirname(legacyFile), { recursive: true });
+  fs.writeFileSync(legacyFile, JSON.stringify({ v: 1, entries: {
+    [enrichmentKeyFor(gatedBody)]: { q: ['done , what now', 'which lane does every prompt actually pass through before anything is injected?'], ts: Date.now() },
+    [enrichmentKeyFor('a second body whose only recorded text is an acknowledgement, long enough to key')]: { q: ['300mb is ok'], ts: Date.now() },
+  } }));
+  const legacy = readEnrichment(legacyBrain, { home });
+  ok(legacy.length === 1 && legacy[0].q.length === 1 && /every prompt/.test(legacy[0].q[0]),
+    'EN7: a legacy sidecar is cleaned on read — junk texts dropped, an entry with nothing left is dropped whole');
+  ok(enrichmentTextFor(legacy, `Retrieval: 🛠️ ${gatedBody}\n#retrieval`) === legacy[0].q[0],
+    'EN7: the cleaned entry still joins to its card');
+
+  // ── EN8 — the MCP path records the AUTHORED question beside the intent ──
+  const noteText8 = 'Retrieval: the authored question rides beside the declared intent on the MCP note path';
+  const res8 = await opBrainNote({ vault: proj2, canvas: brain2, text: noteText8, area: 'Retrieval', via: 'test',
+    enrichmentQuestion: ['how does a note become findable by a paraphrase nobody typed?', 'ok do them', 'audit the brain retrieval core for over- and underfitting'] });
+  ok(!res8.isError, 'EN8: the note lands');
+  const side8 = readEnrichment(brain2, {}).find((entry) => entry.key === enrichmentKeyFor(noteText8));
+  ok(side8 && side8.q.some((q) => /paraphrase nobody typed/.test(q)) && side8.q.some((q) => /audit the brain/.test(q)) && !side8.q.some((q) => /ok do them/.test(q)),
+    'EN8: both the authored question and the intent are recorded; the acknowledgement is not');
+
+  // ── EN9 — the hook's `q:` marker suffix ─────────────────────────────────
+  const { splitMarkerSuffixes } = await import('../src/global-brain-hook.mjs');
+  const parsed = splitMarkerSuffixes('Pan = dedicated hand tool in toolbar; Zoom = steppers in the status bar q: how do I move around the board and change magnification? closes: [[Canvas navigation]] ev: src/canvas/Toolbar.tsx');
+  ok(parsed.body === 'Pan = dedicated hand tool in toolbar; Zoom = steppers in the status bar', 'EN9: the q: suffix never leaks into the card text');
+  ok(parsed.question === 'how do I move around the board and change magnification?', 'EN9: the question is parsed out in full');
+  ok(parsed.closes === '[[Canvas navigation]]' && parsed.evidence && parsed.evidence.length === 1,
+    'EN9: closes: and ev: still parse around it (shared lookahead — no lockstep drift)');
+  const noQ = splitMarkerSuffixes('Decided: FAQ: entries stay in the docs, not the brain');
+  ok(noQ.body === 'Decided: FAQ: entries stay in the docs, not the brain' && noQ.question === '', 'EN9: "FAQ:" is not a q: suffix — the key needs a word boundary');
+  const onlyQ = splitMarkerSuffixes('Keep the merge driver append-only q: why can a merge never drop a card?');
+  ok(onlyQ.body === 'Keep the merge driver append-only' && onlyQ.question === 'why can a merge never drop a card?' && onlyQ.closes === '' && onlyQ.evidence === null,
+    'EN9: q: alone works, other keys stay empty');
 
   if (failures) { console.error(`\n✗ ${failures} assertion(s) failed`); process.exit(1); }
   console.log('\n✓ enrichment — all assertions passed');

@@ -66,18 +66,73 @@ function readFile(file) {
 
 const cleanQuestion = (q) => String(q || '').replace(/\s+/g, ' ').trim().slice(0, ENRICHMENT_MAX_QUESTION_CHARS);
 
+// ── Question quality gate (1.86) ─────────────────────────────────────────────
+// "The nearest human prompt" is the right SOURCE of asker language but is not
+// always a question. Measured on this project's own sidecar (2026-09-16, 187
+// recorded texts): 36% were question-shaped, 18% were acknowledgements ("done,
+// what now", "300mb is ok", "ok do them"), and the rest included npm script
+// echoes ("> klypix@1.3.127 release:register …"), hook feedback re-injected
+// as a user turn, and pasted documents. Every one of those was appended to a
+// card's EMBED input as if it were the words someone would ask with — pulling
+// the vector toward generic chatter, the opposite of the vocabulary bridge
+// enrichment exists to build. The gate rejects text that carries no askable
+// vocabulary and runs on BOTH sides (record and read), so an already-recorded
+// sidecar is cleaned lazily on its next read without a rewrite. A rejection
+// costs nothing but recall the text never carried.
+export const ENRICHMENT_MIN_CONTENT_TOKENS = 4;
+const ENRICHMENT_STOPWORDS = new Set((
+  'a an and are as at be been but by can could did do does for from had has have he her his how i if in is it its '
+  + 'just let lets me my no nor not of ok okay on or our out she so than that the their them then there these they this '
+  + 'those to up us was we were what when where which who whom why will with would you your yes yep nope sure please '
+  + 'thanks thank great good fine done cool right now also very really any all both each more most some such too again '
+  + 'about into over under after before while because '
+  // Arabic function words and acknowledgements (folded forms; enrichment text is
+  // recorded as typed, so the common unfolded spellings are listed too).
+  + 'هل ما ماذا لماذا كيف اين أين وين متى من في على الى إلى عن هذا هذه ذلك تلك هو هي هم انا أنا نحن انت أنت و او أو لا نعم تمام طيب اوكي ايوه ايوا'
+).split(/\s+/).filter(Boolean));
+const ENRICHMENT_MACHINE_RE = /stop hook feedback|<agent-message|\[subagent hand-back\]|<task-notification|system-reminder|\[system notification|<command-(?:name|message|args)|local-command-(?:stdout|stderr)|<hook-[a-z0-9-]+|^\[image:|base directory for this skill:/i;
+const ENRICHMENT_CONSOLE_RE = /^[>$]\s|(?:^|\s)npm (?:err!|warn)\b|\bexited with code \d|[✓✔]|^\s*\{"|^\s*\[\{/i;
+const ENRICHMENT_PASTED_DOC_RE = /^#{1,6}\s|^```|^---\s|^(?:import|export|const|function|class)\s/;
+const contentTokens = (text) => String(text || '').toLowerCase().split(/[^\p{L}\p{N}]+/u)
+  .filter((token) => token.length >= 2 && !ENRICHMENT_STOPWORDS.has(token));
+
+/**
+ * Decide whether a text carries askable vocabulary worth embedding beside a
+ * card. Returns { ok, reason, text } — `text` is the cleaned form that would be
+ * recorded. Reasons: too-short · machine (harness/hook output) · console (npm /
+ * shell echo) · pasted-doc (markdown/code block) · low-content (fewer than
+ * ENRICHMENT_MIN_CONTENT_TOKENS non-stopword tokens — the acknowledgement class).
+ */
+export function enrichmentQuestionQuality(question) {
+  const text = cleanQuestion(question);
+  if (text.length < 8) return { ok: false, reason: 'too-short', text };
+  if (ENRICHMENT_MACHINE_RE.test(text)) return { ok: false, reason: 'machine', text };
+  if (ENRICHMENT_CONSOLE_RE.test(text)) return { ok: false, reason: 'console', text };
+  if (ENRICHMENT_PASTED_DOC_RE.test(text)) return { ok: false, reason: 'pasted-doc', text };
+  if (contentTokens(text).length < ENRICHMENT_MIN_CONTENT_TOKENS) return { ok: false, reason: 'low-content', text };
+  return { ok: true, reason: null, text };
+}
+
 /**
  * Record question/intent text for captured card bodies. `items` is
  * [{ body, question }]; entries merge per body key (deduped, newest kept,
  * capped). Bounded overall: past ENRICHMENT_MAX_ENTRIES the OLDEST entries are
  * pruned — enrichment is a rolling quality window, not an archive, and unlike
  * the claims lane nothing downstream depends on any single entry existing.
+ * Returns { recorded, rejected } — `rejected` counts texts the quality gate
+ * refused (see enrichmentQuestionQuality); they are never written.
  */
 export function recordEnrichment(brainPath, items, { home = os.homedir(), now = Date.now() } = {}) {
-  const list = (Array.isArray(items) ? items : [])
-    .map((item) => ({ key: enrichmentKeyFor(item?.body), q: cleanQuestion(item?.question) }))
-    .filter((item) => item.key.length >= 24 && item.q.length >= 8);
-  if (!list.length) return { recorded: 0 };
+  const list = [];
+  let rejected = 0;
+  for (const item of (Array.isArray(items) ? items : [])) {
+    const key = enrichmentKeyFor(item?.body);
+    if (key.length < 24) continue;
+    const quality = enrichmentQuestionQuality(item?.question);
+    if (!quality.ok) { rejected++; continue; }
+    list.push({ key, q: quality.text });
+  }
+  if (!list.length) return { recorded: 0, rejected };
   const file = enrichmentFileFor(brainPath, home);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const data = readFile(file);
@@ -104,7 +159,7 @@ export function recordEnrichment(brainPath, items, { home = os.homedir(), now = 
   const tmp = `${file}.tmp-${process.pid}`;
   fs.writeFileSync(tmp, JSON.stringify(data), 'utf8');
   fs.renameSync(tmp, file);
-  return { recorded };
+  return { recorded, rejected };
 }
 
 /**
@@ -126,9 +181,14 @@ export function readEnrichment(brainPath, { home = os.homedir(), now = Date.now(
   const memo = readMemo.get(file);
   if (memo && memo.stamp === stamp) return memo.entries;
   const data = stamp ? readFile(file) : { entries: {} };
+  // The quality gate runs here too: a sidecar written before 1.86 (or by an
+  // older hook) is cleaned on read, so its acknowledgements and console echoes
+  // stop reaching the embedder without anyone rewriting the file. Entries left
+  // with no acceptable text are dropped from the served array entirely.
   const entries = Object.entries(data.entries)
     .filter(([, entry]) => now - Number(entry.ts || 0) <= ENRICHMENT_TTL_MS)
-    .map(([key, entry]) => ({ key, q: (entry.q || []).map(cleanQuestion).filter(Boolean) }));
+    .map(([key, entry]) => ({ key, q: (entry.q || []).map((q) => enrichmentQuestionQuality(q)).filter((r) => r.ok).map((r) => r.text) }))
+    .filter((entry) => entry.q.length > 0);
   readMemo.set(file, { stamp, entries });
   if (readMemo.size > 8) readMemo.delete(readMemo.keys().next().value);
   return entries;

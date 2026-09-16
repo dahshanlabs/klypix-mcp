@@ -1622,10 +1622,15 @@ export async function opBrainNote({ vault, canvas, text: noteText, area, marker 
     // natural-language question that produced this card — recorded to the
     // retrieval sidecar so brain_ask finds the card in the asker's vocabulary.
     // Additive: any failure costs recall, never the write above.
-    if (enrichmentQuestion && (res.stats?.added || 0) > 0) {
+    // Accepts one string or a list (1.86: the caller's authored `question` plus
+    // the declared intent); the sidecar's quality gate drops what carries no
+    // askable vocabulary, so passing both never records junk.
+    const enrichmentQuestions = (Array.isArray(enrichmentQuestion) ? enrichmentQuestion : [enrichmentQuestion])
+      .map((q) => String(q || '').trim()).filter(Boolean);
+    if (enrichmentQuestions.length && (res.stats?.added || 0) > 0) {
       try {
         const enrich = await import('./enrichment.mjs');
-        enrich.recordEnrichment(file, [{ body: noteText, question: enrichmentQuestion }]);
+        enrich.recordEnrichment(file, enrichmentQuestions.map((question) => ({ body: noteText, question })));
       } catch { /* sidecar unavailable — additive signal only */ }
     }
     const s = res.stats || {};

@@ -704,6 +704,7 @@ server.registerTool('brain_note', {
     marker: z.enum(['', '?', '!', '+', '✓', '~']).optional().describe('(none)=decision · ?=open question · !=milestone · +=🛠️ skill (reusable how-to/gotcha; always resurfaces, never ages out) · ✓=resolve+archive the best-matching card · ~=update the matching card in place. Default: decision.'),
     area: z.string().optional().describe('Area/topic — routes the card into that titled container and becomes a #tag (e.g. "Auth", "Release").'),
     closes: z.string().optional().describe('Title or [[wikilink]] of a strategy/question card this note fulfils — resolves+archives it and draws a "closed by" arrow.'),
+    question: z.string().max(240).optional().describe('The question this note ANSWERS, phrased as someone would ask it ("how do we keep a draft separate from what runs?"). Recorded as retrieval enrichment beside the vector cache — never on the canvas — so the card is found by paraphrase, not only by its own words. The session\'s declared intent is recorded as well.'),
     evidence: z.array(z.object({
       kind: z.enum(['file', 'pr', 'url', 'commit', 'run']),
       ref: z.string().min(1).max(1000).describe('A project-relative file path (optional :line or #Lline), or an external reference. External references are stored without fetching them.'),
@@ -724,10 +725,12 @@ server.registerTool('brain_note', {
     }).optional().describe("GUARD CARDS: make this '+' skill fire BEFORE a matching tool call runs (Claude Code PreToolUse denies on severity block; other hosts warn), not just resurface in briefs. The card stays a normal 🛠️ rule — ✓-resolving it retires the guard, ~ with {remove:true} disarms it."),
     canvas: z.string().optional().describe('Brain canvas filename/path. Defaults to the project brain ("brain").'),
   },
-}, async ({ text, marker, area, closes, evidence, verify, guard, canvas }, extra) => {
+}, async ({ text, marker, area, closes, question, evidence, verify, guard, canvas }, extra) => {
   // Both 1.77 and 1.78 ride this call: the enrichment question (the asker's
-  // vocabulary for retrieval) AND the per-session capture receipt below.
-  const result = await opBrainNote({ vault: mcpPresence.vault, canvas: boundBrainCanvas(canvas), text, area, marker: marker || '', closes, evidence, verify, guard, via: extra.klypixClientName, enrichmentQuestion: mcpPresence.declaredIntent });
+  // vocabulary for retrieval) AND the per-session capture receipt below. Since
+  // 1.86 the authored `question` (the pattern) rides beside the declared intent
+  // (the instance); the sidecar's quality gate decides what is worth keeping.
+  const result = await opBrainNote({ vault: mcpPresence.vault, canvas: boundBrainCanvas(canvas), text, area, marker: marker || '', closes, evidence, verify, guard, via: extra.klypixClientName, enrichmentQuestion: [question, mcpPresence.declaredIntent] });
   // Per-session capture receipt — this is what stops the uncaptured-work nudge
   // from firing at a session that DID record its reasoning, just through MCP
   // rather than a 🧠 marker. The Stop hook and this server share one session-id

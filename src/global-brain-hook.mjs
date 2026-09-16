@@ -105,25 +105,37 @@ function parseEvidence(s) {
     const prepared = prepareBrainEvidence({ projectRoot: CWD, evidence: refs });
     return prepared.ok ? prepared.evidence : refs; // legacy malformed refs remain unverified
 }
-// Pull optional `closes:` / `ev:` / `verify:` suffixes off the END of a marker
-// body (any order), returning the cleaned body + parsed extras. The suffix
-// region starts at the first known key, so a decision can carry none, any, or
-// all without the keywords leaking into the card text. The three value regexes
-// must stay in LOCKSTEP: each value ends at the NEXT known key (or end of
-// line), so omitting a key from one lookahead silently folds "verify: …" into
-// that key's value — parseEvidence would mint junk file refs from it.
+// Pull optional `closes:` / `ev:` / `verify:` / `q:` suffixes off the END of a
+// marker body (any order), returning the cleaned body + parsed extras. The
+// suffix region starts at the first known key, so a decision can carry none,
+// any, or all without the keywords leaking into the card text. Every value
+// ends at the NEXT known key (or end of line) through ONE shared lookahead
+// built from the key list, so adding a key cannot silently fold "verify: …"
+// into a neighbour's value — the lockstep bug three hand-written lookaheads
+// used to invite (parseEvidence would mint junk file refs from it).
+//
+// `q:` (1.86) is the question this card ANSWERS, in the words someone would
+// ask it. It is pattern-level retrieval enrichment authored by the model that
+// knows the content — recorded in the sidecar beside the vector cache, never
+// on the canvas — so a card is findable by a paraphrase nobody has typed yet,
+// not only by the prompt that happened to precede its capture.
+const MARKER_SUFFIX_KEYS = ['closes', 'ev', 'verify', 'q'];
+const MARKER_SUFFIX_NEXT = `(?=${MARKER_SUFFIX_KEYS.map(k => `\\s+\\b${k}:`).join('|')}|$)`;
 function splitMarkerSuffixes(body) {
-    const m = body.match(/\s+(?:closes|ev|verify):/i);
-    if (!m) return { body, closes: '', evidence: null, verify: '' };
+    const m = body.match(new RegExp(`\\s+(?:${MARKER_SUFFIX_KEYS.join('|')}):`, 'i'));
+    if (!m) return { body, closes: '', evidence: null, verify: '', question: '' };
     const suffix = body.slice(m.index);
-    const closesM = suffix.match(/\bcloses:\s*(.+?)\s*(?=\s+\bev:|\s+\bverify:|$)/i);
-    const evM = suffix.match(/\bev:\s*(.+?)\s*(?=\s+\bcloses:|\s+\bverify:|$)/i);
-    const verifyM = suffix.match(/\bverify:\s*(.+?)\s*(?=\s+\bcloses:|\s+\bev:|$)/i);
+    const grab = (key) => {
+        const mm = suffix.match(new RegExp(`\\b${key}:\\s*(.+?)\\s*${MARKER_SUFFIX_NEXT}`, 'i'));
+        return mm ? mm[1].trim() : '';
+    };
+    const ev = grab('ev');
     return {
         body: body.slice(0, m.index).trim(),
-        closes: closesM ? closesM[1].trim() : '',
-        evidence: evM ? parseEvidence(evM[1].trim()) : null,
-        verify: verifyM ? verifyM[1].trim().slice(0, 200) : '',
+        closes: grab('closes'),
+        evidence: ev ? parseEvidence(ev) : null,
+        verify: grab('verify').slice(0, 200),
+        question: grab('q').slice(0, 240),
     };
 }
 // ── Self-healing brain (decision lifecycle, part 3) ──────────────────────────
@@ -2684,7 +2696,7 @@ async function capture(lib) {
             // Strip optional `closes:` / `ev:` / `verify:` suffixes off the body so
             // they don't leak into the card text; they drive the close-link,
             // evidence, and live-probe below.
-            const { body: cleanBody, closes, evidence, verify } = splitMarkerSuffixes(body);
+            const { body: cleanBody, closes, evidence, verify, question: markerQuestion } = splitMarkerSuffixes(body);
             body = cleanBody; if (!body) continue;
             const preview = body.slice(0, 90);
             // EXAMPLE/doc guard — rejects marker-SYNTAX documentation (which
@@ -2741,7 +2753,12 @@ async function capture(lib) {
             // per-resolution outcome after the capture.
             if (type === '✓') { resolutions.push({ area, text: body }); ledger.push({ action: 'resolve', area, preview, rIdx: resolutions.length - 1 }); continue; }
             // ~ updates the matching card in place (small corrections).
-            if (type === '~') { updates.push({ area, text: body, createdVia: 'claude-code', ...(evidence ? { evidence } : {}), ...(verify ? { verify } : {}) }); ledger.push({ action: 'update', area, preview, ...(evidence ? { ev: evidence.map(e => e.ref) } : {}) }); continue; }
+            if (type === '~') {
+                updates.push({ area, text: body, createdVia: 'claude-code', ...(evidence ? { evidence } : {}), ...(verify ? { verify } : {}) });
+                if (markerQuestion) enrichmentPairs.push({ body, question: markerQuestion });
+                ledger.push({ action: 'update', area, preview, ...(evidence ? { ev: evidence.map(e => e.ref) } : {}) });
+                continue;
+            }
             // Type → scannable prefix + border color: ? open question (amber),
             // ! milestone (blue), + skill (violet), else decision (green). A plain
             // decision whose text reads as a reusable RULE is AUTO-promoted to a
@@ -2759,6 +2776,9 @@ async function capture(lib) {
             const card = (area ? `${area}: ${prefix}${body}` : `${prefix}${body}`) + (tagLine ? `\n${tagLine}` : '');
             cards.push({ text: card, area, borderColor, ...(closes ? { closes } : {}), ...(evidence ? { evidence } : {}), ...(verify ? { verify } : {}) });
             if (lastUserPrompt) enrichmentPairs.push({ body, question: lastUserPrompt });
+            // The authored `q:` rides alongside the incidental prompt: the pattern
+            // (what someone would ask) and the instance (what someone did type).
+            if (markerQuestion) enrichmentPairs.push({ body, question: markerQuestion });
             ledger.push({ action: type === '?' ? 'add-question' : type === '!' ? 'add-milestone' : isSkill ? 'add-skill' : 'add-decision', area, preview, files: fileTags, ...(closes ? { closes } : {}), ...(evidence ? { ev: evidence.map(e => e.ref) } : {}) });
         }
     }
@@ -3561,7 +3581,10 @@ async function promptRetrieve(lib) {
     let hits = [], repeats = [], struct = null;
     if (tokens.length) {
         struct = await cachedStruct(lib);
-        hits = lib.scoreCardsAgainstQuery(struct, tokens, { topK: 5, minScore: 3 });
+        // The lexical bar is the engine's measured export (1.86: 4 — one title
+        // word alone no longer injects; see HOOK_LEXICAL_MIN_SCORE). An older
+        // engine keeps the pre-1.86 bar of 3.
+        hits = lib.scoreCardsAgainstQuery(struct, tokens, { topK: 5, minScore: Number.isFinite(lib.HOOK_LEXICAL_MIN_SCORE) ? lib.HOOK_LEXICAL_MIN_SCORE : 3 });
         // PRECISION-first repeat nudge ("you already did this in another session"):
         // only on a do/build request, only completed-work cards, only high confidence.
         // Matched on the PROMPT's stated intent (ptoks), not the git-diff fallback. A
@@ -3579,8 +3602,15 @@ async function promptRetrieve(lib) {
     // prompt never enters this lane → zero added latency. Bulletproof: not installed
     // / timeout / any failure → stays exactly today's pure-lexical behavior. The
     // helper is optional+deploy-gated, so a missing copy degrades cleanly to lexical.
-    let semMode = 'lexical';
-    if (!repeats.length && !freshHits.length && tokens.length && struct) {
+    let semMode = 'lexical', semTop = null;
+    // Prompt-side admission (1.86): the fallback is an UNCORROBORATED five-card
+    // guess, and the measured cosines cannot tell an acknowledgement from a
+    // real question — but the prompt can. Fewer than FALLBACK_MIN_CONTENT_TOKENS
+    // content tokens ("build best in class", "continue where needed") skips the
+    // lane; the git-diff file tokens do not count, they are not the asker's words.
+    const fallbackEligible = typeof lib.lexicalMissFallbackEligible === 'function' ? lib.lexicalMissFallbackEligible(ptoks) : true;
+    if (!repeats.length && !freshHits.length && tokens.length && struct && !fallbackEligible) semMode = 'sem-skipped';
+    if (!repeats.length && !freshHits.length && tokens.length && struct && fallbackEligible) {
         try {
             const semlib = await import(new URL('./brain-semantic.mjs', import.meta.url).href);
             if (typeof semlib.semanticVecs === 'function') {
@@ -3590,20 +3620,38 @@ async function promptRetrieve(lib) {
                 const sem = await semlib.semanticVecs(BRAIN, struct, humanText || '', { timeoutMs: 1500 });
                 if (!sem) semMode = 'sem-unavailable';
                 else {
-                    const fresh = Date.now() - 30 * 86_400_000;
-                    const ranked = struct.cards
-                        .filter(c => c.type !== 'container' && (c.text || '').trim() && !/^archive$/i.test(c.area || ''))
-                        .map(c => { const v = sem.vecsMap.get(c.id); return { card: c, s: v ? sem.dot(sem.qv, v) : null }; })
-                        .filter(x => x.s != null && x.s >= 0.30)   // miss-path floor: no lexical corroboration, so demand a real match
-                        .map(x => { let score = x.s * 10; if ((x.card.createdAt || 0) >= fresh) score += 0.5; return { card: x.card, score }; })
-                        .sort((a, b) => b.score - a.score).slice(0, 5);
+                    // ONE production primitive for this lane (1.86). The ranking
+                    // used to live inline here, which meant the surface every
+                    // session actually receives was the one no harness could
+                    // measure — an eval must IMPORT the ranker, never re-implement
+                    // it. rankLexicalMissFallback in klypix-format.mjs is that
+                    // primitive (scripts/eval-hook-lane.mjs measures it); its
+                    // defaults are the measured ones. An older engine without the
+                    // export degrades to the pre-1.86 inline ranking.
+                    let ranked;
+                    if (typeof lib.rankLexicalMissFallback === 'function') {
+                        const r = lib.rankLexicalMissFallback(struct, sem, { topK: 5 });
+                        ranked = r.hits; semTop = r.topCos;
+                    } else {
+                        const fresh = Date.now() - 30 * 86_400_000;
+                        ranked = struct.cards
+                            .filter(c => c.type !== 'container' && (c.text || '').trim() && !/^archive$/i.test(c.area || ''))
+                            .map(c => { const v = sem.vecsMap.get(c.id); return { card: c, s: v ? sem.dot(sem.qv, v) : null }; })
+                            .filter(x => x.s != null && x.s >= 0.30)
+                            .map(x => { let score = x.s * 10; if ((x.card.createdAt || 0) >= fresh) score += 0.5; return { card: x.card, score }; })
+                            .sort((a, b) => b.score - a.score).slice(0, 5);
+                    }
                     freshHits = ranked;
                     semMode = ranked.length ? 'sem-hit' : 'sem-empty';
                 }
             }
         } catch { semMode = 'sem-error'; }
-        if (semMode !== 'lexical') { try { appendJsonl(HEALTH, { ts: nowIso(), project: path.basename(CWD), mode: 'prompt', sem: semMode, hits: freshHits.length }, 500); } catch { /* */ } }
     }
+    // The health row carries the best cosine the lane saw (`top1`) so the
+    // admission rule can be re-fitted from the field later without a
+    // transcript — the 2026-09-16 audit had only "hits: 5" ×165 to go on. A
+    // skipped lane is logged too (`sem-skipped`, with the content-token count).
+    if (semMode !== 'lexical') { try { appendJsonl(HEALTH, { ts: nowIso(), project: path.basename(CWD), mode: 'prompt', sem: semMode, hits: freshHits.length, ...(Number.isFinite(semTop) ? { top1: Math.round(semTop * 1000) / 1000 } : {}), ...(semMode === 'sem-skipped' ? { content: ptoks.length } : {}) }, 500); } catch { /* */ } }
     // T8 STATUS-DIGEST INJECTION (2026-07-23): a status-shaped prompt gets the
     // COMPUTED current-state digest INSTEAD of card hits — so an agent that
     // never queried the brain still answers "what is remaining?" from state,
@@ -4104,7 +4152,7 @@ function legendFooter() {
     return '\n\n---\n'
         + '🧠 **Capture markers** — write these in your reply; the Stop hook harvests them into the brain (no separate log step). Use sparingly, for real decisions / milestones / discoveries:\n'
         + '`🧠 BRAIN [Area]: decision` · `[Area] ?: open question` · `[Area] !: milestone` · `[Area] +: 🛠️ skill (reusable how-to / gotcha — resurfaces every session, never ages out)` · `[Area] ✓: resolves+archives the matching card` · `[Area] ~: updates it in place` · 🎯 in text = a goal (reads as open).\n'
-        + 'Optional suffixes: `closes: <card title / [[wikilink]]>` (resolve the strategy/question this fulfils) · `ev: <file[:line]>, PR#<n>` (anchor to code → auto drift-badge).\n'
+        + 'Optional suffixes: `closes: <card title / [[wikilink]]>` (resolve the strategy/question this fulfils) · `ev: <file[:line]>, PR#<n>` (anchor to code → auto drift-badge) · `q: <the question this answers, as someone would ASK it>` (retrieval enrichment — makes the card findable by paraphrase; sidecar only, never on the canvas).\n'
         + '**Correcting a stale card:** include the word `CORRECTION` (or "was WRONG" / "OBSOLETE" — UPPERCASE; casing is the deliberate-signal, casual prose never fires it) in the decision — the capture then hunts the stale card across ALL areas at a lower match bar and supersedes it (archived + arrowed, with a receipt; restore from Archive if it grabbed the wrong one). A rephrased duplicate `?` merges into the existing open question instead of stacking a twin.\n'
         + '**Verified-fix rule drafts:** when a session FIXES + VERIFIES something trap-shaped that landed as a one-off note, the Stop hook auto-DRAFTS a candidate 🛠️ rule (a per-project sidecar — never a brain card). Approve a real recurring trap with the `+` marker the nudge shows you and it becomes a standing rule that fires EVERY session (like the release-naming rule); ignore the rest and they age out. Draft-only, no blind auto-capture.\n'
         + '**Session brief:** the SessionStart hook prints a ≤2KB ultra brief and writes the FULL brief to `.claude/brain-brief.md` — read that file when planning non-trivial work.\n'

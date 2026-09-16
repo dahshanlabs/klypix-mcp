@@ -2123,7 +2123,7 @@ export function structToUltraBrief(struct, { freshness = null, briefPath = '.cla
     const tail = [
         '',
         `📖 **Full brief: \`${briefPath}\`** — skills (${skills.length}), milestones, recent decisions, connections, self-heal detail. READ IT before planning non-trivial work.`,
-        '🧠 Capture: `🧠 BRAIN [Area]: <decision>` · `?` question · `!` milestone · `+` skill · `✓` resolve · `~` update · a "CORRECTION: …" decision supersedes its stale card across areas · suffixes `closes:` / `ev:` (full legend in the brief file).',
+        '🧠 Capture: `🧠 BRAIN [Area]: <decision>` · `?` question · `!` milestone · `+` skill · `✓` resolve · `~` update · a "CORRECTION: …" decision supersedes its stale card across areas · suffixes `closes:` / `ev:` / `q: <question this answers>` (full legend in the brief file).',
     ];
     const budget = Math.max(400, budgetChars - tail.reduce((s, l) => s + l.length + 1, 0));
     push(`# ${struct.title} — brain (ultra brief)`);
@@ -2467,6 +2467,91 @@ export function scoreCardsAgainstQuery(struct, query, { topK = 6, minScore = 2, 
     }
     scored.sort((a, b) => b.score - a.score || (b.card.createdAt || 0) - (a.card.createdAt || 0));
     return scored.filter(s => s.score >= minScore).slice(0, topK);
+}
+
+// ── Lexical-miss semantic fallback — the per-prompt hook's second lane ───────
+// scoreCardsAgainstQuery (above) is what every prompt gets first. When it finds
+// nothing (paraphrase, no keyword overlap) the hook ranks the warm vector cache
+// against the prompt embedding and injects the top few. That ranking lived
+// INLINE in the hook until 1.86, so the one surface every session receives was
+// the one surface no harness could measure. It is a production primitive now:
+// the hook calls it, scripts/eval-hook-lane.mjs imports it, and the defaults
+// below are the measured ones, not guesses.
+//
+// FLOOR HISTORY. The lane shipped with an absolute cosine floor of 0.30
+// ("demand a real match"). Under the production contract (bge-small, CLS
+// pooling, query instruction prefix) cosines never go that low: field health
+// logs across every project on this machine (2026-09-16, 165 lexical-miss
+// prompts with a live model) show EXACTLY five cards injected every single
+// time — the floor never trimmed once. An absolute floor is also the wrong
+// shape: brain_ask's abstention probe measured true answers as low as 0.498
+// while out-of-domain top-1 reaches 0.683 (see rankForQuestion).
+//
+// MEASURED 2026-09-16 (scripts/eval-hook-lane.mjs, 110 real founder prompts
+// from this machine's enrichment sidecar, real 2,695-card brain): on the
+// prompts that reached this lane, the best cosine was 0.58–0.64 for
+// acknowledgements ("do full publish 100%") and 0.64 for the one real prompt
+// that missed lexically — NO cosine bar separates them (`minTop` 0.65 zeroes
+// junk but the sole real row sat at 0.642 with its gold at cosine rank 238).
+// So `minTop` and `margin` ship as null: the harness keeps sweeping them and
+// the hook's health row now records `top1` so the field can supply the
+// evidence this decision lacked. What DOES separate the two classes is the
+// PROMPT: acknowledgements carry 1–3 content tokens, real prompts 4+ — see
+// lexicalMissFallbackEligible below, which the hook applies before this lane.
+// `sem` is the hook's { qv, vecsMap, dot } from brain-semantic.semanticVecs.
+export function rankLexicalMissFallback(struct, sem, { topK = 5, floor = 0.30, minTop = null, margin = null, now = Date.now(), recentDays = 30 } = {}) {
+    const empty = { hits: [], topCos: null, pool: 0 };
+    if (!struct || !Array.isArray(struct.cards) || !sem || !sem.vecsMap || !sem.qv || typeof sem.dot !== 'function') return empty;
+    const fresh = now - recentDays * 86_400_000;
+    const pool = [];
+    for (const c of struct.cards) {
+        if (c.type === 'container' || !(c.text || '').trim() || /^archive$/i.test(c.area || '')) continue;
+        const v = sem.vecsMap.get(c.id);
+        if (!v) continue;
+        const cos = sem.dot(sem.qv, v);
+        if (!Number.isFinite(cos)) continue;
+        pool.push({ card: c, cos, score: cos * 10 + ((c.createdAt || 0) >= fresh ? 0.5 : 0) });
+    }
+    if (!pool.length) return empty;
+    let topCos = -Infinity;
+    for (const x of pool) if (x.cos > topCos) topCos = x.cos;
+    if (minTop != null && topCos < minTop) return { hits: [], topCos, pool: pool.length };
+    const bar = Math.max(floor ?? -Infinity, margin != null ? topCos - margin : -Infinity);
+    const hits = pool
+        .filter(x => x.cos >= bar)
+        .sort((a, b) => b.score - a.score || (b.card.createdAt || 0) - (a.card.createdAt || 0))
+        .slice(0, Math.max(0, topK));
+    return { hits, topCos, pool: pool.length };
+}
+
+// ── The hook lane's two measured bars (1.86) ─────────────────────────────────
+// Both were swept on 2026-09-16 with scripts/eval-hook-lane.mjs over 110 real
+// founder prompts (35 capture-pairs with a gold card, 75 that should inject
+// nothing) against the real 2,695-card brain. The harness reads these exports,
+// so the number it measures is the number the hook ships.
+//
+// HOOK_LEXICAL_MIN_SCORE — scoreCardsAgainstQuery's bar for the per-prompt
+// lexical lane. A title/tag hit scores 3, a body hit ≤ 1, a standing skill +1:
+//   minScore 3 (pre-1.86)  real prompts: fired 97% · right card in top-5 29% · 4.6 cards
+//                          junk prompts: injected nothing 27% of the time
+//   minScore 4 (ships)     real prompts: fired 91% · right card in top-5 26% · 4.0 cards
+//                          junk prompts: injected nothing 69% of the time
+//   minScore 5             real prompts: fired 74% · 20% · 2.4 cards · junk zero 81%
+// One title word is no longer enough ("do all best in class" used to inject a
+// card titled "…kill stale-closure CLASS…"); a title word plus corroboration,
+// or a 🛠️ skill, still is. The one-gold cost (29→26 on n=35) is inside noise.
+export const HOOK_LEXICAL_MIN_SCORE = 4;
+// FALLBACK_MIN_CONTENT_TOKENS — the semantic fallback only runs for a prompt
+// that carries at least this many content tokens (after stopwords and status
+// vocabulary). Measured: every junk prompt that reached the fallback had 1–3
+// ("build best in class", "continue where needed"); the real ones had 4+
+// ("i pressed restart and nothing appears , why"). Terse real prompts keep the
+// lexical lane and its git-diff fallback — they lose only an uncorroborated
+// five-card semantic guess that the cosine data says cannot tell junk apart.
+export const FALLBACK_MIN_CONTENT_TOKENS = 4;
+export function lexicalMissFallbackEligible(tokens, { minContentTokens = FALLBACK_MIN_CONTENT_TOKENS } = {}) {
+    const n = Array.isArray(tokens) ? tokens.filter(t => typeof t === 'string' && t.trim()).length : 0;
+    return n >= minContentTokens;
 }
 
 // ── Ask-the-brain — whole-brain, correction-aware retrieval for a question ───

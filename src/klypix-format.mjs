@@ -4442,13 +4442,35 @@ export function partialNoteRuns(text) {
     if (cur) runs.push(cur);
     return runs.map(r => { const t = r.lines.join(' '); return { start: r.start, end: r.end, text: t, key: partialNoteKey(t) }; });
 }
-// Does this card already carry this note? Prefix-tolerant in one direction only
-// (the stored copy may be the untruncated in-batch mirror of a 100-char disk
-// note) and only for bodies long enough that a shared prefix means something.
+// Does this card already carry this note?
+//
+// WHITESPACE-INSENSITIVE, and that is the whole fix (2026-09-16 review): the
+// note is stored WRAPPED, and wrapText breaks a token longer than the card
+// width (brainCPL() = 37) MID-WORD with no space —
+// `src/canvas/interaction/ConnectionPale` + `tteOverlay.tsx`. partialNoteRuns
+// rejoins a run's lines with ' ', so the stored key gains a space the marker
+// body never had and could never equal `want`. Paths, URLs, shas, wikilinks and
+// slashed compounds routinely exceed 37 chars — 129 of the 250 ✔ partial runs on
+// the live KLYPIX brain sit on that path — so the 1.85 dedup silently did
+// nothing for most real prose and the notes kept stacking. The only thing a
+// wrap can inject is whitespace, so comparing whitespace-free keys restores the
+// identity without loosening it in any other direction.
+//
+// The prefix branch is belt-and-braces for the in-batch mirror and is gated at
+// the FULL truncation width: at the old ≥20 a genuinely NEW, shorter note that
+// happened to be a prefix of an existing longer one was swallowed and counted as
+// a skip (verified), which is silent loss — the one thing this engine may never
+// do. The mirror now stores the same 100-char body the disk gets, so the exact
+// branch covers it and this one only ever fires on a real 100-char truncation.
 export function hasPartialNote(text, body) {
     const want = partialNoteKey(body);
     if (!want) return false;
-    return partialNoteRuns(text).some(r => r.key === want || (want.length >= 20 && r.key.startsWith(want)));
+    const squash = (x) => String(x).replace(/\s+/g, '');
+    const w = squash(want);
+    return partialNoteRuns(text).some(r => {
+        const k = squash(r.key);
+        return k === w || (want.length >= 100 && k.startsWith(w));
+    });
 }
 // The repair for cards already damaged: collapse duplicate notes to the FIRST
 // (earliest-dated) one. Lossless — every removed line is a repeat of one that
@@ -4659,7 +4681,11 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                         j.content = `${j.content}\n✔ partial ${today}: ${cleanR.slice(0, 100)}${still}`;
                         j.borderColor = 'rgba(16,185,129,0.45)';
                     });
-                    target.text += `\n✔ partial ${today}: ${cleanR}`;
+                    // The in-memory mirror is the string that reached DISK, not
+                    // the untruncated body: a second copy of the same marker in
+                    // the same batch then matches by exact key instead of
+                    // leaning on the prefix tolerance in hasPartialNote.
+                    target.text += `\n✔ partial ${today}: ${cleanR.slice(0, 100)}${still}`;
                     stats.partialResolved = (stats.partialResolved || 0) + 1;
                     record('partial', { uncovered: uncoveredId.map(x => x.text.slice(0, 60)) });
                     continue;
@@ -4764,7 +4790,8 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                             j.content = `${j.content}\n✔ partial ${today}: ${cleanR.slice(0, 100)}${still}`;
                             j.borderColor = 'rgba(16,185,129,0.45)';
                         });
-                        best.text += `\n✔ partial ${today}: ${cleanR}`;
+                        // Mirror the DISK string (see the id path above).
+                        best.text += `\n✔ partial ${today}: ${cleanR.slice(0, 100)}${still}`;
                         stats.partialResolved = (stats.partialResolved || 0) + 1;
                         outcomeOf('partial', { cardId: best.id });
                         continue;

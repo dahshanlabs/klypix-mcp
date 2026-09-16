@@ -20,6 +20,12 @@
 //   P5  the repair collapses existing damage to the earliest note per body,
 //       removes nothing else, and is idempotent.
 //   P6  brain_garden repair:"duplicate-partials" is dry-run by default.
+//   P7  THE 2026-09-16 REVIEW BLOCKER: a body carrying a token wider than the
+//       card (brainCPL()=37 — a file path, URL, sha or [[wikilink]], i.e. most
+//       of this brain's prose) is wrapped MID-WORD, which put a space inside the
+//       stored key that the marker body never had. P2's plain-words fixture is
+//       why the suite was green while three captures left three notes.
+//   P8  and the prefix tolerance does not swallow a genuinely SHORTER new note.
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -170,6 +176,73 @@ const idOf = async (buf) => (await parseKlypix(buf)).struct.cards.find(c => /rem
 
   const bad = await opBrainGarden({ vault: dir, canvas: file, repair: 'not-a-repair' });
   ok(bad.isError === true, 'P6 an unknown repair name is refused, never silently ignored');
+}
+
+// ── P7 — a note body carrying an OVER-WIDTH token ───────────────────────────
+// The 2026-09-16 review blocker. Cards are stored hard-wrapped at brainCPL()=37
+// and wrapText breaks a token longer than that MID-WORD, with no space. The run
+// rejoin then puts a space inside the token, so the stored key could never equal
+// the marker body and the "already noted" guard did nothing — for exactly the
+// prose this brain is made of (file paths, URLs, shas, [[wikilinks]]). Three
+// captures of one marker used to leave THREE identical notes; the plain-words
+// fixture in P2 is why the suite was green.
+{
+  // The note BODY carries the over-width token; the clause items stay plain, so
+  // this fixture isolates the identity bug and nothing else.
+  const PATHY = 'ship the arrow tool in src/canvas/interaction/ConnectionPaletteOverlay.tsx';
+  ok(PATHY.split(/\s+/).some(t => t.length > 37), 'P7 the fixture really does carry a token wider than the card');
+  const CLAUSE7 = 'Canvas: ❓ remaining: ship the arrow tool + rewrite the lasso hit testing for rotated groups';
+  const buf0 = await buildKlypix({ title: 'partials-wide', cards: [{ text: CLAUSE7, area: 'Canvas' }] });
+  const id7 = (await parseKlypix(buf0)).struct.cards.find(c => /remaining: ship the arrow/.test(flat(c.text))).id;
+  const marker = { text: PATHY };
+
+  const p1 = await captureIntoBrain(buf0, { resolutions: [marker] });
+  const c1 = (await parseKlypix(p1.buffer)).struct.cards.find(c => c.id === id7);
+  ok(p1.stats.partialResolved === 1 && countNotes(c1.text) === 1, 'P7 the first pass writes exactly one note');
+  // The seam is the cause: the rejoined run carries a space the body never had.
+  ok(partialNoteRuns(c1.text)[0].key.replace(/\s+/g, '') === partialNoteKey(PATHY).replace(/\s+/g, '')
+    && partialNoteRuns(c1.text)[0].key !== partialNoteKey(PATHY),
+    'P7 the stored key differs from the body by WHITESPACE ONLY (the mid-word wrap seam)');
+
+  const p2 = await captureIntoBrain(p1.buffer, { resolutions: [marker] });
+  const c2 = (await parseKlypix(p2.buffer)).struct.cards.find(c => c.id === id7);
+  const p3 = await captureIntoBrain(p2.buffer, { resolutions: [marker] });
+  const c3 = (await parseKlypix(p3.buffer)).struct.cards.find(c => c.id === id7);
+  ok(p2.stats.partialSkipped === 1 && p3.stats.partialSkipped === 1, 'P7 passes 2 and 3 report partialSkipped');
+  ok(!p2.stats.partialResolved && !p3.stats.partialResolved, 'P7 neither repeat counts as a fresh partial resolve');
+  ok(countNotes(c3.text) === 1, `P7 THE HEADLINE: still exactly ONE ✔ partial note after three captures (got ${countNotes(c3.text)})`);
+  ok(flat(c3.text) === flat(c1.text) && flat(c2.text) === flat(c1.text), 'P7 the card is unchanged by the repeats');
+
+  // Same body, one batch — the in-batch mirror must agree with the disk copy.
+  const bufB = await buildKlypix({ title: 'partials-wide-batch', cards: [{ text: CLAUSE7, area: 'Canvas' }] });
+  const idB = (await parseKlypix(bufB)).struct.cards.find(c => /remaining: ship the arrow/.test(flat(c.text))).id;
+  const batch = await captureIntoBrain(bufB, { resolutions: [marker, marker, marker] });
+  const cB = (await parseKlypix(batch.buffer)).struct.cards.find(c => c.id === idB);
+  ok(countNotes(cB.text) === 1 && batch.stats.partialSkipped === 2,
+    `P7 three copies in ONE batch write one note (notes ${countNotes(cB.text)}, skipped ${batch.stats.partialSkipped})`);
+
+  // And the id-addressed path (brain_reconcile confirm) inherits it.
+  const bufI = await buildKlypix({ title: 'partials-wide-id', cards: [{ text: CLAUSE7, area: 'Canvas' }] });
+  const idI = (await parseKlypix(bufI)).struct.cards.find(c => /remaining: ship the arrow/.test(flat(c.text))).id;
+  const i1 = await captureIntoBrain(bufI, { resolutions: [{ id: idI, text: PATHY }] });
+  const i2 = await captureIntoBrain(i1.buffer, { resolutions: [{ id: idI, text: PATHY }] });
+  ok(i2.stats.partialSkipped === 1, 'P7 the id path skips the repeat too');
+  ok(countNotes((await parseKlypix(i2.buffer)).struct.cards.find(c => c.id === idI).text) === 1,
+    'P7 and leaves one note on the card');
+}
+
+// ── P8 — a SHORTER new note is not swallowed by a longer existing one ───────
+// The prefix tolerance exists only for the in-batch mirror of a 100-char
+// truncation. At the old ≥20 bar it also matched a genuinely different, shorter
+// resolution that happened to share a prefix — reported as a skip while nothing
+// was recorded, which is silent loss.
+{
+  const longNote = '✔ partial 2026-09-15: spooled the big assets to userData in eight megabyte chunks so nothing is base64';
+  const card = `Canvas: ❓ remaining: spool the assets + drop the base64 encoder\n${longNote}`;
+  ok(hasPartialNote(card, 'spooled the big assets to userData in eight megabyte chunks so nothing is base64'),
+    'P8 the note it really carries is still recognised');
+  ok(!hasPartialNote(card, 'spooled the big assets to userData'),
+    'P8 a shorter, genuinely different body is NOT counted as already noted');
 }
 
 fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });

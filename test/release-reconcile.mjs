@@ -200,6 +200,9 @@ ok(Buffer.compare(before, fs.readFileSync(brainFile)) === 0, 'the advisory leave
 //         moves only by the release milestone, and every change is a text edit,
 //         a move to Archive, or an added connection.
 //   RR14  a dismissed pair is never re-suggested by the release listing.
+//   RR15  the byte-identical promise also holds for refusals the ENGINE raises
+//         (not-open, and an already-carried ✔ partial), not just the ones
+//         klypix-core catches before the capture.
 const sha256 = (b) => createHash('sha256').update(b).digest('hex');
 const vault = path.join(project, 'vault-unused');
 fs.mkdirSync(vault, { recursive: true });
@@ -303,6 +306,40 @@ ok(afterDismiss.connections.some(cn => cn.relationship === 'not_fulfilled'
 const noEvidence = await reconcile({ mode: 'claims', confirm: [{ id: openIdBefore, milestoneId: milestone.id }] });
 ok(/no-card-evidence \(no likely-closed-by link or coverage between this card and that milestone\)/.test(textOf(noEvidence)),
   'RR14 a claims confirm with no link and no coverage is refused no-card-evidence');
+
+// ── RR15 — a refusal the ENGINE raises writes nothing either ────────────────
+// 2026-09-16 review: RR12 only exercised the refusals klypix-core catches, which
+// return before the capture. The 'claims' branch never checks the target is
+// still OPEN, so confirming the same pair twice reached captureIntoBrain, which
+// refused `not-open` — and tidy + atomicWrite still ran, changing the file's
+// sha256 for nothing. The documented promise (README, and the brain_reconcile
+// tool description) is that an all-refused call is byte-identical.
+{
+  // wholeCard was archived by the release confirm above and carries a solid
+  // 'closed by' edge to the milestone — so klypix-core's claims checks PASS
+  // (the milestone is live, the pair has evidence) and the entry reaches the
+  // engine, which refuses it `not-open`. That is the path RR12 never covered.
+  const shaNow = () => sha256(fs.readFileSync(brainFile));
+  const beforeEngineRefusal = shaNow();
+  const again = await reconcile({ mode: 'claims', confirm: [{ id: wholeCard.id, milestoneId: milestone.id }] });
+  const againText = textOf(again);
+  ok(new RegExp(`refused: ${wholeCard.id} — not-open`).test(againText),
+    `RR15 an already-archived card is refused not-open by the ENGINE [${againText.split('\n')[0].slice(-80)}]`);
+  ok(/0 confirmed/.test(againText) && /0 partial/.test(againText), 'RR15 the receipt counts nothing applied');
+  ok(shaNow() === beforeEngineRefusal, 'RR15 THE HEADLINE: an engine-side refusal leaves the brain byte-identical');
+
+  // …and a ✔ partial the card already carries is a SKIP, not an application:
+  // no write, and the receipt says so rather than implying a fresh stamp.
+  const beforeRepeat = shaNow();
+  const repeat = await reconcile({
+    mode: 'release', ref: 'release/1.3.170', sinceRef: 'v1.3.169',
+    confirm: [{ id: clauseCard.id, sha: shipSha }],
+  });
+  const repeatText = textOf(repeat);
+  ok(shaNow() === beforeRepeat, 'RR15 re-confirming an already-noted partial writes nothing');
+  ok(!/one clause item covered; ✔ partial noted/.test(repeatText) || /already on the card/.test(repeatText),
+    'RR15 and the receipt does not claim a fresh ✔ partial stamp');
+}
 
 fs.rmSync(project, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 console.log(failures ? `\n${failures} failure(s)` : '\n✓ release-reconcile: all assertions passed');

@@ -1201,14 +1201,27 @@ async function applyBrainReconcile({ file, how, mode, root, ref, sinceRef, confi
         const dres = await addBrainConnections(buf, dismissEdges);
         buf = dres.buffer;
       }
-      try { buf = (await tidyBrain(buf)).buffer; } catch { /* keep the capture result if tidy fails */ }
-      await atomicWrite(file, buf);
+      // "A call whose every entry is refused leaves the brain byte-identical"
+      // has to hold for refusals the ENGINE raises too, not just the ones the
+      // checks above catch (2026-09-16 review). Confirming the same pair twice
+      // reports `1 refused … — not-open` the second time, yet captureIntoBrain
+      // hands back a re-serialized buffer and tidy + atomicWrite changed the
+      // file's sha256 for nothing. A ✔ partial the card already carried is the
+      // same case: it is a skip, not an application.
+      const applied = dismissEdges.length > 0
+        || outcomes.some(o => o.outcome === 'archived' || (o.outcome === 'partial' && !o.skipped));
+      if (applied) {
+        try { buf = (await tidyBrain(buf)).buffer; } catch { /* keep the capture result if tidy fails */ }
+        await atomicWrite(file, buf);
+      }
     } catch (e) {
       return err(`brain_reconcile ${mode} failed (brain unchanged): ${e.message}`);
     }
     const confirmed = outcomes.filter(o => o.outcome === 'archived').length;
     const partial = outcomes.filter(o => o.outcome === 'partial');
-    const details = partial.map(o => `partial: ${o.id} — one clause item covered; ✔ partial noted, card stays open (pass whole:true to archive it)`);
+    const details = partial.map(o => (o.skipped
+      ? `partial: ${o.id} — this ✔ partial note was already on the card; nothing was re-stamped`
+      : `partial: ${o.id} — one clause item covered; ✔ partial noted, card stays open (pass whole:true to archive it)`));
     return { blocks: [text(reconcileReceipt({
       file, how, mode, ref: ctx?.ref || ref, confirmed, partial: partial.length,
       dismissed: dismissEdges.length, refused, details, note,

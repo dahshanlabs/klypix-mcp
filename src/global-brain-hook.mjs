@@ -2722,6 +2722,12 @@ async function capture(lib) {
             // The ~ (update / re-verify) and ✓ (resolve) markers are IDEMPOTENT on
             // an existing card, so they BYPASS dedup entirely — that's what lets the
             // self-heal loop re-stamp a drifted fact even when its text is unchanged.
+            // The bypass is KEPT (1.85.0). What changed is that it is now honest:
+            // a PARTIAL resolve leaves its card live, so re-pushing the marker used
+            // to append the same ✔ partial note on every Stop (85 lines on one live
+            // card). The ENGINE now skips a note the card already carries, and
+            // reports it per marker — so the ledger below says
+            // `resolve-partial-skipped` instead of implying a fresh stamp.
             const additive = type !== '✓' && type !== '~';
             const key = sha((type + '|' + area + '|' + body).toLowerCase());
             if (additive) {
@@ -2730,7 +2736,10 @@ async function capture(lib) {
             }
             if (entryInGap) gapAuthored++;
             // ✓ resolves an EXISTING card (stamped ✅ + archived) — not a new card.
-            if (type === '✓') { resolutions.push({ area, text: body }); ledger.push({ action: 'resolve', area, preview }); continue; }
+            // `rIdx` is this marker's position in the array handed to the engine,
+            // which is how the ledger entry is matched back to the engine's own
+            // per-resolution outcome after the capture.
+            if (type === '✓') { resolutions.push({ area, text: body }); ledger.push({ action: 'resolve', area, preview, rIdx: resolutions.length - 1 }); continue; }
             // ~ updates the matching card in place (small corrections).
             if (type === '~') { updates.push({ area, text: body, createdVia: 'claude-code', ...(evidence ? { evidence } : {}), ...(verify ? { verify } : {}) }); ledger.push({ action: 'update', area, preview, ...(evidence ? { ev: evidence.map(e => e.ref) } : {}) }); continue; }
             // Type → scannable prefix + border color: ? open question (amber),
@@ -3094,8 +3103,26 @@ async function capture(lib) {
             enrich.recordEnrichment(BRAIN, enrichmentPairs.map(pair => ({ body: pair.body, question: pair.question })));
         } catch { /* stale deployment or unwritable sidecar — additive signal only */ }
     }
+    // Reconcile the ledger with what the engine ACTUALLY did with each ✓. A
+    // resolve that matched a card already carrying its ✔ partial note changed
+    // nothing, and a ledger that still reads `resolve` claims a stamp that never
+    // happened. Skew-safe: an engine without resolutionOutcomes leaves the
+    // ledger exactly as it was.
+    let partialSkipped = 0;
+    if (Array.isArray(stats.resolutionOutcomes) && stats.resolutionOutcomes.length) {
+        const byIdx = new Map(stats.resolutionOutcomes.map(o => [o.i, o.outcome]));
+        for (const d of ledger) {
+            if (d.action !== 'resolve' || d.rIdx == null) continue;
+            const outcome = byIdx.get(d.rIdx);
+            if (outcome === 'partial-skipped') { d.action = 'resolve-partial-skipped'; partialSkipped++; }
+            else if (outcome === 'partial') d.action = 'resolve-partial';
+            else if (outcome === 'fallback-milestone') d.action = 'resolve-unmatched';
+        }
+    }
     const bits = [`${stats.added} added`];
     if (stats.resolved) bits.push(`${stats.resolved} resolved`);
+    if (stats.partialResolved) bits.push(`${stats.partialResolved} partial (card kept open)`);
+    if (stats.partialSkipped) bits.push(`${stats.partialSkipped} partial already noted`);
     if (stats.updated) bits.push(`${stats.updated} updated`);
     if (stats.merged) bits.push(`${stats.merged} merged`);
     if (stats.closed) bits.push(`${stats.closed} closed`);
@@ -3114,6 +3141,18 @@ async function capture(lib) {
     // confirmation channel: say WHAT was archived and how to undo a wrong grab.
     if (Array.isArray(stats.corrections) && stats.corrections.length) {
         process.stderr.write(`[brain] correction supersede: ${stats.corrections.map(c => `"${c.old}" (${c.overlap})`).join('; ')} — archived + arrowed; restore from Archive or ~ update if wrong\n`);
+    }
+    // A `closes:` target the engine judged too generic archived NOTHING. It used
+    // to archive an arbitrary match silently, so this receipt is the difference
+    // between "your close was refused, here is why" and losing a card.
+    if (Array.isArray(stats.closeRefused) && stats.closeRefused.length) {
+        for (const f of stats.closeRefused.slice(0, 3)) {
+            process.stderr.write(`[brain] ⛔ closes: "${f.target}" matched ${f.total} live cards — too generic to trust, so NOTHING was archived and your note was kept as an ordinary card. Name a longer target, or close the exact card by id. Top candidates: ${f.candidates.map(c => `(${c.id}) "${c.title}" cov ${c.cov}`).join(' · ')}\n`);
+        }
+    }
+    if (partialSkipped || stats.partialSkipped) {
+        const n = partialSkipped || stats.partialSkipped;
+        process.stderr.write(`[brain] ✔ partial already noted: ${n} ✓ marker(s) matched a card that already carries that note — nothing was re-stamped. A partial resolve leaves its card OPEN by design, so the marker keeps matching; that is expected, not a failure.\n`);
     }
     if (stats.added > 0 && !stats.linked) process.stderr.write(`[brain] note: ${stats.added} card(s) landed unlinked — \`brain_connect\` (or [[wikilinks]] next time) wires them into the graph\n`);
     // Fulfillment receipts (claim engine): a captured 🏁 that appears to cover a

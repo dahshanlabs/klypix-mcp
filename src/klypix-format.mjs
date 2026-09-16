@@ -4613,7 +4613,14 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
         // second capture — the same field pass 2 uses for `closes:` targets, so
         // the arrows are identical whichever path drew them.
         const idArchived = [];
+        // Per-resolution outcome, indexed by the caller's own array position, so
+        // a host that kept a ledger entry per marker can say what ACTUALLY
+        // happened to each one instead of implying a fresh stamp (the hook's
+        // `resolve-partial-skipped` action).
+        let rIdx = -1;
+        const outcomeOf = (outcome, extra = {}) => { (stats.resolutionOutcomes ||= []).push({ i: rIdx, outcome, ...extra }); };
         for (const r of resolutions) {
+            rIdx++;
             // ── ID-ADDRESSED RESOLVE (1.85.0) ───────────────────────────────
             // brain_reconcile confirm names the EXACT card, so there is nothing
             // to fuzzy-match and RESOLVE_AT is skipped. Everything else about a
@@ -4625,7 +4632,7 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
             // never to do. `whole: true` is the explicit human override, and the
             // outcome (archived | partial) is reported per id.
             if (r && r.id) {
-                const record = (outcome, extra = {}) => { (stats.idResolutions ||= []).push({ id: r.id, outcome, ...extra }); };
+                const record = (outcome, extra = {}) => { (stats.idResolutions ||= []).push({ id: r.id, outcome, ...extra }); outcomeOf(extra.skipped ? 'partial-skipped' : outcome, { id: r.id }); };
                 const target = struct.cards.find(c => c.id === r.id && c.type !== 'container' && (c.text || '').trim());
                 if (!target) { record('refused', { reason: 'unknown-id' }); continue; }
                 const guarded = /🛠/.test(target.text) || /^archive$/i.test(target.area || '') || !isUnresolvedOpenCard(target);
@@ -4749,6 +4756,7 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                         // COUNTED so the receipt can say what happened.
                         if (hasPartialNote(best.text, cleanR.slice(0, 100))) {
                             stats.partialSkipped = (stats.partialSkipped || 0) + 1;
+                            outcomeOf('partial-skipped', { cardId: best.id });
                             continue;
                         }
                         const still = uncoveredItems.length ? ` — still open: ${uncoveredItems.map(x => x.text.slice(0, 50)).join(' + ').slice(0, 160)}` : '';
@@ -4758,6 +4766,7 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                         });
                         best.text += `\n✔ partial ${today}: ${cleanR}`;
                         stats.partialResolved = (stats.partialResolved || 0) + 1;
+                        outcomeOf('partial', { cardId: best.id });
                         continue;
                     }
                     await rewriteCard(best.id, j => {
@@ -4767,6 +4776,7 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                     await archiveCard(best.id);
                     best.text += ` ✅ ${r.text}`; // keep in-memory struct honest for later matching
                     stats.resolved++;
+                    outcomeOf('archived', { cardId: best.id });
                 }
             } else {
                 // __fromResolve: an unmatched-✓ fallback card must not seed the
@@ -4776,6 +4786,9 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                 const cleanR = stripLifecycleGlyphs(r.text);
                 if (cleanR && !nearDupExists(cleanR)) {
                     milestonesFallback.push({ text: (r.area ? `${r.area}: ` : '') + `🏁 ${cleanR}`, area: r.area, borderColor: 'rgba(59,130,246,0.8)', __fromResolve: true });
+                    outcomeOf('fallback-milestone');
+                } else {
+                    outcomeOf('no-match');
                 }
             }
         }

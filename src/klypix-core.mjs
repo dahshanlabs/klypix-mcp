@@ -29,6 +29,7 @@ import {
   areaStatusDigest, addBrainConnections, proposeStructuralConnections, atomicWrite,
   findUnrecordedMigrations, captureIntoBrain, tidyBrain, noteToCaptureInput,
   selectGardenCandidates, applyGarden, detectContradictions,
+  findDuplicatePartialNotes, collapseDuplicatePartialNotes,
   rankForQuestion, questionContextToMarkdown, findLegacyShipCards,
   challengeBrain, challengeContextToMarkdown, buildRenderSpec, structToBrief,
   brainLensData, lensToMarkdown, deathDateOfCard,
@@ -1305,7 +1306,7 @@ const withVaultCreateLock = (vault, fn) => withWriteLock('vault:' + path.resolve
   withAdvisoryWriteLock(vaultCreateLockPath(vault), (locked) => locked ? fn() : lockBusy('Canvas creation'))
 );
 
-export async function opBrainGarden({ vault, canvas, apply = false, syntheses, approve = '' }) {
+export async function opBrainGarden({ vault, canvas, apply = false, syntheses, approve = '', repair = '' }) {
   const t = brainTarget(vault, canvas);
   if (t.ambiguous) return ambiguousBrainErr(t.ambiguous);
   if (!t.file) return err(`No brain found — looked for ./brain.klypix in the project, then ${vault}. Pass canvas: "<name>".`);
@@ -1313,6 +1314,37 @@ export async function opBrainGarden({ vault, canvas, apply = false, syntheses, a
   let struct;
   try { ({ struct } = await parseKlypix(fs.readFileSync(file))); } catch (e) { return err(`Read failed: ${e.message}`); }
   const stamp = brainStamp(file, struct, t.how);
+
+  // ── repair: "duplicate-partials" ──────────────────────────────────────────
+  // The cleanup half of the 2026-09-15 ✔-partial incident. A partial resolve
+  // leaves its card LIVE by design, so a re-pushed ✓ marker re-appended the same
+  // note on every turn end until the engine guard landed; cards already damaged
+  // need the repeats collapsed. Dry-run first like every other pass here, and
+  // deliberately NOT behind the garden approval code: that code exists because
+  // gardening ARCHIVES cards, and this deletes nothing — every removed line is a
+  // repeat of one that stays, keeping the earliest date. Idempotent: a second
+  // run finds nothing.
+  if (repair) {
+    if (repair !== 'duplicate-partials') return err(`Unknown repair "${repair}" — the only repair is "duplicate-partials" (collapse repeated ✔ partial notes on a card to the earliest one).`);
+    const found = findDuplicatePartialNotes(struct);
+    if (!found.total) return { blocks: [text(stamp + '✓ No card carries a repeated ✔ partial note — nothing to repair.')] };
+    const rows = found.cards.map(c => `- (id ${c.id}) [${c.area || '?'}] ${c.total} ✔ partial line(s), ${c.distinct} distinct → ${c.duplicates} would be removed\n    ${c.headline}`);
+    const more = found.total > found.cards.length ? `\n\n…and ${found.total - found.cards.length} more card(s).` : '';
+    if (!apply) {
+      return { blocks: [text(stamp + `# 🧹 ${found.total} card(s) carry repeated ✔ partial notes — ${found.notes} duplicate note(s)\n_Nothing was changed. Each repeat is byte-identical in substance to one that stays; the repair keeps the FIRST (earliest-dated) note per distinct body and removes the rest. Nothing is archived and no card is deleted. Re-run with \`apply:true\` to repair. Cause: a ✓ that only PARTIALLY resolves a card leaves it live, so a marker re-pushed at every turn end re-appended the same note — the engine now skips a note it already carries, so this list cannot grow again._\n\n${rows.join('\n')}${more}`)] };
+    }
+    return withCanvasWriteLock(file, async () => {
+      try {
+        const { buffer, stats } = await collapseDuplicatePartialNotes(fs.readFileSync(file));
+        if (!stats.cards) return { blocks: [text('✓ Nothing to repair — no card carries a repeated ✔ partial note.')] };
+        await atomicWrite(file, buffer);
+        return { blocks: [text(`🧹 Repaired ${stats.cards} card(s): ${stats.notes} duplicate ✔ partial note(s) removed, the earliest of each kept. Nothing was archived or deleted. Reopen the brain in the KLYPIX app to see it.`)] };
+      } catch (e) {
+        return err(`Repair failed (brain unchanged): ${e.message}`);
+      }
+    }, { brain: true });
+  }
+
   const areas = selectGardenCandidates(struct);
   if (!areas.length) return { blocks: [text(stamp + 'Nothing to garden — no area has 3+ DORMANT cards (old, beyond its newest 8, AND peripheral/≤1 link). Anything still woven into the graph is protected. The brain is tidy.')] };
 
@@ -1586,6 +1618,11 @@ export async function opBrainNote({ vault, canvas, text: noteText, area, marker 
     const s = res.stats || {};
     const bits = [`${s.added || 0} added`];
     for (const k of ['resolved', 'updated', 'merged', 'closed', 'superseded']) if (s[k]) bits.push(`${s[k]} ${k}`);
+    // A partial resolve and a SKIPPED partial are different events, and a
+    // receipt that reports neither reads as "nothing happened" for the first
+    // and as a fresh stamp for the second.
+    if (s.partialResolved) bits.push(`${s.partialResolved} partial (clause struck, card kept open)`);
+    if (s.partialSkipped) bits.push(`${s.partialSkipped} partial already noted (card unchanged)`);
     if (s.reAdopted) bits.push(`${s.reAdopted} re-adopted`);
     if (s.linked) bits.push(`${s.linked} linked`);
     // Correction receipt — a correction-cue note superseded a card cross-area /

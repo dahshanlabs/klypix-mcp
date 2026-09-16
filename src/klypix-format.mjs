@@ -4339,6 +4339,115 @@ export function looksLikeTrap(text) {
     return TRAP_CONTRAST.test(t) || TRAP_FAILURE.test(t);
 }
 
+// ── ✔ partial notes are written ONCE (1.85.0 — live data damage) ─────────────
+// A FULL resolve is idempotent: the card is archived, so the same ✓ marker
+// never matches again. A PARTIAL resolve is NOT — the card deliberately stays
+// live — and the Claude-Code hook re-pushes every ✓ marker still visible in the
+// transcript at every Stop, on the documented promise that a resolve is
+// idempotent. So the same note appended forever. Measured in the KLYPIX brain
+// on 2026-09-15: one card carried 85 ✔ partial lines (5 distinct notes),
+// three others 31 / 9 / 9. The promise is the ENGINE's to keep — a fix in one
+// host would leave every other host still writing the damage.
+//
+// Two things make the comparison non-obvious:
+//   · rewriteCard hard-wraps every card it touches, so a stored note is split
+//     across several lines — it has to be read as a RUN, flattened.
+//   · the " — still open: …" tail legitimately drifts (each appended note
+//     changes what the clause scanner sees on the next pass), and the disk copy
+//     truncates the body to 100 chars while the in-memory mirror keeps it whole.
+//     So the identity is the note BODY, date and tail excluded.
+export const PARTIAL_NOTE_PREFIX = '✔ partial ';
+const PARTIAL_NOTE_TAIL = ' — still open:';
+const PARTIAL_RUN_END_RE = /^(?:✅|↩|⤵|\(re-affirmed)/u;
+export function partialNoteKey(s) {
+    return String(s || '')
+        .replace(/\s+/g, ' ')
+        .replace(/^✔ partial\s*/u, '')
+        .replace(/^\d{4}-\d{2}-\d{2}\s*:\s*/, '')
+        .split(PARTIAL_NOTE_TAIL)[0]
+        .trim().toLowerCase();
+}
+// Every ✔ partial note on a card, as line RUNS over its raw (wrapped) content.
+// A note always begins its own line — it is appended after a '\n', and wrapText
+// only ever adds breaks inside a paragraph, it never merges two.
+export function partialNoteRuns(text) {
+    const lines = String(text || '').split('\n');
+    const runs = [];
+    let cur = null;
+    for (let i = 0; i < lines.length; i++) {
+        const l = lines[i];
+        if (l.startsWith(PARTIAL_NOTE_PREFIX)) { if (cur) runs.push(cur); cur = { start: i, end: i, lines: [l] }; continue; }
+        if (!cur) continue;
+        if (PARTIAL_RUN_END_RE.test(l.trim())) { runs.push(cur); cur = null; continue; }
+        cur.end = i; cur.lines.push(l);
+    }
+    if (cur) runs.push(cur);
+    return runs.map(r => { const t = r.lines.join(' '); return { start: r.start, end: r.end, text: t, key: partialNoteKey(t) }; });
+}
+// Does this card already carry this note? Prefix-tolerant in one direction only
+// (the stored copy may be the untruncated in-batch mirror of a 100-char disk
+// note) and only for bodies long enough that a shared prefix means something.
+export function hasPartialNote(text, body) {
+    const want = partialNoteKey(body);
+    if (!want) return false;
+    return partialNoteRuns(text).some(r => r.key === want || (want.length >= 20 && r.key.startsWith(want)));
+}
+// The repair for cards already damaged: collapse duplicate notes to the FIRST
+// (earliest-dated) one. Lossless — every removed line is a repeat of one that
+// stays — and idempotent: a second run finds nothing.
+export function findDuplicatePartialNotes(struct, { max = 50 } = {}) {
+    const rows = [];
+    for (const c of (struct?.cards || [])) {
+        if (c.type === 'container' || !(c.text || '').trim()) continue;
+        const runs = partialNoteRuns(c.text);
+        if (runs.length < 2) continue;
+        const seen = new Set();
+        let duplicates = 0;
+        for (const r of runs) { if (seen.has(r.key)) duplicates++; else seen.add(r.key); }
+        if (!duplicates) continue;
+        rows.push({
+            id: c.id, area: c.area || null,
+            headline: String(c.text || '').replace(/\s+/g, ' ').trim().slice(0, 110),
+            total: runs.length, distinct: seen.size, duplicates,
+        });
+    }
+    rows.sort((a, b) => b.duplicates - a.duplicates || String(a.id).localeCompare(String(b.id)));
+    return { cards: rows.slice(0, max), total: rows.length, notes: rows.reduce((n, r) => n + r.duplicates, 0) };
+}
+export async function collapseDuplicatePartialNotes(buffer) {
+    const { zip, canvas, manifest, isV4, struct } = await parseKlypix(buffer);
+    if (!isV4 || !canvas.positions) throw new Error('the ✔ partial repair supports v4 .klypix only');
+    const stats = { cards: 0, notes: 0 };
+    for (const c of struct.cards) {
+        if (c.type === 'container' || (c.type != null && c.type !== 'text')) continue;
+        const ip = `items/${shard(c.id)}/${c.id}.json`;
+        const f = zip.file(ip);
+        if (!f) continue;
+        let j;
+        try { j = JSON.parse(await f.async('string')); } catch { continue; }
+        const content = String(j.content || '');
+        const runs = partialNoteRuns(content);
+        if (runs.length < 2) continue;
+        const seen = new Set();
+        const drop = new Set();
+        let dropped = 0;
+        for (const r of runs) {
+            if (seen.has(r.key)) { dropped++; for (let i = r.start; i <= r.end; i++) drop.add(i); }
+            else seen.add(r.key);
+        }
+        if (!drop.size) continue;
+        j.content = wrapText(content.split('\n').filter((_, i) => !drop.has(i)).join('\n'));
+        zip.file(ip, JSON.stringify(j));
+        const pos = canvas.positions[c.id];
+        if (pos) canvas.positions[c.id] = { ...pos, h: measureCardH(j.content) };
+        stats.cards++;
+        stats.notes += dropped;
+    }
+    if (!stats.cards) return { buffer, stats };
+    stampBrainKind(manifest);
+    return { buffer: await finalizeBrainZip(zip, canvas, manifest, Date.now()), stats };
+}
+
 export async function captureIntoBrain(buffer, { cards = [], resolutions = [], updates = [] } = {}) {
     const SUPERSEDE_AT = 0.6, RESOLVE_AT = 0.3, UPDATE_AT = 0.45, CLOSE_COVER_AT = 0.6, QUESTION_MERGE_AT = 0.6;
     let work = buffer;
@@ -4471,6 +4580,15 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                     && ((coveredId.length && uncoveredId.length) || (/🏁/.test(target.text) && itemsId.length > 0));
                 if (partialId) {
                     const cleanR = stripLifecycleGlyphs(r.text);
+                    // Already noted → say so and change nothing (see the
+                    // PARTIAL_NOTE_PREFIX block above: a partial resolve is not
+                    // idempotent on its own, and re-pushed markers stacked 85
+                    // identical lines onto one live card).
+                    if (hasPartialNote(target.text, cleanR.slice(0, 100))) {
+                        stats.partialSkipped = (stats.partialSkipped || 0) + 1;
+                        record('partial', { skipped: true });
+                        continue;
+                    }
                     const still = uncoveredId.length ? ` — still open: ${uncoveredId.map(x => x.text.slice(0, 50)).join(' + ').slice(0, 160)}` : '';
                     await rewriteCard(target.id, j => {
                         j.content = `${j.content}\n✔ partial ${today}: ${cleanR.slice(0, 100)}${still}`;
@@ -4559,6 +4677,18 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                     const partial = (coveredItems.length && uncoveredItems.length) || (/🏁/.test(best.text) && items.length > 0);
                     if (partial) {
                         const cleanR = stripLifecycleGlyphs(r.text);
+                        // IDEMPOTENCE, for real (2026-09-15 live incident): the
+                        // hook re-pushes every ✓ marker in the transcript at
+                        // every Stop because a resolve is documented as
+                        // idempotent — true for a full resolve, which archives
+                        // its card, and false for this branch, which leaves it
+                        // live. 85 identical ✔ partial lines on one card before
+                        // this guard. Skipping is the honest outcome, and it is
+                        // COUNTED so the receipt can say what happened.
+                        if (hasPartialNote(best.text, cleanR.slice(0, 100))) {
+                            stats.partialSkipped = (stats.partialSkipped || 0) + 1;
+                            continue;
+                        }
                         const still = uncoveredItems.length ? ` — still open: ${uncoveredItems.map(x => x.text.slice(0, 50)).join(' + ').slice(0, 160)}` : '';
                         await rewriteCard(best.id, j => {
                             j.content = `${j.content}\n✔ partial ${today}: ${cleanR.slice(0, 100)}${still}`;

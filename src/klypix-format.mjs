@@ -4582,6 +4582,11 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
             c.type !== 'container' && (c.text || '').trim()
             && !/^archive$/i.test(c.area || '')
             && !/↩|✅/.test(c.text));
+        // Every area name this brain actually uses, normalized once. Used by the
+        // CLOSE-LINK pass to tell an `Area:` prefix from an ordinary prose colon.
+        let _areaKeys = null;
+        const knownAreaKeys = () => (_areaKeys ||= new Set(
+            struct.cards.map(c => normTitleKey(c.type === 'container' ? (c.title || c.text || '') : (c.area || ''))).filter(Boolean)));
         const rewriteCard = async (id, mutate) => {
             const ip = `items/${shard(id)}/${id}.json`;
             const f = zip.file(ip); if (!f) return false;
@@ -5002,6 +5007,18 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
             // a full sentence.
             const wantTitle = closeTargetKey(target);
             const tTok = tokenSet(target);
+            // …but naming the area must still DISAMBIGUATE (2026-09-16 review).
+            // Stripping the prefix from BOTH sides meant `Collab: permanent
+            // share-link` stopped being distinguishable from the same-titled
+            // card in `canvas-share`: 10 stripped titles on the live brain are
+            // shared across different areas, one across five, and at ≤4 matches
+            // the close swept them all — over-matching, the loss direction. So
+            // the target's own prefix is kept as a CONSTRAINT on the title-grade
+            // paths, and ONLY when it names an area that actually exists, so an
+            // ordinary prose colon ("fix: the thing") constrains nothing. A card
+            // it excludes still reaches the token-coverage path below.
+            const wantAreaRaw = (/^\s*(?:\[\[)?\s*([^:\n]{1,40}):\s*/.exec(target) || [])[1] || '';
+            const wantArea = knownAreaKeys().has(normTitleKey(wantAreaRaw)) ? wantAreaRaw : '';
             // Collect EVERY live card the close-target covers — near-duplicate ❓
             // twins score together, and the old first-match-and-break resolved one
             // while its twin stayed "open" in every brief forever. Capped for
@@ -5019,6 +5036,9 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                 // exactly is a deliberate act, a shared prefix is not.
                 const core = closeTargetKey(c.title);
                 const longEnough = core.length >= 10;
+                // A named area on the target constrains the TITLE-grade paths
+                // only (see wantArea above); coverage is left alone.
+                const areaOk = !wantArea || sameAreaKey(c.area, wantArea);
                 // A 🛠️ retires ONLY by being NAMED: exact/prefix match of its
                 // glyph-and-area-stripped title. Never the contains path (titles
                 // are derived from prose, so a skill that merely MENTIONS the
@@ -5026,8 +5046,8 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                 // trap), and never token coverage (2026-08-01: naming is a
                 // deliberate human act; overlap is not).
                 if (/🛠/.test(c.text)) {
-                    if (core && wantTitle.length >= 6 && core === wantTitle) matches.push({ c, cov: 1, overlap: core.length });
-                    else if (core && longEnough && wantTitle.length >= 6 && (core.startsWith(wantTitle) || wantTitle.startsWith(core))) {
+                    if (areaOk && core && wantTitle.length >= 6 && core === wantTitle) matches.push({ c, cov: 1, overlap: core.length });
+                    else if (areaOk && core && longEnough && wantTitle.length >= 6 && (core.startsWith(wantTitle) || wantTitle.startsWith(core))) {
                         matches.push({ c, cov: 1, overlap: Math.min(core.length, wantTitle.length) });
                     }
                     continue;
@@ -5037,11 +5057,11 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                 // CONTAINS the target — the contains variant needs a LONGER
                 // target (≥10) because a short generic word ("sandbox") appears
                 // in many unrelated titles.
-                if (core && wantTitle.length >= 6 && core === wantTitle) { matches.push({ c, cov: 1, overlap: core.length }); continue; }
-                if (core && longEnough && wantTitle.length >= 6 && (core.startsWith(wantTitle) || wantTitle.startsWith(core))) {
+                if (areaOk && core && wantTitle.length >= 6 && core === wantTitle) { matches.push({ c, cov: 1, overlap: core.length }); continue; }
+                if (areaOk && core && longEnough && wantTitle.length >= 6 && (core.startsWith(wantTitle) || wantTitle.startsWith(core))) {
                     matches.push({ c, cov: 1, overlap: Math.min(core.length, wantTitle.length) }); continue;
                 }
-                if (core && longEnough && wantTitle.length >= 10 && core.includes(wantTitle)) { matches.push({ c, cov: 1, overlap: wantTitle.length }); continue; }
+                if (areaOk && core && longEnough && wantTitle.length >= 10 && core.includes(wantTitle)) { matches.push({ c, cov: 1, overlap: wantTitle.length }); continue; }
                 // Else target-coverage (≥2 tokens, no floor): a short deliberate
                 // close-target whose tokens are present in a card is a precise hit.
                 if (tTok.size >= 2) {
@@ -5058,18 +5078,41 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
             // this engine may never do. REFUSE, keep the note as an ordinary
             // card, and hand back the top candidates so the author can name a
             // longer target or close by id.
-            if (matches.length > 4) {
+            //
+            // The cap applies to the TIER, not to the whole list (2026-09-16
+            // review). A title-grade hit is an unambiguous naming; coverage hits
+            // are a broad net around it, and counting them toward the cap made
+            // an exact title match refuse because the target's words happened to
+            // appear in five other cards. The documented example — `closes:
+            // v1.2.0 staged as a github draft` — matches 18 live cards on
+            // brain.klypix, exactly ONE of them title-grade (txt_kotyx0i2, rank
+            // 1): the pre-1.85 code archived that right card, this branch
+            // archived nothing. Simulated over all 1,890 live cards on
+            // brain.klypix using each card's own headline as the close target
+            // (tier cap only, no area constraint): refusals fall 45.2% → 13.2%
+            // and the intended card is the one closed in 1,569 of 1,890. A
+            // genuinely ambiguous target — review-G's 7-char 'sandbox', 6 hits,
+            // none exact — is still refused, which is what the cap is for.
+            // The tier is `cov === 1` — a title hit OR a card that carries every
+            // token of the target — deliberately NOT "title-grade only". The
+            // near-duplicate-twins guard depends on it: one ❓ twin usually
+            // matches by title and its paraphrase only by full coverage, and
+            // narrowing the tier to titles alone closed one twin and left the
+            // other open in every brief forever (caught by brain-quality P4a).
+            const exact = matches.filter(m => m.cov === 1);
+            const tier = exact.length ? exact : matches;
+            if (tier.length > 4) {
                 (stats.closeRefused ||= []).push({
                     target: target.slice(0, 80),
-                    total: matches.length,
-                    candidates: matches.slice(0, 5).map(m => ({
+                    total: tier.length,
+                    candidates: tier.slice(0, 5).map(m => ({
                         id: m.c.id, area: m.c.area || null, cov: Math.round(m.cov * 100) / 100,
                         title: String(m.c.title || m.c.text || '').replace(/\s+/g, ' ').trim().slice(0, 90),
                     })),
                 });
                 continue;
             }
-            const chosen = matches;
+            const chosen = tier;
             if (!chosen.length) continue;
             const ship = String(card.text).replace(/\s+/g, ' ').replace(/^[^:\n]{1,40}:\s*/, '').replace(/^🏁\s*/, '').trim().slice(0, 80);
             card.__closesIds = [];

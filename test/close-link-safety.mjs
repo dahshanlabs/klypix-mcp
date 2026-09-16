@@ -18,6 +18,12 @@
 //       order, and the choice is stable across runs.
 //   C5  the guards that already existed are intact: a 🛠 skill still retires
 //       only by being NAMED, and an exact short title still closes.
+//   C6  the >4 cap applies to the TITLE-grade TIER, not to the whole match
+//       list — otherwise the broad coverage net around the right card made an
+//       unambiguous naming refuse (2026-09-16 review).
+//   C7  naming the area still DISAMBIGUATES: the target's own `Area:` prefix
+//       constrains the title paths when it names a real area, and an ordinary
+//       prose colon constrains nothing.
 import {
   buildKlypixMap, parseKlypix, captureIntoBrain, closeTargetKey, formatCaptureReceipts,
 } from '../src/klypix-format.mjs';
@@ -176,6 +182,87 @@ const seed = () => buildKlypixMap({
   const { struct: sn } = await parseKlypix(named.buffer);
   const namedSkill = sn.cards.find(c => /🛠/.test(String(c.text || '')));
   ok(/^archive$/i.test(namedSkill.area || ''), 'C5 …but NAMING it exactly still retires it — the documented escape hatch survives');
+}
+
+// ── C6 — the cap applies to the TIER, not to the whole match list ───────────
+// 2026-09-16 review: counting the broad coverage net toward the >4 refusal made
+// an UNAMBIGUOUS title match refuse. The documented target — `closes: v1.2.0
+// staged as a github draft` — matches 18 live cards on brain.klypix, exactly
+// ONE of them title-grade (txt_kotyx0i2, rank 1): the pre-1.85 code archived
+// that right card and this branch archived nothing, i.e. `closes:` was
+// effectively disabled for precise targets on a mature brain.
+{
+  const buf = await buildKlypixMap({
+    title: 'brain',
+    areas: [{
+      title: 'Release',
+      cards: [
+        { text: 'Release: v1.2.0 STAGED as a GitHub draft' },
+        // Five cards the target's TOKENS cover (staged + github, 2 of 3) but
+        // whose titles it does not name — the broad net around the right card.
+        ...Array.from({ length: 5 }, (_, i) => ({
+          text: `Release: the staged bundle number ${i} is uploaded to github before the tag is pushed`,
+        })),
+      ],
+    }],
+  });
+  const { struct: s0 } = await parseKlypix(buf);
+  const wanted = s0.cards.find(c => /v1\.2\.0 STAGED/.test(flat(c.text)));
+  const { stats, buffer } = await captureIntoBrain(buf, {
+    cards: [{ text: 'Release: 🏁 the draft was published\n#release', area: 'Release', closes: 'v1.2.0 staged as a github draft' }],
+  });
+  const { struct } = await parseKlypix(buffer);
+  const gone = archived(struct);
+  ok(stats.closed === 1, `C6 THE HEADLINE: one title-grade hit inside a broad net still closes (closed=${stats.closed || 0})`);
+  ok(gone.length === 1 && gone[0].id === wanted.id, 'C6 and it is the card the target names, not one of the five it merely covers');
+  ok(!(stats.closeRefused || []).length, 'C6 no refusal receipt — the target was not ambiguous');
+}
+
+// ── C7 — naming the area still DISAMBIGUATES ────────────────────────────────
+// closeTargetKey strips the `Area:` prefix from BOTH sides, which is what made
+// bare stubs harmless — but it also meant `Collab: permanent share-link…` could
+// no longer be told apart from the same-titled card in `canvas-share`. Ten
+// stripped titles on the live brain are shared across different areas (one
+// across five), and at ≤4 matches the close swept them all.
+{
+  const TITLE = 'permanent share-link tokens rotate on every publish';
+  const mk = () => buildKlypixMap({
+    title: 'brain',
+    areas: [
+      { title: 'Collab', cards: [{ text: `Collab: ${TITLE}` }] },
+      { title: 'canvas-share', cards: [{ text: `canvas-share: ${TITLE}` }] },
+    ],
+  });
+  const buf = await mk();
+  const { struct: s0 } = await parseKlypix(buf);
+  const inCollab = s0.cards.find(c => c.area === 'Collab' && /permanent share-link/.test(flat(c.text)));
+  const { stats, buffer } = await captureIntoBrain(buf, {
+    cards: [{ text: 'Collab: 🏁 share-link rotation shipped\n#collab', area: 'Collab', closes: `Collab: ${TITLE}` }],
+  });
+  const { struct } = await parseKlypix(buffer);
+  const gone = archived(struct);
+  ok(gone.length === 1, `C7 THE HEADLINE: an area-qualified target closes ONE card, not its twin in another area (${gone.length})`);
+  ok(gone.length === 1 && gone[0].id === inCollab.id, 'C7 and it is the one in the area the target named');
+  ok((stats.closed || 0) === 1, `C7 the receipt agrees (closed=${stats.closed || 0})`);
+}
+{
+  // …and an ordinary prose colon is NOT an area, so it constrains nothing.
+  // The target is LONGER than the card title, so it can only land on the title
+  // prefix path — token coverage is 5/9 = 0.56, below CLOSE_COVER_AT. If "fix:"
+  // were treated as an area the card would match nothing at all.
+  const buf = await buildKlypixMap({
+    title: 'brain',
+    areas: [{ title: 'Canvas UX', cards: [{ text: 'Canvas UX: the lasso hit testing misses rotated groups' }] }],
+  });
+  const { stats, buffer } = await captureIntoBrain(buf, {
+    cards: [{
+      text: 'Canvas UX: 🏁 lasso rewritten\n#canvas', area: 'Canvas UX',
+      closes: 'fix: the lasso hit testing misses rotated groups inside nested container transforms',
+    }],
+  });
+  const { struct } = await parseKlypix(buffer);
+  ok((stats.closed || 0) === 1 && archived(struct).length === 1,
+    `C7 a leading "fix:" is prose, not an area constraint — the close still lands (closed=${stats.closed || 0})`);
 }
 
 console.log(failures ? `\n${failures} failure(s)` : '\n✓ close-link-safety: all assertions passed');

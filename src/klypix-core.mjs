@@ -37,7 +37,7 @@ import {
   splitQueryTokens, scoreCardsAgainstQuery, correctionOverlaysFor, currentGuidanceFor, currentGuidancePrefix,
   isFastDecayCard, isUnresolvedOpenCard, isSkillCard, validateGuard, guardSidecarPathFor, ensureGuardSidecar, DECAY_STALE_MS, formatDecayAge,
   isPlanCard, planFulfillmentFor, PLAN_PAIR_SIM_BRAIN, isAgconfTwinId,
-  readPendingShips, clearPendingShips, pendingShipCards, formatCaptureReceipts,
+  readPendingShips, clearPendingShips, pendingShipCards, formatCaptureReceipts, parseVerifySuffix,
 } from './klypix-format.mjs';
 import { findProjectBrain, postPresenceMessage, readReleaseLease } from './agent-presence.mjs';
 import { collectRepoState, commitsInRange, makeContainmentProbe } from './repo-state.mjs';
@@ -1592,7 +1592,7 @@ export async function opBrainNote({ vault, canvas, text: noteText, area, marker 
     if (!v.ok) return err(`Invalid guard: ${v.reason}`);
     guardField = v.guard;
   }
-  const metadata = prepareBrainEvidence({ projectRoot: path.dirname(file), evidence, verify, marker, text: noteText });
+  const metadata = prepareBrainEvidence({ projectRoot: path.dirname(file), evidence, verify, marker, text: noteText, deriveVerify: parseVerifySuffix });
   if (!metadata.ok) return err(`Invalid brain note metadata: ${metadata.error}`);
   const input = noteToCaptureInput({ text: noteText, area, marker, closes: closes || '', evidence: metadata.evidence, verify: metadata.verify, guard: guardField, createdVia: via || 'mcp' });
   // Deliver any queued out-of-session ship observations on THIS write. The
@@ -1627,7 +1627,9 @@ export async function opBrainNote({ vault, canvas, text: noteText, area, marker 
     // askable vocabulary, so passing both never records junk.
     const enrichmentQuestions = (Array.isArray(enrichmentQuestion) ? enrichmentQuestion : [enrichmentQuestion])
       .map((q) => String(q || '').trim()).filter(Boolean);
-    if (enrichmentQuestions.length && (res.stats?.added || 0) > 0) {
+    // A ~ that rewrote or amended its card counts too (1.86.1): the sidecar
+    // joins the question to whichever card holds the note's text.
+    if (enrichmentQuestions.length && ((res.stats?.added || 0) + (res.stats?.updated || 0)) > 0) {
       try {
         const enrich = await import('./enrichment.mjs');
         enrich.recordEnrichment(file, enrichmentQuestions.map((question) => ({ body: noteText, question })));
@@ -1636,6 +1638,10 @@ export async function opBrainNote({ vault, canvas, text: noteText, area, marker 
     const s = res.stats || {};
     const bits = [`${s.added || 0} added`];
     for (const k of ['resolved', 'updated', 'merged', 'closed', 'superseded']) if (s[k]) bits.push(`${s[k]} ${k}`);
+    // A thin ~ is appended to its card (1.86.1), and one the card already says
+    // changes nothing — neither may read as a plain "1 updated" / "0 added".
+    if (Array.isArray(s.updateAmended) && s.updateAmended.length) bits.push(`${s.updateAmended.length} appended as a dated amendment (too thin to replace its card)`);
+    if (Array.isArray(s.updateUnchanged) && s.updateUnchanged.length) bits.push(`${s.updateUnchanged.length} unchanged (the card already says it)`);
     // A partial resolve and a SKIPPED partial are different events, and a
     // receipt that reports neither reads as "nothing happened" for the first
     // and as a fresh stamp for the second.

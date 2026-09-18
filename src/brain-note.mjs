@@ -22,7 +22,7 @@ import fs from 'fs';
 import path from 'path';
 import { prepareBrainEvidence } from './brain-evidence.mjs';
 import { looksLikeUnfilledDraft } from './capture-gap.mjs';
-import { captureIntoBrain, tidyBrain, atomicWrite, noteToCaptureInput, formatCaptureReceipts } from './klypix-format.mjs';
+import { captureIntoBrain, tidyBrain, atomicWrite, noteToCaptureInput, formatCaptureReceipts, parseVerifySuffix } from './klypix-format.mjs';
 import { brainCaptureLockPath, withAdvisoryWriteLock } from './brain-write-lock.mjs';
 
 const MARKERS = { '': '', '?': '?', '!': '!', '✓': '✓', '~': '~', question: '?', milestone: '!', resolve: '✓', update: '~', decision: '', done: '✓' };
@@ -73,7 +73,7 @@ if (!opts.text) { console.error('brain-note: nothing to write — pass a note as
 if (!fs.existsSync(file)) { console.error(`brain-note: no brain at ${file} (run from a project with ./brain.klypix, or pass a path).`); process.exit(1); }
 
 if (looksLikeUnfilledDraft(opts.text)) { console.error('brain-note refused (brain unchanged): complete or discard the draft rationale before capturing it.'); process.exit(1); }
-const metadata = prepareBrainEvidence({ projectRoot: path.dirname(file), evidence: opts.evidence, verify: opts.verify, marker: opts.marker, text: opts.text });
+const metadata = prepareBrainEvidence({ projectRoot: path.dirname(file), evidence: opts.evidence, verify: opts.verify, marker: opts.marker, text: opts.text, deriveVerify: parseVerifySuffix });
 if (!metadata.ok) { console.error(`brain-note refused (brain unchanged): ${metadata.error}`); process.exit(1); }
 const input = noteToCaptureInput({ text: opts.text, area: opts.area, marker: opts.marker, closes: opts.closes, evidence: metadata.evidence, verify: metadata.verify, createdVia: 'cli' });
 try {
@@ -95,6 +95,10 @@ try {
     const s = res.stats || {};
     const bits = [`${s.added || 0} added`];
     for (const k of ['resolved', 'updated', 'closed', 'superseded']) if (s[k]) bits.push(`${s[k]} ${k}`);
+    // A thin ~ is appended to its card (1.86.1), and one the card already says
+    // changes nothing — neither may read as a plain "1 updated" / "0 added".
+    if (Array.isArray(s.updateAmended) && s.updateAmended.length) bits.push(`${s.updateAmended.length} appended as a dated amendment (too thin to replace its card)`);
+    if (Array.isArray(s.updateUnchanged) && s.updateUnchanged.length) bits.push(`${s.updateUnchanged.length} unchanged (the card already says it)`);
     if (s.reAdopted) bits.push(`${s.reAdopted} re-adopted`);
     if (s.linked) bits.push(`${s.linked} linked`);
     console.error(`✓ brain-note → ${path.basename(file)} (${bits.join(' · ')})`);

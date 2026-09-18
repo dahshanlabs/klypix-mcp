@@ -80,7 +80,7 @@ function workingTreeStatus(root, relative, deadline) {
   } catch (error) { return error.status === 1 ? 'changed' : 'unverified'; }
 }
 
-export function prepareBrainEvidence({ projectRoot, evidence, verify, marker = '', text = '' } = {}) {
+export function prepareBrainEvidence({ projectRoot, evidence, verify, marker = '', text = '', deriveVerify = null } = {}) {
   const bad = error => ({ ok: false, error });
   if (marker === '✓' && (evidence !== undefined || verify !== undefined)) {
     return bad('A resolve marker archives existing evidence. To record new evidence, write a milestone with closes, or amend the card with marker ~.');
@@ -88,9 +88,15 @@ export function prepareBrainEvidence({ projectRoot, evidence, verify, marker = '
   if (verify !== undefined && (typeof verify !== 'string' || verify.length > 2000 || /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(verify))) {
     return bad('verify must be a string of at most 2000 characters; it is recorded, never executed.');
   }
-  // Lowercase `verify: value` only — the marker grammar (1.86.1) treats
-  // "Verify:" and `npm run verify:mcp` as prose, so they can never come back.
-  if (marker === '~' && typeof verify === 'string' && !verify.trim() && /(?:^|\s)verify:\s+\S/.test(String(text))) {
+  // The question is "would the READER derive a verify from this text?" — so
+  // the callers pass the reader itself (klypix-format parseVerifySuffix; this
+  // module may not import it). Then "every agent verify: the tag" is not
+  // refused (the reader derives nothing) and an own-line `verify: <command>`
+  // is (the reader derives it). Without a deriver: a lowercase `verify: value`.
+  const inlineVerify = () => (typeof deriveVerify === 'function'
+    ? Boolean(deriveVerify(String(text)))
+    : /(?:^|\s)verify:\s+\S/.test(String(text)));
+  if (marker === '~' && typeof verify === 'string' && !verify.trim() && inlineVerify()) {
     return bad('To clear verification, remove the inline verify: suffix from the amended text too.');
   }
   if (evidence !== undefined && (!Array.isArray(evidence) || evidence.length > 16)) return bad('evidence must be an array of at most 16 references.');

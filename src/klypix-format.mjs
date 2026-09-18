@@ -254,28 +254,52 @@ const RENAME_BACKOFF_MS = [40, 120, 300, 700, 1500];
 // keys had the same hazard ("see the ev: numbers", "every agent verify: the
 // tag", "treats closes: links as ..."). A suffix is now recognised only where
 // it cannot be prose:
-//   • keys are lowercase and written `key: value`, with whitespace on BOTH
-//     sides of the colon, so "Q:", "FAQ:", "q:auth" and `npm run verify:mcp`
-//     are ordinary text;
+//   • keys are lowercase and written `key: value`, with whitespace before the
+//     key and after the colon, so "Q:", "FAQ:", "q:auth" and `npm run
+//     verify:mcp` are ordinary text. Two unambiguous exceptions: no space is
+//     needed before a [[wikilink]] or an ev: reference ("closes:[[X]]",
+//     "ev:src/a.ts"), and `Closes:` is accepted before a [[wikilink]];
 //   • suffixes form ONE run that reaches the end of the line, and the run
 //     cannot start right after a word that leaves a clause open ("the ev:",
-//     "a q:", "to verify:");
-//   • every value must have its key's shape: `ev:` a comma list of file / PR /
-//     run references; `verify:` a command (a known CLI, a script or path, a
-//     hyphenated probe name, or a tool given a --flag); `q:` a question (a
-//     question word first, `?` or `؟` last); `closes:` any title, and capture
-//     puts a `closes:` that names no live card back into the card text.
-// A run that breaks any rule is not a suffix run: parsing moves on to the next
-// key, and when none qualifies the whole line stays the card body, untouched.
+//     "a q:", "we verify:", "Always verify:", "Rule: verify:"). A single
+//     capital letter and "May" are not open words, so "option A closes:" and
+//     "ships in May closes:" end a clause. Particles and copulas ("stays on",
+//     "as is") block every run except one that opens with a well-formed ev:
+//     reference list;
+//   • every value must have its key's shape: `ev:` a comma list (`,` or `،`)
+//     of file / PR / run references; `verify:` a command (a known CLI, a
+//     script or path, a hyphenated probe name, or a tool given a --flag) with
+//     no prose connectives outside quotes; `q:` a question (a question word,
+//     or a preposition + which/what, first; `?` or `؟` last); `closes:` any
+//     title — capture puts a `closes:` that names no live card back into the
+//     card text;
+//   • a dangling key at the very end ("shipped X ev:") is dropped; a repeated
+//     ev: joins its references.
+// A run whose FIRST segment breaks a rule is not a suffix run: parsing moves on
+// to the next key, and when none qualifies the whole line stays the card body,
+// untouched. Once a run has a well-formed ev: / verify: / q: segment it IS a
+// suffix run, so a later malformed segment goes back into the card text
+// (`kept`) and the well-formed ones still count — one bad value never cancels
+// the rest. A `closes:` alone never proves a run (its value is free text),
+// unless its whole value is one [[wikilink]].
+// `closesAnchored` says the closes: is unmistakably a suffix — it follows a
+// clause boundary, is exactly one [[wikilink]], or rides with a well-formed
+// sibling — and capture only lets an UNanchored one close a card it names by
+// title.
 const MARKER_SUFFIX_KEYS = ['closes', 'ev', 'verify', 'q'];
-const MARKER_SUFFIX_KEY_RE = new RegExp(`(?<=\\s)(${MARKER_SUFFIX_KEYS.join('|')}):(?=\\s)`, 'g');
+const MARKER_SUFFIX_KEY_RE = new RegExp(`(?<=\\s)(${MARKER_SUFFIX_KEYS.join('|')}|Closes):`, 'g');
 const MARKER_SUFFIX_OPEN_WORDS = new Set([
-    'a', 'an', 'the', 'this', 'that', 'these', 'those', 'its', 'their', 'our', 'my', 'your', 'every', 'each',
-    'of', 'to', 'in', 'on', 'at', 'for', 'with', 'by', 'from', 'into', 'onto', 'about', 'via', 'per', 'like', 'as', 'than',
-    'and', 'or', 'nor', 'but', 'if', 'whether', 'because',
-    'is', 'are', 'was', 'were', 'be', 'been', 'being', 'am',
+    'a', 'an', 'the', 'this', 'that', 'these', 'those', 'its', 'their', 'our', 'my', 'your', 'every', 'each', 'any', 'some', 'no', 'not',
+    'of', 'to', 'than', 'via', 'per',
+    'and', 'or', 'nor', 'but', 'if', 'whether', 'because', 'so', 'then', 'when', 'while', 'where', 'which', 'who',
+    'I', 'we', 'they', 'he', 'she',
     'do', 'does', 'did', 'can', 'could', 'should', 'would', 'will', 'shall', 'may', 'might', 'must',
+    'always', 'never', 'also', 'just', 'please',
     'في', 'من', 'على', 'إلى', 'الى', 'عن', 'مع', 'أو', 'او', 'ثم', 'هذا', 'هذه', 'ذلك', 'تلك', 'كل',
+]);
+const MARKER_SUFFIX_SOFT_WORDS = new Set([
+    'in', 'on', 'at', 'for', 'with', 'by', 'from', 'into', 'onto', 'about', 'like', 'as', 'off', 'up', 'out', 'over',
+    'is', 'are', 'was', 'were', 'be', 'been', 'being', 'it', 'you', 'one',
 ]);
 const MARKER_SUFFIX_CLI = new Set([
     'gh', 'git', 'npm', 'npx', 'node', 'pnpm', 'yarn', 'bun', 'deno', 'corepack', 'curl', 'wget', 'pwsh', 'powershell',
@@ -284,14 +308,37 @@ const MARKER_SUFFIX_CLI = new Set([
     'swift', 'xcodebuild', 'xcrun', 'fastlane', 'jq', 'rg', 'grep', 'cat', 'ls', 'cd', 'echo', 'tsc', 'vitest',
     'jest', 'eslint', 'psql', 'sqlite3', 'ssh', 'openssl', 'wsl',
 ]);
-const MARKER_SUFFIX_QUESTION_LEAD = /^(?:(?:how|what|why|where|when|which|who|whom|whose|whether|can|could|should|would|will|shall|may|might|must|do|does|did|is|are|was|were|has|have|had|am)(?:n['’]t)?|won['’]t|هل|ما|ماذا|لماذا|لما|كيف|أين|اين|متى|من|كم|أي|أية|لم)(?![\p{L}\p{N}])/iu;
+// Connectives a command line never needs outside a quoted argument: a verify:
+// value carrying one is a sentence ("npm view x version matches the tag").
+const MARKER_SUFFIX_PROSE = new Set([
+    'the', 'before', 'after', 'when', 'whenever', 'while', 'as', 'matches', 'then', 'that', 'which', 'because',
+    'should', 'must', 'is', 'are', 'was', 'were', 'until', 'unless', 'instead',
+]);
+const MARKER_SUFFIX_QUESTION_LEAD = /^(?:(?:how|what|why|where|when|which|who|whom|whose|whether|can|could|should|would|will|shall|may|might|must|do|does|did|is|are|was|were|has|have|had|am)(?:n['’]t)?|won['’]t|(?:on|in|at|for|to|from|by|with|into|onto|of|about|under|after|before)\s+(?:which|what|whom|whose)|هل|ما|ماذا|لماذا|لما|كيف|أين|اين|متى|من|كم|أي|أية|لم|ماهي|ماهو|وين|ليش|ليه|شو|إيش|ايش|أيش|مين|منين|إمتى|امتى|إزاي|ازاي)(?![\p{L}\p{N}])/iu;
+// Direction marks and Arabic vowel marks are invisible, so they never decide
+// a shape: a question that ends in ؟ followed by a right-to-left mark, or one
+// written with vowel marks (كَيْفَ), is still a question.
+const MARKER_SUFFIX_INVISIBLE = /[\u200E\u200F\u061C\u202A-\u202E\u2066-\u2069\u064B-\u065F\u0670\u0640]/g;
+const MARKER_SUFFIX_DIRECTION = /[\u200E\u200F\u061C\u202A-\u202E\u2066-\u2069]/g;   // stripped from the stored q: too
+const MARKER_SUFFIX_BOUNDARY = /[.!?;)\]✓✅…—–؛؟]$/u;
 const MARKER_SUFFIX_BARE_FILES = /^(?:Makefile|Dockerfile|Procfile|Gemfile|Rakefile|Jenkinsfile|Vagrantfile|Brewfile|Justfile|LICENSE|README|NOTICE|CHANGELOG|CODEOWNERS|AUTHORS|COPYING)$/;
+const MARKER_SUFFIX_WIKILINK = /^\[\[[^\][]+\]\][.,;!]?$/;
+// Case matters only where it disambiguates: a single capital letter ("option
+// A") and the month "May" end a clause; any other Titlecase word counts as its
+// lowercase form, so "Always verify:" is as open as "always verify:".
+function markerSuffixWordIn(set, word) {
+    if (set.has(word)) return true;
+    return /^\p{Lu}\p{Ll}+$/u.test(word) && word !== 'May' && set.has(word.toLowerCase());
+}
 function markerSuffixRefOk(item) {
     const ref = item.trim();
     if (!ref) return false;
     if (/^(?:pr|gh|issue)?\s*#?\d+$/i.test(ref)) return true;                  // PR#12 · PR 12 · GH3 · #12
     const words = ref.split(/\s+/);
-    return words.length <= 4 && words.some((word) => {
+    if (words.length > 4) return false;
+    // "PR#12 to the line", "3 cards on the board": a reference is never a phrase.
+    if (words.some((w) => MARKER_SUFFIX_OPEN_WORDS.has(w.toLowerCase()) || MARKER_SUFFIX_SOFT_WORDS.has(w.toLowerCase()))) return false;
+    return words.some((word) => {
         const w = word.replace(/^[`'"([]+|[`'")\].,;]+$/g, '');
         return /[\/\\\d]/.test(w) || /\.[A-Za-z0-9]/.test(w) || MARKER_SUFFIX_BARE_FILES.test(w);
     });
@@ -299,6 +346,8 @@ function markerSuffixRefOk(item) {
 function markerSuffixCommandOk(value) {
     const head = value.split(/\s+/)[0].replace(/^[`'"(]+|[`'")]+$/g, '');
     if (!head) return false;
+    const unquoted = value.replace(/`[^`]*`|"[^"]*"|'[^']*'/g, ' ');
+    if (unquoted.split(/\s+/).slice(1).some((w) => MARKER_SUFFIX_PROSE.has(w.toLowerCase()))) return false;
     if (MARKER_SUFFIX_CLI.has(head.toLowerCase()) || /^klypix-[a-z-]+$/.test(head)) return true;
     if (/^[A-Z][a-z]+-[A-Z][A-Za-z]+$/.test(head)) return true;                 // PowerShell Verb-Noun
     if (/[\/\\]|^[.~$]/.test(head) || /\.(?:mjs|cjs|js|ts|ps1|sh|py|cmd|bat|exe)$/i.test(head)) return true;
@@ -308,29 +357,66 @@ function markerSuffixCommandOk(value) {
 function markerSuffixValueOk(key, value) {
     if (!value) return false;
     if (key === 'closes') return true;
-    if (key === 'ev') return value.split(',').every(markerSuffixRefOk);
+    if (key === 'ev') {
+        const items = value.split(/[,،]/).filter((item) => item.trim());
+        return items.length > 0 && items.every(markerSuffixRefOk);
+    }
     if (key === 'verify') return markerSuffixCommandOk(value);
-    const question = value.replace(/^[`'"“‘(]+/, '');
+    const question = value.replace(MARKER_SUFFIX_INVISIBLE, '').replace(/^[`'"“‘(]+/, '').trim();
     return MARKER_SUFFIX_QUESTION_LEAD.test(question) && /[?？؟][`'"”’)]*$/.test(question);
 }
-// → { body, closes, ev, verify, q } as raw strings ('' when absent).
+// → { body, closes, ev, verify, q, kept, closesAnchored, bodyWithCloses }.
+// Strings are '' when absent. `body` is the card text (with any `kept` segment
+// folded back in); `bodyWithCloses` is the same text with the closes: segment
+// left where it was written — what lands when the closes: acts on nothing.
 function parseMarkerSuffixText(line) {
     const text = String(line || '');
-    const keys = [...text.matchAll(MARKER_SUFFIX_KEY_RE)].map((m) => ({ key: m[1], at: m.index, from: m.index + m[0].length }));
+    const none = { body: text.trim(), closes: '', ev: '', verify: '', q: '', kept: '', closesAnchored: false, bodyWithCloses: text.trim() };
+    const keys = [];
+    for (const m of text.matchAll(MARKER_SUFFIX_KEY_RE)) {
+        const from = m.index + m[0].length;
+        const rest = text.slice(from);
+        const wiki = /^\s*\[\[/.test(rest);
+        if (m[1] === 'Closes' && !wiki) continue;                                // "Closes:" only before a [[wikilink]]
+        const spaced = rest === '' || /^\s/.test(rest);
+        if (!spaced && !(wiki && /^closes$/i.test(m[1])) && !(m[1] === 'ev' && markerSuffixRefOk((/^[^\s,،]+/.exec(rest) || [''])[0]))) continue;
+        keys.push({ key: m[1].toLowerCase(), at: m.index, from });
+    }
+    const segEnd = (k) => (k + 1 < keys.length ? keys[k + 1].at : text.length);
+    const valueOf = (k) => text.slice(keys[k].from, segEnd(k)).trim();
     for (let start = 0; start < keys.length; start++) {
         const body = text.slice(0, keys[start].at).trim();
-        const lastWord = (/(\S+)$/.exec(body) || [])[1] || '';
-        if (!body || MARKER_SUFFIX_OPEN_WORDS.has(lastWord.toLowerCase())) continue;
-        const found = {};
-        let wellFormed = true;
-        for (let k = start; k < keys.length && wellFormed; k++) {
-            const value = text.slice(keys[k].from, k + 1 < keys.length ? keys[k + 1].at : text.length).trim();
-            if (!markerSuffixValueOk(keys[k].key, value)) wellFormed = false;
-            else if (!(keys[k].key in found)) found[keys[k].key] = value;
+        if (!body) continue;
+        const lastWord = /(\S+)$/.exec(body)[1];
+        if (lastWord.endsWith(':') || markerSuffixWordIn(MARKER_SUFFIX_OPEN_WORDS, lastWord)) continue;
+        if (markerSuffixWordIn(MARKER_SUFFIX_SOFT_WORDS, lastWord) && !(keys[start].key === 'ev' && markerSuffixValueOk('ev', valueOf(start)))) continue;
+        const found = { closes: '', ev: [], verify: '', q: '' };
+        let closesSegment = '', failAt = -1, anchored = false;
+        for (let k = start; k < keys.length; k++) {
+            const { key } = keys[k];
+            const value = valueOf(k);
+            if (!value && k === keys.length - 1) break;                          // a dangling key at the end is dropped
+            if (!markerSuffixValueOk(key, value) || (key !== 'ev' && found[key])) { failAt = k; break; }
+            if (key !== 'closes' || MARKER_SUFFIX_WIKILINK.test(value)) anchored = true;
+            if (key === 'ev') found.ev.push(value);
+            else found[key] = value;
+            if (key === 'closes') closesSegment = text.slice(keys[k].at, segEnd(k)).trim();
         }
-        if (wellFormed) return { body, closes: found.closes || '', ev: found.ev || '', verify: found.verify || '', q: found.q || '' };
+        if (failAt !== -1 && !anchored) continue;
+        const kept = failAt === -1 ? '' : text.slice(keys[failAt].at).trim();
+        const cardBody = kept ? `${body} ${kept}` : body;
+        return {
+            body: cardBody,
+            closes: found.closes,
+            ev: found.ev.join(', '),
+            verify: found.verify,
+            q: found.q.replace(MARKER_SUFFIX_DIRECTION, '').trim(),
+            kept,
+            closesAnchored: Boolean(found.closes) && (anchored || MARKER_SUFFIX_BOUNDARY.test(body)),
+            bodyWithCloses: closesSegment ? [body, closesSegment, kept].filter(Boolean).join(' ') : cardBody,
+        };
     }
-    return { body: text.trim(), closes: '', ev: '', verify: '', q: '' };
+    return none;
 }
 // ── Marker suffix grammar ─── MIRROR END ────────────────────────────────────
 
@@ -345,8 +431,35 @@ function parseMarkerSuffixText(line) {
 // probe from the prose of 12 cards and every one was wrong ("mcp gate" from
 // `npm run verify:mcp`, "command on demand, and …" from a sentence ABOUT the
 // verify: field); this grammar derives none.
+//
+// The grammar needs the WHOLE sentence (a suffix run reaches the end of it, and
+// a verify: followed by prose is not a command), but a stored card is
+// hard-wrapped (wrapText, ~37 chars), so reading line by line cut "…requires
+// agents verify: npm view klypix-mcp version matches the tag before
+// announcing" into the "command" `npm view klypix-mcp`. The logical lines are
+// rebuilt first: a break is SOFT when the next line's first word would not
+// have fitted (wrapText's own rule — a mid-word chunk of an over-long token
+// rejoins with no space), and a line that STARTS with a suffix key (a
+// `verify: <command>` written on its own line) is the tail of the line above.
+// Tag lines and lifecycle notes (✔ ✅ ↩ ⤵ "(re-affirmed" "(~ amended") always
+// start a line of their own.
 export function parseVerifySuffix(text) {
-    for (const line of String(text || '').split('\n')) {
+    const cpl = brainCPL();
+    const lines = String(text || '').split('\n');
+    const logical = [];
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const prevRaw = i > 0 ? lines[i - 1] : '';
+        const blockStart = /^\s*(?:#[\p{L}\p{N}_-]+\s*)+$/u.test(line) || /^(?:✔|✅|↩|⤵|\(re-affirmed|\(~ amended)/u.test(line.trim());
+        if (!logical.length || !prevRaw.trim() || !line.trim() || blockStart) { logical.push(line); continue; }
+        const firstWord = (/^\S*/.exec(line.trim()) || [''])[0];
+        const midWord = prevRaw.length === cpl && !/\s/.test(prevRaw.trim());
+        const soft = prevRaw.length <= cpl && line.length <= cpl && (midWord || prevRaw.length + 1 + firstWord.length > cpl);
+        const suffixTail = /^\s*(?:closes|ev|verify|q):/.test(line);
+        if (soft || suffixTail) logical[logical.length - 1] = `${logical[logical.length - 1].trimEnd()}${midWord && !suffixTail ? '' : ' '}${line.trim()}`;
+        else logical.push(line);
+    }
+    for (const line of logical) {
         if (!line.includes('verify:')) continue;
         const { verify } = parseMarkerSuffixText(line);
         if (verify) return verify;
@@ -4070,17 +4183,48 @@ const isTerseConfirmUpdate = (text, targetLength) => CONFIRM_CUE_RE.test(String(
 
 // UPDATE FLOOR (1.86.1). A ~ that REPLACES its card must carry at least
 // UPDATE_MIN_WORDS distinct content words (4+ letters, the tokenSet unit) OR at
-// least half as many as the card it replaces. Anything thinner is refused: the
-// card stays exactly as it was and the text lands as a separate card. Both
-// halves matter — the absolute bar alone would refuse a four-word correction of
-// a four-word card ("Dev server runs on port 5174 now"), the ratio alone would
-// let a stub replace a card twice its size.
+// least half as many as the card it replaces. Both halves matter — the absolute
+// bar alone would refuse a four-word correction of a four-word card ("Dev
+// server runs on port 5174 now"), the ratio alone would let a stub replace a
+// card twice its size.
+//
+// A thinner ~ is neither dropped nor turned into a card of its own: it is
+// APPENDED to the card it matched as a dated `(~ amended <date>: …)` line. The
+// short correction is exactly what ~ is for, and it has to land on the card it
+// corrects — a price change ("$5 monthly" vs "$4 monthly") shares every content
+// word with its card, so a separate card was dropped as a near-duplicate of the
+// stale one, and a separate "now run from main" card sat live beside the card it
+// contradicts. Appending keeps both halves of the promise: the richer card is
+// never replaced by a stub, and the correction is on the card.
 export const UPDATE_MIN_WORDS = 6;
 // The words a card's CONTENT carries: tag-only lines (#area #file-x) are
 // routing, not content, and would pad the target's count.
 const updateTargetTokens = (text) => tokenSet(String(text || '').split('\n')
     .filter((line) => !/^\s*(?:#[\p{L}\p{N}_-]+\s*)+$/u.test(line)).join('\n'));
 export const isThinUpdate = (words, targetWords) => words < UPDATE_MIN_WORDS && words * 2 < targetWords;
+// Does a card's text already say this, word for word? Case- and
+// whitespace-insensitive, on word boundaries ("port 51" is not in "port 5173").
+// A card is stored hard-wrapped (wrapText breaks an over-long token mid-word
+// with no space), so the wrapped text is read both ways: line breaks as spaces,
+// and line breaks as nothing.
+const sayNorm = (s) => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+export function cardAlreadySays(cardText, body) {
+    const want = sayNorm(body);
+    if (!want) return false;
+    const raw = String(cardText || '');
+    for (const hay of [sayNorm(raw), sayNorm(raw.replace(/\n/g, ''))]) {
+        let from = 0;
+        for (;;) {
+            const at = hay.indexOf(want, from);
+            if (at < 0) break;
+            const before = at > 0 ? hay[at - 1] : '';
+            const after = hay[at + want.length] || '';
+            if (!/[\p{L}\p{N}]/u.test(before) && !/[\p{L}\p{N}]/u.test(after)) return true;
+            from = at + 1;
+        }
+    }
+    return false;
+}
 // Cue META words describe the act of correcting, not the subject — left in, they
 // dilute the overlap denominator and push real correction pairs just under the
 // bar (the field fixture lands at 0.375 with them, 0.5 without). Stripped before
@@ -4652,7 +4796,10 @@ export function looksLikeTrap(text) {
 //     So the identity is the note BODY, date and tail excluded.
 export const PARTIAL_NOTE_PREFIX = '✔ partial ';
 const PARTIAL_NOTE_TAIL = ' — still open:';
-const PARTIAL_RUN_END_RE = /^(?:✅|↩|⤵|\(re-affirmed)/u;
+// A ~ amendment line (1.86.1) also starts its own line and ends a note run —
+// without it an amendment after a ✔ partial note was read as part of that
+// note, its key changed, and the partial note re-stacked on the next ✓.
+const PARTIAL_RUN_END_RE = /^(?:✅|↩|⤵|\(re-affirmed|\(~ amended)/u;
 export function partialNoteKey(s) {
     return String(s || '')
         .replace(/\s+/g, ' ')
@@ -5066,8 +5213,8 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
         // replaced (area prefix + tag preserved), createdAt bumped so the
         // brief treats it as fresh. No match → falls through as a new card.
         // Too thin to stand in for the card it matched (UPDATE FLOOR below) →
-        // the card is left exactly as it was, and the text falls through as a
-        // new card that may not supersede anything.
+        // the card is kept whole and the text is appended to it as a dated
+        // `(~ amended …)` line; nothing separate is ever minted for it.
         for (const [uIndex, u] of updates.entries()) {
             const uTok = tokenSet(u.text);
             let best = null, bestScore = 0;
@@ -5086,20 +5233,55 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
             // thirteen-word card. A terse confirmation appends, never replaces,
             // so it is exempt; so is a guard amendment — structured intent,
             // where a refused disarm would leave a live guard firing.
-            let refusal = null;
+            //
+            // A thin ~ is APPENDED to its card as a dated amendment line — the
+            // correction lands where it belongs and nothing is destroyed. It
+            // is a no-op when the card already says it word for word: that is
+            // the same marker re-harvested at the next Stop (a ~ bypasses the
+            // hook's dedup), or a stub whose full correction already replaced
+            // the card — neither is news, and re-reporting it every Stop was
+            // noise. Never a separate card: one would attract the next ~ that
+            // tried to correct the original (review-traced), or be dropped as
+            // a near-duplicate of the stale card it contradicts.
             if (matched && !isTerseConfirm && !(u.guard && typeof u.guard === 'object')) {
                 const targetWords = updateTargetTokens(best.text).size;
                 if (isThinUpdate(uTok.size, targetWords)) {
-                    refusal = {
+                    const body = stripLifecycleGlyphs(u.text);
+                    const report = {
                         i: uIndex, id: best.id, area: best.area || null,
                         target: String(best.text || '').replace(/\s+/g, ' ').trim().slice(0, 90),
-                        text: String(u.text || '').replace(/\s+/g, ' ').trim().slice(0, 100),
-                        words: uTok.size, targetWords, savedAsCard: false,
+                        text: body.slice(0, 100), words: uTok.size, targetWords,
                     };
-                    (stats.updateRefused ||= []).push(refusal);
+                    if (!body || cardAlreadySays(best.text, body)) {
+                        (stats.updateUnchanged ||= []).push({ ...report, reason: 'already-says' });
+                        continue;
+                    }
+                    const line = `(~ amended ${today}: ${body})`;
+                    await rewriteCard(best.id, j => {
+                        j.content = `${j.content}\n${line}`;
+                        j.createdAt = now;
+                        j.borderColor = 'rgba(16,185,129,0.6)';
+                        if (u.createdVia) j.createdVia = String(u.createdVia);
+                        // An amendment ADDS to the card, so its evidence joins the
+                        // card's (same ref: the amendment's fresher stamp wins); an
+                        // explicit empty list still clears, as on the replace path.
+                        if (Array.isArray(u.evidence)) {
+                            if (!u.evidence.length) delete j.evidence;
+                            else {
+                                const byRef = new Map((Array.isArray(j.evidence) ? j.evidence : []).map(ev => [ev && ev.ref, ev]));
+                                for (const ev of u.evidence) byRef.set(ev && ev.ref, ev);
+                                j.evidence = [...byRef.values()].slice(0, 16);
+                            }
+                        }
+                        if (typeof u.verify === 'string') { if (u.verify.trim()) j.verify = u.verify.trim(); else delete j.verify; }
+                    });
+                    best.text = `${best.text}\n${line}`;
+                    stats.updated++;
+                    (stats.updateAmended ||= []).push(report);
+                    continue;
                 }
             }
-            if (matched && !refusal) {
+            if (matched) {
                 const tag = u.area ? `\n#${u.area.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : '';
                 await rewriteCard(best.id, j => {
                     if (isTerseConfirm) j.content = `${j.content}\n(re-affirmed ${today}: ${u.text})`;
@@ -5131,18 +5313,20 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                 // a glyph-less guard card was silently consolidatable while
                 // still enforcing (review 2026-08-24). remove-sentinels add no
                 // glyph and no field: an unmatched disarm is inert by design.
-                // A REFUSED (too thin) update lands the same way but may not
-                // supersede or merge into anything — that would be the
-                // replacement the floor just refused, by another route.
-                cards.push({ text: (u.area ? `${u.area}: ` : '') + (u.guard && u.guard.remove !== true && !/🛠/.test(u.text) ? '🛠️ ' : '') + u.text + (u.area ? `\n#${u.area.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : ''), area: u.area, createdVia: u.createdVia, ...(Array.isArray(u.evidence) && u.evidence.length ? { evidence: u.evidence } : {}), ...(typeof u.verify === 'string' && u.verify.trim() ? { verify: u.verify.trim() } : {}), ...(u.guard && typeof u.guard === 'object' && u.guard.remove !== true ? { guard: u.guard } : {}), ...(refusal ? { __keepExisting: true } : {}) });
-                if (refusal) refusal.savedAsCard = true;
+                cards.push({ text: (u.area ? `${u.area}: ` : '') + (u.guard && u.guard.remove !== true && !/🛠/.test(u.text) ? '🛠️ ' : '') + u.text + (u.area ? `\n#${u.area.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : ''), area: u.area, createdVia: u.createdVia, ...(Array.isArray(u.evidence) && u.evidence.length ? { evidence: u.evidence } : {}), ...(typeof u.verify === 'string' && u.verify.trim() ? { verify: u.verify.trim() } : {}), ...(u.guard && typeof u.guard === 'object' && u.guard.remove !== true ? { guard: u.guard } : {}) });
             }
         }
 
         // Which live cards a close-target names — shared by the unmatched-closes
         // pass below and the CLOSE-LINK pass, so both judge a target the same
         // way. Returns the tier the close would act on (> 4 = too generic).
-        const closeTierFor = (target) => {
+        // strict (1.86.1): the target came from marker PROSE with nothing to
+        // anchor it as a suffix (no clause boundary before `closes:`, not a
+        // lone [[wikilink]], no well-formed ev:/verify:/q: beside it), so it
+        // may act only on a card it NAMES by title — "treats closes: as free
+        // text, so …" once archived two unrelated milestones by loose token
+        // coverage. Title-grade hits carry `title: true`.
+        const closeTierFor = (target, { strict = false } = {}) => {
             // Both sides are normalized the SAME way (2026-09-15): strip the
             // [[wikilink]] brackets, the `Area:` prefix and any lifecycle glyph,
             // then collapse. Card titles are derived from prose, so an
@@ -5189,9 +5373,9 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                 // trap), and never token coverage (2026-08-01: naming is a
                 // deliberate human act; overlap is not).
                 if (/🛠/.test(c.text)) {
-                    if (areaOk && core && wantTitle.length >= 6 && core === wantTitle) matches.push({ c, cov: 1, overlap: core.length });
+                    if (areaOk && core && wantTitle.length >= 6 && core === wantTitle) matches.push({ c, cov: 1, overlap: core.length, title: true });
                     else if (areaOk && core && longEnough && wantTitle.length >= 6 && (core.startsWith(wantTitle) || wantTitle.startsWith(core))) {
-                        matches.push({ c, cov: 1, overlap: Math.min(core.length, wantTitle.length) });
+                        matches.push({ c, cov: 1, overlap: Math.min(core.length, wantTitle.length), title: true });
                     }
                     continue;
                 }
@@ -5200,11 +5384,11 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                 // CONTAINS the target — the contains variant needs a LONGER
                 // target (≥10) because a short generic word ("sandbox") appears
                 // in many unrelated titles.
-                if (areaOk && core && wantTitle.length >= 6 && core === wantTitle) { matches.push({ c, cov: 1, overlap: core.length }); continue; }
+                if (areaOk && core && wantTitle.length >= 6 && core === wantTitle) { matches.push({ c, cov: 1, overlap: core.length, title: true }); continue; }
                 if (areaOk && core && longEnough && wantTitle.length >= 6 && (core.startsWith(wantTitle) || wantTitle.startsWith(core))) {
-                    matches.push({ c, cov: 1, overlap: Math.min(core.length, wantTitle.length) }); continue;
+                    matches.push({ c, cov: 1, overlap: Math.min(core.length, wantTitle.length), title: true }); continue;
                 }
-                if (areaOk && core && longEnough && wantTitle.length >= 10 && core.includes(wantTitle)) { matches.push({ c, cov: 1, overlap: wantTitle.length }); continue; }
+                if (areaOk && core && longEnough && wantTitle.length >= 10 && core.includes(wantTitle)) { matches.push({ c, cov: 1, overlap: wantTitle.length, title: true }); continue; }
                 // Else target-coverage (≥2 tokens, no floor): a short deliberate
                 // close-target whose tokens are present in a card is a precise hit.
                 if (tTok.size >= 2) {
@@ -5242,10 +5426,22 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
             // matches by title and its paraphrase only by full coverage, and
             // narrowing the tier to titles alone closed one twin and left the
             // other open in every brief forever (caught by brain-quality P4a).
+            // A strict target keeps that same tier, but only when some card is
+            // NAMED by it; loose coverage alone never acts on prose.
+            if (strict) return matches.some(m => m.title) ? matches.filter(m => m.cov === 1) : [];
             const exact = matches.filter(m => m.cov === 1);
             const tier = exact.length ? exact : matches;
             return tier;
         };
+        // The receipt for a close that was too generic to trust (> 4 cards).
+        const closeRefusal = (target, tier) => ({
+            target: target.slice(0, 80),
+            total: tier.length,
+            candidates: tier.slice(0, 5).map(m => ({
+                id: m.c.id, area: m.c.area || null, cov: Math.round(m.cov * 100) / 100,
+                title: String(m.c.title || m.c.text || '').replace(/\s+/g, ' ').trim().slice(0, 90),
+            })),
+        });
 
         // UNMATCHED CLOSES (1.86.1) — `closes:` is the one marker suffix whose
         // value is free text, so no grammar can tell "shipped the uploader
@@ -5256,15 +5452,28 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
         // nothing and a mistyped target stays visible instead of vanishing. It
         // runs before merge/supersede so the cut-down text never acts on
         // anything. A structured `closes` (brain_note) carries no fallback.
+        //
+        // The decision is made ONCE, here: a close that will act (1–4 cards)
+        // keeps the cut text; anything else — nothing named, or too generic
+        // to trust (> 4) — lands the sentence as written and drops the closes,
+        // so CLOSE-LINK can never act on it later (supersede below may shrink
+        // the tier) and the truncated text never lands. A grammar-derived
+        // closes the grammar could not anchor is judged strictly (see
+        // closeTierFor), and CLOSE-LINK repeats that strictness.
         for (const card of cards) {
             if (!card || typeof card.closesFallbackText !== 'string') continue;
             const fallback = card.closesFallbackText;
+            const strict = card.closesAnchored !== true;
             delete card.closesFallbackText;
+            delete card.closesAnchored;
             const target = (card.closes || '').toString().trim();
-            if (!target || !fallback.trim() || closeTierFor(target).length) continue;
+            if (!target || !fallback.trim()) continue;
+            const tier = closeTierFor(target, { strict });
+            if (tier.length >= 1 && tier.length <= 4) { if (strict) card.__closeStrict = true; continue; }
             card.text = fallback;
             delete card.closes;
-            (stats.closesKept ||= []).push({ target: target.slice(0, 80), area: card.area || null });
+            if (tier.length > 4) (stats.closeRefused ||= []).push(closeRefusal(target, tier));
+            else (stats.closesKept ||= []).push({ target: target.slice(0, 80), area: card.area || null, strict });
         }
 
         // MERGE-ON-CAPTURE for duplicate open questions — a rephrased ❓ that
@@ -5274,7 +5483,7 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
         // twins could never merge at capture at all.)
         for (let i = cards.length - 1; i >= 0; i--) {
             const card = cards[i];
-            if (card.__keepExisting || !/❓/.test(card.text) || /🏁|🛠/.test(card.text)) continue;
+            if (!/❓/.test(card.text) || /🏁|🛠/.test(card.text)) continue;
             const nTok = tokenSet(card.text);
             let best = null, bestScore = 0;
             for (const c of liveTextCards()) {
@@ -5283,6 +5492,19 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                 if (s > bestScore) { bestScore = s; best = c; }
             }
             if (best && bestScore >= QUESTION_MERGE_AT) {
+                // The merge REWRITES the open question wholesale, so the ~
+                // floor applies here too (1.86.1): a stub never replaces a
+                // richer question. A thin one the card already says word for
+                // word is a duplicate — counted as merged, the card untouched;
+                // any other thin one lands as its own card.
+                if (isThinUpdate(updateTargetTokens(card.text).size, updateTargetTokens(best.text).size)) {
+                    let asked = String(card.text).split('\n')
+                        .filter(line => !/^\s*(?:#[\p{L}\p{N}_-]+\s*)+$/u.test(line)).join(' ').trim();
+                    if (card.area && asked.startsWith(`${card.area}:`)) asked = asked.slice(String(card.area).length + 1);
+                    asked = stripLifecycleGlyphs(asked);
+                    if (asked && cardAlreadySays(best.text, asked)) { cards.splice(i, 1); stats.merged++; }
+                    continue;
+                }
                 await rewriteCard(best.id, j => {
                     j.content = String(card.text);
                     j.createdAt = now;
@@ -5301,7 +5523,7 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
         // to the new card is drawn in pass 2 (after the new ids exist), matched
         // back by remembering which old card each new card displaced.
         for (const card of cards) {
-            if (card.__keepExisting || /❓|🎯|🏁|🛠/.test(card.text)) continue; // only plain decisions supersede (not questions/goals/milestones/skills), never a refused ~
+            if (/❓|🎯|🏁|🛠/.test(card.text)) continue; // only plain decisions supersede (not questions/goals/milestones/skills)
             const nTok = tokenSet(card.text);
             const area = (card.area || '').toLowerCase();
             // A correction-cue note ("CORRECTION: … was WRONG") declares it
@@ -5356,16 +5578,9 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
         for (const card of cards) {
             const target = (card.closes || '').toString().trim();
             if (!target) continue;
-            const tier = closeTierFor(target);
+            const tier = closeTierFor(target, { strict: card.__closeStrict === true });
             if (tier.length > 4) {
-                (stats.closeRefused ||= []).push({
-                    target: target.slice(0, 80),
-                    total: tier.length,
-                    candidates: tier.slice(0, 5).map(m => ({
-                        id: m.c.id, area: m.c.area || null, cov: Math.round(m.cov * 100) / 100,
-                        title: String(m.c.title || m.c.text || '').replace(/\s+/g, ' ').trim().slice(0, 90),
-                    })),
-                });
+                (stats.closeRefused ||= []).push(closeRefusal(target, tier));
                 continue;
             }
             const chosen = tier;
@@ -5373,6 +5588,9 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
             const ship = String(card.text).replace(/\s+/g, ' ').replace(/^[^:\n]{1,40}:\s*/, '').replace(/^🏁\s*/, '').trim().slice(0, 80);
             card.__closesIds = [];
             for (const { c: best } of chosen) {
+                // Name what was archived — "N closed" alone gave the author no
+                // way to see that a close grabbed the wrong card.
+                const title = String(best.title || best.text || '').replace(/\s+/g, ' ').trim().slice(0, 90);
                 await rewriteCard(best.id, j => {
                     j.content = `${j.content}\n✅ ${today}: closed by → ${ship}`;
                     j.borderColor = 'rgba(16,185,129,0.35)';
@@ -5381,6 +5599,7 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                 best.text = `✅ ${best.text}`;
                 card.__closesIds.push(best.id);
                 stats.closed++;
+                (stats.closedCards ||= []).push({ id: best.id, area: best.area || null, title, target: target.slice(0, 80) });
             }
         }
 
@@ -6379,16 +6598,21 @@ export function formatCaptureReceipts(stats, { maxEach = 3 } = {}) {
     for (const f of (Array.isArray(s.closeRefused) ? s.closeRefused : []).slice(0, maxEach)) {
         lines.push(`⛔ closes: "${f.target}" matched ${f.total} live cards — too generic to trust, so NOTHING was archived and your note was kept as an ordinary card. Name a longer target, or close the exact card with brain_reconcile mode:"claims" confirm:[{ id, milestoneId }]. Top candidates: ${f.candidates.map(c => `(id ${c.id}) "${c.title}"${c.area ? ` [${c.area}]` : ''} cov ${c.cov}`).join(' · ')}`);
     }
-    // A ~ too thin to stand in for the card it matched changed NOTHING on that
-    // card (1.86.1 update floor) — the author has to hear it, or the correction
-    // they think they made is simply absent.
-    for (const f of (Array.isArray(s.updateRefused) ? s.updateRefused : []).slice(0, maxEach)) {
-        lines.push(`⚠️ ~ update NOT applied: "${f.text}" carries ${f.words} content word${f.words === 1 ? '' : 's'}, too few to replace "${f.target}" (${f.targetWords}), so that card was left exactly as it was${f.savedAsCard ? ' and your text was kept as a separate card beside it' : ''}. To replace it, send the ~ again with the full corrected claim.`);
+    // Every card a closes: archived, by name — "N closed" alone gave the
+    // author no way to notice a close that grabbed the wrong card.
+    for (const f of (Array.isArray(s.closedCards) ? s.closedCards : []).slice(0, maxEach)) {
+        lines.push(`✅ closes: "${f.target}" archived (id ${f.id}) "${f.title}"${f.area ? ` [${f.area}]` : ''}. If that is the wrong card, restore it from Archive.`);
+    }
+    // A ~ too thin to stand in for the card it matched (1.86.1 update floor)
+    // was APPENDED to that card instead of replacing it — say so, and name the
+    // card, so the author knows the old claim still heads it.
+    for (const f of (Array.isArray(s.updateAmended) ? s.updateAmended : []).slice(0, maxEach)) {
+        lines.push(`✎ ~ appended, not replaced: "${f.text}" has ${f.words} content word${f.words === 1 ? '' : 's'}, too few to replace (id ${f.id}) "${f.target}" (${f.targetWords}), so it was added to that card as a dated "(~ amended …)" line and the card's text was kept. If it corrects the whole claim, send a ~ that restates the full corrected claim.`);
     }
     // A closes: target that names no live card closed nothing; the phrase went
     // back into the note's text rather than vanishing.
     for (const f of (Array.isArray(s.closesKept) ? s.closesKept : []).slice(0, maxEach)) {
-        lines.push(`↩ closes: "${f.target}" names no live card, so nothing was closed and the phrase stays in your note's text. To close a card, name its exact title or [[wikilink]].`);
+        lines.push(`↩ closes: "${f.target}" ${f.strict ? 'names no live card by its title' : 'matched no live card'}, so nothing was closed and the phrase stays in your note's text. To close a card, end the sentence first and name its exact title or [[wikilink]].`);
     }
     return lines;
 }

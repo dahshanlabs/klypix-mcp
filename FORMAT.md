@@ -143,12 +143,17 @@ references are read with both HEAD and working-file changes considered. These fi
 describe source provenance and change detection, never factual verification.
 `verify` is retained text, not executable configuration. All these optional fields
 survive the format codec and capture lifecycle; an explicit empty amendment clears them.
+A cleared `verify` is stored as the empty string `""`, and a reader treats any string `verify`,
+the empty one included, as authoritative: `""` means "no probe" and nothing is derived from the
+card's prose.
 A card without a `verify` field may still carry one in its text as a line-end
 `verify: <command>` suffix (or a `verify: <command>` line of its own); the reference reader
 derives the field with the same grammar the capture hook uses (lowercase key followed by
 whitespace, trailing position, a command-shaped value with no prose after it), reading a
 hard-wrapped card as its unwrapped sentences, so prose such as `npm run verify:mcp` or
-"every agent verify: the tag" never becomes a probe.
+"every agent verify: the tag" never becomes a probe. A probe stops before a following line that
+opens like a new sentence (a plain capitalised word), because such a break may have been typed
+rather than wrapped.
 
 The optional **`author`** answers the question a team actually asks: `createdBy` says
 *what* wrote a card, `author` says *whose*. It is resolved from `git config user.name`

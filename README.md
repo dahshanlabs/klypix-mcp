@@ -391,9 +391,17 @@ well-formed one also stays in the text, and the other suffixes still count; the 
 agent on its next prompt. On `✓` and `~` markers a `closes:` is plain text, because those markers
 close nothing. A `closes:` that will not act keeps the sentence as written: it names no live card,
 or it names more than four. A `closes:` that does not come after the end of a sentence, a
-`[[wikilink]]` or another suffix closes only a card it names by title. A `~` update too thin to
-replace its card (fewer than six content words and under half the card's) is appended to that card
-as a dated `(~ amended …)` line instead. The correction lands and nothing is lost.
+`[[wikilink]]` or another suffix closes only a card it names by title. One whose named card is
+already closed closes nothing else. A `~` update too thin to replace its card (fewer than six
+content words and under half the card's) is appended to that card as a dated `(~ amended …)` line
+instead. The card keeps its date, colour and probe, and previews show the newest amendment first.
+The correction lands and nothing is lost.
+
+The Stop hook reads the whole transcript every time, so a `~` or `✓` line applies once. A marker
+that an older hook (1.85 or 1.86.0) already captured is not captured again after an upgrade. If
+1.86.0 cut the note short, the stub is restored to the full text in place. When a marker does not
+do what it says, the next prompt tells the agent. A receipt left by a session that has ended goes
+to the next session that starts in the project.
 
 On every other host, capture is explicit: `brain_note` runs the same capture engine as the hooks —
 dedup, supersession, round-trip re-adoption receipts, `✓` resolve, `~` update in place, `+` skill,

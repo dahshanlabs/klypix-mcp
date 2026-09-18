@@ -88,7 +88,9 @@ export function prepareBrainEvidence({ projectRoot, evidence, verify, marker = '
   if (verify !== undefined && (typeof verify !== 'string' || verify.length > 2000 || /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(verify))) {
     return bad('verify must be a string of at most 2000 characters; it is recorded, never executed.');
   }
-  if (marker === '~' && typeof verify === 'string' && !verify.trim() && /(?:^|\s)verify:\s*[^\n\s]/i.test(String(text))) {
+  // Lowercase `verify: value` only — the marker grammar (1.86.1) treats
+  // "Verify:" and `npm run verify:mcp` as prose, so they can never come back.
+  if (marker === '~' && typeof verify === 'string' && !verify.trim() && /(?:^|\s)verify:\s+\S/.test(String(text))) {
     return bad('To clear verification, remove the inline verify: suffix from the amended text too.');
   }
   if (evidence !== undefined && (!Array.isArray(evidence) || evidence.length > 16)) return bad('evidence must be an array of at most 16 references.');

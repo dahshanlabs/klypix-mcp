@@ -239,20 +239,121 @@ export async function atomicWrite(filePath, buf, opts = {}) {
 const RENAME_RETRYABLE_CODES = new Set(['EPERM', 'EBUSY', 'EACCES']);
 const RENAME_BACKOFF_MS = [40, 120, 300, 700, 1500];
 
+// ── Marker suffix grammar ─── MIRROR BEGIN ──────────────────────────────────
+// ONE grammar for the optional `closes:` / `ev:` / `verify:` / `q:` suffixes on
+// a `🧠 BRAIN` marker line. This block is byte-identical in
+// global-brain-hook.mjs (which parses markers) and klypix-format.mjs (whose
+// parseVerifySuffix reads a `verify:` still sitting in card prose), and
+// test/marker-suffix-grammar.mjs fails if the two copies drift. Neither file
+// may import the other: the hook's --live lane must never pay the format
+// import, and klypix-format.mjs is copied alone beside the git merge driver.
+//
+// 1.86.0 split a body at the FIRST whitespace + "Q:"/"q:" in any case, so
+// "Support page gets a Q: and A: layout" became the card "Support page gets
+// a", and a `~` cut the same way replaced a rich card with the stub. The older
+// keys had the same hazard ("see the ev: numbers", "every agent verify: the
+// tag", "treats closes: links as ..."). A suffix is now recognised only where
+// it cannot be prose:
+//   • keys are lowercase and written `key: value`, with whitespace on BOTH
+//     sides of the colon, so "Q:", "FAQ:", "q:auth" and `npm run verify:mcp`
+//     are ordinary text;
+//   • suffixes form ONE run that reaches the end of the line, and the run
+//     cannot start right after a word that leaves a clause open ("the ev:",
+//     "a q:", "to verify:");
+//   • every value must have its key's shape: `ev:` a comma list of file / PR /
+//     run references; `verify:` a command (a known CLI, a script or path, a
+//     hyphenated probe name, or a tool given a --flag); `q:` a question (a
+//     question word first, `?` or `؟` last); `closes:` any title, and capture
+//     puts a `closes:` that names no live card back into the card text.
+// A run that breaks any rule is not a suffix run: parsing moves on to the next
+// key, and when none qualifies the whole line stays the card body, untouched.
+const MARKER_SUFFIX_KEYS = ['closes', 'ev', 'verify', 'q'];
+const MARKER_SUFFIX_KEY_RE = new RegExp(`(?<=\\s)(${MARKER_SUFFIX_KEYS.join('|')}):(?=\\s)`, 'g');
+const MARKER_SUFFIX_OPEN_WORDS = new Set([
+    'a', 'an', 'the', 'this', 'that', 'these', 'those', 'its', 'their', 'our', 'my', 'your', 'every', 'each',
+    'of', 'to', 'in', 'on', 'at', 'for', 'with', 'by', 'from', 'into', 'onto', 'about', 'via', 'per', 'like', 'as', 'than',
+    'and', 'or', 'nor', 'but', 'if', 'whether', 'because',
+    'is', 'are', 'was', 'were', 'be', 'been', 'being', 'am',
+    'do', 'does', 'did', 'can', 'could', 'should', 'would', 'will', 'shall', 'may', 'might', 'must',
+    'في', 'من', 'على', 'إلى', 'الى', 'عن', 'مع', 'أو', 'او', 'ثم', 'هذا', 'هذه', 'ذلك', 'تلك', 'كل',
+]);
+const MARKER_SUFFIX_CLI = new Set([
+    'gh', 'git', 'npm', 'npx', 'node', 'pnpm', 'yarn', 'bun', 'deno', 'corepack', 'curl', 'wget', 'pwsh', 'powershell',
+    'cmd', 'bash', 'sh', 'zsh', 'python', 'python3', 'py', 'pip', 'pip3', 'uv', 'cargo', 'go', 'make', 'docker',
+    'kubectl', 'helm', 'az', 'aws', 'gcloud', 'vercel', 'netlify', 'supabase', 'firebase', 'dotnet', 'mvn', 'gradle',
+    'swift', 'xcodebuild', 'xcrun', 'fastlane', 'jq', 'rg', 'grep', 'cat', 'ls', 'cd', 'echo', 'tsc', 'vitest',
+    'jest', 'eslint', 'psql', 'sqlite3', 'ssh', 'openssl', 'wsl',
+]);
+const MARKER_SUFFIX_QUESTION_LEAD = /^(?:(?:how|what|why|where|when|which|who|whom|whose|whether|can|could|should|would|will|shall|may|might|must|do|does|did|is|are|was|were|has|have|had|am)(?:n['’]t)?|won['’]t|هل|ما|ماذا|لماذا|لما|كيف|أين|اين|متى|من|كم|أي|أية|لم)(?![\p{L}\p{N}])/iu;
+const MARKER_SUFFIX_BARE_FILES = /^(?:Makefile|Dockerfile|Procfile|Gemfile|Rakefile|Jenkinsfile|Vagrantfile|Brewfile|Justfile|LICENSE|README|NOTICE|CHANGELOG|CODEOWNERS|AUTHORS|COPYING)$/;
+function markerSuffixRefOk(item) {
+    const ref = item.trim();
+    if (!ref) return false;
+    if (/^(?:pr|gh|issue)?\s*#?\d+$/i.test(ref)) return true;                  // PR#12 · PR 12 · GH3 · #12
+    const words = ref.split(/\s+/);
+    return words.length <= 4 && words.some((word) => {
+        const w = word.replace(/^[`'"([]+|[`'")\].,;]+$/g, '');
+        return /[\/\\\d]/.test(w) || /\.[A-Za-z0-9]/.test(w) || MARKER_SUFFIX_BARE_FILES.test(w);
+    });
+}
+function markerSuffixCommandOk(value) {
+    const head = value.split(/\s+/)[0].replace(/^[`'"(]+|[`'")]+$/g, '');
+    if (!head) return false;
+    if (MARKER_SUFFIX_CLI.has(head.toLowerCase()) || /^klypix-[a-z-]+$/.test(head)) return true;
+    if (/^[A-Z][a-z]+-[A-Z][A-Za-z]+$/.test(head)) return true;                 // PowerShell Verb-Noun
+    if (/[\/\\]|^[.~$]/.test(head) || /\.(?:mjs|cjs|js|ts|ps1|sh|py|cmd|bat|exe)$/i.test(head)) return true;
+    if (/^[a-z][a-z0-9]*(?:-[a-z0-9]+)+$/.test(head)) return true;             // probe name: npm-version, gh-release
+    return /^[a-z][\w.-]*$/.test(head) && /\s--?[A-Za-z]/.test(value);         // any tool given a --flag
+}
+function markerSuffixValueOk(key, value) {
+    if (!value) return false;
+    if (key === 'closes') return true;
+    if (key === 'ev') return value.split(',').every(markerSuffixRefOk);
+    if (key === 'verify') return markerSuffixCommandOk(value);
+    const question = value.replace(/^[`'"“‘(]+/, '');
+    return MARKER_SUFFIX_QUESTION_LEAD.test(question) && /[?？؟][`'"”’)]*$/.test(question);
+}
+// → { body, closes, ev, verify, q } as raw strings ('' when absent).
+function parseMarkerSuffixText(line) {
+    const text = String(line || '');
+    const keys = [...text.matchAll(MARKER_SUFFIX_KEY_RE)].map((m) => ({ key: m[1], at: m.index, from: m.index + m[0].length }));
+    for (let start = 0; start < keys.length; start++) {
+        const body = text.slice(0, keys[start].at).trim();
+        const lastWord = (/(\S+)$/.exec(body) || [])[1] || '';
+        if (!body || MARKER_SUFFIX_OPEN_WORDS.has(lastWord.toLowerCase())) continue;
+        const found = {};
+        let wellFormed = true;
+        for (let k = start; k < keys.length && wellFormed; k++) {
+            const value = text.slice(keys[k].from, k + 1 < keys.length ? keys[k + 1].at : text.length).trim();
+            if (!markerSuffixValueOk(keys[k].key, value)) wellFormed = false;
+            else if (!(keys[k].key in found)) found[keys[k].key] = value;
+        }
+        if (wellFormed) return { body, closes: found.closes || '', ev: found.ev || '', verify: found.verify || '', q: found.q || '' };
+    }
+    return { body: text.trim(), closes: '', ev: '', verify: '', q: '' };
+}
+// ── Marker suffix grammar ─── MIRROR END ────────────────────────────────────
+
 // ── verify: suffix (decay-aware status, 2026-07-28 post-mortem) ──────────────
 // A card may carry the EXACT live-probe command for its fast-decay claim as a
-// `verify:` suffix ("🏁 build 26 uploaded verify: gh run list --limit 5"), the
-// same marker grammar as closes:/ev: (value runs to the next known key or end
-// of line). The hook strips+persists it as a machine field at capture; cards
-// authored by humans/the app/brain_note keep it in prose — so parseKlypix
-// falls back to a prose parse and every render surface sees ONE `verify` field.
-const VERIFY_SUFFIX_RE = /(?:^|\s)verify:\s*([^\n]+)/i;
+// `verify:` suffix ("🏁 build 26 uploaded verify: gh run list --limit 5"), in
+// the marker grammar above. The hook strips+persists it as a machine field at
+// capture; cards authored by humans/the app/brain_note keep it in prose — so
+// parseKlypix falls back to a prose parse and every render surface sees ONE
+// `verify` field. The prose parse is the SAME grammar, line by line: on the
+// live brain (2,736 cards) the old case-insensitive `verify:` scan derived a
+// probe from the prose of 12 cards and every one was wrong ("mcp gate" from
+// `npm run verify:mcp`, "command on demand, and …" from a sentence ABOUT the
+// verify: field); this grammar derives none.
 export function parseVerifySuffix(text) {
-    const m = VERIFY_SUFFIX_RE.exec(String(text || ''));
-    if (!m) return null;
-    const v = m[1].split(/\s+\b(?:closes|ev):/i)[0].trim();
-    return v || null;
+    for (const line of String(text || '').split('\n')) {
+        if (!line.includes('verify:')) continue;
+        const { verify } = parseMarkerSuffixText(line);
+        if (verify) return verify;
+    }
+    return null;
 }
+export { parseMarkerSuffixText };
 
 /**
  * Parse a .klypix/.any buffer into a structured object + the loaded zip (so
@@ -2123,7 +2224,7 @@ export function structToUltraBrief(struct, { freshness = null, briefPath = '.cla
     const tail = [
         '',
         `📖 **Full brief: \`${briefPath}\`** — skills (${skills.length}), milestones, recent decisions, connections, self-heal detail. READ IT before planning non-trivial work.`,
-        '🧠 Capture: `🧠 BRAIN [Area]: <decision>` · `?` question · `!` milestone · `+` skill · `✓` resolve · `~` update · a "CORRECTION: …" decision supersedes its stale card across areas · suffixes `closes:` / `ev:` / `q: <question this answers>` (full legend in the brief file).',
+        '🧠 Capture: `🧠 BRAIN [Area]: <decision>` · `?` question · `!` milestone · `+` skill · `✓` resolve · `~` update · a "CORRECTION: …" decision supersedes its stale card across areas · line-end suffixes `closes:` / `ev:` / `q: <question?>` (full legend in the brief file).',
     ];
     const budget = Math.max(400, budgetChars - tail.reduce((s, l) => s + l.length + 1, 0));
     push(`# ${struct.title} — brain (ultra brief)`);
@@ -3947,6 +4048,39 @@ export const CORRECTION_RE = /\bCORRECTIONS?\b|\bOBSOLETE\b|\bwas WRONG\b/;
 const CORRECTION_PHRASE_RE = /\bstale note (?:is )?resolved\b/i;
 export const hasCorrectionCue = (t) => CORRECTION_RE.test(String(t || '')) || CORRECTION_PHRASE_RE.test(String(t || ''));
 export const CORRECTION_SUPERSEDE_AT = 0.4;   // widened cross-area bar (vs same-area SUPERSEDE_AT 0.6)
+
+// NON-DESTRUCTIVE CONFIRM GUARD (2026-07-23) for ~ updates: content replacement
+// is wholesale, so a terse "~ still true" against a rich card used to truncate
+// it to the confirmation text — the system had no non-destructive verify verb
+// at all. The guard is OPT-IN by shape: only an update that READS as a
+// confirmation ("still true", "confirmed", "verified", "unchanged", "holds") is
+// appended as a re-affirmed line; anything else — including same-vocabulary
+// inversions, terse lowercase corrections, and negations, none of which
+// token-set/length heuristics can see (adversarial review live-traced all
+// three) — REPLACES, the documented ~ semantics where the new text wins. Digits
+// or contrast/negation words disqualify ("still true but port now 9223" is a
+// correction). No ✅/↩/⤵ glyphs in the stamp — those would drop the card out of
+// liveTextCards matching forever.
+const CONFIRM_CUE_RE = /^\s*(?:\(|")?\s*(?:still\b|confirmed?\b|verified\b|unchanged\b|re-?affirmed?\b|holds\b|remains true\b)/i;
+const CONFIRM_DISQUALIFIER_RE = /\d|\b(?:not|no|never|but|instead|now|except|however|wrong|longer|actually)\b/i;
+const isTerseConfirmUpdate = (text, targetLength) => CONFIRM_CUE_RE.test(String(text || ''))
+    && !CONFIRM_DISQUALIFIER_RE.test(String(text || ''))
+    && String(text || '').length < targetLength * 0.6
+    && !hasCorrectionCue(text);
+
+// UPDATE FLOOR (1.86.1). A ~ that REPLACES its card must carry at least
+// UPDATE_MIN_WORDS distinct content words (4+ letters, the tokenSet unit) OR at
+// least half as many as the card it replaces. Anything thinner is refused: the
+// card stays exactly as it was and the text lands as a separate card. Both
+// halves matter — the absolute bar alone would refuse a four-word correction of
+// a four-word card ("Dev server runs on port 5174 now"), the ratio alone would
+// let a stub replace a card twice its size.
+export const UPDATE_MIN_WORDS = 6;
+// The words a card's CONTENT carries: tag-only lines (#area #file-x) are
+// routing, not content, and would pad the target's count.
+const updateTargetTokens = (text) => tokenSet(String(text || '').split('\n')
+    .filter((line) => !/^\s*(?:#[\p{L}\p{N}_-]+\s*)+$/u.test(line)).join('\n'));
+export const isThinUpdate = (words, targetWords) => words < UPDATE_MIN_WORDS && words * 2 < targetWords;
 // Cue META words describe the act of correcting, not the subject — left in, they
 // dilute the overlap denominator and push real correction pairs just under the
 // bar (the field fixture lands at 0.375 with them, 0.5 without). Stripped before
@@ -4931,7 +5065,10 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
         // corrections that don't deserve supersession history. Content is
         // replaced (area prefix + tag preserved), createdAt bumped so the
         // brief treats it as fresh. No match → falls through as a new card.
-        for (const u of updates) {
+        // Too thin to stand in for the card it matched (UPDATE FLOOR below) →
+        // the card is left exactly as it was, and the text falls through as a
+        // new card that may not supersede anything.
+        for (const [uIndex, u] of updates.entries()) {
             const uTok = tokenSet(u.text);
             let best = null, bestScore = 0;
             for (const c of liveTextCards()) {
@@ -4939,29 +5076,31 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                 const s = overlapScore(uTok, tokenSet(c.text));
                 if (s > bestScore) { bestScore = s; best = c; }
             }
-            if (best && bestScore >= UPDATE_AT) {
+            const matched = best && bestScore >= UPDATE_AT;
+            const isTerseConfirm = matched && isTerseConfirmUpdate(u.text, String(best.text || '').length);
+            // UPDATE FLOOR (1.86.1): the replace is wholesale and leaves no ↩
+            // trace and no Archive copy, so a handful of words must never stand
+            // in for a richer card. The field case: 1.86.0 cut the marker
+            // "~: Pricing page layout switches to Q: and A: FAQ blocks …" at
+            // "Q:", and the four-word stub (overlap 0.75) replaced a
+            // thirteen-word card. A terse confirmation appends, never replaces,
+            // so it is exempt; so is a guard amendment — structured intent,
+            // where a refused disarm would leave a live guard firing.
+            let refusal = null;
+            if (matched && !isTerseConfirm && !(u.guard && typeof u.guard === 'object')) {
+                const targetWords = updateTargetTokens(best.text).size;
+                if (isThinUpdate(uTok.size, targetWords)) {
+                    refusal = {
+                        i: uIndex, id: best.id, area: best.area || null,
+                        target: String(best.text || '').replace(/\s+/g, ' ').trim().slice(0, 90),
+                        text: String(u.text || '').replace(/\s+/g, ' ').trim().slice(0, 100),
+                        words: uTok.size, targetWords, savedAsCard: false,
+                    };
+                    (stats.updateRefused ||= []).push(refusal);
+                }
+            }
+            if (matched && !refusal) {
                 const tag = u.area ? `\n#${u.area.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : '';
-                // NON-DESTRUCTIVE CONFIRM GUARD (2026-07-23): content replacement
-                // is wholesale, so a terse "~ still true" against a rich card used
-                // to truncate it to the confirmation text — the system had no
-                // non-destructive verify verb at all. The guard is OPT-IN by
-                // shape: only an update that READS as a confirmation ("still
-                // true", "confirmed", "verified", "unchanged", "holds") is
-                // appended as a re-affirmed line; anything else — including
-                // same-vocabulary inversions, terse lowercase corrections, and
-                // negations, none of which token-set/length heuristics can see
-                // (adversarial review live-traced all three) — REPLACES, the
-                // documented ~ semantics where the new text wins. Digits or
-                // contrast/negation words disqualify ("still true but port now
-                // 9223" is a correction). No ✅/↩/⤵ glyphs in the stamp — those
-                // would drop the card out of liveTextCards matching forever.
-                const bestLen = String(best.text || '').length;
-                const CONFIRM_CUE_RE = /^\s*(?:\(|")?\s*(?:still\b|confirmed?\b|verified\b|unchanged\b|re-?affirmed?\b|holds\b|remains true\b)/i;
-                const CONFIRM_DISQUALIFIER_RE = /\d|\b(?:not|no|never|but|instead|now|except|however|wrong|longer|actually)\b/i;
-                const isTerseConfirm = CONFIRM_CUE_RE.test(String(u.text || ''))
-                    && !CONFIRM_DISQUALIFIER_RE.test(String(u.text || ''))
-                    && String(u.text || '').length < bestLen * 0.6
-                    && !hasCorrectionCue(u.text);
                 await rewriteCard(best.id, j => {
                     if (isTerseConfirm) j.content = `${j.content}\n(re-affirmed ${today}: ${u.text})`;
                     else j.content = (u.area ? `${u.area}: ` : '') + u.text + tag;
@@ -4992,99 +5131,18 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                 // a glyph-less guard card was silently consolidatable while
                 // still enforcing (review 2026-08-24). remove-sentinels add no
                 // glyph and no field: an unmatched disarm is inert by design.
-                cards.push({ text: (u.area ? `${u.area}: ` : '') + (u.guard && u.guard.remove !== true && !/🛠/.test(u.text) ? '🛠️ ' : '') + u.text + (u.area ? `\n#${u.area.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : ''), area: u.area, createdVia: u.createdVia, ...(Array.isArray(u.evidence) && u.evidence.length ? { evidence: u.evidence } : {}), ...(typeof u.verify === 'string' && u.verify.trim() ? { verify: u.verify.trim() } : {}), ...(u.guard && typeof u.guard === 'object' && u.guard.remove !== true ? { guard: u.guard } : {}) });
+                // A REFUSED (too thin) update lands the same way but may not
+                // supersede or merge into anything — that would be the
+                // replacement the floor just refused, by another route.
+                cards.push({ text: (u.area ? `${u.area}: ` : '') + (u.guard && u.guard.remove !== true && !/🛠/.test(u.text) ? '🛠️ ' : '') + u.text + (u.area ? `\n#${u.area.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : ''), area: u.area, createdVia: u.createdVia, ...(Array.isArray(u.evidence) && u.evidence.length ? { evidence: u.evidence } : {}), ...(typeof u.verify === 'string' && u.verify.trim() ? { verify: u.verify.trim() } : {}), ...(u.guard && typeof u.guard === 'object' && u.guard.remove !== true ? { guard: u.guard } : {}), ...(refusal ? { __keepExisting: true } : {}) });
+                if (refusal) refusal.savedAsCard = true;
             }
         }
 
-        // MERGE-ON-CAPTURE for duplicate open questions — a rephrased ❓ that
-        // heavily overlaps an EXISTING live ❓ updates that card in place (fresh
-        // wording + createdAt) instead of stacking a twin the close-pass would
-        // later miss. (Supersede deliberately skips ? cards, so without this
-        // twins could never merge at capture at all.)
-        for (let i = cards.length - 1; i >= 0; i--) {
-            const card = cards[i];
-            if (!/❓/.test(card.text) || /🏁|🛠/.test(card.text)) continue;
-            const nTok = tokenSet(card.text);
-            let best = null, bestScore = 0;
-            for (const c of liveTextCards()) {
-                if (!/❓/.test(c.text)) continue;
-                const s = overlapScore(nTok, tokenSet(c.text));
-                if (s > bestScore) { bestScore = s; best = c; }
-            }
-            if (best && bestScore >= QUESTION_MERGE_AT) {
-                await rewriteCard(best.id, j => {
-                    j.content = String(card.text);
-                    j.createdAt = now;
-                    if (card.createdVia) j.createdVia = String(card.createdVia);
-                    if (Array.isArray(card.evidence) && card.evidence.length) j.evidence = card.evidence;
-                    if (typeof card.verify === 'string' && card.verify.trim()) j.verify = card.verify.trim();
-                    if (card.guard && typeof card.guard === 'object') j.guard = card.guard;
-                });
-                best.text = String(card.text);
-                cards.splice(i, 1);
-                stats.merged++;
-            }
-        }
-
-        // SUPERSEDE — pre-mark old cards that a NEW decision replaces. The arrow
-        // to the new card is drawn in pass 2 (after the new ids exist), matched
-        // back by remembering which old card each new card displaced.
-        for (const card of cards) {
-            if (/❓|🎯|🏁|🛠/.test(card.text)) continue; // only plain decisions supersede (not questions/goals/milestones/skills)
-            const nTok = tokenSet(card.text);
-            const area = (card.area || '').toLowerCase();
-            // A correction-cue note ("CORRECTION: … was WRONG") declares it
-            // replaces something — widen the search to ALL areas and lower the
-            // bar: a cross-area reworded correction could never fire the
-            // same-area 0.6 path by construction, which is exactly how stale
-            // cards outlived their corrections in the field.
-            const isCorrection = hasCorrectionCue(card.text);
-            const nTokCmp = isCorrection ? stripCueMeta(nTok) : nTok;   // cue meta words dilute the denominator
-            let best = null, bestScore = 0;
-            for (const c of liveTextCards()) {
-                if (!isCorrection && area && !sameAreaKey(c.area, area)) continue;
-                if (/🛠/.test(c.text)) continue; // never auto-archive a 🛠️ skill via a decision's supersede — skills are standing reference (correct with ~)
-                // cueMatch returns 0 unless it clears the widened bar (ratio OR
-                // absolute subject mass) — so for corrections, any non-zero fires.
-                const s = isCorrection ? cueMatch(nTokCmp, tokenSet(c.text), CORRECTION_SUPERSEDE_AT) : overlapScore(nTok, tokenSet(c.text));
-                if (s > bestScore) { bestScore = s; best = c; }
-            }
-            if (best && (isCorrection ? bestScore > 0 : bestScore >= SUPERSEDE_AT)) {
-                // Detect the round-trip BEFORE mutating B. The normal lifecycle
-                // remains A→B→C; this adds a separate A→C provenance receipt and
-                // a read-alone stamp without changing recall/as_of successor truth.
-                const readopted = findReadoptedAncestor(struct, best, card.text);
-                await rewriteCard(best.id, j => {
-                    j.content = `↩︎ superseded ${today}\n${j.content}`;
-                    j.borderColor = 'rgba(120,120,135,0.5)';
-                });
-                await archiveCard(best.id);
-                const wasCross = isCorrection && (bestScore < SUPERSEDE_AT || (area && !sameAreaKey(best.area, area)));
-                best.text = `↩︎ ${best.text}`;
-                card.__supersedes = best.id;
-                if (readopted) {
-                    card.__reAdopts = readopted.id;
-                    card.text = `${String(card.text || '').trimEnd()}\n${reAdoptionReceipt(readopted, today)}`;
-                    stats.reAdopted++;
-                }
-                stats.superseded++;
-                // Surface the widened match for confirmation: the caller tells the
-                // agent what was archived and how to undo (restore from Archive /
-                // re-run with ~) — the widened bar acts WITH a visible receipt.
-                if (wasCross) stats.corrections.push({ old: (best.title || String(best.text).replace(/^↩︎\s*/, '').slice(0, 80)), area: best.area || null, overlap: Math.round(bestScore * 100) / 100 });
-            }
-        }
-
-        // CLOSE-LINK — a card carrying `closes` resolves the (often cross-area)
-        // strategy/question card that SPAWNED it: stamp ✅, archive it, and draw a
-        // "closed by" arrow in pass 2. Unlike supersede (same-area, high lexical
-        // overlap), a shipped milestone rarely echoes the strategy's prose — so
-        // this matches across ALL areas, prefers an explicit [[wikilink]]/title
-        // hit, and otherwise fires on only a low overlap. This is the fix for
-        // "strategy cards never get closed out when their feature actually ships".
-        for (const card of cards) {
-            const target = (card.closes || '').toString().trim();
-            if (!target) continue;
+        // Which live cards a close-target names — shared by the unmatched-closes
+        // pass below and the CLOSE-LINK pass, so both judge a target the same
+        // way. Returns the tier the close would act on (> 4 = too generic).
+        const closeTierFor = (target) => {
             // Both sides are normalized the SAME way (2026-09-15): strip the
             // [[wikilink]] brackets, the `Area:` prefix and any lifecycle glyph,
             // then collapse. Card titles are derived from prose, so an
@@ -5186,6 +5244,119 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
             // other open in every brief forever (caught by brain-quality P4a).
             const exact = matches.filter(m => m.cov === 1);
             const tier = exact.length ? exact : matches;
+            return tier;
+        };
+
+        // UNMATCHED CLOSES (1.86.1) — `closes:` is the one marker suffix whose
+        // value is free text, so no grammar can tell "shipped the uploader
+        // closes: Upload question" from "The resolver treats closes: links as
+        // exact title matches". The hook therefore hands over the card as
+        // written WITH its closes segment (closesFallbackText); when the target
+        // names no live card, that text is the card, so a prose "closes:" costs
+        // nothing and a mistyped target stays visible instead of vanishing. It
+        // runs before merge/supersede so the cut-down text never acts on
+        // anything. A structured `closes` (brain_note) carries no fallback.
+        for (const card of cards) {
+            if (!card || typeof card.closesFallbackText !== 'string') continue;
+            const fallback = card.closesFallbackText;
+            delete card.closesFallbackText;
+            const target = (card.closes || '').toString().trim();
+            if (!target || !fallback.trim() || closeTierFor(target).length) continue;
+            card.text = fallback;
+            delete card.closes;
+            (stats.closesKept ||= []).push({ target: target.slice(0, 80), area: card.area || null });
+        }
+
+        // MERGE-ON-CAPTURE for duplicate open questions — a rephrased ❓ that
+        // heavily overlaps an EXISTING live ❓ updates that card in place (fresh
+        // wording + createdAt) instead of stacking a twin the close-pass would
+        // later miss. (Supersede deliberately skips ? cards, so without this
+        // twins could never merge at capture at all.)
+        for (let i = cards.length - 1; i >= 0; i--) {
+            const card = cards[i];
+            if (card.__keepExisting || !/❓/.test(card.text) || /🏁|🛠/.test(card.text)) continue;
+            const nTok = tokenSet(card.text);
+            let best = null, bestScore = 0;
+            for (const c of liveTextCards()) {
+                if (!/❓/.test(c.text)) continue;
+                const s = overlapScore(nTok, tokenSet(c.text));
+                if (s > bestScore) { bestScore = s; best = c; }
+            }
+            if (best && bestScore >= QUESTION_MERGE_AT) {
+                await rewriteCard(best.id, j => {
+                    j.content = String(card.text);
+                    j.createdAt = now;
+                    if (card.createdVia) j.createdVia = String(card.createdVia);
+                    if (Array.isArray(card.evidence) && card.evidence.length) j.evidence = card.evidence;
+                    if (typeof card.verify === 'string' && card.verify.trim()) j.verify = card.verify.trim();
+                    if (card.guard && typeof card.guard === 'object') j.guard = card.guard;
+                });
+                best.text = String(card.text);
+                cards.splice(i, 1);
+                stats.merged++;
+            }
+        }
+
+        // SUPERSEDE — pre-mark old cards that a NEW decision replaces. The arrow
+        // to the new card is drawn in pass 2 (after the new ids exist), matched
+        // back by remembering which old card each new card displaced.
+        for (const card of cards) {
+            if (card.__keepExisting || /❓|🎯|🏁|🛠/.test(card.text)) continue; // only plain decisions supersede (not questions/goals/milestones/skills), never a refused ~
+            const nTok = tokenSet(card.text);
+            const area = (card.area || '').toLowerCase();
+            // A correction-cue note ("CORRECTION: … was WRONG") declares it
+            // replaces something — widen the search to ALL areas and lower the
+            // bar: a cross-area reworded correction could never fire the
+            // same-area 0.6 path by construction, which is exactly how stale
+            // cards outlived their corrections in the field.
+            const isCorrection = hasCorrectionCue(card.text);
+            const nTokCmp = isCorrection ? stripCueMeta(nTok) : nTok;   // cue meta words dilute the denominator
+            let best = null, bestScore = 0;
+            for (const c of liveTextCards()) {
+                if (!isCorrection && area && !sameAreaKey(c.area, area)) continue;
+                if (/🛠/.test(c.text)) continue; // never auto-archive a 🛠️ skill via a decision's supersede — skills are standing reference (correct with ~)
+                // cueMatch returns 0 unless it clears the widened bar (ratio OR
+                // absolute subject mass) — so for corrections, any non-zero fires.
+                const s = isCorrection ? cueMatch(nTokCmp, tokenSet(c.text), CORRECTION_SUPERSEDE_AT) : overlapScore(nTok, tokenSet(c.text));
+                if (s > bestScore) { bestScore = s; best = c; }
+            }
+            if (best && (isCorrection ? bestScore > 0 : bestScore >= SUPERSEDE_AT)) {
+                // Detect the round-trip BEFORE mutating B. The normal lifecycle
+                // remains A→B→C; this adds a separate A→C provenance receipt and
+                // a read-alone stamp without changing recall/as_of successor truth.
+                const readopted = findReadoptedAncestor(struct, best, card.text);
+                await rewriteCard(best.id, j => {
+                    j.content = `↩︎ superseded ${today}\n${j.content}`;
+                    j.borderColor = 'rgba(120,120,135,0.5)';
+                });
+                await archiveCard(best.id);
+                const wasCross = isCorrection && (bestScore < SUPERSEDE_AT || (area && !sameAreaKey(best.area, area)));
+                best.text = `↩︎ ${best.text}`;
+                card.__supersedes = best.id;
+                if (readopted) {
+                    card.__reAdopts = readopted.id;
+                    card.text = `${String(card.text || '').trimEnd()}\n${reAdoptionReceipt(readopted, today)}`;
+                    stats.reAdopted++;
+                }
+                stats.superseded++;
+                // Surface the widened match for confirmation: the caller tells the
+                // agent what was archived and how to undo (restore from Archive /
+                // re-run with ~) — the widened bar acts WITH a visible receipt.
+                if (wasCross) stats.corrections.push({ old: (best.title || String(best.text).replace(/^↩︎\s*/, '').slice(0, 80)), area: best.area || null, overlap: Math.round(bestScore * 100) / 100 });
+            }
+        }
+
+        // CLOSE-LINK — a card carrying `closes` resolves the (often cross-area)
+        // strategy/question card that SPAWNED it: stamp ✅, archive it, and draw a
+        // "closed by" arrow in pass 2. Unlike supersede (same-area, high lexical
+        // overlap), a shipped milestone rarely echoes the strategy's prose — so
+        // this matches across ALL areas, prefers an explicit [[wikilink]]/title
+        // hit, and otherwise fires on only a low overlap. This is the fix for
+        // "strategy cards never get closed out when their feature actually ships".
+        for (const card of cards) {
+            const target = (card.closes || '').toString().trim();
+            if (!target) continue;
+            const tier = closeTierFor(target);
             if (tier.length > 4) {
                 (stats.closeRefused ||= []).push({
                     target: target.slice(0, 80),
@@ -6207,6 +6378,17 @@ export function formatCaptureReceipts(stats, { maxEach = 3 } = {}) {
     // warning, which is silent loss; the refusal has to be visible instead.
     for (const f of (Array.isArray(s.closeRefused) ? s.closeRefused : []).slice(0, maxEach)) {
         lines.push(`⛔ closes: "${f.target}" matched ${f.total} live cards — too generic to trust, so NOTHING was archived and your note was kept as an ordinary card. Name a longer target, or close the exact card with brain_reconcile mode:"claims" confirm:[{ id, milestoneId }]. Top candidates: ${f.candidates.map(c => `(id ${c.id}) "${c.title}"${c.area ? ` [${c.area}]` : ''} cov ${c.cov}`).join(' · ')}`);
+    }
+    // A ~ too thin to stand in for the card it matched changed NOTHING on that
+    // card (1.86.1 update floor) — the author has to hear it, or the correction
+    // they think they made is simply absent.
+    for (const f of (Array.isArray(s.updateRefused) ? s.updateRefused : []).slice(0, maxEach)) {
+        lines.push(`⚠️ ~ update NOT applied: "${f.text}" carries ${f.words} content word${f.words === 1 ? '' : 's'}, too few to replace "${f.target}" (${f.targetWords}), so that card was left exactly as it was${f.savedAsCard ? ' and your text was kept as a separate card beside it' : ''}. To replace it, send the ~ again with the full corrected claim.`);
+    }
+    // A closes: target that names no live card closed nothing; the phrase went
+    // back into the note's text rather than vanishing.
+    for (const f of (Array.isArray(s.closesKept) ? s.closesKept : []).slice(0, maxEach)) {
+        lines.push(`↩ closes: "${f.target}" names no live card, so nothing was closed and the phrase stays in your note's text. To close a card, name its exact title or [[wikilink]].`);
     }
     return lines;
 }

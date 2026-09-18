@@ -193,7 +193,7 @@ try {
   ok(parsed.closes === '[[Canvas navigation]]' && parsed.evidence && parsed.evidence.length === 1,
     'EN9: closes: and ev: still parse around it (shared lookahead — no lockstep drift)');
   const noQ = splitMarkerSuffixes('Decided: FAQ: entries stay in the docs, not the brain');
-  ok(noQ.body === 'Decided: FAQ: entries stay in the docs, not the brain' && noQ.question === '', 'EN9: "FAQ:" is not a q: suffix — the key needs a word boundary');
+  ok(noQ.body === 'Decided: FAQ: entries stay in the docs, not the brain' && noQ.question === '', 'EN9: "FAQ:" is not a q: suffix — a key needs whitespace before it (1.86.1 grammar)');
   const onlyQ = splitMarkerSuffixes('Keep the merge driver append-only q: why can a merge never drop a card?');
   ok(onlyQ.body === 'Keep the merge driver append-only' && onlyQ.question === 'why can a merge never drop a card?' && onlyQ.closes === '' && onlyQ.evidence === null,
     'EN9: q: alone works, other keys stay empty');

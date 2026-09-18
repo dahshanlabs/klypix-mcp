@@ -38,10 +38,12 @@ const STATE = path.resolve(CWD, '.claude', 'brain-capture-state.json');
 //                  reads as a general rule is auto-promoted to a skill too)
 //                · [Area] ✓: resolves the matching existing card (archives it)
 //                · [Area] ~: updates the matching card IN PLACE (small corrections)
-// Optional trailing suffixes on a decision/milestone (either order, end of line):
+// Optional trailing suffixes on a decision/milestone (either order, end of line,
+// lowercase `key: value` — the exact grammar is parseMarkerSuffixText below):
 //                · closes: <strategy/question card title or [[wikilink]]> —
 //                  resolves+archives the (cross-area) card this work fulfils and
-//                  draws a "closed by" arrow (the decision-lifecycle link).
+//                  draws a "closed by" arrow (the decision-lifecycle link). A
+//                  target that names no live card stays in the card text.
 //                · ev: <path[:line]>, <path>, PR#<n> — evidence anchors; file
 //                  paths get their git blob OID stamped so the brief can later
 //                  flag the card when that code drifts.
@@ -50,6 +52,9 @@ const STATE = path.resolve(CWD, '.claude', 'brain-capture-state.json');
 //                  stale, the status renderer re-prints it as "VERIFY: <cmd>"
 //                  instead of asserting the claim as current. Emit PS-5.1-safe
 //                  commands (no && chaining; use `;` or separate lines).
+//                · q: <question?> — the question this card answers, phrased as
+//                  someone would ask it (a question word first, ? last);
+//                  retrieval enrichment only, never on the canvas.
 const MARKER = /🧠\s*BRAIN\s*(?:\[([^\]]+)\])?\s*([?!✓~+]?)\s*:\s*(.+)$/i;
 const sha = (s) => crypto.createHash('sha1').update(s).digest('hex').slice(0, 16);
 // Numeric semver compare (major.minor.patch; pre-release tags ignored). <0 if
@@ -105,37 +110,115 @@ function parseEvidence(s) {
     const prepared = prepareBrainEvidence({ projectRoot: CWD, evidence: refs });
     return prepared.ok ? prepared.evidence : refs; // legacy malformed refs remain unverified
 }
-// Pull optional `closes:` / `ev:` / `verify:` / `q:` suffixes off the END of a
-// marker body (any order), returning the cleaned body + parsed extras. The
-// suffix region starts at the first known key, so a decision can carry none,
-// any, or all without the keywords leaking into the card text. Every value
-// ends at the NEXT known key (or end of line) through ONE shared lookahead
-// built from the key list, so adding a key cannot silently fold "verify: …"
-// into a neighbour's value — the lockstep bug three hand-written lookaheads
-// used to invite (parseEvidence would mint junk file refs from it).
+// ── Marker suffix grammar ─── MIRROR BEGIN ──────────────────────────────────
+// ONE grammar for the optional `closes:` / `ev:` / `verify:` / `q:` suffixes on
+// a `🧠 BRAIN` marker line. This block is byte-identical in
+// global-brain-hook.mjs (which parses markers) and klypix-format.mjs (whose
+// parseVerifySuffix reads a `verify:` still sitting in card prose), and
+// test/marker-suffix-grammar.mjs fails if the two copies drift. Neither file
+// may import the other: the hook's --live lane must never pay the format
+// import, and klypix-format.mjs is copied alone beside the git merge driver.
 //
-// `q:` (1.86) is the question this card ANSWERS, in the words someone would
-// ask it. It is pattern-level retrieval enrichment authored by the model that
-// knows the content — recorded in the sidecar beside the vector cache, never
-// on the canvas — so a card is findable by a paraphrase nobody has typed yet,
-// not only by the prompt that happened to precede its capture.
+// 1.86.0 split a body at the FIRST whitespace + "Q:"/"q:" in any case, so
+// "Support page gets a Q: and A: layout" became the card "Support page gets
+// a", and a `~` cut the same way replaced a rich card with the stub. The older
+// keys had the same hazard ("see the ev: numbers", "every agent verify: the
+// tag", "treats closes: links as ..."). A suffix is now recognised only where
+// it cannot be prose:
+//   • keys are lowercase and written `key: value`, with whitespace on BOTH
+//     sides of the colon, so "Q:", "FAQ:", "q:auth" and `npm run verify:mcp`
+//     are ordinary text;
+//   • suffixes form ONE run that reaches the end of the line, and the run
+//     cannot start right after a word that leaves a clause open ("the ev:",
+//     "a q:", "to verify:");
+//   • every value must have its key's shape: `ev:` a comma list of file / PR /
+//     run references; `verify:` a command (a known CLI, a script or path, a
+//     hyphenated probe name, or a tool given a --flag); `q:` a question (a
+//     question word first, `?` or `؟` last); `closes:` any title, and capture
+//     puts a `closes:` that names no live card back into the card text.
+// A run that breaks any rule is not a suffix run: parsing moves on to the next
+// key, and when none qualifies the whole line stays the card body, untouched.
 const MARKER_SUFFIX_KEYS = ['closes', 'ev', 'verify', 'q'];
-const MARKER_SUFFIX_NEXT = `(?=${MARKER_SUFFIX_KEYS.map(k => `\\s+\\b${k}:`).join('|')}|$)`;
+const MARKER_SUFFIX_KEY_RE = new RegExp(`(?<=\\s)(${MARKER_SUFFIX_KEYS.join('|')}):(?=\\s)`, 'g');
+const MARKER_SUFFIX_OPEN_WORDS = new Set([
+    'a', 'an', 'the', 'this', 'that', 'these', 'those', 'its', 'their', 'our', 'my', 'your', 'every', 'each',
+    'of', 'to', 'in', 'on', 'at', 'for', 'with', 'by', 'from', 'into', 'onto', 'about', 'via', 'per', 'like', 'as', 'than',
+    'and', 'or', 'nor', 'but', 'if', 'whether', 'because',
+    'is', 'are', 'was', 'were', 'be', 'been', 'being', 'am',
+    'do', 'does', 'did', 'can', 'could', 'should', 'would', 'will', 'shall', 'may', 'might', 'must',
+    'في', 'من', 'على', 'إلى', 'الى', 'عن', 'مع', 'أو', 'او', 'ثم', 'هذا', 'هذه', 'ذلك', 'تلك', 'كل',
+]);
+const MARKER_SUFFIX_CLI = new Set([
+    'gh', 'git', 'npm', 'npx', 'node', 'pnpm', 'yarn', 'bun', 'deno', 'corepack', 'curl', 'wget', 'pwsh', 'powershell',
+    'cmd', 'bash', 'sh', 'zsh', 'python', 'python3', 'py', 'pip', 'pip3', 'uv', 'cargo', 'go', 'make', 'docker',
+    'kubectl', 'helm', 'az', 'aws', 'gcloud', 'vercel', 'netlify', 'supabase', 'firebase', 'dotnet', 'mvn', 'gradle',
+    'swift', 'xcodebuild', 'xcrun', 'fastlane', 'jq', 'rg', 'grep', 'cat', 'ls', 'cd', 'echo', 'tsc', 'vitest',
+    'jest', 'eslint', 'psql', 'sqlite3', 'ssh', 'openssl', 'wsl',
+]);
+const MARKER_SUFFIX_QUESTION_LEAD = /^(?:(?:how|what|why|where|when|which|who|whom|whose|whether|can|could|should|would|will|shall|may|might|must|do|does|did|is|are|was|were|has|have|had|am)(?:n['’]t)?|won['’]t|هل|ما|ماذا|لماذا|لما|كيف|أين|اين|متى|من|كم|أي|أية|لم)(?![\p{L}\p{N}])/iu;
+const MARKER_SUFFIX_BARE_FILES = /^(?:Makefile|Dockerfile|Procfile|Gemfile|Rakefile|Jenkinsfile|Vagrantfile|Brewfile|Justfile|LICENSE|README|NOTICE|CHANGELOG|CODEOWNERS|AUTHORS|COPYING)$/;
+function markerSuffixRefOk(item) {
+    const ref = item.trim();
+    if (!ref) return false;
+    if (/^(?:pr|gh|issue)?\s*#?\d+$/i.test(ref)) return true;                  // PR#12 · PR 12 · GH3 · #12
+    const words = ref.split(/\s+/);
+    return words.length <= 4 && words.some((word) => {
+        const w = word.replace(/^[`'"([]+|[`'")\].,;]+$/g, '');
+        return /[\/\\\d]/.test(w) || /\.[A-Za-z0-9]/.test(w) || MARKER_SUFFIX_BARE_FILES.test(w);
+    });
+}
+function markerSuffixCommandOk(value) {
+    const head = value.split(/\s+/)[0].replace(/^[`'"(]+|[`'")]+$/g, '');
+    if (!head) return false;
+    if (MARKER_SUFFIX_CLI.has(head.toLowerCase()) || /^klypix-[a-z-]+$/.test(head)) return true;
+    if (/^[A-Z][a-z]+-[A-Z][A-Za-z]+$/.test(head)) return true;                 // PowerShell Verb-Noun
+    if (/[\/\\]|^[.~$]/.test(head) || /\.(?:mjs|cjs|js|ts|ps1|sh|py|cmd|bat|exe)$/i.test(head)) return true;
+    if (/^[a-z][a-z0-9]*(?:-[a-z0-9]+)+$/.test(head)) return true;             // probe name: npm-version, gh-release
+    return /^[a-z][\w.-]*$/.test(head) && /\s--?[A-Za-z]/.test(value);         // any tool given a --flag
+}
+function markerSuffixValueOk(key, value) {
+    if (!value) return false;
+    if (key === 'closes') return true;
+    if (key === 'ev') return value.split(',').every(markerSuffixRefOk);
+    if (key === 'verify') return markerSuffixCommandOk(value);
+    const question = value.replace(/^[`'"“‘(]+/, '');
+    return MARKER_SUFFIX_QUESTION_LEAD.test(question) && /[?？؟][`'"”’)]*$/.test(question);
+}
+// → { body, closes, ev, verify, q } as raw strings ('' when absent).
+function parseMarkerSuffixText(line) {
+    const text = String(line || '');
+    const keys = [...text.matchAll(MARKER_SUFFIX_KEY_RE)].map((m) => ({ key: m[1], at: m.index, from: m.index + m[0].length }));
+    for (let start = 0; start < keys.length; start++) {
+        const body = text.slice(0, keys[start].at).trim();
+        const lastWord = (/(\S+)$/.exec(body) || [])[1] || '';
+        if (!body || MARKER_SUFFIX_OPEN_WORDS.has(lastWord.toLowerCase())) continue;
+        const found = {};
+        let wellFormed = true;
+        for (let k = start; k < keys.length && wellFormed; k++) {
+            const value = text.slice(keys[k].from, k + 1 < keys.length ? keys[k + 1].at : text.length).trim();
+            if (!markerSuffixValueOk(keys[k].key, value)) wellFormed = false;
+            else if (!(keys[k].key in found)) found[keys[k].key] = value;
+        }
+        if (wellFormed) return { body, closes: found.closes || '', ev: found.ev || '', verify: found.verify || '', q: found.q || '' };
+    }
+    return { body: text.trim(), closes: '', ev: '', verify: '', q: '' };
+}
+// ── Marker suffix grammar ─── MIRROR END ────────────────────────────────────
+
+// Split a marker body into the card text and its parsed suffixes. `q:` (1.86)
+// is the question the card ANSWERS, in the words someone would ask it: retrieval
+// enrichment recorded in the sidecar beside the vector cache, never on the
+// canvas. `bodyWithCloses` is the body with its `closes:` segment put back —
+// the card text capture falls back to when the target names no live card.
 function splitMarkerSuffixes(body) {
-    const m = body.match(new RegExp(`\\s+(?:${MARKER_SUFFIX_KEYS.join('|')}):`, 'i'));
-    if (!m) return { body, closes: '', evidence: null, verify: '', question: '' };
-    const suffix = body.slice(m.index);
-    const grab = (key) => {
-        const mm = suffix.match(new RegExp(`\\b${key}:\\s*(.+?)\\s*${MARKER_SUFFIX_NEXT}`, 'i'));
-        return mm ? mm[1].trim() : '';
-    };
-    const ev = grab('ev');
+    const parsed = parseMarkerSuffixText(body);
     return {
-        body: body.slice(0, m.index).trim(),
-        closes: grab('closes'),
-        evidence: ev ? parseEvidence(ev) : null,
-        verify: grab('verify').slice(0, 200),
-        question: grab('q').slice(0, 240),
+        body: parsed.body,
+        closes: parsed.closes,
+        evidence: parsed.ev ? parseEvidence(parsed.ev) : null,
+        verify: parsed.verify.slice(0, 200),
+        question: parsed.q.slice(0, 240),
+        bodyWithCloses: parsed.closes ? `${parsed.body} closes: ${parsed.closes}` : parsed.body,
     };
 }
 // ── Self-healing brain (decision lifecycle, part 3) ──────────────────────────
@@ -2693,10 +2776,12 @@ async function capture(lib) {
             const m = MARKER.exec(trimmed); if (!m) continue;
             const area = (m[1] || '').trim(), type = m[2] || '';
             let body = m[3].trim(); if (!body) continue;
-            // Strip optional `closes:` / `ev:` / `verify:` suffixes off the body so
-            // they don't leak into the card text; they drive the close-link,
-            // evidence, and live-probe below.
-            const { body: cleanBody, closes, evidence, verify, question: markerQuestion } = splitMarkerSuffixes(body);
+            // Strip optional `closes:` / `ev:` / `verify:` / `q:` suffixes off the
+            // body so they don't leak into the card text; they drive the
+            // close-link, evidence, live-probe and enrichment below. Only a
+            // well-formed trailing run is a suffix (parseMarkerSuffixText) — a
+            // "Q:" or "the ev:" in prose stays in the card.
+            const { body: cleanBody, closes, evidence, verify, question: markerQuestion, bodyWithCloses } = splitMarkerSuffixes(body);
             body = cleanBody; if (!body) continue;
             const preview = body.slice(0, 90);
             // EXAMPLE/doc guard — rejects marker-SYNTAX documentation (which
@@ -2756,7 +2841,9 @@ async function capture(lib) {
             if (type === '~') {
                 updates.push({ area, text: body, createdVia: 'claude-code', ...(evidence ? { evidence } : {}), ...(verify ? { verify } : {}) });
                 if (markerQuestion) enrichmentPairs.push({ body, question: markerQuestion });
-                ledger.push({ action: 'update', area, preview, ...(evidence ? { ev: evidence.map(e => e.ref) } : {}) });
+                // `uIdx` maps this entry to the engine's per-update refusals, the
+                // way `rIdx` does for resolves (own markers lead the array).
+                ledger.push({ action: 'update', area, preview, uIdx: updates.length - 1, ...(evidence ? { ev: evidence.map(e => e.ref) } : {}) });
                 continue;
             }
             // Type → scannable prefix + border color: ? open question (amber),
@@ -2773,8 +2860,12 @@ async function capture(lib) {
             const areaTag = area ? `#${slugify(area)}` : '';
             const fileTags = recentTags.slice(-4).filter(t => t !== areaTag);
             const tagLine = [areaTag, ...fileTags].filter(Boolean).join(' ');
-            const card = (area ? `${area}: ${prefix}${body}` : `${prefix}${body}`) + (tagLine ? `\n${tagLine}` : '');
-            cards.push({ text: card, area, borderColor, ...(closes ? { closes } : {}), ...(evidence ? { evidence } : {}), ...(verify ? { verify } : {}) });
+            const cardText = (b) => (area ? `${area}: ${prefix}${b}` : `${prefix}${b}`) + (tagLine ? `\n${tagLine}` : '');
+            const card = cardText(body);
+            // `closes:` is the one suffix whose value is free text, so the engine
+            // also gets the card as written WITH it: when the target names no
+            // live card, that text is what lands (see captureIntoBrain).
+            cards.push({ text: card, area, borderColor, ...(closes ? { closes, closesFallbackText: cardText(bodyWithCloses) } : {}), ...(evidence ? { evidence } : {}), ...(verify ? { verify } : {}) });
             if (lastUserPrompt) enrichmentPairs.push({ body, question: lastUserPrompt });
             // The authored `q:` rides alongside the incidental prompt: the pattern
             // (what someone would ask) and the instance (what someone did type).
@@ -3066,7 +3157,7 @@ async function capture(lib) {
             return null;
         }
         const res = await lib.captureIntoBrain(brainBuf, {
-            cards: landedCards.map(c => ({ text: c.text, color: '#e8e8ed', borderColor: c.borderColor, area: c.area, createdVia: c.createdVia || 'claude-code', ...(c.closes ? { closes: c.closes } : {}), ...(c.evidence ? { evidence: c.evidence } : {}), ...(c.verify ? { verify: c.verify } : {}) })),
+            cards: landedCards.map(c => ({ text: c.text, color: '#e8e8ed', borderColor: c.borderColor, area: c.area, createdVia: c.createdVia || 'claude-code', ...(c.closes ? { closes: c.closes } : {}), ...(c.closes && typeof c.closesFallbackText === 'string' ? { closesFallbackText: c.closesFallbackText } : {}), ...(c.evidence ? { evidence: c.evidence } : {}), ...(c.verify ? { verify: c.verify } : {}) })),
             resolutions,
             updates,
         });
@@ -3150,11 +3241,19 @@ async function capture(lib) {
             else if (outcome === 'fallback-milestone') d.action = 'resolve-unmatched';
         }
     }
+    // Same honesty for ~: a refused update did NOT rewrite its card, and a ledger
+    // that still read `update` would claim a replacement that never happened.
+    const updateRefused = Array.isArray(stats.updateRefused) ? stats.updateRefused : [];
+    if (updateRefused.length) {
+        const refusedIdx = new Set(updateRefused.map(f => f.i));
+        for (const d of ledger) if (d.action === 'update' && refusedIdx.has(d.uIdx)) d.action = 'update-refused-thin';
+    }
     const bits = [`${stats.added} added`];
     if (stats.resolved) bits.push(`${stats.resolved} resolved`);
     if (stats.partialResolved) bits.push(`${stats.partialResolved} partial (card kept open)`);
     if (stats.partialSkipped) bits.push(`${stats.partialSkipped} partial already noted`);
     if (stats.updated) bits.push(`${stats.updated} updated`);
+    if (updateRefused.length) bits.push(`${updateRefused.length} update refused (too thin to replace its card)`);
     if (stats.merged) bits.push(`${stats.merged} merged`);
     if (stats.closed) bits.push(`${stats.closed} closed`);
     if (stats.superseded) bits.push(`${stats.superseded} superseded`);
@@ -3180,6 +3279,11 @@ async function capture(lib) {
         for (const f of stats.closeRefused.slice(0, 3)) {
             process.stderr.write(`[brain] ⛔ closes: "${f.target}" matched ${f.total} live cards — too generic to trust, so NOTHING was archived and your note was kept as an ordinary card. Name a longer target, or close the exact card by id. Top candidates: ${f.candidates.map(c => `(${c.id}) "${c.title}" cov ${c.cov}`).join(' · ')}\n`);
         }
+    }
+    // A ~ too thin to stand in for its card, and a closes: that named no live
+    // card — both left the brain as it was; say so, and how to finish the job.
+    if ((updateRefused.length || (Array.isArray(stats.closesKept) && stats.closesKept.length)) && typeof lib.formatCaptureReceipts === 'function') {
+        for (const line of lib.formatCaptureReceipts({ updateRefused, closesKept: stats.closesKept }, { maxEach: 3 })) process.stderr.write(`[brain] ${line}\n`);
     }
     if (partialSkipped || stats.partialSkipped) {
         // `partialSkipped` counts MARKERS whose strongest outcome was a skip;
@@ -4152,7 +4256,7 @@ function legendFooter() {
     return '\n\n---\n'
         + '🧠 **Capture markers** — write these in your reply; the Stop hook harvests them into the brain (no separate log step). Use sparingly, for real decisions / milestones / discoveries:\n'
         + '`🧠 BRAIN [Area]: decision` · `[Area] ?: open question` · `[Area] !: milestone` · `[Area] +: 🛠️ skill (reusable how-to / gotcha — resurfaces every session, never ages out)` · `[Area] ✓: resolves+archives the matching card` · `[Area] ~: updates it in place` · 🎯 in text = a goal (reads as open).\n'
-        + 'Optional suffixes: `closes: <card title / [[wikilink]]>` (resolve the strategy/question this fulfils) · `ev: <file[:line]>, PR#<n>` (anchor to code → auto drift-badge) · `q: <the question this answers, as someone would ASK it>` (retrieval enrichment — makes the card findable by paraphrase; sidecar only, never on the canvas).\n'
+        + 'Optional suffixes go at the END of the marker line, lowercase, written `key: value`: `closes: <card title / [[wikilink]]>` (resolve the strategy/question this fulfils; a target that names no live card stays in the text) · `ev: <file[:line]>, PR#<n>` (anchor to code → auto drift-badge) · `verify: <command>` (the live probe for a fast-decay status claim) · `q: <how/what/why …?>` (the question this answers, as someone would ASK it — a question word first, `?` last; retrieval enrichment, sidecar only, never on the canvas). Anything else is plain text: "a Q: and A: layout", "the ev: field", `npm run verify:mcp` stay in the card.\n'
         + '**Correcting a stale card:** include the word `CORRECTION` (or "was WRONG" / "OBSOLETE" — UPPERCASE; casing is the deliberate-signal, casual prose never fires it) in the decision — the capture then hunts the stale card across ALL areas at a lower match bar and supersedes it (archived + arrowed, with a receipt; restore from Archive if it grabbed the wrong one). A rephrased duplicate `?` merges into the existing open question instead of stacking a twin.\n'
         + '**Verified-fix rule drafts:** when a session FIXES + VERIFIES something trap-shaped that landed as a one-off note, the Stop hook auto-DRAFTS a candidate 🛠️ rule (a per-project sidecar — never a brain card). Approve a real recurring trap with the `+` marker the nudge shows you and it becomes a standing rule that fires EVERY session (like the release-naming rule); ignore the rest and they age out. Draft-only, no blind auto-capture.\n'
         + '**Session brief:** the SessionStart hook prints a ≤2KB ultra brief and writes the FULL brief to `.claude/brain-brief.md` — read that file when planning non-trivial work.\n'
@@ -4459,5 +4563,5 @@ if (!process.env.KLYPIX_BRAIN_NO_MAIN) {
 
 // Exported for hermetic unit tests only (gated by KLYPIX_BRAIN_NO_MAIN above so the
 // import doesn't run main()/exit the test). Not part of the runtime hook contract.
-export { refreshNpmCurrency, versionCurrencyFooter, bakedBrainVersion, httpsFetchLatest, cmpSemver, decayStampForMessage, messageActionId, messageFooter, postMessages, touchSession, writeHostmapAtomic, commitPresenceIdentityFiles, MSG_OUTBOX_FILE, HOSTMAP_FILE, SESSIONS_FILE, splitMarkerSuffixes, evidenceGitPath, gitBlobOid, computeFreshness, selfHealFooter };
+export { refreshNpmCurrency, versionCurrencyFooter, bakedBrainVersion, httpsFetchLatest, cmpSemver, decayStampForMessage, messageActionId, messageFooter, postMessages, touchSession, writeHostmapAtomic, commitPresenceIdentityFiles, MSG_OUTBOX_FILE, HOSTMAP_FILE, SESSIONS_FILE, splitMarkerSuffixes, parseMarkerSuffixText, evidenceGitPath, gitBlobOid, computeFreshness, selfHealFooter };
 // (shouldSelfUpdate is exported at its declaration above — the auto-propagation decision seam for tests)

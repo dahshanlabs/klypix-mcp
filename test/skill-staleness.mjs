@@ -98,11 +98,17 @@ const skillCard = { id: 's1', type: 'text', area: 'Chat', createdAt: D0, text: I
 }
 
 // ── capture-time: receipt + persisted edge, and the skill survives ───────────
+// buildKlypixMap stamps every card with the build time (the createdAt below is
+// not read), and a milestone only obsoletes a skill it POST-dates. A capture in
+// the same millisecond as the build therefore raised nothing — a timing flake
+// that failed CI on a fast runner. Wait for the clock to move first.
+const afterBuild = async () => { const t = Date.now(); while (Date.now() <= t) await new Promise((r) => setTimeout(r, 1)); };
 {
     const buf = await buildKlypixMap({
         title: 'brain',
         areas: [{ title: 'Chat', cards: [{ text: INCIDENT_SKILL, createdAt: D0 }] }],
     });
+    await afterBuild();
     const res = await captureIntoBrain(buf, { cards: [{ text: 'Chat: 🏁 native tool-use in chat shipped — list_directory via Gemini function-calling; chat can now list a folder inline with real tools', area: 'Chat' }] });
     ok(Array.isArray(res.stats.skillStale) && res.stats.skillStale.length >= 1, 'capture: 🏁 over a live limitation-skill raises a skillStale receipt');
     ok(res.stats.skillStale.length && /~/.test(res.stats.skillStale[0].marker), 'capture: the receipt carries a ready-to-fill ~ amendment');
@@ -120,6 +126,7 @@ const skillCard = { id: 's1', type: 'text', area: 'Chat', createdAt: D0, text: I
         title: 'brain',
         areas: [{ title: 'Export', cards: [{ text: '🛠️ the exporter does not support rotated strokes on legacy canvases — flatten before exporting', createdAt: D0 }] }],
     });
+    await afterBuild();
     const res = await captureIntoBrain(buf, { cards: [{ text: 'Export: 🏁 exporter now ships rotated strokes support on legacy canvases end to end — no flatten step needed', area: 'Export' }] });
     ok(res.stats.skillStale.length >= 1 && !res.stats.skillStale[0].via, 'capture: tight clause reaches coverage grade');
     const { struct } = await parseKlypix(res.buffer);

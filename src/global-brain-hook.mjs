@@ -155,10 +155,13 @@ function parseEvidence(s) {
 // (`kept`) and the well-formed ones still count — one bad value never cancels
 // the rest. A `closes:` alone never proves a run (its value is free text),
 // unless its whole value is one [[wikilink]].
-// `closesAnchored` says the closes: is unmistakably a suffix — it follows a
-// clause boundary, is exactly one [[wikilink]], or rides with a well-formed
-// sibling — and capture only lets an UNanchored one close a card it names by
-// title.
+// `closesAnchored` says the closes: is unmistakably a suffix, judged ONLY by
+// what comes before it or by its own value: it follows a clause boundary,
+// follows another well-formed suffix, or is exactly one [[wikilink]]. A
+// well-formed ev: AFTER a prose "closes:" proves nothing about the closes:
+// ("The resolver now treats closes: targets as exact titles ev: src/x.mjs"
+// is still prose), and capture only lets an UNanchored one close a card it
+// names by title.
 const MARKER_SUFFIX_KEYS = ['closes', 'ev', 'verify', 'q'];
 const MARKER_SUFFIX_KEY_RE = new RegExp(`(?<=\\s)(${MARKER_SUFFIX_KEYS.join('|')}|Closes):`, 'g');
 const MARKER_SUFFIX_OPEN_WORDS = new Set([
@@ -285,7 +288,7 @@ function parseMarkerSuffixText(line) {
             verify: found.verify,
             q: found.q.replace(MARKER_SUFFIX_DIRECTION, '').trim(),
             kept,
-            closesAnchored: Boolean(found.closes) && (anchored || MARKER_SUFFIX_BOUNDARY.test(body)),
+            closesAnchored: Boolean(found.closes) && (keys[start].key !== 'closes' || MARKER_SUFFIX_WIKILINK.test(found.closes) || MARKER_SUFFIX_BOUNDARY.test(body)),
             bodyWithCloses: closesSegment ? [body, closesSegment, kept].filter(Boolean).join(' ') : cardBody,
         };
     }
@@ -313,6 +316,21 @@ function splitMarkerSuffixes(body) {
         kept: parsed.kept,
         bodyWithCloses: parsed.bodyWithCloses,
     };
+}
+// The card bodies the two PUBLISHED hooks keyed a marker on: 1.86.0 cut the
+// marker at the first whitespace + closes:/ev:/verify:/q: anywhere, in any
+// case; 1.85 the same without q:. capture() treats those keys as seen, so a
+// marker an older hook already landed never lands again after an upgrade.
+function publishedHookCuts(markerBody) {
+    const text = String(markerBody || '');
+    const out = [];
+    for (const re of [/\s+(?:closes|ev|verify|q):/i, /\s+(?:closes|ev|verify):/i]) {
+        const at = text.search(re);
+        if (at <= 0) continue;
+        const cut = text.slice(0, at).trim();
+        if (cut && !out.includes(cut)) out.push(cut);
+    }
+    return out;
 }
 // ── Self-healing brain (decision lifecycle, part 3) ──────────────────────────
 // Source fingerprints detect drift, never factual truth: code-anchored cards get
@@ -2438,7 +2456,30 @@ const readRuleDrafts = () => { try { const d = JSON.parse(fs.readFileSync(RULE_D
 // pending finding and vice versa. Both writers now read the file first and
 // replace only their own key. Adding a third list is safe by the same rule.
 const readSidecar = () => { try { const d = JSON.parse(fs.readFileSync(RULE_DRAFTS, 'utf8')); return d && typeof d === 'object' && !Array.isArray(d) ? d : {}; } catch { return {}; } };
-const writeSidecar = (patch) => { try { fs.mkdirSync(path.dirname(RULE_DRAFTS), { recursive: true }); const tmp = `${RULE_DRAFTS}.tmp-${process.pid}`; fs.writeFileSync(tmp, JSON.stringify({ ...readSidecar(), ...patch }, null, 2)); fs.renameSync(tmp, RULE_DRAFTS); } catch { /* best-effort */ } };
+// tmp+rename. On Windows a rename over a file another hook is READING throws
+// EPERM (review 2026-09-18: 20 concurrent Stops + prompts lost 1 of 20 capture
+// receipts and left 6 tmp files behind), so the rename retries on a short
+// backoff and the tmp is removed if it never lands. Returns whether the write
+// landed — a caller that marks something "shown" must know.
+const SIDECAR_RENAME_BACKOFF_MS = [20, 50, 120, 250, 500];
+const writeSidecar = (patch) => {
+    let tmp = null;
+    try {
+        fs.mkdirSync(path.dirname(RULE_DRAFTS), { recursive: true });
+        tmp = `${RULE_DRAFTS}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+        fs.writeFileSync(tmp, JSON.stringify({ ...readSidecar(), ...patch }, null, 2));
+        for (let attempt = 0; ; attempt++) {
+            try { fs.renameSync(tmp, RULE_DRAFTS); return true; }
+            catch (error) {
+                if (attempt >= SIDECAR_RENAME_BACKOFF_MS.length || !['EPERM', 'EACCES', 'EBUSY'].includes(error?.code)) throw error;
+                sleepSync(SIDECAR_RENAME_BACKOFF_MS[attempt]);
+            }
+        }
+    } catch {
+        if (tmp) { try { fs.unlinkSync(tmp); } catch { /* best-effort */ } }
+        return false;
+    }
+};
 const writeRuleDrafts = (drafts) => writeSidecar({ drafts: (drafts || []).slice(-RULE_DRAFTS_MAX) });
 const draftKey = (area, text) => sha(((area || '') + '|' + String(text)).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim());
 // Token overlap: is a draft seed substantially covered by a (skill) card's text?
@@ -2693,68 +2734,114 @@ async function findingDraftsFooter(sid, { markShown = true } = {}) {
 // closes: named no card", "your q: stayed text") went to stderr with exit 0,
 // which Claude Code does not feed back to the model — the one party who could
 // re-emit a corrected marker never heard them. Same channel as the drafts
-// above: the Stop hook records them in the shared sidecar (its own key), the
-// NEXT prompt of the same session prints them once (UserPromptSubmit stdout is
-// model context), and a SessionStart picks up ones an ended session never saw
-// — a receipt from a session's final Stop is not lost. Deduped by key, so a
-// ~ / ✓ re-harvested at every Stop is reported once; TTL-pruned; never throws.
+// above: the Stop hook records them in the shared sidecar (its own key), and
+// the NEXT prompt of the same session prints them once (UserPromptSubmit
+// stdout is model context), three at a time. Deduped by key; TTL-pruned;
+// never throws.
+//
+// A receipt from a session's FINAL Stop would never be seen, so a SessionStart
+// ADOPTS receipts whose author has ended: it reassigns them to itself, and its
+// own first prompt prints them — nothing is printed at SessionStart, where the
+// block landed past the ~2 KB preview the harness shows (review 2026-09-18).
+// "Ended" is decided from the lane, never from age alone: a receipt whose
+// author still has a LIVE lane row stays with that author (a new session
+// used to print — and mark shown for everyone — a live session's receipts, so
+// the author never saw them). The one live row that does not count is a
+// predecessor in this same host process: a /clear or resume replaced that
+// conversation, so its receipts move to the new session at once. With no live
+// lane row, a receipt unshown for CAPTURE_RECEIPT_HANDOFF_MS is adopted.
+// Adoption and every shown-mark happen under RULE_DRAFTS_LOCK in ONE
+// read-modify-write, so two sessions can never both take the same receipt, and
+// a receipt is printed only when its shown-mark was actually persisted (an
+// unwritable sidecar printed the same receipt on every prompt).
 const CAPTURE_RECEIPT_TTL_MS = 3 * 24 * 60 * 60 * 1000;
 const CAPTURE_RECEIPTS_MAX = 40;
 const CAPTURE_RECEIPTS_SHOWN = 3;
-const CAPTURE_RECEIPT_HANDOFF_MS = 30 * 60 * 1000;   // unshown this long → a new session may show it
+const CAPTURE_RECEIPT_HANDOFF_MS = 30 * 60 * 1000;   // no live lane row + unshown this long → a new session adopts it
 const readCaptureReceipts = () => { const d = readSidecar(); return Array.isArray(d.captureReceipts) ? d.captureReceipts : []; };
+// → 'written' | 'unchanged' | false (lock timeout or a failed write).
 function persistCaptureReceipts(mutate) {
-    const got = acquireLock(RULE_DRAFTS_LOCK, { tries: 20, waitMs: 25 });
-    if (!got) return;   // lock timeout → skip (mirrors persistDrafts); the stderr copy still printed
+    const got = acquireLock(RULE_DRAFTS_LOCK, { tries: 80, waitMs: 25 });
+    if (!got) return false;
     try {
         const now = Date.now();
         const raw = readCaptureReceipts();
         const rawJson = JSON.stringify(raw);
         const live = raw.filter(r => r && r.key && r.line && (now - (r.ts || 0)) < CAPTURE_RECEIPT_TTL_MS);
         const next = (mutate(live, now) || live).slice(-CAPTURE_RECEIPTS_MAX);
-        if (JSON.stringify(next) === rawJson) return;
-        writeSidecar({ captureReceipts: next });
-    } catch { /* best-effort */ } finally { releaseLock(RULE_DRAFTS_LOCK); }
+        if (JSON.stringify(next) === rawJson) return 'unchanged';
+        return writeSidecar({ captureReceipts: next }) ? 'written' : false;
+    } catch { return false; } finally { releaseLock(RULE_DRAFTS_LOCK); }
 }
-// Record [{ key, line }] for this session; returns the items that were NEW.
+// Record [{ key, line }] for this session (a key already recorded is skipped).
 function recordCaptureReceipts(sid, items) {
-    const fresh = [];
     try {
-        if (!sid || !Array.isArray(items) || !items.length) return fresh;
-        persistCaptureReceipts((list, now) => {
+        if (!sid || !Array.isArray(items) || !items.length) return false;
+        return persistCaptureReceipts((list, now) => {
             const have = new Set(list.map(r => r.key));
             for (const it of items) {
                 if (!it || !it.key || !it.line || have.has(it.key)) continue;
                 have.add(it.key);
                 list.push({ key: it.key, sid: String(sid), ts: now, line: String(it.line).slice(0, 700), shown: false });
-                fresh.push(it);
             }
             return list;
         });
-    } catch { /* best-effort */ }
-    return fresh;
+    } catch { return false; }
 }
-// The block the next prompt (or a later SessionStart) prints, marking what it
-// showed. Empty string when there is nothing — the zero-cost contract.
-function captureReceiptsFooter(sid, { sessionStart = false } = {}) {
+// SessionStart: take over receipts an ended session never saw (see above).
+// Returns how many were adopted; prints nothing.
+function adoptCaptureReceipts(sid) {
+    try {
+        if (!sid) return 0;
+        if (!readCaptureReceipts().some(r => r && !r.shown && r.sid !== String(sid))) return 0;   // lock-free fast path
+        const now = Date.now();
+        const rows = readSessions();
+        const hostOf = new Map(rows.filter(r => r && r.id).map(r => [String(r.id), r.hostPid]));
+        const liveIds = new Set(pruneSessions(rows, now).map(r => String(r.id)));
+        let adopted = 0;
+        const res = persistCaptureReceipts((list) => {
+            adopted = 0;
+            for (const r of list) {
+                if (r.shown || r.sid === String(sid)) continue;
+                const predecessor = Boolean(HOST_PID && hostOf.get(String(r.sid)) === HOST_PID);
+                const ended = !liveIds.has(String(r.sid)) && (now - (r.ts || 0)) > CAPTURE_RECEIPT_HANDOFF_MS;
+                if (!predecessor && !ended) continue;
+                r.adoptedFrom = r.adoptedFrom || r.sid;
+                r.sid = String(sid);
+                adopted++;
+            }
+            return list;
+        });
+        return res ? adopted : 0;
+    } catch { return 0; }
+}
+// The block the next prompt prints for THIS session (its own receipts and the
+// ones it adopted), marking what it shows in the same locked write. Empty
+// string when there is nothing — the zero-cost contract.
+function captureReceiptsFooter(sid) {
     try {
         if (!sid) return '';
-        const now = Date.now();
-        const mine = (r) => r.sid === String(sid);
-        const pending = readCaptureReceipts().filter(r => r && r.key && r.line && !r.shown
-            && (now - (r.ts || 0)) < CAPTURE_RECEIPT_TTL_MS
-            && (mine(r) || (sessionStart && now - (r.ts || 0) > CAPTURE_RECEIPT_HANDOFF_MS)));
-        if (!pending.length) return '';
-        const display = pending.slice(0, CAPTURE_RECEIPTS_SHOWN);
-        const shownKeys = new Set(display.map(r => r.key));
-        persistCaptureReceipts((list) => { for (const r of list) if (shownKeys.has(r.key)) r.shown = true; return list; });
+        if (!readCaptureReceipts().some(r => r && !r.shown && r.sid === String(sid))) return '';   // lock-free fast path
+        let display = [], remaining = 0;
+        const res = persistCaptureReceipts((list) => {
+            const pending = list.filter(r => !r.shown && r.sid === String(sid));
+            display = pending.slice(0, CAPTURE_RECEIPTS_SHOWN).map(r => ({ ...r }));
+            remaining = pending.length - display.length;
+            const shownKeys = new Set(display.map(r => r.key));
+            for (const r of list) if (shownKeys.has(r.key)) r.shown = true;
+            return list;
+        });
+        if (res !== 'written' || !display.length) return '';
+        const adopted = display.filter(r => r.adoptedFrom).length;
         const lines = ['', '---',
-            display.every(mine)
-                ? '## ⚠️ Brain capture — what your last 🧠 BRAIN markers actually did'
-                : '## ⚠️ Brain capture — markers from an earlier session that did not do what they said',
-            'The Stop hook captured these, but not the way the marker reads. If it matters, re-emit a corrected marker; nothing else is needed.'];
-        for (const r of display) lines.push(`- ${r.line}`);
-        if (pending.length > display.length) lines.push(`- …and ${pending.length - display.length} more, shown on the next prompt.`);
+            adopted === 0 ? '## ⚠️ Brain capture — what your last 🧠 BRAIN markers actually did'
+                : adopted === display.length ? '## ⚠️ Brain capture — markers from an earlier, ended session that did not do what they said'
+                : '## ⚠️ Brain capture — markers that did not do what they said',
+            adopted === 0
+                ? 'The Stop hook captured these, but not the way the marker reads. If it matters, re-emit a corrected marker; nothing else is needed.'
+                : 'The Stop hook captured these, but not the way the marker reads. Lines marked (earlier session) came from a session that has ended: check the card before acting, and re-emit a corrected marker only when you know what it meant — never a closes: you cannot verify.'];
+        for (const r of display) lines.push(`- ${r.adoptedFrom ? '(earlier session) ' : ''}${r.line}`);
+        if (remaining > 0) lines.push(`- …and ${remaining} more, shown on the next prompt.`);
         return '\n' + lines.join('\n') + '\n';
     } catch { return ''; }
 }
@@ -2875,6 +2962,8 @@ async function capture(lib) {
     // Receipts the NEXT prompt shows the model (see captureReceiptsFooter):
     // a Stop hook's exit-0 stderr never reaches it.
     const suffixReceipts = [];
+    // Old-hook dedup keys already used for a stub repair in this capture.
+    const legacyClaimed = new Set();
     for (let transcriptIndex = 0; transcriptIndex < lines.length; transcriptIndex++) {
         const ln = lines[transcriptIndex];
         let e; try { e = JSON.parse(ln); } catch { continue; }
@@ -2952,6 +3041,7 @@ async function capture(lib) {
             const m = MARKER.exec(trimmed); if (!m) continue;
             const area = (m[1] || '').trim(), type = m[2] || '';
             let body = m[3].trim(); if (!body) continue;
+            const markerBody = body;   // as written — what the published hooks cut and keyed
             // Strip optional `closes:` / `ev:` / `verify:` / `q:` suffixes off the
             // body so they don't leak into the card text; they drive the
             // close-link, evidence, live-probe and enrichment below. Only a
@@ -2998,29 +3088,73 @@ async function capture(lib) {
                     + 'Replace it with the one sentence only you know, then re-emit; or drop the card if there is nothing durable.\n');
                 continue;
             }
-            // Dedup is for ADDITIVE markers only (decision / ? / !): re-capturing
-            // one would stack a duplicate card. Type is in the key so a self-heal
-            // ~ / ✓ on the SAME text isn't confused with the original decision.
-            // The ~ (update / re-verify) and ✓ (resolve) markers are IDEMPOTENT on
-            // an existing card, so they BYPASS dedup entirely — that's what lets the
-            // self-heal loop re-stamp a drifted fact even when its text is unchanged.
-            // The bypass is KEPT (1.85.0). What changed is that it is now honest:
-            // a PARTIAL resolve leaves its card live, so re-pushing the marker used
-            // to append the same ✔ partial note on every Stop (85 lines on one live
-            // card). The ENGINE now skips a note the card already carries, and
-            // reports it per marker — so the ledger below says
-            // `resolve-partial-skipped` instead of implying a fresh stamp.
+            // TEXT dedup is for ADDITIVE markers only (decision / ? / !):
+            // re-capturing one would stack a duplicate card. Type is in the key so
+            // a self-heal ~ / ✓ on the SAME text isn't confused with the original
+            // decision. The ~ (update / re-verify) and ✓ (resolve) markers BYPASS
+            // text dedup — that's what lets the self-heal loop re-stamp a drifted
+            // fact even when its text is unchanged (KEPT since 1.85.0; the engine
+            // also skips a ✔ partial note the card already carries and reports it
+            // as `resolve-partial-skipped`).
             // The key is the marker AS WRITTEN (bodyWithCloses): keyed on the
             // cut body, two different notes that share the words before their
             // closes: were one note, and the second was skipped forever. A key
-            // an older hook wrote on the cut body still counts as seen, so an
-            // upgrade mid-session never re-captures a note it already landed.
+            // written on the cut body by this grammar still counts as seen.
+            //
+            // The PUBLISHED hooks keyed a marker on the text they cut it to
+            // (1.86.0 at the first whitespace + closes:/ev:/verify:/q: anywhere,
+            // 1.85 the same without q:), so after an upgrade every marker whose
+            // parse changed would get a new key and land a SECOND time at the
+            // next Stop of a live or resumed session (review 2026-09-18: 5 of 6).
+            // Those keys still count as seen. When the old cut threw text away —
+            // the 1.86.0 stub "Support page gets a" — the full text is sent as a
+            // repair of THAT card (engine STUB REPAIR, rewritten in place, never
+            // a sibling); any other old key simply means "already captured".
+            //
+            // ~ and ✓ keep their text bypass (a self-heal re-stamp of unchanged
+            // text is a NEW marker and must apply), but ONE transcript line
+            // applies once: Stop re-reads the whole transcript, and re-applying
+            // an old line re-appended amendments, moved a stale correction onto
+            // another session's newer card, and landed a thin ~ on a different
+            // card once its own was resolved (review 2026-09-18). The key is the
+            // transcript event + the line, recorded with the rest of the seen
+            // set only when the batch is durably written or queued.
             const additive = type !== '✓' && type !== '~';
             const key = sha((type + '|' + area + '|' + (additive ? bodyWithCloses : body)).toLowerCase());
             const legacyKey = additive && closes ? sha((type + '|' + area + '|' + body).toLowerCase()) : null;
+            let repairStub = '';
             if (additive) {
-                if (seen.has(key) || (legacyKey && seen.has(legacyKey))) { ledger.push({ action: 'skipped-seen', area, preview }); continue; }
+                if (seen.has(key)) { ledger.push({ action: 'skipped-seen', area, preview }); continue; }
+                // Two DIFFERENT notes that share the words before a key had ONE
+                // key under any cut-body rule: the first landed and the second
+                // was skipped as "seen" — never captured. So an old key is
+                // claimed by the FIRST marker of a capture that carries it; a
+                // later one with the same old key is a note that never landed.
+                if (legacyKey && seen.has(legacyKey) && !legacyClaimed.has(legacyKey)) {
+                    legacyClaimed.add(legacyKey); seen.add(key);
+                    ledger.push({ action: 'skipped-seen', area, preview }); continue;
+                }
+                const olderCut = publishedHookCuts(markerBody).find(cut => seen.has(sha((type + '|' + area + '|' + cut).toLowerCase())));
                 seen.add(key);
+                if (olderCut !== undefined) {
+                    const olderKey = sha((type + '|' + area + '|' + olderCut).toLowerCase());
+                    const landing = closes && !closesAnchored ? bodyWithCloses : body;
+                    const squash = (s) => String(s).replace(/\s+/g, '').toLowerCase();
+                    const longer = squash(landing).length > squash(olderCut).length && squash(landing).startsWith(squash(olderCut));
+                    // Claimed per capture, as above: only the first marker
+                    // carrying an old key repairs its stub (or is skipped); a
+                    // later one with the same old key lands as the note it is.
+                    if (!legacyClaimed.has(olderKey)) {
+                        legacyClaimed.add(olderKey);
+                        if (longer) repairStub = olderCut;
+                        else { ledger.push({ action: 'skipped-seen', area, preview, olderHook: true }); continue; }
+                    }
+                }
+            } else {
+                const sourceEvent = String(e.uuid || e.id || e.timestamp || e.ts || transcriptIndex);
+                const appliedKey = sha(('applied|' + sourceEvent + '|' + type + '|' + area + '|' + body).toLowerCase());
+                if (seen.has(appliedKey)) { ledger.push({ action: 'skipped-applied', area, preview }); continue; }
+                seen.add(appliedKey);
             }
             // A malformed suffix segment went back into the card text — say so
             // (ledger + a receipt the next prompt shows the model), because the
@@ -3029,7 +3163,7 @@ async function capture(lib) {
                 ledger.push({ action: 'suffix-kept-as-text', area, preview, kept: keptSuffix.slice(0, 120) });
                 suffixReceipts.push({ key: sha(('kept|' + type + '|' + area + '|' + body).toLowerCase()), line: keptSuffixReceipt(area, type, keptSuffix) });
             }
-            if (entryInGap) gapAuthored++;
+            if (entryInGap && !repairStub) gapAuthored++;   // a repair is work an older hook already counted
             // ✓ resolves an EXISTING card (stamped ✅ + archived) — not a new card.
             // `rIdx` is this marker's position in the array handed to the engine,
             // which is how the ledger entry is matched back to the engine's own
@@ -3065,12 +3199,20 @@ async function capture(lib) {
             // that text is what lands (see captureIntoBrain). `closesAnchored`
             // is the grammar's verdict that this closes: is unmistakably a
             // suffix; an unanchored one may only close a card it names by title.
-            cards.push({ text: card, area, borderColor, ...(closes ? { closes, closesFallbackText: cardText(bodyWithCloses), closesAnchored: closesAnchored === true } : {}), ...(evidence ? { evidence } : {}), ...(verify ? { verify } : {}) });
+            if (repairStub) {
+                // A 1.86.0 stub restored to what the marker says (see the dedup
+                // block above). A repair only fixes text: it carries no closes:
+                // (that close ran — or not — when the stub landed), so a prose
+                // closes: stays in the text and an anchored one is dropped.
+                cards.push({ text: cardText(closes && !closesAnchored ? bodyWithCloses : body), area, borderColor, repairStub, ...(evidence ? { evidence } : {}), ...(verify ? { verify } : {}) });
+            } else {
+                cards.push({ text: card, area, borderColor, ...(closes ? { closes, closesFallbackText: cardText(bodyWithCloses), closesAnchored: closesAnchored === true } : {}), ...(evidence ? { evidence } : {}), ...(verify ? { verify } : {}) });
+            }
             if (lastUserPrompt) enrichmentPairs.push({ body, question: lastUserPrompt });
             // The authored `q:` rides alongside the incidental prompt: the pattern
             // (what someone would ask) and the instance (what someone did type).
             if (markerQuestion) enrichmentPairs.push({ body, question: markerQuestion });
-            ledger.push({ action: type === '?' ? 'add-question' : type === '!' ? 'add-milestone' : isSkill ? 'add-skill' : 'add-decision', area, preview, files: fileTags, ...(closes ? { closes } : {}), ...(evidence ? { ev: evidence.map(e => e.ref) } : {}) });
+            ledger.push({ action: repairStub ? 'repair-stub' : type === '?' ? 'add-question' : type === '!' ? 'add-milestone' : isSkill ? 'add-skill' : 'add-decision', area, preview, files: fileTags, ...(repairStub ? { stub: repairStub.slice(0, 90) } : {}), ...(closes && !repairStub ? { closes } : {}), ...(evidence ? { ev: evidence.map(e => e.ref) } : {}) });
         }
     }
     const messagePost = postMessages(messages);   // durable outbox → shared lane
@@ -3192,10 +3334,13 @@ async function capture(lib) {
         return;
     }
     // A suffix kept as text is known at parse time, whatever the brain write
-    // does. Recorded once per marker (a re-harvested ~ / ✓ re-parses it every
-    // Stop), printed for the human, and shown to the model on its next prompt.
+    // does. Each marker reaches here once (additive markers are deduped by
+    // text, ~ / ✓ by transcript line), so every one is printed for the human —
+    // even when the sidecar lock or write fails, which used to swallow the
+    // receipt from both audiences — and recorded for the model's next prompt.
     if (suffixReceipts.length) {
-        for (const r of recordCaptureReceipts(sid, suffixReceipts)) process.stderr.write(`[brain] ${r.line}\n`);
+        for (const r of suffixReceipts) process.stderr.write(`[brain] ${r.line}\n`);
+        if (!recordCaptureReceipts(sid, suffixReceipts)) process.stderr.write('[brain] (the receipt above could not be recorded for the next prompt — the sidecar is busy or not writable)\n');
     }
     // Post-verified-fix rule DRAFTS (see the block above). Independent of the brain
     // write — it only touches the pending-drafts sidecar, never a brain card. DRY-RUN
@@ -3363,7 +3508,7 @@ async function capture(lib) {
             return null;
         }
         const res = await lib.captureIntoBrain(brainBuf, {
-            cards: landedCards.map(c => ({ text: c.text, color: '#e8e8ed', borderColor: c.borderColor, area: c.area, createdVia: c.createdVia || 'claude-code', ...(c.closes ? { closes: c.closes } : {}), ...(c.closes && typeof c.closesFallbackText === 'string' ? { closesFallbackText: c.closesFallbackText, closesAnchored: c.closesAnchored === true } : {}), ...(c.evidence ? { evidence: c.evidence } : {}), ...(c.verify ? { verify: c.verify } : {}) })),
+            cards: landedCards.map(c => ({ text: c.text, color: '#e8e8ed', borderColor: c.borderColor, area: c.area, createdVia: c.createdVia || 'claude-code', ...(c.closes ? { closes: c.closes } : {}), ...(c.closes && typeof c.closesFallbackText === 'string' ? { closesFallbackText: c.closesFallbackText, closesAnchored: c.closesAnchored === true } : {}), ...(typeof c.repairStub === 'string' ? { repairStub: c.repairStub } : {}), ...(c.evidence ? { evidence: c.evidence } : {}), ...(c.verify ? { verify: c.verify } : {}) })),
             resolutions,
             updates,
         });
@@ -3416,7 +3561,7 @@ async function capture(lib) {
     // without enrichment.mjs just skips, costing recall, never correctness.
     // An update counts (1.86.1): a ~ that rewrote or amended its card carries a
     // q: too, and the sidecar joins a question to whichever card holds its body.
-    if (enrichmentPairs.length && (stats.added > 0 || stats.updated > 0)) {
+    if (enrichmentPairs.length && (stats.added > 0 || stats.updated > 0 || stats.repaired > 0)) {
         try {
             const enrich = await import(new URL('./enrichment.mjs', import.meta.url).href);
             enrich.recordEnrichment(BRAIN, enrichmentPairs.map(pair => ({ body: pair.body, question: pair.question })));
@@ -3468,6 +3613,7 @@ async function capture(lib) {
     if (stats.partialResolved) bits.push(`${stats.partialResolved} partial (card kept open)`);
     if (stats.partialSkipped) bits.push(`${stats.partialSkipped} partial already noted`);
     if (stats.updated) bits.push(`${stats.updated} updated${updateAmended.length ? ` (${updateAmended.length} appended as a dated amendment — too thin to replace its card)` : ''}`);
+    if (stats.repaired) bits.push(`${stats.repaired} repaired (a note 1.86.0 cut short, restored in place)`);
     if (stats.merged) bits.push(`${stats.merged} merged`);
     if (stats.closed) bits.push(`${stats.closed} closed`);
     if (stats.superseded) bits.push(`${stats.superseded} superseded`);
@@ -3498,7 +3644,10 @@ async function capture(lib) {
     // replaced, and a closes: that named no live card — say so, and how to
     // finish the job.
     if (typeof lib.formatCaptureReceipts === 'function') {
-        for (const line of lib.formatCaptureReceipts({ closedCards: stats.closedCards, updateAmended, closesKept: stats.closesKept }, { maxEach: 3 })) process.stderr.write(`[brain] ${line}\n`);
+        for (const line of lib.formatCaptureReceipts({ closedCards: stats.closedCards, updateAmended, closesKept: stats.closesKept, stubRepairs: stats.stubRepairs }, { maxEach: 3 })) process.stderr.write(`[brain] ${line}\n`);
+        if (Array.isArray(stats.stubRepairMissing) && stats.stubRepairMissing.length) {
+            process.stderr.write(`[brain] ${stats.stubRepairMissing.length} marker(s) an older hook already landed cut short were NOT re-added: that card is no longer live (archived, superseded or edited since) — e.g. "${stats.stubRepairMissing[0].stub}"\n`);
+        }
         // …and the MODEL has to hear the ones that need a re-emit: a Stop
         // hook's exit-0 stderr never reaches it, so these go to a sidecar the
         // next prompt prints once (captureReceiptsFooter).
@@ -4059,7 +4208,11 @@ async function promptRetrieve(lib) {
     if (!repeats.length && !freshHits.length && !peers && !inflight && !messages && !drafts && !findings && !statusMd && !capReceipts) return; // nothing → zero output, zero added context
     const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
     const day = (ts) => ts ? new Date(ts).toISOString().slice(0, 10) : '';
-    const head = (c, n = 120) => { const t = flat(c.text); return t.length > n ? t.slice(0, n - 1) + '…' : t; };
+    // A card's newest (~ amended …) line leads its preview (1.86.1): a thin ~ is
+    // appended UNDER the claim it corrects, and 120 characters of head showed
+    // only the stale claim. Skew-safe: an older klypix-format has no helper.
+    const previewOf = (t) => (typeof lib.amendmentFirst === 'function' ? lib.amendmentFirst(t) : t);
+    const head = (c, n = 120) => { const t = flat(previewOf(c.text)); return t.length > n ? t.slice(0, n - 1) + '…' : t; };
     const lines = [];
     if (statusMd) lines.push(statusMd);
     if (repeats.length) {
@@ -4634,11 +4787,11 @@ async function read(lib) {
     // The FULL brief: tiered brief + every self-heal/health footer. Messages are
     // deliberately NOT part of it: messageFooter advances durable offer/ack state
     // and must only go to stdout where the receiving model can see the exact token.
-    // Capture receipts an ended session never saw (its final Stop), or this
-    // session's own on a resume — once, then marked shown (1.86.1).
-    const capReceipts = captureReceiptsFooter(input.session_id, { sessionStart: true });
+    // Capture receipts an ENDED session never saw (its final Stop) are adopted
+    // by this session and printed on its first prompt — never here, past the
+    // preview (1.86.1; see adoptCaptureReceipts).
+    adoptCaptureReceipts(input.session_id);
     const full = ((typeof lib.structToBrief === 'function') ? lib.structToBrief(struct, { freshness, summary }) : lib.structToMarkdown(struct))
-        + capReceipts
         + inflightFooter(input.session_id, struct) + selfHealFooter(drifted) + reconcileFooter(lib, struct) + staleOpenFooter(stale)
         + ruleDraftsFooter(input.session_id, struct, { markShown: false })
         + receiptLine + selfCheckFooter() + doctorFooter() + versionCurrencyFooter() + legendFooter() + memoryFooter();
@@ -4689,7 +4842,7 @@ async function read(lib) {
     // then replayed until explicit token-bound consumption. They go right after
     // the ultra brief, never after footers that could push them past a preview cut.
     const messages = messageFooter(input.session_id || '', input.transcript_path, lib);
-    const out = ultra + messages + capReceipts + presenceLine + shipObsLine + gitHookNotice + laneWarning + healLine + draftLine
+    const out = ultra + messages + presenceLine + shipObsLine + gitHookNotice + laneWarning + healLine + draftLine
         + receiptLine
         + inflightFooter(input.session_id, struct)
         + selfCheckFooter() + doctorFooter() + versionCurrencyFooter();

@@ -11,11 +11,14 @@
 //
 //   R1  a ✓ that only partially covers a clause writes the note once, the
 //       card stays open, and the ledger says `resolve-partial`.
-//   R2  THE POINT: replaying the SAME marker on the next Stop changes nothing,
+//   R2  THE POINT: the next Stop re-reads the same transcript line and
+//       changes nothing — since 1.86.1 one ~ / ✓ transcript line applies
+//       once (ledger `skipped-applied`). The SAME ✓ text in a NEW turn
+//       reaches the engine, which skips the note the card already carries:
 //       the stderr receipt says "✔ partial already noted", and the ledger
 //       entry reads `resolve-partial-skipped`, not `resolve`.
-//   R3  the bypass itself is intact — the marker was never dropped as
-//       `skipped-seen`, which is what would break the self-heal loop.
+//   R3  the bypass itself is intact — a new ✓ with the same text was never
+//       dropped as `skipped-seen`, which is what would break the self-heal loop.
 //   R4  a ✓ that resolves WHOLE still reads `resolve` and archives.
 //   R5  one ✓ can hit several near-tie twins, so the ledger reports the
 //       STRONGEST outcome — an archive is never filed as a skipped partial.
@@ -58,7 +61,7 @@ const WHOLE = '🧠 BRAIN [Canvas] ✓: the capsule header auto-fit clipping at 
 const transcript = path.join(home, 'transcript.jsonl');
 const writeTranscript = (texts) => fs.writeFileSync(
   transcript,
-  texts.map(t => JSON.stringify({ message: { role: 'assistant', content: [{ type: 'text', text: t }] } })).join('\n') + '\n',
+  texts.map((t, i) => JSON.stringify({ uuid: `turn-${i}-${t.length}`, message: { role: 'assistant', content: [{ type: 'text', text: t }] } })).join('\n') + '\n',
 );
 
 // The hook writes its receipts to stderr and exits 0, so spawnSync (not
@@ -95,15 +98,22 @@ ok(decisions().some(d => d.action === 'resolve-partial'), `R1 the ledger records
 ok(!/partial already noted/.test(err1), 'R1 nothing is reported as already noted on the first pass');
 
 // ── R2/R3 — the SAME marker on the next Stop ────────────────────────────────
+spawnCapture('r2-replay');
+const replayed = await cardText();
+ok(partialNoteRuns(replayed.card.text).length === 1 && flat(replayed.card.text) === flat(first.card.text),
+  'R2 the next Stop re-reads the same transcript line and changes nothing');
+ok(decisions().some(d => d.action === 'skipped-applied' && /arrow tool/.test(d.preview || '')), 'R2 …and the ledger says that line was already applied (skipped-applied)');
+// The SAME ✓ text in a NEW turn is a new marker: it reaches the engine.
+writeTranscript([`Wired the arrow tool.\n${MARKER}`, `Re-checked it.\n${MARKER}`]);
 const err2 = spawnCapture('r2');
 const second = await cardText();
-ok(partialNoteRuns(second.card.text).length === 1, `R2 THE POINT: still ONE ✔ partial note after the replay (${partialNoteRuns(second.card.text).length})`);
-ok(flat(second.card.text) === flat(first.card.text), 'R2 the card content is unchanged by the replay');
+ok(partialNoteRuns(second.card.text).length === 1, `R2 THE POINT: still ONE ✔ partial note after the repeat (${partialNoteRuns(second.card.text).length})`);
+ok(flat(second.card.text) === flat(first.card.text), 'R2 the card content is unchanged by the repeat');
 ok(/✔ partial already noted/.test(err2), `R2 the stderr receipt says what happened [${(err2.split('\n').find(l => /partial already noted/.test(l)) || '').slice(0, 120)}]`);
 ok(/nothing was re-stamped/i.test(err2), 'R2 …and says explicitly that nothing was re-stamped');
 const after = decisions();
 ok(after.some(d => d.action === 'resolve-partial-skipped'), 'R2 the ledger action is `resolve-partial-skipped`, not `resolve`');
-ok(!after.some(d => d.action === 'skipped-seen' && /arrow tool/.test(d.preview || '')), 'R3 the ✓ was NOT dropped by the seen-dedup — the bypass is intact');
+ok(!after.some(d => d.action === 'skipped-seen' && /arrow tool/.test(d.preview || '')), 'R3 the repeated ✓ was NOT dropped by the text dedup — the bypass is intact');
 
 // ── R4 — a whole resolve still reads `resolve` ──────────────────────────────
 {

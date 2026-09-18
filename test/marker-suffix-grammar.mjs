@@ -35,7 +35,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
-import { execFileSync } from 'child_process';
+import { execFileSync, spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 
 const SRC = new URL('../src/', import.meta.url);
@@ -60,6 +60,7 @@ const { buildKlypixMap, parseKlypix, captureIntoBrain, formatCaptureReceipts, pa
 
 const home = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-grammar-home-'));
 const proj = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-grammar-proj-'));
+const extraDirs = [];
 
 try {
   // ── G1 — prose is never a suffix ──────────────────────────────────────────
@@ -141,9 +142,18 @@ try {
     'G2 closes: is free text — an UNanchored one, with the full sentence for capture to fall back to (C1 below)');
   ok(splitMarkerSuffixes('Shipped the retry. closes: Upload retry question').closesAnchored === true
     && splitMarkerSuffixes('Shipped the retry closes: [[Upload retry question]]').closesAnchored === true
-    && splitMarkerSuffixes('Shipped the retry closes: Upload retry question ev: src/retry.mjs').closesAnchored === true
+    && splitMarkerSuffixes('Shipped the retry. closes: Upload retry question ev: src/retry.mjs').closesAnchored === true
+    && splitMarkerSuffixes('Shipped the retry ev: src/retry.mjs closes: Upload retry question').closesAnchored === true
     && splitMarkerSuffixes('The resolver treats closes: [[wikilinks]] as exact titles now').closesAnchored === false,
-    'G2 closesAnchored: after a clause boundary, a lone [[wikilink]], or a well-formed sibling — not a wikilink inside prose');
+    'G2 closesAnchored: after a clause boundary, after another well-formed suffix, or a lone [[wikilink]] — not a wikilink inside prose');
+  // Review 2026-09-18 (F2): a well-formed ev: AFTER a prose closes: proves
+  // nothing about the closes: — the documented marker shape "… ev: <file>" is
+  // exactly when agents follow instructions, and it archived unrelated cards.
+  const proseCloseEv = splitMarkerSuffixes('The resolver now treats closes: targets as exact titles ev: src/klypix-format.mjs');
+  ok(proseCloseEv.closesAnchored === false && proseCloseEv.evidence?.[0]?.ref === 'src/klypix-format.mjs'
+    && proseCloseEv.bodyWithCloses === 'The resolver now treats closes: targets as exact titles'
+    && splitMarkerSuffixes('Shipped the retry closes: Upload retry question ev: src/retry.mjs').closesAnchored === false,
+    'G2 a prose closes: followed by a well-formed ev: is NOT anchored (only what comes before a closes: anchors it)');
   // Review round 2: one malformed segment no longer cancels the others.
   const foldQ = splitMarkerSuffixes('Pan hand tool moved into the main toolbar closes: Canvas navigation ev: src/canvas/Toolbar.tsx q: how do I pan the canvas');
   ok(foldQ.closes === 'Canvas navigation' && foldQ.evidence?.[0]?.ref === 'src/canvas/Toolbar.tsx' && !foldQ.question
@@ -227,6 +237,41 @@ try {
   ok(clear('Release checklist now makes every agent verify: the tag, the npm version and the desktop bundle'),
     'G3 …but a sentence that uses "verify:" as a verb is not refused (the reader derives nothing from it)');
   ok(clear('gate `npm run verify:mcp` is green'), 'G3 …nor an npm script name');
+  // Review 2026-09-18 (R7): an AUTHORED line break (brain_note text, the app)
+  // that falls where wrapText would also have broken must not glue the next
+  // sentence onto the command; a wrapped long command still reads whole, and a
+  // wrapped prose "verify:" sentence still derives nothing.
+  ok(parseVerifySuffix('Gate probe verify: gh run list -L 5\nOwner release lane weekly') === 'gh run list -L 5'
+    && parseVerifySuffix('Health probe verify: curl -sf /api/up\nNightly window returns 503 by design') === 'curl -sf /api/up',
+    'G3 a typed break before a new sentence ends the probe (never "gh run list -L 5 Owner release lane weekly")');
+  {
+    const buf = await buildKlypixMap({ title: 'brain', areas: [{ title: 'Rel', cards: [{ text: 'Rel: unrelated seed card about the lint rules' }] }] });
+    const { buffer } = await captureIntoBrain(buf, { cards: [
+      { text: 'Rel: 🏁 build 26 uploaded and the notes were posted verify: gh run list --workflow publish.yml --limit 5\n#rel', area: 'Rel' },
+      { text: 'Rel: Release gate now requires agents verify: npm view klypix-mcp version matches the tag before announcing\n#rel', area: 'Rel' },
+    ] });
+    const { struct } = await parseKlypix(buffer);
+    const longCmd = struct.cards.find((c) => /build 26 uploaded/.test(flat(c.text)));
+    const proseCmd = struct.cards.find((c) => /Release gate now requires/.test(flat(c.text)));
+    ok(/\n/.test(longCmd.text) && longCmd.verify === 'gh run list --workflow publish.yml --limit 5', `G3 a hard-wrapped long command still reads whole [${longCmd.verify}]`);
+    ok(/\n/.test(proseCmd.text) && !proseCmd.verify, 'G3 a hard-wrapped prose "verify:" sentence still derives nothing');
+  }
+  {
+    // The explicit clear holds (R7): the reader used to derive the probe back
+    // from the prose of a card whose verify a ~ had just cleared.
+    const text = 'Smoke probe verify: npm run smoke:ci\nDeploys happen after the gate passes';
+    const buf = await buildKlypixMap({ title: 'brain', areas: [{ title: 'Smoke', cards: [{ text: `Smoke: ${text}` }] }] });
+    const { struct: s0 } = await parseKlypix(buf);
+    const before = s0.cards.find((c) => /Smoke probe verify/.test(flat(c.text)));
+    const { stats, buffer } = await captureIntoBrain(buf, { updates: [{ area: 'Smoke', text, verify: '' }] });
+    const { struct, zip } = await parseKlypix(buffer);
+    const card = struct.cards.find((c) => c.id === before.id);
+    const raw = JSON.parse(await zip.file(Object.keys(zip.files).find((n) => n.endsWith(`/${card.id}.json`))).async('string'));
+    ok(before.verify === 'npm run smoke:ci' && stats.updated === 1 && raw.verify === '' && card.verify === null,
+      `G3 an explicit verify clear is PERSISTED as "" and the reader derives nothing from the prose after it [${JSON.stringify(card.verify)}]`);
+  }
+  ok(parseVerifySuffix('A card with no probe key at all, wrapped\nacross two lines') === null && parseVerifySuffix('') === null,
+    'G3 a card that never says "verify:" is answered on the fast path (null)');
 
   // ── U1 — the ~ update floor ────────────────────────────────────────────────
   const seed = () => buildKlypixMap({
@@ -342,6 +387,103 @@ try {
     && fmt.cardAlreadySays('Paths: see src/canvas/interaction/ConnectionPale\ntteOverlay.tsx for it', 'src/canvas/interaction/ConnectionPaletteOverlay.tsx'),
     'U1 cardAlreadySays is word-bounded ("port 51" is not in "port 5173") and reads a mid-word wrap');
   {
+    // Review 2026-09-18 (F1/R1): an amendment that mixes ordinary words with a
+    // token longer than a card line (a path, a URL, a 40-char SHA) is stored
+    // with BOTH kinds of wrap break — reading every break as a space, or every
+    // break as nothing, never rebuilt it, so the same thin ~ re-appended itself
+    // at every Stop and re-dated the card.
+    const cases = [
+      ['Dev', 'Dev: The dev server port is configured in vite.config.ts and electron waits on it before launching the overlay; strictPort stays true so a busy port fails loudly', 'Dev port now set in electron/config/devServerPortSettings.ts', 'now set in electron/config/devServerPortSettings'],
+      ['Store', 'Store: Stripe checkout plan is configured in the billing settings page with monthly and annual prices and a coupon field', 'Stripe checkout plan moved to https://p.io/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p', null],
+      ['Release', 'Release: Release installer builds are produced by the publish workflow on every tag and uploaded to the GitHub release with checksums', 'Release installer builds pinned at 3f9a1c2e4b5d6f708192a3b4c5d6e7f8091a2b3c', null],
+    ];
+    for (const [area, cardText, thin, headOfToken] of cases) {
+      let buf = await buildKlypixMap({ title: 'brain', areas: [{ title: area, cards: [{ text: cardText }] }] });
+      const { struct: s0 } = await parseKlypix(buf);
+      const { id, createdAt: born } = live(s0)[0];
+      const runs = [];
+      for (let i = 0; i < 3; i++) {
+        const r = await captureIntoBrain(buf, { updates: [{ area, text: thin, createdVia: 'claude-code' }] });
+        buf = r.buffer; runs.push(r.stats);
+      }
+      const { struct } = await parseKlypix(buf);
+      const card = struct.cards.find((c) => c.id === id);
+      const lines = card.text.split('\n');
+      const mixed = lines.some((l) => l.length === 37 && !/\s/.test(l)) && lines.some((l) => /^\(~ amended/.test(l) && !l.includes(')'));
+      ok(mixed && amendments(card.text) === 1 && runs[0].updateAmended?.length === 1
+        && runs.slice(1).every((s) => !s.updateAmended && s.updateUnchanged?.length === 1 && s.updated === 0),
+        `U1 a thin ~ carrying a long token (${area}) is appended ONCE over 3 captures, then "already says" (${amendments(card.text)} line(s))`);
+      ok(card.createdAt === born, `U1 …and the amendment never re-dates the claim it sits under (${area})`);
+      if (headOfToken) ok(!fmt.cardAlreadySays(card.text, headOfToken), `U1 …while the HEAD of a wrapped long token is not "said" (${area})`);
+    }
+  }
+  {
+    // Review 2026-09-18 (F5): an amendment leaves the claim's own metadata
+    // alone and keeps its own evidence at the 16-ref cap.
+    const seedBuf = await buildKlypixMap({ title: 'brain', areas: [{ title: 'Deploy', cards: [{ text: 'Deploy: lint runs before tests in the pipeline' }] }] });
+    const ev16 = Array.from({ length: 16 }, (_, i) => ({ kind: 'file', ref: `docs/deploy-${i}.md` }));
+    const seeded = await captureIntoBrain(seedBuf, { cards: [{ text: 'Deploy: 🏁 Production deploy runs from the release branch through the publish workflow with manual approval and a canary stage\n#deploy', area: 'Deploy', borderColor: 'rgba(59,130,246,0.8)', createdVia: 'cli', evidence: ev16, verify: 'gh workflow view publish' }] });
+    const { struct: s0, zip: z0 } = await parseKlypix(seeded.buffer);
+    const ms = s0.cards.find((c) => /Production deploy runs/.test(flat(c.text)));
+    const rawOf = async (zip, id) => JSON.parse(await zip.file(Object.keys(zip.files).find((n) => n.endsWith(`/${id}.json`))).async('string'));
+    const j0 = await rawOf(z0, ms.id);
+    const { stats, buffer } = await captureIntoBrain(seeded.buffer, { updates: [{ area: 'Deploy', text: 'Production deploy now runs from main', createdVia: 'claude-code', evidence: [{ kind: 'file', ref: 'deploy/main-pipeline.yml' }], verify: 'gh run list' }] });
+    const { zip } = await parseKlypix(buffer);
+    const j1 = await rawOf(zip, ms.id);
+    ok(stats.updateAmended?.length === 1 && j1.content.includes('(~ amended'), 'U1 (setup) the thin ~ was appended to the 🏁 card');
+    ok(j1.verify === 'gh workflow view publish' && j1.createdAt === j0.createdAt && j1.borderColor === j0.borderColor && j1.createdVia === 'cli',
+      'U1 an amendment keeps the claim\'s verify, createdAt, border colour and createdVia');
+    ok(j1.evidence.length === 16 && j1.evidence[0].ref === 'deploy/main-pipeline.yml' && stats.updateAmended[0].evidenceDropped === 1
+      && formatCaptureReceipts(stats).some((l) => /oldest were dropped/.test(l)),
+      'U1 …its own evidence survives the 16-ref cap (the amendment\'s refs first) and the drop is reported');
+  }
+  {
+    // Review 2026-09-18 (R6a): a thin ~ and then a full ~ for the same card in
+    // ONE batch leave no amendment behind — and must not report one.
+    const buf = await seed();
+    const { struct: s0 } = await parseKlypix(buf);
+    const support = s0.cards.find((c) => /one long list/.test(c.text));
+    const r = await captureIntoBrain(buf, { updates: [
+      { area: 'Support', text: 'Support page layout now uses' },
+      { area: 'Support', text: 'Support page layout now uses Q: and A: pairs grouped by plan instead of one long list' },
+    ] });
+    const { struct } = await parseKlypix(r.buffer);
+    ok(!r.stats.updateAmended && amendments(struct.cards.find((c) => c.id === support.id).text) === 0 && !formatCaptureReceipts(r.stats).some((l) => /appended, not replaced/.test(l)),
+      'U1 an amendment a later full ~ in the same batch replaced is not reported as "appended"');
+  }
+  {
+    // Review 2026-09-18 (F6): previews lead with the newest amendment — the
+    // stale claim still heads the stored card, and ~120 characters of head
+    // never reached the correction.
+    const stored = 'Dev: The dev server port is configured in\nvite.config.ts and electron waits on it\n#dev\n(~ amended 2026-09-17: port was 5174)\n(~ amended 2026-09-18: Dev port now set in\nelectron/config/devServerPortSettings\n.ts)';
+    const lead = fmt.amendmentFirst(stored);
+    ok(lead.startsWith('(~ amended 2026-09-18: Dev port now set in electron/config/devServerPortSettings.ts)\nDev: The dev server port')
+      && lead.includes('(~ amended 2026-09-17: port was 5174)') && fmt.amendmentFirst('Dev: no amendment here') === 'Dev: no amendment here',
+      'U1 amendmentFirst puts the newest amendment (rejoined across its wrap) ahead of the claim, and leaves other cards alone');
+    const q = { text: 'Support: ❓ Should support macros be localized for Arabic agents, and who owns the translations for the help center articles?\n(~ amended 2026-09-18: owner is the support lead)', area: 'Support' };
+    const ultra = fmt.structToUltraBrief({ title: 'brain', counts: { cards: 1, connections: 0 }, cards: [{ id: 'q1', type: 'text', area: 'Support', createdAt: Date.now(), ...q }], connections: [] });
+    ok(/owner is the support lead/.test(ultra), 'U1 the ultra brief shows the amendment of a long open question');
+  }
+  {
+    // STUB REPAIR (engine): the stub a 1.86.0 cut left is rewritten in place;
+    // an ev: / verify: 1.86.0 read out of the very prose it cut is dropped, and
+    // metadata this text does not name is kept.
+    const base = await buildKlypixMap({ title: 'brain', areas: [{ title: 'Rel', cards: [{ text: 'Rel: unrelated seed card about the lint rules' }] }] });
+    const seeded = await captureIntoBrain(base, { cards: [{ text: 'Rel: 🛠️ Every agent must\n#rel', area: 'Rel', verify: 'the npm tag and the desktop bundle before announcing', evidence: [{ kind: 'file', ref: 'docs/release.md' }] }] });
+    const { struct: s0 } = await parseKlypix(seeded.buffer);
+    const stub = s0.cards.find((c) => /Every agent must/.test(flat(c.text)));
+    const full = 'Rel: 🛠️ Every agent must verify: the npm tag and the desktop bundle before announcing\n#rel';
+    const { stats, buffer } = await captureIntoBrain(seeded.buffer, { cards: [{ text: full, area: 'Rel', repairStub: 'Every agent must' }] });
+    const { struct } = await parseKlypix(buffer);
+    const card = struct.cards.find((c) => c.id === stub.id);
+    ok(stats.repaired === 1 && stats.stubRepairs?.[0]?.id === stub.id && flat(card.text).startsWith(flat(full).replace(/ #rel$/, ''))
+      && live(struct).length === live(s0).length && !card.verify && (card.evidence || []).some((e) => e.ref === 'docs/release.md'),
+      'U1 a stub is repaired in place: full text, no junk verify read from its own prose, unrelated evidence kept, no second card');
+    const again = await captureIntoBrain(buffer, { cards: [{ text: full, area: 'Rel', repairStub: 'Every agent must' }] });
+    ok(!again.stats.repaired && again.stats.stubRepairMissing?.length === 1 && again.stats.added === 0,
+      'U1 with no live stub left, a repair lands nothing (reported as stubRepairMissing)');
+  }
+  {
     // An amendment line ENDS a ✔ partial note run, so the note keeps its
     // identity and a re-harvested ✓ is still recognised as already noted.
     const text = 'Release: 🏁 1.2 shipped — remaining: docs + changelog\n✔ partial 2026-09-18: docs updated — still open: changelog\n(~ amended 2026-09-18: npm tag is latest)';
@@ -456,11 +598,88 @@ try {
       { text: 'Brain: ❓ Should the uploader retry on a 429 or back off entirely' },
       { text: 'Brain: ❓ Uploader should retry or back off entirely on 429s?' },
     ] }] });
-    const { stats } = await captureIntoBrain(buf, {
+    const close = (anchored) => captureIntoBrain(buf, {
       cards: [{ text: 'Brain: 🏁 uploader backs off\n#brain', area: 'Brain', closes: 'Should the uploader retry on a 429 or back off entirely',
-        closesFallbackText: 'Brain: 🏁 uploader backs off closes: Should the uploader retry on a 429 or back off entirely\n#brain', closesAnchored: false }],
+        closesFallbackText: 'Brain: 🏁 uploader backs off closes: Should the uploader retry on a 429 or back off entirely\n#brain', closesAnchored: anchored }],
     });
-    ok(stats.closed === 2, `C1 an unanchored closes: naming a ❓ by title still closes it AND its paraphrased twin (closed=${stats.closed})`);
+    const unanchored = await close(false);
+    ok(unanchored.stats.closed === 1 && unanchored.stats.closedCards?.[0]?.title?.startsWith('Brain: ❓ Should the uploader'),
+      `C1 an UNanchored closes: closes only the ❓ it NAMES by title — its paraphrased twin stays open, visibly (closed=${unanchored.stats.closed})`);
+    const anchored = await close(true);
+    ok(anchored.stats.closed === 2, `C1 an ANCHORED closes: naming a ❓ by title still closes it AND its paraphrased twin (closed=${anchored.stats.closed})`);
+  }
+  {
+    // Review 2026-09-18 (F4): a strict close that names ONE card by title
+    // archived every other card that merely carried all the target's words.
+    // Stored as capture stores them: hard-wrapped, so a card's title is its
+    // first line (wrapText output, written out).
+    const buf = await buildKlypixMap({ title: 'brain', areas: [
+      { title: 'Brain', cards: [
+        { text: 'Brain: Merge driver container dedup' },
+        { text: 'Brain: ❓ Does the merge driver\ncontainer dedup lose edges when two\ncontainers collapse into one?' },
+      ] },
+      { title: 'Canvas', cards: [{ text: 'Canvas: container dedup inside the\nmerge driver path is slow on big\nbrains, 4 s on 3k cards' }] },
+    ] });
+    const { stats, buffer } = await captureIntoBrain(buf, {
+      cards: [{ text: 'Brain: The gardener pass\n#brain', area: 'Brain', closes: 'merge driver container dedup',
+        closesFallbackText: 'Brain: The gardener pass closes: merge driver container dedup\n#brain', closesAnchored: false }],
+    });
+    const { struct } = await parseKlypix(buffer);
+    ok(stats.closed === 1 && liveText(struct, /Does the merge driver container dedup/).length === 1 && liveText(struct, /inside the merge driver path/).length === 1,
+      `C1 a strict close archives only the card it names by title, not the ones that merely carry its words (closed=${stats.closed})`);
+  }
+  {
+    // Review 2026-09-18 (F2), through the hook's own parse: the documented
+    // marker shape "… closes: … ev: <file>" with a PROSE closes: archived four
+    // unrelated live cards by word coverage.
+    const buf = await buildKlypixMap({ title: 'brain', areas: [
+      { title: 'Ship', cards: [{ text: 'Ship: 🏁 Exact titles for release targets shipped in the resolver lane' }] },
+      { title: 'Brain', cards: [{ text: 'Brain: the merge driver keeps every card from both sides' }] },
+    ] });
+    const p = splitMarkerSuffixes('The resolver now treats closes: targets as exact titles ev: src/klypix-format.mjs');
+    const { stats, buffer } = await captureIntoBrain(buf, {
+      cards: [{ text: `Brain: ${p.body}\n#brain`, area: 'Brain', closes: p.closes, closesFallbackText: `Brain: ${p.bodyWithCloses}\n#brain`, closesAnchored: p.closesAnchored, evidence: p.evidence }],
+    });
+    const { struct } = await parseKlypix(buffer);
+    ok(stats.closed === 0 && liveText(struct, /Exact titles for release targets/).length === 1
+      && liveText(struct, /^Brain: The resolver now treats closes: targets as exact titles/).length === 1,
+      'C1 a prose closes: followed by an ev: archives no card it only covers by words, and the whole sentence lands');
+    const control = await captureIntoBrain(buf, {
+      cards: [{ text: 'Brain: The resolver ships.\n#brain', area: 'Brain', closes: p.closes, closesFallbackText: 'Brain: The resolver ships. closes: targets as exact titles\n#brain', closesAnchored: true }],
+    });
+    ok(control.stats.closed === 1, 'C1 (control) the same target after a clause boundary still closes by coverage — the setup exercises the coverage path');
+  }
+  {
+    // Review 2026-09-18 (F8): an ANCHORED close whose named card is already
+    // closed must not fall through to word coverage on unrelated live cards
+    // (corpus replay: "closes: PR #153 needs founder Merge click." archived
+    // "🏁 Overlap story CLOSED 100%").
+    const buf = await buildKlypixMap({ title: 'brain', areas: [
+      { title: 'Canvas', cards: [{ text: 'Canvas: 🏁 Overlap story CLOSED 100% — one-click merge-brains after the founder ruling; needs one dev restart' }] },
+      { title: 'Archive', cards: [{ text: 'Release: PR #153 needs founder Merge click.\n✅ 2026-09-01: closed by → merged' }] },
+    ] });
+    const { stats, buffer } = await captureIntoBrain(buf, {
+      cards: [{ text: 'Release: 🏁 Merged it.\n#release', area: 'Release', closes: 'PR #153 needs founder Merge click.',
+        closesFallbackText: 'Release: 🏁 Merged it. closes: PR #153 needs founder Merge click.\n#release', closesAnchored: true }],
+    });
+    const { struct } = await parseKlypix(buffer);
+    ok(stats.closed === 0 && liveText(struct, /Overlap story CLOSED/).length === 1 && stats.closesKept?.[0]?.alreadyClosed
+      && formatCaptureReceipts(stats).some((l) => /already closed/.test(l)),
+      'C1 a close that names an already-closed card archives nothing else by word coverage, and says so');
+    const noArchive = await buildKlypixMap({ title: 'brain', areas: [
+      { title: 'Canvas', cards: [{ text: 'Canvas: 🏁 Overlap story CLOSED 100% — one-click merge-brains after the founder ruling; needs one dev restart' }] },
+    ] });
+    const control = await captureIntoBrain(noArchive, {
+      cards: [{ text: 'Release: 🏁 Merged it.\n#release', area: 'Release', closes: 'PR #153 needs founder Merge click.',
+        closesFallbackText: 'Release: 🏁 Merged it. closes: PR #153 needs founder Merge click.\n#release', closesAnchored: true }],
+    });
+    ok(control.stats.closed === 1, 'C1 (control) with no closed card named, the same anchored target closes by coverage — the setup exercises that path');
+  }
+  {
+    // Review 2026-09-18: 4 cards closed, 3 named — the receipt never hides a remainder.
+    const lines = formatCaptureReceipts({ closedCards: [1, 2, 3, 4].map((n) => ({ id: `c${n}`, title: `card ${n}`, target: 't' })) }, { maxEach: 3 });
+    ok(lines.filter((l) => /archived \(id c\d\)/.test(l)).length === 3 && lines.some((l) => /and 1 more card archived by closes: \(id c4\)/.test(l)),
+      'C1 every archived card is named in the receipts, the fourth one on an overflow line');
   }
   {
     const buf = await closeSeed();
@@ -589,11 +808,197 @@ try {
   ok((allOut.match(/suffix kept as card text: "q: pan tool location\?"/g) || []).length === 1, 'E1 the kept-suffix receipt reaches the model exactly once');
   ok(!/Brain capture —/.test(prompts[3]), 'E1 once shown, the receipts do not repeat');
   if (stderr) console.log(stderr);
+
+  // ── E2 — re-harvest, upgrade and stub repair through the real Stop hook ───
+  // Review 2026-09-18: Stop re-reads the WHOLE transcript, so (R6/F7) one ~ / ✓
+  // line must apply once, (F1) a thin ~ naming a long token must never stack,
+  // (F2) a prose closes: followed by an ev: must not archive by word coverage,
+  // and (R2/F3) a marker the published 1.86.0 hook already landed — keyed on
+  // the text it CUT — must not land again after the upgrade: its stub is
+  // repaired in place instead.
+  {
+    const home2 = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-grammar-home2-'));
+    const proj2 = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-grammar-proj2-'));
+    extraDirs.push(home2, proj2);
+    fs.mkdirSync(path.join(home2, '.claude', 'project-brain'), { recursive: true });
+    fs.writeFileSync(path.join(home2, '.claude', 'project-brain', '.npm-currency.json'), JSON.stringify({ pkg: 'klypix-mcp', latest: '99.0.0', checkedAt: Date.now() }));
+    fs.mkdirSync(path.join(proj2, '.claude'), { recursive: true });
+    const brain2 = path.join(proj2, 'brain.klypix');
+    fs.writeFileSync(brain2, await buildKlypixMap({
+      title: 'brain',
+      areas: [
+        { title: 'Dev', cards: [{ text: 'Dev: The dev server port is configured in vite.config.ts and electron waits on it before launching the overlay; strictPort stays true so a busy port fails loudly instead of drifting silently' }] },
+        { title: 'Ship', cards: [{ text: 'Ship: 🏁 Exact titles for release targets shipped in the resolver lane' }] },
+        { title: 'Deploy', cards: [
+          { text: 'Deploy: Production deploy runs from the release branch through the GitHub publish workflow job, gated by the canary ring and the rollout table' },
+          { text: 'Deploy: Staging deploy runs from main on every push through the preview workflow, no canary gate and no rollout row' },
+        ] },
+        // What 1.86.0 already landed for three of the markers below.
+        { title: 'Faq', cards: [{ text: 'Faq: Faq page gets a\n#faq' }] },
+        { title: 'Uploader', cards: [{ text: 'Uploader: 🏁 Uploader retry shipped\n#uploader' }] },
+        { title: 'Docs', cards: [{ text: 'Docs: Docs index uses a\n#docs' }] },
+        { title: 'Share', cards: [{ text: 'Share: Share page gets a\n#share' }] },
+        { title: 'Pair', cards: [{ text: 'Pair: Pair key treats\n#pair' }] },
+      ],
+    }));
+    const key186 = (type, area, cut) => crypto.createHash('sha1').update(`${type}|${area}|${cut}`.toLowerCase()).digest('hex').slice(0, 16);
+    fs.writeFileSync(path.join(proj2, '.claude', 'brain-capture-state.json'), JSON.stringify({ seen: [
+      key186('', 'Faq', 'Faq page gets a'),
+      key186('!', 'Uploader', 'Uploader retry shipped'),
+      key186('', 'Docs', 'Docs index uses a'),
+      key186('', 'Gone', 'Gone page gets a'),                 // its stub card is not live any more
+      key186('', 'Share', 'Share page gets a'),
+      key186('', 'Pair', 'Pair key treats'),
+    ] }));
+    const thinDev = '🧠 BRAIN [Dev] ~: Dev port now set in electron/config/devServerPortSettings.ts';
+    const turn1 = [
+      thinDev,
+      '🧠 BRAIN [Brain]: The resolver now treats closes: targets as exact titles ev: src/klypix-format.mjs',
+      '🧠 BRAIN [Faq]: Faq page gets a Q: and A: layout so billing questions read as a FAQ',
+      '🧠 BRAIN [Uploader] !: Uploader retry shipped q: backoff and jitter numbers',
+      '🧠 BRAIN [Docs]: Docs index uses a q: prefix for search terms ev: docs/search.md',
+      '🧠 BRAIN [Gone]: Gone page gets a Q: and A: section for refunds',
+      // Two different notes with the same words before the prose "Q:": 1.86.0
+      // landed the first as the stub and skipped the second as already seen.
+      '🧠 BRAIN [Share]: Share page gets a Q: and A: block for team invites',
+      '🧠 BRAIN [Share]: Share page gets a Q: prefix on every invite question',
+      // The same through the closes: key the grammar still cuts at.
+      '🧠 BRAIN [Pair]: Pair key treats closes: links as exact title matches rather than fuzzy overlap',
+      '🧠 BRAIN [Pair]: Pair key treats closes: targets case-insensitively after the grammar change',
+      '🧠 BRAIN [Deploy] ~: Production deploy now runs from main',
+    ];
+    const tp2 = path.join(home2, 't-e2.jsonl');
+    const entries = [
+      { type: 'user', uuid: 'u-1', message: { role: 'user', content: 'wire the dev port and ship the uploader retry' } },
+      { type: 'assistant', uuid: 'a-1', message: { role: 'assistant', content: [{ type: 'text', text: `Done.\n\n${turn1.join('\n')}` }] } },
+    ];
+    const writeT = () => fs.writeFileSync(tp2, entries.map((e) => JSON.stringify(e)).join('\n') + '\n');
+    const env2 = { ...process.env, HOME: home2, USERPROFILE: home2, KLYPIX_BRAIN_NUDGE: 'off', KLYPIX_AUTO_UPDATE: '0' };
+    delete env2.KLYPIX_BRAIN_NO_MAIN;
+    const stop2 = () => spawnSync(process.execPath, [HOOK, '--capture'], { cwd: proj2, env: env2, encoding: 'utf8', input: JSON.stringify({ session_id: 'grammar-e2', transcript_path: tp2 }) });
+    const snap = async () => (await parseKlypix(fs.readFileSync(brain2))).struct;
+    const ledger2 = () => { const f = path.join(proj2, '.claude', 'brain-capture-log.jsonl'); return fs.existsSync(f) ? fs.readFileSync(f, 'utf8') : ''; };
+    writeT();
+    const r1 = stop2();
+    ok(r1.status === 0, `E2 Stop 1 exits 0 (${r1.status})`);
+    const s1 = await snap();
+    const devOf = (s) => s.cards.find((c) => c.type !== 'container' && /dev server port is configured/.test(flat(c.text)));
+    const dev1 = devOf(s1);
+    ok(amendments(dev1.text) === 1, 'E2 Stop 1: the thin ~ naming a long path is appended once');
+    ok(liveText(s1, /Exact titles for release targets/).length === 1 && liveText(s1, /^Brain: The resolver now treats closes: targets as exact titles/).length === 1,
+      'E2 a prose closes: followed by an ev: archives nothing by word coverage; the whole sentence lands');
+    const faq = liveText(s1, /Faq page gets a/);
+    ok(faq.length === 1 && /^Faq: Faq page gets a Q: and A: layout so billing questions read as a FAQ/.test(faq[0]),
+      `E2 a 1.86.0 stub cut at a prose Q: is REPAIRED in place with the full text — one live card (${faq.length})`);
+    const up = liveText(s1, /Uploader retry shipped/);
+    ok(up.length === 1 && /^Uploader: 🏁 Uploader retry shipped q: backoff and jitter numbers/.test(up[0]),
+      `E2 a 1.86.0 stub cut at a malformed q: is repaired in place — one live milestone (${up.length})`);
+    const docs = liveText(s1, /Docs index uses a/);
+    const docsCard = s1.cards.find((c) => c.type !== 'container' && /Docs index uses a q: prefix/.test(flat(c.text)));
+    ok(docs.length === 1 && Boolean(docsCard) && (docsCard.evidence || []).some((e) => e.ref === 'docs/search.md'),
+      'E2 …and a repaired stub takes the marker\'s real evidence');
+    ok(liveText(s1, /Gone page gets a/).length === 0, 'E2 a marker 1.86.0 already landed whose card is gone is NOT re-added');
+    ok(liveText(s1, /^Share: Share page gets a Q: and A: block for team invites/).length === 1
+      && liveText(s1, /^Share: Share page gets a Q: prefix on every invite question/).length === 1 && liveText(s1, /^Share: Share page gets a( #|$)/).length === 0,
+      'E2 two notes 1.86.0 keyed as one: the first repairs the stub, the second (never captured) lands as its own card');
+    ok(liveText(s1, /links as exact title matches/).length === 0 && liveText(s1, /^Pair: Pair key treats closes: targets case-insensitively/).length === 1,
+      'E2 …and through a closes: cut: the first is already captured, the second lands');
+    ok(/"repair-stub"/.test(ledger2()) && /repaired/.test(r1.stderr || ''), 'E2 the ledger and the receipt say "repaired"');
+    const prodAmended = liveText(s1, /Production deploy runs from the release branch/);
+    ok(prodAmended.length === 1 && /now runs from main/.test(prodAmended[0]), 'E2 (setup) the thin Production ~ is appended to the Production card');
+    // Stops 2 and 3 re-read the same transcript: nothing changes.
+    const brainBytes1 = fs.readFileSync(brain2);
+    stop2(); stop2();
+    const s3 = await snap();
+    ok(amendments(devOf(s3).text) === 1 && devOf(s3).createdAt === dev1.createdAt, 'E2 Stops 2–3: still ONE amendment line, the card not re-dated');
+    ok(/"skipped-applied"/.test(ledger2()), 'E2 the re-read ~ lines are ledgered as skipped-applied');
+    ok(Buffer.compare(brainBytes1, fs.readFileSync(brain2)) === 0, 'E2 a re-read transcript leaves brain.klypix byte-identical');
+    // A NEW turn repeating the same thin ~ is a new marker — the engine sees the
+    // card already says it.
+    entries.push({ type: 'user', uuid: 'u-2', message: { role: 'user', content: 'again' } });
+    entries.push({ type: 'assistant', uuid: 'a-2', message: { role: 'assistant', content: [{ type: 'text', text: `Confirmed.\n\n${thinDev}` }] } });
+    // F7: the ✓ that retires the Production card, one Stop later.
+    entries.push({ type: 'assistant', uuid: 'a-3', message: { role: 'assistant', content: [{ type: 'text', text: 'Retired.\n\n🧠 BRAIN [Deploy] ✓: Production deploy runs from the release branch through the publish workflow — retired, replaced by tag pipeline' }] } });
+    writeT();
+    stop2(); stop2();
+    const s5 = await snap();
+    ok(amendments(devOf(s5).text) === 1 && /"update-already-says"/.test(ledger2()), 'E2 the same thin ~ in a NEW turn is "already says" — still one line');
+    const staging = s5.cards.find((c) => c.type !== 'container' && /Staging deploy runs from main/.test(flat(c.text)));
+    ok(Boolean(staging) && amendments(staging.text) === 0, 'E2 once its card is resolved, a re-read thin ~ never lands on ANOTHER card');
+  }
+
+  // ── E3 — receipts reach the author, or a session that replaced it ─────────
+  // Review 2026-09-18 (R3/R4/R5): a new session printed a LIVE session's
+  // receipts at SessionStart (past the ~2 KB preview) and marked them shown for
+  // everyone, so the author never saw them; an unwritable sidecar re-printed
+  // the same receipt on every prompt.
+  {
+    const home3 = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-grammar-home3-'));
+    const proj3 = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-grammar-proj3-'));
+    extraDirs.push(home3, proj3);
+    fs.mkdirSync(path.join(home3, '.claude', 'project-brain'), { recursive: true });
+    fs.writeFileSync(path.join(home3, '.claude', 'project-brain', '.npm-currency.json'), JSON.stringify({ pkg: 'klypix-mcp', latest: '99.0.0', checkedAt: Date.now() }));
+    fs.mkdirSync(path.join(proj3, '.claude'), { recursive: true });
+    fs.writeFileSync(path.join(proj3, 'brain.klypix'), await buildKlypixMap({ title: 'brain', areas: [{ title: 'Nav', cards: [{ text: 'Nav: Pan hand tool lives in the bottom status bar next to the zoom steppers' }] }] }));
+    const env3 = (hostPid) => {
+      const env = { ...process.env, HOME: home3, USERPROFILE: home3, KLYPIX_BRAIN_NUDGE: 'off', KLYPIX_AUTO_UPDATE: '0', CLAUDE_PID: String(hostPid) };
+      delete env.KLYPIX_BRAIN_NO_MAIN;
+      return env;
+    };
+    const hostA = process.pid, hostB = process.ppid || process.pid;
+    const run3 = (mode, input, hostPid) => spawnSync(process.execPath, [HOOK, ...(mode ? [mode] : [])], { cwd: proj3, env: env3(hostPid), encoding: 'utf8', input: JSON.stringify(input) });
+    let turn = 0;
+    const markerStop = (sid, marker, hostPid) => {
+      const tp = path.join(home3, `t-${sid}.jsonl`);
+      turn++;
+      fs.writeFileSync(tp, JSON.stringify({ type: 'assistant', uuid: `e3-${turn}`, message: { role: 'assistant', content: [{ type: 'text', text: `Done.\n\n${marker}` }] } }) + '\n');
+      return run3('--capture', { session_id: sid, transcript_path: tp }, hostPid);
+    };
+    const receiptsFile = path.join(proj3, '.claude', 'brain-rule-drafts.json');
+    const receipts = () => { try { return JSON.parse(fs.readFileSync(receiptsFile, 'utf8')).captureReceipts || []; } catch { return []; } };
+    const block = /Brain capture —/;
+    // A live author on another host keeps its receipt.
+    markerStop('sess-A', '🧠 BRAIN [Nav] !: Pan tool moved to the main toolbar ev: src/canvas/Toolbar.tsx q: pan tool location?', hostA);
+    ok(receipts().some((r) => r.sid === 'sess-A' && !r.shown), 'E3 (setup) session A has an unshown receipt');
+    const startB = run3('', { session_id: 'sess-B', source: 'startup' }, hostB);
+    ok(startB.status === 0 && !block.test(startB.stdout || ''), 'E3 SessionStart prints no receipts block (it would land past the preview)');
+    ok(!block.test(run3('--prompt', { session_id: 'sess-B', prompt: 'continue with the toolbar work' }, hostB).stdout || ''),
+      'E3 a new session on ANOTHER host does not take a LIVE session\'s receipts');
+    const promptA = run3('--prompt', { session_id: 'sess-A', prompt: 'continue with the toolbar work' }, hostA).stdout || '';
+    ok(/what your last 🧠 BRAIN markers actually did/.test(promptA) && /q: pan tool location\?/.test(promptA), 'E3 …the author sees its own receipt on its next prompt');
+    // A /clear in the SAME host replaces the conversation: its receipts move over at once.
+    markerStop('sess-A', '🧠 BRAIN [Nav] !: Zoom steppers moved beside the pan tool ev: src/canvas/Zoom.tsx q: zoom location?', hostA);
+    run3('', { session_id: 'sess-A2', source: 'clear' }, hostA);
+    const promptA2 = run3('--prompt', { session_id: 'sess-A2', prompt: 'continue with the toolbar work' }, hostA).stdout || '';
+    ok(/\(earlier session\) suffix kept as card text: "q: zoom location\?"/.test(promptA2) && /ended session/.test(promptA2),
+      'E3 after a /clear in the same host, the new session adopts the predecessor\'s receipt and prints it once, marked as from an earlier session');
+    ok(!block.test(run3('--prompt', { session_id: 'sess-A', prompt: 'continue' }, hostA).stdout || ''), 'E3 …and nobody prints it again');
+    // An author with no live lane row, unshown for 30+ minutes, is handed off.
+    markerStop('sess-C', '🧠 BRAIN [Nav] !: Minimap toggle moved into the view menu ev: src/canvas/ViewMenu.tsx q: minimap location?', hostB);
+    const sessDir = path.join(home3, '.claude', 'project-brain', 'sessions');
+    for (const f of fs.readdirSync(sessDir).filter((n) => /\.json$/.test(n))) {
+      const d = JSON.parse(fs.readFileSync(path.join(sessDir, f), 'utf8'));
+      if (Array.isArray(d.sessions)) { d.sessions = d.sessions.filter((s) => s.id !== 'sess-C'); fs.writeFileSync(path.join(sessDir, f), JSON.stringify(d)); }
+    }
+    const aged = JSON.parse(fs.readFileSync(receiptsFile, 'utf8'));
+    for (const r of aged.captureReceipts) if (r.sid === 'sess-C') r.ts = Date.now() - 31 * 60 * 1000;
+    fs.writeFileSync(receiptsFile, JSON.stringify(aged));
+    run3('', { session_id: 'sess-D', source: 'startup' }, hostA);
+    // R4: a shown-mark that cannot be persisted prints nothing (the lock is held).
+    const lockFile = `${receiptsFile}.lock`;
+    fs.writeFileSync(lockFile, 'held by the test');
+    const held = run3('--prompt', { session_id: 'sess-D', prompt: 'continue with the menus' }, hostA).stdout || '';
+    fs.rmSync(lockFile, { force: true });
+    ok(!block.test(held) && receipts().some((r) => r.sid === 'sess-D' && !r.shown), 'E3 a receipt whose shown-mark cannot be written is not printed, and stays pending');
+    const promptD = run3('--prompt', { session_id: 'sess-D', prompt: 'continue with the menus' }, hostA).stdout || '';
+    ok(/\(earlier session\) suffix kept as card text: "q: minimap location\?"/.test(promptD), 'E3 an ended session\'s receipt is adopted at the next SessionStart and printed on that session\'s prompt');
+    ok(!block.test(run3('--prompt', { session_id: 'sess-D', prompt: 'continue' }, hostA).stdout || ''), 'E3 …once');
+  }
 } catch (e) {
   console.error('✗ suite crashed:', e && e.stack || e);
   failures++;
 } finally {
-  for (const d of [home, proj]) { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* temp */ } }
+  for (const d of [home, proj, ...extraDirs]) { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* temp */ } }
 }
 
 if (failures) { console.error(`\n✗ ${failures} assertion(s) failed`); process.exit(1); }

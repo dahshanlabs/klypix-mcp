@@ -144,10 +144,11 @@ describe source provenance and change detection, never factual verification.
 `verify` is retained text, not executable configuration. All these optional fields
 survive the format codec and capture lifecycle; an explicit empty amendment clears them.
 A card without a `verify` field may still carry one in its text as a line-end
-`verify: <command>` suffix; the reference reader derives the field with the same grammar
-the capture hook uses (lowercase key followed by whitespace, trailing position, a
-command-shaped value), so prose such as `npm run verify:mcp` or "every agent verify: the
-tag" never becomes a probe.
+`verify: <command>` suffix (or a `verify: <command>` line of its own); the reference reader
+derives the field with the same grammar the capture hook uses (lowercase key followed by
+whitespace, trailing position, a command-shaped value with no prose after it), reading a
+hard-wrapped card as its unwrapped sentences, so prose such as `npm run verify:mcp` or
+"every agent verify: the tag" never becomes a probe.
 
 The optional **`author`** answers the question a team actually asks: `createdBy` says
 *what* wrote a card, `author` says *whose*. It is resolved from `git config user.name`

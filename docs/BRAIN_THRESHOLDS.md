@@ -24,6 +24,7 @@ release). If you change one, update this table and the snapshot-parity fixtures.
 | `RESOLVE_AT` | 0.3 | `klypix-format.mjs` `captureIntoBrain` | ✓ resolve floor; 1.17 resolves the best match **± 0.1 near-ties** (cap 3), not just the first |
 | `CLOSE_COVER_AT` | 0.6 | `klypix-format.mjs` `captureIntoBrain` | `closes:` coverage; 1.17 resolves **ALL** matches ≥ bar (cap 4), was first-match-and-break |
 | `UPDATE_AT` | 0.45 | `klypix-format.mjs` `captureIntoBrain` | ~ update in-place match |
+| `UPDATE_MIN_WORDS` | 6 (and ≥ half the card's) | `klypix-format.mjs` `isThinUpdate` | **new 1.86.1** — a ~ that would REPLACE its card needs ≥6 distinct content words (tokenSet: 4+ letters) OR at least half the card's own; thinner is refused — card untouched, text kept as a separate card that may not supersede or merge. Terse confirmations (append) and guard amendments are exempt |
 | recall `topK=5 / minScore=3` | — | `global-brain-hook.mjs` `promptRetrieve` | per-prompt task-matched recall |
 | body-score length norm | `min(1, 6/log2(bodyWords+1))` | `klypix-format.mjs` `scoreCardsAgainstQuery` | **new 1.17** — body hits scale down for cards over ~64 distinct words; title/tag hits untouched |
 | repeat `topK=2 / minScore=5 / minTokens=2` | — | `klypix-format.mjs` `detectRepeatWork` | repeat-work nudge floors |
@@ -44,6 +45,26 @@ release). If you change one, update this table and the snapshot-parity fixtures.
 
 Used in three places (deliberately the same): capture-side widened supersede,
 recall-side overlay (`correctionOverlaysFor`), and `detectContradictions`.
+
+## Marker suffix grammar (1.86.1)
+
+`parseMarkerSuffixText` — one block, byte-identical in `global-brain-hook.mjs` (marker
+capture) and `klypix-format.mjs` (`parseVerifySuffix`, the prose fallback for `verify`);
+`test/marker-suffix-grammar.mjs` fails if the copies drift.
+
+- Keys: `closes:` `ev:` `verify:` `q:` — lowercase only, whitespace before the key AND after
+  the colon. `Q:`, `FAQ:`, `q:auth`, `npm run verify:mcp` are text.
+- One run of suffixes that reaches the end of the line. The run may not start right after an
+  article / determiner / preposition / conjunction / auxiliary (`the ev:`, `a q:`, `to verify:`).
+- Value shapes: `ev:` every comma item is a PR shorthand or ≤4 words with a path, digit or
+  `.ext`; `verify:` starts with a known CLI, a PowerShell Verb-Noun, a path/script, a
+  hyphenated probe name, or is a tool given a `--flag`; `q:` starts with a question word
+  (English or Arabic) and ends with `?` / `؟`; `closes:` any text.
+- A run that breaks any rule is not a suffix run; the next key position is tried, and with none
+  left the whole line is the body.
+- `closes:` is free text, so capture carries the card as written WITH the segment
+  (`closesFallbackText`): a target that names no live card (`closeTierFor` empty) lands that
+  text and reports `stats.closesKept`, before merge/supersede run.
 
 ## Adversarial-review hardening (post-implementation, 21 confirmed findings)
 

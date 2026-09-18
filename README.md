@@ -381,6 +381,15 @@ same JSON on stdin, or `--evidence '<JSON array>'` and `--verify '<text>'`.
 On Claude Code, decisions are captured automatically at turn end from inline `🧠 BRAIN [Area]:`
 markers in the transcript, deduped, under a capture lock.
 
+A marker can end with optional suffixes, in any order: `closes: <card title or [[wikilink]]>`,
+`ev: <file[:line]>, PR#<n>`, `verify: <command>` and `q: <the question this answers?>`. They count
+only as one run at the very end of the line, written lowercase as `key: value`, and each value
+must have its key's shape: references for `ev:`, a command for `verify:`, a question (question
+word first, `?` last) for `q:`. Anything else is kept as card text, so "a Q: and A: layout" or
+"the ev: field" never cuts a note short. A `closes:` target that names no live card stays in the
+text instead of vanishing. A `~` update too thin to replace its card (fewer than six content words
+and under half the card's) leaves that card untouched and is kept beside it as a separate card.
+
 On every other host, capture is explicit: `brain_note` runs the same capture engine as the hooks —
 dedup, supersession, round-trip re-adoption receipts, `✓` resolve, `~` update in place, `+` skill,
 `closes:` — and stamps which agent wrote the card. A `✓` question preference ranks only candidates

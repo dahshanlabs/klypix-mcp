@@ -420,8 +420,51 @@ function reconcileFooter(lib, struct) {
 // project into two registry entries AND two parse-cache files.
 const normBrainPath = (p) => String(p).replace(/\\/g, '/').replace(/^[a-zA-Z]:/, (m) => m.toLowerCase());
 
+// The seen set is a FIFO capped at STATE_SEEN_MAX. Every Stop re-reads the
+// whole transcript, so a key is only safe to evict once no live transcript
+// still carries its line: a capture moves every key it HIT to the young end
+// (doCapture), and the cap leaves room for several busy sessions (review
+// 2026-09-18, third round: KLYPIX held 1,658 of 2,000, and a resumed old
+// session whose keys aged out re-applied its ~ lines over newer edits).
+const STATE_SEEN_MAX = 5000;
 const readState = () => { try { return new Set(JSON.parse(fs.readFileSync(STATE, 'utf8')).seen || []); } catch { return new Set(); } };
-const writeState = (seen) => { try { fs.mkdirSync(path.dirname(STATE), { recursive: true }); fs.writeFileSync(STATE, JSON.stringify({ seen: [...seen].slice(-2000) })); } catch { /* ignore */ } };
+// `legacyUntil` (1.86.2): the moment before which an OLDER hook may have keyed
+// this project's markers. Older hooks keyed a marker on the text they CUT it to
+// (1.86.0 at the first whitespace + closes:/ev:/verify:/q:, 1.85 the same
+// without q:), and wrote no per-line key for ~ / ✓, so the upgrade path consults
+// those old keys, and treats a ~ / ✓ line as already applied, ONLY for
+// transcript events older than this. It used to consult them forever, and a
+// 1.86.1 key is byte-identical to the old-cut key of a LATER note that starts
+// with the same sentence ("X ev: README.md", then "X Q: and A: …"): the later
+// note was folded into the earlier card as a "repair", dropped as "not
+// re-added", or had its closes: skipped (review 2026-09-18, third round).
+//   no state file yet        → 0: no older hook ever keyed this project;
+//   a state file without it  → its mtime: the last write an older hook made
+//                               (every event it keyed is older than that);
+//   a stamped state file     → the stamp, carried by every writeState.
+// An older hook that writes the file later drops the field, and the next run
+// re-stamps from that newer mtime — which is right: it keyed events up to then.
+let stateLegacyUntil = null;
+function captureLegacyUntil() {
+    if (stateLegacyUntil !== null) return stateLegacyUntil;
+    try {
+        const raw = fs.readFileSync(STATE, 'utf8');
+        let parsed = null; try { parsed = JSON.parse(raw); } catch { /* corrupt → treat as an older writer */ }
+        const stamp = Number(parsed && parsed.legacyUntil);
+        if (parsed && Object.prototype.hasOwnProperty.call(parsed, 'legacyUntil') && Number.isFinite(stamp) && stamp >= 0) stateLegacyUntil = stamp;
+        else { let mtime = Date.now(); try { mtime = fs.statSync(STATE).mtimeMs; } catch { /* keep now */ } stateLegacyUntil = Math.min(mtime, Date.now()); }
+    } catch (error) {
+        stateLegacyUntil = error && error.code === 'ENOENT' ? 0 : Date.now();
+    }
+    return stateLegacyUntil;
+}
+const writeState = (seen) => {
+    try {
+        const legacyUntil = captureLegacyUntil();   // resolved BEFORE this write changes the mtime
+        fs.mkdirSync(path.dirname(STATE), { recursive: true });
+        fs.writeFileSync(STATE, JSON.stringify({ seen: [...seen].slice(-STATE_SEEN_MAX), legacyUntil }));
+    } catch { /* ignore */ }
+};
 const messageHandledKey = (messageId) => `message:${String(messageId || '')}`;
 // Persist only these message keys into a fresh read. The in-memory capture set
 // may already contain brain-card markers whose brain write has not happened;
@@ -523,21 +566,86 @@ function appendJsonl(file, obj, maxLines = 0) {
 // is stolen so a crashed session can't wedge the brain forever. Best-effort: if
 // it can't get the lock within the budget it writes anyway (better than dropping
 // the markers) and flags it in the health log.
+//
+// Stale-lock break (review 2026-09-18, third round). The holder writes
+// "<pid> <token>"; a lock is stale when that pid is provably dead (a crash no
+// longer costs every waiter up to 15 s — ~2.5 s per prompt), or when its mtime
+// is more than LOCK_STALE_MS away from now in EITHER direction (a crashed
+// holder's lock after the clock stepped back used to stay forever). Breaking is
+// serialized by a short-lived "<lock>.break" file and re-checks that the lock
+// is still the SAME stale one before unlinking it: two waiters that both saw it
+// stale used to unlink it in turn, and the second deleted the first one's
+// fresh lock, so both held it. A release only removes a lock this process
+// still owns. Lock files written by other writers (a bare pid, a JSON object,
+// a test's placeholder) are read the same way; one whose pid cannot be read is
+// only ever broken by age.
 const LOCK_STALE_MS = 15000;
+const LOCK_BREAK_STALE_MS = 5000;
 const sleepSync = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* */ } };
+const heldLockTokens = new Map();   // lockPath → the content this process wrote
+const lockHolderPid = (content) => {
+    const text = String(content || '').trim();
+    if (text.startsWith('{')) { try { return Number(JSON.parse(text).pid) || null; } catch { return null; } }
+    const m = /^(\d+)(?:\s|$)/.exec(text);
+    return m ? Number(m[1]) : null;
+};
+// `isProcessAlive` is declared with the presence helpers further down; every
+// lock call site runs from main(), long after module init, so the forward
+// reference is a runtime read, never a TDZ one. Keep it that way.
+function lockIsStale(lockPath, now = Date.now()) {
+    let content, mtimeMs;
+    try { content = fs.readFileSync(lockPath, 'utf8'); mtimeMs = fs.statSync(lockPath).mtimeMs; } catch { return null; }
+    const pid = lockHolderPid(content);
+    const stale = (pid && pid !== process.pid && isProcessAlive(pid) === false) || Math.abs(now - mtimeMs) > LOCK_STALE_MS;
+    return stale ? { content, mtimeMs } : null;
+}
+function breakStaleLock(lockPath, seen) {
+    const breaker = `${lockPath}.break`;
+    let fd;
+    try { fd = fs.openSync(breaker, 'wx'); }
+    catch (e) {
+        // Another waiter is breaking it. A breaker file left by a crash inside
+        // this few-microsecond window is itself broken by age.
+        try { if (e?.code === 'EEXIST' && Math.abs(Date.now() - fs.statSync(breaker).mtimeMs) > LOCK_BREAK_STALE_MS) fs.unlinkSync(breaker); } catch { /* raced */ }
+        return false;
+    }
+    try {
+        fs.closeSync(fd);
+        const now = lockIsStale(lockPath);
+        if (!now || now.content !== seen.content || now.mtimeMs !== seen.mtimeMs) return false;   // not the lock we judged
+        fs.unlinkSync(lockPath);
+        return true;
+    } catch { return false; }
+    finally { try { fs.unlinkSync(breaker); } catch { /* */ } }
+}
 function acquireLock(lockPath, { tries = 60, waitMs = 60 } = {}) {
     try { fs.mkdirSync(path.dirname(lockPath), { recursive: true }); } catch { /* */ }
     for (let i = 0; i < tries; i++) {
-        try { const fd = fs.openSync(lockPath, 'wx'); fs.writeSync(fd, String(process.pid)); fs.closeSync(fd); return true; }
+        try {
+            const token = `${process.pid} ${crypto.randomBytes(6).toString('hex')}`;
+            const fd = fs.openSync(lockPath, 'wx'); fs.writeSync(fd, token); fs.closeSync(fd);
+            heldLockTokens.set(lockPath, token);
+            return true;
+        }
         catch (e) {
             if (e && e.code !== 'EEXIST') return false;  // unexpected FS error → caller writes best-effort
-            try { if (Date.now() - fs.statSync(lockPath).mtimeMs > LOCK_STALE_MS) { fs.unlinkSync(lockPath); continue; } } catch { /* lost a race on the stale file — just retry */ }
+            const stale = lockIsStale(lockPath);
+            if (stale && breakStaleLock(lockPath, stale)) continue;
             sleepSync(waitMs);
         }
     }
     return false;  // contended past ~3.6s → write best-effort (rare; captures are sub-second)
 }
-function releaseLock(lockPath) { try { fs.unlinkSync(lockPath); } catch { /* */ } }
+function releaseLock(lockPath) {
+    const token = heldLockTokens.get(lockPath);
+    heldLockTokens.delete(lockPath);
+    try {
+        // Never remove a lock this process no longer owns (it was broken as
+        // stale and re-taken by another writer).
+        if (token !== undefined && fs.readFileSync(lockPath, 'utf8') !== token) return;
+        fs.unlinkSync(lockPath);
+    } catch { /* */ }
+}
 
 // ── Live cross-session coordination (brain.sessions heartbeat) ───────────────
 // The brain is ASYNC memory — capture on Stop, recall on the next Start — so two
@@ -701,6 +809,43 @@ function queuePendingCapture(batch) {
 }
 function clearDrainedOrphans(paths) {
     for (const f of (paths || [])) { try { fs.unlinkSync(f); } catch { /* re-drained next time; landing twice is superseded away */ } }
+}
+// A queued batch the engine throws on (review 2026-09-18, third round) is
+// blamed each time a capture has to land without it; after
+// DRAIN_FAILURES_MAX such drains it is moved to its own
+// "<queue>.poison-<id>.json" — kept, never drained again, and reported —
+// instead of costing every later capture in the project a failed attempt.
+// Returns the batches set aside by this call.
+const DRAIN_FAILURES_MAX = 3;
+function recordDrainFailure(batches, error) {
+    const quarantined = [];
+    try {
+        const reason = String((error && error.message) || error || 'unknown').slice(0, 200);
+        const bump = (b) => ({ ...b, drainFailures: (Number(b.drainFailures) || 0) + 1, lastDrainError: reason });
+        const setAside = (b) => {
+            try {
+                const { __orphanPath, ...clean } = b;
+                const file = `${PENDING_CAPTURES_FILE}.poison-${String(b.id || Date.now()).replace(/[^A-Za-z0-9_-]+/g, '-')}.json`;
+                fs.writeFileSync(file, JSON.stringify({ ...clean, quarantinedAt: nowIso() }));
+                quarantined.push({ id: b.id || null, file, cards: (b.cards || []).length, updates: (b.updates || []).length, resolutions: (b.resolutions || []).length, first: String((b.cards?.[0]?.text) || (b.updates?.[0]?.text) || (b.resolutions?.[0]?.text) || '').replace(/\s+/g, ' ').slice(0, 90) });
+                return true;
+            } catch { return false; }
+        };
+        const mainIds = new Set(batches.filter(b => b && !b.__orphanPath && b.id).map(b => b.id));
+        if (mainIds.size) {
+            updatePendingCaptures((current) => current.flatMap((b) => {
+                if (!b || !mainIds.has(b.id)) return [b];
+                const next = bump(b);
+                return next.drainFailures >= DRAIN_FAILURES_MAX && setAside(next) ? [] : [next];
+            }));
+        }
+        for (const b of batches.filter(x => x && x.__orphanPath)) {
+            const next = bump(b);
+            if (next.drainFailures >= DRAIN_FAILURES_MAX && setAside(next)) { try { fs.unlinkSync(b.__orphanPath); } catch { /* re-drained, then set aside again */ } continue; }
+            try { const { __orphanPath, ...clean } = next; const tmp = `${b.__orphanPath}.tmp-${process.pid}`; fs.writeFileSync(tmp, JSON.stringify(clean)); fs.renameSync(tmp, b.__orphanPath); } catch { /* the count is best-effort */ }
+        }
+    } catch { /* best-effort: an unrecorded failure only delays the set-aside */ }
+    return quarantined;
 }
 const SESSION_FRESH_MS = 10 * 60 * 1000;   // a lane unseen for 10min is treated as ended
 const MCP_SESSION_FRESH_MS = 3 * 60 * 1000; // an mcp-channel heartbeat is dead after 3min (matches agent-presence)
@@ -2462,16 +2607,59 @@ const readSidecar = () => { try { const d = JSON.parse(fs.readFileSync(RULE_DRAF
 // backoff and the tmp is removed if it never lands. Returns whether the write
 // landed — a caller that marks something "shown" must know.
 const SIDECAR_RENAME_BACKOFF_MS = [20, 50, 120, 250, 500];
+// A sidecar that CANNOT be written (a read-only attribute, a deny-delete ACL, a
+// handle held without FILE_SHARE_DELETE) used to cost the whole ~940 ms backoff
+// inside the lock on every prompt with a pending receipt, for up to three days
+// (review 2026-09-18, third round: three prompts at ~1.33 s each against a
+// ~0.4 s baseline). A read-only destination now fails at once; a final
+// permission failure stamps the per-project health dir, and for
+// SIDECAR_FAIL_BACKOFF_MS every writer skips straight to "not written" (the
+// callers already treat that as "leave it pending"). Only EBUSY, or EPERM /
+// EACCES on a writable destination (a reader holding it for a moment), is
+// retried with backoff.
+const SIDECAR_FAIL_BACKOFF_MS = 10 * 60 * 1000;
+const SIDECAR_FAIL_STAMP = HEALTH.replace(/\.jsonl$/, '') + '.sidecar-unwritable';
+const stampSidecarFailure = (code) => { try { fs.mkdirSync(path.dirname(SIDECAR_FAIL_STAMP), { recursive: true }); fs.writeFileSync(SIDECAR_FAIL_STAMP, `${nowIso()} ${code || 'unwritable'} ${RULE_DRAFTS}\n`); } catch { /* best-effort */ } };
+const sidecarWritable = () => {
+    try { fs.accessSync(RULE_DRAFTS, fs.constants.W_OK); return true; }
+    catch (error) { return error?.code === 'ENOENT'; }   // absent → the rename creates it
+};
+// The backoff must not outlive its cause: the moment the destination is
+// writable again (the common case — someone cleared a read-only attribute) the
+// stamp is dropped and the next write goes through. It only holds the skip
+// while the destination still refuses, or while it is writable-but-locked
+// (an ACL or a handle held without FILE_SHARE_DELETE, which accessSync cannot
+// see) — then the 10 minutes are what keeps a doomed ~940 ms backoff off every
+// single prompt for three days.
+const sidecarRecentlyFailed = () => {
+    let raw = '', fresh = false;
+    try { fresh = Date.now() - fs.statSync(SIDECAR_FAIL_STAMP).mtimeMs < SIDECAR_FAIL_BACKOFF_MS; raw = fs.readFileSync(SIDECAR_FAIL_STAMP, 'utf8'); } catch { return false; }
+    if (!fresh) return false;
+    // A read-only destination is the one cause someone can clear in a second,
+    // and the one accessSync can see: the moment it is gone, so is the backoff.
+    if (/\bread-only\b/.test(raw) && sidecarWritable()) { try { fs.unlinkSync(SIDECAR_FAIL_STAMP); } catch { /* raced with another writer */ } return false; }
+    return true;
+};
 const writeSidecar = (patch) => {
     let tmp = null;
     try {
+        if (sidecarRecentlyFailed()) return false;
+        if (!sidecarWritable()) { stampSidecarFailure('read-only'); return false; }
         fs.mkdirSync(path.dirname(RULE_DRAFTS), { recursive: true });
         tmp = `${RULE_DRAFTS}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
         fs.writeFileSync(tmp, JSON.stringify({ ...readSidecar(), ...patch }, null, 2));
         for (let attempt = 0; ; attempt++) {
-            try { fs.renameSync(tmp, RULE_DRAFTS); return true; }
-            catch (error) {
-                if (attempt >= SIDECAR_RENAME_BACKOFF_MS.length || !['EPERM', 'EACCES', 'EBUSY'].includes(error?.code)) throw error;
+            try {
+                fs.renameSync(tmp, RULE_DRAFTS);
+                if (attempt > 0 || fs.existsSync(SIDECAR_FAIL_STAMP)) { try { fs.unlinkSync(SIDECAR_FAIL_STAMP); } catch { /* none */ } }
+                return true;
+            } catch (error) {
+                const code = error?.code;
+                if (attempt >= SIDECAR_RENAME_BACKOFF_MS.length || !['EPERM', 'EACCES', 'EBUSY'].includes(code)) {
+                    if (code === 'EPERM' || code === 'EACCES') stampSidecarFailure(code);
+                    throw error;
+                }
+                if (code !== 'EBUSY' && !sidecarWritable()) { stampSidecarFailure('read-only'); throw error; }
                 sleepSync(SIDECAR_RENAME_BACKOFF_MS[attempt]);
             }
         }
@@ -2739,28 +2927,58 @@ async function findingDraftsFooter(sid, { markShown = true } = {}) {
 // stdout is model context), three at a time. Deduped by key; TTL-pruned;
 // never throws.
 //
-// A receipt from a session's FINAL Stop would never be seen, so a SessionStart
-// ADOPTS receipts whose author has ended: it reassigns them to itself, and its
-// own first prompt prints them — nothing is printed at SessionStart, where the
-// block landed past the ~2 KB preview the harness shows (review 2026-09-18).
-// "Ended" is decided from the lane, never from age alone: a receipt whose
-// author still has a LIVE lane row stays with that author (a new session
-// used to print — and mark shown for everyone — a live session's receipts, so
-// the author never saw them). The one live row that does not count is a
-// predecessor in this same host process: a /clear or resume replaced that
-// conversation, so its receipts move to the new session at once. With no live
-// lane row, a receipt unshown for CAPTURE_RECEIPT_HANDOFF_MS is adopted.
-// Adoption and every shown-mark happen under RULE_DRAFTS_LOCK in ONE
-// read-modify-write, so two sessions can never both take the same receipt, and
-// a receipt is printed only when its shown-mark was actually persisted (an
-// unwritable sidecar printed the same receipt on every prompt).
+// A receipt from a session's FINAL Stop would never be seen, so another
+// session ADOPTS it: it reassigns the receipt to itself, and its own next
+// prompt prints it — nothing is printed at SessionStart, where the block
+// landed past the ~2 KB preview the harness shows (review 2026-09-18).
+//
+// Who may adopt (third review, 2026-09-18). Every receipt records the host
+// process (CLAUDE_PID) and the machine of the session that wrote it.
+//   • The same host process — a /clear or an in-app /resume replaced that
+//     conversation: the new session's next PROMPT adopts it. The prompt hook
+//     always fires; SessionStart on /clear only runs where the installed
+//     matcher lists "clear" (1.86.1's did not, and a runtime update never
+//     rewrites settings.json), so a handoff that lived only at SessionStart
+//     never ran after a real /clear, and an unrelated session printed the
+//     receipt half an hour later. Capped at CAPTURE_RECEIPT_PREDECESSOR_MS, so
+//     an OS-reused pid never claims an old receipt.
+//   • Another host process on this machine: only once that process is
+//     PROVABLY gone (isProcessAlive === false), at the next SessionStart. An
+//     author that is idle but alive keeps its receipts however long it idles
+//     ("no live lane row for 30 minutes" only ever meant "idle for 30
+//     minutes"), and a receipt from ANOTHER machine is never adopted — its
+//     TTL expires it.
+//   • A receipt with no host pid (a session without CLAUDE_PID, or one 1.86.1
+//     wrote) keeps the old rule: no live lane row, unshown for
+//     CAPTURE_RECEIPT_HANDOFF_MS — and its heading does not claim the author
+//     has ended.
+// Adoption re-stamps the receipt with the adopter's host, machine and time, so
+// it does not hop again. Adoption and every shown-mark happen under
+// RULE_DRAFTS_LOCK in ONE read-modify-write, so two sessions can never both
+// take the same receipt, and a receipt is printed only when its shown-mark was
+// actually persisted (an unwritable sidecar printed the same receipt on every
+// prompt).
 const CAPTURE_RECEIPT_TTL_MS = 3 * 24 * 60 * 60 * 1000;
 const CAPTURE_RECEIPTS_MAX = 40;
 const CAPTURE_RECEIPTS_SHOWN = 3;
-const CAPTURE_RECEIPT_HANDOFF_MS = 30 * 60 * 1000;   // no live lane row + unshown this long → a new session adopts it
+const CAPTURE_RECEIPT_HANDOFF_MS = 30 * 60 * 1000;          // legacy rule: no live lane row + unshown this long
+const CAPTURE_RECEIPT_PREDECESSOR_MS = 24 * 60 * 60 * 1000; // same-host handoff window (pid reuse guard)
 const readCaptureReceipts = () => { const d = readSidecar(); return Array.isArray(d.captureReceipts) ? d.captureReceipts : []; };
+// The cap drops SHOWN receipts first, oldest first, and an unshown one only
+// when more than CAPTURE_RECEIPTS_MAX are unshown: trimming by position used
+// to push an idle author's unshown receipt out while shown ones sat waiting
+// for their TTL (review 2026-09-18, third round).
+function capCaptureReceipts(list) {
+    if (list.length <= CAPTURE_RECEIPTS_MAX) return list;
+    let excess = list.length - CAPTURE_RECEIPTS_MAX;
+    const drop = new Set();
+    for (const r of list) { if (excess <= 0) break; if (r.shown) { drop.add(r); excess--; } }
+    for (const r of list) { if (excess <= 0) break; if (!drop.has(r)) { drop.add(r); excess--; } }
+    return list.filter(r => !drop.has(r));
+}
 // → 'written' | 'unchanged' | false (lock timeout or a failed write).
 function persistCaptureReceipts(mutate) {
+    if (sidecarRecentlyFailed()) return false;   // known unwritable: never pay the lock + backoff again
     const got = acquireLock(RULE_DRAFTS_LOCK, { tries: 80, waitMs: 25 });
     if (!got) return false;
     try {
@@ -2768,11 +2986,12 @@ function persistCaptureReceipts(mutate) {
         const raw = readCaptureReceipts();
         const rawJson = JSON.stringify(raw);
         const live = raw.filter(r => r && r.key && r.line && (now - (r.ts || 0)) < CAPTURE_RECEIPT_TTL_MS);
-        const next = (mutate(live, now) || live).slice(-CAPTURE_RECEIPTS_MAX);
+        const next = capCaptureReceipts(mutate(live, now) || live);
         if (JSON.stringify(next) === rawJson) return 'unchanged';
         return writeSidecar({ captureReceipts: next }) ? 'written' : false;
     } catch { return false; } finally { releaseLock(RULE_DRAFTS_LOCK); }
 }
+const receiptHost = () => ({ ...(HOST_PID ? { hostPid: HOST_PID } : {}), machine: MACHINE_ID });
 // Record [{ key, line }] for this session (a key already recorded is skipped).
 function recordCaptureReceipts(sid, items) {
     try {
@@ -2782,13 +3001,26 @@ function recordCaptureReceipts(sid, items) {
             for (const it of items) {
                 if (!it || !it.key || !it.line || have.has(it.key)) continue;
                 have.add(it.key);
-                list.push({ key: it.key, sid: String(sid), ts: now, line: String(it.line).slice(0, 700), shown: false });
+                list.push({ key: it.key, sid: String(sid), ts: now, line: String(it.line).slice(0, 700), shown: false, ...receiptHost() });
             }
             return list;
         });
     } catch { return false; }
 }
-// SessionStart: take over receipts an ended session never saw (see above).
+// An unshown receipt from ANOTHER session of this same host process: the
+// conversation this one replaced (/clear, in-app /resume).
+const isPredecessorReceipt = (r, sid, now) => Boolean(HOST_PID && r && !r.shown && r.sid !== String(sid)
+    && Number(r.hostPid) === HOST_PID && r.machine === MACHINE_ID
+    && now - (r.ts || 0) < CAPTURE_RECEIPT_PREDECESSOR_MS);
+function adoptReceipt(r, sid, now, why) {
+    r.adoptedFrom = r.adoptedFrom || r.sid;
+    r.adoptedWhy = why;
+    r.sid = String(sid);
+    r.ts = now;
+    if (HOST_PID) r.hostPid = HOST_PID; else delete r.hostPid;
+    r.machine = MACHINE_ID;
+}
+// SessionStart: take over receipts whose author is provably gone (see above).
 // Returns how many were adopted; prints nothing.
 function adoptCaptureReceipts(sid) {
     try {
@@ -2799,15 +3031,23 @@ function adoptCaptureReceipts(sid) {
         const hostOf = new Map(rows.filter(r => r && r.id).map(r => [String(r.id), r.hostPid]));
         const liveIds = new Set(pruneSessions(rows, now).map(r => String(r.id)));
         let adopted = 0;
-        const res = persistCaptureReceipts((list) => {
+        const res = persistCaptureReceipts((list, at) => {
             adopted = 0;
             for (const r of list) {
                 if (r.shown || r.sid === String(sid)) continue;
-                const predecessor = Boolean(HOST_PID && hostOf.get(String(r.sid)) === HOST_PID);
-                const ended = !liveIds.has(String(r.sid)) && (now - (r.ts || 0)) > CAPTURE_RECEIPT_HANDOFF_MS;
-                if (!predecessor && !ended) continue;
-                r.adoptedFrom = r.adoptedFrom || r.sid;
-                r.sid = String(sid);
+                let why = null;
+                if (isPredecessorReceipt(r, sid, at)) why = 'predecessor';
+                else if (r.hostPid !== undefined && r.hostPid !== null) {
+                    if (r.machine === MACHINE_ID && isProcessAlive(r.hostPid) === false) why = 'ended';
+                } else if (r.machine && r.machine !== MACHINE_ID) {
+                    why = null;   // another machine's session: never ours to take
+                } else if (HOST_PID && hostOf.get(String(r.sid)) === HOST_PID) {
+                    why = 'predecessor';   // a 1.86.1 receipt: the lane knows its host
+                } else if (!liveIds.has(String(r.sid)) && (at - (r.ts || 0)) > CAPTURE_RECEIPT_HANDOFF_MS) {
+                    why = 'idle';
+                }
+                if (!why) continue;
+                adoptReceipt(r, sid, at, why);
                 adopted++;
             }
             return list;
@@ -2815,15 +3055,18 @@ function adoptCaptureReceipts(sid) {
         return res ? adopted : 0;
     } catch { return 0; }
 }
-// The block the next prompt prints for THIS session (its own receipts and the
-// ones it adopted), marking what it shows in the same locked write. Empty
-// string when there is nothing — the zero-cost contract.
+// The block the next prompt prints for THIS session: its own receipts, the
+// ones it adopted, and — adopted right here, in the same locked write that
+// marks what it shows — a replaced conversation's in this host process.
+// Empty string when there is nothing — the zero-cost contract.
 function captureReceiptsFooter(sid) {
     try {
         if (!sid) return '';
-        if (!readCaptureReceipts().some(r => r && !r.shown && r.sid === String(sid))) return '';   // lock-free fast path
+        const probeAt = Date.now();
+        if (!readCaptureReceipts().some(r => r && !r.shown && (r.sid === String(sid) || isPredecessorReceipt(r, sid, probeAt)))) return '';   // lock-free fast path
         let display = [], remaining = 0;
-        const res = persistCaptureReceipts((list) => {
+        const res = persistCaptureReceipts((list, now) => {
+            for (const r of list) if (isPredecessorReceipt(r, sid, now)) adoptReceipt(r, sid, now, 'predecessor');
             const pending = list.filter(r => !r.shown && r.sid === String(sid));
             display = pending.slice(0, CAPTURE_RECEIPTS_SHOWN).map(r => ({ ...r }));
             remaining = pending.length - display.length;
@@ -2832,14 +3075,18 @@ function captureReceiptsFooter(sid) {
             return list;
         });
         if (res !== 'written' || !display.length) return '';
-        const adopted = display.filter(r => r.adoptedFrom).length;
+        const adopted = display.filter(r => r.adoptedFrom);
+        const from = [...new Set(adopted.map(r => r.adoptedWhy || 'idle'))].map(why => why === 'predecessor'
+            ? 'the conversation this one replaced in this terminal (/clear or /resume)'
+            : why === 'ended' ? 'a session that is no longer running'
+                : 'a session with no activity for 30+ minutes (it may have ended)');
         const lines = ['', '---',
-            adopted === 0 ? '## ⚠️ Brain capture — what your last 🧠 BRAIN markers actually did'
-                : adopted === display.length ? '## ⚠️ Brain capture — markers from an earlier, ended session that did not do what they said'
+            adopted.length === 0 ? '## ⚠️ Brain capture — what your last 🧠 BRAIN markers actually did'
+                : adopted.length === display.length ? '## ⚠️ Brain capture — markers from an earlier session that did not do what they said'
                 : '## ⚠️ Brain capture — markers that did not do what they said',
-            adopted === 0
+            adopted.length === 0
                 ? 'The Stop hook captured these, but not the way the marker reads. If it matters, re-emit a corrected marker; nothing else is needed.'
-                : 'The Stop hook captured these, but not the way the marker reads. Lines marked (earlier session) came from a session that has ended: check the card before acting, and re-emit a corrected marker only when you know what it meant — never a closes: you cannot verify.'];
+                : `The Stop hook captured these, but not the way the marker reads. Lines marked (earlier session) came from ${from.join(' or ')}: check the card before acting, and re-emit a corrected marker only when you know what it meant — never a closes: you cannot verify.`];
         for (const r of display) lines.push(`- ${r.adoptedFrom ? '(earlier session) ' : ''}${r.line}`);
         if (remaining > 0) lines.push(`- …and ${remaining} more, shown on the next prompt.`);
         return '\n' + lines.join('\n') + '\n';
@@ -2917,6 +3164,20 @@ async function capture(lib) {
     const gapPaths = new Set(), gapShellCmds = [], gapErrorIds = new Set();
     let gapAuthored = 0, gapLatestArtifactAt = 0;
     const seen = readState();
+    // Keys this capture found already seen: they move to the young end of the
+    // FIFO so a transcript still being re-read never ages out of it — in
+    // doCapture on a real capture, and here on a Stop with nothing new.
+    const hitKeys = new Set();
+    const refreshHitKeys = () => {
+        if (!hitKeys.size) return;
+        const before = [...readState()];
+        const merged = new Set(before);
+        for (const k of hitKeys) if (merged.delete(k)) merged.add(k);   // only keys the state already holds
+        const after = [...merged];
+        if (after.length !== before.length || after.some((k, i) => k !== before[i])) writeState(merged);
+    };
+    // See captureLegacyUntil: older hooks' keys only count for older events.
+    const legacyUntil = captureLegacyUntil();
     const cards = [];
     const resolutions = [];
     const updates = [];
@@ -3023,7 +3284,7 @@ async function capture(lib) {
                     const sourceEvent = String(e.uuid || e.id || e.timestamp || e.ts || transcriptIndex);
                     const messageId = sha(`msg|${sid}|${sourceEvent}|${target}|${txt}`);
                     const handledKey = messageHandledKey(messageId);
-                    if (seen.has(handledKey)) continue;
+                    if (seen.has(handledKey)) { hitKeys.add(handledKey); continue; }
                     messages.push({
                         id: messageId,
                         from: sid,
@@ -3111,6 +3372,14 @@ async function capture(lib) {
             // repair of THAT card (engine STUB REPAIR, rewritten in place, never
             // a sibling); any other old key simply means "already captured".
             //
+            // …but ONLY for a transcript event older than `legacyUntil`, the
+            // last moment an older hook could have keyed it (third review: the
+            // old-cut key "X" of "X Q: and A: …" is byte-for-byte this grammar's
+            // key for an earlier "X ev: README.md", so a new note was folded
+            // into an unrelated card, dropped, or had its closes: skipped — long
+            // after any upgrade). A project that never ran an older hook has
+            // legacyUntil 0 and never looks.
+            //
             // ~ and ✓ keep their text bypass (a self-heal re-stamp of unchanged
             // text is a NEW marker and must apply), but ONE transcript line
             // applies once: Stop re-reads the whole transcript, and re-applying
@@ -3118,34 +3387,51 @@ async function capture(lib) {
             // another session's newer card, and landed a thin ~ on a different
             // card once its own was resolved (review 2026-09-18). The key is the
             // transcript event + the line, recorded with the rest of the seen
-            // set only when the batch is durably written or queued.
+            // set only when the batch is durably written or queued. An older
+            // hook wrote no such key, so a ~ / ✓ line from an event older than
+            // `legacyUntil` counts as applied: every Stop of those hooks applied
+            // it (third review: at the first 1.86.1 Stop, old lines re-applied
+            // over newer cards — a milestone wholesale-replaced, two unrelated
+            // cards archived by a re-read ✓).
+            // An event with no readable timestamp counts as NEW: not looking at
+            // an old key costs at most a stub that stays as 1.86.0 cut it,
+            // while looking wrongly folds a real note into someone else's card.
+            const beforeUpgrade = legacyUntil > 0 && Number.isFinite(entryAt) && entryAt < legacyUntil;
             const additive = type !== '✓' && type !== '~';
             const key = sha((type + '|' + area + '|' + (additive ? bodyWithCloses : body)).toLowerCase());
-            const legacyKey = additive && closes ? sha((type + '|' + area + '|' + body).toLowerCase()) : null;
+            const legacyKey = beforeUpgrade && additive && closes ? sha((type + '|' + area + '|' + body).toLowerCase()) : null;
             let repairStub = '';
             if (additive) {
-                if (seen.has(key)) { ledger.push({ action: 'skipped-seen', area, preview }); continue; }
+                if (seen.has(key)) { hitKeys.add(key); legacyClaimed.add(key); ledger.push({ action: 'skipped-seen', area, preview }); continue; }
                 // Two DIFFERENT notes that share the words before a key had ONE
                 // key under any cut-body rule: the first landed and the second
                 // was skipped as "seen" — never captured. So an old key is
                 // claimed by the FIRST marker of a capture that carries it; a
                 // later one with the same old key is a note that never landed.
+                // Every additive marker claims its OWN key too: a later marker
+                // whose old cut equals it is a different note of this batch.
                 if (legacyKey && seen.has(legacyKey) && !legacyClaimed.has(legacyKey)) {
-                    legacyClaimed.add(legacyKey); seen.add(key);
-                    ledger.push({ action: 'skipped-seen', area, preview }); continue;
+                    legacyClaimed.add(legacyKey); legacyClaimed.add(key); hitKeys.add(legacyKey); seen.add(key);
+                    ledger.push({ action: 'skipped-seen', area, preview, olderHook: true }); continue;
                 }
-                const olderCut = publishedHookCuts(markerBody).find(cut => seen.has(sha((type + '|' + area + '|' + cut).toLowerCase())));
-                seen.add(key);
+                const olderCut = beforeUpgrade ? publishedHookCuts(markerBody).find(cut => seen.has(sha((type + '|' + area + '|' + cut).toLowerCase()))) : undefined;
+                seen.add(key); legacyClaimed.add(key);
                 if (olderCut !== undefined) {
                     const olderKey = sha((type + '|' + area + '|' + olderCut).toLowerCase());
                     const landing = closes && !closesAnchored ? bodyWithCloses : body;
                     const squash = (s) => String(s).replace(/\s+/g, '').toLowerCase();
-                    const longer = squash(landing).length > squash(olderCut).length && squash(landing).startsWith(squash(olderCut));
+                    // Judged on the text BEFORE any closes: — the published hooks
+                    // cut there and ACTED on it, so a card they landed that way
+                    // was complete, and its close is final. (A "closes:txt_…"
+                    // with no space is prose to this grammar; "repairing" the
+                    // card only appended that junk to it.)
+                    const beforeCloses = landing.replace(/\s+closes:[\s\S]*$/i, '');
+                    const longer = squash(beforeCloses).length > squash(olderCut).length && squash(beforeCloses).startsWith(squash(olderCut));
                     // Claimed per capture, as above: only the first marker
                     // carrying an old key repairs its stub (or is skipped); a
                     // later one with the same old key lands as the note it is.
                     if (!legacyClaimed.has(olderKey)) {
-                        legacyClaimed.add(olderKey);
+                        legacyClaimed.add(olderKey); hitKeys.add(olderKey);
                         if (longer) repairStub = olderCut;
                         else { ledger.push({ action: 'skipped-seen', area, preview, olderHook: true }); continue; }
                     }
@@ -3153,7 +3439,8 @@ async function capture(lib) {
             } else {
                 const sourceEvent = String(e.uuid || e.id || e.timestamp || e.ts || transcriptIndex);
                 const appliedKey = sha(('applied|' + sourceEvent + '|' + type + '|' + area + '|' + body).toLowerCase());
-                if (seen.has(appliedKey)) { ledger.push({ action: 'skipped-applied', area, preview }); continue; }
+                if (seen.has(appliedKey)) { hitKeys.add(appliedKey); ledger.push({ action: 'skipped-applied', area, preview }); continue; }
+                if (beforeUpgrade) { ledger.push({ action: 'skipped-applied', area, preview, olderHook: true }); continue; }
                 seen.add(appliedKey);
             }
             // A malformed suffix segment went back into the card text — say so
@@ -3254,7 +3541,7 @@ async function capture(lib) {
             if (!detail && p.num) { const nm = p.num.exec(cmd); if (nm) detail = '#' + nm[1]; }   // pull the PR/issue number out separately
             const summary = `${p.kind}${detail ? ' ' + detail : ''}`;
             const key = sha(('ship|' + p.area + '|' + summary).toLowerCase());
-            if (seen.has(key)) break;                         // already captured this ship
+            if (seen.has(key)) { hitKeys.add(key); break; }   // already captured this ship
             seen.add(key);
             // #auto marks machine-harvested provenance: the repeat-detector demands an
             // entity-token match on these (they're dense with generic ship verbs) and
@@ -3413,6 +3700,12 @@ async function capture(lib) {
     // the authoritative drain happens INSIDE the brain lock (doCapture), so two
     // concurrent sessions can never both land the same queued batch.
     if (!cards.length && !resolutions.length && !updates.length && !readPendingCaptures().length) {
+        // A Stop with nothing new is the COMMON case for a long session, and it
+        // is exactly when the keys of a still-live transcript must not age out
+        // of the capped FIFO — so the keys this run HIT move to the young end
+        // here too (third review, R5). Only keys the file already holds, and
+        // only when the order really changes: a no-op Stop stays a no-op.
+        refreshHitKeys();
         // Record the commit baseline / advance even with nothing to capture, so
         // the next run doesn't re-scan the same commits.
         if (newLastCommit && newLastCommit !== prevCommit) writeLastCommit(newLastCommit);
@@ -3432,6 +3725,10 @@ async function capture(lib) {
     // cards into [Area] containers, and wires [[wikilink]] connections.
     const doCapture = async (locked) => {
         const merged = readState(); for (const k of seen) merged.add(k);
+        // Every key this capture hit moves to the young end of the FIFO (see
+        // STATE_SEEN_MAX): Set order is first insertion, and a key re-read at
+        // every Stop never refreshed, so it aged out while its line was live.
+        for (const k of hitKeys) { merged.delete(k); merged.add(k); }
         // Own-batch snapshot BEFORE the drain merges queued peers' batches in:
         // if the brain write fails we re-queue only OUR contribution (drained
         // batches stay queued — ids/paths clear only after a durable write),
@@ -3458,14 +3755,14 @@ async function capture(lib) {
         }
         // Drain the queue UNDER the lock: read, land, clear-by-id — a peer's
         // batch queued after this read survives, and no batch lands twice.
-        const pendingBatches = readPendingCaptures();
-        const drainedPendingIds = new Set(pendingBatches.map(b => b && b.id).filter(Boolean));
-        const drainedOrphanPaths = pendingBatches.map(b => b && b.__orphanPath).filter(Boolean);
+        const pendingBatches = readPendingCaptures().filter(b => b && typeof b === 'object');
+        const drainedPendingIds = new Set(pendingBatches.map(b => b.id).filter(Boolean));
+        const drainedOrphanPaths = pendingBatches.map(b => b.__orphanPath).filter(Boolean);
+        const drainedCards = [], drainedResolutions = [], drainedUpdates = [];
         for (const b of pendingBatches) {
-            if (!b || typeof b !== 'object') continue;
-            for (const c of (Array.isArray(b.cards) ? b.cards : [])) cards.push(c);
-            for (const r of (Array.isArray(b.resolutions) ? b.resolutions : [])) resolutions.push(r);
-            for (const u of (Array.isArray(b.updates) ? b.updates : [])) updates.push(u);
+            for (const c of (Array.isArray(b.cards) ? b.cards : [])) { cards.push(c); drainedCards.push(c); }
+            for (const r of (Array.isArray(b.resolutions) ? b.resolutions : [])) { resolutions.push(r); drainedResolutions.push(r); }
+            for (const u of (Array.isArray(b.updates) ? b.updates : [])) { updates.push(u); drainedUpdates.push(u); }
         }
         if (!cards.length && !resolutions.length && !updates.length) return null;
         const brainBuf = fs.readFileSync(BRAIN);
@@ -3481,37 +3778,84 @@ async function capture(lib) {
         // filtering on the tag alone is a silent-loss bug, and silent loss is
         // the one thing the brain may never do).
         const isCommitCard = (c) => c && c.createdVia === 'commit' && /#commit-[0-9a-f]{7}/i.test(String(c.text || ''));
-        let landedCards = cards;
-        try {
-            if (cards.some(isCommitCard)) {
-                const { struct: cur } = await lib.parseKlypix(brainBuf);
-                const already = new Set();
-                for (const c of (cur.cards || []))
-                    for (const m of String(c.text || '').matchAll(/#commit-([0-9a-f]{7})/gi)) already.add(m[1].toLowerCase());
-                landedCards = cards.filter(c => {
+        let carded = null;
+        const withoutCarded = async (list) => {
+            try {
+                if (!list.some(isCommitCard)) return list;
+                if (!carded) {
+                    const { struct: cur } = await lib.parseKlypix(brainBuf);
+                    const found = new Set();
+                    for (const c of (cur.cards || []))
+                        for (const m of String(c.text || '').matchAll(/#commit-([0-9a-f]{7})/gi)) found.add(m[1].toLowerCase());
+                    carded = found;
+                }
+                return list.filter(c => {
                     if (!isCommitCard(c)) return true;
                     const m = /#commit-([0-9a-f]{7})/i.exec(String(c.text || ''));
-                    return !already.has(m[1].toLowerCase());
+                    return !carded.has(m[1].toLowerCase());
                 });
+            } catch { return list; /* parse failed → land unfiltered; the supersede pass copes */ }
+        };
+        const toEngine = (c) => ({ text: c.text, color: '#e8e8ed', borderColor: c.borderColor, area: c.area, createdVia: c.createdVia || 'claude-code', ...(c.closes ? { closes: c.closes } : {}), ...(c.closes && typeof c.closesFallbackText === 'string' ? { closesFallbackText: c.closesFallbackText, closesAnchored: c.closesAnchored === true } : {}), ...(typeof c.repairStub === 'string' ? { repairStub: c.repairStub } : {}), ...(c.evidence ? { evidence: c.evidence } : {}), ...(c.verify ? { verify: c.verify } : {}) });
+        // → null when this subset has nothing left to land (every card was
+        // already carded by the git hook), else the engine's result.
+        const land = async (cs, rs, us) => {
+            const landedCards = await withoutCarded(cs);
+            if (!landedCards.length && !rs.length && !us.length) return null;
+            return lib.captureIntoBrain(brainBuf, { cards: landedCards.map(toEngine), resolutions: rs, updates: us });
+        };
+        // A throw in the engine used to lose the WHOLE batch — and a queued
+        // batch that throws was re-drained, and threw, at every later Stop of
+        // every session, so capture was dead project-wide until someone deleted
+        // the queue file (review 2026-09-18, third round). With drained
+        // batches merged in, a failure is retried with this session's own
+        // batch alone (the drained ones are blamed, and set aside once they
+        // have failed DRAIN_FAILURES_MAX times), then with the drained batches
+        // alone (this session's markers stay in its transcript for the next
+        // Stop). Only when both halves fail does nothing land, as before.
+        let res, scope = 'all', batchError = null;
+        try { res = await land(cards, resolutions, updates); }
+        catch (error) {
+            if (!pendingBatches.length) throw error;
+            batchError = error;
+            try { res = await land(ownCards, ownResolutions, ownUpdates); scope = 'own'; }
+            catch (ownError) {
+                res = await land(drainedCards, drainedResolutions, drainedUpdates);   // a throw here: both halves fail
+                scope = 'drained'; batchError = ownError;
             }
-        } catch { /* parse failed → land unfiltered; the supersede pass copes */ }
-        if (!landedCards.length && !resolutions.length && !updates.length) {
+        }
+        const ownLanded = scope !== 'drained', drainedLanded = scope !== 'own';
+        const quarantined = scope === 'own' ? recordDrainFailure(pendingBatches, batchError) : [];
+        const clearDrained = () => {
+            if (drainedPendingIds.size) updatePendingCaptures((current) => current.filter(b => b && !drainedPendingIds.has(b.id)));
+            clearDrainedOrphans(drainedOrphanPaths);
+        };
+        const advanceOwn = () => {
+            writeState(merged);
+            writeLastCommit(newLastCommit); // advance the commit baseline only after a durable write
+            // Same discipline for the two ship channels: the queue is consumed and
+            // the observation baseline advances ONLY now that the cards are durable.
+            if (drainedShips && typeof lib.clearPendingShips === 'function') lib.clearPendingShips(CWD);
+            advanceShipBaseline(lib);
+        };
+        const reportBatch = () => {
+            if (scope === 'all') return;
+            const msg = String((batchError && batchError.message) || batchError).slice(0, 160);
+            const what = scope === 'own'
+                ? `a queued batch from an earlier capture threw (${msg}); this session's own batch landed without it${quarantined.length ? `, and ${quarantined.length} batch(es) that failed ${DRAIN_FAILURES_MAX} times were set aside as ${path.basename(PENDING_CAPTURES_FILE)}.poison-*` : ' — it stays queued'}`
+                : `this session's batch threw (${msg}); the queued batches landed without it, and its markers stay in the transcript for the next Stop`;
+            appendJsonl(HEALTH, { ts: nowIso(), project: path.basename(CWD), mode: 'capture', ok: false, err: `batch-isolated:${scope} — ${what}`.slice(0, 400) }, 500);
+            process.stderr.write(`[brain] capture: ${what}\n`);
+        };
+        if (!res) {
             // Everything gathered was already in the brain (the git hook carded
             // it first). Advance every baseline exactly like a successful write —
             // the commits ARE durable — so the same range never re-scans.
-            writeState(merged);
-            writeLastCommit(newLastCommit);
-            if (drainedPendingIds.size) updatePendingCaptures((current) => current.filter(b => b && !drainedPendingIds.has(b.id)));
-            clearDrainedOrphans(drainedOrphanPaths);
-            if (drainedShips && typeof lib.clearPendingShips === 'function') lib.clearPendingShips(CWD);
-            advanceShipBaseline(lib);
+            if (ownLanded) advanceOwn();
+            if (drainedLanded) clearDrained();
+            reportBatch();
             return null;
         }
-        const res = await lib.captureIntoBrain(brainBuf, {
-            cards: landedCards.map(c => ({ text: c.text, color: '#e8e8ed', borderColor: c.borderColor, area: c.area, createdVia: c.createdVia || 'claude-code', ...(c.closes ? { closes: c.closes } : {}), ...(c.closes && typeof c.closesFallbackText === 'string' ? { closesFallbackText: c.closesFallbackText, closesAnchored: c.closesAnchored === true } : {}), ...(typeof c.repairStub === 'string' ? { repairStub: c.repairStub } : {}), ...(c.evidence ? { evidence: c.evidence } : {}), ...(c.verify ? { verify: c.verify } : {}) })),
-            resolutions,
-            updates,
-        });
         // Re-pack the whole grid so a container that grew never overlaps its neighbor.
         let out = res.buffer; try { out = (await lib.tidyBrain(res.buffer)).buffer; } catch { /* keep append result if tidy fails */ }
         try {
@@ -3523,25 +3867,22 @@ async function capture(lib) {
             // durably (drained batches stay queued — their ids/paths were never
             // cleared), advance baselines only if that queue write succeeded,
             // and exit 0 by contract. Field case: the 2026-08-12 EPERM landed
-            // on a session's FINAL Stop and its markers had nowhere to go.
-            const queued = (ownCards.length || ownResolutions.length || ownUpdates.length)
+            // on a session's FINAL Stop and its markers had nowhere to go. An
+            // own batch the engine could not apply is not queued: its markers
+            // stay in the transcript.
+            const queued = ownLanded && (ownCards.length || ownResolutions.length || ownUpdates.length)
                 ? queuePendingCapture({ id: `${Date.now()}-${process.pid}-${Math.random().toString(36).slice(2)}`, ts: nowIso(), cards: ownCards, resolutions: ownResolutions, updates: ownUpdates })
-                : true;
+                : ownLanded;
             if (queued) { writeState(merged); writeLastCommit(newLastCommit); }
             appendJsonl(HEALTH, { ts: nowIso(), project: path.basename(CWD), mode: 'capture', ok: false, err: `write failed (${e?.code || String(e?.message || e).slice(0, 80)}) — own batch ${queued ? 'QUEUED durably' : 'NOT queued; markers remain re-gatherable'}; drained batches remain queued` }, 500);
             process.stderr.write(`[brain] capture write failed (${e?.code || 'error'}) — ${queued ? 'batch queued durably, nothing lost' : 'queueing ALSO failed; markers stay in the transcript for the next Stop'}\n`);
             return null;
         }
-        writeState(merged);
-        writeLastCommit(newLastCommit); // advance the commit baseline only after a successful write
-        if (drainedPendingIds.size) updatePendingCaptures((current) => current.filter(b => b && !drainedPendingIds.has(b.id)));
-        clearDrainedOrphans(drainedOrphanPaths);
-        // Same discipline for the two ship channels: the queue is consumed and
-        // the observation baseline advances ONLY now that the cards are durable.
-        if (drainedShips && typeof lib.clearPendingShips === 'function') lib.clearPendingShips(CWD);
-        advanceShipBaseline(lib);
+        if (ownLanded) advanceOwn();
+        if (drainedLanded) clearDrained();
+        reportBatch();
         try { await refreshAgentsBrief(lib, out); } catch { /* AGENTS.md refresh is best-effort */ }
-        return res.stats;
+        return { ...res.stats, batchScope: scope, ...(batchError ? { batchError: String(batchError.message || batchError).slice(0, 160) } : {}), ...(quarantined.length ? { quarantined } : {}) };
     };
     // Canonical cross-process lock (heartbeat + token-checked release, shared
     // with the MCP engine and the desktop app). Stale bundles missing the module
@@ -3561,7 +3902,8 @@ async function capture(lib) {
     // without enrichment.mjs just skips, costing recall, never correctness.
     // An update counts (1.86.1): a ~ that rewrote or amended its card carries a
     // q: too, and the sidecar joins a question to whichever card holds its body.
-    if (enrichmentPairs.length && (stats.added > 0 || stats.updated > 0 || stats.repaired > 0)) {
+    // Not when only queued batches landed (this session's own batch failed).
+    if (enrichmentPairs.length && stats.batchScope !== 'drained' && (stats.added > 0 || stats.updated > 0 || stats.repaired > 0)) {
         try {
             const enrich = await import(new URL('./enrichment.mjs', import.meta.url).href);
             enrich.recordEnrichment(BRAIN, enrichmentPairs.map(pair => ({ body: pair.body, question: pair.question })));
@@ -3644,15 +3986,22 @@ async function capture(lib) {
     // replaced, and a closes: that named no live card — say so, and how to
     // finish the job.
     if (typeof lib.formatCaptureReceipts === 'function') {
-        for (const line of lib.formatCaptureReceipts({ closedCards: stats.closedCards, updateAmended, closesKept: stats.closesKept, stubRepairs: stats.stubRepairs }, { maxEach: 3 })) process.stderr.write(`[brain] ${line}\n`);
-        if (Array.isArray(stats.stubRepairMissing) && stats.stubRepairMissing.length) {
-            process.stderr.write(`[brain] ${stats.stubRepairMissing.length} marker(s) an older hook already landed cut short were NOT re-added: that card is no longer live (archived, superseded or edited since) — e.g. "${stats.stubRepairMissing[0].stub}"\n`);
-        }
+        for (const line of lib.formatCaptureReceipts({ closedCards: stats.closedCards, updateAmended, closesKept: stats.closesKept, stubRepairs: stats.stubRepairs, stubRepairMissing: stats.stubRepairMissing, captureErrors: stats.captureErrors }, { maxEach: 3 })) process.stderr.write(`[brain] ${line}\n`);
         // …and the MODEL has to hear the ones that need a re-emit: a Stop
         // hook's exit-0 stderr never reaches it, so these go to a sidecar the
-        // next prompt prints once (captureReceiptsFooter).
-        const forModel = lib.formatCaptureReceipts({ updateAmended, closesKept: stats.closesKept, closeRefused: stats.closeRefused }, { maxEach: 3 });
+        // next prompt prints once (captureReceiptsFooter). That includes a
+        // note folded into an existing card as a stub repair, one NOT re-added
+        // because an older hook captured it, and a marker the engine could
+        // not apply (third review: those went to stderr only).
+        const forModel = lib.formatCaptureReceipts({ updateAmended, closesKept: stats.closesKept, closeRefused: stats.closeRefused, stubRepairs: stats.stubRepairs, stubRepairMissing: stats.stubRepairMissing, captureErrors: stats.captureErrors }, { maxEach: 3 });
         if (forModel.length) recordCaptureReceipts(sid, forModel.map(line => ({ key: sha('capture|' + line), line })));
+    }
+    // A capture that had to land around a failing batch (see doCapture).
+    if (stats.batchScope === 'drained' || (Array.isArray(stats.quarantined) && stats.quarantined.length)) {
+        const lines = [];
+        if (stats.batchScope === 'drained') lines.push(`⚠️ capture failed for this session's markers (${stats.batchError || 'engine error'}); nothing of this turn landed yet. They stay in the transcript and are retried at the next Stop — if this repeats, re-emit the important ones one per turn.`);
+        for (const q of (stats.quarantined || []).slice(0, 3)) lines.push(`⚠️ a queued capture batch failed ${DRAIN_FAILURES_MAX} times and was set aside, not landed (${q.cards} card(s), ${q.updates} update(s), ${q.resolutions} resolve(s)${q.first ? `, e.g. "${q.first}"` : ''}): ${q.file}`);
+        recordCaptureReceipts(sid, lines.map(line => ({ key: sha('capture|' + line), line })));
     }
     if (partialSkipped || stats.partialSkipped) {
         // `partialSkipped` counts MARKERS whose strongest outcome was a skip;
@@ -3694,7 +4043,7 @@ async function capture(lib) {
     // whose only cards were
     // machine-harvested ships/commits has still recorded no reasoning, and must
     // stay nudgeable. brain_note (MCP) writes the same receipt for the same id.
-    if (gapAuthored > 0 && stats.added + (stats.resolved || 0) + (stats.updated || 0) > 0) {
+    if (gapAuthored > 0 && stats.batchScope !== 'drained' && stats.added + (stats.resolved || 0) + (stats.updated || 0) > 0) {
         try {
             const gapLib = await import(new URL('./capture-gap.mjs', import.meta.url).href);
             gapLib.recordSessionCapture?.(String(input.session_id || ''), undefined, Date.now(), { project: CWD, head: newLastCommit || '' });

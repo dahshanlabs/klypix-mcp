@@ -4250,36 +4250,80 @@ export const isThinUpdate = (words, targetWords) => words < UPDATE_MIN_WORDS && 
 // thin ~ naming a long path, URL or 40-char SHA was never recognised as
 // already said, and re-appended itself at every Stop (review 2026-09-18, the
 // same unbounded stacking as the 85-line ✔ partial incident). The body is now
-// matched as a pattern instead: a space matches any run of whitespace, and
-// between two adjacent non-space characters an optional line break — the only
-// thing a mid-word wrap inserts. A match that starts or ends at a mid-word
-// break is not on a word boundary (a body that is only the head or tail of a
-// long token is not "said").
-const sayNorm = (s) => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
-const SAY_REGEX_SPECIAL = /[.*+?^${}()|[\]\\]/g;
+// matched with the card's whitespace taken out of the way instead: a space in
+// the body matches any run of whitespace in the card, and between two adjacent
+// non-space characters the card may carry one line break — the only thing a
+// mid-word wrap inserts. A match that starts or ends at a mid-word break is not
+// on a word boundary (a body that is only the head or tail of a long token is
+// not "said").
+//
+// No regular expression (review 2026-09-18, third round): the first version
+// compiled the body into a pattern, and V8 threw "Stack overflow" from exec on
+// a ~5,000-character body — outside its try, so one long thin ~ threw
+// captureIntoBrain and, once queued, wedged capture for the whole project. It
+// also lower-cased the body before an /iu match, and "İ".toLowerCase() is two
+// code units that simple case folding never maps back, so "İstanbul" did not
+// match itself. Both sides are now lower-cased the SAME way, one code unit at a
+// time, into a whitespace-free string with a map back to the card's offsets;
+// matching is a plain indexOf, linear in the card and the body.
 function isMidWordBreak(raw, nl) {
     if (raw[nl] !== '\n') return false;
     const start = raw.lastIndexOf('\n', nl - 1) + 1;
     const line = raw.slice(start, nl);
     return line.length === brainCPL() && !/\s/.test(line) && /\S/.test(raw[nl + 1] || '');
 }
-export function cardAlreadySays(cardText, body) {
-    const want = sayNorm(body);
-    if (!want) return false;
-    const raw = String(cardText || '');
-    const chars = [...want];
-    let src = '';
-    for (let i = 0; i < chars.length; i++) {
-        if (chars[i] === ' ') { src += '\\s+'; continue; }
-        src += chars[i].replace(SAY_REGEX_SPECIAL, '\\$&');
-        if (i + 1 < chars.length && chars[i + 1] !== ' ') src += '\\n?';
+// A catch handler that itself throws would defeat the containment it is there
+// for, so the two fields a failure is reported with are read defensively: the
+// thing that just failed may be exactly the thing whose property throws.
+const errText = (error) => { try { return String((error && error.message) || error).slice(0, 160); } catch { return 'unknown error'; } };
+function describeFailed(item, textKey) {
+    let area = null, text = '';
+    try { area = (item && item.area) || null; if (area !== null) area = String(area).slice(0, 60); } catch { area = null; }
+    try { text = String((item && item[textKey]) || '').slice(0, 90); } catch { text = ''; }
+    return { area, text };
+}
+// Whitespace-free, unit-by-unit lower-cased copy of s, with, per unit, the
+// offset in s it came from and whether whitespace preceded it.
+function squashForSays(s) {
+    let out = '';
+    const at = [], spaced = [];
+    let sawSpace = false;
+    for (let i = 0; i < s.length; i++) {
+        const c = s[i];
+        if (/\s/.test(c)) { sawSpace = true; continue; }
+        const lc = c.toLowerCase();
+        for (let k = 0; k < lc.length; k++) { out += lc[k]; at.push(i); spaced.push(sawSpace && k === 0); }
+        sawSpace = false;
     }
-    let re;
-    try { re = new RegExp(`(?<![\\p{L}\\p{N}])${src}(?![\\p{L}\\p{N}])`, 'giu'); } catch { return false; }
-    for (let m = re.exec(raw); m; m = re.exec(raw)) {
-        const end = m.index + m[0].length;
-        if (!(m.index > 0 && isMidWordBreak(raw, m.index - 1)) && !isMidWordBreak(raw, end)) return true;
-        re.lastIndex = m.index + 1;
+    return { out, at, spaced };
+}
+const SAY_WORD_CHAR = /[\p{L}\p{N}]/u;
+const codePointBefore = (s, i) => { if (i <= 0) return ''; const lo = s.charCodeAt(i - 1); return (lo >= 0xdc00 && lo <= 0xdfff && i >= 2) ? s.slice(i - 2, i) : s[i - 1]; };
+const codePointAt = (s, i) => (i >= s.length ? '' : String.fromCodePoint(s.codePointAt(i)));
+export function cardAlreadySays(cardText, body) {
+    const raw = String(cardText || '');
+    const want = squashForSays(String(body || '').trim());
+    if (!want.out) return false;
+    const hay = squashForSays(raw);
+    const n = want.out.length;
+    for (let pos = hay.out.indexOf(want.out); pos >= 0; pos = hay.out.indexOf(want.out, pos + 1)) {
+        // The card's whitespace between two matched units must be what the
+        // body has there: some whitespace where the body has a space, and at
+        // most one line break where it has none.
+        let fits = true;
+        for (let k = 1; k < n && fits; k++) {
+            const a = hay.at[pos + k - 1], b = hay.at[pos + k];
+            if (a === b) { fits = !want.spaced[k]; continue; }   // one card char lower-cased to two units
+            const gap = raw.slice(a + 1, b);
+            fits = want.spaced[k] ? gap.length > 0 : (gap === '' || gap === '\n');
+        }
+        if (!fits) continue;
+        const s0 = hay.at[pos];
+        const e0 = hay.at[pos + n - 1] + 1;
+        const end = (e0 < raw.length && raw.charCodeAt(e0) >= 0xdc00 && raw.charCodeAt(e0) <= 0xdfff) ? e0 + 1 : e0;
+        if (SAY_WORD_CHAR.test(codePointBefore(raw, s0)) || SAY_WORD_CHAR.test(codePointAt(raw, end))) continue;
+        if ((s0 > 0 && isMidWordBreak(raw, s0 - 1)) || isMidWordBreak(raw, end)) continue;
+        return true;
     }
     return false;
 }
@@ -4289,27 +4333,50 @@ export function cardAlreadySays(cardText, body) {
 // server port changed to 5174 now" on a 190-character card never appeared
 // there (review 2026-09-18). Previews render the NEWEST amendment first; the
 // stored card is untouched (its title still names the claim, which is what
-// closes: and ✓ match against). The run is rejoined across its wrap (a
-// mid-word chunk with no space) and ends at the next line that starts a block
-// of its own.
+// closes: and ✓ match against).
+//
+// Third review (2026-09-18) — what a preview may NOT reorder:
+//   • a leading lifecycle stamp ("↩︎ superseded …", "⤵ consolidated …") stays
+//     first, and the amendment goes right after it: the repeat nudge shows
+//     superseded cards, and one that opened with the amendment read as live;
+//   • a newer "(re-affirmed …)", "✔ …" or "✅ …" line after the amendment
+//     means the amendment is not the newest word, so the text is left as is;
+//   • the run is the amendment's own lines only: it continues across a wrap
+//     join (the previous line is a full mid-word chunk, or the next line's
+//     first word would not have fitted on it) while its "(" is still open —
+//     a human line added under a one-line amendment is not absorbed into it.
+const parenBalance = (l) => (l.match(/\(/g) || []).length - (l.match(/\)/g) || []).length;
 export function amendmentFirst(text) {
     const raw = String(text || '');
     if (!raw.includes('(~ amended ')) return raw;
     const lines = raw.split('\n');
     const isRunStart = (l) => /^\(~ amended \d{4}-\d{2}-\d{2}:/.test(l.trim());
+    const isStamp = (l) => /^(?:↩|⤵)/u.test(l.trim());
     const isBlockStart = (l) => /^\s*(?:#[\p{L}\p{N}_-]+\s*)+$/u.test(l) || /^(?:✔|✅|↩|⤵|\(re-affirmed|\(~ amended)/u.test(l.trim());
+    const isNewerWord = (l) => /^(?:\(re-affirmed|✔|✅)/u.test(l.trim());
     let start = -1;
     for (let i = lines.length - 1; i >= 0; i--) if (isRunStart(lines[i])) { start = i; break; }
-    if (start <= 0) return raw;
-    let end = start;
-    while (end + 1 < lines.length && lines[end + 1].trim() && !isBlockStart(lines[end + 1])) end++;
+    let lead = 0;
+    while (lead < lines.length && isStamp(lines[lead])) lead++;
+    if (start <= lead) return raw;
     const cpl = brainCPL();
+    let end = start, depth = parenBalance(lines[start]);
+    while (depth > 0 && end + 1 < lines.length) {
+        const prev = lines[end], next = lines[end + 1];
+        if (!next.trim() || isBlockStart(next)) break;
+        const hardWrap = prev.length === cpl && !/\s/.test(prev);
+        const softWrap = prev.trimEnd().length + 1 + (next.trim().split(/\s+/)[0] || '').length > cpl;
+        if (!hardWrap && !softWrap) break;
+        end++;
+        depth += parenBalance(next);
+    }
+    if (lines.slice(end + 1).some(isNewerWord)) return raw;
     let run = lines[start].trim();
     for (let i = start + 1; i <= end; i++) {
         const prev = lines[i - 1];
         run += (prev.length === cpl && !/\s/.test(prev.trim()) ? '' : ' ') + lines[i].trim();
     }
-    return [run, ...lines.slice(0, start), ...lines.slice(end + 1)].join('\n');
+    return [...lines.slice(0, lead), run, ...lines.slice(lead, start), ...lines.slice(end + 1)].join('\n');
 }
 // Cue META words describe the act of correcting, not the subject — left in, they
 // dilute the overlap denominator and push real correction pairs just under the
@@ -5301,7 +5368,11 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
         // Too thin to stand in for the card it matched (UPDATE FLOOR below) →
         // the card is kept whole and the text is appended to it as a dated
         // `(~ amended …)` line; nothing separate is ever minted for it.
-        for (const [uIndex, u] of updates.entries()) {
+        // Each update is CONTAINED (review 2026-09-18, third round): one that
+        // throws is reported in stats.captureErrors and the rest of the batch
+        // still lands — a single bad marker used to throw captureIntoBrain,
+        // lose every other card of its Stop and, once queued, wedge the queue.
+        for (const [uIndex, u] of updates.entries()) try {
             const uTok = tokenSet(u.text);
             let best = null, bestScore = 0;
             for (const c of liveTextCards()) {
@@ -5425,6 +5496,8 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                 // glyph and no field: an unmatched disarm is inert by design.
                 cards.push({ text: (u.area ? `${u.area}: ` : '') + (u.guard && u.guard.remove !== true && !/🛠/.test(u.text) ? '🛠️ ' : '') + u.text + (u.area ? `\n#${u.area.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : ''), area: u.area, createdVia: u.createdVia, ...(Array.isArray(u.evidence) && u.evidence.length ? { evidence: u.evidence } : {}), ...(typeof u.verify === 'string' && u.verify.trim() ? { verify: u.verify.trim() } : {}), ...(u.guard && typeof u.guard === 'object' && u.guard.remove !== true ? { guard: u.guard } : {}) });
             }
+        } catch (error) {
+            (stats.captureErrors ||= []).push({ kind: 'update', i: uIndex, ...describeFailed(u, 'text'), error: errText(error) });
         }
         // Report only amendments that are still ON their card after the whole
         // batch: a thin ~ appended and then replaced by a full ~ for the same
@@ -5455,8 +5528,9 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
             if (area && t.toLowerCase().startsWith(`${String(area).toLowerCase()}:`)) t = t.slice(String(area).length + 1);
             return stripLifecycleGlyphs(t).replace(/\s+/g, '').toLowerCase();
         };
-        for (let i = cards.length - 1; i >= 0; i--) {
-            const card = cards[i];
+        let repairing = null;
+        for (let i = cards.length - 1; i >= 0; i--) try {
+            const card = repairing = cards[i];
             if (!card || typeof card.repairStub !== 'string') continue;
             cards.splice(i, 1);
             const want = stubCore(card.repairStub, card.area);
@@ -5469,8 +5543,21 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
             // on the card (a ref no part of this text names) is kept.
             const fullText = String(card.text).replace(/\s+/g, ' ').toLowerCase();
             const fromThisProse = (v) => { const t = String(v || '').replace(/\s+/g, ' ').trim().toLowerCase(); return Boolean(t) && fullText.includes(t); };
+            // Only the TEXT is repaired. The stub's tag lines — a user's own
+            // tags, the #file-/#dir- anchors it was captured with — are what
+            // the match above ignored, so they are kept and merged with the
+            // marker's tag line (review 2026-09-18, third round: a repair
+            // rebuilt the tag line from the current transcript scan, which
+            // after an upgrade is often empty, and dropped every one).
+            const isTagLine = (l) => /^\s*(?:#[\p{L}\p{N}_-]+\s*)+$/u.test(l);
+            const tagsOf = (t) => String(t || '').split('\n').filter(isTagLine).flatMap(l => l.trim().split(/\s+/));
+            let repaired = String(card.text);
             await rewriteCard(stub.id, j => {
-                j.content = String(card.text);
+                const tags = new Map();
+                for (const tag of [...tagsOf(j.content), ...tagsOf(card.text)]) if (!tags.has(tag.toLowerCase())) tags.set(tag.toLowerCase(), tag);
+                const prose = String(card.text).split('\n').filter(l => !isTagLine(l)).join('\n');
+                repaired = tags.size ? `${prose}\n${[...tags.values()].join(' ')}` : prose;
+                j.content = repaired;
                 if (card.borderColor) j.borderColor = card.borderColor;
                 const byRef = new Map();
                 for (const ev of (Array.isArray(card.evidence) ? card.evidence : [])) byRef.set(ev && ev.ref, ev);
@@ -5480,8 +5567,11 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                 else if (typeof j.verify === 'string' && fromThisProse(j.verify)) delete j.verify;
             });
             (stats.stubRepairs ||= []).push({ id: stub.id, area: stub.area || null, from: String(card.repairStub).slice(0, 90), to: String(card.text).replace(/\s+/g, ' ').trim().slice(0, 120) });
-            stub.text = String(card.text);
+            stub.text = repaired;
             stats.repaired = (stats.repaired || 0) + 1;
+        } catch (error) {
+            // The stub stays as it is; the marker was captured once already.
+            (stats.captureErrors ||= []).push({ kind: 'repair', ...describeFailed(repairing, 'repairStub'), error: errText(error) });
         }
 
         // Which live cards a close-target names — shared by the unmatched-closes
@@ -5677,8 +5767,9 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
         // wording + createdAt) instead of stacking a twin the close-pass would
         // later miss. (Supersede deliberately skips ? cards, so without this
         // twins could never merge at capture at all.)
-        for (let i = cards.length - 1; i >= 0; i--) {
-            const card = cards[i];
+        let merging = null;
+        for (let i = cards.length - 1; i >= 0; i--) try {
+            const card = merging = cards[i];
             if (!/❓/.test(card.text) || /🏁|🛠/.test(card.text)) continue;
             const nTok = tokenSet(card.text);
             let best = null, bestScore = 0;
@@ -5713,6 +5804,10 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                 cards.splice(i, 1);
                 stats.merged++;
             }
+        } catch (error) {
+            // Contained like an update: the question stays in `cards` and
+            // lands as its own card.
+            (stats.captureErrors ||= []).push({ kind: 'question-merge', ...describeFailed(merging, 'text'), error: errText(error) });
         }
 
         // SUPERSEDE — pre-mark old cards that a NEW decision replaces. The arrow
@@ -6815,7 +6910,20 @@ export function formatCaptureReceipts(stats, { maxEach = 3 } = {}) {
     }
     // A 1.86.0 stub restored to the full marker text, in place (stub repair).
     for (const f of (Array.isArray(s.stubRepairs) ? s.stubRepairs : []).slice(0, maxEach)) {
-        lines.push(`🔧 repaired a note 1.86.0 cut short: (id ${f.id}) "${f.from}" now reads "${f.to}".`);
+        lines.push(`🔧 repaired a note 1.86.0 cut short: (id ${f.id}) "${f.from}" now reads "${f.to}". If that card was a different note, restore its text and re-emit this marker.`);
+    }
+    // …and one that was NOT re-added: the stub it would repair is not live any
+    // more. Never silent — the author is the one who can tell whether the note
+    // is already in the brain in another form.
+    for (const f of (Array.isArray(s.stubRepairMissing) ? s.stubRepairMissing : []).slice(0, maxEach)) {
+        lines.push(`↩ not re-added: a marker an older hook already captured as "${f.stub}"${f.area ? ` [${f.area}]` : ''} names no live card of that text any more (archived, superseded or edited since). If the note is not in the brain, re-emit it.`);
+    }
+    // A marker the engine could not apply (contained, so the rest landed).
+    for (const f of (Array.isArray(s.captureErrors) ? s.captureErrors : []).slice(0, maxEach)) {
+        const what = f.kind === 'update' ? '~ update' : f.kind === 'repair' ? 'stub repair' : 'open-question merge';
+        const after = f.kind === 'question-merge' ? 'The question landed as its own card, and the rest of the capture landed too.'
+            : 'The rest of the capture landed; re-emit this one if it matters.';
+        lines.push(`⚠️ ${what} failed${f.text ? `: "${f.text}"` : ''}${f.area ? ` [${f.area}]` : ''} (${f.error}). ${after}`);
     }
     // A closes: target that names no live card closed nothing; the phrase went
     // back into the note's text rather than vanishing.

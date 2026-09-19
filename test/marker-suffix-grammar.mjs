@@ -510,6 +510,12 @@ try {
     const led = fmt.amendmentFirst(human);
     ok(led.startsWith('(~ amended 2026-09-05: port is 5174)\nDev: the dev server') && /\nHuman note: actually we reverted this last week$/.test(led),
       'U1 …and a human line under a one-line amendment is not absorbed into it');
+    // The ✅ a resolve writes is prefixed INLINE onto the claim line, so unlike
+    // a ↩︎ / ⤵ stamp it cannot be kept on top — the card is previewed as
+    // stored instead, because "resolved" is its newest word.
+    const resolved = '✅ Dev: the dev server listens on port 5173\nand electron waits on it before launching\n#dev\n(~ amended 2026-09-05: port is 5174)';
+    ok(fmt.amendmentFirst(resolved) === resolved,
+      'U1 …and a card whose claim line already carries a ✅ is previewed as stored, not led by its amendment');
   }
   {
     // STUB REPAIR (engine): the stub a 1.86.0 cut left is rewritten in place;
@@ -1008,6 +1014,14 @@ try {
     ok(liveText(s1, /links as exact title matches/).length === 0 && liveText(s1, /^Pair: Pair key treats closes: targets case-insensitively/).length === 1,
       'E2 …and through a closes: cut: the first is already captured, the second lands');
     ok(/"repair-stub"/.test(ledger2()) && /repaired/.test(r1.stderr || ''), 'E2 the ledger and the receipt say "repaired"');
+    // …and the MODEL hears both, on its next prompt: a Stop hook's exit-0
+    // stderr never reaches it, and "folded into another card" / "not re-added"
+    // are exactly the outcomes only the author can judge (third review, F1).
+    // Three receipts per prompt, so read the next few — this Stop produced
+    // several, and the point is that these two are among them.
+    const promptE2 = Array.from({ length: 4 }, () => spawnSync(process.execPath, [HOOK, '--prompt'], { cwd: proj2, env: env2, encoding: 'utf8', input: JSON.stringify({ session_id: 'grammar-e2', prompt: 'continue with the pages' }) }).stdout || '').join('\n');
+    ok(/Brain capture —/.test(promptE2) && /repaired a note 1\.86\.0 cut short/.test(promptE2) && /not re-added/.test(promptE2),
+      `E2 (F1) the model hears about a note folded into an existing card and one NOT re-added, on its next prompts (${flat(promptE2).slice(0, 200) || 'EMPTY'})`);
     // ── Third review, 2026-09-18 ─────────────────────────────────────────────
     const pairing = liveText(s1, /Pairing-staleness detection/);
     ok(pairing.length === 1 && !/closes:txt_b08gx7zl/.test(pairing[0]),

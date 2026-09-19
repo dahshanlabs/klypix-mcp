@@ -4366,6 +4366,12 @@ export function amendmentFirst(text) {
     const isStamp = (l) => /^(?:↩|⤵)/u.test(l.trim());
     const isBlockStart = (l) => /^\s*(?:#[\p{L}\p{N}_-]+\s*)+$/u.test(l) || /^(?:✔|✅|↩|⤵|\(re-affirmed|\(~ amended)/u.test(l.trim());
     const isNewerWord = (l) => /^(?:\(re-affirmed|✔|✅)/u.test(l.trim());
+    // A claim line that itself carries a ✅ / ✔ is a card that has been
+    // RESOLVED: that is its newest word, so the preview is left as stored. The
+    // glyph is prefixed inline rather than on a line of its own, so it cannot
+    // be kept on top the way a ↩︎ / ⤵ stamp line is — hoisting past it made a
+    // resolved card read live in the repeat nudge (third review, R6).
+    const isResolvedHead = (l) => /^(?:✅|✔)/u.test(l.trim());
     let start = -1;
     for (let i = lines.length - 1; i >= 0; i--) if (isRunStart(lines[i])) { start = i; break; }
     let lead = 0;
@@ -4382,7 +4388,7 @@ export function amendmentFirst(text) {
         end++;
         depth += parenBalance(next);
     }
-    if (lines.slice(end + 1).some(isNewerWord)) return raw;
+    if (lines.slice(end + 1).some(isNewerWord) || isResolvedHead(lines[lead] || '')) return raw;
     let run = lines[start].trim();
     for (let i = start + 1; i <= end; i++) {
         const prev = lines[i - 1];

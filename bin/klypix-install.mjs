@@ -436,7 +436,9 @@ try {
     // deliberately preserving every host/project config byte.
     const brainCmd = (arg) => `node "${fwd(path.join(BRAIN_DIR, 'global-brain-hook.mjs'))}"${arg ? ' ' + arg : ''}`;
     const GROUPS = [
-        ['SessionStart', { matcher: 'startup|resume', hooks: [{ type: 'command', command: brainCmd('') }] }],
+        // "clear" (1.86.2): a /clear starts a new conversation that needs the
+        // brief as much as a fresh one does.
+        ['SessionStart', { matcher: 'startup|resume|clear', hooks: [{ type: 'command', command: brainCmd('') }] }],
         ['UserPromptSubmit', { hooks: [{ type: 'command', command: brainCmd('--prompt'), timeout: 10 }] }],
         ['Stop', { hooks: [{ type: 'command', command: brainCmd('--capture') }] }],
         ['PostToolUse', { matcher: 'Bash|PowerShell|Edit|Write', hooks: [{ type: 'command', command: brainCmd('--live'), timeout: 10 }] }],

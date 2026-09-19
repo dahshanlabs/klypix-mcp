@@ -37,7 +37,7 @@ import {
   splitQueryTokens, scoreCardsAgainstQuery, correctionOverlaysFor, currentGuidanceFor, currentGuidancePrefix,
   isFastDecayCard, isUnresolvedOpenCard, isSkillCard, validateGuard, guardSidecarPathFor, ensureGuardSidecar, DECAY_STALE_MS, formatDecayAge,
   isPlanCard, planFulfillmentFor, PLAN_PAIR_SIM_BRAIN, isAgconfTwinId,
-  readPendingShips, clearPendingShips, pendingShipCards, formatCaptureReceipts, parseVerifySuffix,
+  readPendingShips, clearPendingShips, pendingShipCards, formatCaptureReceipts, parseVerifySuffix, amendmentFirst,
 } from './klypix-format.mjs';
 import { findProjectBrain, postPresenceMessage, readReleaseLease } from './agent-presence.mjs';
 import { collectRepoState, commitsInRange, makeContainmentProbe } from './repo-state.mjs';
@@ -514,7 +514,10 @@ export async function opBrainTaskContext({
       id: hit.card.id,
       evidence: evidenceFor(hit.card),
       area: flat(hit.card.area) || 'Notes',
-      text: clip(hit.card.text, 420),
+      // Newest amendment first, as in the hook's previews: a thin ~ is appended
+      // UNDER the claim it corrects, and 420 characters of a long card never
+      // reached it (review 2026-09-18, third round).
+      text: clip(amendmentFirst(hit.card.text), 420),
       score: Number(hit.score.toFixed(2)),
       correctedBy: correction ? clip(correction.text, 420) : null,
       ...(correction ? { correctedById: correction.id } : {}),

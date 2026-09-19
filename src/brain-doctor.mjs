@@ -111,7 +111,15 @@ function inspectHooks(home) {
   const present = !!settings;
   const wired = present ? HOOK_EVENTS.filter(wiredFor) : [];
   const missing = present ? HOOK_EVENTS.filter(e => !wired.includes(e)) : HOOK_EVENTS.slice();
-  return { settingsPresent: present, wired, missing };
+  // Informational (never a verdict): installs before 1.86.2 wired SessionStart
+  // for "startup|resume" only, so /clear starts a conversation with no brain
+  // brief. A runtime-only update never rewrites settings.json; a full
+  // `npx klypix-mcp install` does. An empty/absent matcher means every source.
+  const ours = (Array.isArray(settings?.hooks?.SessionStart) ? settings.hooks.SessionStart : [])
+    .filter(g => Array.isArray(g?.hooks) && g.hooks.some(h => typeof h?.command === 'string' && h.command.includes(HOOK_MARK)));
+  const coversClear = (g) => !g.matcher || String(g.matcher).split('|').map(x => x.trim()).some(x => x === 'clear' || x === '*');
+  const sessionStartMissesClear = ours.length > 0 && !ours.some(coversClear);
+  return { settingsPresent: present, wired, missing, sessionStartMissesClear };
 }
 
 // ── TOOLS (discoverable manifest) layer ──────────────────────────────────────
@@ -788,6 +796,7 @@ export function render(r, opts = {}) {
   else if (r.hooks.missing.length === 1 && r.hooks.missing[0] === 'PreToolUse') L.push(`${hmark} ${c.bold}CLAUDE${c.rst}   capture path intact; ${c.yel}guard lane not wired yet${c.rst} — \`npx klypix-mcp install\` adds the PreToolUse hook (guard cards)`);
   else if (r.hooks.missing.length) L.push(`${hmark} ${c.bold}CLAUDE${c.rst}   half-wired — missing: ${c.yel}${r.hooks.missing.join(', ')}${c.rst}  ${c.dim}(liveness up, readiness no)${c.rst}`);
   else L.push(`${hmark} ${c.bold}CLAUDE${c.rst}   existing 5-hook capture path intact: ${r.hooks.wired.join(', ')}`);
+  if (r.hooks.sessionStartMissesClear) L.push(`   ${c.dim}note: SessionStart is not wired for /clear — a cleared conversation starts without the brain brief; "npx klypix-mcp install" adds "clear" to its matcher${c.rst}`);
   const chmark = r.layers.codexHooks === 'warning' ? warn : ok;
   const smart = r.codexSmart?.globalInstructions
     ? 'approval-free Context Gateway active (task memory + clean peers + proactive/guaranteed alerts)'

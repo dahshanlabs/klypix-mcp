@@ -218,6 +218,41 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
   fs.rmSync(home, { recursive: true, force: true });
 }
 
+// Third review, 2026-09-18 (R1): every install before 1.86.2 wired SessionStart
+// for "startup|resume", so a /clear started a conversation with no brain brief
+// — and a RUNTIME-only auto-update never rewrites settings.json, so those
+// installs stay that way until someone runs `npx klypix-mcp install` again.
+// Doctor says so; it is informational and never changes the verdict.
+{
+  const home = path.join(os.tmpdir(), `klypix-doctor-clear-${process.pid}`);
+  const project = path.join(home, 'project');
+  fs.rmSync(home, { recursive: true, force: true });
+  fs.mkdirSync(project, { recursive: true });
+  fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
+  const brainCmd = 'node "C:/Users/x/.claude/project-brain/global-brain-hook.mjs"';
+  const settingsWith = (matcher) => ({
+    hooks: {
+      SessionStart: [{ matcher, hooks: [{ type: 'command', command: brainCmd }] }],
+      UserPromptSubmit: [{ hooks: [{ type: 'command', command: `${brainCmd} --prompt` }] }],
+      Stop: [{ hooks: [{ type: 'command', command: `${brainCmd} --capture` }] }],
+      PostToolUse: [{ matcher: 'Bash|PowerShell|Edit|Write', hooks: [{ type: 'command', command: `${brainCmd} --live` }] }],
+      PreToolUse: [{ matcher: 'Bash|PowerShell|Edit|Write', hooks: [{ type: 'command', command: `${brainCmd} --guard` }] }],
+    },
+  });
+  const settingsPath = path.join(home, '.claude', 'settings.json');
+  fs.writeFileSync(settingsPath, JSON.stringify(settingsWith('startup|resume')));
+  const old = inspect({ home, projectDir: project, fmtLib: null });
+  const oldText = render(old, { color: false });
+  ok(old.hooks.sessionStartMissesClear === true && old.hooks.missing.length === 0
+    && /SessionStart is not wired for \/clear/.test(oldText) && /capture path intact/.test(oldText),
+  'doctor flags a pre-1.86.2 SessionStart matcher that leaves /clear out, without calling the install broken');
+  fs.writeFileSync(settingsPath, JSON.stringify(settingsWith('startup|resume|clear')));
+  const fixed = inspect({ home, projectDir: project, fmtLib: null });
+  ok(fixed.hooks.sessionStartMissesClear === false && !/SessionStart is not wired for \/clear/.test(render(fixed, { color: false })),
+    'doctor stays quiet once the matcher covers /clear');
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
 // A deliberately hibernated supervisor has released its worker but still owns
 // a healthy pull-only connection. Doctor must use the sleeping target for
 // version alignment and must not call the expected worker absence an outage.

@@ -39,6 +39,7 @@ import { execFileSync, spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 
 const SRC = new URL('../src/', import.meta.url);
+const REPO = fileURLToPath(new URL('../', import.meta.url));
 const HOOK = fileURLToPath(new URL('global-brain-hook.mjs', SRC));
 
 let failures = 0;
@@ -61,6 +62,9 @@ const { buildKlypixMap, parseKlypix, captureIntoBrain, formatCaptureReceipts, pa
 const home = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-grammar-home-'));
 const proj = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-grammar-proj-'));
 const extraDirs = [];
+// Junctions are unlinked BEFORE the dirs holding them are removed: a recursive
+// remove must never be pointed at the repo's real node_modules.
+const junctions = [];
 
 try {
   // ── G1 — prose is never a suffix ──────────────────────────────────────────
@@ -465,6 +469,49 @@ try {
     ok(/owner is the support lead/.test(ultra), 'U1 the ultra brief shows the amendment of a long open question');
   }
   {
+    // ── Third review, 2026-09-18 (F4/F5) — cardAlreadySays must answer, not
+    // throw, and must not lose a letter to case folding.
+    //
+    // F4: the pattern the first fix compiled made V8 throw
+    // "SyntaxError: Invalid regular expression … Stack overflow" from exec at
+    // about 5,000 characters of body — OUTSIDE its try, so one long thin ~
+    // threw captureIntoBrain, lost its whole Stop batch and, once queued,
+    // failed at every later Stop of every session in the project.
+    const tail = ' 12 34 56 78 90'.repeat(500);          // ~7.5k characters
+    const longBody = `Release gate verification smoke signing:${tail}`;
+    let threw = null, exact = null, miss = null;
+    try {
+      exact = fmt.cardAlreadySays(`Gate: Release gate verification smoke signing:${tail}`, longBody);
+      miss = fmt.cardAlreadySays('Gate: Release gate verification smoke signing: 12 34 and then something else', longBody);
+    } catch (e) { threw = e; }
+    ok(!threw && exact === true && miss === false,
+      `U1 a ~7.5k-character body is answered, not thrown at (${threw ? threw.message.slice(0, 60) : `${exact}/${miss}`})`);
+    // F5: "İ".toLowerCase() is "i" + U+0307, which simple case folding under
+    // /iu never maps back — so a Turkish thin ~ did not match itself and
+    // re-appended at every Stop.
+    ok(fmt.cardAlreadySays('Office: the office moved to İstanbul last spring', 'İstanbul')
+      && fmt.cardAlreadySays('Office: the office moved to İstanbul last spring', 'moved to İstanbul')
+      && fmt.cardAlreadySays('Sirket: ŞİRKETİ kuruldu geçen yıl', 'ŞİRKETİ')
+      && fmt.cardAlreadySays('Dev: Dev server listens on PORT 5173', 'port 5173')
+      && !fmt.cardAlreadySays('Office: the office moved to Istanbul last spring', 'İstanbul'),
+      'U1 …and a letter whose lowercase EXPANDS (Turkish İ) matches itself, while plain I still does not');
+  }
+  {
+    // ── Third review, 2026-09-18 (R6) — what a preview may NOT reorder.
+    const sup = '↩︎ superseded 2026-09-10 by [[Dev server port]]\nDev: the dev server listens on port 5173\n#dev\n(~ amended 2026-09-05: port is 5174)';
+    const supLines = fmt.amendmentFirst(sup).split('\n');
+    ok(supLines[0] === '↩︎ superseded 2026-09-10 by [[Dev server port]]' && supLines[1] === '(~ amended 2026-09-05: port is 5174)',
+      'U1 amendmentFirst keeps a ↩︎ superseded stamp first (the repeat nudge previews archived cards) and puts the amendment right after it');
+    const cons = '⤵ consolidated 2026-09-10 into [[Dev server port]]\nDev: the dev server listens on port 5173\n(~ amended 2026-09-05: port is 5174)';
+    ok(fmt.amendmentFirst(cons).split('\n')[0] === '⤵ consolidated 2026-09-10 into [[Dev server port]]', 'U1 …the same for a ⤵ consolidated stamp');
+    const reaff = 'Dev: the dev server listens on port 5173\n(~ amended 2026-09-05: port is 5174)\n(re-affirmed 2026-09-12: still true, verified on the release build)';
+    ok(fmt.amendmentFirst(reaff) === reaff, 'U1 …a NEWER (re-affirmed …) line means the amendment is not the newest word, so the card is previewed as stored');
+    const human = 'Dev: the dev server listens on port 5173\n(~ amended 2026-09-05: port is 5174)\nHuman note: actually we reverted this last week';
+    const led = fmt.amendmentFirst(human);
+    ok(led.startsWith('(~ amended 2026-09-05: port is 5174)\nDev: the dev server') && /\nHuman note: actually we reverted this last week$/.test(led),
+      'U1 …and a human line under a one-line amendment is not absorbed into it');
+  }
+  {
     // STUB REPAIR (engine): the stub a 1.86.0 cut left is rewritten in place;
     // an ev: / verify: 1.86.0 read out of the very prose it cut is dropped, and
     // metadata this text does not name is kept.
@@ -482,6 +529,34 @@ try {
     const again = await captureIntoBrain(buffer, { cards: [{ text: full, area: 'Rel', repairStub: 'Every agent must' }] });
     ok(!again.stats.repaired && again.stats.stubRepairMissing?.length === 1 && again.stats.added === 0,
       'U1 with no live stub left, a repair lands nothing (reported as stubRepairMissing)');
+  }
+  {
+    // Third review, 2026-09-18 (F3) — a repair rewrites the stub's TEXT, and
+    // nothing else: the tag lines the stub match deliberately ignores (a
+    // user's own tags, the #file-/#dir- anchors it was captured with) are the
+    // one thing an edit-detector cannot see, and rebuilding the tag line from
+    // the current transcript scan — usually empty after an upgrade — destroyed
+    // every one of them.
+    const base = await buildKlypixMap({ title: 'brain', areas: [{ title: 'Tags', cards: [{ text: 'Tags: unrelated seed card about the lint rules' }] }] });
+    const seeded = await captureIntoBrain(base, { cards: [{ text: 'Tags: Support page gets a\n#tags #file-supportpagetsx #dir-srcpages', area: 'Tags' }] });
+    const { struct: s0, zip: z0 } = await parseKlypix(seeded.buffer);
+    const stub = s0.cards.find((c) => /Support page gets a/.test(flat(c.text)));
+    const stubId = stub.id;
+    // The human tagged it in the app afterwards.
+    const rawName = Object.keys(z0.files).find((n) => n.endsWith(`/${stubId}.json`));
+    const withUserTags = JSON.parse(await z0.file(rawName).async('string'));
+    withUserTags.content = 'Tags: Support page gets a\n#tags #file-supportpagetsx #dir-srcpages #founder-pick #keep';
+    z0.file(rawName, JSON.stringify(withUserTags));
+    const tagged = await z0.generateAsync({ type: 'nodebuffer' });
+    const { stats, buffer } = await captureIntoBrain(tagged, { cards: [{ text: 'Tags: Support page gets a Q: and A: layout so billing questions read as a FAQ\n#tags', area: 'Tags', repairStub: 'Support page gets a' }] });
+    const { struct } = await parseKlypix(buffer);
+    const repaired = struct.cards.find((c) => c.id === stubId);
+    ok(stats.repaired === 1 && /Q: and A: layout so billing questions read as a FAQ/.test(flat(repaired.text)),
+      'U1 (setup) the stub is repaired to the full marker text');
+    const tagsOn = (t) => flat(t).split(/\s+/).filter((w) => w.startsWith('#'));
+    ok(['#founder-pick', '#keep', '#file-supportpagetsx', '#dir-srcpages', '#tags'].every((t) => tagsOn(repaired.text).includes(t)),
+      `U1 …and a repair keeps the stub's own tag lines — user tags and #file-/#dir- anchors (${tagsOn(repaired.text).join(' ')})`);
+    ok(tagsOn(repaired.text).filter((t) => t === '#tags').length === 1, 'U1 …merged with the marker\'s tag line, not duplicated');
   }
   {
     // An amendment line ENDS a ✔ partial note run, so the note keeps its
@@ -732,10 +807,13 @@ try {
     '🧠 BRAIN [Dedup]: Dedup key treats closes: targets case-insensitively after the grammar change',
     '🧠 BRAIN [Store] ~: Pro plan price is $5 monthly, billed via Stripe',
     '🧠 BRAIN [Nav] ~: Pan hand tool now lives in the main toolbar beside the select tool q: where did the pan hand tool move to?',
-    '🧠 BRAIN [Legacy]: Legacy note already captured closes: Some old target',
   ];
+  // The legacy note was emitted BEFORE the upgrade (its event is older than
+  // the state file an older hook wrote); everything else is new.
+  const hourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
   const tp = path.join(home, 't-grammar.jsonl');
   fs.writeFileSync(tp, [
+    { type: 'assistant', timestamp: hourAgo, message: { role: 'assistant', content: [{ type: 'text', text: 'Earlier.\n\n🧠 BRAIN [Legacy]: Legacy note already captured closes: Some old target' }] } },
     { type: 'user', message: { role: 'user', content: 'restructure the support and pricing pages around the questions customers ask' } },
     { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: `Done.\n\n${markers.join('\n')}` }] } },
   ].map((e) => JSON.stringify(e)).join('\n') + '\n');
@@ -839,6 +917,9 @@ try {
         { title: 'Docs', cards: [{ text: 'Docs: Docs index uses a\n#docs' }] },
         { title: 'Share', cards: [{ text: 'Share: Share page gets a\n#share' }] },
         { title: 'Pair', cards: [{ text: 'Pair: Pair key treats\n#pair' }] },
+        // …and one 1.86.0 landed COMPLETE: it cut at the " closes:" and acted
+        // on the close, so this card was never a stub (third review, F2).
+        { title: 'Pairing', cards: [{ text: 'Pairing: Pairing-staleness detection now runs on the desktop lane\n#pairing' }] },
       ],
     }));
     const key186 = (type, area, cut) => crypto.createHash('sha1').update(`${type}|${area}|${cut}`.toLowerCase()).digest('hex').slice(0, 16);
@@ -849,11 +930,12 @@ try {
       key186('', 'Gone', 'Gone page gets a'),                 // its stub card is not live any more
       key186('', 'Share', 'Share page gets a'),
       key186('', 'Pair', 'Pair key treats'),
+      key186('', 'Pairing', 'Pairing-staleness detection now runs on the desktop lane'),
     ] }));
     const thinDev = '🧠 BRAIN [Dev] ~: Dev port now set in electron/config/devServerPortSettings.ts';
-    const turn1 = [
-      thinDev,
-      '🧠 BRAIN [Brain]: The resolver now treats closes: targets as exact titles ev: src/klypix-format.mjs',
+    // What 1.86.0 already processed (its Stop ran before the upgrade, so these
+    // events are older than the state file it wrote) …
+    const turn0 = [
       '🧠 BRAIN [Faq]: Faq page gets a Q: and A: layout so billing questions read as a FAQ',
       '🧠 BRAIN [Uploader] !: Uploader retry shipped q: backoff and jitter numbers',
       '🧠 BRAIN [Docs]: Docs index uses a q: prefix for search terms ev: docs/search.md',
@@ -865,10 +947,32 @@ try {
       // The same through the closes: key the grammar still cuts at.
       '🧠 BRAIN [Pair]: Pair key treats closes: links as exact title matches rather than fuzzy overlap',
       '🧠 BRAIN [Pair]: Pair key treats closes: targets case-insensitively after the grammar change',
+      // Third review (F2): 1.86.0 cut at " closes:" whether or not a space
+      // followed, and ACTED on the close — its card is complete. This grammar
+      // reads "closes:txt_…" as prose, so the marker looks "longer" than the
+      // cut and used to be "repaired", appending that junk to the card.
+      '🧠 BRAIN [Pairing]: Pairing-staleness detection now runs on the desktop lane closes:txt_b08gx7zl',
+      // Third review (F1/R4): two notes of ONE capture where the second's old
+      // CUT is byte-identical to the first's own key. The second is a note
+      // that never landed, not a repair of the first.
+      '🧠 BRAIN [Rollout]: Rollout ring expanded to twenty percent ev: docs/rollout.md',
+      '🧠 BRAIN [Rollout]: Rollout ring expanded to twenty percent Q: and A: blocks now render in the rollout console',
+      // Third review (F6): 1.86.0 applied this ~ at its own Stop and wrote no
+      // per-line key, so the first 1.86.1 Stop re-applied every old ~ / ✓ over
+      // whatever the brain held by then.
+      '🧠 BRAIN [Ship] ~: Exact titles for release targets shipped in the resolver lane and the fuzzy fallback is gone',
+    ];
+    // … and what is new since the upgrade.
+    const turn1 = [
+      thinDev,
+      '🧠 BRAIN [Brain]: The resolver now treats closes: targets as exact titles ev: src/klypix-format.mjs',
       '🧠 BRAIN [Deploy] ~: Production deploy now runs from main',
     ];
     const tp2 = path.join(home2, 't-e2.jsonl');
+    const beforeUpgrade = new Date(Date.now() - 60 * 60 * 1000).toISOString();
     const entries = [
+      { type: 'user', uuid: 'u-0', timestamp: beforeUpgrade, message: { role: 'user', content: 'restructure the faq, docs and share pages' } },
+      { type: 'assistant', uuid: 'a-0', timestamp: beforeUpgrade, message: { role: 'assistant', content: [{ type: 'text', text: `Done.\n\n${turn0.join('\n')}` }] } },
       { type: 'user', uuid: 'u-1', message: { role: 'user', content: 'wire the dev port and ship the uploader retry' } },
       { type: 'assistant', uuid: 'a-1', message: { role: 'assistant', content: [{ type: 'text', text: `Done.\n\n${turn1.join('\n')}` }] } },
     ];
@@ -904,6 +1008,16 @@ try {
     ok(liveText(s1, /links as exact title matches/).length === 0 && liveText(s1, /^Pair: Pair key treats closes: targets case-insensitively/).length === 1,
       'E2 …and through a closes: cut: the first is already captured, the second lands');
     ok(/"repair-stub"/.test(ledger2()) && /repaired/.test(r1.stderr || ''), 'E2 the ledger and the receipt say "repaired"');
+    // ── Third review, 2026-09-18 ─────────────────────────────────────────────
+    const pairing = liveText(s1, /Pairing-staleness detection/);
+    ok(pairing.length === 1 && !/closes:txt_b08gx7zl/.test(pairing[0]),
+      `E2 (F2) a note an older hook cut at an unspaced "closes:" — and ACTED on — is not "repaired" with that junk (${flat(pairing[0] || 'gone')})`);
+    ok(liveText(s1, /Rollout ring expanded to twenty percent Q: and A: blocks now render/).length === 1
+      && s1.cards.some((c) => c.type !== 'container' && /Rollout ring expanded to twenty percent/.test(flat(c.text)) && !/Q: and A:/.test(flat(c.text))),
+      'E2 (F1/R4) two notes of ONE capture whose second\'s old cut equals the first\'s own key land as TWO cards');
+    const ship = liveText(s1, /Exact titles for release targets/);
+    ok(ship.length === 1 && !/fuzzy fallback is gone/.test(ship[0]),
+      `E2 (F6) a ~ from an event an older hook already applied is not applied again at the first 1.86.1 Stop (${flat(ship[0] || 'gone')})`);
     const prodAmended = liveText(s1, /Production deploy runs from the release branch/);
     ok(prodAmended.length === 1 && /now runs from main/.test(prodAmended[0]), 'E2 (setup) the thin Production ~ is appended to the Production card');
     // Stops 2 and 3 re-read the same transcript: nothing changes.
@@ -925,6 +1039,212 @@ try {
     ok(amendments(devOf(s5).text) === 1 && /"update-already-says"/.test(ledger2()), 'E2 the same thin ~ in a NEW turn is "already says" — still one line');
     const staging = s5.cards.find((c) => c.type !== 'container' && /Staging deploy runs from main/.test(flat(c.text)));
     ok(Boolean(staging) && amendments(staging.text) === 0, 'E2 once its card is resolved, a re-read thin ~ never lands on ANOTHER card');
+    // Third review (R5): the seen set is a capped FIFO and a Set keeps FIRST
+    // insertion order, so a key re-read at every Stop never refreshed — it
+    // aged out while its transcript was still live, and resuming that session
+    // re-applied its ~ lines over whatever the cards said by then. KLYPIX's own
+    // state already held 1,658 of the old 2,000. A capture now moves every key
+    // it HIT to the young end (including a Stop with nothing new to land), and
+    // the cap leaves room for several busy sessions.
+    const stateFile = path.join(proj2, '.claude', 'brain-capture-state.json');
+    const stateBefore = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    // 6,000 keys from the project's other sessions arrive AFTER this session's,
+    // which are now the oldest in the set.
+    fs.writeFileSync(stateFile, JSON.stringify({ ...stateBefore, seen: [...stateBefore.seen, ...Array.from({ length: 6000 }, (_, i) => `busy-peer-key-${i}`)] }));
+    // This session Stops again with nothing new to land — the common case, and
+    // the moment its keys must be refreshed.
+    stop2();
+    // Then ANOTHER session captures, which is what trims the set.
+    const tp2b = path.join(home2, 't-e2b.jsonl');
+    fs.writeFileSync(tp2b, [
+      { type: 'user', uuid: 'u-peer', message: { role: 'user', content: 'unrelated work in another session' } },
+      { type: 'assistant', uuid: 'a-peer', message: { role: 'assistant', content: [{ type: 'text', text: 'Done.\n\n🧠 BRAIN [Peer]: A second session captured an unrelated decision about the preview workflow' }] } },
+    ].map((e) => JSON.stringify(e)).join('\n') + '\n');
+    spawnSync(process.execPath, [HOOK, '--capture'], { cwd: proj2, env: env2, encoding: 'utf8', input: JSON.stringify({ session_id: 'grammar-e2-peer', transcript_path: tp2b }) });
+    const kept = JSON.parse(fs.readFileSync(stateFile, 'utf8')).seen;
+    ok(kept.length <= 5000, `E2 (R5) the seen set stays capped (${kept.length} keys)`);
+    // …and resuming the first session re-reads its whole transcript against a
+    // brain that has moved on. Its ~ lines must still count as applied.
+    const bytesBeforeResume = fs.readFileSync(brain2);
+    stop2(); stop2();
+    ok(Buffer.compare(bytesBeforeResume, fs.readFileSync(brain2)) === 0,
+      'E2 (R5) a session resumed after the project\'s seen set overflowed does not re-apply the ~ / ✓ lines it already applied');
+  }
+
+  // ── E2b — the upgrade back-compat is BOUNDED to what an older hook wrote ──
+  // Third review, 2026-09-18 (F1). 1.86.1 keys a note with no closes: on
+  // sha(type|area|body) — byte-identical to the OLD-CUT key of any LATER note
+  // that starts with the same sentence and then carries a key this grammar
+  // keeps as TEXT (a prose "Q:", an unspaced "closes:", a prose "ev:"). Those
+  // old keys were consulted for every additive marker with no time bound, so
+  // the collision had nothing to do with an upgrade: in a project that never
+  // ran an older hook at all, a second note was folded into the FIRST note's
+  // card as a "repair", dropped as "not re-added", or had its closes: skipped
+  // while the ❓ stayed open. Reproduced on a scratch copy of the real brain.
+  // A project whose capture state was never written by an older hook now has
+  // legacyUntil 0 and never looks at an old key.
+  {
+    const home4 = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-grammar-home4-'));
+    const proj4 = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-grammar-proj4-'));
+    extraDirs.push(home4, proj4);
+    fs.mkdirSync(path.join(home4, '.claude', 'project-brain'), { recursive: true });
+    fs.writeFileSync(path.join(home4, '.claude', 'project-brain', '.npm-currency.json'), JSON.stringify({ pkg: 'klypix-mcp', latest: '99.0.0', checkedAt: Date.now() }));
+    fs.mkdirSync(path.join(proj4, '.claude'), { recursive: true });
+    fs.writeFileSync(path.join(proj4, 'README.md'), '# probe\n');
+    const brain4 = path.join(proj4, 'brain.klypix');
+    fs.writeFileSync(brain4, await buildKlypixMap({
+      title: 'brain',
+      areas: [
+        { title: 'ProbeSupport', cards: [{ text: 'ProbeSupport: The support area is where the help centre and its macros live' }] },
+        // The ❓ is about something else, so nothing but an explicit closes:
+        // can retire it.
+        { title: 'ProbeFaq', cards: [{ text: 'ProbeFaq: ❓ Should the invite emails carry a plain-text fallback body' }] },
+      ],
+    }));
+    // NO .claude/brain-capture-state.json: this project has never run any hook.
+    const env4 = { ...process.env, HOME: home4, USERPROFILE: home4, KLYPIX_BRAIN_NUDGE: 'off', KLYPIX_AUTO_UPDATE: '0' };
+    delete env4.KLYPIX_BRAIN_NO_MAIN;
+    const session4 = (sid, markerLines) => {
+      const tp4 = path.join(home4, `t-${sid}.jsonl`);
+      fs.writeFileSync(tp4, [
+        { type: 'user', uuid: `u-${sid}`, message: { role: 'user', content: 'work on the support pages' } },
+        { type: 'assistant', uuid: `a-${sid}`, message: { role: 'assistant', content: [{ type: 'text', text: `Done.\n\n${markerLines.join('\n')}` }] } },
+      ].map((e) => JSON.stringify(e)).join('\n') + '\n');
+      return spawnSync(process.execPath, [HOOK, '--capture'], { cwd: proj4, env: env4, encoding: 'utf8', input: JSON.stringify({ session_id: sid, transcript_path: tp4 }) });
+    };
+    const a = session4('probe-a', [
+      '🧠 BRAIN [ProbeSupport]: Support page redesign shipped ev: README.md',
+      '🧠 BRAIN [ProbeFaq]: Support FAQ accordion shipped ev: README.md',
+    ]);
+    ok(a.status === 0, `E2b Stop a exits 0 (${a.status})`);
+    const b = session4('probe-b', [
+      '🧠 BRAIN [ProbeSupport]: Support page redesign shipped Q: and A: blocks now render as an accordion instead of a flat list',
+      '🧠 BRAIN [ProbeFaq]: Support FAQ accordion shipped closes: [[Should the invite emails carry a plain-text fallback body]]',
+    ]);
+    ok(b.status === 0, `E2b Stop b exits 0 (${b.status})`);
+    const s4 = (await parseKlypix(fs.readFileSync(brain4))).struct;
+    const all4 = (re) => s4.cards.filter((c) => c.type !== 'container' && re.test(flat(c.text))).map((c) => flat(c.text));
+    ok(all4(/Support page redesign shipped Q: and A: blocks now render as an accordion/).length === 1
+      && all4(/Support page redesign shipped/).some((t) => !/Q: and A:/.test(t)),
+      `E2b a later note that starts with an earlier note's sentence is its own card, not a "repair" of it (${all4(/Support page redesign shipped/).length} card(s))`);
+    const stderr4 = `${a.stderr || ''}\n${b.stderr || ''}`;
+    ok(!/repaired a note 1\.86\.0 cut short/.test(stderr4) && !/were NOT re-added/.test(stderr4),
+      `E2b …with no repair and nothing dropped in a project that never ran an older hook (${flat(stderr4).slice(0, 120)})`);
+    ok(liveText(s4, /❓ Should the invite emails carry a plain-text fallback body/).length === 0
+      && all4(/Support FAQ accordion shipped/).length >= 1,
+      'E2b …and a later note whose closes: names an unrelated open question still closes it');
+    // The bound is on the OLD keys only: this project's own dedup is untouched,
+    // so re-reading the same transcripts changes nothing.
+    const bytes4 = fs.readFileSync(brain4);
+    session4('probe-a', ['🧠 BRAIN [ProbeSupport]: Support page redesign shipped ev: README.md', '🧠 BRAIN [ProbeFaq]: Support FAQ accordion shipped ev: README.md']);
+    ok(Buffer.compare(bytes4, fs.readFileSync(brain4)) === 0, 'E2b a re-read transcript still leaves brain.klypix byte-identical');
+  }
+
+  // ── E5 — a marker the engine cannot apply never cancels the batch, and a
+  //        queued batch it keeps failing on never wedges the project ─────────
+  // Third review, 2026-09-18 (F4). The real trigger was cardAlreadySays
+  // throwing V8's regexp "Stack overflow" on a ~5,000-character thin ~ (fixed
+  // above, U1); the damage was everything downstream of it. captureIntoBrain
+  // threw, so the WHOLE Stop batch was lost — an unrelated decision in the
+  // same transcript never landed. And when the brain lock was held (a routine
+  // desktop save) that batch was QUEUED, the author was told "nothing lost",
+  // and every later session drained it, threw, landed nothing and left the
+  // queue in place: capture was dead project-wide until someone deleted the
+  // file.
+  {
+    const buf = await buildKlypixMap({
+      title: 'brain',
+      areas: [
+        { title: 'Dev', cards: [{ text: 'Dev: The dev server port is configured in vite.config.ts and electron waits on it before launching the overlay' }] },
+        { title: 'Ops', cards: [{ text: 'Ops: The deploy pipeline runs lint then tests then the packaging job before uploading the artifacts' }] },
+      ],
+    });
+    // A marker whose own shape makes the engine throw mid-update — the only
+    // way left to exercise containment now that the real thrower is fixed.
+    const bad = { area: 'Dev', text: 'The dev server port is now configured in electron config and the overlay waits on it' };
+    Object.defineProperty(bad, 'guard', { get() { throw new Error('synthetic marker failure'); }, enumerable: true });
+    const good = { area: 'Ops', text: 'The deploy pipeline now runs the packaging job before the tests and uploads the artifacts afterwards' };
+    let threw = null, r = null;
+    try { r = await captureIntoBrain(buf, { updates: [bad, good] }); } catch (e) { threw = e; }
+    ok(!threw && r?.stats.updated === 1 && r.stats.captureErrors?.length === 1 && r.stats.captureErrors[0].kind === 'update'
+      && /synthetic marker failure/.test(r.stats.captureErrors[0].error),
+      `E5 a ~ the engine throws on is contained: the other marker of the same batch still lands (${threw ? threw.message.slice(0, 60) : `${r.stats.updated} updated`})`);
+    ok(Boolean(r) && formatCaptureReceipts(r.stats).some((l) => /~ update failed/.test(l) && /The rest of the capture landed/.test(l)),
+      'E5 …and the author is told which marker failed, not left to guess');
+    const struct = r ? (await parseKlypix(r.buffer)).struct : { cards: [] };
+    ok(liveText(struct, /packaging job before the tests/).length === 1 && liveText(struct, /configured in vite\.config\.ts/).length === 1,
+      'E5 …the good correction is on its card, and the failed one changed nothing');
+  }
+  {
+    // Through the REAL hook, with a queued batch the engine keeps failing on.
+    // The sandbox is the shipped src/ with ONE line added to captureIntoBrain:
+    // it throws on a sentinel. node_modules is junctioned so bare imports still
+    // resolve; nothing else differs from what ships.
+    const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-grammar-poison-'));
+    const sandboxSrc = path.join(sandbox, 'src');
+    const nm = path.join(sandbox, 'node_modules');
+    junctions.push(nm);
+    extraDirs.push(sandbox);
+    fs.mkdirSync(sandboxSrc, { recursive: true });
+    fs.symlinkSync(path.join(REPO, 'node_modules'), nm, 'junction');
+    const srcDir = fileURLToPath(SRC);
+    for (const f of fs.readdirSync(srcDir)) { const s = path.join(srcDir, f); if (fs.statSync(s).isFile()) fs.copyFileSync(s, path.join(sandboxSrc, f)); }
+    const engine = path.join(sandboxSrc, 'klypix-format.mjs');
+    const sig = 'export async function captureIntoBrain(buffer, { cards = [], resolutions = [], updates = [] } = {}) {';
+    const engineSrc = fs.readFileSync(engine, 'utf8');
+    ok(engineSrc.includes(sig), 'E5 (setup) the sandbox engine carries the signature the seam goes after');
+    fs.writeFileSync(engine, engineSrc.replace(sig, `${sig}\n    if ([...cards, ...updates, ...resolutions].some((x) => /POISON-MARKER/.test(String((x && x.text) || '')))) throw new Error('synthetic engine failure');`));
+    const sandboxHook = path.join(sandboxSrc, 'global-brain-hook.mjs');
+    const homeP = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-grammar-homeP-'));
+    const projP = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-grammar-projP-'));
+    extraDirs.push(homeP, projP);
+    fs.mkdirSync(path.join(homeP, '.claude', 'project-brain'), { recursive: true });
+    fs.writeFileSync(path.join(homeP, '.claude', 'project-brain', '.npm-currency.json'), JSON.stringify({ pkg: 'klypix-mcp', latest: '99.0.0', checkedAt: Date.now() }));
+    fs.mkdirSync(path.join(projP, '.claude'), { recursive: true });
+    const brainP = path.join(projP, 'brain.klypix');
+    fs.writeFileSync(brainP, await buildKlypixMap({ title: 'brain', areas: [{ title: 'Queue', cards: [{ text: 'Queue: The capture queue drains under the brain write lock on the next Stop' }] }] }));
+    const { laneFileFor } = await import(new URL('agent-presence.mjs', SRC).href);
+    const pendingFile = path.join(homeP, '.claude', 'project-brain', 'pending', path.basename(laneFileFor(brainP, homeP)).replace(/\.json$/, '.captures.json'));
+    fs.mkdirSync(path.dirname(pendingFile), { recursive: true });
+    fs.writeFileSync(pendingFile, JSON.stringify([{
+      id: 'poison-1', ts: new Date().toISOString(),
+      cards: [{ text: 'Queue: POISON-MARKER a queued batch the engine cannot apply', area: 'Queue', createdVia: 'claude-code' }],
+      resolutions: [], updates: [],
+    }]));
+    const envP = { ...process.env, HOME: homeP, USERPROFILE: homeP, KLYPIX_BRAIN_NUDGE: 'off', KLYPIX_AUTO_UPDATE: '0' };
+    delete envP.KLYPIX_BRAIN_NO_MAIN;
+    const stopP = (sid, line) => {
+      const tp = path.join(homeP, `t-${sid}.jsonl`);
+      fs.writeFileSync(tp, [
+        { type: 'user', uuid: `u-${sid}`, message: { role: 'user', content: 'keep working on the queue' } },
+        { type: 'assistant', uuid: `a-${sid}`, message: { role: 'assistant', content: [{ type: 'text', text: `Done.\n\n${line}` }] } },
+      ].map((e) => JSON.stringify(e)).join('\n') + '\n');
+      return spawnSync(process.execPath, [sandboxHook, '--capture'], { cwd: projP, env: envP, encoding: 'utf8', input: JSON.stringify({ session_id: sid, transcript_path: tp }) });
+    };
+    // Four unrelated decisions from four later sessions: each must land even
+    // though the queue they drain keeps throwing.
+    const own = [
+      ['Queue', 'The pending queue file is read under its own lock before the brain write', /pending queue file is read under its own lock/],
+      ['Docs', 'The troubleshooting guide gains a section on capture batches that will not land', /troubleshooting guide gains a section/],
+      ['Health', 'Hook health rows carry the batch scope so a wedged queue is visible to the doctor', /Hook health rows carry the batch scope/],
+      ['Cli', 'A doctor subcommand lists set-aside capture batches with the first card of each', /doctor subcommand lists set-aside capture batches/],
+    ];
+    const runs = own.map(([area, text], i) => stopP(`poison-${i + 1}`, `🧠 BRAIN [${area}]: ${text}`));
+    ok(runs.every((r) => r.status === 0), `E5 every Stop still exits 0 (${runs.map((r) => r.status).join(',')})`);
+    const sP = (await parseKlypix(fs.readFileSync(brainP))).struct;
+    const landed = own.filter(([, , re]) => liveText(sP, re).length === 1);
+    ok(landed.length === own.length, `E5 a queued batch the engine cannot apply never cancels another session's own markers (${landed.length}/${own.length} landed)`);
+    const stillQueued = (() => { try { const d = JSON.parse(fs.readFileSync(pendingFile, 'utf8')); return Array.isArray(d) ? d : []; } catch { return []; } })();
+    const poisonFiles = fs.readdirSync(path.dirname(pendingFile)).filter((n) => n.startsWith(`${path.basename(pendingFile)}.poison-`));
+    ok(!stillQueued.some((b) => b && b.id === 'poison-1') && poisonFiles.length === 1,
+      `E5 …and after 3 failed drains it is SET ASIDE, not drained forever (queued=${stillQueued.length}, set aside=${poisonFiles.length})`);
+    ok(poisonFiles.length === 1 && /POISON-MARKER/.test(fs.readFileSync(path.join(path.dirname(pendingFile), poisonFiles[0]), 'utf8')),
+      'E5 …kept whole in a file of its own, never deleted');
+    const told = runs.map((r) => r.stderr || '').join('\n');
+    ok(/queued batch from an earlier capture threw/.test(told) && /set aside/.test(told), 'E5 …and both facts are reported, not silent');
+    const healthDir = path.join(homeP, '.claude', 'project-brain', 'health');
+    const health = fs.existsSync(healthDir) ? fs.readdirSync(healthDir).map((f) => fs.readFileSync(path.join(healthDir, f), 'utf8')).join('\n') : '';
+    ok(/batch-isolated:own/.test(health), 'E5 …and recorded in the per-project health log');
   }
 
   // ── E3 — receipts reach the author, or a session that replaced it ─────────
@@ -966,23 +1286,41 @@ try {
       'E3 a new session on ANOTHER host does not take a LIVE session\'s receipts');
     const promptA = run3('--prompt', { session_id: 'sess-A', prompt: 'continue with the toolbar work' }, hostA).stdout || '';
     ok(/what your last 🧠 BRAIN markers actually did/.test(promptA) && /q: pan tool location\?/.test(promptA), 'E3 …the author sees its own receipt on its next prompt');
-    // A /clear in the SAME host replaces the conversation: its receipts move over at once.
+    // A /clear in the SAME host replaces the conversation: its receipts move
+    // over on the new session's first PROMPT. Third review (R1): the installed
+    // SessionStart matcher was "startup|resume", so no SessionStart ran on a
+    // real /clear and the handoff never happened — this runs none.
     markerStop('sess-A', '🧠 BRAIN [Nav] !: Zoom steppers moved beside the pan tool ev: src/canvas/Zoom.tsx q: zoom location?', hostA);
-    run3('', { session_id: 'sess-A2', source: 'clear' }, hostA);
+    ok(!block.test(run3('--prompt', { session_id: 'sess-B', prompt: 'continue with the toolbar work' }, hostB).stdout || '')
+      && receipts().some((r) => r.sid === 'sess-A' && !r.shown && /zoom location/.test(r.line)),
+      'E3 a session on ANOTHER host process (another CLAUDE_PID) never takes a live author\'s receipt at its prompt');
     const promptA2 = run3('--prompt', { session_id: 'sess-A2', prompt: 'continue with the toolbar work' }, hostA).stdout || '';
-    ok(/\(earlier session\) suffix kept as card text: "q: zoom location\?"/.test(promptA2) && /ended session/.test(promptA2),
-      'E3 after a /clear in the same host, the new session adopts the predecessor\'s receipt and prints it once, marked as from an earlier session');
-    ok(!block.test(run3('--prompt', { session_id: 'sess-A', prompt: 'continue' }, hostA).stdout || ''), 'E3 …and nobody prints it again');
-    // An author with no live lane row, unshown for 30+ minutes, is handed off.
-    markerStop('sess-C', '🧠 BRAIN [Nav] !: Minimap toggle moved into the view menu ev: src/canvas/ViewMenu.tsx q: minimap location?', hostB);
+    ok(/\(earlier session\) suffix kept as card text: "q: zoom location\?"/.test(promptA2) && /replaced in this terminal \(\/clear or \/resume\)/.test(promptA2),
+      'E3 after a /clear in the same host — with NO SessionStart between — the new session\'s first prompt adopts the predecessor\'s receipt and prints it, marked as from the conversation it replaced');
+    ok(!block.test(run3('--prompt', { session_id: 'sess-A2', prompt: 'continue' }, hostA).stdout || '')
+      && !block.test(run3('--prompt', { session_id: 'sess-A', prompt: 'continue' }, hostA).stdout || ''), 'E3 …once, and nobody prints it again');
     const sessDir = path.join(home3, '.claude', 'project-brain', 'sessions');
-    for (const f of fs.readdirSync(sessDir).filter((n) => /\.json$/.test(n))) {
-      const d = JSON.parse(fs.readFileSync(path.join(sessDir, f), 'utf8'));
-      if (Array.isArray(d.sessions)) { d.sessions = d.sessions.filter((s) => s.id !== 'sess-C'); fs.writeFileSync(path.join(sessDir, f), JSON.stringify(d)); }
-    }
-    const aged = JSON.parse(fs.readFileSync(receiptsFile, 'utf8'));
-    for (const r of aged.captureReceipts) if (r.sid === 'sess-C') r.ts = Date.now() - 31 * 60 * 1000;
-    fs.writeFileSync(receiptsFile, JSON.stringify(aged));
+    const dropLane = (sid) => {
+      for (const f of fs.readdirSync(sessDir).filter((n) => /\.json$/.test(n))) {
+        const d = JSON.parse(fs.readFileSync(path.join(sessDir, f), 'utf8'));
+        if (Array.isArray(d.sessions)) { d.sessions = d.sessions.filter((s) => s.id !== sid); fs.writeFileSync(path.join(sessDir, f), JSON.stringify(d)); }
+      }
+    };
+    const editReceipts = (fn) => { const d = JSON.parse(fs.readFileSync(receiptsFile, 'utf8')); for (const r of d.captureReceipts) fn(r); fs.writeFileSync(receiptsFile, JSON.stringify(d)); };
+    // R2: an author that is idle but ALIVE keeps its receipt, however long.
+    markerStop('sess-E', '🧠 BRAIN [Nav] !: Ruler toggle moved into the view menu ev: src/canvas/Ruler.tsx q: ruler location?', hostB);
+    dropLane('sess-E');
+    editReceipts((r) => { if (r.sid === 'sess-E') r.ts = Date.now() - 31 * 60 * 1000; });
+    run3('', { session_id: 'sess-F', source: 'startup' }, hostA);
+    ok(!block.test(run3('--prompt', { session_id: 'sess-F', prompt: 'continue with the menus' }, hostA).stdout || '')
+      && receipts().some((r) => r.sid === 'sess-E' && !r.shown),
+      'E3 an author idle for 30+ minutes whose host process is still ALIVE keeps its receipt (no lane row is not "ended")');
+    ok(/q: ruler location\?/.test(run3('--prompt', { session_id: 'sess-E', prompt: 'back from lunch' }, hostB).stdout || ''),
+      'E3 …and sees it itself when it comes back');
+    // An author whose host process is provably gone is handed off at the next
+    // SessionStart, and the heading says it is no longer running.
+    const deadHost = spawnSync(process.execPath, ['-e', '']).pid;
+    markerStop('sess-C', '🧠 BRAIN [Nav] !: Minimap toggle moved into the view menu ev: src/canvas/ViewMenu.tsx q: minimap location?', deadHost);
     run3('', { session_id: 'sess-D', source: 'startup' }, hostA);
     // R4: a shown-mark that cannot be persisted prints nothing (the lock is held).
     const lockFile = `${receiptsFile}.lock`;
@@ -991,13 +1329,91 @@ try {
     fs.rmSync(lockFile, { force: true });
     ok(!block.test(held) && receipts().some((r) => r.sid === 'sess-D' && !r.shown), 'E3 a receipt whose shown-mark cannot be written is not printed, and stays pending');
     const promptD = run3('--prompt', { session_id: 'sess-D', prompt: 'continue with the menus' }, hostA).stdout || '';
-    ok(/\(earlier session\) suffix kept as card text: "q: minimap location\?"/.test(promptD), 'E3 an ended session\'s receipt is adopted at the next SessionStart and printed on that session\'s prompt');
+    ok(/\(earlier session\) suffix kept as card text: "q: minimap location\?"/.test(promptD) && /no longer running/.test(promptD),
+      'E3 a receipt whose author\'s host process is gone is adopted at the next SessionStart and printed on that session\'s prompt');
     ok(!block.test(run3('--prompt', { session_id: 'sess-D', prompt: 'continue' }, hostA).stdout || ''), 'E3 …once');
+    // A receipt with no host pid (a session without CLAUDE_PID, or 1.86.1's)
+    // keeps the old rule: no live lane row and unshown for 30+ minutes — and
+    // the heading does not claim its author has ended.
+    markerStop('sess-G', '🧠 BRAIN [Nav] !: Grid toggle moved into the view menu ev: src/canvas/Grid.tsx q: grid location?', hostB);
+    dropLane('sess-G');
+    editReceipts((r) => { if (r.sid === 'sess-G') { delete r.hostPid; delete r.machine; r.ts = Date.now() - 31 * 60 * 1000; } });
+    run3('', { session_id: 'sess-H', source: 'startup' }, hostA);
+    const promptH = run3('--prompt', { session_id: 'sess-H', prompt: 'continue with the menus' }, hostA).stdout || '';
+    ok(/\(earlier session\) suffix kept as card text: "q: grid location\?"/.test(promptH) && /no activity for 30\+ minutes/.test(promptH) && !/no longer running/.test(promptH),
+      'E3 a legacy receipt with no host pid is handed off by the lane + 30-minute rule, worded as idle, not ended');
+    // …and one from ANOTHER machine is never adopted.
+    markerStop('sess-M', '🧠 BRAIN [Nav] !: Snap toggle moved into the view menu ev: src/canvas/Snap.tsx q: snap location?', hostB);
+    dropLane('sess-M');
+    editReceipts((r) => { if (r.sid === 'sess-M') { r.machine = 'another-machine'; r.hostPid = 999999; r.ts = Date.now() - 31 * 60 * 1000; } });
+    run3('', { session_id: 'sess-N', source: 'startup' }, hostA);
+    ok(!block.test(run3('--prompt', { session_id: 'sess-N', prompt: 'continue' }, hostA).stdout || '') && receipts().some((r) => r.sid === 'sess-M' && !r.shown),
+      'E3 a receipt from another machine is never adopted (its TTL expires it)');
+    // ── Third review, 2026-09-18 ─────────────────────────────────────────────
+    // R3: the stale-lock break was mtime-ONLY, so a crashed holder's lock
+    // survived a clock that stepped backwards (a dual-boot RTC/UTC mixup, an
+    // NTP step) — every prompt with a pending receipt paid ~2.9 s, printed
+    // nothing, and the lock stayed. The lock file already carries the holder's
+    // pid: a provably dead holder is broken on the spot, at any mtime.
+    markerStop('sess-L', '🧠 BRAIN [Nav] !: Scale bar moved into the view menu ev: src/canvas/Scale.tsx q: scale bar location?', hostB);
+    const deadHolder = spawnSync(process.execPath, ['-e', '']).pid;
+    fs.writeFileSync(lockFile, `${deadHolder} crashed-token`);
+    const hourAhead = new Date(Date.now() + 60 * 60 * 1000);
+    fs.utimesSync(lockFile, hourAhead, hourAhead);
+    const promptL = run3('--prompt', { session_id: 'sess-L', prompt: 'continue with the menus' }, hostB).stdout || '';
+    ok(/q: scale bar location\?/.test(promptL) && !fs.existsSync(lockFile),
+      'E3 (R3) a lock whose holder is a DEAD process is broken even with an mtime an hour in the future');
+    // …and a live holder's lock is still respected (the pid is checked, not assumed).
+    markerStop('sess-L', '🧠 BRAIN [Nav] !: Compass moved into the view menu ev: src/canvas/Compass.tsx q: compass location?', hostB);
+    fs.writeFileSync(lockFile, `${process.pid} this-test-holds-it`);
+    const heldLive = run3('--prompt', { session_id: 'sess-L', prompt: 'continue' }, hostB).stdout || '';
+    ok(!/q: compass location\?/.test(heldLive) && fs.existsSync(lockFile),
+      'E3 (R3) …while a lock held by a LIVE process is neither broken nor removed by the waiter');
+    fs.rmSync(lockFile, { force: true });
+    run3('--prompt', { session_id: 'sess-L', prompt: 'continue' }, hostB);
+    // R4: a sidecar that CANNOT be written used to run the full ~940 ms rename
+    // backoff inside the lock on EVERY prompt, for up to the 3-day TTL, and
+    // still print nothing (measured: ~1.33 s per prompt against a ~0.4 s
+    // baseline). It now fails fast, stamps the project's health dir, and skips
+    // the locked write while that stamp is fresh — and drops the stamp the
+    // moment the destination is writable again.
+    const healthDir = path.join(home3, '.claude', 'project-brain', 'health');
+    const stampOf = () => { try { return fs.readdirSync(healthDir).filter((n) => n.endsWith('.sidecar-unwritable')); } catch { return []; } };
+    markerStop('sess-W', '🧠 BRAIN [Nav] !: Locator moved into the view menu ev: src/canvas/Locator.tsx q: locator location?', hostB);
+    fs.chmodSync(receiptsFile, 0o444);
+    const w1 = run3('--prompt', { session_id: 'sess-W', prompt: 'continue with the menus' }, hostB).stdout || '';
+    const stamped = stampOf();
+    const w2 = run3('--prompt', { session_id: 'sess-W', prompt: 'continue with the menus' }, hostB).stdout || '';
+    fs.chmodSync(receiptsFile, 0o666);
+    ok(!block.test(w1) && !block.test(w2) && stamped.length === 1,
+      `E3 (R4) an unwritable sidecar prints nothing and is recorded once, not retried blind on every prompt (${stamped.length} stamp)`);
+    const stampText = (() => { try { return fs.readFileSync(path.join(healthDir, stamped[0]), 'utf8'); } catch { return ''; } })();
+    ok(/read-only/.test(stampText), 'E3 (R4) …and the stamp says why');
+    const w3 = run3('--prompt', { session_id: 'sess-W', prompt: 'continue with the menus' }, hostB).stdout || '';
+    ok(/q: locator location\?/.test(w3) && stampOf().length === 0,
+      'E3 (R4) …and the receipt is printed as soon as the sidecar is writable again — the backoff never outlives its cause');
+    // R8: the 40-receipt cap trimmed by POSITION, so an idle author's still
+    // unshown receipt was pushed out while SHOWN ones sat waiting for their
+    // 3-day TTL. Shown receipts go first now.
+    {
+      const d = JSON.parse(fs.readFileSync(receiptsFile, 'utf8'));
+      const now = Date.now();
+      d.captureReceipts = [
+        { key: 'idle-author', sid: 'sess-IDLE', ts: now - 60 * 60 * 1000, line: 'suffix kept as card text: "q: the idle author\'s receipt"', shown: false, hostPid: hostB, machine: (d.captureReceipts[0] || {}).machine },
+        ...Array.from({ length: 41 }, (_, i) => ({ key: `shown-${i}`, sid: 'sess-OLD', ts: now - 30 * 60 * 1000 + i, line: `already shown ${i}`, shown: true })),
+      ];
+      fs.writeFileSync(receiptsFile, JSON.stringify(d));
+      markerStop('sess-Z', '🧠 BRAIN [Nav] !: Overview moved into the view menu ev: src/canvas/Overview.tsx q: overview location?', hostA);
+      const after = receipts();
+      ok(after.length <= 40 && after.some((r) => r.key === 'idle-author'),
+        `E3 (R8) the receipt cap drops SHOWN receipts first — an idle author's unshown one survives (${after.length} kept, ${after.filter((r) => r.shown).length} shown)`);
+    }
   }
 } catch (e) {
   console.error('✗ suite crashed:', e && e.stack || e);
   failures++;
 } finally {
+  for (const j of junctions) { try { fs.unlinkSync(j); } catch { try { fs.rmdirSync(j); } catch { /* already gone */ } } }
   for (const d of [home, proj, ...extraDirs]) { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* temp */ } }
 }
 

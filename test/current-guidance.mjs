@@ -154,6 +154,21 @@ try {
   check(textOf(priorityContext).length <= 2800, 'evidence appendix respects the same capsule budget');
   check(priorityContext.context.standingRules.every(card => card.evidence.verify.text.length > 100), 'omitted optional text remains available as structured evidence');
 
+  // Third review, 2026-09-18 (R7): brain_sync's task capsule is the ONLY
+  // context surface some hosts have, and it clipped the card's raw text at 420
+  // characters — so on a long card the "(~ amended …)" line a thin ~ appends
+  // UNDER the claim fell past the clip, and the capsule and the hook's own
+  // previews disagreed about what the card said.
+  {
+    const claim = `Parser: The zebraform parser rolls back on a malformed header and ${'writes the reason code into the rollback ledger for the operator to read later. '.repeat(6)}`.trim();
+    const amended = `${claim}\n(~ amended 2026-09-18: the rollback reason code is now written to stderr as well, so a headless run sees it)`;
+    fs.writeFileSync(target, await buildKlypix({ title: 'Amended claim', cards: [{ id: 'amended-claim', text: amended }] }));
+    const capsule = await task('zebraform parser rollback reason code', { k: 1 });
+    check(claim.length > 420, 'R7 (setup) the fixture card is longer than the capsule clip');
+    check(/rollback reason code is now written to stderr/.test(textOf(capsule)),
+      'R7 brain_sync task context leads a long card with its newest amendment, as the hook previews do');
+  }
+
   await makeBrain([oldRule, fix]);
   // The pipeline survives a serialized brain and a fresh operation invocation.
   const restartBefore = await task('The eval harness is broken and its numbers invalid', { k: 1 });

@@ -275,6 +275,12 @@ function runInstall(home, projectCwd, args = []) {
   ok(settings.hooks.PreToolUse.some((g) => g.matcher === 'Bash|PowerShell|Edit|Write'
     && g.hooks?.some((h) => h.command?.includes('--guard'))),
   'D: the PreToolUse entry runs the --guard fast path on shell + file tools');
+  // Claude Code fires SessionStart with source "clear" on /clear. Leaving it
+  // out meant a cleared conversation started with no brain brief at all
+  // (third review, 2026-09-18 — R1).
+  ok(settings.hooks.SessionStart.some((g) => g.hooks?.some((h) => h.command?.includes('global-brain-hook.mjs'))
+    && String(g.matcher || '').split('|').includes('clear')),
+  'D: the SessionStart entry covers /clear as well as startup and resume');
   const globalCodexConfig = fs.readFileSync(path.join(home, '.codex', 'config.toml'), 'utf8');
   ok(!globalCodexConfig.includes('[mcp_servers.klypix-canvas]'), 'D: obsolete wrong-vault global Codex KLYPIX entry is removed');
   ok(globalCodexConfig.includes('model = "gpt-test"') && globalCodexConfig.includes('[mcp_servers.docs]'), 'D: global Codex cleanup preserves user settings + sibling servers');

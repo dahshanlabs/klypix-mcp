@@ -4306,7 +4306,19 @@ export function cardAlreadySays(cardText, body) {
     if (!want.out) return false;
     const hay = squashForSays(raw);
     const n = want.out.length;
-    for (let pos = hay.out.indexOf(want.out); pos >= 0; pos = hay.out.indexOf(want.out, pos + 1)) {
+    // Only offsets that could START a word-bounded match are tried. Restarting
+    // indexOf at pos+1 re-scanned from every position a long repetitive card
+    // matched at and then rejected on the boundary check — 2.4 s on a 60k card
+    // of one repeated letter. The leading-boundary rule is the same one applied
+    // below; it just runs first, so a card with one word head has one candidate.
+    const starts = [];
+    for (let k = 0; k < hay.out.length; k++) {
+        const at = hay.at[k];
+        if (k > 0 && hay.at[k - 1] === at) continue;               // second unit of one expanded char
+        if (at === 0 || !SAY_WORD_CHAR.test(codePointBefore(raw, at))) starts.push(k);
+    }
+    for (const pos of starts) {
+        if (!hay.out.startsWith(want.out, pos)) continue;
         // The card's whitespace between two matched units must be what the
         // body has there: some whitespace where the body has a space, and at
         // most one line break where it has none.

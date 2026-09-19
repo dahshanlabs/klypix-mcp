@@ -2620,6 +2620,12 @@ const SIDECAR_RENAME_BACKOFF_MS = [20, 50, 120, 250, 500];
 const SIDECAR_FAIL_BACKOFF_MS = 10 * 60 * 1000;
 const SIDECAR_FAIL_STAMP = HEALTH.replace(/\.jsonl$/, '') + '.sidecar-unwritable';
 const stampSidecarFailure = (code) => { try { fs.mkdirSync(path.dirname(SIDECAR_FAIL_STAMP), { recursive: true }); fs.writeFileSync(SIDECAR_FAIL_STAMP, `${nowIso()} ${code || 'unwritable'} ${RULE_DRAFTS}\n`); } catch { /* best-effort */ } };
+// The FILE's own writability, deliberately: on Windows the read-only attribute
+// is exactly what makes MoveFileEx(REPLACE_EXISTING) fail, which is the field
+// case. On POSIX a rename-over only needs the DIRECTORY, so this also refuses
+// to replace a sidecar someone marked read-only there — a small, intentional
+// change of behaviour in the direction of not clobbering it, and one the stamp
+// undoes the instant the attribute is cleared.
 const sidecarWritable = () => {
     try { fs.accessSync(RULE_DRAFTS, fs.constants.W_OK); return true; }
     catch (error) { return error?.code === 'ENOENT'; }   // absent → the rename creates it

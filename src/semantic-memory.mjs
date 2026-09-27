@@ -51,6 +51,7 @@ const counters = {
   maxQueued: 0,
   cacheFilesMerged: 0,
   cacheWrites: 0,
+  cacheWriteFailures: 0,
   cacheLockWaits: 0,
   cacheLockTimeouts: 0,
   modelDisposals: 0,
@@ -518,17 +519,77 @@ async function withCrossProcessCacheLock(brainPath, fn) {
   }
 }
 
-function writeCacheAtomic(file, cache) {
+// Windows refuses a rename over a destination another process holds open
+// (EPERM, EBUSY or EACCES by configuration), and this file is read by every
+// one-shot hook and every server on the machine. A bounded backoff (five
+// attempts, 300 ms nominal in total; wall time can be longer because of timer
+// granularity) outlasts a reader passing through; any other error, and a
+// holder that stays, still throws. The retry applies in bounded mode only,
+// because only there the lock serialises writers: in legacy mode a delayed
+// rename would let an older snapshot commit after a newer one, so legacy mode
+// makes a single attempt and throws.
+const CACHE_RENAME_RETRYABLE_CODES = new Set(['EPERM', 'EBUSY', 'EACCES']);
+const CACHE_RENAME_BACKOFF_MS = [20, 40, 80, 160];
+
+async function writeCacheAtomic(file, cache) {
   const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
   try {
     fs.writeFileSync(tmp, JSON.stringify(cache));
-    fs.renameSync(tmp, file);
+    for (let attempt = 0; ; attempt++) {
+      try { fs.renameSync(tmp, file); break; }
+      catch (error) {
+        if (!BOUNDED || attempt >= CACHE_RENAME_BACKOFF_MS.length || !CACHE_RENAME_RETRYABLE_CODES.has(error?.code)) throw error;
+        await wait(CACHE_RENAME_BACKOFF_MS[attempt]);
+      }
+    }
   } finally {
     try { if (fs.existsSync(tmp)) fs.unlinkSync(tmp); } catch { /* cache is best-effort */ }
   }
 }
 
-function readCache(brainPath, desiredHashes) {
+// The disk cache is best-effort: a failed write never fails the caller, whose
+// in-memory result is already correct. It is counted, because a write that
+// keeps failing means readers keep seeing the previous file.
+async function persistCache(file, cache) {
+  try {
+    fs.mkdirSync(EMB_DIR, { recursive: true });
+    await writeCacheAtomic(file, cache);
+    counters.cacheWrites++;
+  } catch { counters.cacheWriteFailures++; }
+}
+
+// A cache entry carries two fingerprints: `h` of the EMBED INPUT (the first
+// 1,500 characters plus question enrichment; the writer's re-embed trigger)
+// and `t` of the FULL card text, which is what a reader can recompute. A
+// reader accepts a vector when either one proves it was embedded from the
+// card's current text: `t` matches, or `h` matches the full or the truncated
+// text (entries written before `t` existed, and entries an older writer kept
+// across an edit beyond the cap). Enrichment may have changed since; the
+// vector still pictures the card and the writer refreshes it on its next run.
+// An entry with neither fingerprint cannot be tied to any text and is refused.
+// Takes precomputed hashes and references nothing outside itself because
+// brain-semantic.mjs holds a second copy (the one-shot hook cannot import this
+// module). Keep the two identical: test/semantic-hash-parity.mjs compares them.
+export function vectorEntryMatchesText(entry, fullHash, truncatedHash) {
+  try {
+    if (!entry || !entry.v || typeof fullHash !== 'string' || !fullHash) return false;
+    if (typeof entry.t === 'string' && entry.t === fullHash) return true;
+    if (typeof entry.h !== 'string' || !entry.h) return false;
+    if (entry.h === fullHash) return true;
+    const truncated = typeof truncatedHash === 'function' ? truncatedHash() : null;
+    return typeof truncated === 'string' && truncated !== '' && entry.h === truncated;
+  } catch { return false; }
+}
+
+// `accept(id, entry)` decides which stored entries survive the bounded merge:
+// the writer keeps an entry whose embed input is unchanged, the read-only path
+// applies vectorEntryMatchesText. Entries are merged by reference, so `t`
+// rides along from alias files. `held` is what the merge refused, first copy
+// per id, which is the canonical file's copy when it has one, by design (the
+// canonical file is read first): the writer puts it back when it has to
+// persist without having embedded, so a failed run never removes a vector
+// from disk.
+function readCache(brainPath, accept) {
   if (!BOUNDED) {
     const key = String(brainPath).replace(/\\/g, '/');
     const file = path.join(EMB_DIR, sha1(key) + '.json');
@@ -541,6 +602,7 @@ function readCache(brainPath, desiredHashes) {
   const candidates = cacheCandidates(brainPath);
   const file = candidates[0].file;
   const cache = { v: 2, modelKey: EMBEDDING_CACHE_KEY, cards: {} };
+  const held = {};
   let found = 0;
   let canonicalValid = false;
   let canonicalStale = false;
@@ -558,7 +620,11 @@ function readCache(brainPath, desiredHashes) {
     if (canonical) canonicalValid = true;
     found++;
     for (const [id, entry] of Object.entries(parsed.cards)) {
-      if (!entry?.v || entry.h !== desiredHashes.get(id)) continue;
+      if (!entry?.v) continue;
+      if (!accept(id, entry)) {
+        if (!held[id]) held[id] = entry;
+        continue;
+      }
       if (!cache.cards[id]) {
         cache.cards[id] = entry;
         if (!canonical) mergedFromAlias = true;
@@ -569,6 +635,7 @@ function readCache(brainPath, desiredHashes) {
   return {
     file,
     cache,
+    held,
     // A stale legacy alias is harmless once the canonical BGE cache is valid.
     // Rewrite only when the canonical file itself is stale/missing or an alias
     // contributes a card the canonical cache did not already contain.
@@ -594,14 +661,39 @@ async function vectorsForBrainUnlocked(pipe, brainPath, cards) {
 ${extra}` : base;
   };
   const desiredHashes = new Map(want.map((card) => [card.id, sha1(embedInputFor(card))]));
-  const loaded = readCache(brainPath, desiredHashes);
+  const textHashes = new Map(want.map((card) => [card.id, sha1(card.text)]));
+  const loaded = readCache(brainPath, (id, entry) => entry.h === desiredHashes.get(id));
   const { file, cache } = loaded;
   let dirty = loaded.dirty;
+  // Kept entries written before `t` existed, or kept across an edit beyond the
+  // embed cap, get their full-text fingerprint here. Hashing only, never an
+  // embed, and only when it differs, so a settled cache is not rewritten. Only
+  // an entry whose embed input is unchanged qualifies: the unbounded read keeps
+  // stale entries in `cache`, and stamping one would vouch for an old vector.
+  let repaired = 0;
+  for (const card of want) {
+    const entry = cache.cards[card.id];
+    if (!entry || entry.h !== desiredHashes.get(card.id)) continue;
+    if (entry.t !== textHashes.get(card.id)) { entry.t = textHashes.get(card.id); repaired++; }
+  }
+  if (repaired) dirty = true;
   const missing = want.filter((card) => cache.cards[card.id]?.h !== desiredHashes.get(card.id));
   if (missing.length) {
-    const vectors = await embedTexts(pipe, missing.map((card) => embedInputFor(card)));
+    let vectors;
+    try { vectors = await embedTexts(pipe, missing.map((card) => embedInputFor(card))); }
+    catch (error) {
+      // The repair above needs no model, so it lands even when the embed does
+      // not. Everything the merge refused goes back beside it: those vectors
+      // are still on disk and a reader may still accept them through `t`.
+      // The persisted file is a superset snapshot: it can contain refused
+      // entries and entries for deleted cards. Readers reject them through
+      // the acceptance rule, and the next write that is dirty for another
+      // reason trims them.
+      if (repaired) await persistCache(file, { ...cache, cards: { ...loaded.held, ...cache.cards } });
+      throw error;
+    }
     missing.forEach((card, index) => {
-      cache.cards[card.id] = { h: desiredHashes.get(card.id), v: vectors[index] };
+      cache.cards[card.id] = { h: desiredHashes.get(card.id), t: textHashes.get(card.id), v: vectors[index] };
     });
     dirty = true;
   }
@@ -609,13 +701,7 @@ ${extra}` : base;
   for (const id of Object.keys(cache.cards)) {
     if (!live.has(id)) { delete cache.cards[id]; dirty = true; }
   }
-  if (dirty) {
-    try {
-      fs.mkdirSync(EMB_DIR, { recursive: true });
-      writeCacheAtomic(file, cache);
-      counters.cacheWrites++;
-    } catch { /* disk cache is best-effort; in-memory result remains correct */ }
-  }
+  if (dirty) await persistCache(file, cache);
   const map = new Map();
   for (const card of want) {
     const entry = cache.cards[card.id];
@@ -628,7 +714,9 @@ ${extra}` : base;
 // embeds a missing card, never writes. For fast paths (brain_sync task context)
 // that may USE card↔card similarity when it is already paid for — plan ↔ 🏁
 // pairing — and must degrade to lexical bars when it is not. Cards whose text
-// changed since they were embedded are simply absent from the result.
+// changed since they were embedded are simply absent from the result: a vector
+// is accepted by vectorEntryMatchesText, never by `h` equality, because `h`
+// fingerprints the truncated, enriched embed input a reader cannot recompute.
 // Single-entry memo for the fast path (review 2026-08-23: brain_sync re-parsed
 // a ~36 MB cache on every plan-shaped hit). Keyed by the canonical cache file
 // + mtime + size + the card-hash digest, so a changed card or a rewritten
@@ -639,7 +727,9 @@ let _cachedVecMemo = null;
 export function cachedVectorsForBrain(brainPath, cards) {
   const map = new Map();
   try {
-    const want = (cards || []).filter((card) => card && card.type !== 'container' && (card.text || '').trim());
+    // A card whose text is not a string is skipped, as the hook reader skips
+    // it: `.trim()` on a number used to throw and empty the Map for the brain.
+    const want = (cards || []).filter((card) => card && card.type !== 'container' && typeof card.text === 'string' && card.text.trim());
     if (!want.length) return map;
     const desiredHashes = new Map(want.map((card) => [card.id, sha1(String(card.text))]));
     const file = cacheCandidates(brainPath)[0].file;
@@ -647,10 +737,19 @@ export function cachedVectorsForBrain(brainPath, cards) {
     try { const st = fs.statSync(file); stamp = `${st.mtimeMs}|${st.size}`; } catch { stamp = null; }
     const digest = sha1([...desiredHashes.entries()].map(([id, h]) => `${id}:${h}`).sort().join('\n'));
     if (stamp && _cachedVecMemo && _cachedVecMemo.file === file && _cachedVecMemo.stamp === stamp && _cachedVecMemo.digest === digest) return _cachedVecMemo.map;
-    const loaded = readCache(brainPath, desiredHashes);
+    const texts = new Map(want.map((card) => [card.id, String(card.text)]));
+    const accept = (id, entry) => {
+      const text = texts.get(id);
+      return text !== undefined && vectorEntryMatchesText(
+        entry,
+        desiredHashes.get(id),
+        () => (text.length > 1500 ? sha1(text.slice(0, 1500)) : null),
+      );
+    };
+    const loaded = readCache(brainPath, accept);
     for (const card of want) {
       const entry = loaded?.cache?.cards?.[card.id];
-      if (entry?.v && entry.h === desiredHashes.get(card.id)) map.set(card.id, entry.v);
+      if (accept(card.id, entry)) map.set(card.id, entry.v);
     }
     if (stamp) _cachedVecMemo = { file, stamp, digest, map };
   } catch { /* cache is best-effort — lexical stays the floor */ }

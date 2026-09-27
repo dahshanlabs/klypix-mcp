@@ -82,9 +82,11 @@ try {
     if (alias !== canonical) {
       fs.writeFileSync(alias, JSON.stringify({ v: 1, cards: { legacy: { h: 'old', v: [1] } } }));
       const before = fs.readFileSync(canonical);
+      const stamp = fs.statSync(canonical).mtimeMs;
       const reused = await run('-updated');
       ok(reused.embedCalls === 0, 'a stale drive-case MiniLM alias does not invalidate the canonical BGE cache');
-      ok(before.equals(fs.readFileSync(canonical)), 'legacy alias coexistence causes zero canonical cache rewrite');
+      ok(before.equals(fs.readFileSync(canonical)) && fs.statSync(canonical).mtimeMs === stamp,
+        'legacy alias coexistence causes zero canonical cache rewrite');
     }
   }
 } catch (error) {

@@ -118,6 +118,21 @@ async function embedQueries(pipe, texts) {
 // Vectors are unit-normalized, so dot == cosine.
 export const dot = (a, b) => { let s = 0; const n = Math.min(a.length, b.length); for (let i = 0; i < n; i++) s += a[i] * b[i]; return s; };
 
+// Copy of vectorEntryMatchesText in semantic-memory.mjs, where the rule is
+// explained (this one-shot module cannot import the long-lived runtime). It
+// takes precomputed hashes and references nothing outside itself. Keep the two
+// identical: test/semantic-hash-parity.mjs compares them.
+export function vectorEntryMatchesText(entry, fullHash, truncatedHash) {
+    try {
+        if (!entry || !entry.v || typeof fullHash !== 'string' || !fullHash) return false;
+        if (typeof entry.t === 'string' && entry.t === fullHash) return true;
+        if (typeof entry.h !== 'string' || !entry.h) return false;
+        if (entry.h === fullHash) return true;
+        const truncated = typeof truncatedHash === 'function' ? truncatedHash() : null;
+        return typeof truncated === 'string' && truncated !== '' && entry.h === truncated;
+    } catch { return false; }
+}
+
 // READ-ONLY card-vector cache — NEVER embeds or writes (embedding all cards in the
 // per-prompt process is the multi-second stall we forbid). Reuses the SAME warm
 // cache the MCP host fills. Current workers canonicalize absolute Windows paths
@@ -141,10 +156,23 @@ function readCachedVecs(brainPath, cards) {
         } catch { /* try next variant */ }
     }
     const map = new Map();
-    // A vector is accepted only for the text it was embedded from (the cache
-    // stores sha1(text) as `h`) — an edited card must fall back to lexical, never
-    // pair on a stale embedding (parity with semantic-memory.cachedVectorsForBrain).
-    if (cache && cache.cards) for (const c of cards) { const e = cache.cards[c.id]; if (e && e.v && (!e.h || e.h === sha1(String(c.text)))) map.set(c.id, e.v); }
+    // A vector is accepted only when its entry proves it was embedded from the
+    // card's current text: the full-text fingerprint `t`, or for an entry written
+    // before `t` existed its `h` against the full or the truncated text (`h` is
+    // the hash of the EMBED INPUT: the first 1,500 characters plus enrichment).
+    // An edited card must fall back to lexical, never pair on a stale embedding.
+    // Same card filter and same acceptance rule as
+    // semantic-memory.cachedVectorsForBrain, on ONE cache file: this reader
+    // stops at the first variant carrying the current modelKey, the server
+    // reader merges every alias file, so the two can differ until a writer run
+    // folds the aliases into the canonical file. The entry lookup comes first
+    // so a card with no cached vector costs no hash.
+    if (cache && cache.cards) for (const c of cards) {
+        if (!c || c.type === 'container' || typeof c.text !== 'string' || !c.text.trim()) continue;
+        const e = cache.cards[c.id];
+        if (!e || !e.v) continue;
+        if (vectorEntryMatchesText(e, sha1(c.text), () => (c.text.length > 1500 ? sha1(c.text.slice(0, 1500)) : null))) map.set(c.id, e.v);
+    }
     return map;
 }
 

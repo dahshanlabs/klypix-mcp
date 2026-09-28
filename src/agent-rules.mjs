@@ -444,12 +444,12 @@ survives across sessions, agents, and context resets.
 - do NOT automatically read the full \`.claude/brain-brief.md\`; open it only when \`brain_sync\`
   says its compact context is insufficient or the task asks for broad project history/status.
 - with the \`klypix-canvas\` MCP server: to **answer a question** from the brain ("what did we decide about X?", "where did Y land?"), call \`brain_ask\` — it ranks the whole brain, includes superseded history, and surfaces the current truth for any corrected card. Use \`search_canvases\` for a raw keyword lookup, \`read_canvas\` (canvas: \`"brain"\`) for the whole thing, or \`brain_insights\` for the load-bearing cards.
-- or via CLI: \`npx klypix-read brain.klypix\`
+- or via CLI: \`npx -y -p klypix-mcp klypix-read brain.klypix\`
 
 **When you make a real decision, finding, or milestone — capture it HERE** so it persists for the next session/agent:
 - with MCP: call \`brain_note\` with a one-line decision, or
 - emit a marker line in your output: \`🧠 BRAIN [Area]: <one-line decision>\`, or
-- via CLI: \`echo "🧠 BRAIN [Area]: <decision>" | npx klypix-append brain.klypix\`
+- via CLI: \`echo "🧠 BRAIN [Area]: <decision>" | npx -y -p klypix-mcp klypix-append brain.klypix\`
 
 Capture **sparingly** — real decisions / milestones / open questions / reusable gotchas, not routine
 steps — and capture it **at the moment you decide** (a one-line marker inline), not batched or left in

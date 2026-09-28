@@ -290,7 +290,7 @@ For a reproducible map artifact on every pull request and main-branch push, inst
 read-only workflow into a Git checkout:
 
 ```bash
-npx klypix-project-map setup-github /path/to/project
+npx -y -p klypix-mcp klypix-project-map setup-github /path/to/project
 ```
 
 The command refuses to overwrite an existing workflow unless `--force` is explicit. The installed
@@ -314,7 +314,7 @@ behaviour is unverified.
 | **VS Code (Copilot / Continue)** | MCP config + instructions file | `link` | Model must call `brain_sync` | Model must call `brain_note` | For the MCP connection |
 | **Gemini CLI / Antigravity** | MCP config + always-on rules file | `link` | Model must call `brain_sync` | Model must call `brain_note` | For the MCP connection |
 | **Windsurf** | Rules file only | `link` | Reaches the tools through Windsurf's own global MCP config | Model must call `brain_note` | Via its own MCP config |
-| **Aider** | Rules file only (no MCP) | `link` | CLI path: `npx klypix-read` | CLI path: `npx klypix-append` | — |
+| **Aider** | Rules file only (no MCP) | `link` | CLI path: `npx -y -p klypix-mcp klypix-read` | CLI path: `npx -y -p klypix-mcp klypix-append` | — |
 | **Claude Desktop** | One-time manual config edit | you | Model must call `brain_sync` | Model must call `brain_note` | For the MCP connection |
 
 `install` and `link` are different things and are not interchangeable: `install` sets up the

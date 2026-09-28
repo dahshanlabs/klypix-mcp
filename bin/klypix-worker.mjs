@@ -94,7 +94,9 @@ const runVerb = async (verb, moduleId) => {
 // into ~/.claude/project-brain and wire the Claude Code hooks. This is the single
 // agent-neutral installer, so a brain release reaches every machine via one npm
 // publish + this command (the global brain serves every project). Runs before any
-// server setup; delegates to the dedicated bin so `npx klypix-install` also works.
+// server setup; delegates to the dedicated bin so `npx -p klypix-mcp klypix-install`
+// also works (the bin name on its own is not an npm package we own — see
+// test/npx-owned-names.mjs).
 await runVerb('install', './klypix-install.mjs');
 
 // `npx klypix-mcp link` — make THIS project's brain automatic for EVERY agent tool,

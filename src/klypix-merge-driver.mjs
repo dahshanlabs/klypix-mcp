@@ -29,10 +29,33 @@
 // the card untouched; if the other side EDITED it after the ancestor, no
 // tombstone is passed and the union keeps the edited card (delete-vs-edit
 // resolves to the edit — no-loss wins over delete).
+//
+// BIN-AWARE MERGE (E-10). Both sides are whole committed files, bins
+// included, so the driver asks the engine for the same receipt-aware rules
+// Brain Sync uses: the bins merge 3-way (a restore or a purge made on one
+// branch propagates), a card new on both branches with different text keeps
+// both, and the title merges 3-way. Same inputs, same result as the cloud
+// path, so git and Brain Sync converge instead of fighting (F8). The engine is
+// imported as a namespace and feature-checked: installs mix file generations,
+// and an older merge-brains.mjs beside this driver must still merge (with its
+// own rules) rather than fail — a failure here is a manual binary conflict.
 
 import fs from 'node:fs';
-import { mergeBrains, sameMeaning } from './merge-brains.mjs';
+import * as engine from './merge-brains.mjs';
 import { parseKlypix, shard } from './klypix-format.mjs';
+
+const { mergeBrains, sameMeaning } = engine;
+// brain_doctor reads this constant from the installed file's TEXT (it never
+// imports a driver) to tell one that asks for the bin-aware rules from one
+// that cannot; test/git-tools.mjs pins DRIVER_OPTIONS the same way.
+const DRIVER_OPTIONS_API = 2;
+const DRIVER_OPTIONS = Object.freeze({
+  binMerge: '3way', newOnBothSides: 'twin', manifestMerge: '3way', adoptResolvedConflicts: true,
+});
+// Why a committed absence is a delete, recorded on the receipt it leaves.
+const COMMITTED_ABSENCE = Object.freeze({
+  initiator: 'unknown', cause: 'git-committed-absence', source: 'git-merge-driver', confidence: 'inferred',
+});
 
 // id -> verbatim item JSON string for one side (null for an empty/absent side).
 async function itemsOf(buf) {
@@ -61,27 +84,37 @@ try {
 
   const [bi, ai, ti] = await Promise.all([itemsOf(base), itemsOf(A), itemsOf(B)]);
 
-  // Committed-absence tombstones (see DELETE SEMANTICS above).
+  // Committed-absence tombstones (see DELETE SEMANTICS above). Each carries a
+  // receipt saying where it came from; a real receipt already in either
+  // side's bin wins over this inferred one through the engine's entry choice.
   const deletedIds = [];
+  const deletedMeta = {};
+  const honor = (id) => { deletedIds.push(id); deletedMeta[id] = COMMITTED_ABSENCE; };
   if (bi && ai && ti) {
     for (const [id, baseJson] of bi) {
       const inA = ai.has(id), inB = ti.has(id);
       if (inA && inB) continue;                                   // alive on both
-      if (!inA && !inB) { deletedIds.push(id); continue; }        // deleted on both
+      if (!inA && !inB) { honor(id); continue; }                  // deleted on both
       // "Untouched" by MEANING, not bytes — a side that merely re-saved the
       // file restamps volatile fields (updatedAt), and a byte compare would
       // read that as an edit and silently refuse to propagate a real delete.
       const survivorJson = inA ? ai.get(id) : ti.get(id);
-      if (sameMeaning(survivorJson, baseJson)) deletedIds.push(id);   // delete vs untouched → honor
+      if (sameMeaning(survivorJson, baseJson)) honor(id);         // delete vs untouched → honor
       // delete vs EDIT → no tombstone; union keeps the edited card
     }
   }
 
-  const { buffer, conflicts, delta } = await mergeBrains({ base, ours: A, theirs: B, deletedIds });
+  // An engine older than the bin-aware rules (no api 2) merges with its own.
+  const options = engine.MERGE_ENGINE_FEATURES?.api >= 2 ? DRIVER_OPTIONS : undefined;
+  const { buffer, conflicts, delta, stats } = await mergeBrains({
+    base, ours: A, theirs: B, deletedIds, deletedMeta, ...(options ? { options } : {}),
+  });
   fs.writeFileSync(aPath, buffer);
   const bits = [];
   if (delta.added.length) bits.push(`+${delta.added.length} card(s)`);
   if (deletedIds.length) bits.push(`-${deletedIds.length} delete(s) honored`);
+  if (delta.revived?.length) bits.push(`~${delta.revived.length} revived`);
+  if (stats?.purgedCopies) bits.push(`${stats.purgedCopies} purged copies dropped`);
   if (conflicts.length) bits.push(`${conflicts.length} conflict twin(s) preserved`);
   console.error(`klypix-merge: ${realPath || 'brain'} united losslessly${bits.length ? ' — ' + bits.join(', ') : ''}`);
   process.exit(0);

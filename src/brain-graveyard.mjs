@@ -29,9 +29,10 @@
 // deleted cards: `list` can hide them, and restore refuses them.
 import fs from 'fs';
 import JSZip from 'jszip';
+import { createHash } from 'node:crypto';
 import {
   parseKlypix, shard, summarizeGraveyardCard, entryKind, receiptIdentity,
-  contentFreeReceiptFor, PURGED_BODY,
+  contentFreeReceiptFor, PURGED_BODY, revivedIdFor, twinIdFor, sameMeaning, itemSignature,
 } from './klypix-format.mjs';
 
 // Moved to klypix-format.mjs; the 1.86 merge engine and the API-5 KLYPIX sync
@@ -97,19 +98,38 @@ function writeIndex(zip, index) {
   else zip.remove('graveyard.json');
 }
 
+// How far a restore follows a chain of deleted cards before it gives up and
+// lands at an id derived from the value itself (real chains are a few steps).
+const LANDING_STEPS = 32;
+const REVIVED_TAIL_RE = /(__r_[0-9a-f]{12})+$/;
+
 /**
- * Put a deleted card back into the brain. It returns to `order` (so it renders
- * again) at its recorded position, and leaves the bin — a card must never be in
- * both, or the next restore would duplicate it.
+ * Put deleted cards back into the brain, each under the id its delete revives
+ * to, and leave a restore receipt where it was.
  *
- * Its former parent may itself be gone; in that case the card is restored to
- * the canvas root rather than into a dangling container.
+ * WHY A NEW ID (Stage 2). A restore used to bring the card back under its old
+ * id and drop the entry. On a brain that syncs, the other copies still held the
+ * delete for that id, so the next merge deleted the restored card again. Now
+ * the old id stays deleted everywhere: the card lands under `revivedIdFor` —
+ * the same id the merge uses when it rescues a deleted card, so two machines
+ * restoring the same card land on one id — and the entry becomes a restore
+ * receipt that says where the card went (`restoredAs`). The bytes leave the
+ * bin, because they are live again. Older machines just see an ordinary add.
  *
- * Receipts are refused, with the reason: a purge receipt holds no card (its
- * placeholder body would come back as an empty card), and a restore receipt's
- * card is already live under `restoredAs`.
+ * The landing walk is the merge's own chain: a landing id that is itself
+ * deleted follows that entry (a restore receipt to its `restoredAs`, a delete
+ * to its own revival); a landing id already live with the same text means the
+ * card is already back; one live with other text takes the card beside it as a
+ * conflict twin. So a restore never lands on an id that has its own bin entry,
+ * and never overwrites newer text.
+ *
+ * A parent that is live, or restored in the same call, keeps its child; a
+ * parent that is gone sends the card to the canvas root rather than into a
+ * dangling container. Receipts are refused, with the reason: a purge receipt
+ * holds no card, and a restore receipt's card is already live.
+ * @returns {Promise<{buffer:Buffer, restored:Array<{id:string, restoredAs:string, reparented:boolean, already?:boolean}>, skipped:Array<{id:string, reason:string}>}>}
  */
-export async function restoreFromGraveyard(buf, ids) {
+export async function restoreFromGraveyard(buf, ids, { now = Date.now() } = {}) {
   const zip = await JSZip.loadAsync(buf);
   const index = await readIndex(zip);
   const canvasFile = zip.file('canvas.json');
@@ -118,34 +138,74 @@ export async function restoreFromGraveyard(buf, ids) {
   canvas.order = Array.isArray(canvas.order) ? canvas.order : [];
   canvas.positions = canvas.positions || {};
   const liveIds = new Set(canvas.order);
+  const itemAt = async (x) => {
+    const f = zip.file(`items/${shard(x)}/${x}.json`);
+    return f ? f.async('string') : null;
+  };
+  const binBody = async (x) => {
+    const f = zip.file(`graveyard/${shard(x)}/${x}.json`);
+    return f ? f.async('string') : null;
+  };
+  // Cards placed by this call, so a later card in the same call sees them live.
+  const planned = new Map();          // landing id -> body
+  const liveJson = async (x) => (planned.has(x) ? planned.get(x) : itemAt(x));
 
-  const restored = [], skipped = [];
+  const landingFor = async (id, entry, body) => {
+    let as = revivedIdFor(id, entry, body);
+    for (let step = 0; step < LANDING_STEPS; step++) {
+      if (liveIds.has(as) || planned.has(as)) {
+        if (sameMeaning(await liveJson(as), body)) return { as, already: true };
+        as = twinIdFor(as, body);
+        continue;
+      }
+      const next = index.entries[as];
+      if (!next) return { as, already: false };
+      as = entryKind(next) === 'R' ? String(next.restoredAs) : revivedIdFor(as, next, await binBody(as));
+    }
+    // A cycle, or a chain longer than any real history: an id derived from the
+    // value itself, which every machine computes alike.
+    const sig = createHash('sha256').update(`cycle\n${id}\n${itemSignature(body) ?? ''}`).digest('hex').slice(0, 12);
+    return { as: `${String(id).replace(REVIVED_TAIL_RE, '')}__r_${sig}`, already: false };
+  };
+
+  const restored = [], skipped = [], landings = [];
   for (const rawId of ids) {
     const id = String(rawId);
     const entry = index.entries[id];
-    const file = zip.file(`graveyard/${shard(id)}/${id}.json`);
-    if (!entry || !file) { skipped.push({ id, reason: 'not in the bin' }); continue; }
+    const body = entry ? await binBody(id) : null;
+    if (!entry || body == null) { skipped.push({ id, reason: 'not in the bin' }); continue; }
     const kind = entryKind(entry);
     if (kind === 'P') { skipped.push({ id, reason: 'deleted permanently' }); continue; }
     if (kind === 'R') { skipped.push({ id, reason: `already restored as ${entry.restoredAs}` }); continue; }
     if (liveIds.has(id)) { skipped.push({ id, reason: 'already in the brain' }); continue; }
+    const { as, already } = await landingFor(id, entry, body);
+    if (!already) planned.set(as, body);
+    landings.push({ id, entry, body, as, already });
+  }
 
-    zip.file(`items/${shard(id)}/${id}.json`, await file.async('string'));
-    const pos = entry.pos || { x: 0, y: 0 };
-    // Re-parent only if the container still exists — a card must never point at
-    // a container that was itself deleted, which would make it unreachable.
-    const parentAlive = entry.parentId && liveIds.has(entry.parentId);
-    canvas.positions[id] = {
-      x: Number(pos.x) || 0, y: Number(pos.y) || 0,
-      ...(pos.w != null ? { w: pos.w } : {}), ...(pos.h != null ? { h: pos.h } : {}),
-      zIndex: canvas.order.length,
-      parentId: parentAlive ? entry.parentId : null,
-    };
-    canvas.order.push(id);
-    liveIds.add(id);
-    zip.remove(`graveyard/${shard(id)}/${id}.json`);
-    delete index.entries[id];
-    restored.push({ id, reparented: Boolean(entry.parentId) && !parentAlive });
+  const landedAt = new Map(landings.map((l) => [l.id, l.as]));
+  for (const { id, entry, body, as, already } of landings) {
+    let reparented = false;
+    if (!already) {
+      zip.file(`items/${shard(as)}/${as}.json`, body);
+      const pos = entry.pos || { x: 0, y: 0 };
+      // A parent restored in this same call is found where it landed.
+      const parent = entry.parentId
+        ? (liveIds.has(entry.parentId) ? entry.parentId : (landedAt.get(entry.parentId) ?? null))
+        : null;
+      reparented = Boolean(entry.parentId) && !parent;
+      canvas.positions[as] = {
+        x: Number(pos.x) || 0, y: Number(pos.y) || 0,
+        ...(pos.w != null ? { w: pos.w } : {}), ...(pos.h != null ? { h: pos.h } : {}),
+        zIndex: canvas.order.length,
+        parentId: parent,
+      };
+      canvas.order.push(as);
+      liveIds.add(as);
+    }
+    index.entries[id] = contentFreeReceiptFor(id, { meta: entry, json: body }, { kind: 'restored', restoredAs: as, now });
+    zip.file(`graveyard/${shard(id)}/${id}.json`, PURGED_BODY);
+    restored.push({ id, restoredAs: as, reparented, ...(already ? { already: true } : {}) });
   }
 
   zip.file('canvas.json', JSON.stringify(canvas));

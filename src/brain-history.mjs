@@ -199,13 +199,50 @@ export function snapshotBrain(brainPath, { home = os.homedir(), reason = 'write'
   }
 }
 
+function replaceFile(brainPath, buf) {
+  fs.mkdirSync(path.dirname(brainPath), { recursive: true });
+  const tmp = `${brainPath}.restore-tmp-${process.pid}`;
+  fs.writeFileSync(tmp, buf);
+  try { fs.renameSync(tmp, brainPath); }
+  catch (err) { try { fs.unlinkSync(tmp); } catch { /* */ } throw err; }
+}
+
+// The merge engine and the shared lock load LAZILY, each on its own. This
+// module is itself loaded lazily by klypix-format, and a static import that
+// failed (an old install missing a file) would take restore points down
+// everywhere. "The import worked" is not the test either: a 1.86 merge-brains
+// loads fine and has no restore merge, so the feature flag decides.
+async function loadRestoreMerge() {
+  let eng = null;
+  let lock = null;
+  try { eng = await import(new URL('./merge-brains.mjs', import.meta.url)); } catch { /* older or partial install */ }
+  try { lock = await import(new URL('./brain-write-lock.mjs', import.meta.url)); } catch { /* older or partial install */ }
+  const ready = typeof eng?.restoreSnapshotAsMerge === 'function'
+    && eng.MERGE_ENGINE_FEATURES?.restoreAsMerge === true
+    && typeof lock?.withAdvisoryWriteLock === 'function'
+    && typeof lock?.brainCaptureLockPath === 'function';
+  return ready ? { eng, lock } : null;
+}
+
 /**
  * Put a restore point back. Snapshots the CURRENT file first (reason
  * 'pre-restore') so a restore is never the destructive act. Verifies the
- * snapshot still parses as a canvas before overwriting anything, if a parser
- * is supplied — a corrupt restore point must not replace a working brain.
+ * snapshot still parses as a canvas before touching anything, if a parser is
+ * supplied — a corrupt restore point must not replace a working brain.
+ *
+ * A restore is a MERGE, not a file copy (mode 'merge'). Replacing the file
+ * would make every card written since the snapshot vanish with no trace, and
+ * Brain Sync, the git driver and the open app would then read those absences
+ * as deletes of cards nobody deleted — or bring deleted cards back as if they
+ * were new. So the snapshot's cards come back (under a new id when the old id
+ * has a deletion on record), later cards go to Deleted cards with a receipt
+ * saying why, and permanently deleted cards stay deleted unless
+ * `includePurged`. It runs under the brain's shared write lock.
+ *
+ * Whole-file writes remain for two cases: the brain file is gone ('recreate'),
+ * or this install has no restore merge ('whole-file').
  */
-export async function restoreBrainSnapshot(brainPath, id, { home = os.homedir(), now = Date.now(), parse = null } = {}) {
+export async function restoreBrainSnapshot(brainPath, id, { home = os.homedir(), now = Date.now(), parse = null, includePurged = false } = {}) {
   const dir = historyDirFor(brainPath, home);
   const entry = readEntries(dir).find((e) => e.id === id || e.id.startsWith(id));
   if (!entry) return { ok: false, error: `no restore point matching "${id}"` };
@@ -215,15 +252,54 @@ export async function restoreBrainSnapshot(brainPath, id, { home = os.homedir(),
     try { await parse(buf); }
     catch (err) { return { ok: false, error: `restore point does not parse as a canvas: ${err?.message || err}` }; }
   }
-  const safety = snapshotBrain(brainPath, { home, reason: 'pre-restore', now, force: true });
-  try {
-    fs.mkdirSync(path.dirname(brainPath), { recursive: true });
-    const tmp = `${brainPath}.restore-tmp-${process.pid}`;
-    fs.writeFileSync(tmp, buf);
-    try { fs.renameSync(tmp, brainPath); }
-    catch (err) { try { fs.unlinkSync(tmp); } catch { /* */ } throw err; }
-  } catch (err) {
-    return { ok: false, error: `write failed: ${err?.message || err}`, safetyId: safety.id || null };
+
+  const exists = fs.existsSync(brainPath);
+  const merger = exists ? await loadRestoreMerge() : null;
+  // The undo point. When the brain already equals the newest restore point,
+  // snapshotBrain dedups and saves nothing, and that newest point IS the undo.
+  const takeSafety = () => {
+    const s = snapshotBrain(brainPath, { home, reason: 'pre-restore', now, force: true });
+    return s.id || (s.skipped === 'unchanged' ? readEntries(dir)[0]?.id : null) || null;
+  };
+
+  if (!merger) {
+    const safetyId = takeSafety();
+    try { replaceFile(brainPath, buf); }
+    catch (err) { return { ok: false, error: `write failed: ${err?.message || err}`, safetyId }; }
+    return { ok: true, mode: exists ? 'whole-file' : 'recreate', restoredFrom: entry.id, bytes: buf.length, safetyId };
   }
-  return { ok: true, restoredFrom: entry.id, bytes: buf.length, safetyId: safety.id || null };
+
+  const { eng, lock } = merger;
+  try {
+    return await lock.withAdvisoryWriteLock(lock.brainCaptureLockPath(brainPath), async (locked) => {
+      if (!locked) {
+        return { ok: false, error: 'busy: another writer holds the brain lock; nothing was changed, try again in a moment', safetyId: null };
+      }
+      // Inside the lock, so the undo point is exactly the state this merge
+      // starts from — no writer can slip in between the two.
+      const safetyId = takeSafety();
+      let current;
+      try { current = fs.readFileSync(brainPath); }
+      catch (err) { return { ok: false, error: `the brain could not be read: ${err?.message || err}`, safetyId }; }
+      let res;
+      try { res = await eng.restoreSnapshotAsMerge({ current, snapshot: buf, includePurged, now }); }
+      catch (err) { return { ok: false, error: `restore merge failed, nothing was changed: ${err?.message || err}`, safetyId }; }
+      try { replaceFile(brainPath, res.buffer); }
+      catch (err) { return { ok: false, error: `write failed: ${err?.message || err}`, safetyId }; }
+      return {
+        ok: true,
+        mode: 'merge',
+        restoredFrom: entry.id,
+        bytes: res.buffer.length,
+        safetyId,
+        reverted: res.reverted,
+        restored: res.restored,
+        revived: res.revived,
+        buried: res.buried,
+        keptPurged: res.keptPurged,
+      };
+    });
+  } catch (err) {
+    return { ok: false, error: `restore failed: ${err?.message || err}`, safetyId };
+  }
 }

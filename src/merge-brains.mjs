@@ -69,7 +69,7 @@ import JSZip from 'jszip';
 import { createHash } from 'node:crypto';
 import {
   parseKlypix, shard, sameMeaning, itemSignature, twinIdFor, binEntryFor,
-  entryKind, receiptIdentity, revivedIdFor, pickBinEntry,
+  entryKind, receiptIdentity, revivedIdFor, pickBinEntry, contentFreeReceiptFor, PURGED_BODY,
 } from './klypix-format.mjs';
 import { generateKeyBetween } from 'fractional-indexing';
 
@@ -109,16 +109,14 @@ const OPTION_DEFAULTS = Object.freeze({
 /** What this engine can do — callers feature-check this rather than a version
  *  string, because installs mix file generations (a 1.87 driver beside a 1.86
  *  engine, a desktop bundle beside a dev-owned ~/.claude). Absent ⇒ ≤ 1.86.
- *  A flag turns true only when the thing it names runs: `revivedIds` also
- *  covers restoreFromGraveyard landing under a revived id, which is not built
- *  yet, so it stays false even though the merge already rescues edits that way. */
+ *  A flag turns true only when the thing it names runs. */
 export const MERGE_ENGINE_FEATURES = Object.freeze({
   api: 2,                            // absent ⇒ 1. Bump only when an option's meaning changes.
   deterministicTwins: true,          // E-1, every caller
   receiptIds: true,                  // E-2, every caller
   purgeReceipts: true,               // purgeGraveyard leaves a content-free receipt
-  revivedIds: false,                 // restores and rescued edits land under revivedIdFor
-  restoreAsMerge: false,             // history restore as a merge
+  revivedIds: true,                  // restores (restoreFromGraveyard) and rescued edits land under revivedIdFor
+  restoreAsMerge: true,              // history restore as a merge (restoreSnapshotAsMerge, E-9)
   arrangeReceipts: false,            // arrangeBrain buries what it collapses
   revivalMap: false,                 // brainDelta/revivalMap for the live watcher
   options: OPTION_VALUES,
@@ -963,6 +961,192 @@ async function finishMerge(B, O, T, opt, run) {
     assets: Object.keys(assets).length,
   };
   return { buffer, delta, conflicts, stats };
+}
+
+/**
+ * restoreSnapshotAsMerge — put a restore point back WITHOUT replacing the file
+ * (E-9). A whole-file restore made every card added since the snapshot vanish
+ * with no receipt, so Brain Sync read it as deletes and a copy that still held
+ * those cards brought them back or lost them depending on who synced first.
+ * As a merge, the result is the snapshot's canvas, and:
+ *   • a card live in both takes the snapshot's value (the restore still
+ *     reverts edits — that is what a restore is for);
+ *   • a card deleted since the snapshot comes back under the id its delete
+ *     revives to (the chain the sync merge and the bin restore use), so the
+ *     old id stays deleted everywhere; its entry becomes a restore receipt only
+ *     when the snapshot's bytes are exactly the deleted ones, otherwise the
+ *     newer deleted bytes stay in the bin, recoverable;
+ *   • a card purged since stays out unless `includePurged` (a purge is the
+ *     secret-was-pasted case; bringing it back must be deliberate);
+ *   • a card live now but absent from the snapshot is BURIED with a receipt —
+ *     recoverable, and a delete every other copy honours.
+ * `reverted` lists the live ids whose value the restore changed (a card's
+ * current incarnation included); `revived[].already` marks a card that was
+ * back under that id before.
+ * @returns {Promise<{buffer:Buffer, reverted:string[], restored:string[], revived:{id:string,as:string,already?:boolean}[], buried:string[], keptPurged:string[]}>}
+ */
+export async function restoreSnapshotAsMerge({
+  current, snapshot,
+  receipt = { initiator: 'user', cause: 'history-restore', source: 'klypix-mcp', confidence: 'explicit' },
+  includePurged = false, now = Date.now(),
+}) {
+  const C = await loadSide(current);
+  const S = await loadSide(snapshot);
+  if (!C || !S) throw new Error('restoreSnapshotAsMerge: current and snapshot are both required');
+  const liveIn = (side, id) => side.ids.has(id) && side.items[id] != null;
+  // loadSide falls back to positions for a file whose order is empty.
+  const sOrder = S.order.length ? S.order : [...S.ids];
+  const cOrder = C.order.length ? C.order : [...C.ids];
+
+  const idMap = new Map();          // snapshot id -> result id
+  const values = new Map();         // result id -> item JSON
+  const reverted = [], restored = [], revived = [], keptPurged = [];
+  const bin = new Map(Object.entries(C.graveyard).map(([id, g]) => [id, { ...g }]));
+  // A landing already taken in the result: the same meaning there is the same
+  // card; anything else goes to the first usable twin slot, then a random id —
+  // never over a value already placed. A slot is unusable when it holds another
+  // value today (that would overwrite it) or has a deletion on record (every
+  // other copy would delete the card again).
+  const take = (id, v) => {
+    if (!values.has(id)) { values.set(id, v); return id; }
+    if (sameMeaning(values.get(id), v)) return id;
+    for (let n = 0; n < TWIN_SLOTS; n++) {
+      const at = twinIdFor(id, v, n);
+      if (values.has(at)) { if (sameMeaning(values.get(at), v)) return at; continue; }
+      if (C.graveyard[at] || (liveIn(C, at) && !sameMeaning(C.items[at], v))) continue;
+      values.set(at, v);
+      return at;
+    }
+    let at;
+    do at = `${id}__agconf_${Math.random().toString(16).slice(2, 14).padEnd(12, '0')}`;
+    while (values.has(at) || liveIn(C, at) || C.graveyard[at]);
+    values.set(at, v);
+    return at;
+  };
+
+  // Two passes. Cards that exist as themselves — live in both, or with no
+  // trace today — hold their own ids first; only then do deleted-since cards
+  // follow their chains, so a chain can never push a card off its own id.
+  const deletedSince = [];
+  for (const k of sOrder) {
+    if (!liveIn(S, k)) continue;
+    const vS = S.items[k];
+    if (liveIn(C, k)) {
+      if (!sameMeaning(C.items[k], vS)) reverted.push(k);
+      idMap.set(k, take(k, vS));
+    } else if (!C.graveyard[k]) {
+      idMap.set(k, take(k, vS));
+      restored.push(k);
+    } else {
+      deletedSince.push(k);
+    }
+  }
+  for (const k of deletedSince) {
+    const vS = S.items[k];
+    const E = C.graveyard[k];
+    // Deleted since: follow the chain to k's current incarnation or a free id.
+    let at = k, purged = false, settled = false;
+    for (let step = 0; step < ROUTE_STEPS; step++) {
+      if (at !== k && liveIn(C, at)) { settled = true; break; }
+      const e = C.graveyard[at];
+      if (!e) { settled = true; break; }
+      const kind = entryKind(e.meta);
+      if (kind === 'P' && !includePurged) { purged = true; break; }
+      at = kind === 'R' ? String(e.meta.restoredAs) : revivedIdFor(at, e.meta, e.json);
+    }
+    if (purged) { keptPurged.push(k); continue; }
+    // A cycle, or a chain longer than any real history: the same value-derived
+    // id the sync merge lands on, so the two agree.
+    if (!settled) at = `${stripRevived(k)}__r_${sha12(`cycle\n${k}\n${itemSignature(vS)}`)}`;
+    const landed = take(at, vS);
+    idMap.set(k, landed);
+    // `already`: the card was back under that id before this restore, which
+    // only sets its value — and says so in `reverted` when that changed it.
+    const already = liveIn(C, landed);
+    if (already && !sameMeaning(C.items[landed], vS)) reverted.push(landed);
+    revived.push({ id: k, as: landed, ...(already ? { already: true } : {}) });
+    if (entryKind(E.meta) === 'F' && sameMeaning(vS, E.json)) {
+      bin.set(k, { meta: contentFreeReceiptFor(k, E, { kind: 'restored', restoredAs: landed, now }), json: PURGED_BODY });
+    }
+  }
+
+  // Cards live now that the result does not carry are buried, with a receipt.
+  const buried = [];
+  const resultIds = new Set(values.keys());
+  for (const id of cOrder) {
+    if (!liveIn(C, id) || resultIds.has(id)) continue;
+    const pos = C.positions[id] || null;
+    bin.set(id, binEntryFor({ id, json: C.items[id], pos, area: C.titleById.get(pos?.parentId) || null, receipt, now }));
+    buried.push(id);
+  }
+  // The snapshot's own entries fill ids today's copy has no record of.
+  for (const [id, g] of Object.entries(S.graveyard)) {
+    if (!bin.has(id) && !liveIn(C, id) && !resultIds.has(id)) bin.set(id, g);
+  }
+
+  // Canvas from the snapshot, re-pointed through the id map.
+  const mapId = (id) => (id == null ? null : (idMap.get(id) ?? (resultIds.has(id) ? id : null)));
+  const order = [];
+  const sourceOf = new Map();       // result id -> the snapshot id it came from
+  for (const k of sOrder) {
+    const r = idMap.get(k);
+    if (r && !sourceOf.has(r)) { sourceOf.set(r, k); order.push(r); }
+  }
+  const positions = {};
+  const usedZ = new Set();
+  let lastZ = null;
+  order.forEach((r, i) => {
+    const p = S.positions[sourceOf.get(r)] || {};
+    let z = p.zKey;
+    if (!z || !isValidZKey(z) || usedZ.has(z)) z = generateKeyBetween(lastZ, null);
+    usedZ.add(z); lastZ = z;
+    positions[r] = { ...p, parentId: mapId(p.parentId ?? null), zKey: z, zIndex: i };
+  });
+  const live = new Set(order);
+  const seenEdge = new Set();
+  const connections = [];
+  for (const c of S.connections) {
+    const fromId = mapId(c.fromId), toId = mapId(c.toId);
+    if (!live.has(fromId) || !live.has(toId)) continue;
+    const key = `${fromId}|${toId}|${c.relationship || ''}|${c.label || ''}`;
+    if (seenEdge.has(key)) continue;
+    seenEdge.add(key);
+    connections.push({ ...c, fromId, toId });
+  }
+
+  const zip = new JSZip();
+  for (const r of order) zip.file(`items/${shard(r)}/${r}.json`, values.get(r));
+  const assets = { ...C.assets, ...S.assets };
+  for (const [p, bytes] of Object.entries(assets)) zip.file(p, bytes);
+  const entries = {};
+  for (const [id, g] of bin) {
+    if (live.has(id) || g?.json == null) continue;
+    zip.file(`graveyard/${shard(id)}/${id}.json`, g.json);
+    entries[id] = g.meta || {};
+  }
+  if (Object.keys(entries).length) zip.file('graveyard.json', JSON.stringify({ version: 1, entries }));
+  const manifest = { format: 'klypix', version: 4, ...(S.manifest || {}) };
+  for (const key of ['cloud', 'kind']) if (C.manifest?.[key] !== undefined) manifest[key] = C.manifest[key];
+  manifest.updatedAt = new Date(now).toISOString();
+  manifest.stats = { ...(manifest.stats || {}), itemCount: order.length, assetCount: Object.keys(assets).length };
+  zip.file('manifest.json', JSON.stringify(manifest));
+  zip.file('canvas.json', JSON.stringify({
+    version: 4, view: S.view || C.view || { panX: 0, panY: 0, zoom: 0.7 },
+    order, connections, lines: S.lines, strokes: S.strokes,
+    nextGroupNumber: Math.max(1, Number(S.nextGroupNumber) || 1, Number(C.nextGroupNumber) || 1),
+    positions, settings: S.settings || {},
+  }));
+  const buffer = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+
+  // Nothing may vanish: every card live now is live or buried with its bytes;
+  // every card live in the snapshot is live or deliberately kept out (purged).
+  const lostNow = cOrder.filter((id) => liveIn(C, id) && !live.has(id) && !(entries[id] && entries[id].purged !== true));
+  if (lostNow.length) throw new Error(`restoreSnapshotAsMerge INVARIANT VIOLATED — ${lostNow.length} current card(s) neither live nor buried: ${lostNow.slice(0, 5).join(', ')}`);
+  const kept = new Set(keptPurged);
+  const lostSnap = sOrder.filter((k) => liveIn(S, k) && !kept.has(k) && !live.has(idMap.get(k)));
+  if (lostSnap.length) throw new Error(`restoreSnapshotAsMerge INVARIANT VIOLATED — ${lostSnap.length} snapshot card(s) not restored: ${lostSnap.slice(0, 5).join(', ')}`);
+  await parseKlypix(buffer);
+  return { buffer, reverted, restored, revived, buried, keptPurged };
 }
 
 /**

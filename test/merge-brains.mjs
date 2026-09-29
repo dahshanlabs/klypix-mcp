@@ -232,7 +232,8 @@ console.log('\n— S2-O options —');
     if (await rejects(mergeBrains({ base, ours: base, theirs: base, options: o }))) allRun = false;
   }
   ok(allRun, 'O11: every advertised value of every option runs');
-  ok(F.revivedIds === false && F.restoreAsMerge === false, 'O12: tools not built yet (revived restores, history as a merge) are not advertised');
+  ok(F.revivedIds === true && F.restoreAsMerge === true && F.arrangeReceipts === false && F.revivalMap === false,
+    'O12: built tools are advertised (revived restores, history as a merge); arrange receipts and the revival map, not built yet, are not');
 }
 
 // S2-I: identity. Truth tables for the entry kinds and identities every copy

@@ -21,7 +21,7 @@ import JSZip from 'jszip';
 import { buildKlypixMap } from '../src/klypix-core.mjs';
 import {
   parseKlypix, structToMarkdown, structToBrief, shard, PURGED_BODY, entryKind, fullEntryRid,
-  contentFreeReceiptFor, summarizeGraveyardCard as summarizeFromFormat,
+  contentFreeReceiptFor, summarizeGraveyardCard as summarizeFromFormat, revivedIdFor, twinIdFor,
 } from '../src/klypix-format.mjs';
 import { mergeBrains } from '../src/merge-brains.mjs';
 import {
@@ -97,18 +97,72 @@ ok(String(bin[0].preview || '').includes('oops pasted'), 'and a preview so a hum
 const full = await readGraveyardCard(after, victim.id);
 ok(String(full?.content || '').includes(SECRET), 'the full text is retrievable for review before restore/purge');
 
-// ── restore puts it back, once ───────────────────────────────────────────────
+// ── restore brings it back under its revived id, once, and leaves a receipt ──
+// The raw entry and body, as every machine holding this delete sees them.
+const rawBin = async (buf, id) => {
+  const zip = await JSZip.loadAsync(buf);
+  const f = zip.file('graveyard.json');
+  const meta = f ? JSON.parse(await f.async('string')).entries[id] : undefined;
+  const b = zip.file(`graveyard/${shard(id)}/${id}.json`);
+  return { meta, body: b ? await b.async('string') : null };
+};
+const deleted = await rawBin(after, victim.id);
+const landing = revivedIdFor(victim.id, deleted.meta, deleted.body);
 const res = await restoreFromGraveyard(after, [victim.id]);
 const { struct: restoredStruct } = await parseKlypix(res.buffer);
 const restoredIds = (await idsOf(res.buffer)).order;
-ok(res.restored.length === 1 && restoredIds.includes(victim.id), 'restore returns the card to the canvas');
-ok(restoredStruct.cards.some(c => c.id === victim.id && String(c.text).includes(SECRET)), 'with its text intact');
-ok((await listGraveyard(res.buffer)).length === 0, 'and removes it from the bin — never in both places');
-ok(restoredIds.filter(id => id === victim.id).length === 1, 'exactly one copy — no duplicate on restore');
+ok(res.restored.length === 1 && res.restored[0].restoredAs === landing,
+  'restore brings the card back under the id its delete revives to — one every machine computes alike');
+ok(!restoredIds.includes(victim.id) && restoredIds.filter(id => id === landing).length === 1,
+  'the old id stays deleted, and the card is live exactly once under the new one');
+ok(restoredStruct.cards.some(c => c.id === landing && String(c.text).includes(SECRET)), 'with its text intact');
+const afterRestore = await listGraveyard(res.buffer);
+const rReceipt = afterRestore.find(e => e.id === victim.id);
+ok(afterRestore.length === 1 && rReceipt?.kind === 'restored' && rReceipt?.restoredAs === landing
+  && (await listGraveyard(res.buffer, { receipts: 'hide' })).length === 0,
+  'the entry becomes a restore receipt naming where the card went — no deleted card is left in the bin');
+ok((await rawBin(res.buffer, victim.id)).body === PURGED_BODY, 'and the bin drops the bytes, which are live again');
 
-// A second restore of the same id is a no-op, not a duplicate.
+// A second restore of the same id is refused and names where the card is.
 const again = await restoreFromGraveyard(res.buffer, [victim.id]);
-ok(again.restored.length === 0 && again.skipped.length === 1, 'restoring twice is refused, not duplicated');
+ok(again.restored.length === 0 && again.skipped[0]?.reason === `already restored as ${landing}`,
+  'restoring twice is refused, not duplicated, and says where the card is');
+
+// The landing walk: a landing id already live with the same text means the
+// card is already back; one live with other text takes the card as a twin.
+{
+  const { zip, canvas } = await parseKlypix(after);
+  const put = async (text) => {
+    const z = await JSZip.loadAsync(await zip.generateAsync({ type: 'nodebuffer' }));
+    const item = JSON.parse(deleted.body);
+    z.file(`items/${shard(landing)}/${landing}.json`, JSON.stringify({ ...item, content: text ?? item.content }));
+    const c = { ...canvas, order: [...canvas.order, landing], positions: { ...canvas.positions, [landing]: { x: 5, y: 5, parentId: null } } };
+    z.file('canvas.json', JSON.stringify(c));
+    return z.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+  };
+  const same = await restoreFromGraveyard(await put(null), [victim.id]);
+  const sameOrder = (await idsOf(same.buffer)).order;
+  ok(same.restored[0]?.already === true && same.restored[0]?.restoredAs === landing && sameOrder.filter(id => id === landing).length === 1,
+    'a landing id already live with the same text: the card is already back, no second copy');
+  const other = await restoreFromGraveyard(await put('someone else wrote here since'), [victim.id]);
+  const twin = other.restored[0]?.restoredAs;
+  ok(twin === twinIdFor(landing, deleted.body) && (await idsOf(other.buffer)).order.includes(landing) && (await idsOf(other.buffer)).order.includes(twin),
+    'a landing id live with other text keeps that text and takes the restored card beside it as a twin');
+}
+
+// A card and its container restored in the same call: the card finds its
+// container where the container landed.
+{
+  const containerId = (await idsOf(base)).positions[victim.id]?.parentId;
+  const both = (await mergeBrains({ base, ours: base, theirs: base, deletedIds: [victim.id, containerId] })).buffer;
+  for (const [label, order] of [['card first', [victim.id, containerId]], ['container first', [containerId, victim.id]]]) {
+    const r = await restoreFromGraveyard(both, order);
+    const at = Object.fromEntries(r.restored.map(x => [x.id, x.restoredAs]));
+    const { positions: pos } = await idsOf(r.buffer);
+    ok(Boolean(containerId) && r.restored.length === 2 && pos[at[victim.id]]?.parentId === at[containerId] && r.restored.every(x => !x.reparented),
+      `a card restored with its container (${label}) is placed back inside the container where it landed`);
+  }
+}
 
 // ── a merge never empties another machine's bin ──────────────────────────────
 {
@@ -259,6 +313,37 @@ ok(again.restored.length === 0 && again.skipped.length === 1, 'restoring twice i
   const oldMerge = await mergeBrains({ base, ours: oldPurged, theirs: stale });
   ok(String((await readGraveyardCard(oldMerge.buffer, victim.id))?.content || '').includes(SECRET),
     'R2 mutation: the 1.86.3 purge drops the entry, and the stale bin carries the secret straight back (the check catches it)');
+}
+
+// ── a restore survives merges with copies that still hold the delete (R1) ────
+// Machine A restores; machine B still holds the delete. Whatever path meets
+// them — Brain Sync (3-way, or without a base), the git driver's options, or
+// the app's own save (union, no options) — the card stays live under its new
+// id and the old id stays a receipt, so it is never deleted a second time.
+{
+  const restoredA = (await restoreFromGraveyard(after, [victim.id])).buffer;
+  const staleB = after;
+  for (const [label, args] of [
+    ['3-way, restored copy as ours', { base: after, ours: restoredA, theirs: staleB, options: { binMerge: '3way' } }],
+    ['3-way, restored copy as theirs', { base: after, ours: staleB, theirs: restoredA, options: { binMerge: '3way' } }],
+    ['no base (receipts)', { base: null, ours: staleB, theirs: restoredA, options: { binMerge: 'receipts' } }],
+    ['app save (union, no options)', { base: after, ours: restoredA, theirs: staleB }],
+  ]) {
+    const m = await mergeBrains(args);
+    const ord = (await idsOf(m.buffer)).order;
+    const e = (await listGraveyard(m.buffer)).find(x => x.id === victim.id);
+    ok(ord.includes(landing) && !ord.includes(victim.id) && e?.kind === 'restored',
+      `R1: ${label} — the restored card stays live and the old delete stays a receipt`);
+  }
+  const restoredB = (await restoreFromGraveyard(after, [victim.id])).buffer;
+  const both = await mergeBrains({ base: after, ours: restoredA, theirs: restoredB, options: { binMerge: '3way' } });
+  const ord = (await idsOf(both.buffer)).order;
+  ok(ord.filter(id => id === landing).length === 1 && !ord.some(id => id.startsWith(`${landing}__agconf_`)),
+    'R1: two machines restoring the same card converge on one live copy, with no conflict twin');
+  const oldRestored = (await OLD_GY.restoreFromGraveyard(after, [victim.id])).buffer;
+  const om = await mergeBrains({ base: after, ours: oldRestored, theirs: staleB, options: { binMerge: '3way' } });
+  ok(!(await idsOf(om.buffer)).order.includes(victim.id),
+    'R1 mutation: a 1.86.3-style restore (old id, entry dropped) is deleted again by the copy that still holds the delete — the check catches it');
 }
 
 // ── the CLI round-trip (bin/klypix-brain-deleted.mjs) ────────────────────────

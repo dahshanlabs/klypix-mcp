@@ -118,7 +118,7 @@ export const MERGE_ENGINE_FEATURES = Object.freeze({
   revivedIds: true,                  // restores (restoreFromGraveyard) and rescued edits land under revivedIdFor
   restoreAsMerge: true,              // history restore as a merge (restoreSnapshotAsMerge, E-9)
   arrangeReceipts: true,             // arrangeBrain buries what it collapses, survivor from content and ids (E-8)
-  revivalMap: false,                 // brainDelta/revivalMap for the live watcher
+  revivalMap: true,                  // revivalMap, and brainDelta's lastKnown/collectLive, for the live watcher
   options: OPTION_VALUES,
 });
 
@@ -1188,7 +1188,101 @@ export async function deletedByAbsence(baseBuf, oursBuf) {
  * lets a briefly-gated tab catch up without any ack/queue. (Updates/removes
  * reconcile on the next save/reopen — safe, since the merge never loses.)
  */
-export async function brainDelta(baseBuf, newBuf) {
+// ── revivalMap (§2.7): where did the cards the app last saw go? ─────────────
+// A watcher showing a brain keeps, for every id, the last JSON it saw while
+// that id was live. When a write moves a card's value to another id — a Brain
+// Sync revival, a git-driver merge, a bin or history restore — the old id
+// leaves the file with an entry in its bin, and this follows that entry the
+// way the merge routes a value (route() above), in the new file only:
+//   purged                         → dropped
+//   restored                       → on to its restoredAs
+//   deleted with this very value   → dropped (the deleter saw it)
+//   deleted with other bytes       → on to revivedIdFor
+// At a live id t: t holding the same meaning is the card (revived {id, as: t});
+// else a live twin of t holding it is (the merge placed it beside t); else
+// nothing — the value went nowhere this file can show, and it is not reported.
+// So a pair never points at a card holding different content, and a renderer
+// that follows it can never overwrite another machine's edit.
+async function revivalMapOf(file, lastKnown) {
+  const { liveIds, liveJson, binMeta, binBody } = file;
+  const revived = [], dropped = [];
+  let twinsByParent = null;
+  const twinsOf = (t) => {
+    if (!twinsByParent) {
+      twinsByParent = new Map();
+      for (const id of liveIds) {
+        const m = TWIN_PARENT_RE.exec(id);
+        if (!m) continue;
+        if (!twinsByParent.has(m[1])) twinsByParent.set(m[1], []);
+        twinsByParent.get(m[1]).push(id);
+      }
+    }
+    return twinsByParent.get(t) || [];
+  };
+  const landAt = async (k, v, t) => {
+    if (!liveIds.has(t)) return false;
+    if (sameMeaning(await liveJson(t), v)) { revived.push({ id: k, as: t }); return true; }
+    for (const x of [...twinsOf(t)].sort()) {
+      if (sameMeaning(await liveJson(x), v)) { revived.push({ id: k, as: x }); return true; }
+    }
+    return true;   // live, but nothing here holds the value: report nothing
+  };
+  const entries = lastKnown instanceof Map ? lastKnown.entries() : Object.entries(lastKnown || {});
+  for (const [k, v] of entries) {
+    if (liveIds.has(k) || !binMeta(k)) continue;
+    const seen = new Set();
+    let t = k, settled = false;
+    for (let step = 0; step < ROUTE_STEPS && !seen.has(t); step++) {
+      seen.add(t);
+      if (t !== k && liveIds.has(t)) { await landAt(k, v, t); settled = true; break; }
+      const meta = binMeta(t);
+      if (!meta) { settled = true; break; }            // a free id: the value went nowhere here
+      const kind = entryKind(meta);
+      if (kind === 'P') { dropped.push(k); settled = true; break; }
+      if (kind === 'R') { t = String(meta.restoredAs); continue; }
+      const body = await binBody(t);
+      if (sameMeaning(v, body)) { dropped.push(k); settled = true; break; }
+      t = revivedIdFor(t, meta, body);
+    }
+    if (!settled) await landAt(k, v, `${stripRevived(k)}__r_${sha12(`cycle\n${k}\n${itemSignature(v)}`)}`);
+  }
+  return { revived, dropped };
+}
+
+// The file view revivalMapOf reads, over one parse.
+function fileViewOf(parsed, readLive) {
+  const liveIds = new Set(parsed.struct.cards.map((c) => c.id));
+  const metaById = new Map((parsed.struct.graveyard || []).map(({ id, ...meta }) => [id, meta]));
+  return {
+    liveIds,
+    liveJson: readLive,
+    binMeta: (id) => metaById.get(id) || null,
+    binBody: async (id) => { const f = parsed.zip.file(`graveyard/${shard(id)}/${id}.json`); return f ? f.async('string') : null; },
+  };
+}
+
+/**
+ * Where the cards in `lastKnown` (Map id → the last item JSON seen while that
+ * id was live) went in `newBuf`: `revived` pairs {id, as} for a value now
+ * living under another id, `dropped` ids whose deletion is on record. An id
+ * still live, or gone with no bin entry, is in neither.
+ * @returns {Promise<{revived:{id:string,as:string}[], dropped:string[]}>}
+ */
+export async function revivalMap(newBuf, lastKnown) {
+  if (!newBuf || !lastKnown) return { revived: [], dropped: [] };
+  const n = await parseKlypix(newBuf);
+  const read = async (id) => { const f = n.zip.file(`items/${shard(id)}/${id}.json`); return f ? f.async('string') : null; };
+  return revivalMapOf(fileViewOf(n, read), lastKnown);
+}
+
+/**
+ * What changed between two brain files, for the live watcher. Unchanged shape
+ * unless asked: `lastKnown` (see revivalMap) adds `revived` and `dropped`, with
+ * the item and position of every revived `as` included in `items`/`positions`;
+ * `collectLive` adds `live` (Map id → raw item JSON of newBuf) so the watcher
+ * can refresh what it knows from the same read.
+ */
+export async function brainDelta(baseBuf, newBuf, { lastKnown = null, collectLive = false } = {}) {
   const empty = { added: [], updated: [], removed: [], items: {}, positions: {}, connections: [], manifest: null };
   if (!baseBuf || !newBuf) return empty;
   const [b, n] = await Promise.all([parseKlypix(baseBuf), parseKlypix(newBuf)]);
@@ -1198,25 +1292,44 @@ export async function brainDelta(baseBuf, newBuf) {
   const nPos = (n.canvas && n.canvas.positions) || {};
   const posKey = (p) => (p ? JSON.stringify([p.x, p.y, p.w, p.h, p.parentId ?? null]) : '');   // ignore zKey/zIndex noise
   const raw = async (zip, id) => { const f = zip.file(`items/${shard(id)}/${id}.json`); return f ? f.async('string') : null; };
+  // Each new-side item is inflated once, whichever of the passes below reads it.
+  const nRaw = new Map();
+  const rawN = async (id) => { if (!nRaw.has(id)) nRaw.set(id, await raw(n.zip, id)); return nRaw.get(id); };
 
   const added = [...newIds].filter((id) => !baseIds.has(id));
   const removed = [...baseIds].filter((id) => !newIds.has(id));
   const updated = [];
   for (const id of newIds) {
     if (!baseIds.has(id)) continue;
-    const [bStr, nStr] = await Promise.all([raw(b.zip, id), raw(n.zip, id)]);
+    const [bStr, nStr] = await Promise.all([raw(b.zip, id), rawN(id)]);
     if (bStr !== nStr || posKey(bPos[id]) !== posKey(nPos[id])) updated.push(id);
   }
 
   const items = {}, positions = {};
   for (const id of [...added, ...updated]) {
-    const s = await raw(n.zip, id);
+    const s = await rawN(id);
     if (s) items[id] = s;
     if (nPos[id]) positions[id] = nPos[id];
   }
   const baseConn = new Set((b.canvas && b.canvas.connections || []).map((c) => c.id));
   const connections = (n.canvas && n.canvas.connections || []).filter((c) => c && c.id && !baseConn.has(c.id));
-  return { added, updated, removed, items, positions, connections, manifest: n.manifest || null };
+  const out = { added, updated, removed, items, positions, connections, manifest: n.manifest || null };
+  if (lastKnown) {
+    const { revived, dropped } = await revivalMapOf(fileViewOf(n, rawN), lastKnown);
+    for (const { as } of revived) {
+      const s = await rawN(as);
+      if (s && !items[as]) items[as] = s;
+      if (nPos[as] && !positions[as]) positions[as] = nPos[as];
+    }
+    out.revived = revived;
+    out.dropped = dropped;
+  }
+  if (collectLive) {
+    const live = new Map();
+    for (const id of newIds) { const s = await rawN(id); if (s != null) live.set(id, s); }
+    out.live = live;
+  }
+  return out;
 }
 
 export default mergeBrains;

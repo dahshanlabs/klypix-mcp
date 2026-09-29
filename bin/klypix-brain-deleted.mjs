@@ -2,10 +2,21 @@
 // `klypix-mcp brain-deleted [list|restore <id…>|purge] [--brain <path>]`
 // The recycle bin for a brain: cards a human deleted are kept recoverable
 // instead of destroyed. Standalone: node bin/klypix-brain-deleted.mjs <args>
+//
+// Receipts (1.87): "Delete permanently" keeps a content-free receipt in the bin
+// so every other copy of the brain drops the card too (see brain-graveyard.mjs).
+// Receipts are not deleted cards — `list` hides them, restore refuses them, and
+// `list <id>` names what happened to one.
+//
+// Every write re-reads the brain INSIDE the capture lock and refuses when the
+// lock is held: reading outside it and writing later would silently roll back
+// a capture (or a desktop save) that landed in between.
 import fs from 'fs';
 import path from 'path';
 import { listGraveyard, purgeGraveyard, readGraveyardCard, restoreFromGraveyard, DEFAULT_RETENTION_DAYS } from '../src/brain-graveyard.mjs';
 import { atomicWrite } from '../src/klypix-format.mjs';
+import { brainCaptureLockPath, withAdvisoryWriteLock } from '../src/brain-write-lock.mjs';
+import { snapshotBrain } from '../src/brain-history.mjs';
 
 const argv = process.argv.slice(2).filter((a) => a !== 'brain-deleted');
 const action = ['list', 'restore', 'purge'].includes(argv[0]) ? argv.shift() : 'list';
@@ -17,7 +28,6 @@ const all = argv.includes('--all');
 const ids = argv.filter((a) => !a.startsWith('-'));
 
 if (!fs.existsSync(brainPath)) { console.error(`No brain at ${brainPath}.`); process.exit(1); }
-const buf = fs.readFileSync(brainPath);
 
 const ago = (ts) => {
   const m = Math.max(0, Math.round((Date.now() - Number(ts || 0)) / 60000));
@@ -27,8 +37,40 @@ const ago = (ts) => {
   return h < 48 ? `${h}h ago` : `${Math.round(h / 24)}d ago`;
 };
 
+// Read-modify-write under the capture lock. `mutate(buf)` returns
+// { buffer?, ...report }; no buffer means nothing to write.
+async function lockedWrite(reason, mutate, { forceSnapshot = false } = {}) {
+  return withAdvisoryWriteLock(brainCaptureLockPath(brainPath), async (locked) => {
+    if (!locked) return { busy: true };
+    const report = await mutate(fs.readFileSync(brainPath));
+    if (!report.buffer) return report;
+    if (forceSnapshot) {
+      // The one irreversible action gets a restore point that no throttle may
+      // skip, taken inside the lock so it holds exactly the bytes replaced.
+      try { snapshotBrain(brainPath, { reason, force: true }); } catch { /* best-effort by contract */ }
+      await atomicWrite(brainPath, report.buffer, { reason, snapshot: false });
+    } else {
+      await atomicWrite(brainPath, report.buffer, { reason });
+    }
+    return report;
+  });
+}
+const refuseBusy = () => {
+  console.error('The brain is busy (another writer holds the capture lock) — retry in a moment. Nothing written.');
+  process.exit(1);
+};
+
 if (action === 'list') {
-  const entries = await listGraveyard(buf);
+  const buf = fs.readFileSync(brainPath);
+  const everything = await listGraveyard(buf, { receipts: 'include' });
+  // A receipt asked for by id: say what happened to it rather than "not found".
+  for (const e of everything) {
+    if (!ids.includes(e.id) || e.kind === 'deleted') continue;
+    console.log(e.kind === 'restored'
+      ? `  ${e.id}   restored as ${e.restoredAs} ${ago(e.restoredAt || e.deletedAt)} — it is live under that id`
+      : `  ${e.id}   permanently deleted ${ago(e.purgedAt || e.deletedAt)} — its content is gone from this file`);
+  }
+  const entries = everything.filter((e) => e.kind === 'deleted');
   if (!entries.length) {
     console.log(`Nothing deleted from ${path.basename(brainPath)}.`);
     console.log('Cards you delete from a brain are kept here, recoverable, instead of destroyed.');
@@ -53,15 +95,21 @@ if (action === 'list') {
 
 if (action === 'restore') {
   if (!ids.length) { console.error('Usage: brain-deleted restore <id…>   (ids from `brain-deleted list`)'); process.exit(2); }
-  const res = await restoreFromGraveyard(buf, ids);
+  const res = await lockedWrite('graveyard-restore', async (buf) => {
+    const r = await restoreFromGraveyard(buf, ids);
+    return r.restored.length ? r : { restored: [], skipped: r.skipped };
+  });
+  if (res.busy) refuseBusy();
   if (!res.restored.length) {
     for (const s of res.skipped) console.error(`  ${s.id}: ${s.reason}`);
     console.error('Nothing restored.');
     process.exit(1);
   }
-  await atomicWrite(brainPath, res.buffer, { reason: 'graveyard-restore' });
   for (const r of res.restored) {
-    console.log(`Restored ${r.id}${r.reparented ? ' (its container is gone — placed at the canvas root)' : ''}`);
+    const as = r.restoredAs && r.restoredAs !== r.id ? ` as ${r.restoredAs}` : '';
+    console.log(r.already
+      ? `${r.id} is already back${as}`
+      : `Restored ${r.id}${as}${r.reparented ? ' (its container is gone — placed at the canvas root)' : ''}`);
   }
   for (const s of res.skipped) console.log(`Skipped ${s.id}: ${s.reason}`);
   console.log('If the app has this brain OPEN, close and reopen the tab so it sees the restored card.');
@@ -76,12 +124,17 @@ if (!ids.length && !all && !olderThan) {
 }
 const days = olderThan ? Number(String(olderThan).replace(/d$/i, '')) : null;
 if (olderThan && !Number.isFinite(days)) { console.error(`--older-than expects days, e.g. --older-than ${DEFAULT_RETENTION_DAYS}d`); process.exit(2); }
-const res = await purgeGraveyard(buf, {
-  ids: ids.length ? ids : (all ? (await listGraveyard(buf)).map((e) => e.id) : null),
-  olderThanDays: ids.length || all ? null : days,
-});
+const res = await lockedWrite('graveyard-purge', async (buf) => {
+  const r = await purgeGraveyard(buf, {
+    // --all means every deleted card; receipts hold nothing left to purge.
+    ids: ids.length ? ids : (all ? (await listGraveyard(buf, { receipts: 'hide' })).map((e) => e.id) : null),
+    olderThanDays: ids.length || all ? null : days,
+  });
+  return r.purged.length ? r : { purged: [] };
+}, { forceSnapshot: true });
+if (res.busy) refuseBusy();
 if (!res.purged.length) { console.log('Nothing matched — nothing purged.'); process.exit(0); }
-await atomicWrite(brainPath, res.buffer, { reason: 'graveyard-purge' });
 console.log(`Purged ${res.purged.length} deleted card(s) permanently from ${path.basename(brainPath)}.`);
+console.log('The delete itself is kept as a receipt with no content, so every copy of this brain drops the card too.');
 console.log('Note: this removes them from the file, not from git history — a secret committed earlier is still in past commits.');
-console.log(`The pre-purge state is a restore point: npx klypix-mcp brain-history list --brain "${brainPath}"`);
+console.log(`The pre-purge state is a restore point, and the only undo: npx klypix-mcp brain-history list --brain "${brainPath}"`);

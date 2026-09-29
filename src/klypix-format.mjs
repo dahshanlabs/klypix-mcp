@@ -142,6 +142,247 @@ export function cardTitle(item) {
 // v4 shards item files by the first 2 hex chars of the id's random part.
 export const shard = (id) => id.replace(/^[a-z]+[_:]/i, '').toLowerCase().slice(0, 2).padStart(2, '_');
 
+// ── Card meaning and recycle-bin identity (Brain Sync Stage 2) ─────────────
+// These lived in merge-brains.mjs and brain-graveyard.mjs. They moved here
+// because every engine file already imports this module, so the merge, the
+// bin tools, the git driver and the KLYPIX sync core can share ONE definition
+// of "did this card change" and "which deletion is this" without a new module
+// (a new module would have to join five copy lists) or an import cycle. Both
+// old homes re-export them, so a caller written against 1.86 still links.
+//
+// VOLATILE = written by the act of saving, not by a human/agent decision:
+//   updatedAt — touch timestamp        zIndex — display order derived from zKey
+//   editedAt  — the desktop app's authored-edit stamp: an edit-then-undo cycle
+//               leaves the content identical while the stamp differs.
+// Everything else (content, colors, geometry, evidence, author…) stays load-
+// bearing: a real edit to any of them is still a real conflict.
+export const VOLATILE_ITEM_FIELDS = ['updatedAt', 'zIndex', 'editedAt'];
+
+// Key-sorted JSON, so two writers' key orders can never fake a difference.
+const stableJson = (v) => JSON.stringify(v, (_k, val) =>
+    (val && typeof val === 'object' && !Array.isArray(val))
+        ? Object.fromEntries(Object.keys(val).sort().map(k => [k, val[k]]))
+        : val);
+
+/** A card's MEANING as a canonical string: parsed, volatile fields stripped,
+ *  key-sorted. Unparseable JSON falls back to byte identity — a malformed item
+ *  must never crash a merge. */
+export function itemSignature(json) {
+    if (json == null) return null;
+    try {
+        const obj = JSON.parse(json);
+        for (const f of VOLATILE_ITEM_FIELDS) delete obj[f];
+        return stableJson(obj);
+    } catch {
+        return json;
+    }
+}
+
+/** True when two item JSON strings mean the same thing (volatile fields aside).
+ *  The single definition of "did this card actually change": the git merge
+ *  driver, the merge engine and the Brain Sync core all decide with it, so all
+ *  three transports agree on what an edit is. */
+export const sameMeaning = (a, b) => {
+    if (a === b) return true;           // fast path: byte-identical
+    if (a == null || b == null) return false;
+    return itemSignature(a) === itemSignature(b);
+};
+
+const compactText = (value, max = 140) => String(value || '').replace(/\s+/g, ' ').trim().slice(0, max);
+
+/** A bounded, type-aware description safe to show without restoring the item. */
+export function summarizeGraveyardCard(card) {
+    if (!card || typeof card !== 'object') return null;
+    const type = compactText(card.type, 32) || 'unknown';
+    const text = compactText(card.content || card.code || card.description || card.details);
+    const title = compactText(card.title || card.fileName || card.question || card.siteName || card.url, 180);
+    const label = title || text;
+    return {
+        type,
+        label,
+        preview: text,
+        ...(Number.isFinite(card.fileSize) ? { fileSize: Number(card.fileSize) } : {}),
+        ...(card.extension ? { extension: compactText(card.extension, 20) } : {}),
+        ...(Number.isFinite(card.originalWidth) ? { width: Number(card.originalWidth) } : {}),
+        ...(Number.isFinite(card.originalHeight) ? { height: Number(card.originalHeight) } : {}),
+        ...(card.language ? { language: compactText(card.language, 30) } : {}),
+        ...(card.url ? { url: compactText(card.url, 500) } : {}),
+        ...(card.projectGraph?.counts ? {
+            projectGraph: {
+                nodes: Number(card.projectGraph.counts.nodes) || 0,
+                edges: Number(card.projectGraph.counts.edges) || 0,
+            },
+        } : {}),
+    };
+}
+
+const DELETION_INITIATORS = new Set(['user', 'agent', 'system', 'peer', 'unknown']);
+const DELETION_CONFIDENCE = new Set(['explicit', 'inferred', 'legacy']);
+const boundedToken = (value, fallback, max = 64) => {
+    const clean = String(value || '').trim().toLowerCase().replace(/[^a-z0-9_-]/g, '-').replace(/-+/g, '-');
+    return clean ? clean.slice(0, max) : fallback;
+};
+
+// Deletion receipts cross renderer, IPC, merge, git and cloud boundaries. Keep
+// the persisted shape deliberately small and vocabulary-like: enough to answer
+// "who/what removed this?", never an unbounded action payload or device secret.
+export function sanitizeDeletionReceipt(raw) {
+    const r = raw && typeof raw === 'object' ? raw : {};
+    const initiator = DELETION_INITIATORS.has(r.initiator) ? r.initiator : 'unknown';
+    const confidence = DELETION_CONFIDENCE.has(r.confidence) ? r.confidence : 'inferred';
+    const cause = boundedToken(r.cause, 'unclassified');
+    const source = boundedToken(r.source, 'merge', 40);
+    const triggerCause = r.triggerCause ? boundedToken(r.triggerCause, '', 64) : '';
+    return { initiator, cause, source, confidence, ...(triggerCause ? { triggerCause } : {}) };
+}
+
+// A bin entry is its metadata in graveyard.json plus its body under
+// graveyard/<shard>/<id>.json. There are three kinds:
+//   F  a full entry — the deleted card's bytes, recoverable.
+//   P  a purge receipt — "Delete permanently" happened; the body is an empty
+//      placeholder. It must outlive the bytes, or the next merge with a copy
+//      that still holds them reads the missing entry as "never deleted".
+//   R  a restore receipt — the card came back (under `restoredAs`); the bytes
+//      live there, so the entry keeps none.
+// P and R are both `purged:true` on purpose: a Stage-1 reader (KLYPIX core
+// API 5, desktop 1.3.171) treats both as purge receipts — it hides them and
+// refuses to restore them, which is right for R too.
+//
+// The placeholder body exists because every merge drops an entry whose body
+// is missing; an empty one travels like any other entry.
+export const PURGED_BODY = '{"type":"text","content":"","purged":true}';
+export const entryKind = (meta) => (meta && meta.purged === true)
+    ? (typeof meta.restoredAs === 'string' && meta.restoredAs ? 'R' : 'P')
+    : 'F';
+export const isContentFreeReceipt = (meta) => !!meta && meta.purged === true;
+
+const sha256Hex = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
+
+// Identity ids ("rid") name a DELETION, never order one (no clock may pick a
+// winner — two machines' clocks disagree). An F entry's identity comes from its
+// id and meaning, so two machines that bury the same bytes agree without
+// talking. A P receipt's is random: a content-free receipt must not carry a
+// hash of what it purged, because a short secret could be brute-forced from it.
+// An R receipt keeps its F's identity: those bytes are live again, nothing leaks.
+export const fullEntryRid = (id, json) => 'r_' + sha256Hex(`${id}\n${itemSignature(json) ?? ''}`).slice(0, 16);
+
+/** The identity of one bin entry: its stored rid, else the one it would have
+ *  been minted with. A pre-rid F shares its identity with a new F of the same
+ *  bytes; a Stage-1 P (no rid) gets one from fields every copy holds verbatim,
+ *  so every machine derives the same value. */
+export function receiptIdentity(id, meta, json) {
+    if (meta && typeof meta.rid === 'string' && meta.rid) return meta.rid;
+    const kind = entryKind(meta);
+    if (kind === 'F') return fullEntryRid(id, json);
+    return `${kind === 'R' ? 'lr' : 'lp'}_`
+        + sha256Hex(`${id}\n${Number(meta?.deletedAt) || 0}\n${Number(meta?.purgedAt) || 0}`).slice(0, 16);
+}
+
+/** Deterministic conflict-twin id: the same conflict merged on two machines,
+ *  or through git and through Brain Sync, lands on ONE twin. `n` walks to the
+ *  next slot when this one is taken by something else. */
+export const twinIdFor = (id, json, n = 0) =>
+    `${id}__agconf_${sha256Hex((itemSignature(json) ?? '') + (n ? `\n#${n}` : '')).slice(0, 12)}`;
+
+const REVIVED_TAIL_RE = /(__r_[0-9a-f]{12})+$/;
+/** The id a deleted card comes back under. A restore, or an edit rescued from
+ *  a delete, cannot reuse the old id: that id stays deleted everywhere, so no
+ *  receipt is ever contradicted and an older machine sees an ordinary add. */
+export const revivedIdFor = (id, meta, json) =>
+    `${String(id).replace(REVIVED_TAIL_RE, '')}__r_${sha256Hex(`${id}\n${receiptIdentity(id, meta, json)}`).slice(0, 12)}`;
+
+const ENTRY_RANK = { F: 1, R: 2, P: 3 };
+const entryKey = (id, e) => {
+    const kind = entryKind(e.meta);
+    return [
+        ENTRY_RANK[kind],
+        kind === 'F' ? (itemSignature(e.json) ?? '') : receiptIdentity(id, e.meta, e.json),
+        stableJson(e.meta || {}),
+        String(e.json ?? ''),
+    ];
+};
+
+/** Which of two entries for one card a bin keeps: a strict TOTAL order, so the
+ *  maximum of any set is the same whatever the grouping or arrival order —
+ *  every replica and both transports choose the same entry. P beats R beats F
+ *  (delete-permanently is about the card, whatever version any bin holds; a
+ *  restore must beat the entry it restored). Within a kind the smaller
+ *  canonical content key wins: arbitrary, deterministic, never a clock —
+ *  deletedAt only sits inside the metadata tie-break, behind the content, so it
+ *  can only separate two records of the same deletion. Entries are
+ *  `{ meta, json }`. */
+export function pickBinEntry(id, a, b) {
+    if (!a) return b || null;
+    if (!b) return a;
+    const ka = entryKey(id, a), kb = entryKey(id, b);
+    if (ka[0] !== kb[0]) return ka[0] > kb[0] ? a : b;
+    for (let i = 1; i < ka.length; i++) if (ka[i] !== kb[i]) return ka[i] < kb[i] ? a : b;
+    return a;
+}
+
+/** A full (F) entry for a card leaving the brain. Every entry the engine mints
+ *  comes from here, so every one carries its identity. */
+export function binEntryFor({ id, json, pos = null, area = null, receipt, extra = {}, now = Date.now() }) {
+    let summary = null;
+    try { summary = summarizeGraveyardCard(JSON.parse(json)); } catch { /* damaged item remains restorable */ }
+    const deletion = sanitizeDeletionReceipt(receipt);
+    return {
+        meta: {
+            rid: fullEntryRid(id, json),
+            deletedAt: now,
+            // Flat field retained for older readers; `deletion` is authoritative.
+            deletedBy: deletion.initiator,
+            deletion,
+            area: area || null,
+            parentId: pos?.parentId ?? null,
+            pos: pos ? { x: pos.x, y: pos.y, w: pos.w ?? null, h: pos.h ?? null } : null,
+            preview: summary?.preview || '',
+            ...(summary ? { summary } : {}),
+            ...extra,
+        },
+        json,
+    };
+}
+
+/** The content-free receipt that replaces an entry: kind 'purged' (P) or
+ *  'restored' (R, with `restoredAs`). Its deletedAt is later than the entry it
+ *  replaces — Stage-1 engines keep the newer entry in their bin union, so that
+ *  is what makes an older machine keep the receipt over the bytes. Stage-2
+ *  merges never read it to decide anything. Returns the metadata; the body is
+ *  PURGED_BODY. `entry` is `{ meta, json }`. */
+export function contentFreeReceiptFor(id, entry, { kind, restoredAs = null, now = Date.now() } = {}) {
+    if (kind !== 'purged' && kind !== 'restored') throw new TypeError(`contentFreeReceiptFor: kind must be 'purged' or 'restored'`);
+    if (kind === 'restored' && !(typeof restoredAs === 'string' && restoredAs)) throw new TypeError('contentFreeReceiptFor: a restore receipt needs restoredAs');
+    const meta = entry?.meta || {};
+    const deletion = meta.deletion && typeof meta.deletion === 'object'
+        ? meta.deletion
+        : (meta.deletedBy
+            ? { initiator: meta.deletedBy, confidence: 'legacy' }
+            : { initiator: 'unknown', cause: kind === 'purged' ? 'purge' : 'restore', source: 'klypix-mcp', confidence: 'inferred' });
+    const common = {
+        deletedAt: Math.max(now, (Number(meta.deletedAt) || 0) + 1),
+        deletedBy: deletion.initiator ?? 'unknown',
+        deletion,
+        purged: true,
+        purgedAt: now,
+        preview: '',
+    };
+    if (kind === 'restored') {
+        return {
+            rid: receiptIdentity(id, meta, entry?.json),
+            ...common,
+            restoredAs,
+            restoredAt: now,
+            summary: { type: 'restored', label: 'Restored', preview: '' },
+        };
+    }
+    return {
+        rid: 'p_' + crypto.randomBytes(8).toString('hex'),
+        ...common,
+        summary: { type: 'purged', label: 'Permanently deleted', preview: '' },
+    };
+}
+
 /**
  * Atomically persist a .klypix buffer: verify it round-trips, write a sibling
  * .tmp, then rename over the target. A concurrent reader (e.g. the shared-brain

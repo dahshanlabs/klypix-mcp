@@ -1,3 +1,6 @@
+// FROZEN FIXTURE — src/brain-graveyard.mjs exactly as released in klypix-mcp 1.86.3 (58e095e),
+// except that it imports the live klypix-format.mjs. Tests run the same case
+// through this copy to prove they catch the old behaviour. Never edit.
 // brain-graveyard — the recoverable bin for items deleted from a brain.
 //
 // WHY THIS AND NOT THE ARCHIVE CONTAINER. "Archived" in a KLYPIX brain is a
@@ -18,60 +21,56 @@
 // collaborators, so "delete" is also the escape hatch for a pasted key or a
 // personal detail. Purge removes the bytes from the working file — it cannot
 // remove them from git history, and the caller is told so.
-//
-// PURGE LEAVES A RECEIPT (Stage 2). A purge used to drop the entry outright.
-// On a brain that syncs, that read as "this copy never had the delete": the
-// next merge with a copy still holding the bytes (the cloud, a git branch)
-// carried them straight back into the bin. So a purge now keeps the entry as
-// a content-free receipt — no preview, no position, an empty placeholder body,
-// a random identity — and every copy that meets it drops the bytes. The same
-// receipt the KLYPIX desktop has written since 1.3.171. Receipts are not
-// deleted cards: `list` can hide them, and restore refuses them.
 import fs from 'fs';
 import JSZip from 'jszip';
-import {
-  parseKlypix, shard, summarizeGraveyardCard, entryKind, receiptIdentity,
-  contentFreeReceiptFor, PURGED_BODY,
-} from './klypix-format.mjs';
-
-// Moved to klypix-format.mjs; the 1.86 merge engine and the API-5 KLYPIX sync
-// core import it from here, and a mixed install must still link.
-export { summarizeGraveyardCard };
+import { parseKlypix, shard } from '../../../src/klypix-format.mjs';
 
 export const DEFAULT_RETENTION_DAYS = 30;
 
-const KIND_NAME = { F: 'deleted', P: 'purged', R: 'restored' };
+const compact = (value, max = 140) => String(value || '').replace(/\s+/g, ' ').trim().slice(0, max);
 
-/**
- * Deleted cards, newest first. Every entry carries `kind`
- * ('deleted' | 'purged' | 'restored') and its identity `rid`.
- * `receipts: 'hide'` leaves out the content-free receipts (P and R): they are
- * not cards anyone can restore, only the record that keeps a delete honest.
- * The default stays 'include' because desktop 1.3.171 filters them itself.
- */
-export async function listGraveyard(buf, { receipts = 'include' } = {}) {
-  if (receipts !== 'include' && receipts !== 'hide') throw new TypeError(`listGraveyard: receipts must be 'include' or 'hide'`);
+/** A bounded, type-aware description safe to show without restoring the item. */
+export function summarizeGraveyardCard(card) {
+  if (!card || typeof card !== 'object') return null;
+  const type = compact(card.type, 32) || 'unknown';
+  const text = compact(card.content || card.code || card.description || card.details);
+  const title = compact(card.title || card.fileName || card.question || card.siteName || card.url, 180);
+  const label = title || text;
+  return {
+    type,
+    label,
+    preview: text,
+    ...(Number.isFinite(card.fileSize) ? { fileSize: Number(card.fileSize) } : {}),
+    ...(card.extension ? { extension: compact(card.extension, 20) } : {}),
+    ...(Number.isFinite(card.originalWidth) ? { width: Number(card.originalWidth) } : {}),
+    ...(Number.isFinite(card.originalHeight) ? { height: Number(card.originalHeight) } : {}),
+    ...(card.language ? { language: compact(card.language, 30) } : {}),
+    ...(card.url ? { url: compact(card.url, 500) } : {}),
+    ...(card.projectGraph?.counts ? {
+      projectGraph: {
+        nodes: Number(card.projectGraph.counts.nodes) || 0,
+        edges: Number(card.projectGraph.counts.edges) || 0,
+      },
+    } : {}),
+  };
+}
+
+/** Deleted cards, newest first. */
+export async function listGraveyard(buf) {
   const { struct, zip } = await parseKlypix(buf);
   const result = [];
   for (const entry of (struct.graveyard || [])) {
-    const kind = entryKind(entry);
-    if (receipts === 'hide' && kind !== 'F') continue;
-    let body = null;
-    try {
-      const file = zip.file(`graveyard/${shard(entry.id)}/${entry.id}.json`);
-      // Only an F entry without a stored rid needs its bytes for the identity.
-      const needsBody = (kind === 'F' && !entry.rid) || !(entry.summary && typeof entry.summary === 'object');
-      if (file && needsBody) body = await file.async('string');
-    } catch { /* one damaged deleted item must not hide the rest of the bin */ }
+    let card = null;
     let summary = entry.summary && typeof entry.summary === 'object' ? entry.summary : null;
-    if (!summary && body != null) {
-      try { summary = summarizeGraveyardCard(JSON.parse(body)); } catch { /* shown without a preview */ }
+    if (!summary) {
+      try {
+        const file = zip.file(`graveyard/${shard(entry.id)}/${entry.id}.json`);
+        if (file) card = JSON.parse(await file.async('string'));
+        summary = summarizeGraveyardCard(card);
+      } catch { /* one damaged deleted item must not hide the rest of the bin */ }
     }
-    const { id, ...meta } = entry;
     result.push({
       ...entry,
-      kind: KIND_NAME[kind],
-      rid: receiptIdentity(id, meta, body),
       // Pre-audit entries only carried deletedBy:"human". That was a generic
       // merge stamp, not proof, so expose them honestly as legacy/unverified.
       deletion: entry.deletion && typeof entry.deletion === 'object'
@@ -104,10 +103,6 @@ function writeIndex(zip, index) {
  *
  * Its former parent may itself be gone; in that case the card is restored to
  * the canvas root rather than into a dangling container.
- *
- * Receipts are refused, with the reason: a purge receipt holds no card (its
- * placeholder body would come back as an empty card), and a restore receipt's
- * card is already live under `restoredAs`.
  */
 export async function restoreFromGraveyard(buf, ids) {
   const zip = await JSZip.loadAsync(buf);
@@ -125,9 +120,6 @@ export async function restoreFromGraveyard(buf, ids) {
     const entry = index.entries[id];
     const file = zip.file(`graveyard/${shard(id)}/${id}.json`);
     if (!entry || !file) { skipped.push({ id, reason: 'not in the bin' }); continue; }
-    const kind = entryKind(entry);
-    if (kind === 'P') { skipped.push({ id, reason: 'deleted permanently' }); continue; }
-    if (kind === 'R') { skipped.push({ id, reason: `already restored as ${entry.restoredAs}` }); continue; }
     if (liveIds.has(id)) { skipped.push({ id, reason: 'already in the brain' }); continue; }
 
     zip.file(`items/${shard(id)}/${id}.json`, await file.async('string'));
@@ -156,32 +148,22 @@ export async function restoreFromGraveyard(buf, ids) {
 }
 
 /**
- * Delete bin entries permanently. `olderThanDays` purges by age; explicit
- * `ids` purge regardless of age (the secret-was-pasted case).
- *
- * The card's bytes, preview, summary, position and area go; the entry stays as
- * a content-free purge receipt (see the header) so every other copy of this
- * brain drops the card too. Receipts are skipped: they hold nothing to purge,
- * and an age purge must not keep restamping them.
+ * Permanently remove entries from the bin. `olderThanDays` purges by age;
+ * explicit `ids` purge regardless of age (the secret-was-pasted case).
  */
 export async function purgeGraveyard(buf, { ids = null, olderThanDays = null, now = Date.now() } = {}) {
   const zip = await JSZip.loadAsync(buf);
   const index = await readIndex(zip);
   const cutoff = olderThanDays != null ? now - olderThanDays * 24 * 60 * 60 * 1000 : null;
-  const wanted = ids ? new Set(ids.map(String)) : null;
 
   const target = [];
   for (const [id, meta] of Object.entries(index.entries)) {
-    if (entryKind(meta) !== 'F') continue;
-    if (wanted) { if (wanted.has(id)) target.push(id); continue; }
+    if (ids) { if (ids.includes(id)) target.push(id); continue; }
     if (cutoff != null && Number(meta?.deletedAt || 0) < cutoff) target.push(id);
   }
-  if (!target.length) return { buffer: buf, purged: target };
   for (const id of target) {
-    const file = zip.file(`graveyard/${shard(id)}/${id}.json`);
-    const json = file ? await file.async('string') : null;
-    index.entries[id] = contentFreeReceiptFor(id, { meta: index.entries[id], json }, { kind: 'purged', now });
-    zip.file(`graveyard/${shard(id)}/${id}.json`, PURGED_BODY);
+    zip.remove(`graveyard/${shard(id)}/${id}.json`);
+    delete index.entries[id];
   }
   writeIndex(zip, index);
   const buffer = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });

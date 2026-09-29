@@ -1,4 +1,6 @@
-#!/usr/bin/env node
+// FROZEN FIXTURE — src/merge-brains.mjs exactly as released in klypix-mcp 1.86.3 (58e095e),
+// except that it imports the live klypix-format.mjs. Tests run the same case
+// through this copy to prove they catch the old behaviour. Never edit.
 // merge-brains — the pure, provable core of the desktop-app<->hooks brain
 // concurrency fix. A 3-way UNION-by-stable-id reconcile of two .klypix brains
 // that share a common ancestor, designed so that NO CARD CAN BE LOST.
@@ -31,118 +33,41 @@
 // brainEngine/deploy paths keep loading it unchanged. Edit it HERE — the app
 // copy is GENERATED. It flattens into ~/.claude/project-brain on install, where
 // jszip + fractional-indexing already live.
-//
-// STAGE 2 (klypix-mcp 1.87) — rules that hold for EVERY caller, options or not:
-//   • Conflict twins get DETERMINISTIC ids (twinIdFor: the conflicted card's id
-//     plus a hash of the value being preserved). A random id meant the same
-//     conflict merged twice — by the git driver and by Brain Sync, or on two
-//     machines — left two twins of one value that never folded. Now a value
-//     that already has a twin is never twinned again, and two transports that
-//     resolve the same conflict land on the same card.
-//   • Every bin entry the engine mints carries its identity (`rid`, see
-//     receiptIdentity in klypix-format.mjs) — a name for the deletion that two
-//     machines derive without talking, and that never orders anything.
-// Everything else about a call WITHOUT options is 1.86.3's union, verbatim:
-// the desktop app's merge-on-save sends renderer bytes that carry no bin, so
-// any rule that read a missing bin as meaningful would delete the human's
-// cards. Callers that DO carry a whole file (Brain Sync, the git driver) opt
-// into the receipt-aware rules through `options` (normalizeMergeOptions).
 
 import JSZip from 'jszip';
-import {
-  parseKlypix, shard, sameMeaning, twinIdFor, binEntryFor,
-} from './klypix-format.mjs';
+import { parseKlypix, shard } from '../../../src/klypix-format.mjs';
+import { summarizeGraveyardCard } from './brain-graveyard.mjs';
 import { generateKeyBetween } from 'fractional-indexing';
 
 const isValidZKey = (k) => { try { generateKeyBetween(k, null); return true; } catch { return false; } };
+const rand = () => Math.random().toString(36).slice(2, 10);
 const ARCHIVE = /^archive$/i;
 
-// The identity helpers live in klypix-format.mjs (one definition for every
-// engine file and the KLYPIX core). Re-exported here because callers written
-// against 1.86 — the git driver, the API-5 KLYPIX sync core — import them from
-// this module, and the KLYPIX core reads the whole engine off this namespace.
-export {
-  sameMeaning, itemSignature, VOLATILE_ITEM_FIELDS, twinIdFor, revivedIdFor, receiptIdentity, entryKind,
-  isContentFreeReceipt, pickBinEntry, PURGED_BODY, binEntryFor, contentFreeReceiptFor, fullEntryRid,
-} from './klypix-format.mjs';
-export { purgeGraveyard, restoreFromGraveyard, listGraveyard } from './brain-graveyard.mjs';
+const DELETION_INITIATORS = new Set(['user', 'agent', 'system', 'peer', 'unknown']);
+const DELETION_CONFIDENCE = new Set(['explicit', 'inferred', 'legacy']);
+const boundedToken = (value, fallback, max = 64) => {
+  const clean = String(value || '').trim().toLowerCase().replace(/[^a-z0-9_-]/g, '-').replace(/-+/g, '-');
+  return clean ? clean.slice(0, max) : fallback;
+};
 
-// ── Options (Stage 2) ────────────────────────────────────────────────────────
-// A call with no options is the union merge above (app save, and every 1.86
-// caller). `binMerge: 'receipts' | '3way'` ("option modes") switch to the
-// receipt-aware bin merge; the other keys only mean anything in an option mode.
-//
-// Validation is strict on purpose. A misspelt key, or a half-configured
-// object, would otherwise silently run union — and union reads a stale copy of
-// a deleted card as live. So unknown keys, unknown values, and any non-default
-// key combined with union all throw instead.
-const OPTION_VALUES = Object.freeze({
-  binMerge: Object.freeze(['union', 'receipts', '3way']),
-  theirsTrust: Object.freeze(['descendant', 'unverified']),
-  newOnBothSides: Object.freeze(['theirs', 'twin']),
-  manifestMerge: Object.freeze(['theirs', '3way', 'ours']),
-  adoptResolvedConflicts: Object.freeze([false, true]),
-});
-const OPTION_DEFAULTS = Object.freeze({
-  binMerge: 'union', theirsTrust: 'descendant', newOnBothSides: 'theirs', manifestMerge: 'theirs', adoptResolvedConflicts: false,
-});
-
-// The option-mode merge (fates, routing, the total-order bin) is not in this
-// build yet. Until it is, an option mode is validated and then REFUSED — never
-// run as union — and the feature table below advertises only what runs, so a
-// caller that gates on it (the KLYPIX core's ENGINE_OK, the git driver's
-// api >= 2) keeps its 1.86 path.
-const OPTION_MODES_BUILT = false;
-
-/** What this engine can do — callers feature-check this rather than a version
- *  string, because installs mix file generations (a 1.87 driver beside a 1.86
- *  engine, a desktop bundle beside a dev-owned ~/.claude). Absent ⇒ ≤ 1.86. */
-export const MERGE_ENGINE_FEATURES = Object.freeze({
-  api: OPTION_MODES_BUILT ? 2 : 1,   // bump only when an option's meaning changes
-  deterministicTwins: true,          // E-1, every caller
-  receiptIds: true,                  // E-2, every caller
-  purgeReceipts: true,               // purgeGraveyard leaves a content-free receipt
-  revivedIds: false,                 // restores and rescued edits land under revivedIdFor
-  restoreAsMerge: false,             // history restore as a merge
-  arrangeReceipts: false,            // arrangeBrain buries what it collapses
-  revivalMap: false,                 // brainDelta/revivalMap for the live watcher
-  options: OPTION_MODES_BUILT
-    ? OPTION_VALUES
-    : Object.freeze(Object.fromEntries(Object.entries(OPTION_DEFAULTS).map(([k, v]) => [k, Object.freeze([v])]))),
-});
-
-/**
- * Validate a caller's options and fill the defaults. Exported so callers can
- * pin their frozen option objects in a test: a renamed key then fails a test
- * instead of silently running union.
- * @returns {{binMerge:string, theirsTrust:string, newOnBothSides:string, manifestMerge:string, adoptResolvedConflicts:boolean}}
- */
-export function normalizeMergeOptions(options) {
-  const o = options == null ? {} : options;
-  if (typeof o !== 'object' || Array.isArray(o)) throw new TypeError('mergeBrains: options must be an object');
-  for (const k of Object.keys(o)) {
-    if (!Object.prototype.hasOwnProperty.call(OPTION_VALUES, k)) throw new TypeError(`mergeBrains: unknown option '${k}'`);
-  }
-  const opt = { ...OPTION_DEFAULTS };
-  for (const k of Object.keys(o)) if (o[k] !== undefined) opt[k] = o[k];
-  for (const [k, v] of Object.entries(opt)) {
-    if (!OPTION_VALUES[k].includes(v)) throw new TypeError(`mergeBrains: options.${k} must be one of ${JSON.stringify(OPTION_VALUES[k])}`);
-  }
-  if (opt.binMerge === 'union') {
-    const stray = Object.keys(OPTION_DEFAULTS).filter(k => k !== 'binMerge' && opt[k] !== OPTION_DEFAULTS[k]);
-    if (stray.length) throw new TypeError(`mergeBrains: options ${stray.join(', ')} need binMerge 'receipts' or '3way'`);
-  }
-  if (opt.theirsTrust === 'unverified' && opt.binMerge !== 'receipts') {
-    throw new TypeError("mergeBrains: theirsTrust 'unverified' needs binMerge 'receipts'");
-  }
-  return opt;
+// Deletion receipts cross renderer, IPC, merge, git and cloud boundaries. Keep
+// the persisted shape deliberately small and vocabulary-like: enough to answer
+// "who/what removed this?", never an unbounded action payload or device secret.
+function sanitizeDeletionReceipt(raw) {
+  const r = raw && typeof raw === 'object' ? raw : {};
+  const initiator = DELETION_INITIATORS.has(r.initiator) ? r.initiator : 'unknown';
+  const confidence = DELETION_CONFIDENCE.has(r.confidence) ? r.confidence : 'inferred';
+  const cause = boundedToken(r.cause, 'unclassified');
+  const source = boundedToken(r.source, 'merge', 40);
+  const triggerCause = r.triggerCause ? boundedToken(r.triggerCause, '', 64) : '';
+  return {
+    initiator,
+    cause,
+    source,
+    confidence,
+    ...(triggerCause ? { triggerCause } : {}),
+  };
 }
-
-// Immediate parent of a twin id — greedy, so `k__agconf_a__agconf_b` indexes
-// under `k__agconf_a` (a twin of a twin is that twin's, not the root's).
-const TWIN_PARENT_RE = /^(.*)__agconf_[a-z0-9]+$/i;
-// Deterministic slots tried before the (never-lose) random fallback.
-const TWIN_SLOTS = 16;
 
 // ── Semantic item comparison (2026-08-01 field fix) ─────────────────────────
 // A raw byte compare of item JSON was the change detector, on the assumption
@@ -158,10 +83,43 @@ const TWIN_SLOTS = 16;
 // two writers' key orders can't fake a difference. Byte-compare survives as the
 // fallback for anything unparseable — a malformed item must never crash a merge.
 //
-// The comparator itself — sameMeaning, itemSignature and the VOLATILE field
-// list (updatedAt, zIndex, editedAt) — lives in klypix-format.mjs since 1.87,
-// so the bin identity (receiptIdentity) and twin ids hash exactly the meaning
-// this merge compares.
+// VOLATILE = written by the act of saving, not by a human/agent decision:
+//   updatedAt — touch timestamp        zIndex — display order derived from zKey
+//   editedAt  — the desktop app's authored-edit stamp (2026-08-22): advances on
+//               content-level edits only, but an edit-then-undo cycle leaves the
+//               content identical while the stamp differs — exactly the
+//               same-meaning-different-bytes shape that spawned the updatedAt
+//               twins above. A card whose only difference is WHEN it was last
+//               edited has not diverged.
+// Everything else (content, colors, geometry, evidence, author…) stays load-
+// bearing: a real edit to any of them is still a real conflict.
+const VOLATILE_ITEM_FIELDS = ['updatedAt', 'zIndex', 'editedAt'];
+
+const sortedStable = (v) => JSON.stringify(v, (_k, val) =>
+  (val && typeof val === 'object' && !Array.isArray(val))
+    ? Object.fromEntries(Object.keys(val).sort().map(k => [k, val[k]]))
+    : val);
+
+function itemSignature(json) {
+  if (json == null) return null;
+  try {
+    const obj = JSON.parse(json);
+    for (const f of VOLATILE_ITEM_FIELDS) delete obj[f];
+    return sortedStable(obj);
+  } catch {
+    return json;                      // unparseable → byte identity, as before
+  }
+}
+
+/** True when two item JSON strings mean the same thing (volatile fields aside).
+ *  EXPORTED as the single definition of "did this card actually change" — the
+ *  git merge driver and the Brain Sync core both decide committed-absence
+ *  tombstones with it, so all three transports agree on what an edit is. */
+export const sameMeaning = (a, b) => {
+  if (a === b) return true;           // fast path: byte-identical
+  if (a == null || b == null) return false;
+  return itemSignature(a) === itemSignature(b);
+};
 
 // Load one .klypix buffer into a flat, comparison-friendly shape. Item JSON is
 // kept VERBATIM (the merge must write back exactly what a side held); whether
@@ -217,16 +175,9 @@ const sameParent = (a, b) => (a?.parentId ?? null) === (b?.parentId ?? null);
  *   theirs    = the current on-disk brain, re-read INSIDE the lock (has hook captures).
  *   deletedIds= explicit tombstones. ONLY these can drop a live card.
  *   deletedMeta= bounded per-id audit receipts (initiator/cause/source/confidence).
- *   options   = see normalizeMergeOptions; omitted ⇒ the union merge.
- * @returns {Promise<{buffer:Buffer, delta:{added:string[],updated:string[],archived:string[],removed:string[],revived:object[]}, conflicts:object[], stats:object}>}
+ * @returns {Promise<{buffer:Buffer, delta:{added:string[],updated:string[],archived:string[],removed:string[]}, conflicts:object[], stats:object}>}
  */
-export async function mergeBrains({ base = null, ours, theirs, deletedIds = [], deletedMeta = {}, options = {} }) {
-  const opt = normalizeMergeOptions(options);
-  if (opt.binMerge !== 'union' && !OPTION_MODES_BUILT) {
-    // Refuse rather than fall back: union would read the caller's stale copies
-    // of deleted cards as live, which is exactly what it asked to avoid.
-    throw new Error(`mergeBrains: binMerge '${opt.binMerge}' is not available in this engine (check MERGE_ENGINE_FEATURES.options)`);
-  }
+export async function mergeBrains({ base = null, ours, theirs, deletedIds = [], deletedMeta = {} }) {
   if (!ours || !theirs) throw new Error('mergeBrains needs both ours and theirs buffers');
   const B = await loadSide(base);
   const O = await loadSide(ours);
@@ -244,13 +195,7 @@ export async function mergeBrains({ base = null, ours, theirs, deletedIds = [], 
   const merged = new Map();          // id -> { json, pos }
   const extras = [];                 // conflict-twin cards to append
   const conflicts = [];
-  // `revived` stays empty in the union merge; option modes fill it.
-  const delta = { added: [], updated: [], archived: [], removed: [], revived: [] };
-  // Twins are decided AFTER the loop (E-1): whether a slot is free, taken by a
-  // live twin, or held by a card this same merge deletes is only known once
-  // every id's fate is. Each request keeps its conflict record in place so the
-  // conflicts list reads in the same order as it always has.
-  const twinRequests = [];           // { k, v, srcPos, record }
+  const delta = { added: [], updated: [], archived: [], removed: [] };
 
   // ── Graveyard (2026-08-07) ───────────────────────────────────────────────
   // An honored tombstone still REMOVES the card from the brain — `order`,
@@ -270,12 +215,24 @@ export async function mergeBrains({ base = null, ours, theirs, deletedIds = [], 
     const json = O.items[id] ?? T.items[id] ?? null;
     if (json == null) return;                        // nothing to preserve
     const pos = O.positions[id] || T.positions[id] || null;
-    // E-2: minted through binEntryFor, so the entry carries its identity (rid).
-    graveyard[id] = binEntryFor({
-      id, json, pos,
-      area: (O.titleById.get(pos?.parentId) || T.titleById.get(pos?.parentId) || null),
-      receipt: deletedMeta?.[id],
-    });
+    let summary = null;
+    try { summary = summarizeGraveyardCard(JSON.parse(json)); } catch { /* damaged item remains restorable */ }
+    const preview = summary?.preview || '';
+    const deletion = sanitizeDeletionReceipt(deletedMeta?.[id]);
+    graveyard[id] = {
+      meta: {
+        deletedAt: Date.now(),       // `now` below is declared later in this scope
+        // Flat field retained for older readers; `deletion` is authoritative.
+        deletedBy: deletion.initiator,
+        deletion,
+        area: (O.titleById.get(pos?.parentId) || T.titleById.get(pos?.parentId) || null),
+        parentId: pos?.parentId ?? null,
+        pos: pos ? { x: pos.x, y: pos.y, w: pos.w ?? null, h: pos.h ?? null } : null,
+        preview,
+        ...(summary ? { summary } : {}),
+      },
+      json,
+    };
   };
 
   for (const id of allIds) {
@@ -340,9 +297,9 @@ export async function mergeBrains({ base = null, ours, theirs, deletedIds = [], 
         // GENUINE content conflict: a card that EXISTED at open, edited differently
         // on both sides → human stays live, agent version preserved as a twin.
         json = O.items[id]; side = 'ours';
-        const record = { id, kind: 'content', keptLive: 'ours', twin: null };
-        conflicts.push(record);
-        twinRequests.push({ k: id, v: T.items[id], srcPos: T.positions[id] || O.positions[id], record });
+        const twinId = `${id}__agconf_${rand()}`;
+        extras.push({ id: twinId, json: T.items[id], srcPos: T.positions[id] || O.positions[id], of: id });
+        conflicts.push({ id, kind: 'content', keptLive: 'ours', twin: twinId });
       } else if (tChg && !oChg) { json = T.items[id]; side = 'theirs'; delta.updated.push(id); }
       else if (!inB && diverged) {
         if (!B) {
@@ -352,9 +309,9 @@ export async function mergeBrains({ base = null, ours, theirs, deletedIds = [], 
           // Keep ours live and materialize theirs as a twin, exactly like a
           // normal two-sided edit: convergence is not enough if one meaning dies.
           json = O.items[id]; side = 'ours';
-          const record = { id, kind: 'content-no-base', keptLive: 'ours', twin: null };
-          conflicts.push(record);
-          twinRequests.push({ k: id, v: T.items[id], srcPos: T.positions[id] || O.positions[id], record });
+          const twinId = `${id}__agconf_${rand()}`;
+          extras.push({ id: twinId, json: T.items[id], srcPos: T.positions[id] || O.positions[id], of: id });
+          conflicts.push({ id, kind: 'content-no-base', keptLive: 'ours', twin: twinId });
         } else {
           // The base EXISTS but this id is new since it: the same new agent card
           // can be present on both sides after live-apply and re-serialized with
@@ -390,58 +347,6 @@ export async function mergeBrains({ base = null, ours, theirs, deletedIds = [], 
 
     merged.set(id, { json, pos });
   }
-
-  // ── E-1: deterministic twin slots ─────────────────────────────────────────
-  // A value to preserve as a twin of card k goes, in order:
-  //   1. nowhere new, if a live twin of k already means the same (old random
-  //      twins included) — the conflict was resolved before, maybe elsewhere;
-  //   2. into slot n = twinIdFor(k, v, n), the first slot that is
-  //      free        → mint it;
-  //      alive       → it was minted from v; if it now says something else a
-  //                    person edited it, and v is already represented;
-  //      dying       → a person is deleting that twin in THIS merge — the value
-  //                    still needs a live home, so try the next slot;
-  //      dead (bin)  → next slot (never overwrite or resurrect a buried card);
-  //   3. a random id after TWIN_SLOTS slots — never lose a value.
-  // One index per merge (immediate parent → twin ids), so this stays linear on
-  // a brain with thousands of simultaneous conflicts.
-  const twinIndex = new Map();
-  const indexTwin = (id) => {
-    const m = TWIN_PARENT_RE.exec(id);
-    if (!m) return;
-    if (!twinIndex.has(m[1])) twinIndex.set(m[1], new Set());
-    twinIndex.get(m[1]).add(id);
-  };
-  for (const id of allIds) indexTwin(id);
-  const extraById = new Map();
-  const removedSet = new Set(delta.removed);
-  const liveValue = (x) => merged.get(x)?.json ?? extraById.get(x)?.json ?? null;
-  const slotState = (x) => {
-    if (merged.has(x) || extraById.has(x)) return 'alive';
-    if ((O.items[x] != null || T.items[x] != null) && removedSet.has(x)) return 'dying';
-    if (graveyard[x]) return 'dead';
-    return 'free';
-  };
-  const mint = (x, req) => {
-    const ex = { id: x, json: req.v, srcPos: req.srcPos, of: req.k };
-    extras.push(ex); extraById.set(x, ex); indexTwin(x);
-    return x;
-  };
-  const placeTwin = (req) => {
-    for (const x of (twinIndex.get(req.k) || [])) {
-      if (sameMeaning(liveValue(x), req.v)) return { twin: x, existing: true };
-    }
-    for (let n = 0; n < TWIN_SLOTS; n++) {
-      const x = twinIdFor(req.k, req.v, n);
-      const state = slotState(x);
-      if (state === 'alive') return { twin: x, existing: true, ...(sameMeaning(liveValue(x), req.v) ? {} : { edited: true }) };
-      if (state === 'free') return { twin: mint(x, req) };
-    }
-    let x;
-    do x = `${req.k}__agconf_${Math.random().toString(16).slice(2, 14).padEnd(12, '0')}`; while (slotState(x) !== 'free');
-    return { twin: mint(x, req) };
-  };
-  for (const req of twinRequests) Object.assign(req.record, placeTwin(req));
 
   // ── Conflict twins: place beside their source card, own valid zKey ─────────
   for (const ex of extras) {
@@ -555,7 +460,6 @@ export async function mergeBrains({ base = null, ours, theirs, deletedIds = [], 
     merged: order.length, conflicts: conflicts.length,
     added: delta.added.length, updated: delta.updated.length,
     archived: delta.archived.length, removed: delta.removed.length,
-    revived: delta.revived.length, purgedCopies: 0,   // option modes only
     assets: Object.keys(assets).length,
   };
   return { buffer, delta, conflicts, stats };

@@ -944,6 +944,44 @@ const B_ROWS = [
     want: { union: 'live[k′=v1 k′~=v2] bin[k:R] c[]', receipts: 'live[k′=v1 k′~=v2] bin[k:R] c[]', '3way': 'live[k′=v1 k′~=v2] bin[k:R] c[]' },
   },
   {
+    // Found by the simulator's soak (seed 10153): a machine checked out a file
+    // older than a sync that moved an edit of k to k′. It holds k′'s value
+    // under k, and only absence tombstoned k′ — that copy is k′, not a delete.
+    name: 'B21 a checkout older than a move holds the card under its earlier id',
+    args: async () => ({
+      base: await side({ live: { [kRev('v0')]: pj('v1') }, bin: { txt_k: Fe(k0, 'v0') } }),
+      ours: await side({ live: { txt_k: pj('v1') } }),
+      theirs: await side({ live: { [kRev('v0')]: pj('v1') }, bin: { txt_k: Fe(k0, 'v0') } }),
+      deletedIds: [kRev('v0')],
+    }),
+    want: { union: 'live[k=v1] bin[k′:F(v1)] c[]', receipts: 'live[k′=v1] bin[k:F(v0)] c[]', '3way': 'live[k′=v1] bin[k:F(v0)] c[]' },
+  },
+  {
+    // The same file, but its own bin deletes k′: a person did, and it holds.
+    name: 'B22 a side that deletes the moved card keeps the delete, whatever its earlier id holds',
+    args: async () => ({
+      base: await side({ live: { [kRev('v0')]: pj('v1') }, bin: { txt_k: Fe(k0, 'v0') } }),
+      ours: await side({ live: { txt_k: pj('v1') }, bin: { [kRev('v0')]: binEntryFor({ id: kRev('v0'), json: pj('v1'), now: 1500 }) } }),
+      theirs: await side({ live: { [kRev('v0')]: pj('v1') }, bin: { txt_k: Fe(k0, 'v0') } }),
+      deletedIds: [kRev('v0')],
+    }),
+    want: { union: 'live[k=v1] bin[k′:F(v1)] c[]', receipts: 'live[] bin[k:F(v0) k′:F(v1)] c[]', '3way': 'live[] bin[k:F(v0) k′:F(v1)] c[]' },
+  },
+  {
+    // An older value under the earlier id is not the card as the base holds
+    // it: the checkout took k′'s later text away (a delete of it, as for any
+    // card the older file lacks) and its own text comes back beside it.
+    name: 'B23 a checkout older than an edit made after the move',
+    args: async () => ({
+      base: await side({ live: { [kRev('v0')]: pj('v2') }, bin: { txt_k: Fe(k0, 'v0') } }),
+      ours: await side({ live: { txt_k: pj('v1') } }),
+      theirs: await side({ live: { [kRev('v0')]: pj('v2') }, bin: { txt_k: Fe(k0, 'v0') } }),
+      deletedIds: [kRev('v0')],
+    }),
+    // (k′ twice: the landing is k′'s own revived id, which the summary also shortens to k′.)
+    want: { union: 'live[k=v1] bin[k′:F(v2)] c[]', receipts: 'live[k′=v1] bin[k:F(v0) k′:F(v2)] c[]', '3way': 'live[k′=v1] bin[k:F(v0) k′:F(v2)] c[]' },
+  },
+  {
     // Nothing in any bin: the option modes are the familiar 3-way.
     name: 'B16 no bins anywhere: an ordinary content conflict',
     args: async () => ({ base: await side({ live: { txt_k: 'v0' } }), ours: await side({ live: { txt_k: 'v1' } }), theirs: await side({ live: { txt_k: 'v2' } }) }),
@@ -1329,6 +1367,12 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
       find: '(liveAt(arrived.get(key), mv.v) || supersededAt(arrived.get(key), mv.v))',
       replace: 'liveAt(arrived.get(key), mv.v)',
       row: 'B18', options: { binMerge: 'receipts' },
+    },
+    {
+      rule: 'a side holding the card under its earlier id has not deleted it',
+      find: '    if (del.has(id) && !heldUnderEarlierId.has(id)) {',
+      replace: '    if (del.has(id)) {',
+      row: 'B21', options: { binMerge: 'receipts' },
     },
     {
       rule: 'a restore sends the copy after the card',

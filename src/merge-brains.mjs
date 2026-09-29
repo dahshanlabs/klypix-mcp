@@ -588,9 +588,39 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
     ...O.ids, ...T.ids, ...(B ? B.ids : []),
     ...Object.keys(O.graveyard), ...Object.keys(T.graveyard), ...(B ? Object.keys(B.graveyard) : []),
   ]);
+  // A side that lacks a card only because it holds the card's base value under
+  // the id the card moved from (a checkout of a file older than the move) has
+  // not deleted it: that copy IS the card, and routing takes it there. Absence
+  // alone made the tombstone; the side's own bin would say otherwise (a person
+  // deleting the card leaves an entry, and a file old enough to hold the
+  // earlier id holds no such entry). The chain is read in the base, where the
+  // side last saw the card.
+  const heldUnderEarlierId = new Set();
+  if (B) {
+    const baseLanding = (k, v) => {
+      const seen = new Set([k]);
+      let t = k;
+      for (let step = 0; step < ROUTE_STEPS; step++) {
+        const e = eOf(B, t);
+        if (!e) return null;
+        const kind = entryKind(e.meta);
+        if (kind === 'P') return null;
+        t = kind === 'R' ? e.meta.restoredAs : sameMeaning(v, e.json) ? null : revivedIdFor(t, e.meta, e.json);
+        if (!t || seen.has(t)) return null;
+        seen.add(t);
+        if (live(B, t)) return t;
+      }
+      return null;
+    };
+    for (const S of [O, T]) for (const k of S.ids) {
+      if (!live(S, k) || live(B, k)) continue;
+      const t = baseLanding(k, S.items[k]);
+      if (t && !live(S, t) && !eOf(S, t) && sameMeaning(S.items[k], B.items[t])) heldUnderEarlierId.add(t);
+    }
+  }
   for (const id of allIds) {
     const lo = live(O, id), lt = live(T, id);
-    if (del.has(id)) {
+    if (del.has(id) && !heldUnderEarlierId.has(id)) {
       let E = eAll(id);
       const purged = !!E && entryKind(E.meta) === 'P';
       // T3: today's delete-vs-edit — theirs edited the card after the delete

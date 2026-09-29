@@ -860,8 +860,20 @@ async function finishMerge(B, O, T, opt, run) {
 
   // ── Union connections / lines / strokes by id; drop dangling connections ──
   const byId = (arr) => { const m = new Map(); for (const x of arr) if (x && x.id) m.set(x.id, x); return m; };
-  const connMap = new Map([...byId(T.connections), ...byId(O.connections)]);
   const liveIds = new Set(order);
+  const tConn = byId(T.connections);
+  const connMap = new Map(tConn);
+  // Ours wins an edge both sides hold. In the option modes, not when ours
+  // still points at a card this merge retired while theirs already follows it
+  // to where it went (a revival re-points the edges of the side it came from,
+  // and a later merge meets the other side's old copy): taking ours, the
+  // dangling filter below dropped the edge, and a round later the other
+  // machine put it back. Union mode keeps 1.86.3's rule.
+  const endsLive = (c) => liveIds.has(c.fromId) && liveIds.has(c.toId);
+  for (const [id, c] of byId(O.connections)) {
+    const t = tConn.get(id);
+    connMap.set(id, opt.binMerge !== 'union' && t && !endsLive(c) && endsLive(t) ? t : c);
+  }
   // Collapse EXACT duplicate edges (same endpoints + relationship + label,
   // different ids). Connection deletes have no tombstone, so an arrange/de-dup
   // that dropped a redundant edge in-app used to see it resurrected from disk

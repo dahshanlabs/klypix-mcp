@@ -620,6 +620,7 @@ const Pe = (id, text, now = 2000) => ({ meta: contentFreeReceiptFor(id, Fe(id, t
 const Re = (id, text, as, now = 2000) => ({ meta: contentFreeReceiptFor(id, Fe(id, text), { kind: 'restored', restoredAs: as, now }), json: PURGED_BODY });
 const kRev = (text) => revivedIdFor('txt_k', Fe('txt_k', text).meta, cj('txt_k', text));   // where a delete of k(text) revives
 const pj = (text) => JSON.stringify({ type: 'text', content: text, width: 240, height: 80 });   // a card as brains store it: no id inside
+const EDGE_ARGS = [];   // the B-E case, for its S2-X mutation
 
 const withBin = async (buffer, bin) => {
   const { zip } = await parseKlypix(buffer);
@@ -964,6 +965,34 @@ const B_ROWS = [
   ]);
   offBreaks('B', observed, B_ROWS, '3way', 'receipts', ['B8 exact deleted bytes over a base that holds the deletion']);
 
+  // An edge both sides hold, after a sync elsewhere revived the card it
+  // starts from (the edit went to k′ and theirs' edge follows it) while ours
+  // still has k untouched, which the core tombstones: the edge follows the
+  // card. Taking ours, the dangling filter dropped it and the other machine
+  // put it back a round later (found by the KLYPIX simulator's soak).
+  {
+    const kR = kRev('v0');
+    const withEdge = async (buf, from) => {
+      const { zip, canvas } = await parseKlypix(buf);
+      canvas.connections = [{ id: 'con_e', fromId: from, toId: 'txt_anchor', relationship: 'relates_to' }];
+      zip.file('canvas.json', JSON.stringify(canvas));
+      return rezip(zip);
+    };
+    const eArgs = async () => ({
+      base: await withEdge(await side({ live: { txt_k: pj('v0') } }), 'txt_k'),
+      ours: await withEdge(await side({ live: { txt_k: pj('v0') } }), 'txt_k'),
+      theirs: await withEdge(await side({ live: { [kR]: pj('v1') }, bin: { txt_k: Fe(k0, 'v0') } }), kR),
+      deletedIds: ['txt_k'],
+    });
+    const edgeFrom = async (res) => (await parseKlypix(res.buffer)).canvas.connections?.find((c) => c.id === 'con_e')?.fromId ?? null;
+    for (const binMerge of ['receipts', '3way']) {
+      ok(await edgeFrom(await mergeBrains({ ...(await eArgs()), options: { binMerge } })) === kR,
+        `B-E (${binMerge}): an edge both sides hold follows the card to its revived id, over our copy that points at the retired id`);
+    }
+    ok(await edgeFrom(await mergeBrains(await eArgs())) === null, 'B-E (union): no options keep 1.86.3\'s rule (ours wins, and the dangling edge is dropped)');
+    EDGE_ARGS.push(eArgs);
+  }
+
   // Detail the table's strings cannot show.
   const b2 = await mergeBrains({ ...(await B_ROWS[1].args()), options: { binMerge: 'receipts' } });
   ok(b2.delta.revived.length === 1 && b2.delta.revived[0].id === k0 && b2.delta.revived[0].as === kRev('v0') &&
@@ -1290,6 +1319,12 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
       row: 'B14', options: { binMerge: 'receipts' },
     },
     {
+      rule: 'an edge follows the card that moved, over a copy pointing at the retired id',
+      find: "    connMap.set(id, opt.binMerge !== 'union' && t && !endsLive(c) && endsLive(t) ? t : c);",
+      replace: '    connMap.set(id, c);',
+      edge: true,
+    },
+    {
       rule: 'a stale copy of a card restored and edited since is superseded, not lost',
       find: '(liveAt(arrived.get(key), mv.v) || supersededAt(arrived.get(key), mv.v))',
       replace: 'liveAt(arrived.get(key), mv.v)',
@@ -1323,6 +1358,13 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
   for (const m of MUTATIONS) {
     const engine = await mutant(`m${MUTATIONS.indexOf(m)}`, m.find, m.replace);
     if (!engine) { ok(false, `X mutation target for "${m.rule}" is missing from src/merge-brains.mjs`); continue; }
+    if (m.edge) {
+      const from = async (eng) => (await parseKlypix((await eng.mergeBrains({ ...(await EDGE_ARGS[0]()), options: { binMerge: 'receipts' } })).buffer))
+        .canvas.connections?.find((c) => c.id === 'con_e')?.fromId ?? null;
+      const real = await from({ mergeBrains }), got = await from(engine);
+      ok(real !== null && got === null, `X "${m.rule}" off ⇒ case B-E loses the edge${got === null ? '' : ' — IT DID NOT'}`);
+      continue;
+    }
     const row = rowOf(m.row);
     const want = row.want[m.options.theirsTrust === 'unverified' ? 'unverified' : m.options.binMerge];
     const real = await runWith({ mergeBrains }, m.row, m.options, m.view);

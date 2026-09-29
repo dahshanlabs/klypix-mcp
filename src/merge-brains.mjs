@@ -117,7 +117,7 @@ export const MERGE_ENGINE_FEATURES = Object.freeze({
   purgeReceipts: true,               // purgeGraveyard leaves a content-free receipt
   revivedIds: true,                  // restores (restoreFromGraveyard) and rescued edits land under revivedIdFor
   restoreAsMerge: true,              // history restore as a merge (restoreSnapshotAsMerge, E-9)
-  arrangeReceipts: false,            // arrangeBrain buries what it collapses
+  arrangeReceipts: true,             // arrangeBrain buries what it collapses, survivor from content and ids (E-8)
   revivalMap: false,                 // brainDelta/revivalMap for the live watcher
   options: OPTION_VALUES,
 });

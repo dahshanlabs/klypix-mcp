@@ -1899,8 +1899,13 @@ export async function analyzeBrainLayout(buffer) {
     return layoutReportOf(parsed);
 }
 
+// The receipt an arrange leaves on each duplicate it collapses (E-8). Callers
+// that know better (the KLYPIX CLI, the app) pass their own `source`.
+const ARRANGE_DELETION = Object.freeze({ initiator: 'unknown', cause: 'brain-arrange', source: 'klypix-mcp', confidence: 'explicit' });
+const REVIVED_ID_RE = /__r_[0-9a-f]{12}$/;
+
 export async function arrangeBrain(buffer, opts = {}) {
-    const { dedupe = true, full = true } = opts;
+    const { dedupe = true, full = true, deletion = ARRANGE_DELETION, now = Date.now() } = opts;
     const first = await parseKlypix(buffer);
     if (!first.isV4 || !first.canvas.positions) throw new Error('arrange supports v4 .klypix only (open + re-save legacy files in KLYPIX first)');
     const beforeReport = layoutReportOf(first);
@@ -1909,9 +1914,15 @@ export async function arrangeBrain(buffer, opts = {}) {
     const beforeById = new Map(first.struct.cards.map(c => [c.id, c]));
     const beforeRetiredOf = new Map(first.struct.cards.filter(c => c.type === 'text').map(c => [normTextKey(c.text), retiredTextKey(c.text)]));
     const beforeTitles = new Set(first.struct.cards.filter(c => c.type === 'container').map(c => normTitleKey(c.title)).filter(Boolean));
+    // The bin as it was (dedupePass mutates `first` in place, zip included).
+    const beforeBin = new Map();
+    for (const e of (first.struct.graveyard || [])) {
+        const f = first.zip.file(`graveyard/${shard(e.id)}/${e.id}.json`);
+        beforeBin.set(e.id, { meta: JSON.stringify(e), body: f ? await f.async('string') : null });
+    }
     const stats = {
         before: { items: beforeReport.items, containers: beforeReport.containers, connections: beforeReport.connections, overlaps: beforeReport.overlaps.length, dupCardGroups: beforeReport.dupCards.length, dupContainerGroups: beforeReport.dupContainers.length },
-        mergedContainers: [], collapsedCards: [],
+        mergedContainers: [], collapsedCards: [], buried: [],
         connectionsRepointed: 0, duplicateConnectionsDropped: 0, selfLoopConnectionsDropped: 0, danglingConnectionsDropped: 0,
         moved: 0, containers: 0, after: null,
     };
@@ -1929,16 +1940,16 @@ export async function arrangeBrain(buffer, opts = {}) {
             if (!childrenByParent.has(c.parentId)) childrenByParent.set(c.parentId, []);
             childrenByParent.get(c.parentId).push(c.id);
         }
-        const degree = new Map();
-        for (const cn of (canvas.connections || [])) { degree.set(cn.fromId, (degree.get(cn.fromId) || 0) + 1); degree.set(cn.toId, (degree.get(cn.toId) || 0) + 1); }
-        const orderIndex = new Map((canvas.order || []).map((id, i) => [id, i]));
-        // Survivor: most children (containers) → most connected → oldest
-        // createdAt (unknown sorts last) → earliest in the file order.
-        const pickSurvivor = (ids, extraScore = () => 0) => [...ids].sort((a, b) =>
-            (extraScore(b) - extraScore(a))
-            || ((degree.get(b) || 0) - (degree.get(a) || 0))
-            || ((byId.get(a)?.createdAt || Infinity) - (byId.get(b)?.createdAt || Infinity))
-            || ((orderIndex.get(a) ?? Infinity) - (orderIndex.get(b) ?? Infinity)))[0];
+        // Survivor (E-8): decided by content and ids ONLY — a score, then the
+        // oldest stored createdAt (unknown last), then the smallest id. Never
+        // by connections, child count or file order: those differ between
+        // machines, and two machines arranging the same duplicates must keep
+        // the same card, or each buries the other's survivor.
+        const createdOf = (id) => byId.get(id)?.createdAt || Infinity;
+        const pickSurvivor = (ids, score = () => 0) => [...ids].sort((a, b) =>
+            (score(b) - score(a))
+            || ((createdOf(a) - createdOf(b)) || 0)
+            || (a < b ? -1 : a > b ? 1 : 0))[0];
 
         const remap = new Map();   // loserId -> survivorId
         const removed = new Set();
@@ -1946,7 +1957,7 @@ export async function arrangeBrain(buffer, opts = {}) {
         // 1. Containers with the same normalized title → one survivor; the
         // losers' children re-parent onto it (tidy re-flows them below).
         for (const grp of report.dupContainers) {
-            const survivor = pickSurvivor(grp.ids, (id) => (childrenByParent.get(id) || []).length);
+            const survivor = pickSurvivor(grp.ids);
             for (const loser of grp.ids) {
                 if (loser === survivor) continue;
                 remap.set(loser, survivor); removed.add(loser);
@@ -1978,8 +1989,11 @@ export async function arrangeBrain(buffer, opts = {}) {
         for (const ids of cardGroups.values()) {
             if (ids.length < 2) continue;
             // Survivor: a copy carrying a retirement stamp (the lifecycle record)
-            // beats a bare one; the original id beats a twin id.
-            const survivor = pickSurvivor(ids, (id) => (hasRetirementStamp(byId.get(id)?.text) ? 2 : 0) + (isAgconfTwinId(id) ? 0 : 1));
+            // beats a bare one; the original id beats a twin id; a revived id
+            // beats the id it revived (that old id is already deleted on some
+            // copy, so keeping it would bury the card's own revival there).
+            const survivor = pickSurvivor(ids, (id) => (hasRetirementStamp(byId.get(id)?.text) ? 4 : 0)
+                + (isAgconfTwinId(id) ? 0 : 2) + (REVIVED_ID_RE.test(id) ? 1 : 0));
             for (const loser of ids) { if (loser !== survivor) { remap.set(loser, survivor); removed.add(loser); } }
             stats.collapsedCards.push({ kept: survivor, removed: ids.filter(id => id !== survivor), text: String(byId.get(survivor)?.text || '').split('\n')[0].slice(0, 60) });
         }
@@ -2030,6 +2044,40 @@ export async function arrangeBrain(buffer, opts = {}) {
             if (typeof li.verify === 'string' && li.verify.trim() && !si.verify) { si.verify = li.verify; changed = true; }
             if (changed) zip.file(`items/${shard(sid)}/${sid}.json`, JSON.stringify(si));
         }
+        // 3.6 Burial (E-8): each loser's own bytes go to Deleted cards with a
+        // receipt naming the card it merged into. A collapse that only removed
+        // the loser was invisible to every other copy of the brain — the next
+        // merge read the absence as nothing and carried the duplicate back.
+        // With a receipt it is a delete every copy honours, and recoverable.
+        const idxFile = zip.file('graveyard.json');
+        let binIndex = { version: 1, entries: {} };
+        if (idxFile) {
+            let parsedIdx;
+            try { parsedIdx = JSON.parse(await idxFile.async('string')); }
+            catch { throw new Error('arrange: the Deleted cards index (graveyard.json) is unreadable — aborted, original untouched'); }
+            binIndex = { ...(parsedIdx && typeof parsedIdx === 'object' ? parsedIdx : {}), version: 1, entries: { ...(parsedIdx?.entries || {}) } };
+        }
+        let buriedHere = 0;
+        for (const loser of removed) {
+            const f = zip.file(`items/${shard(loser)}/${loser}.json`);
+            if (!f) continue;
+            // A purge or restore receipt already names this id's fate; its
+            // bytes are the survivor's text anyway.
+            if (isContentFreeReceipt(binIndex.entries[loser])) continue;
+            const json = await f.async('string');
+            const sid = resolve(loser);
+            const parentOfSurvivor = canvas.positions[sid]?.parentId ?? null;
+            const entry = binEntryFor({
+                id: loser, json, pos: canvas.positions[loser] || null,
+                area: parentOfSurvivor ? (byId.get(parentOfSurvivor)?.title || null) : null,
+                receipt: deletion, extra: { mergedInto: sid }, now,
+            });
+            binIndex.entries[loser] = entry.meta;
+            zip.file(`graveyard/${shard(loser)}/${loser}.json`, entry.json);
+            stats.buried.push(loser);
+            buriedHere++;
+        }
+        if (buriedHere) zip.file('graveyard.json', JSON.stringify(binIndex));
         for (const id of removed) {
             delete canvas.positions[id];
             try { zip.remove(`items/${shard(id)}/${id}.json`); } catch { /* */ }
@@ -2096,6 +2144,25 @@ export async function arrangeBrain(buffer, opts = {}) {
     if (afterReport.connections < minConnections) throw new Error(`arrange lost ${minConnections - afterReport.connections} connection(s) beyond the logged duplicates/self-loops — aborted, original untouched`);
     if (dedupe && (afterReport.dupCards.length || afterReport.dupContainers.length || afterReport.dupConnections))
         throw new Error(`arrange left duplicates behind (${afterReport.dupContainers.length} container group(s), ${afterReport.dupCards.length} card group(s), ${afterReport.dupConnections} twin edge(s)) — aborted`);
+    // E-8: every collapsed id is in Deleted cards — with its bytes, or under a
+    // receipt that already named its fate — and every entry the bin held
+    // before (for a card not live then) is exactly as it was.
+    const afterBin = new Map((after.struct.graveyard || []).map((e) => [e.id, e]));
+    const collapsedIds = [...stats.mergedContainers.flatMap((m) => m.removed), ...removedIds];
+    const unburied = collapsedIds.filter((id) => {
+        const e = afterBin.get(id);
+        if (!e) return true;
+        return !isContentFreeReceipt(e) && !after.zip.file(`graveyard/${shard(id)}/${id}.json`);
+    });
+    if (unburied.length) throw new Error(`arrange removed ${unburied.length} card(s) without moving them to Deleted cards (e.g. ${unburied[0]}) — aborted, original untouched`);
+    for (const [id, was] of beforeBin) {
+        if (beforeById.has(id)) continue;
+        const a = afterBin.get(id);
+        const bodyAfter = after.zip.file(`graveyard/${shard(id)}/${id}.json`);
+        const same = a && JSON.stringify(a) === was.meta
+            && (was.body == null || (bodyAfter && (await bodyAfter.async('string')) === was.body));
+        if (!same) throw new Error(`arrange changed an existing Deleted cards entry (${id}) — aborted, original untouched`);
+    }
     stats.after = { items: afterReport.items, containers: afterReport.containers, connections: afterReport.connections, overlaps: 0 };
     return { buffer: work, stats };
 }

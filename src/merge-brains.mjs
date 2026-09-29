@@ -594,9 +594,12 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
   // alone made the tombstone; the side's own bin would say otherwise (a person
   // deleting the card leaves an entry, and a file old enough to hold the
   // earlier id holds no such entry). The chain is read in the base, where the
-  // side last saw the card.
+  // side last saw the card. EVERY side lacking the card must hold it so: a
+  // side that lacks it and holds nothing deleted it, and a stale copy on the
+  // other side (a cloud a stale upload rolled back) must not cancel that.
   const heldUnderEarlierId = new Set();
   if (B) {
+    const holds = new Map();         // card id -> Set of sides ('O' | 'T') holding it under an earlier id
     const baseLanding = (k, v) => {
       const seen = new Set([k]);
       let t = k;
@@ -612,10 +615,13 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
       }
       return null;
     };
-    for (const S of [O, T]) for (const k of S.ids) {
+    for (const [S, side] of [[O, 'O'], [T, 'T']]) for (const k of S.ids) {
       if (!live(S, k) || live(B, k)) continue;
       const t = baseLanding(k, S.items[k]);
-      if (t && !live(S, t) && !eOf(S, t) && sameMeaning(S.items[k], B.items[t])) heldUnderEarlierId.add(t);
+      if (t && !live(S, t) && !eOf(S, t) && sameMeaning(S.items[k], B.items[t])) (holds.get(t) || holds.set(t, new Set()).get(t)).add(side);
+    }
+    for (const [t, sides] of holds) {
+      if ((live(O, t) || sides.has('O')) && (live(T, t) || sides.has('T'))) heldUnderEarlierId.add(t);
     }
   }
   for (const id of allIds) {

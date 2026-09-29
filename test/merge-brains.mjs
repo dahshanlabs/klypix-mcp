@@ -982,6 +982,20 @@ const B_ROWS = [
     want: { union: 'live[k=v1] bin[k′:F(v2)] c[]', receipts: 'live[k′=v1] bin[k:F(v0) k′:F(v2)] c[]', '3way': 'live[k′=v1] bin[k:F(v0) k′:F(v2)] c[]' },
   },
   {
+    // Found by the simulator's soak (seed 50647), against the first version of
+    // B21's rule: ours deleted k′ (absence), and theirs is a cloud a stale
+    // upload rolled back to k's copy of the same text. The side that lacks k′
+    // and holds nothing deleted it; the stale copy must not cancel that.
+    name: 'B24 a delete stands when only the other side holds the card under its earlier id',
+    args: async () => ({
+      base: await side({ live: { [kRev('v0')]: pj('v1') }, bin: { txt_k: Fe(k0, 'v0') } }),
+      ours: await side({ bin: { txt_k: Fe(k0, 'v0') } }),
+      theirs: await side({ live: { txt_k: pj('v1') } }),
+      deletedIds: [kRev('v0')],
+    }),
+    want: { union: 'live[] bin[k:F(v0)] c[]', receipts: 'live[] bin[k:F(v0) k′:F(v1)] c[]', '3way': 'live[] bin[k:F(v0) k′:F(v1)] c[]' },
+  },
+  {
     // Nothing in any bin: the option modes are the familiar 3-way.
     name: 'B16 no bins anywhere: an ordinary content conflict',
     args: async () => ({ base: await side({ live: { txt_k: 'v0' } }), ours: await side({ live: { txt_k: 'v1' } }), theirs: await side({ live: { txt_k: 'v2' } }) }),
@@ -1373,6 +1387,12 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
       find: '    if (del.has(id) && !heldUnderEarlierId.has(id)) {',
       replace: '    if (del.has(id)) {',
       row: 'B21', options: { binMerge: 'receipts' },
+    },
+    {
+      rule: 'every side lacking the card must hold it under its earlier id',
+      find: "      if ((live(O, t) || sides.has('O')) && (live(T, t) || sides.has('T'))) heldUnderEarlierId.add(t);",
+      replace: '      heldUnderEarlierId.add(t);',
+      row: 'B24', options: { binMerge: 'receipts' },
     },
     {
       rule: 'a restore sends the copy after the card',

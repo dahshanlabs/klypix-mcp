@@ -145,5 +145,23 @@ const withRawItems = async (buffer, rawItems) => {
   __resetAuthorCache();
 }
 
+// The id is the item's PATH. A card moved to a new id keeps its original bytes
+// (a restore, a rescued edit, a conflict twin), so an `id` field some writer
+// left inside the JSON must not rename it back to the old id — every reader
+// of struct.cards would then see two cards with one id, or the wrong one.
+{
+  const z = await JSZip.loadAsync(base);
+  const canvas = JSON.parse(await z.file('canvas.json').async('string'));
+  const moved = 'txt_moved__r_0123456789ab';
+  z.file(`items/${shard(moved)}/${moved}.json`, JSON.stringify({ id: 'txt_old_id', type: 'text', content: 'bytes that came from txt_old_id' }));
+  canvas.order.push(moved);
+  canvas.positions[moved] = { x: 0, y: 0, parentId: null };
+  z.file('canvas.json', JSON.stringify(canvas));
+  const { struct } = await parseKlypix(await z.generateAsync({ type: 'nodebuffer' }));
+  const card = struct.cards.find((c) => String(c.text || '').includes('bytes that came from'));
+  ok(card?.id === moved && !struct.cards.some((c) => c.id === 'txt_old_id'),
+    'an id inside an item file never overrides the id its path gives it');
+}
+
 console.log(failures ? `\n[x] ${failures} assertion(s) failed` : '\n[ok] format-guard: all assertions passed');
 process.exit(failures ? 1 : 0);

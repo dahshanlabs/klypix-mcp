@@ -14,9 +14,10 @@ import { execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import {
   buildKlypixMap, appendToKlypix, parseKlypix, buildKlypix, shard,
-  binEntryFor, contentFreeReceiptFor, PURGED_BODY, entryKind,
+  binEntryFor, contentFreeReceiptFor, PURGED_BODY, entryKind, revivedIdFor, twinIdFor,
 } from '../src/klypix-format.mjs';
-import { normalizeMergeOptions } from '../src/merge-brains.mjs';
+import { normalizeMergeOptions, mergeBrains } from '../src/merge-brains.mjs';
+import { restoreFromGraveyard, purgeGraveyard } from '../src/brain-graveyard.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const MCP = path.join(ROOT, 'bin', 'klypix-mcp.mjs');
@@ -293,6 +294,175 @@ console.log('\n— E-10: the driver asks for the bin-aware rules —');
     } finally {
       fs.rmSync(MIX, { recursive: true, force: true });
     }
+  }
+}
+
+// ── Stage 2 through real git: restores, purges, reverts, clones ─────────────
+// The driver cases above run it the way git does; these let git decide when
+// to call it. Git calls a merge driver only when BOTH sides changed the file —
+// when one side is untouched it simply takes the other — so each revert below
+// has a later commit on the brain first, to put the driver in the path.
+console.log('\n— Stage 2 through real git —');
+{
+  const R2 = path.join(TMP, 'repo-stage2');
+  fs.mkdirSync(R2, { recursive: true });
+  const gitIn = (cwd) => (...a) => execFileSync('git', a, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  const g2 = gitIn(R2);
+  g2('init', '-q', '-b', 'main');
+  g2('config', 'user.email', 'stage2@test.local');
+  g2('config', 'user.name', 'stage 2 test');
+  const BR = path.join(R2, 'brain.klypix');
+  const put = (buf) => fs.writeFileSync(BR, buf);
+  const cur = () => fs.readFileSync(BR);
+  const commit = (g, msg) => { g('add', '-A'); g('commit', '-qm', msg); return g('rev-parse', 'HEAD'); };
+  const rezip = (zip) => zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+  const addCard = async (buf, id, text) => {
+    const { zip, canvas } = await parseKlypix(buf);
+    zip.file(`items/${shard(id)}/${id}.json`, JSON.stringify({ id, type: 'text', content: text, width: 240, height: 80 }));
+    canvas.order = [...new Set([...(canvas.order || []), id])];
+    canvas.positions = { ...(canvas.positions || {}), [id]: { x: 40, y: 40 + 100 * canvas.order.length, parentId: null } };
+    zip.file('canvas.json', JSON.stringify(canvas));
+    return rezip(zip);
+  };
+  const setCard = async (buf, id, text) => {
+    const { zip } = await parseKlypix(buf);
+    const p = `items/${shard(id)}/${id}.json`;
+    zip.file(p, JSON.stringify({ ...JSON.parse(await zip.file(p).async('string')), content: text }));
+    return rezip(zip);
+  };
+  const dropCard = async (buf, id) => {
+    const { zip, canvas } = await parseKlypix(buf);
+    zip.remove(`items/${shard(id)}/${id}.json`);
+    canvas.order = (canvas.order || []).filter((x) => x !== id);
+    delete canvas.positions?.[id];
+    zip.file('canvas.json', JSON.stringify(canvas));
+    return rezip(zip);
+  };
+  const deleteWithReceipt = async (buf, id) => (await mergeBrains({ base: buf, ours: buf, theirs: buf, deletedIds: [id] })).buffer;
+  const entryOf = async (buf, id) => {
+    const { zip } = await parseKlypix(buf);
+    const f = zip.file('graveyard.json');
+    const meta = f ? JSON.parse(await f.async('string')).entries[id] : undefined;
+    const body = zip.file(`graveyard/${shard(id)}/${id}.json`);
+    return meta ? { meta, json: body ? await body.async('string') : null } : null;
+  };
+  const liveIds = async (buf) => (await parseKlypix(buf)).struct.cards.map((c) => c.id);
+  const textAt = async (buf, id) => (await parseKlypix(buf)).struct.cards.find((c) => c.id === id)?.text ?? null;
+  const allText = async (buf) => {
+    const { zip } = await parseKlypix(buf);
+    let s = '';
+    for (const p of Object.keys(zip.files)) if (!zip.files[p].dir) s += await zip.file(p).async('string');
+    return s;
+  };
+
+  const inst = run(['git-driver', 'install'], { cwd: R2 });
+  put(await buildKlypix({ title: 'stage 2 in git', kind: 'brain', cards: [{ id: 'txt_anchor', text: 'anchor' }, { id: 'txt_k', text: 'kilo — deleted, then restored on a branch' }] }));
+  commit(g2, 'seed');
+  ok(inst.code === 0, 'fixture: the driver is registered for the Stage 2 repo');
+
+  // A restore made on one branch survives the merge with a branch that moved on.
+  {
+    put(await deleteWithReceipt(cur(), 'txt_k'));
+    commit(g2, 'delete k');
+    const E = await entryOf(cur(), 'txt_k');
+    const kR = revivedIdFor('txt_k', E.meta, E.json);
+    g2('checkout', '-qb', 'restore-k');
+    put((await restoreFromGraveyard(cur(), ['txt_k'])).buffer);
+    commit(g2, 'restore k');
+    g2('checkout', '-q', 'main');
+    put(await addCard(cur(), 'txt_main', 'main moved on'));
+    commit(g2, 'main card');
+    g2('merge', '-q', '--no-edit', 'restore-k');
+    const ids = await liveIds(cur());
+    const e = await entryOf(cur(), 'txt_k');
+    ok(ids.includes(kR) && ids.includes('txt_main') && !ids.includes('txt_k') && entryKind(e?.meta) === 'R' && e.meta.restoredAs === kR,
+      'a restore on one branch survives git merge: the card is back under its new id, the old id stays a restore receipt');
+  }
+
+  // A purge survives `git revert` of the purge commit.
+  {
+    const SECRET = 'sk-git-revert-secret-0123456789';
+    put(await addCard(cur(), 'txt_s', `a pasted credential ${SECRET}`));
+    commit(g2, 'secret card');
+    put(await deleteWithReceipt(cur(), 'txt_s'));
+    commit(g2, 'delete s');
+    put((await purgeGraveyard(cur(), { ids: ['txt_s'] })).buffer);
+    const purgeCommit = commit(g2, 'purge s');
+    put(await addCard(cur(), 'txt_after_purge', 'written after the purge'));
+    commit(g2, 'after the purge');
+    let reverted = true;
+    try { g2('revert', '--no-edit', purgeCommit); } catch { reverted = false; }
+    ok(reverted && entryKind((await entryOf(cur(), 'txt_s'))?.meta) === 'P' && !(await allText(cur())).includes(SECRET),
+      'git revert of a purge merges through the driver and stays purged: the secret is nowhere in the file');
+  }
+
+  // `git revert` of a delete brings the card back — under a revived id, so
+  // every copy that holds the delete agrees with it.
+  {
+    put(await addCard(cur(), 'txt_d', 'delta — deleted, then the delete reverted'));
+    commit(g2, 'd card');
+    put(await deleteWithReceipt(cur(), 'txt_d'));
+    const deleteCommit = commit(g2, 'delete d');
+    const E = await entryOf(cur(), 'txt_d');
+    put(await addCard(cur(), 'txt_after_delete', 'written after the delete'));
+    commit(g2, 'after the delete');
+    let reverted = true;
+    try { g2('revert', '--no-edit', deleteCommit); } catch { reverted = false; }
+    const dR = revivedIdFor('txt_d', E.meta, E.json);
+    const ids = await liveIds(cur());
+    ok(reverted && ids.includes(dR) && !ids.includes('txt_d') && /delta — deleted, then the delete reverted/.test(await textAt(cur(), dR) || ''),
+      'git revert of a delete brings the card back under its revived id, the old id still deleted');
+  }
+
+  // A card removed on both branches with no receipt is buried from the ancestor.
+  {
+    put(await addCard(cur(), 'txt_e', 'echo — removed on both branches, no receipt'));
+    commit(g2, 'e card');
+    const baseJson = await (await parseKlypix(cur())).zip.file(`items/${shard('txt_e')}/txt_e.json`).async('string');
+    g2('checkout', '-qb', 'drop-a');
+    put(await addCard(await dropCard(cur(), 'txt_e'), 'txt_only_a', 'only on a'));
+    commit(g2, 'drop e on a');
+    g2('checkout', '-q', 'main');
+    g2('checkout', '-qb', 'drop-b');
+    put(await addCard(await dropCard(cur(), 'txt_e'), 'txt_only_b', 'only on b'));
+    commit(g2, 'drop e on b');
+    g2('merge', '-q', '--no-edit', 'drop-a');
+    const e = await entryOf(cur(), 'txt_e');
+    const ids = await liveIds(cur());
+    ok(!ids.includes('txt_e') && ids.includes('txt_only_a') && ids.includes('txt_only_b')
+      && entryKind(e?.meta) === 'F' && e.json === baseJson && e.meta.deletion?.cause === 'git-committed-absence',
+    'a card removed on both branches without a receipt is buried from the ancestor, with a receipt saying so');
+    g2('checkout', '-q', 'main');
+  }
+
+  // The same conflict merged in two clones lands on the same twin id.
+  {
+    put(await addCard(cur(), 'txt_c', 'charlie — before both edits'));
+    commit(g2, 'c card');
+    g2('checkout', '-qb', 'edit-x');
+    put(await setCard(cur(), 'txt_c', 'charlie — edited on x'));
+    commit(g2, 'x');
+    g2('checkout', '-q', 'main');
+    g2('checkout', '-qb', 'edit-y');
+    put(await setCard(cur(), 'txt_c', 'charlie — edited on y'));
+    const yJson = await (await parseKlypix(cur())).zip.file(`items/${shard('txt_c')}/txt_c.json`).async('string');
+    commit(g2, 'y');
+    g2('checkout', '-q', 'main');
+    const R3 = path.join(TMP, 'repo-stage2-clone');
+    execFileSync('git', ['clone', '-q', R2, R3], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const g3 = gitIn(R3);
+    g3('config', 'user.email', 'clone@test.local');
+    g3('config', 'user.name', 'stage 2 clone');
+    run(['git-driver', 'install'], { cwd: R3 });
+    g2('checkout', '-q', 'edit-x');
+    g2('merge', '-q', '--no-edit', 'edit-y');
+    g3('checkout', '-q', '-b', 'edit-x', 'origin/edit-x');
+    g3('merge', '-q', '--no-edit', 'origin/edit-y');
+    const twinsIn = async (file) => (await liveIds(fs.readFileSync(file))).filter((id) => id.startsWith('txt_c__agconf_'));
+    const t2 = await twinsIn(BR);
+    const t3 = await twinsIn(path.join(R3, 'brain.klypix'));
+    ok(t2.length === 1 && JSON.stringify(t2) === JSON.stringify(t3) && t2[0] === twinIdFor('txt_c', yJson, 0),
+      'the same conflict merged in two clones lands on one twin id in both');
   }
 }
 

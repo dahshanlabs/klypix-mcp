@@ -794,7 +794,11 @@ export async function parseKlypix(buffer) {
         for (const id of order) {
             const raw = await readText(`items/${shard(id)}/${id}.json`);
             if (!raw) continue;
-            items[id] = { id, ...(canvas.positions[id] || {}), ...JSON.parse(raw) };
+            // The id is the PATH (FORMAT.md: item files carry no id). An `id`
+            // field some writer left inside the JSON must not rename the card:
+            // a card moved to a new id — a restore, a rescued edit, a conflict
+            // twin — keeps its original bytes, and would read as the old id.
+            items[id] = { ...(canvas.positions[id] || {}), ...JSON.parse(raw), id };
         }
     } else if (Array.isArray(canvas.items)) {
         for (const it of canvas.items) items[it.id] = it;

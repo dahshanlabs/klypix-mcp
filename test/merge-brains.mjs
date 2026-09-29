@@ -619,6 +619,7 @@ const Fe = (id, text, now = 1000) => binEntryFor({ id, json: cj(id, text), now }
 const Pe = (id, text, now = 2000) => ({ meta: contentFreeReceiptFor(id, Fe(id, text), { kind: 'purged', now }), json: PURGED_BODY });
 const Re = (id, text, as, now = 2000) => ({ meta: contentFreeReceiptFor(id, Fe(id, text), { kind: 'restored', restoredAs: as, now }), json: PURGED_BODY });
 const kRev = (text) => revivedIdFor('txt_k', Fe('txt_k', text).meta, cj('txt_k', text));   // where a delete of k(text) revives
+const pj = (text) => JSON.stringify({ type: 'text', content: text, width: 240, height: 80 });   // a card as brains store it: no id inside
 
 const withBin = async (buffer, bin) => {
   const { zip } = await parseKlypix(buffer);
@@ -903,6 +904,43 @@ const B_ROWS = [
       receipts: 'live[elsewhere=v0 elsewhere~=v1] bin[k:R] c[revived]',
       '3way': 'live[elsewhere=v0 elsewhere~=v1] bin[k:R] c[revived]',
     },
+  },
+  {
+    // Found by the simulator's soak: a machine on 1.3.171 put the old id back
+    // (its union dropped the restore receipt) after the card was restored and
+    // then edited. The stale copy routes to the restored card and matches the
+    // value it held at the base; the edit made on top of that value wins.
+    // (Plain card JSON: a real card holds no id of its own, so the stale copy
+    // and the restored card are the same value.)
+    name: 'B18 a stale copy of a card restored and edited since (theirs edited it)',
+    args: async () => ({
+      base: await side({ live: { [kRev('v0')]: pj('v0') }, bin: { txt_k: Re(k0, 'v0', kRev('v0')) } }),
+      ours: await side({ live: { [kRev('v0')]: pj('v0') }, bin: { txt_k: Re(k0, 'v0', kRev('v0')) } }),
+      theirs: await side({ live: { txt_k: pj('v0'), [kRev('v0')]: pj('v1') } }),
+    }),
+    want: { union: 'live[k′=v1] bin[k:R] c[]', receipts: 'live[k′=v1] bin[k:R] c[]', '3way': 'live[k′=v1] bin[k:R] c[]' },
+  },
+  {
+    name: 'B19 a stale copy of a card restored and edited since (ours edited it)',
+    args: async () => ({
+      base: await side({ live: { [kRev('v0')]: pj('v0') }, bin: { txt_k: Re(k0, 'v0', kRev('v0')) } }),
+      ours: await side({ live: { [kRev('v0')]: pj('v2') }, bin: { txt_k: Re(k0, 'v0', kRev('v0')) } }),
+      theirs: await side({ live: { txt_k: pj('v0'), [kRev('v0')]: pj('v0') } }),
+    }),
+    want: { union: 'live[k′=v2] bin[k:R] c[]', receipts: 'live[k′=v2] bin[k:R] c[]', '3way': 'live[k′=v2] bin[k:R] c[]' },
+  },
+  {
+    name: 'B20 a stale copy matching a twin of the restored card that was edited since',
+    args: async () => {
+      const kR = kRev('v0');
+      const x = twinIdFor(kR, pj('v0'));
+      return {
+        base: await side({ live: { [kR]: pj('v1'), [x]: pj('v0') }, bin: { txt_k: Re(k0, 'v0', kR) } }),
+        ours: await side({ live: { [kR]: pj('v1'), [x]: pj('v2') }, bin: { txt_k: Re(k0, 'v0', kR) } }),
+        theirs: await side({ live: { txt_k: pj('v0'), [kR]: pj('v1'), [x]: pj('v0') } }),
+      };
+    },
+    want: { union: 'live[k′=v1 k′~=v2] bin[k:R] c[]', receipts: 'live[k′=v1 k′~=v2] bin[k:R] c[]', '3way': 'live[k′=v1 k′~=v2] bin[k:R] c[]' },
   },
   {
     // Nothing in any bin: the option modes are the familiar 3-way.
@@ -1250,6 +1288,12 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
       find: '      if (lt && live(B, id) && !sameMeaning(T.items[id], B.items[id]) && !purged) {',
       replace: '      if (lt && live(B, id) && !sameMeaning(T.items[id], B.items[id])) {',
       row: 'B14', options: { binMerge: 'receipts' },
+    },
+    {
+      rule: 'a stale copy of a card restored and edited since is superseded, not lost',
+      find: '(liveAt(arrived.get(key), mv.v) || supersededAt(arrived.get(key), mv.v))',
+      replace: 'liveAt(arrived.get(key), mv.v)',
+      row: 'B18', options: { binMerge: 'receipts' },
     },
     {
       rule: 'a restore sends the copy after the card',

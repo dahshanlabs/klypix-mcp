@@ -807,9 +807,14 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
       (sameMeaning(valueAt(as), v) || (resultTwins.get(as) || []).some((x) => sameMeaning(valueAt(x), v)));
     const arrived = new Map(delta.revived.map((r) => [`${r.side}\n${r.id}`, r.as]));
     const chainDrop = new Map(drops.filter((d) => d.chain).map((d) => [`${d.side}\n${d.from}`, d]));
+    // A value that matched its landing, where the landing held that very value
+    // at the base and the merge keeps an edit made on top of it: a stale copy,
+    // superseded by someone who saw it (an old machine put the old id back
+    // after the card was restored and then edited).
+    const supersededAt = (as, v) => resultIds.has(as) && baseItem(as) != null && sameMeaning(baseItem(as), v);
     for (const mv of moves) {
       const key = `${mv.side}\n${mv.from}`;
-      if (arrived.has(key) && liveAt(arrived.get(key), mv.v)) continue;
+      if (arrived.has(key) && (liveAt(arrived.get(key), mv.v) || supersededAt(arrived.get(key), mv.v))) continue;
       const d = chainDrop.get(key);
       if (d && (d.kind === 'P' || binHolds(d.at, mv.v))) continue;
       throw new Error(`mergeBrains INVARIANT VIOLATED — a moved value of ${mv.from} is neither live nor in the bin`);

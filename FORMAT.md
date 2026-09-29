@@ -17,6 +17,9 @@ your.klypix                      (a ZIP archive)
 ├── canvas.json                  spatial layout: order, positions, connections, lines, strokes, view, settings
 ├── items/
 │   └── <shard>/<id>.json        one file per item (content only; geometry lives in canvas.json)
+├── graveyard.json               Deleted cards index — absent until the first delete (see below)
+├── graveyard/
+│   └── <shard>/<id>.json        a deleted card's item JSON, or a receipt placeholder
 └── assets/                      embedded binaries — any non-directory entry here is an asset
     ├── images/<shard>/<sha256>.<ext>
     ├── files/<shard>/<sha256>.bin
@@ -197,6 +200,50 @@ instead of an asset. New writers use `assetId` and leave `src` empty.
 `add_to_canvas` and `buildKlypix` write `manifest.json`, `canvas.json` and item
 files — cards and arrows. Embedding binaries is done by the KLYPIX app when you drop
 a file onto a canvas.
+
+## Deleted cards — `graveyard.json` + `graveyard/`
+
+A card deleted from a brain is moved, not destroyed. Its item file goes to
+`graveyard/<shard>/<id>.json` (same sharding as `items/`), and an entry for it goes
+into `graveyard.json`:
+
+```json
+{ "version": 1, "entries": {
+  "txt_hto5hb3r_0_0": {
+    "rid": "r_3f1c…",
+    "deletedAt": 1790676275950,
+    "deletedBy": "user",
+    "deletion": { "initiator": "user", "cause": "history-restore", "source": "klypix-mcp", "confidence": "explicit" },
+    "area": "Work", "parentId": "ctn_…", "pos": { "x": 96, "y": 140, "w": 280, "h": 47 },
+    "preview": "first words of the card…"
+  } } }
+```
+
+Nothing under `graveyard/` is reachable from `canvas.json`'s `order`, so a deleted card
+never renders and is never searched or counted, and a card is never live and in the
+bin at once. Writers add fields to an entry, never rename them; `deletedBy` is the flat
+copy of `deletion.initiator` kept for older readers.
+
+An entry is one of three kinds:
+
+| Kind | How to recognise it | Body file |
+|---|---|---|
+| deleted card | no `purged` | the card's item JSON, verbatim — restorable |
+| permanently deleted | `purged: true`, no `restoredAs` | the placeholder `{"type":"text","content":"","purged":true}` |
+| restored | `purged: true` and `restoredAs: "<id>"` | the same placeholder; the card lives on at `restoredAs` |
+
+The two receipts carry no content, and they are the reason **the bin must travel with
+the file**. A tool that rewrites a `.klypix` has to carry `graveyard.json` and
+`graveyard/` through, or merge them. Dropping them makes the next merge with an older
+copy of the brain read the deletion as "never happened" and bring the card back — a
+permanently deleted one included.
+
+Two id rules follow from the same idea. A card brought back, from the bin or from a
+restore point, should get a new id derived from its deletion (`<id>__r_<12 hex>`, as
+this package's restores do), never the id it was deleted with: other copies still hold
+that deletion and would delete it again. And a card that Arrange collapses as a
+duplicate is buried like any other deletion, with `mergedInto` naming the card that
+absorbed it.
 
 ## Connections, links, tags
 

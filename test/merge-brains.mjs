@@ -1,6 +1,7 @@
-// Concurrency-critical merge regressions found by the 2026-08-01 audit, and the
+// Concurrency-critical merge regressions found by the 2026-08-01 audit, the
 // Stage-2 all-callers rules (deterministic twins E-1, receipt identities E-2,
-// the option plumbing). Pure buffers only, except the git-driver agreement
+// the option plumbing), and one truth table per option-mode option with its
+// mutation checks (S2-B, S2-N, S2-M, S2-V, S2-A, S2-X). Pure buffers only, except the git-driver agreement
 // check, which runs the real driver on files under os.tmpdir().
 //
 // Every Stage-2 rule is also run through a FROZEN copy of the 1.86.3 engine
@@ -10,7 +11,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { execFileSync } from 'child_process';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 import { buildKlypix, parseKlypix, shard, itemSignature, isAgconfTwinId } from '../src/klypix-format.mjs';
 import {
   mergeBrains, normalizeMergeOptions, MERGE_ENGINE_FEATURES, deletedByAbsence,
@@ -223,13 +224,15 @@ console.log('\n— S2-O options —');
     if (await rejects(mergeBrains({ base, ours: base, theirs: base, options: { binMerge: mode } }))) advertisedRun = false;
   }
   ok(advertisedRun, 'O9: every advertised binMerge value runs');
-  let unadvertisedRefused = true;
-  for (const mode of ['receipts', '3way'].filter((m) => !F.options.binMerge.includes(m))) {
-    const e = await rejects(mergeBrains({ base, ours: base, theirs: base, options: { binMerge: mode } }));
-    if (!e || !/not available/.test(e.message)) unadvertisedRefused = false;
+  ok(F.api === 2 && ['union', 'receipts', '3way'].every((m) => F.options.binMerge.includes(m)) && F.options.theirsTrust.includes('unverified'),
+    'O10: api 2 advertises every option value (the option modes run)');
+  let allRun = true;
+  for (const [key, values] of Object.entries(F.options)) for (const value of values) {
+    const o = key === 'binMerge' || value === normalizeMergeOptions({})[key] ? { [key]: value } : { binMerge: 'receipts', [key]: value };
+    if (await rejects(mergeBrains({ base, ours: base, theirs: base, options: o }))) allRun = false;
   }
-  ok(unadvertisedRefused, 'O10: an option mode this build does not advertise is refused, never run as union');
-  ok((F.api >= 2) === F.options.binMerge.includes('receipts'), 'O11: api 2 is claimed exactly when option modes run');
+  ok(allRun, 'O11: every advertised value of every option runs');
+  ok(F.revivedIds === false && F.restoreAsMerge === false, 'O12: tools not built yet (revived restores, history as a merge) are not advertised');
 }
 
 // S2-I: identity. Truth tables for the entry kinds and identities every copy
@@ -569,6 +572,713 @@ console.log('\n— S2-U no options ⇒ unchanged (differential against 1.86.3) �
   }
   ok(agree === SEEDS, `U1: ${agree}/${SEEDS} seeded app-save/sync shapes merge identically to 1.86.3 modulo twin ids and rid${disagreements.length ? ` (differ: seeds ${disagreements.slice(0, 8).join(', ')})` : ''}`);
   ok(withTwins >= 5 && withRemovals >= 5 && withBins >= 5, `U2: the differential exercised twins (${withTwins}), removals (${withRemovals}) and carried bins (${withBins})`);
+}
+
+// ══════════════════════ Stage 2 option modes ════════════════════════════════
+// One truth table per option. Each row is a small three-way scene (base, ours,
+// theirs, tombstones) and the expected outcome under EVERY value of that
+// option, written as `live[…] bin[…] c[…]`:
+//   live  the cards in the result (the fixed anchor card left out), id=content
+//   bin   the result's recycle bin, id:KIND (F shows the buried content)
+//   c     the conflict kinds reported
+// Ids are shortened for reading: `txt_` is dropped, a revived id reads k′
+// and a twin reads k~. The OFF column of every table is the old behaviour,
+// so each table is its own mutation check: after the rows run, every rule is
+// asserted to change at least one named row (flip the option ⇒ that row fails).
+// Rules inside the option modes that are not options of their own are then
+// switched off one at a time in a mutated copy of the engine (S2-X).
+
+const TEMPLATE = await buildKlypix({ title: 'modes', cards: [{ id: 'txt_anchor', text: 'anchor' }] });
+const cj = (id, text, extra = {}) => JSON.stringify({ id, type: 'text', content: text, width: 240, height: 80, ...extra });
+const Fe = (id, text, now = 1000) => binEntryFor({ id, json: cj(id, text), now });
+const Pe = (id, text, now = 2000) => ({ meta: contentFreeReceiptFor(id, Fe(id, text), { kind: 'purged', now }), json: PURGED_BODY });
+const Re = (id, text, as, now = 2000) => ({ meta: contentFreeReceiptFor(id, Fe(id, text), { kind: 'restored', restoredAs: as, now }), json: PURGED_BODY });
+const kRev = (text) => revivedIdFor('txt_k', Fe('txt_k', text).meta, cj('txt_k', text));   // where a delete of k(text) revives
+
+const withBin = async (buffer, bin) => {
+  const { zip } = await parseKlypix(buffer);
+  const f = zip.file('graveyard.json');
+  const entries = f ? JSON.parse(await f.async('string')).entries : {};
+  for (const [id, e] of Object.entries(bin)) {
+    entries[id] = e.meta;
+    zip.file(`graveyard/${shard(id)}/${id}.json`, e.json);
+  }
+  zip.file('graveyard.json', JSON.stringify({ version: 1, entries }));
+  return rezip(zip);
+};
+const withManifest = async (buffer, patch) => {
+  const { zip, manifest } = await parseKlypix(buffer);
+  zip.file('manifest.json', JSON.stringify({ ...manifest, ...patch }));
+  return rezip(zip);
+};
+const withPos = async (buffer, id, patch) => {
+  const { zip, canvas } = await parseKlypix(buffer);
+  canvas.positions[id] = { ...canvas.positions[id], ...patch };
+  zip.file('canvas.json', JSON.stringify(canvas));
+  return rezip(zip);
+};
+// A side: live cards as { id: text | json }, a bin as { id: entry }.
+const side = async ({ live = {}, bin = {}, manifest = null } = {}) => {
+  let b = TEMPLATE;
+  for (const [id, v] of Object.entries(live)) b = await putItem(b, id, v.startsWith('{') ? v : cj(id, v));
+  if (Object.keys(bin).length) b = await withBin(b, bin);
+  if (manifest) b = await withManifest(b, manifest);
+  return b;
+};
+
+const short = (id) => id.replace(/^txt_/, '').replace(/__r_[0-9a-f]{12}/g, '′').replace(/__agconf_[0-9a-z]+/gi, '~');
+const summarize = async (res, { withX = false } = {}) => {
+  const { zip, canvas } = await parseKlypix(res.buffer);
+  const liveParts = [];
+  for (const id of canvas.order || []) {
+    if (id === 'txt_anchor') continue;
+    const item = JSON.parse(await zip.file(`items/${shard(id)}/${id}.json`).async('string'));
+    liveParts.push(`${short(id)}=${item.content}${withX ? `@${canvas.positions[id]?.x}` : ''}`);
+  }
+  const binParts = [];
+  for (const [id, meta] of Object.entries(await binIndex(res.buffer))) {
+    const kind = entryKind(meta);
+    const body = kind === 'F' ? JSON.parse(await zip.file(`graveyard/${shard(id)}/${id}.json`).async('string')).content : '';
+    binParts.push(`${short(id)}:${kind}${kind === 'F' ? `(${body})` : ''}`);
+  }
+  const kinds = [...new Set(res.conflicts.map((c) => c.kind))].sort();
+  return `live[${liveParts.sort().join(' ')}] bin[${binParts.sort().join(' ')}] c[${kinds.join(' ')}]`;
+};
+
+// Run one table: every row under every value of `option`. Returns
+// observed[row][value] so the mutation check can compare columns.
+const runTable = async (tag, option, values, rows, fixed = {}, view = {}) => {
+  const observed = {};
+  for (const row of rows) {
+    const args = await row.args();
+    observed[row.name] = {};
+    for (const value of values) {
+      const options = option === 'binMerge' && value === 'union' ? {} : { ...fixed, [option]: value };
+      let got;
+      try { got = await summarize(await mergeBrains({ ...args, options }), view); } catch (e) { got = `threw ${e.message}`; }
+      observed[row.name][value] = got;
+      const want = row.want[value];
+      ok(got === want, `${tag} ${row.name} [${option}=${JSON.stringify(value)}] → ${want}${got === want ? '' : `   (got ${got})`}`);
+    }
+  }
+  return observed;
+};
+// The table's own mutation check: running the OFF value must break the
+// expectation of each row that proves the rule.
+const offBreaks = (tag, observed, rows, on, off, provers) => {
+  for (const name of provers) {
+    const row = rows.find((r) => r.name === name);
+    ok(row && observed[name][off] !== row.want[on],
+      `${tag} mutation: ${JSON.stringify(off)} instead of ${JSON.stringify(on)} fails row ${name}`);
+  }
+};
+
+const k0 = 'txt_k';
+
+// ── S2-B binMerge (E-3, E-4, E-11, purge and restore receipts) ──────────────
+// union is 1.86.3's bin (newest deletedAt wins, the bin never looks at the
+// base); receipts and 3way are the fates → routing → content merge. The two
+// option values differ in exactly one cell: B8, a committed revert.
+console.log('\n— S2-B binMerge truth table —');
+const B_ROWS = [
+  {
+    name: 'B1 stale copy of exactly the deleted bytes',
+    args: async () => ({ base: await side({ live: { txt_k: 'v0' } }), ours: await side({ live: { txt_k: 'v0' } }), theirs: await side({ bin: { txt_k: Fe(k0, 'v0') } }) }),
+    want: {
+      union: 'live[k=v0] bin[] c[]',
+      receipts: 'live[] bin[k:F(v0)] c[]',
+      '3way': 'live[] bin[k:F(v0)] c[]',
+    },
+  },
+  {
+    name: 'B2 edit made after the delete (base had the card)',
+    args: async () => ({ base: await side({ live: { txt_k: 'v0' } }), ours: await side({ live: { txt_k: 'v1' } }), theirs: await side({ bin: { txt_k: Fe(k0, 'v0') } }) }),
+    want: {
+      union: 'live[k=v1] bin[] c[]',
+      receipts: 'live[k′=v1] bin[k:F(v0)] c[]',
+      '3way': 'live[k′=v1] bin[k:F(v0)] c[]',
+    },
+  },
+  {
+    // R5: the base lags (here: no base at all). 1.86.3 cannot prove the edit
+    // and lets the delete win — the edit is lost.
+    name: 'B3 edit-beats-delete without a base',
+    args: async () => ({ base: null, ours: await side({ bin: { txt_k: Fe(k0, 'v0') } }), theirs: await side({ live: { txt_k: 'v1' } }) }),
+    want: {
+      union: 'live[] bin[k:F(v0)] c[]',
+      receipts: 'live[k′=v1] bin[k:F(v0)] c[]',
+      '3way': 'live[k′=v1] bin[k:F(v0)] c[]',
+    },
+  },
+  {
+    name: 'B4 purge vs an edited copy (P-a)',
+    args: async () => ({ base: await side({ live: { txt_k: 'v0' } }), ours: await side({ bin: { txt_k: Pe(k0, 'v0') } }), theirs: await side({ live: { txt_k: 'v1 + secret' } }) }),
+    want: {
+      union: 'live[k=v1 + secret] bin[] c[delete-vs-edit]',
+      receipts: 'live[] bin[k:P] c[purge-vs-edit]',
+      '3way': 'live[] bin[k:P] c[purge-vs-edit]',
+    },
+  },
+  {
+    // An older machine deleted the same card later (or has a fast clock):
+    // newest-deletedAt would bring the purged bytes back.
+    name: 'B5 purge beats a later-stamped full entry',
+    args: async () => ({ base: await side({ live: { txt_k: 'v0' } }), ours: await side({ bin: { txt_k: Pe(k0, 'v0', 2000) } }), theirs: await side({ bin: { txt_k: Fe(k0, 'v0', 9e12) } }) }),
+    want: {
+      union: 'live[] bin[k:F(v0)] c[]',
+      receipts: 'live[] bin[k:P] c[]',
+      '3way': 'live[] bin[k:P] c[]',
+    },
+  },
+  {
+    name: 'B6 a restore reaches a machine that still holds the entry',
+    args: async () => ({
+      base: await side({ bin: { txt_k: Fe(k0, 'v0') } }),
+      ours: await side({ bin: { txt_k: Fe(k0, 'v0') } }),
+      theirs: await side({ live: { [kRev('v0')]: cj(kRev('v0'), 'v0') }, bin: { txt_k: Re(k0, 'v0', kRev('v0')) } }),
+    }),
+    want: {
+      union: 'live[k′=v0] bin[k:R] c[]',
+      receipts: 'live[k′=v0] bin[k:R] c[]',
+      '3way': 'live[k′=v0] bin[k:R] c[]',
+    },
+  },
+  {
+    // R1: the other machine edited k before the restore arrived. 1.86.3 keeps
+    // both lineages live and drops the receipt; the copy must follow the card.
+    name: 'B7 a restore meets an edited copy of the old id',
+    args: async () => ({
+      base: await side({ live: { txt_k: 'v0' } }),
+      ours: await side({ live: { txt_k: 'v1' } }),
+      theirs: await side({ live: { [kRev('v0')]: cj(kRev('v0'), 'v0') }, bin: { txt_k: Re(k0, 'v0', kRev('v0')) } }),
+    }),
+    want: {
+      union: 'live[k=v1 k′=v0] bin[] c[]',
+      receipts: 'live[k′=v0 k′~=v1] bin[k:R] c[revived]',
+      '3way': 'live[k′=v0 k′~=v1] bin[k:R] c[revived]',
+    },
+  },
+  {
+    // The one cell where the transports differ: in git, bringing back the
+    // exact deleted bytes over a base that holds that deletion is a committed
+    // revert; on path L it is a stale copy.
+    name: 'B8 exact deleted bytes over a base that holds the deletion',
+    args: async () => ({ base: await side({ bin: { txt_k: Fe(k0, 'v0') } }), ours: await side({ bin: { txt_k: Fe(k0, 'v0') } }), theirs: await side({ live: { txt_k: 'v0' } }) }),
+    want: {
+      union: 'live[] bin[k:F(v0)] c[]',
+      receipts: 'live[] bin[k:F(v0)] c[]',
+      '3way': 'live[k′=v0] bin[k:F(v0)] c[]',
+    },
+  },
+  {
+    // R3: both sides are checkouts from before the entry existed. No receipt,
+    // no purge: the base's entry comes back.
+    name: 'B9 an entry both sides merely lack returns from the base',
+    args: async () => ({ base: await side({ bin: { txt_k: Fe(k0, 'v0') } }), ours: await side(), theirs: await side() }),
+    want: {
+      union: 'live[] bin[] c[]',
+      receipts: 'live[] bin[k:F(v0)] c[]',
+      '3way': 'live[] bin[k:F(v0)] c[]',
+    },
+  },
+  {
+    name: 'B10 tombstone for a card gone from both sides (E-11)',
+    args: async () => ({ base: await side({ live: { txt_k: 'v0' } }), ours: await side(), theirs: await side(), deletedIds: [k0] }),
+    want: {
+      union: 'live[] bin[] c[]',
+      receipts: 'live[] bin[k:F(v0)] c[]',
+      '3way': 'live[] bin[k:F(v0)] c[]',
+    },
+  },
+  {
+    // q2b: ours' edit of k routes to the restored k′, which this same merge
+    // deletes. Fates come first, so the edit moves on to a fresh revival
+    // instead of being buried with k′'s old bytes.
+    name: 'B11 a value routed onto a card this merge deletes moves on',
+    args: async () => {
+      const k1 = kRev('v0');
+      return {
+        base: await side({ live: { [k1]: cj(k1, 'v0') }, bin: { txt_k: Re(k0, 'v0', k1) } }),
+        ours: await side({ live: { txt_k: 'v1' } }),
+        theirs: await side({ bin: { txt_k: Re(k0, 'v0', k1), [k1]: binEntryFor({ id: k1, json: cj(k1, 'v0'), now: 3000 }) } }),
+        deletedIds: [k1],
+      };
+    },
+    want: {
+      union: 'live[k=v1] bin[k′:F(v0)] c[]',
+      receipts: 'live[k′=v1] bin[k:R k′:F(v0)] c[]',
+      '3way': 'live[k′=v1] bin[k:R k′:F(v0)] c[]',
+    },
+  },
+  {
+    // q1: someone edited the revived card; a second rescued edit arrives. A
+    // moved value never overwrites a live card — it becomes its twin.
+    name: 'B12 a rescued edit never overwrites the live revived card',
+    args: async () => ({
+      base: await side({ live: { txt_k: 'v0' } }),
+      ours: await side({ live: { txt_k: 'v1' } }),
+      theirs: await side({ live: { [kRev('v0')]: cj(kRev('v0'), 'v2 sibling edit') }, bin: { txt_k: Fe(k0, 'v0') } }),
+    }),
+    want: {
+      union: 'live[k=v1 k′=v2 sibling edit] bin[] c[]',
+      receipts: 'live[k′=v2 sibling edit k′~=v1] bin[k:F(v0)] c[revived]',
+      '3way': 'live[k′=v2 sibling edit k′~=v1] bin[k:F(v0)] c[revived]',
+    },
+  },
+  {
+    // Both sides hold k live over a base that deleted it: each copy is judged
+    // on its own. Receipts: the stale copy drops, the edit revives. 3way: the
+    // stale copy is a revert too, so both come back (one card + one twin).
+    name: 'B13 both sides live: a stale copy and an edit',
+    args: async () => ({ base: await side({ bin: { txt_k: Fe(k0, 'v0') } }), ours: await side({ live: { txt_k: 'v0' } }), theirs: await side({ live: { txt_k: 'v1' } }) }),
+    want: {
+      union: 'live[k=v1] bin[] c[]',
+      receipts: 'live[k′=v1] bin[k:F(v0)] c[]',
+      '3way': 'live[k′=v0 k′~=v1] bin[k:F(v0)] c[revived]',
+    },
+  },
+  {
+    name: 'B14 a purge outranks the delete-vs-edit rescue',
+    args: async () => ({ base: await side({ live: { txt_k: 'v0' } }), ours: await side({ bin: { txt_k: Pe(k0, 'v0') } }), theirs: await side({ live: { txt_k: 'v1' } }), deletedIds: [k0] }),
+    want: {
+      union: 'live[k=v1] bin[] c[delete-vs-edit]',
+      receipts: 'live[] bin[k:P] c[purge-vs-edit]',
+      '3way': 'live[] bin[k:P] c[purge-vs-edit]',
+    },
+  },
+  {
+    // A person resolved this conflict by deleting its twin; re-merging the old
+    // conflict must not bring the twin back (option modes only).
+    name: 'B15 a twin deleted since the base is not re-minted',
+    args: async () => {
+      const x = twinIdFor(k0, cj(k0, 'v2'));
+      return {
+        base: await side({ live: { txt_k: 'v0' } }),
+        ours: await side({ live: { txt_k: 'v1' }, bin: { [x]: binEntryFor({ id: x, json: cj(k0, 'v2') }) } }),
+        theirs: await side({ live: { txt_k: 'v2' } }),
+      };
+    },
+    want: {
+      union: 'live[k=v1 k~=v2] bin[k~:F(v2)] c[content]',
+      receipts: 'live[k=v1] bin[k~:F(v2)] c[content]',
+      '3way': 'live[k=v1] bin[k~:F(v2)] c[content]',
+    },
+  },
+  {
+    // A restore does not always land at revivedIdFor(k): it walks past cards
+    // deleted since and lands beside newer text. Only restoredAs finds it.
+    name: 'B17 a copy follows a restore that landed elsewhere',
+    args: async () => ({
+      base: await side({ live: { txt_k: 'v0' } }),
+      ours: await side({ live: { txt_k: 'v1' } }),
+      theirs: await side({ live: { txt_elsewhere: 'v0' }, bin: { txt_k: Re(k0, 'v0', 'txt_elsewhere') } }),
+    }),
+    want: {
+      union: 'live[elsewhere=v0 k=v1] bin[] c[]',
+      receipts: 'live[elsewhere=v0 elsewhere~=v1] bin[k:R] c[revived]',
+      '3way': 'live[elsewhere=v0 elsewhere~=v1] bin[k:R] c[revived]',
+    },
+  },
+  {
+    // Nothing in any bin: the option modes are the familiar 3-way.
+    name: 'B16 no bins anywhere: an ordinary content conflict',
+    args: async () => ({ base: await side({ live: { txt_k: 'v0' } }), ours: await side({ live: { txt_k: 'v1' } }), theirs: await side({ live: { txt_k: 'v2' } }) }),
+    want: {
+      union: 'live[k=v1 k~=v2] bin[] c[content]',
+      receipts: 'live[k=v1 k~=v2] bin[] c[content]',
+      '3way': 'live[k=v1 k~=v2] bin[] c[content]',
+    },
+  },
+];
+{
+  const observed = await runTable('B', 'binMerge', ['union', 'receipts', '3way'], B_ROWS);
+  offBreaks('B', observed, B_ROWS, 'receipts', 'union', [
+    'B1 stale copy of exactly the deleted bytes', 'B2 edit made after the delete (base had the card)',
+    'B3 edit-beats-delete without a base', 'B4 purge vs an edited copy (P-a)', 'B5 purge beats a later-stamped full entry',
+    'B7 a restore meets an edited copy of the old id', 'B9 an entry both sides merely lack returns from the base',
+    'B10 tombstone for a card gone from both sides (E-11)', 'B14 a purge outranks the delete-vs-edit rescue',
+    'B17 a copy follows a restore that landed elsewhere',
+  ]);
+  offBreaks('B', observed, B_ROWS, '3way', 'receipts', ['B8 exact deleted bytes over a base that holds the deletion']);
+
+  // Detail the table's strings cannot show.
+  const b2 = await mergeBrains({ ...(await B_ROWS[1].args()), options: { binMerge: 'receipts' } });
+  ok(b2.delta.revived.length === 1 && b2.delta.revived[0].id === k0 && b2.delta.revived[0].as === kRev('v0') &&
+    b2.delta.revived[0].via === 'edit' && b2.delta.revived[0].side === 'ours', 'B2: the rescue lands at revivedIdFor(k, its entry) and is reported in delta.revived');
+  ok(b2.delta.removed.includes(k0) && !b2.delta.added.length && b2.stats.revived === 1, 'B2: k counts as removed, the landing is not an add');
+  const b4 = await mergeBrains({ ...(await B_ROWS[3].args()), options: { binMerge: 'receipts' } });
+  ok(b4.stats.purgedCopies === 1 && b4.conflicts.some((c) => c.kind === 'purge-vs-edit' && c.id === k0 && c.side === 'theirs'), 'B4: the dropped copy is counted and named');
+  const b4zip = (await parseKlypix(b4.buffer)).zip;
+  let leaked = false;
+  for (const p of Object.keys(b4zip.files)) if (!b4zip.files[p].dir && (await b4zip.file(p).async('string')).includes('secret')) leaked = true;
+  ok(!leaked, 'B4: nothing of the purged copy is anywhere in the result');
+  const b4stale = await mergeBrains({ base: await side({ live: { txt_k: 'v0' } }), ours: await side({ bin: { txt_k: Pe(k0, 'v0') } }), theirs: await side({ live: { txt_k: 'v0' } }), options: { binMerge: 'receipts' } });
+  ok(!b4stale.conflicts.length && b4stale.stats.purgedCopies === 1, 'B4: a purge dropping an UNCHANGED copy is the purge working, not a conflict');
+  const b11 = await mergeBrains({ ...(await B_ROWS[10].args()), options: { binMerge: 'receipts' } });
+  const b11as = b11.delta.revived.find((r) => r.id === k0)?.as;
+  ok(b11as && b11as !== kRev('v0') && (await liveIds(b11.buffer)).includes(b11as), 'B11: the edit lands at a NEW revival, not on the deleted k′');
+  const b8 = await mergeBrains({ ...(await B_ROWS[7].args()), options: { binMerge: '3way' } });
+  ok(b8.delta.revived[0]?.via === 'resurrection', 'B8: the 3way revival is reported as a resurrection');
+  const b15 = await mergeBrains({ ...(await B_ROWS[14].args()), options: { binMerge: 'receipts' } });
+  ok(b15.conflicts.some((c) => c.suppressed === 'deleted-twin'), 'B15: the suppressed twin is reported, not silent');
+
+  // Determinism and idempotence: the same inputs give the same bytes-level
+  // result, and merging the result again changes nothing.
+  let stable = true, quiet = true;
+  for (const row of B_ROWS) {
+    const args = await row.args();
+    for (const binMerge of ['receipts', '3way']) {
+      const r1 = await mergeBrains({ ...args, options: { binMerge } });
+      const r2 = await mergeBrains({ ...args, options: { binMerge } });
+      if (await summarize(r1) !== await summarize(r2) || JSON.stringify(await liveIds(r1.buffer)) !== JSON.stringify(await liveIds(r2.buffer))) stable = false;
+      const again = await mergeBrains({ base: r1.buffer, ours: r1.buffer, theirs: r1.buffer, options: { binMerge } });
+      if ((await summarize(again)).replace(/ c\[.*\]$/, '') !== (await summarize(r1)).replace(/ c\[.*\]$/, '')) quiet = false;
+    }
+  }
+  ok(stable, 'B: every row gives the same ids on every run (no clock, no randomness)');
+  ok(quiet, 'B: re-merging any result with itself is a no-op');
+
+  // The grouping of merges cannot change the bin (q3): three replicas each
+  // hold a different entry for k.
+  const X = await side({ bin: { txt_k: Fe(k0, 'va') } });
+  const Y = await side({ bin: { txt_k: Re(k0, 'va', kRev('va')) }, live: { [kRev('va')]: cj(kRev('va'), 'va') } });
+  const Z = await side({ bin: { txt_k: Pe(k0, 'va') } });
+  const m = async (o, t) => (await mergeBrains({ base: null, ours: o, theirs: t, options: { binMerge: 'receipts' } })).buffer;
+  const left = await m(await m(X, Y), Z), right = await m(X, await m(Y, Z)), swapped = await m(Z, await m(Y, X));
+  const binOf = async (b) => JSON.stringify(Object.entries(await binIndex(b)).map(([id, e]) => [id, entryKind(e), e.rid]).sort());
+  ok(await binOf(left) === await binOf(right) && await binOf(right) === await binOf(swapped) && (await binOf(left)).includes('"P"'),
+    'B: ((X·Y)·Z), (X·(Y·Z)) and (Z·(Y·X)) keep the same entry — the purge');
+}
+
+// ── S2-N newOnBothSides (E-5) ─────────────────────────────────────────────────
+console.log('\n— S2-N newOnBothSides truth table —');
+const N_ROWS = [
+  {
+    name: 'N1 new on both, same meaning',
+    args: async () => ({ base: TEMPLATE, ours: await side({ live: { txt_n: cj('txt_n', 'same', { updatedAt: 1 }) } }), theirs: await side({ live: { txt_n: cj('txt_n', 'same', { updatedAt: 2 }) } }) }),
+    want: { theirs: 'live[n=same] bin[] c[]', twin: 'live[n=same] bin[] c[]' },
+  },
+  {
+    name: 'N2 new on both, diverged',
+    args: async () => ({ base: TEMPLATE, ours: await side({ live: { txt_n: 'ours wording' } }), theirs: await side({ live: { txt_n: 'theirs wording' } }) }),
+    want: { theirs: 'live[n=theirs wording] bin[] c[]', twin: 'live[n=ours wording n~=theirs wording] bin[] c[content-new-both]' },
+  },
+  {
+    name: 'N3 diverged with no base at all',
+    args: async () => ({ base: null, ours: await side({ live: { txt_n: 'ours wording' } }), theirs: await side({ live: { txt_n: 'theirs wording' } }) }),
+    want: { theirs: 'live[n=ours wording n~=theirs wording] bin[] c[content-no-base]', twin: 'live[n=ours wording n~=theirs wording] bin[] c[content-no-base]' },
+  },
+  {
+    name: 'N4 new on one side only',
+    args: async () => ({ base: TEMPLATE, ours: TEMPLATE, theirs: await side({ live: { txt_n: 'agent card' } }) }),
+    want: { theirs: 'live[n=agent card] bin[] c[]', twin: 'live[n=agent card] bin[] c[]' },
+  },
+];
+{
+  for (const binMerge of ['receipts', '3way']) {
+    const observed = await runTable(`N(${binMerge})`, 'newOnBothSides', ['theirs', 'twin'], N_ROWS, { binMerge });
+    offBreaks(`N(${binMerge})`, observed, N_ROWS, 'twin', 'theirs', ['N2 new on both, diverged']);
+  }
+  const args = await N_ROWS[1].args();
+  const r1 = await mergeBrains({ ...args, options: { binMerge: 'receipts', newOnBothSides: 'twin' } });
+  const x = twinIdFor('txt_n', cj('txt_n', 'theirs wording'));
+  ok((await liveIds(r1.buffer)).includes(x), 'N2: the twin is the deterministic slot for theirs\' value');
+  const r2 = await mergeBrains({ base: args.base, ours: r1.buffer, theirs: args.theirs, options: { binMerge: 'receipts', newOnBothSides: 'twin' } });
+  ok((await twinsOf(r2.buffer, 'txt_n')).length === 1, 'N2: re-merging the same pair keeps one twin (idempotent)');
+}
+
+// ── S2-M manifestMerge (E-7) ──────────────────────────────────────────────────
+console.log('\n— S2-M manifestMerge truth table —');
+{
+  const titled = (title, extra = {}) => withManifest(TEMPLATE, { title, ...extra });
+  const titleOf = async (res) => {
+    const { manifest } = await parseKlypix(res.buffer);
+    const c = res.conflicts.find((x) => x.kind === 'title' || x.kind === 'title-no-base');
+    return `${manifest.title}${c ? ` !${c.kind}` : ''}${manifest.cloud ? ` cloud=${manifest.cloud.id}` : ''}`;
+  };
+  const M_ROWS = [
+    { name: 'M1 nobody renamed', o: 'A', t: 'A', b: 'A', want: { theirs: 'A', '3way': 'A', ours: 'A' } },
+    { name: 'M2 only theirs renamed', o: 'A', t: 'T', b: 'A', want: { theirs: 'T', '3way': 'T', ours: 'A' } },
+    { name: 'M3 only ours renamed', o: 'O', t: 'A', b: 'A', want: { theirs: 'A', '3way': 'O', ours: 'O' } },
+    { name: 'M4 both renamed, differently', o: 'O', t: 'T', b: 'A', want: { theirs: 'T', '3way': 'O !title', ours: 'O' } },
+    { name: 'M5 both renamed alike', o: 'N', t: 'N', b: 'A', want: { theirs: 'N', '3way': 'N', ours: 'N' } },
+    { name: 'M6 differ with no base', o: 'O', t: 'T', b: null, want: { theirs: 'T', '3way': 'O !title-no-base', ours: 'O' } },
+    { name: 'M7 a stamp only ours carries survives', o: 'A', t: 'A', b: 'A', oCloud: { id: 'c1' }, want: { theirs: 'A cloud=c1', '3way': 'A cloud=c1', ours: 'A cloud=c1' } },
+    { name: 'M8 a stamp both carry, differently', o: 'A', t: 'A', b: 'A', oCloud: { id: 'c-ours' }, tCloud: { id: 'c-theirs' }, want: { theirs: 'A cloud=c-theirs', '3way': 'A cloud=c-theirs', ours: 'A cloud=c-ours' } },
+  ];
+  const observed = {};
+  for (const row of M_ROWS) {
+    observed[row.name] = {};
+    const base = row.b == null ? null : await titled(row.b);
+    const ours = await titled(row.o, row.oCloud ? { cloud: row.oCloud } : {});
+    const theirs = await titled(row.t, row.tCloud ? { cloud: row.tCloud } : {});
+    for (const value of ['theirs', '3way', 'ours']) {
+      const got = await titleOf(await mergeBrains({ base, ours, theirs, options: { binMerge: 'receipts', manifestMerge: value } }));
+      observed[row.name][value] = got;
+      ok(got === row.want[value], `M ${row.name} [manifestMerge="${value}"] → ${row.want[value]}${got === row.want[value] ? '' : `   (got ${got})`}`);
+    }
+  }
+  offBreaks('M', observed, M_ROWS, '3way', 'theirs', ['M3 only ours renamed', 'M4 both renamed, differently', 'M6 differ with no base']);
+  offBreaks('M', observed, M_ROWS, '3way', 'ours', ['M2 only theirs renamed']);
+  const union = await titleOf(await mergeBrains({ base: await titled('A'), ours: await titled('O'), theirs: await titled('A') }));
+  ok(union === 'A', 'M: no options keeps 1.86.3\'s theirs-first title (app save is unchanged)');
+}
+
+// ── S2-V theirsTrust (E-6) ────────────────────────────────────────────────────
+// 'unverified' is for foreign bytes with no proven ancestry (Stage 3): nothing
+// theirs holds may delete, overwrite or move one of our cards.
+console.log('\n— S2-V theirsTrust truth table —');
+const V_ROWS = [
+  {
+    name: 'V1 only theirs edited',
+    args: async () => ({ base: await side({ live: { txt_k: 'v0' } }), ours: await side({ live: { txt_k: 'v0' } }), theirs: await side({ live: { txt_k: 'v1' } }) }),
+    want: { descendant: 'live[k=v1@24] bin[] c[]', unverified: 'live[k=v0@24 k~=v1@48] bin[] c[content-unverified]' },
+  },
+  {
+    name: 'V2 a purge only theirs holds (q6)',
+    args: async () => ({ base: await side({ live: { txt_k: 'v0' } }), ours: await side({ live: { txt_k: 'v0' } }), theirs: await side({ bin: { txt_k: Pe(k0, 'v0') } }) }),
+    want: { descendant: 'live[] bin[k:P] c[]', unverified: 'live[k=v0@24] bin[] c[]' },
+  },
+  {
+    name: 'V3 a full entry only theirs holds',
+    args: async () => ({ base: await side({ live: { txt_k: 'v0' } }), ours: await side({ live: { txt_k: 'v0' } }), theirs: await side({ bin: { txt_k: Fe(k0, 'v0') } }) }),
+    want: { descendant: 'live[] bin[k:F(v0)] c[]', unverified: 'live[k=v0@24] bin[] c[]' },
+  },
+  {
+    name: 'V4 a restore only theirs holds',
+    args: async () => ({
+      base: await side({ live: { txt_k: 'v0' } }),
+      ours: await side({ live: { txt_k: 'v1' } }),
+      theirs: await side({ live: { [kRev('v0')]: cj(kRev('v0'), 'v0') }, bin: { txt_k: Re(k0, 'v0', kRev('v0')) } }),
+    }),
+    want: { descendant: 'live[k′=v0@24 k′~=v1@48] bin[k:R] c[revived]', unverified: 'live[k=v1@24 k′=v0@24] bin[] c[]' },
+  },
+  {
+    name: 'V5 only theirs moved the card',
+    args: async () => ({ base: await side({ live: { txt_k: 'v0' } }), ours: await side({ live: { txt_k: 'v0' } }), theirs: await withPos(await side({ live: { txt_k: 'v0' } }), k0, { x: 900 }) }),
+    want: { descendant: 'live[k=v0@900] bin[] c[]', unverified: 'live[k=v0@24] bin[] c[]' },
+  },
+  {
+    name: 'V6 a card only theirs added',
+    args: async () => ({ base: TEMPLATE, ours: TEMPLATE, theirs: await side({ live: { txt_n: 'foreign card' } }) }),
+    want: { descendant: 'live[n=foreign card@24] bin[] c[]', unverified: 'live[n=foreign card@24] bin[] c[]' },
+  },
+  {
+    name: 'V7 theirs lacks our card with no receipt',
+    args: async () => ({ base: await side({ live: { txt_k: 'v0' } }), ours: await side({ live: { txt_k: 'v0' } }), theirs: TEMPLATE }),
+    want: { descendant: 'live[k=v0@24] bin[] c[]', unverified: 'live[k=v0@24] bin[] c[]' },
+  },
+  {
+    name: 'V8 our own purge still drops their stale copy',
+    args: async () => ({ base: await side({ live: { txt_k: 'v0' } }), ours: await side({ bin: { txt_k: Pe(k0, 'v0') } }), theirs: await side({ live: { txt_k: 'v0' } }) }),
+    want: { descendant: 'live[] bin[k:P] c[]', unverified: 'live[] bin[k:P] c[]' },
+  },
+  {
+    name: 'V9 theirs\' entry never replaces ours',
+    args: async () => ({ base: TEMPLATE, ours: await side({ bin: { txt_k: Fe(k0, 'v-ours') } }), theirs: await side({ bin: { txt_k: Pe(k0, 'v0') } }) }),
+    want: { descendant: 'live[] bin[k:P] c[]', unverified: 'live[] bin[k:F(v-ours)] c[]' },
+  },
+];
+{
+  const observed = await runTable('V', 'theirsTrust', ['descendant', 'unverified'], V_ROWS, { binMerge: 'receipts' }, { withX: true });
+  offBreaks('V', observed, V_ROWS, 'unverified', 'descendant', [
+    'V1 only theirs edited', 'V2 a purge only theirs holds (q6)', 'V3 a full entry only theirs holds',
+    'V4 a restore only theirs holds', 'V5 only theirs moved the card', 'V9 theirs\' entry never replaces ours',
+  ]);
+  // Assets: under 'unverified' our bytes win a path both carry.
+  const withAsset = async (b, bytes) => { const { zip } = await parseKlypix(b); zip.file('assets/img_1', Buffer.from(bytes)); return rezip(zip); };
+  const [ao, at] = [await withAsset(TEMPLATE, 'ours bytes'), await withAsset(TEMPLATE, 'theirs bytes')];
+  const assetOf = async (res) => (await parseKlypix(res.buffer)).zip.file('assets/img_1').async('string');
+  ok(await assetOf(await mergeBrains({ base: TEMPLATE, ours: ao, theirs: at, options: { binMerge: 'receipts' } })) === 'theirs bytes' &&
+    await assetOf(await mergeBrains({ base: TEMPLATE, ours: ao, theirs: at, options: { binMerge: 'receipts', theirsTrust: 'unverified' } })) === 'ours bytes',
+  'V10: a shared asset path takes theirs\' bytes when descendant, ours when unverified');
+}
+
+// ── S2-A adoptResolvedConflicts (E-1b) ────────────────────────────────────────
+// The same conflict resolved on the other side first (git, or another
+// machine): its twin already holds our text. Adopting that resolution keeps
+// both texts live without a second, redundant twin.
+console.log('\n— S2-A adoptResolvedConflicts truth table —');
+const A_ROWS = [
+  {
+    name: 'A1 theirs resolved it the other way round',
+    args: async () => {
+      const y = twinIdFor(k0, cj(k0, 'O1'));
+      return { base: await side({ live: { txt_k: 'v0' } }), ours: await side({ live: { txt_k: 'O1' } }), theirs: await side({ live: { txt_k: 'T1', [y]: cj(k0, 'O1') } }) };
+    },
+    want: { false: 'live[k=O1 k~=O1 k~=T1] bin[] c[content]', true: 'live[k=T1 k~=O1] bin[] c[content]' },
+  },
+  {
+    name: 'A2 both resolved it, in opposite orientations (pinned residual)',
+    args: async () => {
+      const x = twinIdFor(k0, cj(k0, 'T1')), y = twinIdFor(k0, cj(k0, 'O1'));
+      return { base: await side({ live: { txt_k: 'v0' } }), ours: await side({ live: { txt_k: 'O1', [x]: cj(k0, 'T1') } }), theirs: await side({ live: { txt_k: 'T1', [y]: cj(k0, 'O1') } }) };
+    },
+    want: { false: 'live[k=O1 k~=O1 k~=T1] bin[] c[content]', true: 'live[k=O1 k~=O1 k~=T1] bin[] c[content]' },
+  },
+  {
+    name: 'A3 theirs resolved it, but ours deleted that twin since',
+    args: async () => {
+      const y = twinIdFor(k0, cj(k0, 'O1'));
+      return {
+        base: await side({ live: { txt_k: 'v0', [y]: cj(k0, 'O1') } }),
+        ours: await side({ live: { txt_k: 'O1' } }),
+        theirs: await side({ live: { txt_k: 'T1', [y]: cj(k0, 'O1') } }),
+        deletedIds: [y],
+      };
+    },
+    want: { false: 'live[k=O1 k~=T1] bin[k~:F(O1)] c[content]', true: 'live[k=O1 k~=T1] bin[k~:F(O1)] c[content]' },
+  },
+  {
+    name: 'A4 an unresolved conflict',
+    args: async () => ({ base: await side({ live: { txt_k: 'v0' } }), ours: await side({ live: { txt_k: 'O1' } }), theirs: await side({ live: { txt_k: 'T1' } }) }),
+    want: { false: 'live[k=O1 k~=T1] bin[] c[content]', true: 'live[k=O1 k~=T1] bin[] c[content]' },
+  },
+];
+{
+  for (const binMerge of ['receipts', '3way']) {
+    const observed = await runTable(`A(${binMerge})`, 'adoptResolvedConflicts', [false, true], A_ROWS, { binMerge });
+    offBreaks(`A(${binMerge})`, observed, A_ROWS, true, false, ['A1 theirs resolved it the other way round']);
+  }
+  const a1 = await mergeBrains({ ...(await A_ROWS[0].args()), options: { binMerge: '3way', adoptResolvedConflicts: true } });
+  ok(a1.conflicts.some((c) => c.adopted === true && c.keptLive === 'theirs') && a1.delta.updated.includes(k0),
+    'A1: the adoption is reported and counts as an update of k');
+}
+
+// ── S2-X rules that are not options, switched off in a mutated engine ────────
+// Each mutant is the real engine source with ONE rule changed (the target
+// text must exist exactly once, so a refactor cannot silently retire a
+// mutation). The named row — or the named invariant — must then fail.
+console.log('\n— S2-X mutation checks (one rule off at a time) —');
+{
+  const MUT_DIR = path.join(ROOT, 'test', `.mutants-${process.pid}`);
+  const SRC = fs.readFileSync(path.join(ROOT, 'src', 'merge-brains.mjs'), 'utf8');
+  const mutant = async (name, find, replace) => {
+    if (SRC.split(find).length !== 2) return null;
+    fs.mkdirSync(MUT_DIR, { recursive: true });
+    const file = path.join(MUT_DIR, `${name}.mjs`);
+    fs.writeFileSync(file, SRC.replace(find, replace).replaceAll("from './", "from '../../src/"));
+    return import(pathToFileURL(file).href);
+  };
+  const rowOf = (name) => B_ROWS.find((r) => r.name.startsWith(name)) || V_ROWS.find((r) => r.name.startsWith(name));
+  const runWith = async (engine, rowName, options, view = {}) => {
+    const row = rowOf(rowName);
+    try { return await summarize(await engine.mergeBrains({ ...(await row.args()), options }), view); } catch (e) { return `threw ${e.message}`; }
+  };
+  const MUTATIONS = [
+    {
+      rule: 'P-a (a purge drops every live copy)',
+      find: "      drops.push({ S, side, from: id, v, at: id, kind: 'P' });",
+      replace: "      moves.push({ S, side, from: id, v, target: revivedIdFor(id, E.meta, E.json), via: 'edit' }); return;",
+      row: 'B4', options: { binMerge: 'receipts' },
+    },
+    {
+      rule: 'edit-beats-delete (R5: an unseen edit revives)',
+      find: "    moves.push({ S, side, from: id, v, target: revivedIdFor(id, E.meta, E.json), via: 'edit' });",
+      replace: "    drops.push({ S, side, from: id, v, at: id, kind: 'F' });",
+      row: 'B3', options: { binMerge: 'receipts' },
+    },
+    {
+      rule: 'a stale copy of the deleted bytes drops',
+      find: "      drops.push({ S, side, from: id, v, at: id, kind: 'F' });",
+      replace: "      moves.push({ S, side, from: id, v, target: revivedIdFor(id, E.meta, E.json), via: 'edit' });",
+      row: 'B1', options: { binMerge: 'receipts' },
+    },
+    {
+      rule: 'the 3way resurrection cell (a committed revert comes back)',
+      find: '      if (threeWay && !live(B, id) && eb &&',
+      replace: '      if (false && !live(B, id) && eb &&',
+      row: 'B8', options: { binMerge: '3way' },
+    },
+    {
+      rule: 'the resurrection cell is 3way only (path L keeps the delete)',
+      find: '      if (threeWay && !live(B, id) && eb &&',
+      replace: '      if (!live(B, id) && eb &&',
+      row: 'B8', options: { binMerge: 'receipts' },
+    },
+    {
+      rule: 'the total order picks the entry (no clock)',
+      find: '  const maxEntry = (id, list) => list.reduce((w, e) => (e ? pickBinEntry(id, w, e) : w), null);',
+      replace: '  const maxEntry = (id, list) => list.reduce((w, e) => (e ? (!w || Number(e.meta?.deletedAt || 0) > Number(w.meta?.deletedAt || 0) ? e : w) : w), null);',
+      row: 'B5', options: { binMerge: 'receipts' },
+    },
+    {
+      rule: 'no receipt, no purge (the base\'s entry counts)',
+      find: '    : maxEntry(id, [eOf(O, id), eOf(T, id), eOf(B, id)]));',
+      replace: '    : maxEntry(id, [eOf(O, id), eOf(T, id)]));',
+      row: 'B9', options: { binMerge: 'receipts' },
+    },
+    {
+      rule: 'E-11 (a tombstone buries from the base\'s bytes)',
+      find: '        const json = O.items[id] ?? T.items[id] ?? baseItem(id) ?? null;',
+      replace: '        const json = O.items[id] ?? T.items[id] ?? null;',
+      row: 'B10', options: { binMerge: 'receipts' },
+    },
+    {
+      rule: 'fates before routing (a dead target is never landed on)',
+      find: '      if (f.alive) return landIntoAlive(mv, t);',
+      replace: '      if (true) return landIntoAlive(mv, t);',
+      row: 'B11', options: { binMerge: 'receipts' },
+    },
+    {
+      rule: 'a purge outranks delete-vs-edit',
+      find: '      if (lt && live(B, id) && !sameMeaning(T.items[id], B.items[id]) && !purged) {',
+      replace: '      if (lt && live(B, id) && !sameMeaning(T.items[id], B.items[id])) {',
+      row: 'B14', options: { binMerge: 'receipts' },
+    },
+    {
+      rule: 'a restore sends the copy after the card',
+      find: "    if (kind === 'R') { moves.push({ S, side, from: id, v, target: E.meta.restoredAs, via: 'restore' }); return; }",
+      replace: '',
+      row: 'B17', options: { binMerge: 'receipts' },
+    },
+    {
+      rule: 'twins a person deleted since the base stay deleted',
+      find: "      if (state === 'dead' && suppressDeleted && suppressDeleted(x, v)) return { twin: x, suppressed: 'deleted-twin' };",
+      replace: '',
+      row: 'B15', options: { binMerge: 'receipts' },
+    },
+    {
+      rule: 'unverified: a foreign entry never kills our card',
+      find: '    (live(T, id) || (unverified && live(O, id))) ? null : eOf(T, id),',
+      replace: '    live(T, id) ? null : eOf(T, id),',
+      row: 'V2', options: { binMerge: 'receipts', theirsTrust: 'unverified' }, view: { withX: true },
+    },
+    {
+      rule: 'unverified: a one-sided foreign edit is twinned',
+      find: '        if (unverified) {',
+      replace: '        if (false) {',
+      row: 'V1', options: { binMerge: 'receipts', theirsTrust: 'unverified' }, view: { withX: true },
+    },
+  ];
+  for (const m of MUTATIONS) {
+    const engine = await mutant(`m${MUTATIONS.indexOf(m)}`, m.find, m.replace);
+    if (!engine) { ok(false, `X mutation target for "${m.rule}" is missing from src/merge-brains.mjs`); continue; }
+    const row = rowOf(m.row);
+    const want = row.want[m.options.theirsTrust === 'unverified' ? 'unverified' : m.options.binMerge];
+    const real = await runWith({ mergeBrains }, m.row, m.options, m.view);
+    const got = await runWith(engine, m.row, m.options, m.view);
+    ok(real === want && got !== want, `X "${m.rule}" off ⇒ row ${row.name} fails${got !== want ? ` (mutant: ${got})` : ' — IT DID NOT'}`);
+  }
+
+  // The invariants are load-bearing: break the merge underneath them and the
+  // merge must THROW rather than write the damage.
+  const e12 = await mutant('e12',
+    '  const bin = [...fate].filter(([, f]) => !f.alive && f.entry).map(([id, f]) => [id, f.entry]);',
+    "  const bin = [...fate].filter(([, f]) => !f.alive && f.entry && f.why !== 'receipt').map(([id, f]) => [id, f.entry]);");
+  ok(e12 && /INVARIANT VIOLATED — removed 1 card\(s\) without a receipt/.test(await runWith(e12, 'B1', { binMerge: 'receipts' })),
+    'X E-12: a merge that removes a live card without writing its entry throws');
+  // The draft's p8a fold: a moved value folded into a live card it does not match.
+  const e13 = await mutant('e13', '    if (twins.holds(t, mv.v)) return arrive(mv, t);', '    return arrive(mv, t);');
+  ok(e13 && /INVARIANT VIOLATED — a moved value of txt_k is neither live nor in the bin/.test(await runWith(e13, 'B12', { binMerge: 'receipts' })),
+    'X E-13: a merge that folds a rescued edit into a card holding other text throws');
+  const e13drop = await mutant('e13drop',
+    "    moves.push({ S, side, from: id, v, target: revivedIdFor(id, E.meta, E.json), via: 'edit' });",
+    "    drops.push({ S, side, from: id, v, at: id, kind: 'F' });");
+  ok(e13drop && /INVARIANT VIOLATED — dropped txt_k without its bytes in the bin/.test(await runWith(e13drop, 'B2', { binMerge: 'receipts' })),
+    'X E-13: a merge that drops an edit whose bytes are not in the bin throws');
+
+  fs.rmSync(MUT_DIR, { recursive: true, force: true });
 }
 
 console.log(failures ? `\n[x] ${failures} assertion(s) failed` : '\n[ok] merge-brains: all assertions passed');

@@ -17,7 +17,7 @@ import {
   restoreBrainSnapshot,
   snapshotBrain,
 } from '../src/brain-history.mjs';
-import { atomicWrite, parseKlypix, shard, revivedIdFor, entryKind, PURGED_BODY } from '../src/klypix-format.mjs';
+import { atomicWrite, parseKlypix, shard, revivedIdFor, twinIdFor, entryKind, PURGED_BODY } from '../src/klypix-format.mjs';
 import { buildKlypixMap } from '../src/klypix-core.mjs';
 import { mergeBrains, restoreSnapshotAsMerge } from '../src/merge-brains.mjs';
 import { purgeGraveyard, restoreFromGraveyard } from '../src/brain-graveyard.mjs';
@@ -395,6 +395,43 @@ ok(listBrainHistory(brain, { home }).length === beforeShrink + 1, 'the shrink sn
   const idsBoth = (await liveOf(both.buffer)).map((c) => c.id).sort();
   ok(JSON.stringify(ids1) === JSON.stringify(idsBoth) && !idsBoth.some((id) => id.includes('__agconf_')),
     'E-9: two machines restoring the same point converge on one copy of each card, no twins');
+
+  // A chain never pushes a card off its own id. The point holds a card X and,
+  // from older history, another card under the very id X's delete revives to.
+  // That card keeps its id; X lands beside it as a deterministic twin.
+  {
+    const base = await buildKlypixMap({ title: 'collision', kind: 'brain', areas: [{ title: 'Work', cards: [{ text: 'xray: the card that gets deleted' }] }] });
+    const X = (await liveOf(base)).find((c) => c.text.includes('xray:')).id;
+    const parent = JSON.parse(await (await JSZip.loadAsync(base)).file('canvas.json').async('string')).positions[X].parentId;
+    const cur = (await mergeBrains({ base, ours: base, theirs: base, deletedIds: [X] })).buffer;
+    const gy = await binOf(cur);
+    const Xr = revivedIdFor(X, gy.entries[X], await gy.body(X));
+    const snap = await addCard(base, Xr, 'yankee: a different card that holds that id', parent);
+    const vX = await (await JSZip.loadAsync(snap)).file(itemPath(X)).async('string');
+    const r = await restoreSnapshotAsMerge({ current: cur, snapshot: snap, now: t + 48_000 });
+    const lv = await liveOf(r.buffer);
+    const at = (id) => lv.find((c) => c.id === id)?.text ?? '';
+    const xAs = r.revived.find((e) => e.id === X)?.as;
+    ok(r.restored.includes(Xr) && at(Xr).includes('yankee:') && xAs === twinIdFor(Xr, vX, 0) && at(xAs).includes('xray:'),
+      'E-9: a chain never pushes a card off its own id — the deleted card lands beside it as a deterministic twin');
+
+    // That first twin slot is taken today — by a card holding other text, or
+    // by a deletion on record. X skips it: overwriting the one would lose that
+    // text, and landing on the other would be deleted again by every copy.
+    const T0 = twinIdFor(Xr, vX, 0);
+    const T1 = twinIdFor(Xr, vX, 1);
+    const curLive = await addCard(cur, T0, 'zulu: a twin someone edited', parent);
+    const r2 = await restoreSnapshotAsMerge({ current: curLive, snapshot: snap, now: t + 48_100 });
+    const gy2 = await binOf(r2.buffer);
+    ok(r2.revived.find((e) => e.id === X)?.as === T1 && (await liveOf(r2.buffer)).find((c) => c.id === T1)?.text.includes('xray:')
+      && r2.buried.includes(T0) && (await gy2.body(T0))?.includes('zulu:'),
+    'E-9: a twin slot holding other text today is skipped, never overwritten (that card is buried with its bytes, like any card added since)');
+    const curBin = (await mergeBrains({ base: curLive, ours: curLive, theirs: curLive, deletedIds: [T0] })).buffer;
+    const r3 = await restoreSnapshotAsMerge({ current: curBin, snapshot: snap, now: t + 48_200 });
+    const gy3 = await binOf(r3.buffer);
+    ok(r3.revived.find((e) => e.id === X)?.as === T1 && entryKind(gy3.entries[T0]) === 'F' && (await gy3.body(T0))?.includes('zulu:'),
+      'E-9: a twin slot with a deletion on record is skipped, and the deleted text stays in the bin');
+  }
 
   // Restoring the same point again changes nothing.
   const again = await restoreBrainSnapshot(brain5, pointSnap.id, { home, now: t + 42_000, parse: parseKlypix });

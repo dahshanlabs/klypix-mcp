@@ -1138,12 +1138,23 @@ export async function restoreSnapshotAsMerge({
   }));
   const buffer = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
 
-  // Nothing may vanish: every card live now is live or buried with its bytes;
-  // every card live in the snapshot is live or deliberately kept out (purged).
-  const lostNow = cOrder.filter((id) => liveIn(C, id) && !live.has(id) && !(entries[id] && entries[id].purged !== true));
-  if (lostNow.length) throw new Error(`restoreSnapshotAsMerge INVARIANT VIOLATED — ${lostNow.length} current card(s) neither live nor buried: ${lostNow.slice(0, 5).join(', ')}`);
+  // Nothing may vanish. Every card live now is live — with its own value, or
+  // the snapshot's where the restore says so (`reverted`) — or in the bin with
+  // ITS bytes. Every card live in the snapshot is live or deliberately kept
+  // out (purged). Today's bin survives: an entry leaves only when its card is
+  // live today (the live copy wins, as in every merge) or it has no bytes.
+  const revertedIds = new Set(reverted);
+  const lostNow = cOrder.filter((id) => liveIn(C, id) && (live.has(id)
+    ? !(sameMeaning(values.get(id), C.items[id]) || revertedIds.has(id))
+    : !(entries[id] && entries[id].purged !== true && sameMeaning(bin.get(id)?.json, C.items[id]))));
+  if (lostNow.length) throw new Error(`restoreSnapshotAsMerge INVARIANT VIOLATED — ${lostNow.length} current card(s) overwritten or not buried with their bytes: ${lostNow.slice(0, 5).join(', ')}`);
+  const lostBin = Object.entries(C.graveyard).filter(([id, g]) => g?.json != null && !liveIn(C, id) && !entries[id]).map(([id]) => id);
+  if (lostBin.length) throw new Error(`restoreSnapshotAsMerge INVARIANT VIOLATED — ${lostBin.length} bin entr(ies) dropped: ${lostBin.slice(0, 5).join(', ')}`);
   const kept = new Set(keptPurged);
-  const lostSnap = sOrder.filter((k) => liveIn(S, k) && !kept.has(k) && !live.has(idMap.get(k)));
+  // Live is not enough: the card's landing must hold ITS value, or a later
+  // landing overwrote it.
+  const lostSnap = sOrder.filter((k) => liveIn(S, k) && !kept.has(k)
+    && !(live.has(idMap.get(k)) && sameMeaning(values.get(idMap.get(k)), S.items[k])));
   if (lostSnap.length) throw new Error(`restoreSnapshotAsMerge INVARIANT VIOLATED — ${lostSnap.length} snapshot card(s) not restored: ${lostSnap.slice(0, 5).join(', ')}`);
   await parseKlypix(buffer);
   return { buffer, reverted, restored, revived, buried, keptPurged };

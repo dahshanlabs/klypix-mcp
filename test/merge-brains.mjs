@@ -352,6 +352,30 @@ console.log('\n— S2-T bin entry total order —');
     'T6: which F version the bin keeps never depends on a clock');
   ok(unionPick(late(va), early(vb)).json !== unionPick(early(va), late(vb)).json,
     'T6 mutation: the 1.86.3 newest-deletedAt rule lets the clock pick the content (the check catches it)');
+
+  // The draft's rule (critic A q3): a restore beats the deletion it restored,
+  // anything else goes to the newest. It cycles — F(i) > R(j) > F(j) > F(i) —
+  // so the grouping of three merges picks different entries, and three
+  // replicas re-upload forever. The same associativity check must catch it.
+  const when = (e) => Number(e.meta.restoredAt ?? e.meta.deletedAt ?? 0);
+  const restores = (r, f) => entryKind(r.meta) === 'R' && entryKind(f.meta) === 'F' && r.meta.rid === f.meta.rid;
+  const draftPick = (x, y) => {
+    const kx = entryKind(x.meta), ky = entryKind(y.meta);
+    if (kx === 'P' || ky === 'P') return kx === 'P' ? x : y;
+    if (restores(x, y)) return x;
+    if (restores(y, x)) return y;
+    return when(y) > when(x) ? y : x;
+  };
+  const Fi = binEntryFor({ id: 'k', json: va, now: 5 });
+  const Fj = binEntryFor({ id: 'k', json: vb, now: 7 });
+  const Rj = { meta: contentFreeReceiptFor('k', Fj, { kind: 'restored', restoredAs: 'k__r_cccccccccccc', now: 3 }), json: PURGED_BODY };
+  let draftAssociative = true;
+  for (const x of [Fi, Fj, Rj]) for (const y of [Fi, Fj, Rj]) for (const z of [Fi, Fj, Rj]) {
+    if (key(draftPick(draftPick(x, y), z)) !== key(draftPick(x, draftPick(y, z)))) draftAssociative = false;
+  }
+  ok(!draftAssociative, "T7 mutation: the draft's rule cycles, and the associativity check catches it");
+  const ours = (x, y) => pickBinEntry('k', x, y);
+  ok(key(ours(ours(Fi, Rj), Fj)) === key(ours(Fi, ours(Rj, Fj))), 'T7: … the total order does not, on the same three entries');
 }
 
 // S2-E2: every entry a merge mints carries its identity, and the identity is

@@ -146,11 +146,17 @@ export function wouldThrottle(brainPath, { home = os.homedir(), now = Date.now()
  * `nextBytes` (the size about to be written) enables the shrink rule — pass it
  * whenever the caller knows it; without it every eligible write is snapshotted,
  * which is safe, just chattier.
+ *
+ * `bytes` snapshots a version that never reached the disk instead: the app's
+ * unsaved tab, when a purge made elsewhere drops a card the tab had edited
+ * (P-a — the edit survives in this machine's restore point, as a Brain Sync's
+ * does in its pre-merge snapshot).
  */
-export function snapshotBrain(brainPath, { home = os.homedir(), reason = 'write', nextBytes = null, now = Date.now(), force = false } = {}) {
+export function snapshotBrain(brainPath, { home = os.homedir(), reason = 'write', nextBytes = null, now = Date.now(), force = false, bytes = null } = {}) {
   try {
     let buf;
-    try { buf = fs.readFileSync(brainPath); } catch { return { saved: false, skipped: 'no-current-file' }; }
+    if (bytes) buf = Buffer.from(bytes);
+    else try { buf = fs.readFileSync(brainPath); } catch { return { saved: false, skipped: 'no-current-file' }; }
     if (!buf.length) return { saved: false, skipped: 'empty' };
 
     const dir = historyDirFor(brainPath, home);

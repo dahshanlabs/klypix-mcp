@@ -97,6 +97,19 @@ ok(listBrainHistory(brain, { home }).length === beforeShrink + 1, 'the shrink sn
   ok(undo.ok && afterUndo === wrecked, 'and that undo actually returns the replaced state');
 }
 
+// ── a version that never reached the disk (P-a in the app save) ──────────────
+{
+  fs.writeFileSync(brain, await brainWith(4));
+  const tab = await brainWith(6);
+  const onDisk = fs.readFileSync(brain);
+  const res = snapshotBrain(brain, { home, now: t + 15_000, reason: 'purge-vs-edit', force: true, bytes: tab });
+  const point = listBrainHistory(brain, { home })[0];
+  ok(res.saved === true && point.id === res.id && point.reason === 'purge-vs-edit',
+    'bytes: the given version is kept as a restore point, under its reason');
+  ok(Buffer.compare(fs.readFileSync(res.path), tab) === 0 && Buffer.compare(fs.readFileSync(brain), onDisk) === 0,
+    'bytes: the restore point holds exactly those bytes, and the brain on disk is untouched');
+}
+
 // ── the brain file itself is deleted ─────────────────────────────────────────
 {
   fs.writeFileSync(brain, await brainWith(9));

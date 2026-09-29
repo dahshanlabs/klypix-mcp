@@ -76,6 +76,44 @@ console.log('\n— git-driver install (stranger repo, empty runtime) —');
   const status = run(['git-driver', 'status']);
   ok(status.code === 0, 'status exits 0 when fully registered');
 }
+
+console.log('\n— git-driver install never downgrades the installed engine —');
+{
+  // The same four files arrive from the full installer, the desktop bundle and
+  // auto-update. An older `npx klypix-mcp git-driver install` must not put its
+  // engine under a newer one: the gate is the full installer's own rule.
+  const DIR = path.join(TMP, 'brain-runtime-gate');
+  const FILES = ['klypix-format.mjs', 'brain-graveyard.mjs', 'merge-brains.mjs', 'klypix-merge-driver.mjs'];
+  const SENTINEL = '// engine written by another install\n';
+  const envFor = { env: { ...process.env, KLYPIX_BRAIN_DIR: DIR } };
+  const stampWith = (s) => fs.writeFileSync(path.join(DIR, '.brain-version.json'), JSON.stringify(s));
+  const allSentinel = () => FILES.every((f) => fs.readFileSync(path.join(DIR, f), 'utf8') === SENTINEL);
+  fs.mkdirSync(DIR, { recursive: true });
+  for (const f of FILES) fs.writeFileSync(path.join(DIR, f), SENTINEL);
+
+  stampWith({ brainVersion: '99.0.0', via: 'npm' });
+  const newer = run(['git-driver', 'install'], envFor);
+  ok(newer.code === 0 && allSentinel() && /kept the engine installed by v99\.0\.0 \(via npm\)/.test(newer.out),
+    'a newer installed engine is kept, and the output says whose it is');
+
+  stampWith({ brainVersion: '1.0.0', via: 'dev', dev: true });
+  const dev = run(['git-driver', 'install'], envFor);
+  ok(dev.code === 0 && allSentinel() && /kept the engine installed by a dev deploy/.test(dev.out),
+    'a dev-owned engine is kept');
+
+  stampWith({ brainVersion: '99.0.0', via: 'npm' });
+  fs.rmSync(path.join(DIR, 'merge-brains.mjs'));
+  const gap = run(['git-driver', 'install'], envFor);
+  ok(gap.code === 0 && !fs.existsSync(path.join(DIR, 'merge-brains.mjs')) && /missing merge-brains\.mjs/.test(gap.out),
+    'a newer install missing a file is reported, never filled with an older file');
+
+  stampWith({ brainVersion: '1.0.0', via: 'npm' });
+  const older = run(['git-driver', 'install'], envFor);
+  const current = FILES.every((f) => fs.readFileSync(path.join(DIR, f), 'utf8') === fs.readFileSync(path.join(ROOT, 'src', f), 'utf8'));
+  ok(older.code === 0 && current && /provisioned: klypix-format\.mjs, brain-graveyard\.mjs, merge-brains\.mjs, klypix-merge-driver\.mjs/.test(older.out),
+    'an older engine is replaced as one set, dependencies first');
+  ok(!fs.readdirSync(DIR).some((f) => f.includes('.klypix-new')), 'each file is swapped in atomically, no temp file left');
+}
 git('add', '-A');
 git('commit', '-qm', 'driver attributes');
 

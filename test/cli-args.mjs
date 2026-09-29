@@ -237,6 +237,8 @@ const run = (args, { cwd = REPO, home = HOME_ROOT, timeout = 60_000 } = {}) => {
       const refs = [
         ...executable.matchAll(/from\s+['"]\.\/([^'"]+\.mjs)['"]/g),
         ...executable.matchAll(/import\(\s*['"]\.\/([^'"]+\.mjs)['"]\s*\)/g),
+        // brain-history loads the merge engine as import(new URL('./x.mjs', import.meta.url)).
+        ...executable.matchAll(/new URL\(\s*['"]\.\/([^'"]+\.mjs)['"]\s*,\s*import\.meta\.url\s*\)/g),
       ].map((m) => m[1]);
       return [...new Set(refs)].filter((ref) => !staged.has(ref)).map((ref) => `${file} -> ./${ref}`);
     });
@@ -248,6 +250,14 @@ const run = (args, { cwd = REPO, home = HOME_ROOT, timeout = 60_000 } = {}) => {
     { encoding: 'utf8', timeout: 60_000 });
   ok(doctorImport.status === 0 && /^ok/m.test(doctorImport.stdout),
     `G: the staged brain-doctor.mjs imports cleanly from the flat bundle${doctorImport.status === 0 ? '' : ` (${(doctorImport.stderr || '').split('\n').find((l) => /Error|Cannot find/.test(l)) || 'exit ' + doctorImport.status})`}`);
+
+  // Stage 2: history restore, the KLYPIX core and the git driver load ONE merge
+  // engine from this directory. It must be staged, current, and beside its driver.
+  const engineImport = spawnSync(process.execPath, ['--input-type=module', '-e',
+    `import(${JSON.stringify(pathToFileURL(path.join(bundleDir, 'merge-brains.mjs')).href)}).then(m => { if (m.MERGE_ENGINE_FEATURES?.restoreAsMerge !== true) throw new Error('no restore merge'); console.log('ok'); })`],
+    { encoding: 'utf8', timeout: 60_000 });
+  ok(engineImport.status === 0 && /^ok/m.test(engineImport.stdout) && staged.has('klypix-merge-driver.mjs'),
+    `G: the flat bundle stages the merge engine (restore merge included) and the git driver${engineImport.status === 0 ? '' : ` (${(engineImport.stderr || '').split('\n').find((l) => /Error|Cannot find/.test(l)) || 'exit ' + engineImport.status})`}`);
 
   // The flat bundle stages the worker but NOT the link/doctor/install bins, so its
   // dispatch used to die with a raw ERR_MODULE_NOT_FOUND stack trace.

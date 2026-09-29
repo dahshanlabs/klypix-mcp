@@ -23,7 +23,7 @@ import {
   linkProject,
   safeReadCodexConfig,
 } from '../src/agent-rules.mjs';
-import { inspect, render } from '../src/brain-doctor.mjs';
+import { driftLine, inspect, render } from '../src/brain-doctor.mjs';
 import { laneFileFor } from '../src/agent-presence.mjs';
 import { makeVault, seedBrain } from './_harness.mjs';
 
@@ -322,6 +322,58 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
   ok(backpressured.layers.supervisor === 'drift'
     && /0 healthy .* 1 delivery-backpressured/.test(backpressuredText),
   'doctor excludes a backpressured transport from the healthy supervisor count');
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
+// MERGE ENGINE (Stage 2): an engine or git driver OLDER than the brain is
+// drift with a fix named — it runs 1.86 rules, so a card deleted here comes
+// back from another copy. Read from the deployed text, never imported.
+{
+  const home = path.join(os.tmpdir(), `klypix-doctor-merge-${process.pid}`);
+  const project = path.join(home, 'project');
+  const brainDir = path.join(home, '.claude', 'project-brain');
+  fs.rmSync(home, { recursive: true, force: true });
+  fs.mkdirSync(project, { recursive: true });
+  fs.mkdirSync(brainDir, { recursive: true });
+  const SRC = path.join(__dirname, '..', 'src');
+  const OLD = path.join(__dirname, 'fixtures', 'engine-1.86.3');
+  const put = (file, from) => fs.copyFileSync(from, path.join(brainDir, file));
+  const baked = (v) => fs.writeFileSync(path.join(brainDir, 'klypix-mcp-server.mjs'), `const PKG_VERSION = '${v}';\n`);
+  const at = () => inspect({ home, projectDir: project, fmtLib: null });
+
+  baked('1.87.0');
+  put('merge-brains.mjs', path.join(SRC, 'merge-brains.mjs'));
+  put('klypix-merge-driver.mjs', path.join(SRC, 'klypix-merge-driver.mjs'));
+  let r = at();
+  ok(r.layers.mergeEngine === 'ok' && r.mergeEngine.engine.api >= 2 && r.mergeEngine.driver.api >= 2
+    && /MERGE\s+engine api \d+ · git driver api \d+/.test(render(r, { color: false })),
+  'MERGE: a current engine and driver under a 1.87 brain read ok, with their api levels');
+
+  put('merge-brains.mjs', path.join(OLD, 'merge-brains.mjs'));
+  r = at();
+  ok(r.layers.mergeEngine === 'drift' && r.mergeEngine.engine.api === 1 && r.verdict === 'DRIFTED'
+    && r.actions.some((a) => a.startsWith('npx klypix-mcp install') && a.includes('merge-brains.mjs predates brain v1.87.0'))
+    && /merge engine older than the brain/.test(driftLine(r)),
+  'MERGE: a 1.86 engine under a 1.87 brain is drift, and the fix is named');
+
+  put('merge-brains.mjs', path.join(SRC, 'merge-brains.mjs'));
+  fs.writeFileSync(path.join(brainDir, 'klypix-merge-driver.mjs'), "import * as engine from './merge-brains.mjs';\n// a 1.86 driver: no options constant\n");
+  r = at();
+  ok(r.layers.mergeEngine === 'drift' && r.mergeEngine.driver.api === 1
+    && r.actions.some((a) => a.includes('klypix-merge-driver.mjs predates')),
+  'MERGE: a 1.86 git driver beside a current engine is drift too');
+
+  baked('1.86.3');
+  r = at();
+  ok(r.layers.mergeEngine === 'n/a' && !/MERGE\s/.test(render(r, { color: false })),
+    'MERGE: an older brain is not judged against the new engine');
+
+  baked('1.87.0');
+  fs.rmSync(path.join(brainDir, 'merge-brains.mjs'));
+  fs.rmSync(path.join(brainDir, 'klypix-merge-driver.mjs'));
+  r = at();
+  ok(r.layers.mergeEngine === 'absent' && r.drifted === 0 && /MERGE\s+engine missing/.test(render(r, { color: false })),
+    'MERGE: a missing engine is shown, not counted as drift');
   fs.rmSync(home, { recursive: true, force: true });
 }
 

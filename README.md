@@ -534,9 +534,11 @@ That registers a merge driver for `*.klypix` (a per-machine git config line plus
 rule you commit) and provisions the engine it needs. When two people change the brain and one
 pulls, git calls the engine instead of stopping: new cards from both sides are kept, a card only
 one side edited takes that edit, and a card edited differently on both sides keeps **both**
-versions — the second as a linked twin, never a silent overwrite. Before returning, the merge
-asserts it still contains every surviving card from both sides and refuses rather than hand back a
-result that lost one.
+versions — the second as a linked twin, never a silent overwrite. Deletions travel too: a deleted
+card leaves a receipt in the brain's Deleted cards, and the driver merges those three-way, so a
+card deleted — or permanently deleted — on one branch stays out instead of coming back from the
+other. Before returning, the merge asserts it still contains every surviving card from both sides
+and refuses rather than hand back a result that lost one.
 
 The honest boundary: a machine that has not run `git-driver install` simply gets the old binary
 conflict — safe degradation, not corruption — and git keeps both parents of every merge, so even a
@@ -576,6 +578,12 @@ So every brain write takes a restore point of the previous bytes first:
 npx klypix-mcp brain-history list          # age, card count, delta against the brain now
 npx klypix-mcp brain-history restore <id>  # and this is itself undoable
 ```
+
+A restore is a merge into the brain as it is now, not a copy over the file, and it prints what it
+changed. The point's cards come back — a card deleted since returns under a new id, so every other
+copy of the brain agrees the old one was deleted — and cards written after the point move to
+Deleted cards (`npx klypix-mcp brain-deleted list`), where each one can be restored. Permanently
+deleted cards stay out unless you pass `--include-purged`.
 
 They live under `~/.claude/project-brain/history/`, never beside the brain — nothing lands in git,
 in the merge driver's path, or in your diffs, and they survive deletion of the `.klypix` file

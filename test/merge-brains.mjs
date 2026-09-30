@@ -1092,6 +1092,32 @@ const B_ROWS = [
     EDGE_ARGS.push(eArgs);
   }
 
+  // Both ends of one edge move, on different sides: ours rescues its edit of
+  // k1 (theirs deleted it) and theirs rescues its edit of k2 (ours deleted it).
+  // Each side re-points only its own copy of the edge; the edge follows both.
+  {
+    const edge = async (buf, from, to) => {
+      const { zip, canvas } = await parseKlypix(buf);
+      canvas.connections = [{ id: 'con_both', fromId: from, toId: to, relationship: 'relates_to' }];
+      zip.file('canvas.json', JSON.stringify(canvas));
+      return rezip(zip);
+    };
+    const F = (id, text) => binEntryFor({ id, json: pj(text), now: 1000 });
+    const k1R = revivedIdFor('txt_k1', F('txt_k1', 'a0').meta, pj('a0'));
+    const k2R = revivedIdFor('txt_k2', F('txt_k2', 'b0').meta, pj('b0'));
+    const args = async () => ({
+      base: await edge(await side({ live: { txt_k1: pj('a0'), txt_k2: pj('b0') } }), 'txt_k1', 'txt_k2'),
+      ours: await edge(await side({ live: { txt_k1: pj('a1') }, bin: { txt_k2: F('txt_k2', 'b0') } }), 'txt_k1', 'txt_k2'),
+      theirs: await edge(await side({ live: { txt_k2: pj('b1') }, bin: { txt_k1: F('txt_k1', 'a0') } }), 'txt_k1', 'txt_k2'),
+    });
+    for (const binMerge of ['receipts', '3way']) {
+      const res = await mergeBrains({ ...(await args()), options: { binMerge } });
+      const c = (await parseKlypix(res.buffer)).canvas.connections?.find((x) => x.id === 'con_both');
+      ok(c?.fromId === k1R && c?.toId === k2R, `B-E2 (${binMerge}): an edge whose ends moved on different sides follows both (${c ? `${c.fromId}->${c.toId}` : 'dropped'})`);
+    }
+    EDGE_ARGS.push(args);
+  }
+
   // Detail the table's strings cannot show.
   const b2 = await mergeBrains({ ...(await B_ROWS[1].args()), options: { binMerge: 'receipts' } });
   ok(b2.delta.revived.length === 1 && b2.delta.revived[0].id === k0 && b2.delta.revived[0].as === kRev('v0') &&
@@ -1424,6 +1450,12 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
       edge: true,
     },
     {
+      rule: 'an edge end follows a move made on the other side',
+      find: "    if (movedTo.size) for (const [id, c] of connMap) {",
+      replace: '    if (false) for (const [id, c] of connMap) {',
+      edge2: true,
+    },
+    {
       rule: 'a stale copy of a card restored and edited since is superseded, not lost',
       find: '(liveAt(arrived.get(key), mv.v) || supersededAt(arrived.get(key), mv.v))',
       replace: 'liveAt(arrived.get(key), mv.v)',
@@ -1481,6 +1513,12 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
   for (const m of MUTATIONS) {
     const engine = await mutant(`m${MUTATIONS.indexOf(m)}`, m.find, m.replace);
     if (!engine) { ok(false, `X mutation target for "${m.rule}" is missing from src/merge-brains.mjs`); continue; }
+    if (m.edge2) {
+      const res = await engine.mergeBrains({ ...(await EDGE_ARGS[1]()), options: { binMerge: 'receipts' } });
+      const c = (await parseKlypix(res.buffer)).canvas.connections?.find((x) => x.id === 'con_both');
+      ok(!c, `X "${m.rule}" off ⇒ case B-E2 loses the edge${!c ? '' : ' — IT DID NOT'}`);
+      continue;
+    }
     if (m.edge) {
       const from = async (eng) => (await parseKlypix((await eng.mergeBrains({ ...(await EDGE_ARGS[0]()), options: { binMerge: 'receipts' } })).buffer))
         .canvas.connections?.find((c) => c.id === 'con_e')?.fromId ?? null;

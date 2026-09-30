@@ -936,6 +936,19 @@ async function finishMerge(B, O, T, opt, run) {
     const t = tConn.get(id);
     connMap.set(id, opt.binMerge !== 'union' && t && !endsLive(c) && endsLive(t) ? t : c);
   }
+  // And an end a move retired follows its card to where it went, whichever
+  // side moved it: the two ends of one edge can move on different sides (each
+  // side re-points only its own copy), and then neither copy pointed at both
+  // live cards and the edge was dropped (found on a copy of the real brain).
+  if (opt.binMerge !== 'union') {
+    const movedTo = new Map();
+    for (const r of run.delta?.revived || []) if (!movedTo.has(r.id) && liveIds.has(r.as)) movedTo.set(r.id, r.as);
+    if (movedTo.size) for (const [id, c] of connMap) {
+      const from = liveIds.has(c.fromId) ? c.fromId : (movedTo.get(c.fromId) ?? c.fromId);
+      const to = liveIds.has(c.toId) ? c.toId : (movedTo.get(c.toId) ?? c.toId);
+      if (from !== c.fromId || to !== c.toId) connMap.set(id, { ...c, fromId: from, toId: to });
+    }
+  }
   // Collapse EXACT duplicate edges (same endpoints + relationship + label,
   // different ids). Connection deletes have no tombstone, so an arrange/de-dup
   // that dropped a redundant edge in-app used to see it resurrected from disk

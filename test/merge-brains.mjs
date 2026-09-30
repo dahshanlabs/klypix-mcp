@@ -1032,6 +1032,19 @@ const B_ROWS = [
     want: { union: 'live[k=v15 k′=v9] bin[] c[]', receipts: 'live[k′=v15] bin[k:F(v0)] c[]', '3way': 'live[k′=v15] bin[k:F(v0)] c[]' },
   },
   {
+    // Found by the simulator's soak (I9, seed 80642): ours' base holds k
+    // deleted (v0), yet ours holds k live with v1 — a tab with no watcher typed
+    // into it and the app save kept the edit. Elsewhere k was restored as k′,
+    // still v0: the edit was made on exactly those bytes, and lands on k′.
+    name: 'B28 an edit of a card the base holds deleted lands on its restore when that still holds the deleted bytes',
+    args: async () => ({
+      base: await side({ bin: { txt_k: binEntryFor({ id: k0, json: pj('v0'), now: 1000 }) } }),
+      ours: await side({ live: { txt_k: pj('v1') } }),
+      theirs: await side({ live: { txt_elsewhere: pj('v0') }, bin: { txt_k: Re(k0, 'v0', 'txt_elsewhere') } }),
+    }),
+    want: { union: 'live[elsewhere=v0 k=v1] bin[] c[]', receipts: 'live[elsewhere=v1] bin[k:R] c[]', '3way': 'live[elsewhere=v1] bin[k:R] c[]' },
+  },
+  {
     // The landing was edited since the value ours' edit was made on: a real
     // conflict, both kept.
     name: 'B27 an edit beside a card edited since stays a twin',
@@ -1475,9 +1488,15 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
     },
     {
       rule: 'an edit of exactly what the landing holds lands on it',
-      find: "    if (!unverified && madeOn != null && !live(mv.S, t) && live(other, t) && !folded.has(t) && sameMeaning(other.items[t], madeOn)) {",
+      find: "    if (!unverified && madeOn != null && !landed.has(t) && !live(mv.S, t) && live(other, t) && !folded.has(t) && sameMeaning(other.items[t], madeOn)) {",
       replace: '    if (false) {',
       row: 'B26', options: { binMerge: 'receipts' },
+    },
+    {
+      rule: 'a copy of an id the base holds deleted was made on the deleted bytes',
+      find: "    const madeOn = baseItem(mv.from) ?? (eb && entryKind(eb.meta) === 'F' ? eb.json : null);",
+      replace: '    const madeOn = baseItem(mv.from);',
+      row: 'B28', options: { binMerge: 'receipts' },
     },
     {
       rule: 'a restore sends the copy after the card',

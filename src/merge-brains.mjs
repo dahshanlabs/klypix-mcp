@@ -736,8 +736,16 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
     if (twins.holds(t, mv.v)) return arrive(mv, t);
     for (const x of twins.twinsOf(t)) if (twins.holds(x, mv.v)) return arrive(mv, x);
     const other = mv.side === 'ours' ? T : O;
-    const madeOn = baseItem(mv.from);
-    if (!unverified && madeOn != null && !live(mv.S, t) && live(other, t) && !folded.has(t) && sameMeaning(other.items[t], madeOn)) {
+    // What this side's copy was made on: the id's base value, or — when the
+    // base holds the id deleted — the bytes that delete removed (the copy is
+    // then an edit the deleter never saw, which the app save or an old tool
+    // put back: e.g. a tab with no watcher typing into a card deleted and
+    // restored elsewhere).
+    const eb = eOf(B, mv.from);
+    const madeOn = baseItem(mv.from) ?? (eb && entryKind(eb.meta) === 'F' ? eb.json : null);
+    // Only onto a card the other side already held — never onto a value this
+    // merge landed a moment ago (that value would then be lost, E-13).
+    if (!unverified && madeOn != null && !landed.has(t) && !live(mv.S, t) && live(other, t) && !folded.has(t) && sameMeaning(other.items[t], madeOn)) {
       folded.set(t, mv);
       return arrive(mv, t);
     }

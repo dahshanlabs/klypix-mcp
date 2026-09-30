@@ -892,6 +892,27 @@ const B_ROWS = [
     },
   },
   {
+    // Found by the simulator's soak (seed 60466). Theirs buried the twin that
+    // held v2 while putting v2 on the card itself (a history restore); ours
+    // edited the card since. Theirs did not reject v2 — it is theirs' text —
+    // so the new conflict keeps it beside the card instead of suppressing it.
+    name: 'B25 a twin buried by the side that kept its value on the card is no resolution',
+    args: async () => {
+      const x = twinIdFor(k0, cj(k0, 'v2'));
+      return {
+        base: await side({ live: { txt_k: 'v0' } }),
+        ours: await side({ live: { txt_k: 'v1' } }),
+        theirs: await side({ live: { txt_k: 'v2' }, bin: { [x]: binEntryFor({ id: x, json: cj(k0, 'v2') }) } }),
+      };
+    },
+    // (k~ twice: slot 0 is dead, so the twin takes slot 1 — both shorten to k~.)
+    want: {
+      union: 'live[k=v1 k~=v2] bin[k~:F(v2)] c[content]',
+      receipts: 'live[k=v1 k~=v2] bin[k~:F(v2)] c[content]',
+      '3way': 'live[k=v1 k~=v2] bin[k~:F(v2)] c[content]',
+    },
+  },
+  {
     // A restore does not always land at revivedIdFor(k): it walks past cards
     // deleted since and lands beside newer text. Only restoredAs finds it.
     name: 'B17 a copy follows a restore that landed elsewhere',
@@ -1402,9 +1423,15 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
     },
     {
       rule: 'twins a person deleted since the base stay deleted',
-      find: "      if (state === 'dead' && suppressDeleted && suppressDeleted(x, v)) return { twin: x, suppressed: 'deleted-twin' };",
+      find: "      if (state === 'dead' && suppressDeleted && suppressDeleted(x, v, side)) return { twin: x, suppressed: 'deleted-twin' };",
       replace: '',
       row: 'B15', options: { binMerge: 'receipts' },
+    },
+    {
+      rule: 'only the side that kept its own text resolves a conflict by deleting the twin',
+      find: "      if (side === 'theirs') return !!eOf(O, x);",
+      replace: "      if (side === 'theirs') return !!(eOf(O, x) || eOf(T, x));",
+      row: 'B25', options: { binMerge: 'receipts' },
     },
     {
       rule: 'unverified: a foreign entry never kills our card',

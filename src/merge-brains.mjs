@@ -287,14 +287,15 @@ function makeTwinPlacer({ seedIds, liveValues, slotState, suppressDeleted = null
     extras.push(ex); extraById.set(x, ex); indexTwin(x);
     return { twin: x };
   };
-  const place = (k, v, srcPos) => {
+  // `side`: the side whose copy holds `v` ('ours' | 'theirs'), when known.
+  const place = (k, v, srcPos, side = null) => {
     for (const x of (index.get(k) || [])) if (holds(x, v)) return { twin: x, existing: true };
     for (let n = 0; n < TWIN_SLOTS; n++) {
       const x = twinIdFor(k, v, n);
       const state = stateOf(x);
       if (state === 'alive') return { twin: x, existing: true, ...(holds(x, v) ? {} : { edited: true }) };
       if (state === 'free') return mint(x, k, v, srcPos);
-      if (state === 'dead' && suppressDeleted && suppressDeleted(x, v)) return { twin: x, suppressed: 'deleted-twin' };
+      if (state === 'dead' && suppressDeleted && suppressDeleted(x, v, side)) return { twin: x, suppressed: 'deleted-twin' };
     }
     let x;
     do x = `${k}__agconf_${Math.random().toString(16).slice(2, 14).padEnd(12, '0')}`; while (stateOf(x) !== 'free');
@@ -691,9 +692,16 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
     },
     // A twin a person deleted since the base, holding this very value: the
     // conflict was resolved by deleting it (critic A §8). Never in union mode.
-    suppressDeleted: (x, v) => {
+    // The resolution is the OTHER side's — the side that kept its own text on
+    // the card. A side that buried the twin while holding this very value on
+    // the card itself (a history restore that put it back there) did not
+    // reject it, and suppressing it would lose it (KLYPIX soak, seed 60466).
+    suppressDeleted: (x, v, side) => {
       const e = fate.get(x)?.entry;
-      return !!e && entryKind(e.meta) === 'F' && sameMeaning(e.json, v) && !!(eOf(O, x) || eOf(T, x)) && !eOf(B, x);
+      if (!e || entryKind(e.meta) !== 'F' || !sameMeaning(e.json, v) || eOf(B, x)) return false;
+      if (side === 'theirs') return !!eOf(O, x);
+      if (side === 'ours') return !!eOf(T, x);
+      return !!(eOf(O, x) || eOf(T, x));
     },
   });
   const repoint = (S, from, to) => {
@@ -720,7 +728,7 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
   const landIntoAlive = (mv, t) => {
     if (twins.holds(t, mv.v)) return arrive(mv, t);
     for (const x of twins.twinsOf(t)) if (twins.holds(x, mv.v)) return arrive(mv, x);
-    const r = twins.place(t, mv.v, mv.S.positions[mv.from] || O.positions[t] || T.positions[t]);
+    const r = twins.place(t, mv.v, mv.S.positions[mv.from] || O.positions[t] || T.positions[t], mv.side);
     conflicts.push({ id: t, kind: 'revived', keptLive: 'ours', from: mv.from, side: mv.side, ...r });
     if (r.suppressed) { drops.push({ ...mv, at: r.twin, kind: 'F', chain: true }); return; }
     arrive(mv, r.twin);
@@ -756,7 +764,8 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
 
   // ── Pass C: content, over the ids still alive ─────────────────────────────
   const merged = new Map();
-  const twinOf = (k, v, srcPos, kind) => conflicts.push({ id: k, kind, keptLive: 'ours', ...twins.place(k, v, srcPos) });
+  // Every content twin holds theirs' text (ours stays live on the card).
+  const twinOf = (k, v, srcPos, kind) => conflicts.push({ id: k, kind, keptLive: 'ours', ...twins.place(k, v, srcPos, 'theirs') });
   // E-1b: S holds a live twin of k whose value is `val` — the conflict was
   // already resolved on S's side, with `val` kept beside the card.
   const liveTwinHolding = (S, k, val) =>

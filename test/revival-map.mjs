@@ -80,17 +80,29 @@ const X2 = (await restoreFromGraveyard(X1, [K])).buffer;                        
 }
 {
     // One machine restored k (as kR); another edited k without seeing either.
-    // The merge sends that edit to kR, which holds other text, so it lands as
-    // kR's deterministic twin — and the map points there, not at kR.
+    // kR still holds exactly the value that edit was made on, so the merge
+    // lands the edit on kR (no conflict) — and the map points at kR.
     const editedB = await setText(X0, K, 'kilo — EDITED on the machine that never saw the delete');
     const vB = await itemJson(editedB, K);
     const m = (await mergeBrains({ base: X0, ours: X2, theirs: editedB, options: OPTS })).buffer;
+    ok((await itemJson(m, kR)) === vB && same(await revivalMap(m, new Map([[K, vB]])), { revived: [{ id: K, as: kR }], dropped: [] }),
+        'an edit of exactly what the restored card holds lands on it, and is followed there');
+}
+{
+    // The restored card was edited too (other text): the merge keeps the edit
+    // of k beside it as kR's deterministic twin — and the map points there.
+    const editedB = await setText(X0, K, 'kilo — EDITED on the machine that never saw the delete');
+    const vB = await itemJson(editedB, K);
+    const restoredThenEdited = await setText(X2, kR, 'kilo — edited after the restore');
+    const vR = await itemJson(restoredThenEdited, kR);
+    const m = (await mergeBrains({ base: X0, ours: restoredThenEdited, theirs: editedB, options: OPTS })).buffer;
     const twin = twinIdFor(kR, vB, 0);
     const toTwin = await revivalMap(m, new Map([[K, vB]]));
-    const toCard = await revivalMap(m, new Map([[K, vK]]));
+    const toCard = await revivalMap(m, new Map([[K, vR]]));
     ok((await itemJson(m, twin)) === vB && same(toTwin, { revived: [{ id: K, as: twin }], dropped: [] }),
         'a value routed beside a card holding other text is followed to its twin');
-    ok(same(toCard, { revived: [{ id: K, as: kR }], dropped: [] }), 'and the restored value still to the restored card');
+    ok((await itemJson(m, kR)) === vR, 'and the restored card keeps its own edit');
+    ok(same(toCard, { revived: [], dropped: [] }) || toCard.revived.every((x) => x.as === kR), 'and a value the card holds is never pointed at the twin');
 }
 
 // ── the negatives ────────────────────────────────────────────────────────────

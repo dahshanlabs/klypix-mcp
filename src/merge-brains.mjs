@@ -722,12 +722,25 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
     landed.add(t);
     arrive(mv, t);
   };
-  // A moved value NEVER overwrites a live card (the draft's p8a fold lost a
-  // sibling's edit that way): it matches the card or one of its twins, or it
-  // becomes a new deterministic twin.
+  // A moved value NEVER overwrites a live card holding something it has not
+  // seen (the draft's p8a fold lost a sibling's edit that way): it matches the
+  // card or one of its twins, or it becomes a new deterministic twin. One case
+  // is no conflict at all: the landing, on the other side, still holds exactly
+  // the value this side's edit was made on (its base value of the id it moves
+  // from), and this side does not hold the landing. The edit then lands on the
+  // card, as a one-sided change does in the 3-way — twinning it left an edit of
+  // the card's own text beside it (the KLYPIX soak's I9: an edit of a card a
+  // sync had meanwhile revived or a person restored). Never from foreign bytes.
+  const folded = new Map();          // landing id -> the move whose value it takes
   const landIntoAlive = (mv, t) => {
     if (twins.holds(t, mv.v)) return arrive(mv, t);
     for (const x of twins.twinsOf(t)) if (twins.holds(x, mv.v)) return arrive(mv, x);
+    const other = mv.side === 'ours' ? T : O;
+    const madeOn = baseItem(mv.from);
+    if (!unverified && madeOn != null && !live(mv.S, t) && live(other, t) && !folded.has(t) && sameMeaning(other.items[t], madeOn)) {
+      folded.set(t, mv);
+      return arrive(mv, t);
+    }
     const r = twins.place(t, mv.v, mv.S.positions[mv.from] || O.positions[t] || T.positions[t], mv.side);
     conflicts.push({ id: t, kind: 'revived', keptLive: 'ours', from: mv.from, side: mv.side, ...r });
     if (r.suppressed) { drops.push({ ...mv, at: r.twin, kind: 'F', chain: true }); return; }
@@ -777,7 +790,11 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
     const cb = baseItem(id);
     const srcPos = T.positions[id] || O.positions[id];
     let json, side;
-    if (inO && inT) {
+    const fold = folded.get(id);
+    if (fold) {
+      json = fold.v; side = fold.side;
+      if (side === 'theirs') delta.updated.push(id);
+    } else if (inO && inT) {
       const oChg = !cb || !sameMeaning(O.items[id], cb);
       const tChg = !cb || !sameMeaning(T.items[id], cb);
       const diverged = !sameMeaning(O.items[id], T.items[id]);

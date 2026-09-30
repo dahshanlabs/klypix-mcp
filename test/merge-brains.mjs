@@ -915,16 +915,19 @@ const B_ROWS = [
   {
     // A restore does not always land at revivedIdFor(k): it walks past cards
     // deleted since and lands beside newer text. Only restoredAs finds it.
+    // (Plain card JSON: a real card holds no id of its own, so the restored
+    // card holds exactly the value ours' edit was made on — the edit lands on
+    // it, no twin.)
     name: 'B17 a copy follows a restore that landed elsewhere',
     args: async () => ({
-      base: await side({ live: { txt_k: 'v0' } }),
-      ours: await side({ live: { txt_k: 'v1' } }),
-      theirs: await side({ live: { txt_elsewhere: 'v0' }, bin: { txt_k: Re(k0, 'v0', 'txt_elsewhere') } }),
+      base: await side({ live: { txt_k: pj('v0') } }),
+      ours: await side({ live: { txt_k: pj('v1') } }),
+      theirs: await side({ live: { txt_elsewhere: pj('v0') }, bin: { txt_k: Re(k0, 'v0', 'txt_elsewhere') } }),
     }),
     want: {
       union: 'live[elsewhere=v0 k=v1] bin[] c[]',
-      receipts: 'live[elsewhere=v0 elsewhere~=v1] bin[k:R] c[revived]',
-      '3way': 'live[elsewhere=v0 elsewhere~=v1] bin[k:R] c[revived]',
+      receipts: 'live[elsewhere=v1] bin[k:R] c[]',
+      '3way': 'live[elsewhere=v1] bin[k:R] c[]',
     },
   },
   {
@@ -1015,6 +1018,29 @@ const B_ROWS = [
       deletedIds: [kRev('v0')],
     }),
     want: { union: 'live[] bin[k:F(v0)] c[]', receipts: 'live[] bin[k:F(v0) k′:F(v1)] c[]', '3way': 'live[] bin[k:F(v0) k′:F(v1)] c[]' },
+  },
+  {
+    // Found by the simulator's soak (I9, seed 126): ours edited k (v9 → v15)
+    // while a sync elsewhere revived k's v9 at k′. k′ still holds exactly what
+    // ours edited: the edit lands on it (it was twinned beside it).
+    name: 'B26 an edit lands on the card it moved to when that card still holds the value it was made on',
+    args: async () => ({
+      base: await side({ live: { txt_k: pj('v9') } }),
+      ours: await side({ live: { txt_k: pj('v15') } }),
+      theirs: await side({ live: { [kRev('v0')]: pj('v9') }, bin: { txt_k: Fe(k0, 'v0') } }),
+    }),
+    want: { union: 'live[k=v15 k′=v9] bin[] c[]', receipts: 'live[k′=v15] bin[k:F(v0)] c[]', '3way': 'live[k′=v15] bin[k:F(v0)] c[]' },
+  },
+  {
+    // The landing was edited since the value ours' edit was made on: a real
+    // conflict, both kept.
+    name: 'B27 an edit beside a card edited since stays a twin',
+    args: async () => ({
+      base: await side({ live: { txt_k: pj('v9') } }),
+      ours: await side({ live: { txt_k: pj('v15') } }),
+      theirs: await side({ live: { [kRev('v0')]: pj('v12') }, bin: { txt_k: Fe(k0, 'v0') } }),
+    }),
+    want: { union: 'live[k=v15 k′=v12] bin[] c[]', receipts: 'live[k′=v12 k′~=v15] bin[k:F(v0)] c[revived]', '3way': 'live[k′=v12 k′~=v15] bin[k:F(v0)] c[revived]' },
   },
   {
     // Nothing in any bin: the option modes are the familiar 3-way.
@@ -1414,6 +1440,12 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
       find: "      if ((live(O, t) || sides.has('O')) && (live(T, t) || sides.has('T'))) heldUnderEarlierId.add(t);",
       replace: '      heldUnderEarlierId.add(t);',
       row: 'B24', options: { binMerge: 'receipts' },
+    },
+    {
+      rule: 'an edit of exactly what the landing holds lands on it',
+      find: "    if (!unverified && madeOn != null && !live(mv.S, t) && live(other, t) && !folded.has(t) && sameMeaning(other.items[t], madeOn)) {",
+      replace: '    if (false) {',
+      row: 'B26', options: { binMerge: 'receipts' },
     },
     {
       rule: 'a restore sends the copy after the card',

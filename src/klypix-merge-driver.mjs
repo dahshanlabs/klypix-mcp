@@ -124,7 +124,8 @@ try {
   // already says is kept off the card (both texts stay): said, never silent.
   const heldInTwin = conflicts.filter((c) => c.kind === 'change-held-in-twin').length;
   // An embedded file both branches changed has no twin: one version is kept.
-  const filesPicked = conflicts.filter((c) => c.kind === 'asset').length;
+  const filesOurs = conflicts.filter((c) => c.kind === 'asset' && c.kept === 'ours').length;
+  const filesTheirs = conflicts.filter((c) => c.kind === 'asset' && c.kept !== 'ours').length;
   // Both branches renamed the brain (or one did and there is no base): one
   // name is kept. The committer sees only this line, so it says which.
   const title = conflicts.find((c) => c.kind === 'title' || c.kind === 'title-no-base');
@@ -142,17 +143,15 @@ try {
   if (twinsMade) bits.push(`${twinsMade} conflict twin(s) preserved`);
   if (heldInTwin) {
     bits.push(heldInTwin === 1
-      ? '1 card kept its text — the other version is in the conflict copy beside it (delete the one you do not want)'
-      : `${heldInTwin} cards kept their text — the other versions are in the conflict copies beside them (delete the ones you do not want)`);
+      ? '1 change to a card was not applied: its conflict copy already holds that text (both are on the board — delete the one you do not want)'
+      : `${heldInTwin} changes to cards were not applied: their conflict copies already hold those texts (both are on the board — delete the ones you do not want)`);
   }
-  if (filesPicked) {
-    bits.push(filesPicked === 1
-      ? "1 embedded file changed on both branches — one version kept (the other is in the other branch's history)"
-      : `${filesPicked} embedded files changed on both branches — one version of each kept (the others are in the other branch's history)`);
-  }
+  if (filesOurs) bits.push(`${filesOurs} embedded file(s) differ on the two branches — this branch's version kept (the other branch's stays in its history)`);
+  if (filesTheirs) bits.push(`${filesTheirs} embedded file(s) differ on the two branches — the other branch's version kept (this branch's stays in its history)`);
   if (title) {
-    const kept = title.kept === 'ours' ? title.ours : title.theirs, other = title.kept === 'ours' ? title.theirs : title.ours;
-    bits.push(`brain title "${kept}" kept (the other branch had "${other}")`);
+    bits.push(title.kept === 'ours'
+      ? `this branch's title "${title.ours}" kept (the other branch had "${title.theirs}")`
+      : `the other branch's title "${title.theirs}" kept (this branch had "${title.ours}")`);
   }
   console.error(`klypix-merge: ${realPath || 'brain'} merged${bits.length ? ' — ' + bits.join(', ') : ''}`);
   process.exit(0);

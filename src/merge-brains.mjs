@@ -100,20 +100,42 @@
 //     twins hold both, one of the two by the texts alone. This is more than a
 //     tie-break: it also keeps a change ONE side made off the card when that
 //     change is the twin's text, and says so (`change-held-in-twin`). Pass C
-//     says why, and how the desktop lets a person take that text.
-//   • A card (or a line or a stroke) is never left under a container that is
-//     not on the board: it goes where the other side has it, or to the top
-//     level. Nor in a loop
-//     of containers (each side nested one group into the other): the loop is
-//     opened at one member, the same one on every machine.
+//     says why, and how the desktop lets a person take that text. ("Holds" is
+//     the whole card's meaning — sameMeaning — not its text alone: a twin that
+//     differs from the card's new value in any other field does not hold it,
+//     and the change lands.)
+//   • A card is never left under a container that is not on the board: it
+//     follows a container this merge moved to a new id, else goes where the
+//     other side has it, else to the top level (a line or a stroke: the moved
+//     container, or the top level). Nor in a loop of containers (each side
+//     nested one group into the other): the loop is opened at one member, the
+//     same one on every machine.
+//   • A conflict twin the desktop buried as SETTLED (its card had been made to
+//     say what it held; receipt cause conflict-settled) counts as that side's
+//     change of the card, when the burial was made since the base. The
+//     settling side's base can predate the conflict (the twin came by the
+//     other transport, or a base write failed): its choice then read as
+//     "unchanged", the other side's text as a one-sided change, and the
+//     choice was undone with the chosen text live nowhere. Read as changed on
+//     both sides it is a conflict like any other: both texts stay.
+//   • Arrows, lines and strokes are written in id order, and of two arrows
+//     that mean the same the one with the smaller id stays: theirs-first
+//     wrote a different array on every machine, and git and Brain Sync then
+//     rewrote each other's file for ever.
 //   STILL OPEN with two transports on one brain (git and Brain Sync): a value
 //   only ONE side changed is decided from that transport's base, and the two
-//   do not share one. With a third value of one field and the two transports
-//   strictly alternating, a stacking key, a container, an arrow label, a
-//   stroke, a setting or the title can be handed back and forth; nothing is
-//   lost (both values are live, one in the repo and one in the cloud) and two
-//   syncs with no git merge between them end it. Closing it needs an edit
-//   counter kept in the file (Stage 3).
+//   do not share one. Two values of one field that pass each other between
+//   the transports are enough (no third value, no driver merge): a card's
+//   place, container or stacking key, an arrow label, a stroke, a setting,
+//   the title or an embedded file's bytes can then be handed back and forth,
+//   each machine relaying one transport's value into the other; so can a
+//   card's text once its conflict twin is gone (deleted or settled) while the
+//   two transports still hold different texts. Nothing is lost (both values
+//   are live, one in the repo and one in the cloud). It ends when each
+//   transport is brought to rest in turn — every machine syncs until none
+//   writes, then every machine pulls and pushes until none merges; syncing
+//   twice is not enough on its own. Closing it needs an edit counter kept in
+//   the file (Stage 3).
 //   • The merge proves itself: every removal of a live card leaves an entry
 //     (E-12) and every moved value is live or its bytes are in the bin (E-13).
 
@@ -407,7 +429,7 @@ function descendantPosition(O, T, B, id, canonical = false) {
 // brain with thousands of simultaneous conflicts. `liveValues(x)` and
 // `slotState(x)` describe the merge's own cards; twins minted here are tracked
 // by the placer itself.
-function makeTwinPlacer({ seedIds, liveValues, slotState, suppressDeleted = null }) {
+function makeTwinPlacer({ seedIds, liveValues, slotState, suppressDeleted = null, keptValues = null, heldAtBase = null }) {
   const index = new Map();
   const extras = [];                 // twins minted by this merge, in mint order
   const extraById = new Map();
@@ -427,12 +449,26 @@ function makeTwinPlacer({ seedIds, liveValues, slotState, suppressDeleted = null
     return { twin: x };
   };
   // `side`: the side whose copy holds `v` ('ours' | 'theirs'), when known.
-  const place = (k, v, srcPos, side = null) => {
-    for (const x of (index.get(k) || [])) if (holds(x, v)) return { twin: x, existing: true };
+  // `strict` (a content conflict's twin): a twin both sides hold with different
+  // texts is being decided by this very merge, so only what it holds AFTER
+  // the merge counts as a home for v (`keptValues`). Read from either side, a
+  // copy one side had rewritten still "held" the text the merge was about to
+  // replace in it, and that text ended on no card, in no twin and in no bin
+  // (review round 6).
+  const place = (k, v, srcPos, side = null, strict = false) => {
+    const has = (x) => (strict && keptValues && !extraById.has(x) ? keptValues(x).some((val) => sameMeaning(val, v)) : holds(x, v));
+    for (const x of (index.get(k) || [])) if (has(x)) return { twin: x, existing: true };
     for (let n = 0; n < TWIN_SLOTS; n++) {
       const x = twinIdFor(k, v, n);
       const state = stateOf(x);
-      if (state === 'alive') return { twin: x, existing: true, ...(holds(x, v) ? {} : { edited: true }) };
+      if (state === 'alive') {
+        if (has(x)) return { twin: x, existing: true };
+        // It says something else: a person edited it and v counts as seen —
+        // unless the edit was made since the base (the base's copy still held
+        // v): then this merge is what replaces v, and v still needs a home.
+        if (strict && heldAtBase && heldAtBase(x, v)) continue;
+        return { twin: x, existing: true, edited: true };
+      }
       if (state === 'free') return mint(x, k, v, srcPos);
       if (state === 'dead' && suppressDeleted && suppressDeleted(x, v, side)) return { twin: x, suppressed: 'deleted-twin' };
     }
@@ -979,6 +1015,21 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
   const twins = makeTwinPlacer({
     seedIds: [...O.ids, ...T.ids],
     liveValues: liveValuesAt,
+    // What a twin holds after this merge: both copies equal → that value;
+    // one side changed it since the base → that side's; both did, or nothing
+    // says → both stay live somewhere.
+    keptValues: (x) => {
+      if (!fate.get(x)?.alive) return [];
+      const lo = live(O, x), lt = live(T, x);
+      if (lo && lt && !sameMeaning(O.items[x], T.items[x])) {
+        const bx = baseItem(x);
+        if (bx && !unverified && sameMeaning(O.items[x], bx)) return [T.items[x]];
+        if (bx && !unverified && sameMeaning(T.items[x], bx)) return [O.items[x]];
+        return [O.items[x], T.items[x]];
+      }
+      return lo ? [O.items[x]] : lt ? [T.items[x]] : [];
+    },
+    heldAtBase: (x, v) => !!B && B.items[x] != null && sameMeaning(B.items[x], v),
     slotState: (x) => {
       const f = fate.get(x);
       if (!f) return 'free';
@@ -1115,7 +1166,17 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
   // ── Pass C: content, over the ids still alive ─────────────────────────────
   const merged = new Map();
   // Every content twin holds theirs' text (ours stays live on the card).
-  const twinOf = (k, v, srcPos, kind) => conflicts.push({ id: k, kind, keptLive: 'ours', ...twins.place(k, v, srcPos, 'theirs') });
+  const twinOf = (k, v, srcPos, kind) => conflicts.push({ id: k, kind, keptLive: 'ours', ...twins.place(k, v, srcPos, 'theirs', true) });
+  // A conflict twin a person SETTLED since the base (the desktop buried it
+  // because its card had been made to say what it held: receipt cause
+  // conflict-settled) is that side's change of the card, whatever the base
+  // says: card id -> the sides that settled it and still show the settled text.
+  const settledSince = new Map();
+  for (const [S, name] of [[O, 'ours'], [T, 'theirs']]) for (const [x, e] of Object.entries(S.graveyard || {})) {
+    if (e?.meta?.deletion?.cause !== 'conflict-settled' || e.json == null || eOf(B, x)) continue;
+    const k = TWIN_PARENT_RE.exec(x)?.[1];
+    if (k && live(S, k) && sameMeaning(S.items[k], e.json)) (settledSince.get(k) || settledSince.set(k, new Set()).get(k)).add(name);
+  }
   // E-1b: S holds a live twin of k whose value is `val` — the conflict was
   // already resolved on S's side, with `val` kept beside the card.
   const liveTwinHolding = (S, k, val) =>
@@ -1149,8 +1210,8 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
       json = fold.v; side = fold.side;
       if (side === 'theirs') delta.updated.push(id);
     } else if (inO && inT) {
-      const oChg = !cb || !sameMeaning(O.items[id], cb);
-      const tChg = !cb || !sameMeaning(T.items[id], cb);
+      const oChg = !cb || !sameMeaning(O.items[id], cb) || !!settledSince.get(id)?.has('ours');
+      const tChg = !cb || !sameMeaning(T.items[id], cb) || !!settledSince.get(id)?.has('theirs');
       const diverged = !sameMeaning(O.items[id], T.items[id]);
       // A text of this card that a twin beside it holds too (on either side,
       // and still after this merge) is safe wherever the card goes.
@@ -1210,7 +1271,9 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
         // E-1b: theirs already resolved this very conflict the other way round
         // (its twin holds our text) and ours has not — adopt that resolution
         // instead of twinning a second time. Both texts stay live.
-        const adoptTwin = opt.adoptResolvedConflicts ? liveTwinHolding(T, id, O.items[id]) : null;
+        const adoptTwin0 = opt.adoptResolvedConflicts ? liveTwinHolding(T, id, O.items[id]) : null;
+        // ...and only if this merge leaves our text in that twin: ours did not change the twin since.
+        const adoptTwin = adoptTwin0 && (!live(O, adoptTwin0) || sameMeaning(O.items[adoptTwin0], T.items[adoptTwin0])) ? adoptTwin0 : null;
         if (adoptTwin && !liveTwinHolding(O, id, T.items[id])) {
           json = T.items[id]; side = 'theirs'; delta.updated.push(id);
           conflicts.push({ id, kind: 'content', keptLive: 'theirs', twin: adoptTwin, adopted: true });
@@ -1328,6 +1391,11 @@ async function finishMerge(B, O, T, opt, run) {
 
   // ── Union connections / lines / strokes by id; drop dangling connections ──
   const byId = (arr) => { const m = new Map(); for (const x of arr) if (x && x.id) m.set(x.id, x); return m; };
+  // The option modes write arrows, lines and strokes in id order. Theirs-first
+  // (theirs' ids, then ours-only) is a different array on every machine: with
+  // git and Brain Sync on one brain each rewrote the file the other wrote, on
+  // every round, after each machine had drawn ONE new arrow (review round 6).
+  const inIdOrder = (xs) => (opt.binMerge !== 'union' ? xs.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)) : xs);
   const liveIds = new Set(order);
   const tConn = byId(T.connections);
   const connMap = new Map(tConn);
@@ -1379,7 +1447,7 @@ async function finishMerge(B, O, T, opt, run) {
   // that dropped a redundant edge in-app used to see it resurrected from disk
   // by this union — as a byte-identical twin arrow. Never meaningful to keep.
   const seenEdge = new Set();
-  const connections = [...connMap.values()].filter(c => {
+  const connections = inIdOrder([...connMap.values()]).filter(c => {
     if (!(liveIds.has(c.fromId) && liveIds.has(c.toId))) return false;
     const k = `${c.fromId}|${c.toId}|${c.relationship || ''}|${c.label || ''}`;
     if (seenEdge.has(k)) return false;
@@ -1389,7 +1457,7 @@ async function finishMerge(B, O, T, opt, run) {
   const unionById = (key) => {
     const m = new Map([...byId(T[key]), ...byId(O[key])]);
     if (threeWay) for (const [id, v] of pickById(key)) m.set(id, v);
-    return [...m.values()];
+    return inIdOrder([...m.values()]);
   };
   // A line or a stroke drawn inside a container that is not on the board
   // (deleted on the other side) is drawn nowhere, like a card: it follows a
@@ -1420,6 +1488,14 @@ async function finishMerge(B, O, T, opt, run) {
       assets[p] = ours ? ob : tb;
       conflicts.push({ id: null, kind: 'asset', path: p, kept: ours ? 'ours' : 'theirs' });
     }
+  }
+  // With no base nothing says who repacked a file: theirs' bytes, as ever —
+  // but SAID, so the machine whose bytes go keeps a restore point and the
+  // driver's summary names it (a first sync replaced a repacked file with the
+  // cloud's older bytes and told nobody).
+  if (!B && opt.binMerge !== 'union') for (const [p, ob] of Object.entries(O.assets)) {
+    const tb = T.assets[p];
+    if (tb && Buffer.compare(ob, tb) !== 0) conflicts.push({ id: null, kind: 'asset', path: p, kept: Buffer.compare(assets[p], ob) === 0 ? 'ours' : 'theirs' });
   }
 
   // ── Build merged zip ──────────────────────────────────────────────────────

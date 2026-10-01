@@ -446,6 +446,59 @@ ok(listBrainHistory(brain, { home }).length === beforeShrink + 1, 'the shrink sn
       'E-9: a twin slot with a deletion on record is skipped, and the deleted text stays in the bin');
   }
 
+  // What belongs to today's file stays with it: a point taken before the brain
+  // was linked to the cloud must not unlink it. And the point's own bin fills
+  // in an entry today's copy has no record of (an older writer dropped it), so
+  // a delete on record at the point stays a delete, with its bytes. Each rule
+  // also runs through a copy of the engine without it.
+  {
+    const MUT = path.join(root, 'test', `.mutants-hist-${process.pid}`);
+    const SRC = fs.readFileSync(path.join(root, 'src', 'merge-brains.mjs'), 'utf8');
+    const without = async (name, find) => {
+      if (SRC.split(find).length !== 2) return null;
+      fs.mkdirSync(MUT, { recursive: true });
+      const file = path.join(MUT, `${name}.mjs`);
+      fs.writeFileSync(file, SRC.replace(find, '').replaceAll("from './", "from '../../src/"));
+      return import(pathToFileURL(file).href);
+    };
+    const withManifest = (buf, patch) => editZip(buf, async (zip) => {
+      const m = JSON.parse(await zip.file('manifest.json').async('string'));
+      for (const [key, value] of Object.entries(patch)) { if (value === undefined) delete m[key]; else m[key] = value; }
+      zip.file('manifest.json', JSON.stringify(m));
+    });
+    const dropEntry = (buf, id) => editZip(buf, async (zip) => {
+      const index = JSON.parse(await zip.file('graveyard.json').async('string'));
+      delete index.entries[id];
+      zip.file('graveyard.json', JSON.stringify(index));
+      zip.remove(`graveyard/${shard(id)}/${id}.json`);
+    });
+    try {
+      const linked = await withManifest(pre, { cloud: { id: 'c-today' }, kind: 'brain' });
+      const unlinked = await withManifest(point, { cloud: undefined, kind: undefined });
+      const keeps = async (engine) => {
+        const r = await engine.restoreSnapshotAsMerge({ current: linked, snapshot: unlinked, now: t + 49_000 });
+        const m = JSON.parse(await (await JSZip.loadAsync(r.buffer)).file('manifest.json').async('string'));
+        return m.cloud?.id === 'c-today' && m.kind === 'brain';
+      };
+      ok(await keeps({ restoreSnapshotAsMerge }), "E-9: the restore keeps today's cloud link and kind, which the point predates");
+      const m1 = await without('keep-cloud-kind', "  for (const key of ['cloud', 'kind']) if (C.manifest?.[key] !== undefined) manifest[key] = C.manifest[key];");
+      ok(m1 && !(await keeps(m1)), 'E-9 mutation: without that rule the restore unlinks the brain');
+
+      // B is in the bin at the "point" (pre); today's copy has no record of it.
+      const lacking = await dropEntry(pre, B);
+      const fills = async (engine) => {
+        const r = await engine.restoreSnapshotAsMerge({ current: lacking, snapshot: pre, now: t + 49_500 });
+        const g = await binOf(r.buffer);
+        return entryKind(g.entries[B]) === 'F' && !!(await g.body(B))?.includes('bravo:') && !(await liveOf(r.buffer)).some((c) => c.id === B);
+      };
+      ok(await fills({ restoreSnapshotAsMerge }), "E-9: the point's own entry fills in a card today's copy has no record of: the delete stays, with its bytes");
+      const m2 = await without('snapshot-entries', '    if (!bin.has(id) && !liveIn(C, id) && !resultIds.has(id)) bin.set(id, g);');
+      ok(m2 && !(await fills(m2)), "E-9 mutation: without that rule the point's delete leaves no record");
+    } finally {
+      fs.rmSync(MUT, { recursive: true, force: true });
+    }
+  }
+
   // Restoring the same point again changes nothing.
   const again = await restoreBrainSnapshot(brain5, pointSnap.id, { home, now: t + 42_000, parse: parseKlypix });
   ok(again.ok && again.mode === 'merge' && again.buried.length === 0 && again.reverted.length === 0

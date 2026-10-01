@@ -16,7 +16,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { execFileSync } from 'child_process';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 import JSZip from 'jszip';
 import { buildKlypixMap } from '../src/klypix-core.mjs';
 import {
@@ -148,6 +148,39 @@ ok(again.restored.length === 0 && again.skipped[0]?.reason === `already restored
   const twin = other.restored[0]?.restoredAs;
   ok(twin === twinIdFor(landing, deleted.body) && (await idsOf(other.buffer)).order.includes(landing) && (await idsOf(other.buffer)).order.includes(twin),
     'a landing id live with other text keeps that text and takes the restored card beside it as a twin');
+
+  // A landing id with a bin entry of its own: a merge rescued an edit of the
+  // card there, and a person deleted that since. Landing on it would put back
+  // a card every other copy holds a deletion for, and they would delete it
+  // again; the walk follows the entry to that card's own revival instead. A
+  // restore receipt there sends it on to where that card went.
+  const rescued = await put('an edit a merge rescued there');
+  const gone = (await mergeBrains({ base: rescued, ours: rescued, theirs: rescued, deletedIds: [landing] })).buffer;
+  const atLanding = await rawBin(gone, landing);
+  const next = revivedIdFor(landing, atLanding.meta, atLanding.body);
+  const brought = (await restoreFromGraveyard(gone, [landing])).buffer;
+  const walks = async (restore) => {
+    const f = await restore(gone, [victim.id]);
+    const r = await restore(brought, [victim.id]);
+    const fOrder = (await idsOf(f.buffer)).order;
+    return f.restored[0]?.restoredAs === next && fOrder.includes(next) && !fOrder.includes(landing)
+      && String(atLanding.body).includes('rescued')
+      && r.restored[0]?.restoredAs === twinIdFor(next, deleted.body);
+  };
+  ok(await walks(restoreFromGraveyard),
+    "a landing id with its own bin entry is never landed on: a delete there is followed to that card's revival, a restore receipt to where it went");
+  // The same restore through a copy of the bin tools without that step.
+  const MUT = path.join(ROOT, 'test', `.mutants-gy-${process.pid}`);
+  try {
+    const src = fs.readFileSync(path.join(ROOT, 'src', 'brain-graveyard.mjs'), 'utf8');
+    const find = "as = entryKind(next) === 'R' ? String(next.restoredAs) : revivedIdFor(as, next, await binBody(as));";
+    fs.mkdirSync(MUT, { recursive: true });
+    fs.writeFileSync(path.join(MUT, 'brain-graveyard.mjs'), src.replace(find, 'return { as, already: false };').replaceAll("from './", "from '../../src/"));
+    const M = src.split(find).length === 2 ? await import(pathToFileURL(path.join(MUT, 'brain-graveyard.mjs')).href) : null;
+    ok(M && !(await walks(M.restoreFromGraveyard)), 'mutation: a walk that stops at a landing with its own entry fails that check');
+  } finally {
+    fs.rmSync(MUT, { recursive: true, force: true });
+  }
 }
 
 // A card and its container restored in the same call: the card finds its

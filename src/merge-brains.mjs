@@ -893,11 +893,26 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
   // the deletion it undid, minted from those bytes), so a copy of the card it
   // landed on can be checked against them: card id -> [deleted id, rid].
   const restoredBytes = new Map();
+  const restoredHere = new Map([[O, new Set()], [T, new Set()]]);   // side -> the cards its OWN bin says it restored
   for (const S of [O, T, B]) for (const [d, e] of Object.entries(S?.graveyard || {})) {
     const at = e?.meta && entryKind(e.meta) === 'R' ? e.meta.restoredAs : null;
-    if (typeof at === 'string' && typeof e.meta.rid === 'string') (restoredBytes.get(at) || restoredBytes.set(at, []).get(at)).push([d, e.meta.rid]);
+    if (typeof at !== 'string' || typeof e.meta.rid !== 'string') continue;
+    (restoredBytes.get(at) || restoredBytes.set(at, []).get(at)).push([d, e.meta.rid]);
+    restoredHere.get(S)?.add(at);
   }
   const asRestored = (id, v) => (restoredBytes.get(id) || []).some(([d, rid]) => fullEntryRid(d, v) === rid);
+  // The other side's text is an edit of the restored bytes only when that
+  // side restored the card itself: a rescue of an older text lands on the
+  // very id a restore of that deletion uses (both come from revivedIdFor), and
+  // a machine with no receipt for it holds a stale value, not an edit. Nor
+  // when a value this merge moved has arrived there (landed, or matched the
+  // copy holding the restored bytes): replacing that copy loses it.
+  const arrivedAt = new Set(delta.revived.map((r) => r.as));
+  const editsItsRestore = (id) => {
+    if (arrivedAt.has(id)) return false;
+    const o = asRestored(id, O.items[id]), t = asRestored(id, T.items[id]);
+    return o !== t && restoredHere.get(o ? T : O).has(id);
+  };
   for (const [id, f] of fate) {
     if (!f.alive) continue;
     const inO = live(O, id), inT = live(T, id);
@@ -932,7 +947,7 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
           json = O.items[id]; side = 'ours';
           twinOf(id, T.items[id], srcPos, 'content-unverified');
         } else { json = T.items[id]; side = 'theirs'; delta.updated.push(id); }
-      } else if (!cb && diverged && B && !unverified && asRestored(id, O.items[id]) !== asRestored(id, T.items[id])) {
+      } else if (!cb && diverged && B && !unverified && editsItsRestore(id)) {
         // One restore made on both sides — the same deletion, so the same id —
         // is new on both since the base, yet its receipt names the bytes it
         // came back with: the side still holding them has not touched the

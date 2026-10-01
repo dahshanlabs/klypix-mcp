@@ -640,6 +640,7 @@ const kChain = (text) => {
 };
 const EDGE_ARGS = [];   // the B-E case, for its S2-X mutation
 const PURGE_GROUPINGS = [];   // the B-P check, for its S2-X mutation
+const N9_CHECK = [];          // the N9 case, for its S2-X mutation
 
 const withBin = async (buffer, bin) => {
   const { zip } = await parseKlypix(buffer);
@@ -1465,6 +1466,21 @@ const N_ROWS = [
     want: { theirs: 'live[k′=v3] bin[k:R] c[]', twin: 'live[k′=v3] bin[k:R] c[]' },
   },
   {
+    // Found by the certifying soak (seed 179 and 8 more): ours restored k
+    // (k′, its receipt in ours' bin). A machine with no base after a crash
+    // still held a stale k = v2 and met a cloud where k was deleted with v8:
+    // it rescued v2 to revivedIdFor(k, F(v8)) — the very id ours' restore
+    // uses — and holds only the deletion. Theirs never restored k, so its v2
+    // is no edit of the restored bytes: both texts stay (taking it lost v8).
+    name: 'N8 a value rescued to the id a restore uses is no edit of the restored bytes',
+    args: async () => ({
+      base: await side({ bin: { txt_k: pFe(k0, 'v8') } }),
+      ours: await side({ live: { [kRestoredAs('v8')]: pj('v8') }, bin: { txt_k: pRe(k0, 'v8', kRestoredAs('v8')) } }),
+      theirs: await side({ live: { [kRestoredAs('v8')]: pj('v2') }, bin: { txt_k: pFe(k0, 'v8') } }),
+    }),
+    want: { theirs: 'live[k′=v2] bin[k:R] c[]', twin: 'live[k′=v8 k′~=v2] bin[k:R] c[content-new-both]' },
+  },
+  {
     // Both sides edited the restored card: a real conflict.
     name: 'N7 a card both sides restored and both edited is new on both',
     args: async () => ({
@@ -1486,6 +1502,34 @@ const N_ROWS = [
   ok((await liveIds(r1.buffer)).includes(x), 'N2: the twin is the deterministic slot for theirs\' value');
   const r2 = await mergeBrains({ base: args.base, ours: r1.buffer, theirs: args.theirs, options: { binMerge: 'receipts', newOnBothSides: 'twin' } });
   ok((await twinsOf(r2.buffer, 'txt_n')).length === 1, 'N2: re-merging the same pair keeps one twin (idempotent)');
+  // N8 the other way round: the rescued value is ours, the restore theirs.
+  const n8 = await N_ROWS.find((x) => x.name.startsWith('N8')).args();
+  for (const binMerge of ['receipts', '3way']) {
+    const got = await summarize(await mergeBrains({ base: n8.base, ours: n8.theirs, theirs: n8.ours, options: { binMerge, newOnBothSides: 'twin' } }));
+    ok(got === 'live[k′=v2 k′~=v8] bin[k:R] c[content-new-both]', `N8 swapped (${binMerge}): the restored v8 and the rescued v2 both survive (${got})`);
+  }
+  // Found by the certifying soak (seed 78, a fleet with a legacy machine): a
+  // stale copy of the old id routed through the restore receipt arrived at
+  // k′ by matching the copy that holds the restored bytes, and theirs had
+  // edited its own restore there. Taking theirs' text replaced the copy the
+  // moved value had arrived at, and the merge threw (E-13). A value this merge
+  // moved to the card keeps the card's copy; theirs' edit stays beside it.
+  const n9 = async (engine) => {
+    const kR = kRestoredAs('v0');
+    const a = {
+      base: await side({ bin: { txt_k: pFe(k0, 'v0') } }),
+      ours: await side({ live: { txt_k: pj('v0'), [kR]: pj('v0') }, bin: { txt_k: pRe(k0, 'v0', kR) } }),
+      theirs: await side({ live: { [kR]: pj('v3') }, bin: { txt_k: pRe(k0, 'v0', kR) } }),
+    };
+    const out = [];
+    for (const binMerge of ['receipts', '3way']) {
+      try { out.push(await summarize(await engine.mergeBrains({ ...a, options: { binMerge, newOnBothSides: 'twin' } }))); } catch (e) { out.push(`threw ${e.message}`); }
+    }
+    return out;
+  };
+  const n9got = await n9({ mergeBrains });
+  ok(n9got.every((g) => g === 'live[k′=v0 k′~=v3] bin[k:R] c[content-new-both]'), `N9: a value moved onto a restore keeps it; the edit made on the restore stays beside it, nothing lost and no throw (${n9got.join(' | ')})`);
+  N9_CHECK.push(n9);
 }
 
 // ── S2-M manifestMerge (E-7) ──────────────────────────────────────────────────
@@ -1777,9 +1821,21 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
     },
     {
       rule: "the side still holding a restore's bytes has not edited the card",
-      find: '      } else if (!cb && diverged && B && !unverified && asRestored(id, O.items[id]) !== asRestored(id, T.items[id])) {',
+      find: '      } else if (!cb && diverged && B && !unverified && editsItsRestore(id)) {',
       replace: '      } else if (false) {',
       row: 'N5', options: { binMerge: 'receipts', newOnBothSides: 'twin' }, key: 'twin',
+    },
+    {
+      rule: 'only a side that restored the card itself edited its restore',
+      find: '    return o !== t && restoredHere.get(o ? T : O).has(id);',
+      replace: '    return o !== t;',
+      row: 'N8', options: { binMerge: 'receipts', newOnBothSides: 'twin' }, key: 'twin',
+    },
+    {
+      rule: 'a value moved onto a restore is never replaced by the other side\'s edit',
+      find: '    if (arrivedAt.has(id)) return false;',
+      replace: '',
+      n9: true,
     },
     {
       rule: 'a restore sends the copy after the card',
@@ -1830,6 +1886,12 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
     if (m.groupings) {
       const agree = await PURGE_GROUPINGS[0](engine);
       ok(!agree, `X "${m.rule}" off ⇒ check B-P's groupings disagree${!agree ? '' : ' — THEY DID NOT'}`);
+      continue;
+    }
+    if (m.n9) {
+      const got = await N9_CHECK[0](engine);
+      const broke = got.some((g) => g !== 'live[k′=v0 k′~=v3] bin[k:R] c[content-new-both]');
+      ok(broke, `X "${m.rule}" off ⇒ case N9 fails${broke ? ` (mutant: ${got.join(' | ')})` : ' — IT DID NOT'}`);
       continue;
     }
     if (m.edge2) {

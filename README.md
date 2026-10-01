@@ -567,7 +567,9 @@ was judged worse — but it is a real limit, not a guarantee.
 
 ### Restore points
 
-Merging, tidying and gardening are built to keep every card nobody deleted. What none of them can undo is a
+Merging, tidying and gardening are built to keep every card nobody deleted (one deliberate exception: a
+card deleted permanently leaves every copy that syncs, an edited copy included, and the merge reports
+that edit). What none of them can undo is a
 *deliberate-looking* deletion: you select a dozen cards, delete them, and save. That is not a bug
 to prevent — a brain has to stay correctable, and an uncorrectable memory is worse than none — but
 it deserves a way back, because the brain is **co-owned**: hooks, the MCP server, commit capture

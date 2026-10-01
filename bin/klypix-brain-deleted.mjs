@@ -135,7 +135,8 @@ const res = await lockedWrite('graveyard-purge', async (buf) => {
 if (res.busy) refuseBusy();
 if (!res.purged.length) { console.log('Nothing matched — nothing purged.'); process.exit(0); }
 console.log(`Purged ${res.purged.length} deleted card(s) permanently from ${path.basename(brainPath)}.`);
-console.log('The delete itself is kept as a receipt with no content, so every copy of this brain drops the card too.');
+console.log('The delete itself is kept as a receipt with no content, so copies that sync with this version or later drop the card too.');
+console.log('An edit of it that a merge kept as a separate card elsewhere is not removed: purge that card as well.');
 console.log('Not its attachments: an image or file a purged card held stays in the brain\'s assets, in this file and every copy.');
 console.log('Note: this removes them from the file, not from git history — a secret committed earlier is still in past commits.');
 console.log(`The pre-purge state is a restore point, and the only undo: npx klypix-mcp brain-history list --brain "${brainPath}"`);

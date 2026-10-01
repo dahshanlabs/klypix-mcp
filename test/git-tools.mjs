@@ -285,6 +285,25 @@ console.log('\n— E-10: the driver asks for the bin-aware rules —');
       `a twin that already exists is not counted again, and the line claims nothing about losslessness (got: ${again.err.trim()})`);
   }
 
+  // A purge that reaches a restore takes an edit someone made on the restored
+  // card and then deleted (it sat in their Deleted cards). The line names it
+  // with the other edits a purge took, whichever branch is ours.
+  {
+    const F0 = binEntryFor({ id: 'txt_k', json: cj('txt_k', 'k as deleted'), now: 1000 });
+    const kR = revivedIdFor('txt_k', F0.meta, F0.json);
+    const O = await withEntry(seed, 'txt_k', F0.meta, F0.json);
+    const F1 = binEntryFor({ id: kR, json: cj(kR, 'typed into the restored card, then deleted'), now: 1500 });
+    const restored = await withEntry(await withEntry(O, 'txt_k', contentFreeReceiptFor('txt_k', F0, { kind: 'restored', restoredAs: kR, now: 2000 }), PURGED_BODY), kR, F1.meta, F1.json);
+    const purgedK = await withEntry(O, 'txt_k', contentFreeReceiptFor('txt_k', F0, { kind: 'purged', now: 2000 }), PURGED_BODY);
+    for (const [label, A, B] of [['ours', restored, purgedK], ['theirs', purgedK, restored]]) {
+      const r = drive(DRIVER, O, A, B);
+      const line = r.err.trim();
+      ok(r.code === 0 && line === 'klypix-merge: brain.klypix merged — 1 edited copy of a permanently deleted card dropped (still in git history)'
+        && entryKind((await entries(r.out))[kR] ?? {}) === 'P',
+      `the driver's summary names an edit a purge took from the restoring branch's Deleted cards (restore on ${label}; got: ${line})`);
+    }
+  }
+
   // A title renamed on one branch is not lost to the other's unchanged title.
   {
     const O = await withTitle(seed, 'Original title');

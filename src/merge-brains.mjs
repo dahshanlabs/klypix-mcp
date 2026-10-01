@@ -71,7 +71,9 @@
 //     receipt is contradicted and an older machine sees an ordinary add.
 //   • A purge reaches the restores of its card the purging machine never saw:
 //     every landing a restore receipt names dies under a receipt derived from
-//     the purge (P-a: a purge wins over every copy).
+//     the purge (P-a: a purge wins over every copy). Text typed into a
+//     landing goes too, on the board or in Deleted cards, and is reported
+//     (purge-vs-edit).
 //   • A moved value never overwrites a live card: it matches one, or becomes
 //     its deterministic twin.
 //   • The merge proves itself: every removal of a live card leaves an entry
@@ -824,6 +826,27 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
     if (E) fate.set(id, { alive: false, why: 'buried', entry: E });
   }
 
+  // A purge that reaches a restore reaches the landing's own bin entry too.
+  // The person who restored the card may have typed into it and then deleted
+  // it: that text sits in their Deleted cards, restorable, and the receipt the
+  // purge derives for the landing replaces it. It goes (P-a: the purge takes
+  // the purged text and every copy built on it), but the purging machine
+  // never saw that text, and the person who typed it would lose it with
+  // nobody told — so it is reported and counted, like an edited landing still
+  // on the board. An entry holding exactly the bytes the restore put back is
+  // the purge working. Only an entry a side still holds counts: one only the
+  // base holds was taken by an earlier merge, which said so then.
+  let binEditsPurged = 0;
+  for (const [y, via] of reached) {
+    if (fate.get(y)?.entry !== via.entry) continue;
+    const typedInto = [O, T].some((S) => {
+      const F = live(S, y) ? null : eOf(S, y);
+      return !!F && entryKind(F.meta) === 'F' && !(via.rid && fullEntryRid(via.from, F.json) === via.rid);
+    });
+    if (!typedInto) continue;
+    conflicts.push({ id: y, kind: 'purge-vs-edit', side: 'bin', purgedWith: via.root }); binEditsPurged++;
+  }
+
   // ── Pass B: routing ───────────────────────────────────────────────────────
   const landed = new Set();
   const liveValuesAt = (x) => {
@@ -1084,7 +1107,8 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
     }
   };
 
-  const purgedCopies = drops.filter((d) => d.kind === 'P').length;
+  // Every copy a purge dropped: live copies, and the edits it took from a bin.
+  const purgedCopies = drops.filter((d) => d.kind === 'P').length + binEditsPurged;
   return { merged, extras: twins.extras, conflicts, delta, bin, survivors, purgedCopies, verify };
 }
 

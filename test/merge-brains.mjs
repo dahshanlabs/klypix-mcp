@@ -1330,6 +1330,26 @@ const B_ROWS = [
     want: { union: 'live[k=v15 k′=v9] bin[] c[]', receipts: 'live[k′=v15] bin[k:F(v0)] c[]', '3way': 'live[k′=v15] bin[k:F(v0)] c[]' },
   },
   {
+    // Review round 3 (c1, C1a): ours restored k (it landed at k′), typed v1
+    // into k′ and deleted it, so v1 sat in ours' Deleted cards, restorable.
+    // Theirs, which saw none of it, purged k. The purge reaches k′ and its
+    // receipt replaces that entry (P-a takes the purged text and what was
+    // built on it), but the person who typed v1 was told nothing. It is now
+    // reported, as an edited landing on the board is (B31). The other way
+    // round is checked below.
+    name: 'B43 a purge reaches a restore landing deleted after an edit, and says so',
+    args: async () => ({
+      base: await side({ bin: { txt_k: pFe(k0, 'v0') } }),
+      ours: await side({ bin: { txt_k: pRe(k0, 'v0', kRestoredAs('v0')), [kRestoredAs('v0')]: binEntryFor({ id: kRestoredAs('v0'), json: pj('v1 typed after the restore, then deleted'), now: 1500 }) } }),
+      theirs: await side({ bin: { txt_k: pPe(k0, 'v0') } }),
+    }),
+    want: {
+      union: 'live[] bin[k:P k′:F(v1 typed after the restore, then deleted)] c[]',
+      receipts: 'live[] bin[k:P k′:P] c[purge-vs-edit]',
+      '3way': 'live[] bin[k:P k′:P] c[purge-vs-edit]',
+    },
+  },
+  {
     // Nothing in any bin: the option modes are the familiar 3-way.
     name: 'B16 no bins anywhere: an ordinary content conflict',
     args: async () => ({ base: await side({ live: { txt_k: 'v0' } }), ours: await side({ live: { txt_k: 'v1' } }), theirs: await side({ live: { txt_k: 'v2' } }) }),
@@ -1353,6 +1373,7 @@ const B_ROWS = [
     'B34 a purge follows a restore chain through an edited card, and says so',
     'B35 an edit routed onto a permanently deleted card drops, and says so',
     'B37 a moved value follows a restore receipt to where the restore landed',
+    'B43 a purge reaches a restore landing deleted after an edit, and says so',
   ]);
   offBreaks('B', observed, B_ROWS, '3way', 'receipts', ['B8 exact deleted bytes over a base that holds the deletion']);
 
@@ -1504,6 +1525,31 @@ const B_ROWS = [
     const b31 = await mergeBrains({ ...(await B_ROWS.find((x) => x.name.startsWith('B31')).args()), options: { binMerge: 'receipts' } });
     ok(b31.conflicts.some((c) => c.kind === 'purge-vs-edit' && c.id === kR && c.side === 'ours' && c.purgedWith === k0),
       'B31: the dropped edit is reported against the landing, naming the purge that reached it');
+    // B43 both ways round, in both option modes: the edit the purge took from
+    // Deleted cards is reported once, against the landing, naming the purge,
+    // and counted; nothing of it is left in the file. A landing deleted
+    // holding exactly the bytes the restore put back is the purge working:
+    // nothing to say, nothing counted.
+    const swap = (a) => ({ ...a, ours: a.theirs, theirs: a.ours });
+    const b43 = await B_ROWS.find((x) => x.name.startsWith('B43')).args();
+    const b43same = { ...b43, ours: await side({ bin: { txt_k: pRe(k0, 'v0', kR), [kR]: binEntryFor({ id: kR, json: pj('v0'), now: 1500 }) } }) };
+    for (const binMerge of ['receipts', '3way']) {
+      for (const [label, a] of [['ours restored', b43], ['theirs restored', swap(b43)]]) {
+        const r43 = await mergeBrains({ ...a, options: { binMerge } });
+        const told = r43.conflicts.filter((c) => c.kind === 'purge-vs-edit');
+        const z43 = (await parseKlypix(r43.buffer)).zip;
+        let kept43 = false;
+        for (const p of Object.keys(z43.files)) if (!z43.files[p].dir && (await z43.file(p).async('string')).includes('typed after the restore')) kept43 = true;
+        ok(await summarize(r43) === B_ROWS.find((x) => x.name.startsWith('B43')).want[binMerge] && told.length === 1 && told[0].id === kR
+          && told[0].side === 'bin' && told[0].purgedWith === k0 && r43.stats.purgedCopies === 1 && !kept43,
+        `B43 (${binMerge}, ${label}): the edit the purge took from Deleted cards is reported against the landing, counted, and gone`);
+      }
+      for (const [label, a] of [['ours restored', b43same], ['theirs restored', swap(b43same)]]) {
+        const r43 = await mergeBrains({ ...a, options: { binMerge } });
+        ok(await summarize(r43) === 'live[] bin[k:P k′:P] c[]' && r43.stats.purgedCopies === 0,
+          `B43 (${binMerge}, ${label}): a landing deleted holding exactly the restored bytes is the purge working — nothing reported`);
+      }
+    }
     // A foreign purge never reaches our restore (q6), ours reaches a foreign one.
     const unv = { binMerge: 'receipts', theirsTrust: 'unverified' };
     const r1 = await mergeBrains({ base: await side({ bin: { txt_k: pFe(k0, 'v0') } }), ours: await side({ live: { [kR]: pj('v0') }, bin: { txt_k: pRe(k0, 'v0', kR) } }), theirs: await side({ bin: { txt_k: purge } }), options: unv });
@@ -2196,6 +2242,12 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
       find: '        reach(y, k, P, k, rid);',
       replace: '        reach(y, k, P, x, receiptIdentity(x, r.meta, r.json));',
       row: 'B34', options: { binMerge: 'receipts' },
+    },
+    {
+      rule: 'an edit a purge takes from a landing in Deleted cards is reported',
+      find: "    conflicts.push({ id: y, kind: 'purge-vs-edit', side: 'bin', purgedWith: via.root }); binEditsPurged++;",
+      replace: '',
+      row: 'B43', options: { binMerge: 'receipts' },
     },
     {
       rule: 'a derived receipt is derived again from the purge that wins now',

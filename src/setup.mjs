@@ -265,7 +265,7 @@ export function renderBrief(report) {
     + (report.editors.skippedTargets.length ? `   (skipped ${report.editors.skippedTargets.length} for tools you don't have)` : ''));
 
   if (report.gitDriver) {
-    L.push(`  git       ${report.gitDriver.ok ? 'lossless .klypix merge driver registered' : '✗ merge driver not registered'}`);
+    L.push(`  git       ${report.gitDriver.ok ? '.klypix merge driver registered' : '✗ merge driver not registered'}`);
   }
 
   for (const v of report.verified || []) {

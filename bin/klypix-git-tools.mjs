@@ -2,7 +2,7 @@
 // klypix-git-tools — the GitHub lane: three verbs that put the brain where
 // dev teams actually live (the repo and the PR page).
 //
-//   git-driver [install|status] [repo]   register the lossless .klypix merge
+//   git-driver [install|status] [repo]   register the card-level .klypix merge
 //                                        driver for a repo, zero-command
 //   diff [ref] [--brain <path>]          readable brain diff vs a git ref
 //   pr-brief [baseRef] [--brain <path>]  brain cards touching the files
@@ -214,12 +214,12 @@ async function gitDriver() {
   let already = false;
   try { already = (await gitText(toplevel, 'config', '--get', 'merge.klypix.driver')) === driverCmd; } catch { /* unset */ }
   if (!already) {
-    await git(toplevel, ['config', 'merge.klypix.name', 'KLYPIX lossless brain merge (union by card id)']);
+    await git(toplevel, ['config', 'merge.klypix.name', 'KLYPIX brain merge (3-way, card by card)']);
     await git(toplevel, ['config', 'merge.klypix.driver', driverCmd]);
   }
   let gaState = 'present';
   if (!gaHasRule) {
-    const rule = `${gaText && !gaText.endsWith('\n') ? '\n' : ''}# .klypix brains merge losslessly via the KLYPIX 3-way union driver\n# (per-machine registration: npx klypix-mcp git-driver install).\n${DRIVER_ATTR_RULE}\n`;
+    const rule = `${gaText && !gaText.endsWith('\n') ? '\n' : ''}# .klypix brains merge card by card via the KLYPIX 3-way driver\n# (per-machine registration: npx klypix-mcp git-driver install).\n${DRIVER_ATTR_RULE}\n`;
     fs.appendFileSync(gaPath, rule);
     gaState = 'added';
   }

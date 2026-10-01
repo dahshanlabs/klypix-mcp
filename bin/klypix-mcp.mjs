@@ -35,7 +35,7 @@ const USAGE = [
   '  init                                seed a starter ./brain.klypix + print an MCP config',
   '  garden-code [brain]                 print the human approval code for brain_garden',
   '  uninstall [--check|--yes|unlink]    remove this install from the machine (--check inventories first; never deletes a .klypix)',
-  '  git-driver [install|status] [repo]  register the lossless .klypix merge driver for a repo (zero-command teams)',
+  '  git-driver [install|status] [repo]  register the card-level .klypix merge driver for a repo (zero-command teams)',
   '  git-hook [install|remove|status]    wire the agent-neutral commit-capture hook (any agent/branch/worktree → brain cards)',
   '  brain-history [list|restore <id>]   restore points for this brain — undo an accidental delete, edit, or overwrite',
   '  brain-deleted [list|restore|purge]  recycle bin for this brain — cards you deleted, kept recoverable',

@@ -68,7 +68,7 @@ if (action === 'list') {
     if (!ids.includes(e.id) || e.kind === 'deleted') continue;
     console.log(e.kind === 'restored'
       ? `  ${e.id}   restored as ${e.restoredAs} ${ago(e.restoredAt || e.deletedAt)} — it is live under that id`
-      : `  ${e.id}   permanently deleted ${ago(e.purgedAt || e.deletedAt)} — its content is gone from this file`);
+      : `  ${e.id}   permanently deleted ${ago(e.purgedAt || e.deletedAt)} — its text is gone from this file (an image or file attached to it is not)`);
   }
   const entries = everything.filter((e) => e.kind === 'deleted');
   if (!entries.length) {
@@ -136,5 +136,6 @@ if (res.busy) refuseBusy();
 if (!res.purged.length) { console.log('Nothing matched — nothing purged.'); process.exit(0); }
 console.log(`Purged ${res.purged.length} deleted card(s) permanently from ${path.basename(brainPath)}.`);
 console.log('The delete itself is kept as a receipt with no content, so every copy of this brain drops the card too.');
+console.log('Not its attachments: an image or file a purged card held stays in the brain\'s assets, in this file and every copy.');
 console.log('Note: this removes them from the file, not from git history — a secret committed earlier is still in past commits.');
 console.log(`The pre-purge state is a restore point, and the only undo: npx klypix-mcp brain-history list --brain "${brainPath}"`);

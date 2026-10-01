@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 // merge-brains — the pure, provable core of the desktop-app<->hooks brain
 // concurrency fix. A 3-way UNION-by-stable-id reconcile of two .klypix brains
-// that share a common ancestor, designed so that NO CARD CAN BE LOST.
+// that share a common ancestor, designed so that a merge never drops a card a
+// person did not delete (the one deliberate exception, in the option modes: a
+// permanently deleted card's copies, edited or not — P-a, below).
 //
 // Why this exists: the desktop app used to SAVE the brain with a blind full-file
 // overwrite, clobbering any card the Claude Code hooks captured after the app
@@ -15,7 +17,7 @@
 //     be a deferred/gated renderer apply, not a deletion). This is the fix for
 //     the "false-delete clobber" + "delete-by-absence" blockers.
 //   • assets/ entries are UNIONed by path (else theirs-only images ship blank).
-//   • Content conflict (both edited the same card) keeps BOTH texts losslessly:
+//   • Content conflict (both edited the same card) keeps BOTH texts:
 //     the human's stays live on the card, the agent's is preserved as a linked
 //     twin card — never silently dropped.
 //   • zKeys are de-collided (duplicate keys silently no-op in the app reducer).
@@ -271,7 +273,7 @@ function descendantPosition(O, T, B, id) {
 //                    (`suppressDeleted`: a person deleted that very twin since
 //                    the base, so re-merging the old conflict must not bring
 //                    it back);
-//   3. a random id after TWIN_SLOTS slots — never lose a value.
+//   3. a random id after TWIN_SLOTS slots, so the value still has a home.
 // One index per merge (immediate parent → twin ids), so this stays linear on a
 // brain with thousands of simultaneous conflicts. `liveValues(x)` and
 // `slotState(x)` describe the merge's own cards; twins minted here are tracked
@@ -391,7 +393,7 @@ function mergeUnion(B, O, T, del, deletedMeta) {
       const theirsChanged = inT && inB && !sameMeaning(T.items[id], baseItem(id));
       if (inT && theirsChanged) {
         // delete-vs-edit: the human deleted it but a hook edited it after open →
-        // KEEP theirs (never lose the hook's new info); record the conflict.
+        // KEEP theirs (the hook's text is newer than the delete); record the conflict.
         conflicts.push({ id, kind: 'delete-vs-edit', kept: 'theirs' });
         // fall through to keep from theirs below
       } else {

@@ -10,6 +10,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { createHash } from 'crypto';
 import { execFileSync } from 'child_process';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { buildKlypix, parseKlypix, shard, itemSignature, isAgconfTwinId } from '../src/klypix-format.mjs';
@@ -624,7 +625,17 @@ const pj = (text) => JSON.stringify({ type: 'text', content: text, width: 240, h
 const pFe = (id, text) => binEntryFor({ id, json: pj(text), now: 1000 });
 const pRe = (id, text, as, now = 2000) => ({ meta: contentFreeReceiptFor(id, pFe(id, text), { kind: 'restored', restoredAs: as, now }), json: PURGED_BODY });
 const kRestoredAs = (text) => revivedIdFor('txt_k', pFe('txt_k', text).meta, pj(text));
+// A purge of k(text) as brains store cards (its rid is random, as a purge's is).
+const pPe = (id, text, now = 2000) => ({ meta: contentFreeReceiptFor(id, pFe(id, text), { kind: 'purged', now }), json: PURGED_BODY });
+// k restored as k′, then k′ deleted holding the same bytes and restored again as k″.
+const kChain = (text) => {
+  const k1 = kRestoredAs(text);
+  const f1 = binEntryFor({ id: k1, json: pj(text), now: 1500 });
+  const k2 = revivedIdFor(k1, f1.meta, pj(text));
+  return { k1, k2, r1: pRe('txt_k', text, k1), r2: { meta: contentFreeReceiptFor(k1, f1, { kind: 'restored', restoredAs: k2, now: 2500 }), json: PURGED_BODY } };
+};
 const EDGE_ARGS = [];   // the B-E case, for its S2-X mutation
+const PURGE_GROUPINGS = [];   // the B-P check, for its S2-X mutation
 
 const withBin = async (buffer, bin) => {
   const { zip } = await parseKlypix(buffer);
@@ -1060,6 +1071,57 @@ const B_ROWS = [
     want: { union: 'live[k=v15 k′=v12] bin[] c[]', receipts: 'live[k′=v12 k′~=v15] bin[k:F(v0)] c[revived]', '3way': 'live[k′=v12 k′~=v15] bin[k:F(v0)] c[revived]' },
   },
   {
+    // Found on copies of the real brains (review round 2): ours restored k
+    // from its bin (k′, and a receipt naming it) while theirs, which never saw
+    // the restore, purged k. P beats R — and k′, holding the very bytes the
+    // purge was for, stayed live with nobody told. A purge wins over every
+    // copy (P-a): it follows the restore and k′ dies under a receipt derived
+    // from the purge. k′ still holds exactly the restored bytes: no conflict.
+    name: 'B29 a purge reaches a restore the purging machine never saw (P-a)',
+    args: async () => ({
+      base: await side({ bin: { txt_k: pFe(k0, 'v0') } }),
+      ours: await side({ live: { [kRestoredAs('v0')]: pj('v0') }, bin: { txt_k: pRe(k0, 'v0', kRestoredAs('v0')) } }),
+      theirs: await side({ bin: { txt_k: pPe(k0, 'v0') } }),
+    }),
+    want: { union: 'live[k′=v0] bin[k:P] c[]', receipts: 'live[] bin[k:P k′:P] c[]', '3way': 'live[] bin[k:P k′:P] c[]' },
+  },
+  {
+    // The same, the other way round: the purge is ours.
+    name: 'B30 a purge reaches a restore the other side made',
+    args: async () => ({
+      base: await side({ bin: { txt_k: pFe(k0, 'v0') } }),
+      ours: await side({ bin: { txt_k: pPe(k0, 'v0') } }),
+      theirs: await side({ live: { [kRestoredAs('v0')]: pj('v0') }, bin: { txt_k: pRe(k0, 'v0', kRestoredAs('v0')) } }),
+    }),
+    want: { union: 'live[k′=v0] bin[k:R] c[]', receipts: 'live[] bin[k:P k′:P] c[]', '3way': 'live[] bin[k:P k′:P] c[]' },
+  },
+  {
+    // An edit of the restored card goes with it (P-a: edited or not), and is
+    // reported: it survives in that machine's restore point.
+    name: 'B31 a purge reaches a restore edited since',
+    args: async () => ({
+      base: await side({ bin: { txt_k: pFe(k0, 'v0') } }),
+      ours: await side({ live: { [kRestoredAs('v0')]: pj('v1 typed after the restore') }, bin: { txt_k: pRe(k0, 'v0', kRestoredAs('v0')) } }),
+      theirs: await side({ bin: { txt_k: pPe(k0, 'v0') } }),
+    }),
+    want: { union: 'live[k′=v1 typed after the restore] bin[k:P] c[]', receipts: 'live[] bin[k:P k′:P] c[purge-vs-edit]', '3way': 'live[] bin[k:P k′:P] c[purge-vs-edit]' },
+  },
+  {
+    // The landing was itself deleted and restored again (k → k′ → k″): the
+    // purge follows the chain, and k′'s own receipt goes too (it named the
+    // purged bytes). (k′ and k″ both shorten to k′.)
+    name: 'B32 a purge follows a restore chain',
+    args: async () => {
+      const c = kChain('v0');
+      return {
+        base: await side({ bin: { txt_k: pFe(k0, 'v0') } }),
+        ours: await side({ live: { [c.k2]: pj('v0') }, bin: { txt_k: c.r1, [c.k1]: c.r2 } }),
+        theirs: await side({ bin: { txt_k: pPe(k0, 'v0') } }),
+      };
+    },
+    want: { union: 'live[k′=v0] bin[k:P k′:R] c[]', receipts: 'live[] bin[k:P k′:P k′:P] c[]', '3way': 'live[] bin[k:P k′:P k′:P] c[]' },
+  },
+  {
     // Nothing in any bin: the option modes are the familiar 3-way.
     name: 'B16 no bins anywhere: an ordinary content conflict',
     args: async () => ({ base: await side({ live: { txt_k: 'v0' } }), ours: await side({ live: { txt_k: 'v1' } }), theirs: await side({ live: { txt_k: 'v2' } }) }),
@@ -1078,6 +1140,8 @@ const B_ROWS = [
     'B7 a restore meets an edited copy of the old id', 'B9 an entry both sides merely lack returns from the base',
     'B10 tombstone for a card gone from both sides (E-11)', 'B14 a purge outranks the delete-vs-edit rescue',
     'B17 a copy follows a restore that landed elsewhere',
+    'B29 a purge reaches a restore the purging machine never saw (P-a)', 'B30 a purge reaches a restore the other side made',
+    'B31 a purge reaches a restore edited since', 'B32 a purge follows a restore chain',
   ]);
   offBreaks('B', observed, B_ROWS, '3way', 'receipts', ['B8 exact deleted bytes over a base that holds the deletion']);
 
@@ -1156,6 +1220,58 @@ const B_ROWS = [
   const b15 = await mergeBrains({ ...(await B_ROWS[14].args()), options: { binMerge: 'receipts' } });
   ok(b15.conflicts.some((c) => c.suppressed === 'deleted-twin'), 'B15: the suppressed twin is reported, not silent');
 
+  // P-a reaching a restore (B29–B32): what the strings cannot show.
+  {
+    const kR = kRestoredAs('v0');
+    const purge = pPe(k0, 'v0');
+    const restored = await side({ live: { [kR]: pj('v0 secret') }, bin: { txt_k: pRe(k0, 'v0 secret', kR) } });
+    const base29 = await side({ bin: { txt_k: pFe(k0, 'v0 secret') } });
+    const purged29 = await side({ bin: { txt_k: { meta: contentFreeReceiptFor(k0, pFe(k0, 'v0 secret'), { kind: 'purged', now: 2000 }), json: PURGED_BODY } } });
+    const kS = kRestoredAs('v0 secret');
+    const restoredS = await side({ live: { [kS]: pj('v0 secret') }, bin: { txt_k: pRe(k0, 'v0 secret', kS) } });
+    const r = await mergeBrains({ base: base29, ours: restoredS, theirs: purged29, options: { binMerge: 'receipts' } });
+    const bin = await binIndex(r.buffer);
+    const pk = bin[k0], pl = bin[kS];
+    const want = `p_${createHash('sha256').update(`${pk?.rid}\n${kS}`).digest('hex').slice(0, 16)}`;
+    ok(entryKind(pl ?? {}) === 'P' && pl.rid === want && pl.purgedWith === k0 && pl.deletedAt === pk.deletedAt && pl.purgedAt === pk.purgedAt
+      && JSON.stringify(pl.deletion) === JSON.stringify(pk.deletion),
+      'B29: the landing\'s receipt is derived from the purge — its rid hashes the purge\'s rid with the landing, its stamps are the purge\'s');
+    ok(r.stats.purgedCopies === 1 && r.delta.removed.includes(kS) && !r.delta.revived.length, 'B29: the dropped copy is counted, the landing is removed, nothing moves');
+    const zip29 = (await parseKlypix(r.buffer)).zip;
+    let leaked29 = false;
+    for (const p of Object.keys(zip29.files)) if (!zip29.files[p].dir && (await zip29.file(p).async('string')).includes('secret')) leaked29 = true;
+    ok(!leaked29, 'B29: nothing of the purged text is anywhere in the result (the restore receipt\'s content-derived rid included)');
+    // The machine that restored meets the result (it never saw the purge): one round.
+    const stale = await mergeBrains({ base: base29, ours: restoredS, theirs: r.buffer, options: { binMerge: 'receipts' } });
+    ok(await summarize(stale) === await summarize(r) && JSON.stringify(await binIndex(stale.buffer)) === JSON.stringify(bin),
+      'B29: the restoring machine meeting the result writes the same receipts — no second round');
+    const b31 = await mergeBrains({ ...(await B_ROWS.find((x) => x.name.startsWith('B31')).args()), options: { binMerge: 'receipts' } });
+    ok(b31.conflicts.some((c) => c.kind === 'purge-vs-edit' && c.id === kR && c.side === 'ours' && c.purgedWith === k0),
+      'B31: the dropped edit is reported against the landing, naming the purge that reached it');
+    // A foreign purge never reaches our restore (q6), ours reaches a foreign one.
+    const unv = { binMerge: 'receipts', theirsTrust: 'unverified' };
+    const r1 = await mergeBrains({ base: await side({ bin: { txt_k: pFe(k0, 'v0') } }), ours: await side({ live: { [kR]: pj('v0') }, bin: { txt_k: pRe(k0, 'v0', kR) } }), theirs: await side({ bin: { txt_k: purge } }), options: unv });
+    ok((await liveIds(r1.buffer)).includes(kR), 'B29 (unverified): a purge only theirs holds never reaches our restore');
+    const r2 = await mergeBrains({ base: await side({ bin: { txt_k: pFe(k0, 'v0') } }), ours: await side({ bin: { txt_k: purge } }), theirs: await side({ live: { [kR]: pj('v0') }, bin: { txt_k: pRe(k0, 'v0', kR) } }), options: unv });
+    ok(!(await liveIds(r2.buffer)).includes(kR) && entryKind((await binIndex(r2.buffer))[kR] ?? {}) === 'P', 'B30 (unverified): our own purge reaches theirs\' restore');
+    // Two machines purged k (two random rids) while a third restored it: every
+    // grouping of the three merges keeps the same receipts, the derived one
+    // included — it is derived from the purge that wins, never from one a
+    // merge in between happened to see.
+    const R3 = await side({ live: { [kR]: pj('v0') }, bin: { txt_k: pRe(k0, 'v0', kR) } });
+    const P1 = await side({ bin: { txt_k: pPe(k0, 'v0') } }), P2 = await side({ bin: { txt_k: pPe(k0, 'v0') } });
+    const groupingsAgree = async (engine) => {
+      const mm = async (o, t) => (await engine.mergeBrains({ base: null, ours: o, theirs: t, options: { binMerge: 'receipts' } })).buffer;
+      const bins3 = async (b) => JSON.stringify(Object.entries(await binIndex(b)).map(([id, e]) => [id, entryKind(e), e.rid, e.purgedWith ?? null]).sort());
+      const g = [await mm(await mm(P1, R3), P2), await mm(P1, await mm(R3, P2)), await mm(await mm(P2, P1), R3), await mm(R3, await mm(P2, P1))];
+      const gb = await Promise.all(g.map(bins3));
+      return gb.every((x) => x === gb[0]) && gb[0].includes(kR) && !(await Promise.all(g.map(liveIds))).some((ids) => ids.includes(kR));
+    };
+    ok(await groupingsAgree({ mergeBrains }),
+      'B-P: two purges of one card and a restore of it — every grouping keeps the same receipts and purges the landing');
+    PURGE_GROUPINGS.push(groupingsAgree);
+  }
+
   // Determinism and idempotence: the same inputs give the same bytes-level
   // result, and merging the result again changes nothing.
   let stable = true, quiet = true;
@@ -1182,6 +1298,8 @@ const B_ROWS = [
   const binOf = async (b) => JSON.stringify(Object.entries(await binIndex(b)).map(([id, e]) => [id, entryKind(e), e.rid]).sort());
   ok(await binOf(left) === await binOf(right) && await binOf(right) === await binOf(swapped) && (await binOf(left)).includes('"P"'),
     'B: ((X·Y)·Z), (X·(Y·Z)) and (Z·(Y·X)) keep the same entry — the purge');
+  ok((await Promise.all([left, right, swapped].map(async (b) => entryKind((await binIndex(b))[kRev('va')] ?? {}) === 'P' && !(await liveIds(b)).includes(kRev('va'))))).every(Boolean),
+    'B: … and in every grouping the purge reaches Y\'s restore of k');
 }
 
 // ── S2-N newOnBothSides (E-5) ─────────────────────────────────────────────────
@@ -1561,6 +1679,18 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
       row: 'B25', options: { binMerge: 'receipts' },
     },
     {
+      rule: 'a purge reaches a restore the purging machine never saw (P-a)',
+      find: '        reach(y, k, P, x, receiptIdentity(x, r.meta, r.json));',
+      replace: '',
+      row: 'B29', options: { binMerge: 'receipts' },
+    },
+    {
+      rule: 'a derived receipt is derived again from the purge that wins now',
+      find: '    if (P) reach(y, root, P, null, null);',
+      replace: '',
+      groupings: true,
+    },
+    {
       rule: 'unverified: a foreign entry never kills our card',
       find: '    (live(T, id) || (unverified && live(O, id))) ? null : eOf(T, id),',
       replace: '    live(T, id) ? null : eOf(T, id),',
@@ -1576,6 +1706,11 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
   for (const m of MUTATIONS) {
     const engine = await mutant(`m${MUTATIONS.indexOf(m)}`, m.find, m.replace);
     if (!engine) { ok(false, `X mutation target for "${m.rule}" is missing from src/merge-brains.mjs`); continue; }
+    if (m.groupings) {
+      const agree = await PURGE_GROUPINGS[0](engine);
+      ok(!agree, `X "${m.rule}" off ⇒ check B-P's groupings disagree${!agree ? '' : ' — THEY DID NOT'}`);
+      continue;
+    }
     if (m.edge2) {
       const res = await engine.mergeBrains({ ...(await EDGE_ARGS[1]()), options: { binMerge: 'receipts' } });
       const c = (await parseKlypix(res.buffer)).canvas.connections?.find((x) => x.id === 'con_both');

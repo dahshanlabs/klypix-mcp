@@ -60,6 +60,9 @@
 //     stale copy of exactly the deleted bytes drops; anything else is news the
 //     deleter never saw and comes back under revivedIdFor — a NEW id, so no
 //     receipt is contradicted and an older machine sees an ordinary add.
+//   • A purge reaches the restores of its card the purging machine never saw:
+//     every landing a restore receipt names dies under a receipt derived from
+//     the purge (P-a: a purge wins over every copy).
 //   • A moved value never overwrites a live card: it matches one, or becomes
 //     its deterministic twin.
 //   • The merge proves itself: every removal of a live card leaves an entry
@@ -528,19 +531,29 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
 
   // ── Entries (E-3) ─────────────────────────────────────────────────────────
   // An entry whose body is missing counts as absent (the writer drops those).
-  const eOf = (S, id) => { const e = S?.graveyard?.[id]; return e && e.json != null ? e : null; };
+  // A receipt an earlier merge derived for a purge that reached a restore is
+  // not read once this merge derives that card's receipt afresh (`reached`,
+  // below): the purge that wins NOW decides it, or a merge in between that
+  // saw a losing purge would leave its choice behind, and the grouping of
+  // merges would change the bin.
+  const reached = new Map();         // card id -> { entry, root, from, rid }: a purge that reached this restore
+  const eOf = (S, id) => {
+    const e = S?.graveyard?.[id];
+    if (!e || e.json == null) return null;
+    return reached.has(id) && typeof e.meta?.purgedWith === 'string' ? null : e;
+  };
   const maxEntry = (id, list) => list.reduce((w, e) => (e ? pickBinEntry(id, w, e) : w), null);
   // The entry a dead card ends with. The base's own entry counts: "no receipt,
   // no purge" — an entry a side merely LACKS (a git checkout of an older file,
   // a ≤1.86 CLI purge that dropped it) comes back instead of vanishing.
   // Unverified: a foreign bin never replaces an entry we or the base hold.
-  const eAll = (id) => (unverified
+  const ownAll = (id) => (unverified
     ? (maxEntry(id, [eOf(O, id), eOf(B, id)]) ?? eOf(T, id))
     : maxEntry(id, [eOf(O, id), eOf(T, id), eOf(B, id)]));
   // The entry that can kill a card live on some side. A side's own entry for
   // its own live card is malformed and ignored; under 'unverified' a foreign
   // entry never kills a card we hold (q6: a foreign purge is not our delete).
-  const eKill = (id) => maxEntry(id, [
+  const ownKill = (id) => maxEntry(id, [
     live(O, id) ? null : eOf(O, id),
     (live(T, id) || (unverified && live(O, id))) ? null : eOf(T, id),
     live(B, id) ? null : eOf(B, id),
@@ -562,7 +575,14 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
       // P-a: delete-permanently is for secrets, and an edited copy usually
       // still holds the secret. Every live copy drops, edited or not.
       drops.push({ S, side, from: id, v, at: id, kind: 'P' });
-      purgeVsEdit(side, id, v);
+      // A restore the purge reached: its receipt names the bytes it put back,
+      // so a copy still holding exactly those is the purge working, and
+      // anything else was edited since — whatever the base knew of the card
+      // (the purging machine never saw it at all).
+      const via = reached.get(id);
+      if (via && via.rid && E === via.entry) {
+        if (fullEntryRid(via.from, v) !== via.rid) conflicts.push({ id, kind: 'purge-vs-edit', side, purgedWith: via.root });
+      } else purgeVsEdit(side, id, v);
       return;
     }
     // A restore: the card lives on at restoredAs; this copy follows it there.
@@ -589,6 +609,77 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
     ...O.ids, ...T.ids, ...(B ? B.ids : []),
     ...Object.keys(O.graveyard), ...Object.keys(T.graveyard), ...(B ? Object.keys(B.graveyard) : []),
   ]);
+
+  // ── P-a reaches a restore the purging machine never saw ──────────────────
+  // Machine A restores k from its bin (the card lands at k′, and A's receipt
+  // for k names it) while machine B, which never saw that restore, purges k.
+  // P beats R, so the bin keeps the purge for k — and k′, which has no entry
+  // of its own, stayed live with the very bytes the purge was for, and nobody
+  // was told. A purge wins over every copy, and a restore's landing is a copy
+  // of the card: the purge follows every restore receipt any side holds for
+  // k, on through a landing that was itself deleted and restored, and each
+  // landing dies under a receipt of its own. That receipt is DERIVED, never
+  // minted: its rid hashes the purge's own rid (random, so nothing of the
+  // content) with the landing, and its stamps are the purge's, so every
+  // replica and both transports write the same entry and a re-merge changes
+  // nothing. Conflict twins of a landing are not followed: they are other
+  // texts, kept beside the card, not the card.
+  const purgeOf = (k) => {
+    const e = ownAll(k);
+    // Only a purge someone made: a derived receipt is the reach of its own root.
+    if (!e || entryKind(e.meta) !== 'P' || typeof e.meta.purgedWith === 'string') return null;
+    // A foreign purge never kills our card (q6): under 'unverified', only a
+    // purge we or the base hold reaches a restore.
+    return unverified && !eOf(O, k) && !eOf(B, k) ? null : e;
+  };
+  const receiptFollowing = (root, P, landing) => {
+    const m = P.meta || {};
+    const meta = {
+      rid: `p_${createHash('sha256').update(`${receiptIdentity(root, m, P.json)}\n${landing}`).digest('hex').slice(0, 16)}`,
+      deletedAt: m.deletedAt, deletedBy: m.deletedBy, deletion: m.deletion,
+      purged: true, purgedAt: m.purgedAt, purgedWith: root,
+      preview: '', summary: { type: 'purged', label: 'Permanently deleted', preview: '' },
+    };
+    for (const key of Object.keys(meta)) if (meta[key] === undefined) delete meta[key];
+    return { meta, json: PURGED_BODY };
+  };
+  // Two purges can reach one landing (two cards restored onto one chain, or
+  // two machines that purged the same card): the total order picks, so the
+  // choice does not depend on which root this loop meets first.
+  const reach = (landing, root, P, from, rid) => {
+    const entry = receiptFollowing(root, P, landing);
+    const had = reached.get(landing);
+    if (!had || pickBinEntry(landing, had.entry, entry) === entry) reached.set(landing, { entry, root, from, rid });
+  };
+  for (const k of allIds) {
+    const P = purgeOf(k);
+    if (!P) continue;
+    const seen = new Set([k]);
+    const queue = [k];
+    while (queue.length && seen.size <= ROUTE_STEPS) {
+      const x = queue.shift();
+      for (const S of [O, T, B]) {
+        const r = eOf(S, x);
+        if (!r || entryKind(r.meta) !== 'R' || seen.has(String(r.meta.restoredAs))) continue;
+        const y = String(r.meta.restoredAs);
+        seen.add(y);
+        queue.push(y);
+        reach(y, k, P, x, receiptIdentity(x, r.meta, r.json));
+      }
+    }
+  }
+  // A receipt an earlier merge derived travels on its own once the restore
+  // receipt it followed has been replaced: re-derive it from the purge that
+  // wins now (see eOf).
+  for (const S of [O, T, B]) for (const [y, e] of Object.entries(S?.graveyard || {})) {
+    const root = e?.meta?.purgedWith;
+    if (typeof root !== 'string' || e.json == null) continue;
+    const P = purgeOf(root);
+    if (P) reach(y, root, P, null, null);
+  }
+  const eAll = (id) => maxEntry(id, [ownAll(id), reached.get(id)?.entry]);
+  const eKill = (id) => maxEntry(id, [ownKill(id), reached.get(id)?.entry]);
+
   // A side that lacks a card only because it holds the card's base value under
   // the id the card moved from (a checkout of a file older than the move) has
   // not deleted it: that copy IS the card, and routing takes it there. Absence

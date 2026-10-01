@@ -1418,15 +1418,6 @@ export async function deletedByAbsence(baseBuf, oursBuf) {
   return b.struct.cards.map((c) => c.id).filter((id) => !oIds.has(id));
 }
 
-/**
- * Delta for the LIVE agent→human watcher: the cards ADDED to `newBuf` since the
- * frozen open-snapshot `baseBuf`, with each added card's raw item JSON + position
- * so the renderer can build it with its normal v4 deserializer. Added-only by
- * design — a new id can never clobber a human's in-progress edit, and the renderer
- * applies it idempotently, so re-sending the full accumulated added-set every time
- * lets a briefly-gated tab catch up without any ack/queue. (Updates/removes
- * reconcile on the next save/reopen — safe, since the merge never loses.)
- */
 // ── revivalMap (§2.7): where did the cards the app last saw go? ─────────────
 // A watcher showing a brain keeps, for every id, the last JSON it saw while
 // that id was live. When a write moves a card's value to another id — a Brain

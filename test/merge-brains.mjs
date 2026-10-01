@@ -1353,6 +1353,40 @@ const B_ROWS = [
     },
   },
   {
+    // Review round 3 (c3): ours restored k at k′ while a rescue of an older
+    // text (vS) had taken that id, so the restored bytes v0 sat in a twin
+    // beside it (N8). Theirs purged k. The purge took k′ (the rescued text,
+    // reported) and left the twin holding exactly the purged bytes on the
+    // board. A twin holding the bytes the restore put back is the card: it
+    // goes too, and its holder is told. The other way round is checked below.
+    name: 'B44 a purge reaches a twin of the landing that holds the restored bytes',
+    args: async () => ({
+      base: await side({ bin: { txt_k: pFe(k0, 'v0') } }),
+      ours: await side({ live: { [kRestoredAs('v0')]: pj('vS stale rescued'), [twinIdFor(kRestoredAs('v0'), pj('v0'))]: pj('v0') }, bin: { txt_k: pRe(k0, 'v0', kRestoredAs('v0')) } }),
+      theirs: await side({ bin: { txt_k: pPe(k0, 'v0') } }),
+    }),
+    want: {
+      union: 'live[k′=vS stale rescued k′~=v0] bin[k:P] c[]',
+      receipts: 'live[] bin[k:P k′:P k′~:P] c[purge-reached-restore purge-vs-edit]',
+      '3way': 'live[] bin[k:P k′:P k′~:P] c[purge-reached-restore purge-vs-edit]',
+    },
+  },
+  {
+    // A twin of the landing holding other text is someone's text kept beside
+    // the card, not the card: the purge takes the landing and leaves it.
+    name: 'B45 a purge leaves a twin of the landing that holds other text',
+    args: async () => ({
+      base: await side({ bin: { txt_k: pFe(k0, 'v0') } }),
+      ours: await side({ live: { [kRestoredAs('v0')]: pj('v0'), [twinIdFor(kRestoredAs('v0'), pj('v5 kept beside it'))]: pj('v5 kept beside it') }, bin: { txt_k: pRe(k0, 'v0', kRestoredAs('v0')) } }),
+      theirs: await side({ bin: { txt_k: pPe(k0, 'v0') } }),
+    }),
+    want: {
+      union: 'live[k′=v0 k′~=v5 kept beside it] bin[k:P] c[]',
+      receipts: 'live[k′~=v5 kept beside it] bin[k:P k′:P] c[purge-reached-restore]',
+      '3way': 'live[k′~=v5 kept beside it] bin[k:P k′:P] c[purge-reached-restore]',
+    },
+  },
+  {
     // Nothing in any bin: the option modes are the familiar 3-way.
     name: 'B16 no bins anywhere: an ordinary content conflict',
     args: async () => ({ base: await side({ live: { txt_k: 'v0' } }), ours: await side({ live: { txt_k: 'v1' } }), theirs: await side({ live: { txt_k: 'v2' } }) }),
@@ -1377,6 +1411,8 @@ const B_ROWS = [
     'B35 an edit routed onto a permanently deleted card drops, and says so',
     'B37 a moved value follows a restore receipt to where the restore landed',
     'B43 a purge reaches a restore landing deleted after an edit, and says so',
+    'B44 a purge reaches a twin of the landing that holds the restored bytes',
+    'B45 a purge leaves a twin of the landing that holds other text',
   ]);
   offBreaks('B', observed, B_ROWS, '3way', 'receipts', ['B8 exact deleted bytes over a base that holds the deletion']);
 
@@ -1552,6 +1588,42 @@ const B_ROWS = [
         ok(await summarize(r43) === 'live[] bin[k:P k′:P] c[]' && r43.stats.purgedCopies === 0,
           `B43 (${binMerge}, ${label}): a landing deleted holding exactly the restored bytes is the purge working — nothing reported`);
       }
+    }
+    // B44 and B45 both ways round, in both option modes. B44: the twin holding
+    // the restored bytes goes with the landing and its holder is told, and
+    // both copies are counted; nothing of the purged text is left; and the
+    // machine that restored, meeting the result, writes the same receipts.
+    // B45: the twin holding other text stays, untouched.
+    {
+      const b44 = await B_ROWS.find((x) => x.name.startsWith('B44')).args();
+      const b45 = await B_ROWS.find((x) => x.name.startsWith('B45')).args();
+      const tw = twinIdFor(kR, pj('v0'));
+      for (const binMerge of ['receipts', '3way']) {
+        for (const [held, a] of [['ours', b44], ['theirs', swap(b44)]]) {
+          const r44 = await mergeBrains({ ...a, options: { binMerge } });
+          const kinds = r44.conflicts.map((c) => `${c.kind}:${c.id === tw ? 'twin' : c.id === kR ? 'landing' : c.id}:${c.side}`).sort().join(' ');
+          ok(await summarize(r44) === B_ROWS.find((x) => x.name.startsWith('B44')).want[binMerge] && r44.stats.purgedCopies === 2
+            && kinds === `purge-reached-restore:twin:${held} purge-vs-edit:landing:${held}` && r44.conflicts.every((c) => c.purgedWith === k0 && !('twin' in c)),
+          `B44 (${binMerge}, restored on ${held}): the twin holding the restored bytes goes with the landing, reported against ${held} (${kinds})`);
+        }
+        for (const [held, a] of [['ours', b45], ['theirs', swap(b45)]]) {
+          const r45 = await mergeBrains({ ...a, options: { binMerge } });
+          ok(await summarize(r45) === B_ROWS.find((x) => x.name.startsWith('B45')).want[binMerge] && r45.stats.purgedCopies === 1,
+            `B45 (${binMerge}, restored on ${held}): a twin of the landing holding other text stays`);
+        }
+      }
+      const kS44 = kRestoredAs('v0 secret');
+      const twS = twinIdFor(kS44, pj('v0 secret'));
+      const restorer = await side({ live: { [kS44]: pj('vS stale rescued'), [twS]: pj('v0 secret') }, bin: { txt_k: pRe(k0, 'v0 secret', kS44) } });
+      const r = await mergeBrains({ base: base29, ours: restorer, theirs: purged29, options: { binMerge: 'receipts' } });
+      const z = (await parseKlypix(r.buffer)).zip;
+      let leaked44 = false;
+      for (const p of Object.keys(z.files)) if (!z.files[p].dir && (await z.file(p).async('string')).includes('secret')) leaked44 = true;
+      ok(!leaked44 && entryKind((await binIndex(r.buffer))[twS] ?? {}) === 'P' && (await binIndex(r.buffer))[twS]?.purgedWith === k0,
+        'B44: nothing of the purged text is left — the twin is purged under a receipt derived from the purge');
+      const again44 = await mergeBrains({ base: base29, ours: restorer, theirs: r.buffer, options: { binMerge: 'receipts' } });
+      ok(await summarize(again44) === await summarize(r) && JSON.stringify(await binIndex(again44.buffer)) === JSON.stringify(await binIndex(r.buffer)),
+        'B44: the restoring machine meeting the result writes the same receipts and is told the same — no second round');
     }
     // B29 both ways round (B30 is its mirror): the restored card that leaves
     // the board untouched is reported once, against the side that held it,
@@ -2258,6 +2330,12 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
       find: '        reach(y, k, P, k, rid);',
       replace: '        reach(y, k, P, x, receiptIdentity(x, r.meta, r.json));',
       row: 'B34', options: { binMerge: 'receipts' },
+    },
+    {
+      rule: 'a purge reaches a twin of the landing that holds the restored bytes',
+      find: '  for (const [x, via] of reachedTwins) {',
+      replace: '  for (const [x, via] of []) {',
+      row: 'B44', options: { binMerge: 'receipts' },
     },
     {
       rule: 'a restored card a purge takes untouched is reported to the side that held it',

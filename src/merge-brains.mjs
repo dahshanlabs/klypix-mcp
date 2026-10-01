@@ -682,14 +682,17 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
   // minted: its rid hashes the purge's own rid (random, so nothing of the
   // content) with the landing, and its stamps are the purge's, so every
   // replica and both transports write the same entry and a re-merge changes
-  // nothing. Conflict twins of a landing are not followed: they are other
-  // texts, kept beside the card, not the card. Nor is an edit a merge rescued
-  // from the delete (it lands on that same revival id, and no receipt names
-  // it): only the deleted bytes lead there, so whether a purge reached it
-  // would depend on which copies a merge happened to meet (a purge receipt
-  // must not carry a hash of them); and the purging machine usually holds
-  // that card live and works on it, so a purge, an age purge included, would
-  // take live work with it.
+  // nothing. A conflict twin of a landing is followed only when it holds
+  // exactly the bytes the restore put back (below): a rescue of an older
+  // text can take the landing's id and leave the restored bytes in a twin
+  // beside it, and that twin is the purged card. A twin holding other text
+  // is someone's text kept beside the card, and stays. Nor is an edit a
+  // merge rescued from the delete followed (it lands on that same revival
+  // id, and no receipt names it): only the deleted bytes lead there, so
+  // whether a purge reached it would depend on which copies a merge
+  // happened to meet (a purge receipt must not carry a hash of them); and
+  // the purging machine usually holds that card live and works on it, so a
+  // purge, an age purge included, would take live work with it.
   const purgeOf = (k) => {
     const e = ownAll(k);
     // Only a purge someone made: a derived receipt is the reach of its own root.
@@ -747,6 +750,28 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
     if (typeof root !== 'string' || e.json == null) continue;
     const P = purgeOf(root);
     if (P) reach(y, root, P, null, null);
+  }
+  // A conflict twin of a reached landing holding exactly the bytes the
+  // restore put back is the purged card too: a rescue of an older text took
+  // the landing's id and the restored bytes went to a twin beside it (N8),
+  // so killing the landing alone left the very text the purge was for on the
+  // board. The purge takes that twin, under a receipt derived the same way.
+  // Every side holding the twin must hold those bytes; a twin holding
+  // anything else is someone's text and stays (see the note above). A twin an
+  // earlier merge reached already travels under its derived receipt; knowing
+  // the bytes lets its copies be judged as the landing's are.
+  const reachedTwins = [];
+  for (const x of new Set([...O.ids, ...T.ids])) {
+    const parent = TWIN_PARENT_RE.exec(x)?.[1];
+    const via = parent ? reached.get(parent) : null;
+    if (!via?.rid || reached.get(x)?.rid) continue;
+    const copies = [O, T].filter((S) => live(S, x)).map((S) => S.items[x]);
+    if (copies.length && copies.every((v) => fullEntryRid(via.from, v) === via.rid)) reachedTwins.push([x, via]);
+  }
+  for (const [x, via] of reachedTwins) {
+    const had = reached.get(x);
+    if (had && had.root === via.root) reached.set(x, { ...had, from: via.from, rid: via.rid });
+    else reach(x, via.root, purgeOf(via.root), via.from, via.rid);
   }
   const eAll = (id) => maxEntry(id, [ownAll(id), reached.get(id)?.entry]);
   const eKill = (id) => maxEntry(id, [ownKill(id), reached.get(id)?.entry]);

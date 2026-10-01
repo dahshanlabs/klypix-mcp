@@ -125,6 +125,9 @@ try {
   const heldInTwin = conflicts.filter((c) => c.kind === 'change-held-in-twin').length;
   // An embedded file both branches changed has no twin: one version is kept.
   const filesPicked = conflicts.filter((c) => c.kind === 'asset').length;
+  // Both branches renamed the brain (or one did and there is no base): one
+  // name is kept. The committer sees only this line, so it says which.
+  const title = conflicts.find((c) => c.kind === 'title' || c.kind === 'title-no-base');
   const staleDropped = Math.max(0, (stats?.purgedCopies || 0) - editsDropped);
   const bits = [];
   if (delta.added.length) bits.push(`+${delta.added.length} card(s)`);
@@ -146,6 +149,10 @@ try {
     bits.push(filesPicked === 1
       ? "1 embedded file changed on both branches — one version kept (the other is in the other branch's history)"
       : `${filesPicked} embedded files changed on both branches — one version of each kept (the others are in the other branch's history)`);
+  }
+  if (title) {
+    const kept = title.kept === 'ours' ? title.ours : title.theirs, other = title.kept === 'ours' ? title.theirs : title.ours;
+    bits.push(`brain title "${kept}" kept (the other branch had "${other}")`);
   }
   console.error(`klypix-merge: ${realPath || 'brain'} merged${bits.length ? ' — ' + bits.join(', ') : ''}`);
   process.exit(0);

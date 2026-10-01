@@ -2314,6 +2314,20 @@ const CANON_CHECKS = {};   // name -> async (engine) => true when the check hold
   ok(k7bOk, `K7b: a change that would make a card say what its own conflict twin says stays off the card and is reported; one that moves the card away from the twin's text wins as ever${k7bOk ? '' : `   (got ${k7bGot.join(' | ')}, want ${K7B_WANT.join(' | ')})`}`);
   CANON_CHECKS.oneSided = async (engine) => { const g = await k7b(engine); return g.every((x, i) => x.split(' told')[0] === K7B_WANT[i % 3].split(' told')[0]); };
   CANON_CHECKS.refusedTold = async (engine) => { const g = await k7b(engine); return g.every((x, i) => x === K7B_WANT[i % 3]); };
+  // K7c: with no base the same, and the side whose text is not on the card
+  // is told either way (nothing says who changed what; its text is in the twin).
+  const k7c = [];
+  for (const options of [SYNC, DRIVER]) for (const [ours, theirs] of [[onlyX, onlyT], [onlyT, onlyX]]) {
+    const res = await mergeBrains({ base: null, ours, theirs, options });
+    k7c.push(`${await texts(res)} told[${res.conflicts.filter((c) => c.kind === 'change-held-in-twin').map((c) => c.refused).join(',')}]`);
+  }
+  const K7C_WANT = 'k=X only here k~=T1 told[theirs] | k=X only here k~=T1 told[ours]';
+  ok(k7c.join(' | ') === `${K7C_WANT} | ${K7C_WANT}`, `K7c: with no base the un-twinned text stays on the card and the other side is told${k7c.join(' | ') === `${K7C_WANT} | ${K7C_WANT}` ? '' : `   (got ${k7c.join(' | ')})`}`);
+  CANON_CHECKS.refusedNoBase = async (engine) => {
+    const out = [];
+    for (const [ours, theirs] of [[onlyX, onlyT], [onlyT, onlyX]]) out.push((await engine.mergeBrains({ base: null, ours, theirs, options: SYNC })).conflicts.some((c) => c.kind === 'change-held-in-twin'));
+    return out.every(Boolean);
+  };
   // And it never counts as a twin this merge made (the driver's and the
   // desktop's "conflict twins kept" count only those).
   const toldRes = await mergeBrains({ base: onlyX, ours: onlyX, theirs: onlyT, options: SYNC });
@@ -2439,6 +2453,43 @@ const CANON_CHECKS = {};   // name -> async (engine) => true when the check hold
   const k9bGot = await k9b({ mergeBrains });
   ok(k9bGot === `${movedId} ${movedId}`, `K9b: a card under a container this merge moved to a new id follows it there${k9bGot === `${movedId} ${movedId}` ? '' : `   (got ${k9bGot}, want ${movedId})`}`);
   CANON_CHECKS.follow = async (engine) => (await k9b(engine)) === `${movedId} ${movedId}`;
+  // K9c: a loop. Each side nested one group into the other — two one-sided
+  // moves, so both win — and neither group, nor anything in them, could be
+  // reached from the top level (1.86.3 did the same, in every mode). The
+  // loop is opened at one member, the same either way round; the card inside
+  // stays inside its group.
+  const k9c = async (engine) => {
+    const boxed = await withCanvas(b0c, (c) => { c.positions.txt_k = { ...c.positions.txt_k, parentId: 'ctn_a' }; });
+    const aInB = await withCanvas(boxed, (c) => { c.positions.ctn_a = { ...c.positions.ctn_a, parentId: 'ctn_b' }; });
+    const bInA = await withCanvas(boxed, (c) => { c.positions.ctn_b = { ...c.positions.ctn_b, parentId: 'ctn_a' }; });
+    const selfLoop = await withCanvas(boxed, (c) => { c.positions.ctn_a = { ...c.positions.ctn_a, parentId: 'ctn_a' }; });
+    const out = [];
+    for (const options of [SYNC, DRIVER, undefined]) for (const [ours, theirs] of [[aInB, bInA], [bInA, aInB], [selfLoop, boxed]]) {
+      const { canvas } = await parseKlypix((await engine.mergeBrains({ base: boxed, ours, theirs, ...(options ? { options } : {}) })).buffer);
+      const p = canvas.positions;
+      const top = (id) => { const seen = new Set(); for (let cur = id; cur != null; cur = p[cur]?.parentId ?? null) { if (seen.has(cur)) return false; seen.add(cur); } return true; };
+      out.push(`${['ctn_a', 'ctn_b', 'txt_k'].every(top) ? 'on-board' : 'LOOP'}:a<${p.ctn_a.parentId ?? 'top'}:b<${p.ctn_b.parentId ?? 'top'}:k<${p.txt_k.parentId ?? 'top'}`);
+    }
+    return out.join(' ');
+  };
+  const K9C_ONE = 'on-board:a<top:b<ctn_a:k<ctn_a on-board:a<top:b<ctn_a:k<ctn_a on-board:a<top:b<top:k<ctn_a';
+  const k9cGot = await k9c({ mergeBrains });
+  ok(k9cGot === [K9C_ONE, K9C_ONE, K9C_ONE].join(' '), `K9c: two groups each side nested into the other stay on the board — the loop is opened at one member, the same either way round, in every mode${k9cGot === [K9C_ONE, K9C_ONE, K9C_ONE].join(' ') ? '' : `   (got ${k9cGot})`}`);
+  CANON_CHECKS.loop = async (engine) => !(await k9c(engine)).includes('LOOP');
+  // K9d: a line and a stroke drawn inside a container the other side deleted.
+  const k9d = async (engine) => {
+    const drawn = await withCanvas(b0c, (c) => { c.lines = [{ id: 'line_1', parentId: 'ctn_b', x1: 0, y1: 0, x2: 10, y2: 10 }]; c.strokes = [{ id: 'stroke_1', parentId: 'ctn_b', points: [[0, 0], [5, 5]] }]; });
+    const gone = await removeItem(b0c, 'ctn_b');
+    const out = [];
+    for (const options of [SYNC, DRIVER, undefined]) for (const [ours, theirs] of [[drawn, gone], [gone, drawn]]) {
+      const { canvas } = await parseKlypix((await engine.mergeBrains({ base: b0c, ours, theirs, deletedIds: ['ctn_b'], ...(options ? { options } : {}) })).buffer);
+      out.push(`${canvas.lines.length}L<${canvas.lines[0]?.parentId ?? 'top'} ${canvas.strokes.length}S<${canvas.strokes[0]?.parentId ?? 'top'}`);
+    }
+    return out.join(' | ');
+  };
+  const k9dGot = await k9d({ mergeBrains });
+  ok(k9dGot === Array(6).fill('1L<top 1S<top').join(' | '), `K9d: a line and a stroke drawn in a container the other side deleted stay on the board, in every mode${k9dGot === Array(6).fill('1L<top 1S<top').join(' | ') ? '' : `   (got ${k9dGot})`}`);
+  CANON_CHECKS.drawings = async (engine) => (await k9d(engine)) === Array(6).fill('1L<top 1S<top').join(' | ');
 
   // K4: both sides renamed the brain.
   const named = (title) => withManifest(b0, { title });
@@ -2865,6 +2916,24 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
       find: '    if (pid == null || liveIds.has(pid)) { positions[id] = pos; continue; }',
       replace: '    if (true) { positions[id] = pos; continue; }',
       canon: 'orphan', check: 'K9',
+    },
+    {
+      rule: 'with no base the side whose text is not on the card is told',
+      find: '        const refused = cb ? (oursStays ? (tChg && !oChg) : (oChg && !tChg)) : true;',
+      replace: '        const refused = cb ? (oursStays ? (tChg && !oChg) : (oChg && !tChg)) : false;',
+      canon: 'refusedNoBase', check: 'K7c',
+    },
+    {
+      rule: 'a drawing is never left under a container that is not on the board',
+      find: "  const onBoard = (d) => (d && d.parentId != null && !liveIds.has(d.parentId)) ? { ...d, parentId: movedTo.get(d.parentId) ?? null } : d;",
+      replace: '  const onBoard = (d) => d;',
+      canon: 'drawings', check: 'K9d',
+    },
+    {
+      rule: 'a loop of containers is opened',
+      find: '    if (cur != null && on.has(cur)) {',
+      replace: '    if (false) {',
+      canon: 'loop', check: 'K9c',
     },
     {
       rule: 'a card follows a container the merge moved to a new id',

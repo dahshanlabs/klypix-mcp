@@ -101,8 +101,11 @@
 //     tie-break: it also keeps a change ONE side made off the card when that
 //     change is the twin's text, and says so (`change-held-in-twin`). Pass C
 //     says why, and how the desktop lets a person take that text.
-//   • A card is never left under a container that is not on the board: it
-//     goes where the other side has it, or to the top level.
+//   • A card (or a line or a stroke) is never left under a container that is
+//     not on the board: it goes where the other side has it, or to the top
+//     level. Nor in a loop
+//     of containers (each side nested one group into the other): the loop is
+//     opened at one member, the same one on every machine.
 //   STILL OPEN with two transports on one brain (git and Brain Sync): a value
 //   only ONE side changed is decided from that transport's base, and the two
 //   do not share one. With a third value of one field and the two transports
@@ -1181,10 +1184,17 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
       if (besideO || besideT) {
         const oursStays = bothBeside ? canonicalFirst(itemSignature(O.items[id]), itemSignature(T.items[id])) : besideT;
         // A change one side alone made to the card, which the plain 3-way
-        // would have taken, and which this keeps off the card.
-        const refused = cb && (oursStays ? (tChg && !oChg) : (oChg && !tChg));
-        if (oursStays) { json = O.items[id]; side = 'ours'; }
-        else {
+        // would have taken, and which this keeps off the card. With no base
+        // nothing says who changed what: the side whose text is not on the
+        // card is told, as ever (its text is in the twin).
+        const refused = cb ? (oursStays ? (tChg && !oChg) : (oChg && !tChg)) : true;
+        if (oursStays) {
+          json = O.items[id]; side = 'ours';
+          // Both sides changed it and theirs' text was already in a twin: a
+          // conflict settled without a new twin — reported, as the mirror
+          // case (theirs on the card, ours in its twin) is.
+          if (cb && oChg && tChg && !refused) conflicts.push({ id, kind: 'content', keptLive: 'ours', twin: keptBeside(O, T, id, T.items[id]) ?? keptBeside(T, O, id, T.items[id]), existing: true });
+        } else {
           json = T.items[id]; side = 'theirs'; delta.updated.push(id);
           // E-1b's report: the driver names a conflict it took as settled elsewhere.
           if (opt.adoptResolvedConflicts && cb && oChg && tChg && !besideT) conflicts.push({ id, kind: 'content', keptLive: 'theirs', twin: liveTwinHolding(T, id, O.items[id]) ?? liveTwinHolding(O, id, O.items[id]), adopted: true });
@@ -1381,8 +1391,12 @@ async function finishMerge(B, O, T, opt, run) {
     if (threeWay) for (const [id, v] of pickById(key)) m.set(id, v);
     return [...m.values()];
   };
-  const lines = unionById('lines');
-  const strokes = unionById('strokes');
+  // A line or a stroke drawn inside a container that is not on the board
+  // (deleted on the other side) is drawn nowhere, like a card: it follows a
+  // container this merge moved, else goes to the top level.
+  const onBoard = (d) => (d && d.parentId != null && !liveIds.has(d.parentId)) ? { ...d, parentId: movedTo.get(d.parentId) ?? null } : d;
+  const lines = unionById('lines').map(onBoard);
+  const strokes = unionById('strokes').map(onBoard);
 
   // ── Union assets by path (later sources win: theirs, then ours, over base).
   // Under 'unverified' our own bytes win over foreign ones.
@@ -1443,6 +1457,23 @@ async function finishMerge(B, O, T, opt, run) {
     const other = movedTo.get(pid)
       ?? [O.positions[id]?.parentId, T.positions[id]?.parentId].find((x) => x != null && x !== pid && liveIds.has(x)) ?? null;
     positions[id] = { ...pos, parentId: other };
+  }
+  // Nor inside a loop of containers. Each side nested one group into the
+  // other: two one-sided moves, so both win, and nothing in a loop is
+  // reachable from the top level — the two groups left the board with
+  // everything in them. A loop is opened at one member, picked from the ids
+  // alone (the same on every machine): it goes to the top level, and the
+  // other nesting stands.
+  const reachesTop = new Set();
+  for (const id of order) {
+    const path = [], on = new Set();
+    let cur = id;
+    while (cur != null && !reachesTop.has(cur) && !on.has(cur)) { on.add(cur); path.push(cur); cur = positions[cur]?.parentId ?? null; }
+    if (cur != null && on.has(cur)) {
+      const open = path.slice(path.indexOf(cur)).sort()[0];
+      positions[open] = { ...positions[open], parentId: null };
+    }
+    for (const x of path) reachesTop.add(x);
   }
 
   // Per-field manifest UNION, theirs-precedence: theirs still wins every field

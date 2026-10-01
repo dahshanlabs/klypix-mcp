@@ -20,7 +20,9 @@
 //   • Content conflict (both edited the same card) keeps BOTH texts:
 //     the human's stays live on the card, the agent's is preserved as a linked
 //     twin card — never silently dropped.
-//   • zKeys are de-collided (duplicate keys silently no-op in the app reducer).
+//   • zKeys are de-collided (duplicate keys silently no-op in the app reducer),
+//     and the order is the cards by zKey, then id — the same whichever side
+//     is ours, so git and Brain Sync stop rewriting each other's order.
 //   • Post-merge SUPERSET VERIFICATION: the result is asserted to contain every
 //     surviving id from both sides; the function throws rather than return a
 //     buffer that lost a card.
@@ -84,6 +86,47 @@ import {
 import { generateKeyBetween } from 'fractional-indexing';
 
 const isValidZKey = (k) => { try { generateKeyBetween(k, null); return true; } catch { return false; } };
+
+// One order for every merge, whichever side is ours. canvas.order lists the
+// cards bottom to top; the app draws by zKey (sorted per parent) and keeps
+// order in step with it. An order built from one side's list first came out
+// different by orientation: git's driver (ours = this checkout) and Brain Sync
+// wrote opposite orders and each rewrote the other's file on every round. So
+// the cards go by zKey, then id; a card with no usable zKey (a twin minted in
+// the merge, a file from before zKeys) goes on top, by its old zIndex, then id.
+// A key that has to be made (missing, invalid, or a duplicate — the app
+// silently no-ops a reorder over duplicates) lands between its neighbours, so
+// the result is sorted by zKey and the next merge leaves it as it is.
+// `ids` may repeat; `posOf(id)` is the card's position before the heal.
+function canonicalZOrder(ids, posOf) {
+  const zOf = (id) => { const z = posOf(id)?.zKey; return z && isValidZKey(z) ? z : null; };
+  const zIndexOf = (id) => { const n = posOf(id)?.zIndex; return Number.isFinite(n) ? n : Infinity; };
+  const cmp = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+  const byZ = (a, b) => {
+    const za = zOf(a), zb = zOf(b);
+    if (za !== zb) return za == null ? 1 : zb == null ? -1 : cmp(za, zb);
+    if (za == null) { const d = zIndexOf(a) - zIndexOf(b); if (d) return d; }
+    return cmp(a, b);
+  };
+  const order = [...new Set(ids)].sort(byZ);
+  const keys = new Map();
+  const used = new Set();
+  let last = null;
+  order.forEach((id, i) => {
+    let z = zOf(id);
+    if (z == null || used.has(z) || (last != null && z <= last)) {
+      let next = null;
+      for (let j = i + 1; j < order.length; j++) {
+        const k = zOf(order[j]);
+        if (k == null) break;
+        if (last == null || k > last) { next = k; break; }
+      }
+      z = generateKeyBetween(last, next);
+    }
+    used.add(z); last = z; keys.set(id, z);
+  });
+  return { order, keyOf: (id) => keys.get(id) };
+}
 const ARCHIVE = /^archive$/i;
 
 // The identity helpers live in klypix-format.mjs (one definition for every
@@ -1055,23 +1098,12 @@ async function finishMerge(B, O, T, opt, run) {
     merged.set(ex.id, { json: ex.json, pos: { x: (src.x || 0) + 24, y: (src.y || 0) + 24, w: src.w, h: src.h, parentId: src.parentId ?? null } });
   }
 
-  // ── Order + zKey heal (de-collide: duplicate zKeys silently no-op in-app) ──
-  const order = [];
-  const seen = new Set();
-  for (const id of [...T.order, ...O.order, ...extras.map(e => e.id)]) {
-    if (merged.has(id) && !seen.has(id)) { seen.add(id); order.push(id); }
-  }
-  // Any merged id not in either order[] (defensive) — append.
-  for (const id of merged.keys()) if (!seen.has(id)) { seen.add(id); order.push(id); }
-
-  const usedZ = new Set();
-  let lastZ = null;
+  // ── Order + zKey heal: one order whichever side is ours (canonicalZOrder) ──
+  const listed = [...T.order, ...O.order, ...extras.map(e => e.id), ...merged.keys()].filter((id) => merged.has(id));
+  const { order, keyOf } = canonicalZOrder(listed, (id) => merged.get(id).pos);
   order.forEach((id, i) => {
     const rec = merged.get(id);
-    let z = rec.pos.zKey;
-    if (!z || !isValidZKey(z) || usedZ.has(z)) z = generateKeyBetween(lastZ, null);
-    usedZ.add(z); lastZ = z;
-    rec.pos = { ...rec.pos, zKey: z, zIndex: i };
+    rec.pos = { ...rec.pos, zKey: keyOf(id), zIndex: i };
   });
 
   // ── Union connections / lines / strokes by id; drop dangling connections ──
@@ -1343,21 +1375,19 @@ export async function restoreSnapshotAsMerge({
 
   // Canvas from the snapshot, re-pointed through the id map.
   const mapId = (id) => (id == null ? null : (idMap.get(id) ?? (resultIds.has(id) ? id : null)));
-  const order = [];
+  const restoredIds = [];
   const sourceOf = new Map();       // result id -> the snapshot id it came from
   for (const k of sOrder) {
     const r = idMap.get(k);
-    if (r && !sourceOf.has(r)) { sourceOf.set(r, k); order.push(r); }
+    if (r && !sourceOf.has(r)) { sourceOf.set(r, k); restoredIds.push(r); }
   }
+  // The same order a merge writes (canonicalZOrder), so the first sync after a
+  // restore does not rewrite the file only to reorder it.
+  const { order, keyOf } = canonicalZOrder(restoredIds, (r) => S.positions[sourceOf.get(r)]);
   const positions = {};
-  const usedZ = new Set();
-  let lastZ = null;
   order.forEach((r, i) => {
     const p = S.positions[sourceOf.get(r)] || {};
-    let z = p.zKey;
-    if (!z || !isValidZKey(z) || usedZ.has(z)) z = generateKeyBetween(lastZ, null);
-    usedZ.add(z); lastZ = z;
-    positions[r] = { ...p, parentId: mapId(p.parentId ?? null), zKey: z, zIndex: i };
+    positions[r] = { ...p, parentId: mapId(p.parentId ?? null), zKey: keyOf(r), zIndex: i };
   });
   const live = new Set(order);
   const seenEdge = new Set();

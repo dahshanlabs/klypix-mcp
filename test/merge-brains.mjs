@@ -530,6 +530,11 @@ console.log('\n— S2-U no options ⇒ unchanged (differential against 1.86.3) �
       if (m) ren.set(id, `${m[1]}__agconf_<${itemSignature(items[id])}>`);
     }
     const R = (id) => ren.get(id) ?? id;
+    // The order and the zKeys are compared apart (U3, U4): since review round
+    // 2 every merge writes one order whichever side is ours, where 1.86.3
+    // listed theirs first.
+    const ids = [...order].sort((a, b) => (R(a) < R(b) ? -1 : R(a) > R(b) ? 1 : 0));
+    const placed = (id) => { const { zKey, zIndex, ...pos } = canvas.positions[id] || {}; return pos; };
     const bin = {};
     const gf = zip.file('graveyard.json');
     const entries = gf ? JSON.parse(await gf.async('string')).entries : {};
@@ -541,9 +546,9 @@ console.log('\n— S2-U no options ⇒ unchanged (differential against 1.86.3) �
     const { revived, purgedCopies, ...stats } = res.stats;
     const { revived: dRevived, ...delta } = res.delta;
     return JSON.stringify({
-      order: order.map(R),
-      items: Object.fromEntries(order.map((id) => [R(id), items[id]])),
-      positions: Object.fromEntries(order.map((id) => [R(id), canvas.positions[id]])),
+      order: ids.map(R),
+      items: Object.fromEntries(ids.map((id) => [R(id), items[id]])),
+      positions: Object.fromEntries(ids.map((id) => [R(id), placed(id)])),
       connections: canvas.connections, lines: canvas.lines, strokes: canvas.strokes, settings: canvas.settings,
       view: canvas.view, nextGroupNumber: canvas.nextGroupNumber,
       bin, manifest: man, delta, stats,
@@ -554,7 +559,7 @@ console.log('\n— S2-U no options ⇒ unchanged (differential against 1.86.3) �
 
   const SEEDS = 60;
   let agree = 0, withTwins = 0, withRemovals = 0, withBins = 0;
-  const disagreements = [];
+  const disagreements = [], unsorted = [], rekeyed = [];
   for (let seed = 1; seed <= SEEDS; seed++) {
     const rnd = mulberry(seed * 7919);
     const pick = (p) => rnd() < p;
@@ -591,8 +596,15 @@ console.log('\n— S2-U no options ⇒ unchanged (differential against 1.86.3) �
     const args = { base: noBase ? null : b, ours, theirs, deletedIds, deletedMeta };
 
     const known = new Set([...(await liveIds(b)), ...(await liveIds(ours)), ...(await liveIds(theirs))]);
-    let newC, oldC;
-    try { newC = await canon(await mergeBrains(args), known); } catch (e) { newC = `threw ${e.message}`; }
+    let newC, oldC, newRes = null;
+    try { newRes = await mergeBrains(args); newC = await canon(newRes, known); } catch (e) { newC = `threw ${e.message}`; }
+    if (newRes) {
+      const { canvas } = await parseKlypix(newRes.buffer);
+      const z = (canvas.order || []).map((id) => canvas.positions[id]?.zKey);
+      if (!z.every((k, i) => typeof k === 'string' && (i === 0 || z[i - 1] < k))) unsorted.push(seed);
+      const bPos = (await parseKlypix(b)).canvas.positions;
+      for (const id of canvas.order || []) if (bPos[id]?.zKey && canvas.positions[id]?.zKey !== bPos[id].zKey) rekeyed.push(`${seed}:${id}`);
+    }
     try { oldC = await canon(await OLD.mergeBrains(args), known); } catch (e) { oldC = `threw ${e.message}`; }
     if (newC === oldC) agree++; else disagreements.push(seed);
     const parsed = JSON.parse(newC.startsWith('threw') ? '{}' : newC);
@@ -600,7 +612,9 @@ console.log('\n— S2-U no options ⇒ unchanged (differential against 1.86.3) �
     if ((parsed.delta?.removed || []).length) withRemovals++;
     if (Object.keys(parsed.bin || {}).length) withBins++;
   }
-  ok(agree === SEEDS, `U1: ${agree}/${SEEDS} seeded app-save/sync shapes merge identically to 1.86.3 modulo twin ids and rid${disagreements.length ? ` (differ: seeds ${disagreements.slice(0, 8).join(', ')})` : ''}`);
+  ok(agree === SEEDS, `U1: ${agree}/${SEEDS} seeded app-save/sync shapes merge identically to 1.86.3 modulo twin ids, rid and order${disagreements.length ? ` (differ: seeds ${disagreements.slice(0, 8).join(', ')})` : ''}`);
+  ok(!unsorted.length, `U3: every merge writes its order sorted by zKey, each key once${unsorted.length ? ` (not: seeds ${unsorted.slice(0, 8).join(', ')})` : ''}`);
+  ok(!rekeyed.length, `U4: a card that had a zKey keeps it${rekeyed.length ? ` (changed: ${rekeyed.slice(0, 8).join(', ')})` : ''}`);
   ok(withTwins >= 5 && withRemovals >= 5 && withBins >= 5, `U2: the differential exercised twins (${withTwins}), removals (${withRemovals}) and carried bins (${withBins})`);
 }
 
@@ -644,6 +658,7 @@ const N9_CHECK = [];          // the N9 case, for its S2-X mutation
 const CYCLE_CHECK = [];       // the B-C case, for its S2-X mutation
 const TITLE_CHECK = [];       // the M6 case, for its S2-X mutation
 const FOLD_OWN_CHECK = [];    // the B-F case, for its S2-X mutation
+const ORDER_CHECK = [];       // the Z1 and Z2 cases, for their S2-X mutations
 
 const withBin = async (buffer, bin) => {
   const { zip } = await parseKlypix(buffer);
@@ -1778,6 +1793,86 @@ console.log('\n— S2-M manifestMerge truth table —');
   ok(union === 'A', 'M: no options keeps 1.86.3\'s theirs-first title (app save is unchanged)');
 }
 
+// ── S2-Z one order, whichever side is ours ────────────────────────────────────
+// Review round 2 (convergence #5): the merge listed theirs' order first, so for
+// two cards added at the same height on two machines git's driver (ours = this
+// checkout) and Brain Sync wrote opposite orders, and each rewrote the other's
+// file on every round. Every merge now writes the cards by zKey, then id.
+console.log('\n— S2-Z one order whichever side is ours —');
+{
+  const withPos = async (buffer, id, patch) => {
+    const { zip, canvas } = await parseKlypix(buffer);
+    canvas.positions[id] = { ...canvas.positions[id], ...patch };
+    zip.file('canvas.json', JSON.stringify(canvas));
+    return rezip(zip);
+  };
+  const shapeOf = async (buffer) => {
+    const { canvas } = await parseKlypix(buffer);
+    return (canvas.order || []).map((id) => `${id.replace(/^txt_/, '')}@${canvas.positions[id]?.zKey}`).join(' ');
+  };
+  const sortedByZ = async (buffer) => {
+    const { canvas } = await parseKlypix(buffer);
+    const z = (canvas.order || []).map((id) => canvas.positions[id]?.zKey);
+    return z.every((k, i) => typeof k === 'string' && (i === 0 || z[i - 1] < k));
+  };
+  const OB = await buildKlypix({ title: 'order', cards: [{ id: 'txt_a', text: 'a' }, { id: 'txt_b', text: 'b' }] });   // a@a0 b@a1
+  const added = async (id, zKey) => withPos(await putItem(OB, id, cj(id, id)), id, { zKey });
+  const MODES = [['union', undefined], ['receipts', { binMerge: 'receipts' }]];
+  const both = async (engine, x, y, options) => [
+    await shapeOf((await engine.mergeBrains({ base: OB, ours: x, theirs: y, ...(options ? { options } : {}) })).buffer),
+    await shapeOf((await engine.mergeBrains({ base: OB, ours: y, theirs: x, ...(options ? { options } : {}) })).buffer),
+  ];
+
+  // Z1: each machine adds a card on top — both get the key a2. Either way
+  // round, one order and one set of keys; merged again, nothing moves.
+  const onX = await added('txt_x', 'a2'), onY = await added('txt_y', 'a2');
+  const o1 = async (engine) => {
+    const got = [];
+    for (const [, options] of MODES) got.push(...await both(engine, onX, onY, options));
+    return got;
+  };
+  const O1_WANT = 'a@a0 b@a1 x@a2 y@a3';
+  const o1got = await o1({ mergeBrains });
+  ok(o1got.every((g) => g === O1_WANT), `Z1: two cards added on top on two machines merge to one order either way round, in every mode → ${O1_WANT}${o1got.every((g) => g === O1_WANT) ? '' : `   (got ${o1got.join(' | ')})`}`);
+  const once = (await mergeBrains({ base: OB, ours: onX, theirs: onY })).buffer;
+  const again = await shapeOf((await mergeBrains({ base: once, ours: once, theirs: once })).buffer);
+  ok(again === O1_WANT, `Z1: a merge of the result leaves its order as it is${again === O1_WANT ? '' : `   (got ${again})`}`);
+  ORDER_CHECK.push(async (engine) => (await o1(engine)).every((g) => g === O1_WANT));
+
+  // Z2: both add a card between a and b (the key a0V on both). The second
+  // one's new key goes between its neighbours: b keeps a1 (an append after
+  // a0V would have made a1 again and pushed b's key along).
+  const midX = await added('txt_x', 'a0V'), midY = await added('txt_y', 'a0V');
+  const o2 = async (engine) => {
+    const got = [];
+    for (const [, options] of MODES) got.push(...await both(engine, midX, midY, options));
+    return got;
+  };
+  const o2got = await o2({ mergeBrains });
+  const O2_WANT = 'a@a0 x@a0V y@a0l b@a1';
+  const o2ok = (g) => g === O2_WANT;
+  ok(o2got.every(o2ok), `Z2: a key made for a duplicate lands between its neighbours, and b keeps a1 → ${O2_WANT}${o2got.every(o2ok) ? '' : `   (got ${o2got.join(' | ')})`}`);
+  ORDER_CHECK.push(async (engine) => (await o2(engine)).every(o2ok));
+
+  // Z3: a conflict twin minted in the merge has no key: it goes on top, and
+  // the result is still sorted by zKey.
+  const twinRes = await mergeBrains({ base: OB, ours: await setText(onX, 'txt_a', 'a on x'), theirs: await setText(onY, 'txt_a', 'a on y') });
+  const twinShape = await shapeOf(twinRes.buffer);
+  ok(await sortedByZ(twinRes.buffer) && /^a@a0 b@a1 x@a2 y@a3 a__agconf_\w+@a4$/.test(twinShape), `Z3: a twin minted in the merge goes on top, keyed after the rest${/a__agconf_/.test(twinShape) ? '' : `   (got ${twinShape})`}`);
+
+  // Z4: a history restore writes the same order a merge does — a snapshot
+  // whose order disagrees with its keys comes back sorted by zKey.
+  const { restoreSnapshotAsMerge } = await import('../src/merge-brains.mjs');
+  const reversed = await (async () => {
+    const { zip, canvas } = await parseKlypix(OB);
+    canvas.order = [...canvas.order].reverse();
+    zip.file('canvas.json', JSON.stringify(canvas));
+    return rezip(zip);
+  })();
+  const restored = await shapeOf((await restoreSnapshotAsMerge({ current: OB, snapshot: reversed, now: 5000 })).buffer);
+  ok(restored === 'a@a0 b@a1', `Z4: a history restore writes its order sorted by zKey${restored === 'a@a0 b@a1' ? '' : `   (got ${restored})`}`);
+}
+
 // ── S2-V theirsTrust (E-6) ────────────────────────────────────────────────────
 // 'unverified' is for foreign bytes with no proven ancestry (Stage 3): nothing
 // theirs holds may delete, overwrite or move one of our cards.
@@ -2131,6 +2226,18 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
       foldOwn: true,
     },
     {
+      rule: 'one order whichever side is ours (the cards by zKey, then id)',
+      find: '  const order = [...new Set(ids)].sort(byZ);',
+      replace: '  const order = [...new Set(ids)];',
+      order: 0,
+    },
+    {
+      rule: 'a key made for a duplicate lands between its neighbours',
+      find: '      z = generateKeyBetween(last, next);',
+      replace: '      z = generateKeyBetween(last, null);',
+      order: 1,
+    },
+    {
       rule: 'with no base, the title is theirs',
       find: '        manifest.title = tT;',
       replace: '        manifest.title = tO;',
@@ -2168,6 +2275,12 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
       try { got = await FOLD_OWN_CHECK[0](engine); } catch (e) { got = `threw ${e.message}`; }
       const kept = ['v9', 'v11', 'v15'].every((v) => got.includes(`=${v}`));
       ok(!kept, `X "${m.rule}" off ⇒ check B-F fails${!kept ? ` (mutant: ${got})` : ' — IT DID NOT'}`);
+      continue;
+    }
+    if (m.order != null) {
+      let held;
+      try { held = await ORDER_CHECK[m.order](engine); } catch { held = false; }
+      ok(!held, `X "${m.rule}" off ⇒ case Z${m.order + 1} fails${!held ? '' : ' — IT DID NOT'}`);
       continue;
     }
     if (m.title) {

@@ -73,7 +73,9 @@
 //     every landing a restore receipt names dies under a receipt derived from
 //     the purge (P-a: a purge wins over every copy). Text typed into a
 //     landing goes too, on the board or in Deleted cards, and is reported
-//     (purge-vs-edit).
+//     (purge-vs-edit); a restored card that leaves the board untouched is
+//     reported too (purge-reached-restore), so the person who restored it
+//     is told.
 //   • A moved value never overwrites a live card: it matches one, or becomes
 //     its deterministic twin.
 //   • The merge proves itself: every removal of a live card leaves an entry
@@ -628,12 +630,18 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
       // still holds the secret. Every live copy drops, edited or not.
       drops.push({ S, side, from: id, v, at: id, kind: 'P' });
       // A restore the purge reached: its receipt names the bytes it put back,
-      // so a copy still holding exactly those is the purge working, and
-      // anything else was edited since — whatever the base knew of the card
-      // (the purging machine never saw it at all).
+      // so a copy holding anything else was edited since — whatever the base
+      // knew of the card (the purging machine never saw it at all) — and is
+      // reported as purge-vs-edit. A copy still holding exactly those bytes
+      // is the purge working, but it is a card someone chose to bring back,
+      // and it leaves their board with nothing restorable behind and, when
+      // their base never held it, no delete anyone can see: it is reported
+      // as purge-reached-restore, against the side that held it, with no
+      // twin. Both are counted in purgedCopies.
       const via = reached.get(id);
       if (via && via.rid && E === via.entry) {
         if (fullEntryRid(via.from, v) !== via.rid) conflicts.push({ id, kind: 'purge-vs-edit', side, purgedWith: via.root });
+        else conflicts.push({ id, kind: 'purge-reached-restore', side, purgedWith: via.root });
       } else purgeVsEdit(side, id, v);
       return;
     }

@@ -836,10 +836,13 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
   // card or one of its twins, or it becomes a new deterministic twin. One case
   // is no conflict at all: the landing, on the other side, still holds exactly
   // the value this side's edit was made on (its base value of the id it moves
-  // from), and this side does not hold the landing. The edit then lands on the
-  // card, as a one-sided change does in the 3-way — twinning it left an edit of
-  // the card's own text beside it (the KLYPIX soak's I9: an edit of a card a
-  // sync had meanwhile revived or a person restored). Never from foreign bytes.
+  // from), and this side either does not hold the landing or holds that same
+  // value there (it met the revival too, and only its old copy carries the
+  // edit). The edit then lands on the card, as a one-sided change does in the
+  // 3-way — twinning it left an edit of the card's own text beside it (the
+  // KLYPIX soak's I9: an edit of a card a sync had meanwhile revived or a
+  // person restored). Never over other text of this side's own at the landing,
+  // and never from foreign bytes.
   const folded = new Map();          // landing id -> the move whose value it takes
   const landIntoAlive = (mv, t) => {
     if (twins.holds(t, mv.v)) return arrive(mv, t);
@@ -856,7 +859,7 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
     const madeOn = baseItem(mv.from);
     // Only onto a card the other side already held — never onto a value this
     // merge landed a moment ago (that value would then be lost, E-13).
-    if (!unverified && madeOn != null && !landed.has(t) && !live(mv.S, t) && live(other, t) && !folded.has(t) && sameMeaning(other.items[t], madeOn)) {
+    if (!unverified && madeOn != null && !landed.has(t) && (!live(mv.S, t) || sameMeaning(mv.S.items[t], madeOn)) && live(other, t) && !folded.has(t) && sameMeaning(other.items[t], madeOn)) {
       folded.set(t, mv);
       return arrive(mv, t);
     }

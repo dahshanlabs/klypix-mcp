@@ -643,6 +643,7 @@ const PURGE_GROUPINGS = [];   // the B-P check, for its S2-X mutation
 const N9_CHECK = [];          // the N9 case, for its S2-X mutation
 const CYCLE_CHECK = [];       // the B-C case, for its S2-X mutation
 const TITLE_CHECK = [];       // the M6 case, for its S2-X mutation
+const FOLD_OWN_CHECK = [];    // the B-F case, for its S2-X mutation
 
 const withBin = async (buffer, bin) => {
   const { zip } = await parseKlypix(buffer);
@@ -1300,6 +1301,19 @@ const B_ROWS = [
     want: { union: 'live[k′=v1] bin[k:P] c[]', receipts: 'live[k′=v1] bin[k:P] c[]', '3way': 'live[k′=v1] bin[k:P] c[]' },
   },
   {
+    // B26 with ours holding the revival too (it met the sync that made k′,
+    // yet its old copy of k carries the edit): k′ holds exactly what the edit
+    // was made on, on both sides, so the edit lands on it rather than beside
+    // it (convergence review, round 2).
+    name: 'B42 an edit lands on the card it moved to when both sides hold that card at the value it was made on',
+    args: async () => ({
+      base: await side({ live: { txt_k: pj('v9') } }),
+      ours: await side({ live: { txt_k: pj('v15'), [kRev('v0')]: pj('v9') } }),
+      theirs: await side({ live: { [kRev('v0')]: pj('v9') }, bin: { txt_k: Fe(k0, 'v0') } }),
+    }),
+    want: { union: 'live[k=v15 k′=v9] bin[] c[]', receipts: 'live[k′=v15] bin[k:F(v0)] c[]', '3way': 'live[k′=v15] bin[k:F(v0)] c[]' },
+  },
+  {
     // Nothing in any bin: the option modes are the familiar 3-way.
     name: 'B16 no bins anywhere: an ordinary content conflict',
     args: async () => ({ base: await side({ live: { txt_k: 'v0' } }), ours: await side({ live: { txt_k: 'v1' } }), theirs: await side({ live: { txt_k: 'v2' } }) }),
@@ -1403,6 +1417,22 @@ const B_ROWS = [
   ok(b8.delta.revived[0]?.via === 'resurrection', 'B8: the 3way revival is reported as a resurrection');
   const b15 = await mergeBrains({ ...(await B_ROWS[14].args()), options: { binMerge: 'receipts' } });
   ok(b15.conflicts.some((c) => c.suppressed === 'deleted-twin'), 'B15: the suppressed twin is reported, not silent');
+  // B42 with ours' copy of k′ edited (v11): the fold never puts the moved
+  // edit over other text this side holds at the landing. All three texts stay.
+  {
+    const ownCase = async (engine) => {
+      const res = await engine.mergeBrains({
+        base: await side({ live: { txt_k: pj('v9') } }),
+        ours: await side({ live: { txt_k: pj('v15'), [kRev('v0')]: pj('v11') } }),
+        theirs: await side({ live: { [kRev('v0')]: pj('v9') }, bin: { txt_k: Fe(k0, 'v0') } }),
+        options: { binMerge: 'receipts', newOnBothSides: 'twin' },
+      });
+      return summarize(res);
+    };
+    const got = await ownCase({ mergeBrains });
+    ok(['v9', 'v11', 'v15'].every((v) => got.includes(`=${v}`)), `B-F: an edit moving onto a card that holds other text of its own side's keeps all three (${got})`);
+    FOLD_OWN_CHECK.push(ownCase);
+  }
   // A routing cycle (k's restore names a, a's names k) lands at an id derived
   // from the value, which every machine computes alike.
   {
@@ -1988,7 +2018,7 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
     },
     {
       rule: 'an edit of exactly what the landing holds lands on it',
-      find: "    if (!unverified && madeOn != null && !landed.has(t) && !live(mv.S, t) && live(other, t) && !folded.has(t) && sameMeaning(other.items[t], madeOn)) {",
+      find: "    if (!unverified && madeOn != null && !landed.has(t) && (!live(mv.S, t) || sameMeaning(mv.S.items[t], madeOn)) && live(other, t) && !folded.has(t) && sameMeaning(other.items[t], madeOn)) {",
       replace: '    if (false) {',
       row: 'B26', options: { binMerge: 'receipts' },
     },
@@ -2089,6 +2119,18 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
       row: 'B40', options: { binMerge: 'receipts' },
     },
     {
+      rule: 'the fold also lands an edit when its own side holds the landing at the value it was made on',
+      find: '(!live(mv.S, t) || sameMeaning(mv.S.items[t], madeOn))',
+      replace: '!live(mv.S, t)',
+      row: 'B42', options: { binMerge: 'receipts' },
+    },
+    {
+      rule: 'the fold never overwrites other text its own side holds at the landing',
+      find: '(!live(mv.S, t) || sameMeaning(mv.S.items[t], madeOn))',
+      replace: 'true',
+      foldOwn: true,
+    },
+    {
       rule: 'with no base, the title is theirs',
       find: '        manifest.title = tT;',
       replace: '        manifest.title = tO;',
@@ -2119,6 +2161,13 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
     if (m.groupings) {
       const agree = await PURGE_GROUPINGS[0](engine);
       ok(!agree, `X "${m.rule}" off ⇒ check B-P's groupings disagree${!agree ? '' : ' — THEY DID NOT'}`);
+      continue;
+    }
+    if (m.foldOwn) {
+      let got;
+      try { got = await FOLD_OWN_CHECK[0](engine); } catch (e) { got = `threw ${e.message}`; }
+      const kept = ['v9', 'v11', 'v15'].every((v) => got.includes(`=${v}`));
+      ok(!kept, `X "${m.rule}" off ⇒ check B-F fails${!kept ? ` (mutant: ${got})` : ' — IT DID NOT'}`);
       continue;
     }
     if (m.title) {

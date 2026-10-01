@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 // klypix-merge-driver — git merge driver for .klypix files.
 //
-// Wires the existing lossless 3-way engine (./merge-brains.mjs — the same one
-// the app uses for merge-on-save) into git, so two people committing to one
+// Wires the 3-way engine (./merge-brains.mjs — the one the app's
+// merge-on-save and Brain Sync use) into git, so two people committing to one
 // brain.klypix stop hitting manual binary conflicts: git calls this on
-// conflict, the union merge runs, and both sides' cards survive.
+// conflict, the engine merges card by card, and both sides' cards survive —
+// except a permanently deleted card's copies, which drop (an edited one is
+// reported in the summary line; its text stays in the branch's history).
 //
 // git invokes it as:   node scripts/klypix-merge-driver.mjs %O %A %B %P
 //   %O = common ancestor file   %A = ours (result is written HERE)
@@ -27,8 +29,10 @@
 // COMMITTED snapshots, so "in ancestor, absent from a side" is a deliberate,
 // committed delete. We honor it as a tombstone ONLY when the other side left
 // the card untouched; if the other side EDITED it after the ancestor, no
-// tombstone is passed and the union keeps the edited card (delete-vs-edit
-// resolves to the edit — no-loss wins over delete).
+// tombstone is passed and the edit survives: on the card itself when the
+// deleting branch left no record, or as a new card (revivedIdFor) when its
+// bin recorded the delete, so that receipt is never contradicted. A permanent
+// delete is the exception: the edit drops, and the summary line says so.
 //
 // BIN-AWARE MERGE (E-10). Both sides are whole committed files, bins
 // included, so the driver asks the engine for the same receipt-aware rules
@@ -110,13 +114,25 @@ try {
     base, ours: A, theirs: B, deletedIds, deletedMeta, ...(options ? { options } : {}),
   });
   fs.writeFileSync(aPath, buffer);
+  // Say what happened, and nothing it did not: a twin counts only when this
+  // merge made it (not one a side already held, a conflict already resolved,
+  // or one a person deleted), and an edit a purge took is named apart from
+  // stale copies, because that text exists now only in the branch's history.
+  const twinsMade = conflicts.filter((c) => c.twin && !c.existing && !c.suppressed && !c.adopted).length;
+  const editsDropped = conflicts.filter((c) => c.kind === 'purge-vs-edit').length;
+  const staleDropped = Math.max(0, (stats?.purgedCopies || 0) - editsDropped);
   const bits = [];
   if (delta.added.length) bits.push(`+${delta.added.length} card(s)`);
   if (deletedIds.length) bits.push(`-${deletedIds.length} delete(s) honored`);
   if (delta.revived?.length) bits.push(`~${delta.revived.length} revived`);
-  if (stats?.purgedCopies) bits.push(`${stats.purgedCopies} purged copies dropped`);
-  if (conflicts.length) bits.push(`${conflicts.length} conflict twin(s) preserved`);
-  console.error(`klypix-merge: ${realPath || 'brain'} united losslessly${bits.length ? ' — ' + bits.join(', ') : ''}`);
+  if (staleDropped) bits.push(`${staleDropped} purged ${staleDropped === 1 ? 'copy' : 'copies'} dropped`);
+  if (editsDropped) {
+    bits.push(editsDropped === 1
+      ? '1 edited copy of a permanently deleted card dropped (still in git history)'
+      : `${editsDropped} edited copies of permanently deleted cards dropped (still in git history)`);
+  }
+  if (twinsMade) bits.push(`${twinsMade} conflict twin(s) preserved`);
+  console.error(`klypix-merge: ${realPath || 'brain'} merged${bits.length ? ' — ' + bits.join(', ') : ''}`);
   process.exit(0);
 } catch (e) {
   // Any failure → normal binary conflict, same as a machine without the driver.

@@ -10,7 +10,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { execFileSync } from 'child_process';
+import { execFileSync, spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import {
   buildKlypixMap, appendToKlypix, parseKlypix, buildKlypix, shard,
@@ -224,13 +224,14 @@ console.log('\n— E-10: the driver asks for the bin-aware rules —');
     return f ? JSON.parse(await f.async('string')).content : null;
   };
   const DIR = fs.mkdtempSync(path.join(TMP, 'driver-'));
+  // `err` is the driver's stderr either way: its summary line on success.
   const drive = (driver, O, A, B) => {
     const [o, a, b] = ['o', 'a', 'b'].map((n) => path.join(DIR, `${n}.klypix`));
     fs.writeFileSync(o, O); fs.writeFileSync(a, A); fs.writeFileSync(b, B);
-    try {
-      execFileSync(process.execPath, [driver, o, a, b, 'brain.klypix'], { stdio: ['ignore', 'pipe', 'pipe'] });
-      return { code: 0, out: fs.readFileSync(a) };
-    } catch (e) { return { code: e.status ?? 1, out: null, err: String(e.stderr || '') }; }
+    const r = spawnSync(process.execPath, [driver, o, a, b, 'brain.klypix'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    return r.status === 0
+      ? { code: 0, out: fs.readFileSync(a), err: String(r.stderr || '') }
+      : { code: r.status ?? 1, out: null, err: String(r.stderr || r.error?.message || '') };
   };
 
   const seed = await buildKlypix({ title: 'driver bins', cards: [{ id: 'txt_anchor', text: 'anchor' }] });
@@ -257,6 +258,31 @@ console.log('\n— E-10: the driver asks for the bin-aware rules —');
     const twin = ids.find((id) => id.startsWith('txt_n__agconf_'));
     ok(r.code === 0 && (await textOf(r.out, 'txt_n')) === 'N — written on branch A' && twin && (await textOf(r.out, twin)) === 'N — written on branch B',
       'a card new on both branches with different text keeps both (ours live, theirs as a twin)');
+  }
+
+  // The summary line says what the merge did and nothing it did not. Branch
+  // A permanently deleted two cards; B edited one of them and left the other
+  // alone, and both wrote a new card under one id. One stale copy drops, one
+  // edit drops and is named apart (only git history holds it now), and one
+  // twin is made. Merged again over its own result, the twin already exists
+  // and is not counted.
+  {
+    const O = await putCard(await putCard(seed, 'txt_p1', 'p1 as committed'), 'txt_p2', 'p2 as committed');
+    const purgeOf = (id, text) => {
+      const f = binEntryFor({ id, json: cj(id, text), now: 1000 });
+      return [contentFreeReceiptFor(id, f, { kind: 'purged', now: 2000 }), PURGED_BODY];
+    };
+    let A = await withEntry(await dropCard(await dropCard(O, 'txt_p1'), 'txt_p2'), 'txt_p1', ...purgeOf('txt_p1', 'p1 as committed'));
+    A = await putCard(await withEntry(A, 'txt_p2', ...purgeOf('txt_p2', 'p2 as committed')), 'txt_n', 'N — written on branch A');
+    const B = await putCard(await putCard(O, 'txt_p1', 'p1 edited on branch B'), 'txt_n', 'N — written on branch B');
+    const r = drive(DRIVER, O, A, B);
+    const line = r.err.trim();
+    ok(r.code === 0 && line === 'klypix-merge: brain.klypix merged — -1 delete(s) honored, 1 purged copy dropped, '
+      + '1 edited copy of a permanently deleted card dropped (still in git history), 1 conflict twin(s) preserved',
+    `the driver's summary counts a stale purged copy, an edit a purge took, and the one twin it made — each apart (got: ${line})`);
+    const again = drive(DRIVER, O, r.out, B);
+    ok(again.code === 0 && !/twin/.test(again.err) && !/lossless/.test(`${line}${again.err}`),
+      `a twin that already exists is not counted again, and the line claims nothing about losslessness (got: ${again.err.trim()})`);
   }
 
   // A title renamed on one branch is not lost to the other's unchanged title.

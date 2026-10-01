@@ -120,6 +120,11 @@ try {
   // stale copies, because that text exists now only in the branch's history.
   const twinsMade = conflicts.filter((c) => c.twin && !c.existing && !c.suppressed && !c.adopted).length;
   const editsDropped = conflicts.filter((c) => c.kind === 'purge-vs-edit').length;
+  // A change that would have made a card say what its own conflict copy
+  // already says is kept off the card (both texts stay): said, never silent.
+  const heldInTwin = conflicts.filter((c) => c.kind === 'change-held-in-twin').length;
+  // An embedded file both branches changed has no twin: one version is kept.
+  const filesPicked = conflicts.filter((c) => c.kind === 'asset').length;
   const staleDropped = Math.max(0, (stats?.purgedCopies || 0) - editsDropped);
   const bits = [];
   if (delta.added.length) bits.push(`+${delta.added.length} card(s)`);
@@ -132,6 +137,16 @@ try {
       : `${editsDropped} edited copies of permanently deleted cards dropped (still in git history)`);
   }
   if (twinsMade) bits.push(`${twinsMade} conflict twin(s) preserved`);
+  if (heldInTwin) {
+    bits.push(heldInTwin === 1
+      ? '1 card kept its text — the other version is in the conflict copy beside it (delete the one you do not want)'
+      : `${heldInTwin} cards kept their text — the other versions are in the conflict copies beside them (delete the ones you do not want)`);
+  }
+  if (filesPicked) {
+    bits.push(filesPicked === 1
+      ? "1 embedded file changed on both branches — one version kept (the other is in the other branch's history)"
+      : `${filesPicked} embedded files changed on both branches — one version of each kept (the others are in the other branch's history)`);
+  }
   console.error(`klypix-merge: ${realPath || 'brain'} merged${bits.length ? ' — ' + bits.join(', ') : ''}`);
   process.exit(0);
 } catch (e) {

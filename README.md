@@ -541,7 +541,10 @@ That registers a merge driver for `*.klypix` (a per-machine git config line plus
 rule you commit) and provisions the engine it needs. When two people change the brain and one
 pulls, git calls the engine instead of stopping: new cards from both sides are kept, a card only
 one side edited takes that edit, and a card edited differently on both sides keeps **both**
-versions — the second as a linked twin, never a silent overwrite. Deletions travel too: a deleted
+versions — the second as a linked twin, never a silent overwrite. (One exception to "takes that
+edit": a card is never changed to say exactly what its own conflict twin beside it already says —
+both versions stay as they are and the driver's summary line says so. Delete the one you do not
+want.) Deletions travel too: a deleted
 card leaves a receipt in the brain's Deleted cards, and the driver merges those three-way, so a
 card deleted — or permanently deleted — on one branch stays out instead of coming back from the
 other, unless the other branch edited it. That edit comes back as a new card when the deleting

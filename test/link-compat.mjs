@@ -95,8 +95,8 @@ try {
     const dir = mix({ 'klypix-format.mjs': NEW('klypix-format.mjs'), 'brain-graveyard.mjs': NEW('brain-graveyard.mjs'), 'merge-brains.mjs': NEW('merge-brains.mjs'), 'klypix-merge-driver.mjs': fs.readFileSync(path.join(ROOT, 'src', 'klypix-merge-driver.mjs'), 'utf8') });
     const eng = await import(pathToFileURL(path.join(dir, 'merge-brains.mjs')).href);
     const r = runDriver(dir);
-    ok(eng.MERGE_ENGINE_FEATURES?.api === 2 && eng.MERGE_ENGINE_FEATURES.restoreAsMerge === true && r.code === 0 && await unionOk(r.out),
-      'the complete 1.88 set links, advertises api 2, and its driver merges');
+    ok(eng.MERGE_ENGINE_FEATURES?.api === 3 && eng.MERGE_ENGINE_FEATURES.restoreAsMerge === true && r.code === 0 && await unionOk(r.out),
+      'the complete 1.88 set links, advertises api 3, and its driver merges');
   }
 } finally {
   for (const dir of MIXES) fs.rmSync(dir, { recursive: true, force: true });

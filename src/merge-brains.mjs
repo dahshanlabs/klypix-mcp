@@ -82,19 +82,35 @@
 //     "ours". In these modes ours is only this machine, so ours-first gave a
 //     different answer on every machine; with two ways to sync one brain (git
 //     and Brain Sync) the repo and the cloud ended up holding opposite
-//     answers, and the machines relayed them back and forth for ever. So:
-//       – a card showing different texts on the two sides, where a twin
-//         beside it already holds one of them: the OTHER stays on the card
-//         (nothing else holds it); where twins hold both: one of the two, by
-//         the texts alone;
+//     answers, and the machines relayed them back and forth for ever. So,
+//     for a value BOTH sides changed:
 //       – a card both sides moved, or put into different containers, or
 //         re-stacked: one place, one container, one stacking key
-//         (descendantPosition);
-//       – a title both renamed, an arrow or setting both changed: one value
-//         (pickThreeWay); and an arrow, line, stroke or setting changed on
-//         one side only wins wherever it was made.
+//         (descendantPosition — with a base; with none, ours as ever);
+//       – a title both renamed, an arrow, line, stroke, setting or embedded
+//         file both changed: one value (pickThreeWay; the bytes themselves
+//         for a file). One changed on one side only wins wherever it was
+//         made: the base says which side that is — or holds no such value,
+//         and then the two are picked between as a tie.
 //     A first conflict between two new texts is unchanged: ours stays on the
 //     card and theirs goes to its twin; the next merge anywhere then agrees.
+//   • A card never settles on the text of its own live conflict twin. Where
+//     the two sides show different texts on a card and a twin beside it holds
+//     one of them, the OTHER stays on the card (nothing else holds it); where
+//     twins hold both, one of the two by the texts alone. This is more than a
+//     tie-break: it also keeps a change ONE side made off the card when that
+//     change is the twin's text, and says so (`change-held-in-twin`). Pass C
+//     says why, and how the desktop lets a person take that text.
+//   • A card is never left under a container that is not on the board: it
+//     goes where the other side has it, or to the top level.
+//   STILL OPEN with two transports on one brain (git and Brain Sync): a value
+//   only ONE side changed is decided from that transport's base, and the two
+//   do not share one. With a third value of one field and the two transports
+//   strictly alternating, a stacking key, a container, an arrow label, a
+//   stroke, a setting or the title can be handed back and forth; nothing is
+//   lost (both values are live, one in the repo and one in the cloud) and two
+//   syncs with no git merge between them end it. Closing it needs an edit
+//   counter kept in the file (Stage 3).
 //   • The merge proves itself: every removal of a live card leaves an entry
 //     (E-12) and every moved value is live or its bytes are in the bin (E-13).
 
@@ -187,7 +203,7 @@ const OPTION_DEFAULTS = Object.freeze({
  *  engine, a desktop bundle beside a dev-owned ~/.claude). Absent ⇒ ≤ 1.86.
  *  A flag turns true only when the thing it names runs. */
 export const MERGE_ENGINE_FEATURES = Object.freeze({
-  api: 2,                            // absent ⇒ 1. Bump only when an option's meaning changes.
+  api: 3,                            // absent ⇒ 1. Bump only when an option's meaning changes. (2 was never published: the option modes before sideFreeTies.)
   deterministicTwins: true,          // E-1, every caller
   receiptIds: true,                  // E-2, every caller
   purgeReceipts: true,               // purgeGraveyard leaves a content-free receipt
@@ -311,7 +327,10 @@ const parentTitle = (side, pos) => {
 // human spatial intent wins; a hook's move or archive applies only if ours did
 // not move or re-parent the card.
 // `canonical` (the option modes: Brain Sync and the git driver, where "ours"
-// is just this machine): when BOTH sides moved the card to different places,
+// is just this machine) AND a base to say who moved anything — with none,
+// every test below is true by construction and the board became a per-card
+// mixture of the two copies, matching neither (review round 5). When BOTH
+// sides moved the card to different places,
 // or into different containers, the winner is picked from the two places
 // alone (placeFirst), the same on every machine. Ours-first kept each
 // machine's own place on its machine; with git and Brain Sync on one brain
@@ -330,8 +349,13 @@ function descendantPosition(O, T, B, id, canonical = false) {
   // not moved kept the OTHER side's key in every merge — the cloud's in a
   // sync, the repo's in a git merge — so the two never agreed.
   const zKeyed = (pos) => {
-    if (!(canonical && oP && tP) || oP.zKey === tP.zKey) return pos;
-    const z = pickThreeWay(oP.zKey ?? null, tP.zKey ?? null, bP ? (bP.zKey ?? null) : undefined);
+    if (!(canonical && B && oP && tP) || oP.zKey === tP.zKey) return pos;
+    // A key that is absent or unusable is not a choice: the side holding a
+    // usable one keeps it (read as a value, a missing key won the pick and
+    // the card was re-minted on top). With none, the order below mints one.
+    const usable = (p) => typeof p.zKey === 'string' && isValidZKey(p.zKey);
+    const z = usable(oP) && usable(tP) ? pickThreeWay(oP.zKey, tP.zKey, bP && usable(bP) ? bP.zKey : undefined)
+      : usable(oP) ? oP.zKey : usable(tP) ? tP.zKey : null;
     if (z == null) { const { zKey, ...rest } = pos; return rest; }
     return { ...pos, zKey: z };
   };
@@ -339,7 +363,7 @@ function descendantPosition(O, T, B, id, canonical = false) {
   const oParentChg = oP && (!bP || !sameParent(oP, bP));
   const tParentChg = tP && (!bP || !sameParent(tP, bP));
   let finalXY = oMoved ? oP : (tP || oP);
-  if (canonical && oP && tP) {
+  if (canonical && B && oP && tP) {
     const tMoved = !bP || !samePos(tP, bP);
     const parentClash = oParentChg && tParentChg && !sameParent(oP, tP);
     const placeClash = oMoved && tMoved && !samePos(oP, tP);
@@ -1129,25 +1153,48 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
       // and still after this merge) is safe wherever the card goes.
       const besideO = diverged && !unverified && (keptBeside(T, O, id, O.items[id]) || keptBeside(O, T, id, O.items[id]));
       const besideT = diverged && !unverified && (keptBeside(O, T, id, T.items[id]) || keptBeside(T, O, id, T.items[id]));
+      // The two sides show different texts on the card, and a conflict twin
+      // beside it already holds one of them, or each. Then which text shows on
+      // the card is decided from the texts and the twins alone — the same on
+      // every machine, in both transports, whatever the base says:
+      //   • both texts stand in twins: one of the two, by the texts alone
+      //     (nothing is at stake whichever shows);
+      //   • one of them stands in a twin: the OTHER stays on the card — it is
+      //     the text nothing else holds, and a card settling on its own
+      //     twin's text would leave that one in no copy at all.
+      // Left to the base and to "ours", git and Brain Sync each settled it
+      // their own way (one saw a conflict, the other a one-sided change), the
+      // repo and the cloud held opposite cards, and the machines swapped them
+      // on every round, for ever (review round 3; 59 of 600 fleets).
+      //
+      // What this costs is one act: changing a card to say exactly what its
+      // live conflict twin says does not stick while the twin lives — the
+      // text it replaced comes back on the card. To the merge that act and a
+      // transport handing the twin's text round again are the same input
+      // (review round 5), so the act has to be made visible another way: the
+      // desktop buries the twin in the same save (its settledTwinsOf), which
+      // IS the person saying "I take that version", and then no rule fires.
+      // Any other writer is told: the refused change is reported
+      // (`change-held-in-twin`), never silent, and both texts stay on the
+      // board — the card's, and the twin's.
+      const bothBeside = besideO && besideT;
       if (besideO || besideT) {
-        // The two sides show different texts on the card, and a twin beside
-        // it already holds one of them, or each: a conflict settled before,
-        // somewhere. Which text shows on the card is all there is to decide,
-        // and it is decided from the texts alone — the same on every machine,
-        // whatever the base says:
-        //   • one of them is in a twin: the OTHER stays on the card (nothing
-        //     else holds it — taking the twinned text would leave it nowhere);
-        //   • both are: one of the two, by the texts alone.
-        // Left to the base and to "ours", one machine settled the conflict
-        // through git and another through Brain Sync, each its own way; the
-        // repo and the cloud held opposite cards and the machines swapped
-        // them on every round, for ever (review round 3).
-        const oursStays = besideO && besideT ? canonicalFirst(itemSignature(O.items[id]), itemSignature(T.items[id])) : besideT;
+        const oursStays = bothBeside ? canonicalFirst(itemSignature(O.items[id]), itemSignature(T.items[id])) : besideT;
+        // A change one side alone made to the card, which the plain 3-way
+        // would have taken, and which this keeps off the card.
+        const refused = cb && (oursStays ? (tChg && !oChg) : (oChg && !tChg));
         if (oursStays) { json = O.items[id]; side = 'ours'; }
         else {
           json = T.items[id]; side = 'theirs'; delta.updated.push(id);
           // E-1b's report: the driver names a conflict it took as settled elsewhere.
           if (opt.adoptResolvedConflicts && cb && oChg && tChg && !besideT) conflicts.push({ id, kind: 'content', keptLive: 'theirs', twin: liveTwinHolding(T, id, O.items[id]) ?? liveTwinHolding(O, id, O.items[id]), adopted: true });
+        }
+        if (refused) {
+          const lost = oursStays ? T.items[id] : O.items[id];
+          conflicts.push({
+            id, kind: 'change-held-in-twin', keptLive: oursStays ? 'ours' : 'theirs', refused: oursStays ? 'theirs' : 'ours',
+            twin: keptBeside(O, T, id, lost) ?? keptBeside(T, O, id, lost), existing: true,
+          });
         }
       } else if (cb && oChg && tChg && diverged) {
         // E-1b: theirs already resolved this very conflict the other way round
@@ -1299,7 +1346,8 @@ async function finishMerge(B, O, T, opt, run) {
   const pickById = (key) => {
     const o = byId(O[key]), t = byId(T[key]), b = byId(B[key]);
     const out = new Map();
-    for (const [id, ov] of o) if (t.has(id) && b.has(id)) out.set(id, pickThreeWay(ov, t.get(id), b.get(id)));
+    // (An id the base never held is new on both sides: a tie, like any other.)
+    for (const [id, ov] of o) if (t.has(id)) out.set(id, pickThreeWay(ov, t.get(id), b.get(id)));
     return out;
   };
   if (threeWay) for (const [id, v] of pickById('connections')) if (endsLive(v)) connMap.set(id, v);
@@ -1307,8 +1355,8 @@ async function finishMerge(B, O, T, opt, run) {
   // side moved it: the two ends of one edge can move on different sides (each
   // side re-points only its own copy), and then neither copy pointed at both
   // live cards and the edge was dropped (found on a copy of the real brain).
+  const movedTo = new Map();
   if (opt.binMerge !== 'union') {
-    const movedTo = new Map();
     for (const r of run.delta?.revived || []) if (!movedTo.has(r.id) && liveIds.has(r.as)) movedTo.set(r.id, r.as);
     if (movedTo.size) for (const [id, c] of connMap) {
       const from = liveIds.has(c.fromId) ? c.fromId : (movedTo.get(c.fromId) ?? c.fromId);
@@ -1341,6 +1389,24 @@ async function finishMerge(B, O, T, opt, run) {
   const assets = {};
   const assetSources = opt.theirsTrust === 'unverified' ? [B, T, O] : [B, O, T];
   for (const src of assetSources) if (src) for (const [p, bytes] of Object.entries(src.assets)) assets[p] = bytes;
+  // The option modes, with a base: an embedded file keeps its path when it is
+  // repacked, so one path can hold different bytes on the two sides. Decided
+  // 3-way like an arrow — bytes one side alone changed win wherever that was,
+  // and bytes both sides changed are picked from the two alone, and reported
+  // (a file has no twin: the other version stays only in the other copy's
+  // history). Theirs-first handed a file repacked on our side back to its old
+  // bytes while its card, merged on its own, went on naming the new ones.
+  if (threeWay) for (const [p, ob] of Object.entries(O.assets)) {
+    const tb = T.assets[p], bb = B.assets[p];
+    if (!tb || Buffer.compare(ob, tb) === 0) continue;
+    if (bb && Buffer.compare(tb, bb) === 0) assets[p] = ob;
+    else if (bb && Buffer.compare(ob, bb) === 0) assets[p] = tb;
+    else {
+      const ours = Buffer.compare(ob, tb) > 0;
+      assets[p] = ours ? ob : tb;
+      conflicts.push({ id: null, kind: 'asset', path: p, kept: ours ? 'ours' : 'theirs' });
+    }
+  }
 
   // ── Build merged zip ──────────────────────────────────────────────────────
   const zip = new JSZip();
@@ -1363,8 +1429,21 @@ async function finishMerge(B, O, T, opt, run) {
     zip.file('graveyard.json', JSON.stringify({ version: 1, entries: graveyardEntries }));
   }
 
+  // A card never keeps a container that is not on the board as its parent:
+  // the board is drawn from the top level down, so such a card is in the file
+  // and on no screen (one side moved it into a container the other side
+  // deleted). It follows a container this merge moved to another id; else it
+  // goes where the other side has it, if that container lives; else to the
+  // top level.
   const positions = {};
-  for (const id of order) positions[id] = merged.get(id).pos;
+  for (const id of order) {
+    const pos = merged.get(id).pos;
+    const pid = pos?.parentId ?? null;
+    if (pid == null || liveIds.has(pid)) { positions[id] = pos; continue; }
+    const other = movedTo.get(pid)
+      ?? [O.positions[id]?.parentId, T.positions[id]?.parentId].find((x) => x != null && x !== pid && liveIds.has(x)) ?? null;
+    positions[id] = { ...pos, parentId: other };
+  }
 
   // Per-field manifest UNION, theirs-precedence: theirs still wins every field
   // it carries (the original semantics — disk/hook-side stamps survive an app
@@ -1410,7 +1489,8 @@ async function finishMerge(B, O, T, opt, run) {
   const settings = { ...(T.settings || {}), ...(O.settings || {}) };
   if (threeWay) {
     const [oS, tS, bS] = [O.settings || {}, T.settings || {}, B.settings || {}];
-    for (const k of Object.keys(settings)) if (k in oS && k in tS && k in bS) settings[k] = pickThreeWay(oS[k], tS[k], bS[k]);
+    // (A key the base never held is new on both sides: a tie, like any other.)
+    for (const k of Object.keys(settings)) if (k in oS && k in tS) settings[k] = pickThreeWay(oS[k], tS[k], bS[k]);
   }
   const canvasJson = {
     version: 4,

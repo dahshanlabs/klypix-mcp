@@ -276,6 +276,8 @@ export async function restoreBrainSnapshot(brainPath, id, { home = os.homedir(),
   }
 
   const { eng, lock } = merger;
+  // Out here, so a lock that throws still reports whatever undo point was taken.
+  let safetyId = null;
   try {
     return await lock.withAdvisoryWriteLock(lock.brainCaptureLockPath(brainPath), async (locked) => {
       if (!locked) {
@@ -283,7 +285,7 @@ export async function restoreBrainSnapshot(brainPath, id, { home = os.homedir(),
       }
       // Inside the lock, so the undo point is exactly the state this merge
       // starts from — no writer can slip in between the two.
-      const safetyId = takeSafety();
+      safetyId = takeSafety();
       let current;
       try { current = fs.readFileSync(brainPath); }
       catch (err) { return { ok: false, error: `the brain could not be read: ${err?.message || err}`, safetyId }; }

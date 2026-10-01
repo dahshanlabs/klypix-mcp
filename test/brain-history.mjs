@@ -565,6 +565,35 @@ ok(listBrainHistory(brain, { home }).length === beforeShrink + 1, 'the shrink sn
       fs.rmSync(MIX, { recursive: true, force: true });
     }
   }
+
+  // Something around the merge throws: the restore reports it and leaves the
+  // brain alone. A throwing lock used to escape as a ReferenceError (the undo
+  // point's id lived inside the lock's callback, out of the catch's reach).
+  const REAL_ENGINE = "export * from '../../../../src/merge-brains.mjs';\n";
+  for (const [label, files, error] of [
+    ['a lock that throws', {
+      'merge-brains.mjs': REAL_ENGINE,
+      'brain-write-lock.mjs': "export const brainCaptureLockPath = (p) => p + '.lock';\nexport async function withAdvisoryWriteLock() { throw new Error('the lock broke'); }\n",
+    }, /^restore failed: the lock broke$/],
+    ['an engine that throws', {
+      'merge-brains.mjs': `${REAL_ENGINE}export async function restoreSnapshotAsMerge() { throw new Error('the engine broke'); }\n`,
+      'brain-write-lock.mjs': LOCK_SHIM,
+    }, /^restore merge failed, nothing was changed: the engine broke$/],
+  ]) {
+    const MIX = fs.mkdtempSync(path.join(FIX, '.hist-'));
+    try {
+      for (const [f, body] of Object.entries(files)) fs.writeFileSync(path.join(MIX, f), body);
+      fs.copyFileSync(path.join(root, 'src', 'brain-history.mjs'), path.join(MIX, 'brain-history.mjs'));
+      const H = await import(pathToFileURL(path.join(MIX, 'brain-history.mjs')).href);
+      fs.writeFileSync(brain5, pre);
+      let r;
+      try { r = await H.restoreBrainSnapshot(brain5, pointSnap.id, { home, now: t + 47_500, parse: parseKlypix }); } catch (e) { r = { threw: e }; }
+      ok(r?.ok === false && error.test(r.error || '') && Buffer.compare(fs.readFileSync(brain5), pre) === 0,
+        `E-9: with ${label}, restore reports it and changes nothing${r?.threw ? ` (threw ${r.threw.name}: ${r.threw.message})` : ''}`);
+    } finally {
+      fs.rmSync(MIX, { recursive: true, force: true });
+    }
+  }
   fs.rmSync(dir5, { recursive: true, force: true });
 }
 

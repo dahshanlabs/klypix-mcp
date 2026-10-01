@@ -164,6 +164,25 @@ const stableJson = (v) => JSON.stringify(v, (_k, val) =>
         ? Object.fromEntries(Object.keys(val).sort().map(k => [k, val[k]]))
         : val);
 
+/** One value from two sides and their base, for a field with no twin to keep
+ *  both (a place, a title, an arrow's label, a canvas setting). A change made
+ *  on one side wins. When BOTH sides changed it, differently, the winner is
+ *  picked from the two values alone — never "ours": ours is a different side
+ *  on every machine, so with two ways to sync one brain (git and Brain Sync)
+ *  each machine kept its own value, the repo and the cloud ended up holding
+ *  opposite ones, and the machines relayed them back and forth for ever. */
+export function pickThreeWay(o, t, b) {
+    const so = stableJson(o), st = stableJson(t);
+    if (so === st) return o;
+    const sb = stableJson(b);
+    if (so === sb) return t;
+    if (st === sb) return o;
+    return canonicalFirst(so, st) ? o : t;
+}
+/** The side-independent order between two different values (as stable JSON
+ *  or any strings): true when the first wins. */
+export const canonicalFirst = (a, b) => a > b;
+
 /** A card's MEANING as a canonical string: parsed, volatile fields stripped,
  *  key-sorted. Unparseable JSON falls back to byte identity — a malformed item
  *  must never crash a merge. */

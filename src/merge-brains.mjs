@@ -78,6 +78,23 @@
 //     is told.
 //   • A moved value never overwrites a live card: it matches one, or becomes
 //     its deterministic twin.
+//   • A tie between the two sides is broken from the values alone, never by
+//     "ours". In these modes ours is only this machine, so ours-first gave a
+//     different answer on every machine; with two ways to sync one brain (git
+//     and Brain Sync) the repo and the cloud ended up holding opposite
+//     answers, and the machines relayed them back and forth for ever. So:
+//       – a card showing different texts on the two sides, where a twin
+//         beside it already holds one of them: the OTHER stays on the card
+//         (nothing else holds it); where twins hold both: one of the two, by
+//         the texts alone;
+//       – a card both sides moved, or put into different containers, or
+//         re-stacked: one place, one container, one stacking key
+//         (descendantPosition);
+//       – a title both renamed, an arrow or setting both changed: one value
+//         (pickThreeWay); and an arrow, line, stroke or setting changed on
+//         one side only wins wherever it was made.
+//     A first conflict between two new texts is unchanged: ours stays on the
+//     card and theirs goes to its twin; the next merge anywhere then agrees.
 //   • The merge proves itself: every removal of a live card leaves an entry
 //     (E-12) and every moved value is live or its bytes are in the bin (E-13).
 
@@ -86,6 +103,7 @@ import { createHash } from 'node:crypto';
 import {
   parseKlypix, shard, sameMeaning, itemSignature, twinIdFor, binEntryFor,
   entryKind, receiptIdentity, revivedIdFor, pickBinEntry, contentFreeReceiptFor, PURGED_BODY, fullEntryRid,
+  pickThreeWay, canonicalFirst,
 } from './klypix-format.mjs';
 import { generateKeyBetween } from 'fractional-indexing';
 
@@ -140,6 +158,7 @@ const ARCHIVE = /^archive$/i;
 export {
   sameMeaning, itemSignature, VOLATILE_ITEM_FIELDS, twinIdFor, revivedIdFor, receiptIdentity, entryKind,
   isContentFreeReceipt, pickBinEntry, PURGED_BODY, binEntryFor, contentFreeReceiptFor, fullEntryRid,
+  pickThreeWay,
 } from './klypix-format.mjs';
 export { purgeGraveyard, restoreFromGraveyard, listGraveyard } from './brain-graveyard.mjs';
 
@@ -176,6 +195,7 @@ export const MERGE_ENGINE_FEATURES = Object.freeze({
   restoreAsMerge: true,              // history restore as a merge (restoreSnapshotAsMerge, E-9)
   arrangeReceipts: true,             // arrangeBrain buries what it collapses, survivor from content and ids (E-8)
   revivalMap: true,                  // revivalMap, and brainDelta's lastKnown/collectLive, for the live watcher
+  sideFreeTies: true,                // option modes: a tie between two sides is broken from the values alone (pickThreeWay)
   options: OPTION_VALUES,
 });
 
@@ -290,19 +310,54 @@ const parentTitle = (side, pos) => {
 // POSITION + parent for a card both sides may have moved (descendant trust):
 // human spatial intent wins; a hook's move or archive applies only if ours did
 // not move or re-parent the card.
-function descendantPosition(O, T, B, id) {
+// `canonical` (the option modes: Brain Sync and the git driver, where "ours"
+// is just this machine): when BOTH sides moved the card to different places,
+// or into different containers, the winner is picked from the two places
+// alone (placeFirst), the same on every machine. Ours-first kept each
+// machine's own place on its machine; with git and Brain Sync on one brain
+// the repo and the cloud then held opposite places and the machines swapped
+// them on every round (review round 3). The app save keeps ours-first: there
+// ours is the person at the open tab.
+const placeFirst = (a, b) => {
+  const ka = [a.x ?? 0, a.y ?? 0, a.w ?? -1, a.h ?? -1], kb = [b.x ?? 0, b.y ?? 0, b.w ?? -1, b.h ?? -1];
+  for (let i = 0; i < 4; i++) if (ka[i] !== kb[i]) return ka[i] > kb[i];
+  return canonicalFirst(String(a.parentId ?? ''), String(b.parentId ?? ''));
+};
+function descendantPosition(O, T, B, id, canonical = false) {
   const oP = O.positions[id], tP = T.positions[id], bP = (B && B.positions[id]) || null;
+  // The stacking key (which card is in front) is its own 3-way decision in
+  // the option modes. It rode with the place: a card brought to the front and
+  // not moved kept the OTHER side's key in every merge — the cloud's in a
+  // sync, the repo's in a git merge — so the two never agreed.
+  const zKeyed = (pos) => {
+    if (!(canonical && oP && tP) || oP.zKey === tP.zKey) return pos;
+    const z = pickThreeWay(oP.zKey ?? null, tP.zKey ?? null, bP ? (bP.zKey ?? null) : undefined);
+    if (z == null) { const { zKey, ...rest } = pos; return rest; }
+    return { ...pos, zKey: z };
+  };
   const oMoved = oP && (!bP || !samePos(oP, bP));
-  const finalXY = oMoved ? oP : (tP || oP);
-
-  let parentId;
   const oParentChg = oP && (!bP || !sameParent(oP, bP));
   const tParentChg = tP && (!bP || !sameParent(tP, bP));
+  let finalXY = oMoved ? oP : (tP || oP);
+  if (canonical && oP && tP) {
+    const tMoved = !bP || !samePos(tP, bP);
+    const parentClash = oParentChg && tParentChg && !sameParent(oP, tP);
+    const placeClash = oMoved && tMoved && !samePos(oP, tP);
+    if (parentClash || placeClash) {
+      const win = placeFirst(oP, tP) ? oP : tP;
+      // Two containers: the card goes whole to one of them. Two places in
+      // one container: the place is the winner's, the parent 3-way as ever.
+      if (parentClash) return { pos: zKeyed({ ...win, parentId: win.parentId ?? null }), tP, tParentChg };
+      finalXY = win;
+    }
+  }
+
+  let parentId;
   if (oParentChg) parentId = oP.parentId ?? null;
   else if (tParentChg) parentId = tP.parentId ?? null;
   else parentId = (finalXY?.parentId ?? oP?.parentId ?? tP?.parentId ?? null);
 
-  return { pos: { ...(finalXY || oP || tP || {}), parentId }, tP, tParentChg };
+  return { pos: zKeyed({ ...(finalXY || oP || tP || {}), parentId }), tP, tParentChg };
 }
 
 // ── E-1: deterministic twin slots ─────────────────────────────────────────────
@@ -1009,6 +1064,11 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
   // already resolved on S's side, with `val` kept beside the card.
   const liveTwinHolding = (S, k, val) =>
     twins.twinsOf(k).find((x) => fate.get(x)?.alive && live(S, x) && sameMeaning(S.items[x], val)) ?? null;
+  // ...and that twin still holds `val` after this merge: the other side lacks
+  // it or holds the same there, and no moved value lands on it.
+  const keptBeside = (S, other, k, val) =>
+    twins.twinsOf(k).find((x) => fate.get(x)?.alive && !folded.has(x) && !landed.has(x) && live(S, x) && sameMeaning(S.items[x], val)
+      && (!live(other, x) || sameMeaning(other.items[x], val))) ?? null;
   // A restore receipt names the bytes it put back (its rid is the identity of
   // the deletion it undid, minted from those bytes), so a copy of the card it
   // landed on can be checked against them: card id -> [deleted id, rid].
@@ -1048,7 +1108,31 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
       const oChg = !cb || !sameMeaning(O.items[id], cb);
       const tChg = !cb || !sameMeaning(T.items[id], cb);
       const diverged = !sameMeaning(O.items[id], T.items[id]);
-      if (cb && oChg && tChg && diverged) {
+      // A text of this card that a twin beside it holds too (on either side,
+      // and still after this merge) is safe wherever the card goes.
+      const besideO = diverged && !unverified && (keptBeside(T, O, id, O.items[id]) || keptBeside(O, T, id, O.items[id]));
+      const besideT = diverged && !unverified && (keptBeside(O, T, id, T.items[id]) || keptBeside(T, O, id, T.items[id]));
+      if (besideO || besideT) {
+        // The two sides show different texts on the card, and a twin beside
+        // it already holds one of them, or each: a conflict settled before,
+        // somewhere. Which text shows on the card is all there is to decide,
+        // and it is decided from the texts alone — the same on every machine,
+        // whatever the base says:
+        //   • one of them is in a twin: the OTHER stays on the card (nothing
+        //     else holds it — taking the twinned text would leave it nowhere);
+        //   • both are: one of the two, by the texts alone.
+        // Left to the base and to "ours", one machine settled the conflict
+        // through git and another through Brain Sync, each its own way; the
+        // repo and the cloud held opposite cards and the machines swapped
+        // them on every round, for ever (review round 3).
+        const oursStays = besideO && besideT ? canonicalFirst(itemSignature(O.items[id]), itemSignature(T.items[id])) : besideT;
+        if (oursStays) { json = O.items[id]; side = 'ours'; }
+        else {
+          json = T.items[id]; side = 'theirs'; delta.updated.push(id);
+          // E-1b's report: the driver names a conflict it took as settled elsewhere.
+          if (opt.adoptResolvedConflicts && cb && oChg && tChg && !besideT) conflicts.push({ id, kind: 'content', keptLive: 'theirs', twin: liveTwinHolding(T, id, O.items[id]) ?? liveTwinHolding(O, id, O.items[id]), adopted: true });
+        }
+      } else if (cb && oChg && tChg && diverged) {
         // E-1b: theirs already resolved this very conflict the other way round
         // (its twin holds our text) and ours has not — adopt that resolution
         // instead of twinning a second time. Both texts stay live.
@@ -1100,7 +1184,7 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
       const oP = O.positions[id], tP = T.positions[id];
       pos = { ...(oP || tP || {}), parentId: oP ? (oP.parentId ?? null) : (tP?.parentId ?? null) };
     } else {
-      const r = descendantPosition(O, T, B, id);
+      const r = descendantPosition(O, T, B, id, true);
       pos = r.pos;
       if (side === 'theirs' && r.tParentChg && ARCHIVE.test(parentTitle(T, r.tP))) delta.archived.push(id);
     }
@@ -1188,6 +1272,20 @@ async function finishMerge(B, O, T, opt, run) {
     const t = tConn.get(id);
     connMap.set(id, t && !endsLive(c) && endsLive(t) ? t : c);
   }
+  // The option modes, with a base and bytes whose ancestry is known: an
+  // arrow both sides and the base hold is decided 3-way — a change made on one
+  // side wins wherever it was made, and one both sides changed is picked from
+  // the two values alone (pickThreeWay). Ours-first lost the other branch's
+  // relabel in a git merge, and kept each machine's own label on its machine.
+  // Never a value that would dangle (a revival re-points only its own side).
+  const threeWay = opt.binMerge !== 'union' && !!B && opt.theirsTrust !== 'unverified';
+  const pickById = (key) => {
+    const o = byId(O[key]), t = byId(T[key]), b = byId(B[key]);
+    const out = new Map();
+    for (const [id, ov] of o) if (t.has(id) && b.has(id)) out.set(id, pickThreeWay(ov, t.get(id), b.get(id)));
+    return out;
+  };
+  if (threeWay) for (const [id, v] of pickById('connections')) if (endsLive(v)) connMap.set(id, v);
   // And an end a move retired follows its card to where it went, whichever
   // side moved it: the two ends of one edge can move on different sides (each
   // side re-points only its own copy), and then neither copy pointed at both
@@ -1213,8 +1311,13 @@ async function finishMerge(B, O, T, opt, run) {
     seenEdge.add(k);
     return true;
   });
-  const lines = [...new Map([...byId(T.lines), ...byId(O.lines)]).values()];
-  const strokes = [...new Map([...byId(T.strokes), ...byId(O.strokes)]).values()];
+  const unionById = (key) => {
+    const m = new Map([...byId(T[key]), ...byId(O[key])]);
+    if (threeWay) for (const [id, v] of pickById(key)) m.set(id, v);
+    return [...m.values()];
+  };
+  const lines = unionById('lines');
+  const strokes = unionById('strokes');
 
   // ── Union assets by path (later sources win: theirs, then ours, over base).
   // Under 'unverified' our own bytes win over foreign ones.
@@ -1258,7 +1361,7 @@ async function finishMerge(B, O, T, opt, run) {
   if (opt.manifestMerge === '3way') {
     // E-7 (R7): theirs-first loses a rename made on our side. The title is a
     // 3-way decision: whichever side changed it since the base wins; if both
-    // changed it, ours stays and theirs is reported. With no base to tell,
+    // changed it, one is kept and the other reported. With no base to tell,
     // theirs is taken, as for every other manifest field, and ours reported:
     // keeping ours, every machine that met the shared copy (Brain Sync's
     // cloud) without a base pushed its own title back over it, and the
@@ -1270,9 +1373,14 @@ async function finishMerge(B, O, T, opt, run) {
         manifest.title = tT;
         conflicts.push({ id: null, kind: 'title-no-base', kept: 'theirs', ours: tO, theirs: tT });
       } else if (tB === tO) manifest.title = tT;
+      else if (tB === tT) manifest.title = tO;
       else {
-        manifest.title = tO;
-        if (tB !== tT) conflicts.push({ id: null, kind: 'title', kept: 'ours', ours: tO, theirs: tT });
+        // Both renamed it, differently: one of the two by the names alone
+        // (ours-first kept each machine's own title on its machine), and the
+        // other reported.
+        const ours = canonicalFirst(String(tO), String(tT));
+        manifest.title = ours ? tO : tT;
+        conflicts.push({ id: null, kind: 'title', kept: ours ? 'ours' : 'theirs', ours: tO, theirs: tT });
       }
     }
   }
@@ -1280,13 +1388,20 @@ async function finishMerge(B, O, T, opt, run) {
   manifest.stats = { ...(manifest.stats || {}), itemCount: order.length, assetCount: Object.keys(assets).length };
   zip.file('manifest.json', JSON.stringify(manifest));
 
+  // Settings: ours over theirs, key by key; in the option modes a key all
+  // three hold is decided 3-way like the arrows above.
+  const settings = { ...(T.settings || {}), ...(O.settings || {}) };
+  if (threeWay) {
+    const [oS, tS, bS] = [O.settings || {}, T.settings || {}, B.settings || {}];
+    for (const k of Object.keys(settings)) if (k in oS && k in tS && k in bS) settings[k] = pickThreeWay(oS[k], tS[k], bS[k]);
+  }
   const canvasJson = {
     version: 4,
     view: O.view || T.view || { panX: 0, panY: 0, zoom: 0.7 },   // human's viewport
     order, connections, lines, strokes,
     nextGroupNumber: Math.max(1, ...[O, T].map(s => Number(s.nextGroupNumber) || 1)),
     positions,
-    settings: { ...(T.settings || {}), ...(O.settings || {}) },
+    settings,
   };
   zip.file('canvas.json', JSON.stringify(canvasJson));
   const buffer = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });

@@ -1943,7 +1943,7 @@ console.log('\n— S2-M manifestMerge truth table —');
     { name: 'M1 nobody renamed', o: 'A', t: 'A', b: 'A', want: { theirs: 'A', '3way': 'A', ours: 'A' } },
     { name: 'M2 only theirs renamed', o: 'A', t: 'T', b: 'A', want: { theirs: 'T', '3way': 'T', ours: 'A' } },
     { name: 'M3 only ours renamed', o: 'O', t: 'A', b: 'A', want: { theirs: 'A', '3way': 'O', ours: 'O' } },
-    { name: 'M4 both renamed, differently', o: 'O', t: 'T', b: 'A', want: { theirs: 'T', '3way': 'O !title', ours: 'O' } },
+    { name: 'M4 both renamed, differently', o: 'O', t: 'T', b: 'A', want: { theirs: 'T', '3way': 'T !title', ours: 'O' } },
     { name: 'M5 both renamed alike', o: 'N', t: 'N', b: 'A', want: { theirs: 'N', '3way': 'N', ours: 'N' } },
     { name: 'M6 differ with no base', o: 'O', t: 'T', b: null, want: { theirs: 'T', '3way': 'T !title-no-base', ours: 'O' } },
     { name: 'M7 a stamp only ours carries survives', o: 'A', t: 'A', b: 'A', oCloud: { id: 'c1' }, want: { theirs: 'A cloud=c1', '3way': 'A cloud=c1', ours: 'A cloud=c1' } },
@@ -2135,15 +2135,15 @@ const A_ROWS = [
       const y = twinIdFor(k0, cj(k0, 'O1'));
       return { base: await side({ live: { txt_k: 'v0' } }), ours: await side({ live: { txt_k: 'O1' } }), theirs: await side({ live: { txt_k: 'T1', [y]: cj(k0, 'O1') } }) };
     },
-    want: { false: 'live[k=O1 k~=O1 k~=T1] bin[] c[content]', true: 'live[k=T1 k~=O1] bin[] c[content]' },
+    want: { false: 'live[k=T1 k~=O1] bin[] c[]', true: 'live[k=T1 k~=O1] bin[] c[content]' },
   },
   {
-    name: 'A2 both resolved it, in opposite orientations (pinned residual)',
+    name: 'A2 both resolved it, in opposite orientations: one card whichever side is ours',
     args: async () => {
       const x = twinIdFor(k0, cj(k0, 'T1')), y = twinIdFor(k0, cj(k0, 'O1'));
       return { base: await side({ live: { txt_k: 'v0' } }), ours: await side({ live: { txt_k: 'O1', [x]: cj(k0, 'T1') } }), theirs: await side({ live: { txt_k: 'T1', [y]: cj(k0, 'O1') } }) };
     },
-    want: { false: 'live[k=O1 k~=O1 k~=T1] bin[] c[content]', true: 'live[k=O1 k~=O1 k~=T1] bin[] c[content]' },
+    want: { false: 'live[k=T1 k~=O1 k~=T1] bin[] c[]', true: 'live[k=T1 k~=O1 k~=T1] bin[] c[]' },
   },
   {
     name: 'A3 theirs resolved it, but ours deleted that twin since',
@@ -2172,6 +2172,173 @@ const A_ROWS = [
   const a1 = await mergeBrains({ ...(await A_ROWS[0].args()), options: { binMerge: '3way', adoptResolvedConflicts: true } });
   ok(a1.conflicts.some((c) => c.adopted === true && c.keptLive === 'theirs') && a1.delta.updated.includes(k0),
     'A1: the adoption is reported and counts as an update of k');
+}
+
+// ── S2-K one choice, whichever side is ours ───────────────────────────────────
+// Review round 3 (engine lens #5): with two ways to sync one brain — git and
+// Brain Sync — "ours wins" kept each machine's own value on its machine. The
+// repo and the cloud ended up holding opposite values, and the machines
+// relayed them back and forth on every round, for ever. In the option modes
+// (where "ours" is only this machine) every tie between two sides is now
+// broken from the two values alone: the same result either way round.
+console.log('\n— S2-K one choice whichever side is ours —');
+const CANON_CHECKS = {};   // name -> async (engine) => true when the check holds, for S2-X
+{
+  const SYNC = { binMerge: 'receipts', newOnBothSides: 'twin', manifestMerge: '3way' };
+  const DRIVER = { binMerge: '3way', newOnBothSides: 'twin', manifestMerge: '3way', adoptResolvedConflicts: true };
+  const withCanvas = async (buf, mutate) => {
+    const { zip, canvas } = await parseKlypix(buf);
+    mutate(canvas);
+    zip.file('canvas.json', JSON.stringify(canvas));
+    return rezip(zip);
+  };
+  // The same two sides merged both ways round, in both callers' modes.
+  const bothWays = async (engine, base, x, y, read) => {
+    const out = [];
+    for (const options of [SYNC, DRIVER]) {
+      out.push(await read(await engine.mergeBrains({ base, ours: x, theirs: y, options })));
+      out.push(await read(await engine.mergeBrains({ base, ours: y, theirs: x, options })));
+    }
+    return out;
+  };
+  const allSame = (xs) => xs.every((x) => x === xs[0]);
+  const texts = async (res) => {
+    const { zip, canvas } = await parseKlypix(res.buffer);
+    const out = [];
+    for (const id of canvas.order || []) if (id !== 'txt_anchor') out.push(`${short(id)}=${JSON.parse(await zip.file(`items/${shard(id)}/${id}.json`).async('string')).content}`);
+    return out.sort().join(' ');
+  };
+
+  // K1: the same conflict kept the other way round on each side.
+  const tT = twinIdFor(k0, cj(k0, 'T1')), tO = twinIdFor(k0, cj(k0, 'O1'));
+  const b0 = await side({ live: { txt_k: 'v0' } });
+  const keptO = await side({ live: { txt_k: 'O1', [tT]: cj(k0, 'T1') } });
+  const keptT = await side({ live: { txt_k: 'T1', [tO]: cj(k0, 'O1') } });
+  const k1 = async (engine) => bothWays(engine, b0, keptO, keptT, texts);
+  const K1_WANT = 'k=T1 k~=O1 k~=T1';
+  const k1got = await k1({ mergeBrains });
+  ok(k1got.every((g) => g === K1_WANT), `K1: one conflict kept the other way round on each side → one card, both texts, either way round and in both modes: ${K1_WANT}${k1got.every((g) => g === K1_WANT) ? '' : `   (got ${k1got.join(' | ')})`}`);
+  CANON_CHECKS.swap = async (engine) => (await k1(engine)).every((g) => g === K1_WANT);
+
+  // K1b: the cycle itself. Every copy holds the card and both twins; one
+  // holds O1 on the card, the other T1, and each one's base is its own copy
+  // (so each merge is a clean one-sided change): still one card.
+  const cardO = await side({ live: { txt_k: 'O1', [tO]: cj(k0, 'O1'), [tT]: cj(k0, 'T1') } });
+  const cardT = await side({ live: { txt_k: 'T1', [tO]: cj(k0, 'O1'), [tT]: cj(k0, 'T1') } });
+  const flips = [];
+  for (const options of [SYNC, DRIVER]) {
+    flips.push(await texts(await mergeBrains({ base: cardO, ours: cardO, theirs: cardT, options })));
+    flips.push(await texts(await mergeBrains({ base: cardT, ours: cardT, theirs: cardO, options })));
+    flips.push(await texts(await mergeBrains({ base: cardT, ours: cardO, theirs: cardT, options })));
+  }
+  ok(flips.every((g) => g === K1_WANT), `K1b: a card flipping between two texts both held beside it settles on one, whatever the base says${flips.every((g) => g === K1_WANT) ? '' : `   (got ${flips.join(' | ')})`}`);
+  ok(await texts(await mergeBrains({ base: cardO, ours: cardO, theirs: cardT })) === 'k=T1 k~=O1 k~=T1'
+    && await texts(await mergeBrains({ base: cardT, ours: cardO, theirs: cardT })) === 'k=O1 k~=O1 k~=T1',
+  'K1b (union): the app save is unchanged — a one-sided change is taken, ours stays otherwise');
+
+  // K1c: the rule never costs a text. Theirs' twin holds O1, but ours edited
+  // that twin since (Z): putting T1 on the card would leave O1 nowhere.
+  const baseC = await side({ live: { txt_k: 'v0', [tO]: cj(k0, 'O1') } });
+  const oursC = await side({ live: { txt_k: 'O1', [tT]: cj(k0, 'T1'), [tO]: cj(k0, 'Z edited beside it') } });
+  const k1c = async (engine) => {
+    const out = [];
+    for (const options of [SYNC, DRIVER]) out.push(await texts(await engine.mergeBrains({ base: baseC, ours: oursC, theirs: keptT, options })));
+    return out;
+  };
+  const hasAll = (g) => ['=O1', '=T1', '=Z edited beside it'].every((v) => g.includes(v));
+  const k1cGot = await k1c({ mergeBrains });
+  ok(k1cGot.every(hasAll), `K1c: when the twin holding a text would not hold it after the merge, the card keeps that text (all three texts stay)${k1cGot.every(hasAll) ? '' : `   (got ${k1cGot.join(' | ')})`}`);
+  CANON_CHECKS.kept = async (engine) => (await k1c(engine)).every(hasAll);
+
+  // K7: only ONE of the two texts is in a twin (seed 106 of the review's
+  // git + sync model: a card new on both sides was twinned once, then flipped
+  // between the two texts). The text nothing else holds stays on the card —
+  // settling on the twinned one would leave the other in no copy at all.
+  const onlyX = await side({ live: { txt_k: 'X only here', [tT]: cj(k0, 'T1') } });
+  const onlyT = await side({ live: { txt_k: 'T1', [tT]: cj(k0, 'T1') } });
+  const plainT = await side({ live: { txt_k: 'T1' } });
+  const K7_WANT = 'k=X only here k~=T1';
+  const k7 = async (engine) => {
+    const out = [...await bothWays(engine, b0, onlyX, onlyT, texts), ...await bothWays(engine, b0, onlyX, plainT, texts)];
+    for (const options of [SYNC, DRIVER]) {
+      out.push(await texts(await engine.mergeBrains({ base: onlyX, ours: onlyX, theirs: onlyT, options })));
+      out.push(await texts(await engine.mergeBrains({ base: onlyT, ours: onlyT, theirs: onlyX, options })));
+      out.push(await texts(await engine.mergeBrains({ base: onlyX, ours: onlyT, theirs: onlyX, options })));
+    }
+    return out;
+  };
+  const k7got = await k7({ mergeBrains });
+  ok(k7got.every((g) => g === K7_WANT), `K7: a card showing two texts, one of them also in a twin beside it, keeps the OTHER on the card — either way round, whatever the base, and against a copy with no twin at all: ${K7_WANT}${k7got.every((g) => g === K7_WANT) ? '' : `   (got ${[...new Set(k7got)].join(' | ')})`}`);
+  CANON_CHECKS.only = async (engine) => (await k7(engine)).every((g) => g === K7_WANT);
+
+  // K2: both sides moved one card, to different places.
+  const moved = (x) => withCanvas(b0, (c) => { c.positions.txt_k = { ...c.positions.txt_k, x }; });
+  const xOf = async (res) => String((await parseKlypix(res.buffer)).canvas.positions.txt_k.x);
+  const [at100, at200] = [await moved(100), await moved(200)];
+  const k2 = async (engine) => bothWays(engine, b0, at100, at200, xOf);
+  const k2got = await k2({ mergeBrains });
+  ok(k2got.every((g) => g === '200'), `K2: a card both sides moved lands in one place either way round${k2got.every((g) => g === '200') ? '' : `   (got ${k2got.join(' | ')})`}`);
+  ok(allSame(await bothWays({ mergeBrains }, b0, at100, b0, xOf)) && await xOf(await mergeBrains({ base: b0, ours: b0, theirs: at100, options: SYNC })) === '100',
+    'K2: a move made on one side only still wins, wherever it was made');
+  ok(await xOf(await mergeBrains({ base: b0, ours: at100, theirs: at200 })) === '100' && await xOf(await mergeBrains({ base: b0, ours: at200, theirs: at100 })) === '200',
+    'K2 (union): the app save keeps the place of the person at the open tab');
+  CANON_CHECKS.place = async (engine) => allSame(await k2(engine));
+
+  // K8: which card is in front. A card brought to the front on one side (its
+  // stacking key changes, its place does not) keeps that key either way
+  // round; one both sides re-stacked takes one key.
+  const stacked = (zKey) => withCanvas(b0, (c) => { c.positions.txt_k = { ...c.positions.txt_k, zKey }; });
+  const zOf = async (res) => String((await parseKlypix(res.buffer)).canvas.positions.txt_k.zKey);
+  const [z0, z1, z2] = [await stacked('a5'), await stacked('a7'), await stacked('a9')];
+  const k8 = async (engine) => [...await bothWays(engine, z0, z0, z1, zOf), ...await bothWays(engine, z0, z1, z2, zOf)];
+  const k8got = await k8({ mergeBrains });
+  ok(k8got.join(' ') === 'a7 a7 a7 a7 a9 a9 a9 a9', `K8: a card re-stacked on one side keeps that key either way round, and one both sides re-stacked takes one key${k8got.join(' ') === 'a7 a7 a7 a7 a9 a9 a9 a9' ? '' : `   (got ${k8got.join(' ')})`}`);
+  CANON_CHECKS.stack = async (engine) => (await k8(engine)).join(' ') === 'a7 a7 a7 a7 a9 a9 a9 a9';
+
+  // K3: both sides put the card into a different container.
+  const into = (parentId, x) => withCanvas(b0, (c) => { c.positions.txt_k = { ...c.positions.txt_k, parentId, x }; });
+  const placeOf = async (res) => { const p = (await parseKlypix(res.buffer)).canvas.positions.txt_k; return `${p.parentId}@${p.x}`; };
+  const [inA, inB] = [await into('ctn_a', 40), await into('ctn_b', 900)];
+  const k3 = async (engine) => bothWays(engine, b0, inA, inB, placeOf);
+  const k3got = await k3({ mergeBrains });
+  ok(k3got.every((g) => g === 'ctn_b@900'), `K3: a card both sides put into different containers goes whole to one of them (never one side's container at the other's place)${k3got.every((g) => g === 'ctn_b@900') ? '' : `   (got ${k3got.join(' | ')})`}`);
+  CANON_CHECKS.container = async (engine) => allSame(await k3(engine));
+
+  // K4: both sides renamed the brain.
+  const named = (title) => withManifest(b0, { title });
+  const titleOf2 = async (res) => `${(await parseKlypix(res.buffer)).manifest.title} kept=${res.conflicts.find((c) => c.kind === 'title')?.kept}`;
+  const [nO, nT] = [await named('O'), await named('T')];
+  const k4 = [];
+  for (const options of [SYNC, DRIVER]) {
+    k4.push(await titleOf2(await mergeBrains({ base: b0, ours: nO, theirs: nT, options })));
+    k4.push(await titleOf2(await mergeBrains({ base: b0, ours: nT, theirs: nO, options })));
+  }
+  ok(k4.join(' | ') === 'T kept=theirs | T kept=ours | T kept=theirs | T kept=ours', `K4: a brain both sides renamed takes one title either way round, and says which side it kept${k4[0] === 'T kept=theirs' ? '' : `   (got ${k4.join(' | ')})`}`);
+  CANON_CHECKS.title = async (engine) => {
+    const t = async (o, th) => (await parseKlypix((await engine.mergeBrains({ base: b0, ours: o, theirs: th, options: SYNC })).buffer)).manifest.title;
+    return await t(nO, nT) === await t(nT, nO);
+  };
+
+  // K5: an arrow's label. A change on one side wins wherever it was made (a
+  // git merge used to keep ours and lose the other branch's relabel); one
+  // both sides changed is the same either way round.
+  const edge = (buf, label) => withCanvas(buf, (c) => { c.connections = [{ id: 'con_k', fromId: 'txt_k', toId: 'txt_anchor', relationship: 'relates_to', label }]; });
+  const labelOf = async (res) => String((await parseKlypix(res.buffer)).canvas.connections.find((c) => c.id === 'con_k')?.label);
+  const [e0, e1, e2] = [await edge(b0, 'L0'), await edge(b0, 'L1'), await edge(b0, 'L2')];
+  const k5 = async (engine) => [...await bothWays(engine, e0, e1, e2, labelOf), ...await bothWays(engine, e0, e0, e2, labelOf)];
+  const k5got = await k5({ mergeBrains });
+  ok(k5got.every((g) => g === 'L2'), `K5: an arrow relabelled on both sides takes one label either way round, and a relabel made on one side wins wherever it was made${k5got.every((g) => g === 'L2') ? '' : `   (got ${k5got.join(' | ')})`}`);
+  ok(await labelOf(await mergeBrains({ base: e0, ours: e0, theirs: e2 })) === 'L0', 'K5 (union): with no options ours\' copy of the arrow stays, as in 1.86.3 (the core re-decides it)');
+  CANON_CHECKS.arrow = async (engine) => (await k5(engine)).every((g) => g === 'L2');
+
+  // K6: a canvas setting, the same way.
+  const bg = (v) => withCanvas(b0, (c) => { c.settings = { ...(c.settings || {}), background: v }; });
+  const bgOf = async (res) => String((await parseKlypix(res.buffer)).canvas.settings.background);
+  const [s0, s1, s2] = [await bg('#000'), await bg('#111'), await bg('#222')];
+  const k6 = async (engine) => [...await bothWays(engine, s0, s1, s2, bgOf), ...await bothWays(engine, s0, s0, s2, bgOf)];
+  const k6got = await k6({ mergeBrains });
+  ok(k6got.every((g) => g === '#222'), `K6: a setting both sides changed takes one value either way round, and a one-sided change wins${k6got.every((g) => g === '#222') ? '' : `   (got ${k6got.join(' | ')})`}`);
+  CANON_CHECKS.setting = async (engine) => (await k6(engine)).every((g) => g === '#222');
 }
 
 // ── S2-X rules that are not options, switched off in a mutated engine ────────
@@ -2448,6 +2615,60 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
       roots: true,
     },
     {
+      rule: 'one conflict kept the other way round on each side settles on one card',
+      find: '      if (besideO || besideT) {',
+      replace: '      if (false) {',
+      canon: 'swap', check: 'K1',
+    },
+    {
+      rule: 'a text only the card holds stays on the card when the other is in a twin',
+      find: '        const oursStays = besideO && besideT ? canonicalFirst(itemSignature(O.items[id]), itemSignature(T.items[id])) : besideT;',
+      replace: '        const oursStays = besideO && besideT ? canonicalFirst(itemSignature(O.items[id]), itemSignature(T.items[id])) : !besideT;',
+      canon: 'only', check: 'K7',
+    },
+    {
+      rule: 'that card is picked only when both texts still stand beside it after the merge',
+      find: '      && (!live(other, x) || sameMeaning(other.items[x], val))) ?? null;',
+      replace: '      ) ?? null;',
+      canon: 'kept', check: 'K1c',
+    },
+    {
+      rule: 'a card both sides moved lands in one place',
+      find: '  if (canonical && oP && tP) {',
+      replace: '  if (false) {',
+      canon: 'place', check: 'K2',
+    },
+    {
+      rule: 'a card both sides re-parented goes whole to one container',
+      find: '      if (parentClash) return { pos: zKeyed({ ...win, parentId: win.parentId ?? null }), tP, tParentChg };',
+      replace: '',
+      canon: 'container', check: 'K3',
+    },
+    {
+      rule: 'the stacking key is its own 3-way decision',
+      find: '    if (!(canonical && oP && tP) || oP.zKey === tP.zKey) return pos;',
+      replace: '    if (true) return pos;',
+      canon: 'stack', check: 'K8',
+    },
+    {
+      rule: 'a brain both sides renamed takes one title',
+      find: '        const ours = canonicalFirst(String(tO), String(tT));',
+      replace: '        const ours = true;',
+      canon: 'title', check: 'K4',
+    },
+    {
+      rule: 'an arrow is decided 3-way in the option modes',
+      find: "  if (threeWay) for (const [id, v] of pickById('connections')) if (endsLive(v)) connMap.set(id, v);",
+      replace: '',
+      canon: 'arrow', check: 'K5',
+    },
+    {
+      rule: 'a setting is decided 3-way in the option modes',
+      find: '    for (const k of Object.keys(settings)) if (k in oS && k in tS && k in bS) settings[k] = pickThreeWay(oS[k], tS[k], bS[k]);',
+      replace: '',
+      canon: 'setting', check: 'K6',
+    },
+    {
       rule: 'with no base, the title is theirs',
       find: '        manifest.title = tT;',
       replace: '        manifest.title = tO;',
@@ -2487,6 +2708,12 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
       ok(!kept, `X "${m.rule}" off ⇒ check B-F fails${!kept ? ` (mutant: ${got})` : ' — IT DID NOT'}`);
       continue;
     }
+    if (m.canon) {
+      let held;
+      try { held = await CANON_CHECKS[m.canon](engine); } catch { held = false; }
+      ok(!held, `X "${m.rule}" off ⇒ check ${m.check} fails${!held ? '' : ' — IT DID NOT'}`);
+      continue;
+    }
     if (m.roots) {
       let held;
       try { held = await REACH_ROOTS[0](engine); } catch { held = false; }
@@ -2522,7 +2749,7 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
       continue;
     }
     if (m.edge) {
-      const from = async (eng) => (await parseKlypix((await eng.mergeBrains({ ...(await EDGE_ARGS[0]()), options: { binMerge: 'receipts' } })).buffer))
+      const from = async (eng) => (await parseKlypix((await eng.mergeBrains(await EDGE_ARGS[0]())).buffer))
         .canvas.connections?.find((c) => c.id === 'con_e')?.fromId ?? null;
       const real = await from({ mergeBrains }), got = await from(engine);
       ok(real !== null && got === null, `X "${m.rule}" off ⇒ case B-E loses the edge${got === null ? '' : ' — IT DID NOT'}`);

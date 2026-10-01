@@ -1161,14 +1161,21 @@ async function finishMerge(B, O, T, opt, run) {
   if (opt.manifestMerge === '3way') {
     // E-7 (R7): theirs-first loses a rename made on our side. The title is a
     // 3-way decision: whichever side changed it since the base wins; if both
-    // changed it (or there is no base to tell), ours stays and theirs is reported.
+    // changed it, ours stays and theirs is reported. With no base to tell,
+    // theirs is taken, as for every other manifest field, and ours reported:
+    // keeping ours, every machine that met the shared copy (Brain Sync's
+    // cloud) without a base pushed its own title back over it, and the
+    // copies took turns instead of converging.
     const tO = O.manifest?.title, tT = T.manifest?.title;
     if (tO !== undefined && tT !== undefined && tO !== tT) {
       const tB = B ? B.manifest?.title : undefined;
-      if (B && tB === tO) manifest.title = tT;
+      if (!B) {
+        manifest.title = tT;
+        conflicts.push({ id: null, kind: 'title-no-base', kept: 'theirs', ours: tO, theirs: tT });
+      } else if (tB === tO) manifest.title = tT;
       else {
         manifest.title = tO;
-        if (!(B && tB === tT)) conflicts.push({ id: null, kind: B ? 'title' : 'title-no-base', kept: 'ours', ours: tO, theirs: tT });
+        if (tB !== tT) conflicts.push({ id: null, kind: 'title', kept: 'ours', ours: tO, theirs: tT });
       }
     }
   }

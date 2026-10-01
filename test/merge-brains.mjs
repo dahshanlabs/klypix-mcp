@@ -642,6 +642,7 @@ const EDGE_ARGS = [];   // the B-E case, for its S2-X mutation
 const PURGE_GROUPINGS = [];   // the B-P check, for its S2-X mutation
 const N9_CHECK = [];          // the N9 case, for its S2-X mutation
 const CYCLE_CHECK = [];       // the B-C case, for its S2-X mutation
+const TITLE_CHECK = [];       // the M6 case, for its S2-X mutation
 
 const withBin = async (buffer, bin) => {
   const { zip } = await parseKlypix(buffer);
@@ -1719,7 +1720,7 @@ console.log('\n— S2-M manifestMerge truth table —');
     { name: 'M3 only ours renamed', o: 'O', t: 'A', b: 'A', want: { theirs: 'A', '3way': 'O', ours: 'O' } },
     { name: 'M4 both renamed, differently', o: 'O', t: 'T', b: 'A', want: { theirs: 'T', '3way': 'O !title', ours: 'O' } },
     { name: 'M5 both renamed alike', o: 'N', t: 'N', b: 'A', want: { theirs: 'N', '3way': 'N', ours: 'N' } },
-    { name: 'M6 differ with no base', o: 'O', t: 'T', b: null, want: { theirs: 'T', '3way': 'O !title-no-base', ours: 'O' } },
+    { name: 'M6 differ with no base', o: 'O', t: 'T', b: null, want: { theirs: 'T', '3way': 'T !title-no-base', ours: 'O' } },
     { name: 'M7 a stamp only ours carries survives', o: 'A', t: 'A', b: 'A', oCloud: { id: 'c1' }, want: { theirs: 'A cloud=c1', '3way': 'A cloud=c1', ours: 'A cloud=c1' } },
     { name: 'M8 a stamp both carry, differently', o: 'A', t: 'A', b: 'A', oCloud: { id: 'c-ours' }, tCloud: { id: 'c-theirs' }, want: { theirs: 'A cloud=c-theirs', '3way': 'A cloud=c-theirs', ours: 'A cloud=c-ours' } },
   ];
@@ -1737,6 +1738,12 @@ console.log('\n— S2-M manifestMerge truth table —');
   }
   offBreaks('M', observed, M_ROWS, '3way', 'theirs', ['M3 only ours renamed', 'M4 both renamed, differently', 'M6 differ with no base']);
   offBreaks('M', observed, M_ROWS, '3way', 'ours', ['M2 only theirs renamed']);
+  // M6: with no base, theirs' title is taken and ours' is what the conflict
+  // reports, so a machine meeting the shared copy adopts it.
+  const noBase = async (engine) => engine.mergeBrains({ base: null, ours: await titled('O'), theirs: await titled('T'), options: { binMerge: 'receipts', manifestMerge: '3way' } });
+  const m6 = (await noBase({ mergeBrains })).conflicts.find((c) => c.kind === 'title-no-base');
+  ok(m6?.kept === 'theirs' && m6.ours === 'O' && m6.theirs === 'T', 'M6: the no-base title conflict says theirs was kept and names ours');
+  TITLE_CHECK.push(async (engine) => titleOf(await noBase(engine)));
   const union = await titleOf(await mergeBrains({ base: await titled('A'), ours: await titled('O'), theirs: await titled('A') }));
   ok(union === 'A', 'M: no options keeps 1.86.3\'s theirs-first title (app save is unchanged)');
 }
@@ -2082,6 +2089,12 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
       row: 'B40', options: { binMerge: 'receipts' },
     },
     {
+      rule: 'with no base, the title is theirs',
+      find: '        manifest.title = tT;',
+      replace: '        manifest.title = tO;',
+      title: true,
+    },
+    {
       rule: 'a routing cycle lands at an id derived from the value',
       find: '    const c = `${stripRevived(mv.from)}__r_${sha12(`cycle\\n${mv.from}\\n${itemSignature(mv.v)}`)}`;',
       replace: '    const c = `${stripRevived(mv.from)}__r_${sha12(`cycle\\n${mv.from}`)}`;',
@@ -2106,6 +2119,11 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
     if (m.groupings) {
       const agree = await PURGE_GROUPINGS[0](engine);
       ok(!agree, `X "${m.rule}" off ⇒ check B-P's groupings disagree${!agree ? '' : ' — THEY DID NOT'}`);
+      continue;
+    }
+    if (m.title) {
+      const got = await TITLE_CHECK[0](engine);
+      ok(got !== 'T !title-no-base', `X "${m.rule}" off ⇒ row M6 fails${got !== 'T !title-no-base' ? ` (mutant: ${got})` : ' — IT DID NOT'}`);
       continue;
     }
     if (m.cycle) {

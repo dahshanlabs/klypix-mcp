@@ -1,4 +1,4 @@
-// revival-map — §2.7 (Stage 2, 1.87). An app showing a brain holds cards by id.
+// revival-map — §2.7 (Stage 2, 1.88). An app showing a brain holds cards by id.
 // When a write moves a card's value to another id (a restore, a Brain Sync or
 // git merge that rescues an edit, a merge that routes a stale copy to where a
 // restored card went) the old id leaves the file with an entry in its bin.

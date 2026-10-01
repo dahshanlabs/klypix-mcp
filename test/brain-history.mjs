@@ -3,7 +3,7 @@
 // protection from becoming a problem of its own (repo pollution, unbounded
 // growth, a snapshot failure blocking a save, an unparseable restore).
 //
-// Stage 2 (1.87): a restore is a MERGE, not a file copy — see the E-9 section.
+// Stage 2 (1.88): a restore is a MERGE, not a file copy — see the E-9 section.
 import fs from 'fs';
 import os from 'os';
 import path from 'path';

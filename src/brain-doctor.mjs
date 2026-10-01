@@ -523,17 +523,17 @@ export function inspectDecayGuard(brainDir, lib, now = Date.now()) {
   };
 }
 
-// ── MERGE ENGINE layer (Stage 2, brain 1.87) ─────────────────────────────────
+// ── MERGE ENGINE layer (Stage 2, brain 1.88) ─────────────────────────────────
 // Brain Sync, the git driver, history restore and arrange rely on the
 // receipt-aware engine (merge-brains.mjs, MERGE_ENGINE_FEATURES.api ≥ 2) and on
 // a driver that asks for it (DRIVER_OPTIONS_API ≥ 2). Installs mix file
 // generations — a desktop bundle beside a dev-owned ~/.claude, an older
-// `git-driver install` — and an api-1 file under a 1.87 brain runs 1.86 rules:
+// `git-driver install` — and an api-1 file under a 1.88 brain runs pre-1.88 rules:
 // a card deleted here comes back from a copy that still has it. Read the
 // DEPLOYED text, no import (the doctor stays synchronous and must diagnose a
 // broken bundle). A file without the marker is api 1; a marker that does not
 // parse is unknown, never a guess.
-const MERGE_ENGINE_SINCE = '1.87.0';
+const MERGE_ENGINE_SINCE = '1.88.0';
 export function inspectMergeEngine(brainDir) {
   const scan = (file, marker, re) => {
     const src = readText(path.join(brainDir, file));
@@ -547,8 +547,8 @@ export function inspectMergeEngine(brainDir) {
     driver: scan('klypix-merge-driver.mjs', 'DRIVER_OPTIONS_API', /\bDRIVER_OPTIONS_API\s*=\s*(\d+)/),
   };
 }
-// ok | drift (an api-1 file under a ≥ 1.87 brain) | absent (no engine file) |
-// unknown (a marker that does not parse) | n/a (brain older than 1.87, or no
+// ok | drift (an api-1 file under a ≥ 1.88 brain) | absent (no engine file) |
+// unknown (a marker that does not parse) | n/a (brain older than 1.88, or no
 // baked version to compare).
 function mergeEngineLayer(mergeEngine, baked) {
   if (!baked || cmpSemver(baked, MERGE_ENGINE_SINCE) < 0) return 'n/a';
@@ -769,7 +769,7 @@ export function inspect(opts = {}) {
     if (layers.decayGuard === 'drift') actions.push('npx klypix-mcp install   # decay-aware status guard missing/stale — stale build/deploy claims can render as CURRENT state');
     if (layers.mergeEngine === 'drift') {
       const old = [mergeEngine.engine.api < 2 && 'merge-brains.mjs', mergeEngine.driver.api < 2 && 'klypix-merge-driver.mjs'].filter(Boolean).join(' + ');
-      actions.push(`${version.dev ? 'npx klypix-mcp install --force (or re-deploy from the checkout that owns this dev install)' : 'npx klypix-mcp install'}   # ${old} predates brain v${version.baked} — restores, Arrange and the git driver run 1.86 rules, so a deleted card can come back from another copy`);
+      actions.push(`${version.dev ? 'npx klypix-mcp install --force (or re-deploy from the checkout that owns this dev install)' : 'npx klypix-mcp install'}   # ${old} predates brain v${version.baked} — restores, Arrange and the git driver run pre-1.88 rules, so a deleted card can come back from another copy`);
     }
     for (const s of supervisors.impaired || []) {
       const why = s.workerImpaired ? 'has no live worker; tool calls cannot complete' : `cannot confirm host delivery (${s.deliveryStatus})`;

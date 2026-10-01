@@ -440,7 +440,7 @@ console.log('\n— S2-E1 deterministic twins —');
   const folded = await mergeBrains({ base, ours: oursWithLegacy, theirs });
   const foldedTwins = await twinsOf(folded.buffer, 'txt_A');
   ok(foldedTwins.length === 1 && foldedTwins[0] === legacyTwin && folded.conflicts.some((c) => c.twin === legacyTwin && c.existing),
-    'D6: a value already held by a live pre-1.87 random twin is not twinned again');
+    'D6: a value already held by a live pre-1.88 random twin is not twinned again');
 
   // X1: a person edited the twin since. It is never overwritten and the value
   // is not twinned again — the edit descends from it.

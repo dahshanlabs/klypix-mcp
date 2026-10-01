@@ -1,4 +1,4 @@
-// merge-scale — conflict twins stay linear (Stage 2, 1.87). Deterministic twin
+// merge-scale — conflict twins stay linear (Stage 2, 1.88). Deterministic twin
 // ids mean every conflict looks for an existing twin before minting one; done
 // naively that is a scan per conflict, quadratic in a brain with thousands of
 // simultaneous conflicts (two machines that re-saved every card). The engine
@@ -6,8 +6,8 @@
 // stays within 1.5x of the 1.86.3 engine on the same many-conflict merge, and
 // doubling the conflicts roughly doubles the time.
 //
-// Measured on 3,000 conflicts while writing this: 1.86.3 5.6-5.8 s, 1.87 union
-// 5.1-5.4 s, 1.87 3-way 5.4-5.9 s. The committed size is smaller to keep the
+// Measured on 3,000 conflicts while writing this: 1.86.3 5.6-5.8 s, 1.88 union
+// 5.1-5.4 s, 1.88 3-way 5.4-5.9 s. The committed size is smaller to keep the
 // suite fast; a quadratic index shows at this size already.
 //
 // Run:  node test/merge-scale.mjs        (exit 0 = pass, 1 = fail)
@@ -41,7 +41,7 @@ const old = await best(() => OLD.mergeBrains(big));
 const now = await best(() => mergeBrains({ ...big, options: OPTS }));
 ok(old.r.conflicts.length === N && now.r.conflicts.length === N, `fixture: ${N} simultaneous conflicts, each twinned by both engines`);
 ok(now.ms <= 1.5 * old.ms,
-    `a ${N}-conflict merge stays within 1.5x of 1.86.3 (1.87 3-way ${now.ms.toFixed(0)} ms, 1.86.3 ${old.ms.toFixed(0)} ms, x${(now.ms / old.ms).toFixed(2)})`);
+    `a ${N}-conflict merge stays within 1.5x of 1.86.3 (1.88 3-way ${now.ms.toFixed(0)} ms, 1.86.3 ${old.ms.toFixed(0)} ms, x${(now.ms / old.ms).toFixed(2)})`);
 
 const small = await conflicted(N / 2);
 const half = await best(() => mergeBrains({ ...small, options: OPTS }));

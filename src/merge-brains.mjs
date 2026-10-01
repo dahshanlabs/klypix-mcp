@@ -759,13 +759,18 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
   // Every side holding the twin must hold those bytes; a twin holding
   // anything else is someone's text and stays (see the note above). A twin an
   // earlier merge reached already travels under its derived receipt; knowing
-  // the bytes lets its copies be judged as the landing's are.
+  // the bytes lets its copies be judged as the landing's are. A twin no side
+  // holds live is judged by the bytes its Deleted-cards entries hold: deleted
+  // holding the restored bytes, it kept the very text the purge was for in
+  // every copy's bin, for anyone to restore (review round 4).
   const reachedTwins = [];
-  for (const x of new Set([...O.ids, ...T.ids])) {
+  for (const x of new Set([...O.ids, ...T.ids, ...Object.keys(O.graveyard), ...Object.keys(T.graveyard)])) {
     const parent = TWIN_PARENT_RE.exec(x)?.[1];
     const via = parent ? reached.get(parent) : null;
     if (!via?.rid || reached.get(x)?.rid) continue;
-    const copies = [O, T].filter((S) => live(S, x)).map((S) => S.items[x]);
+    const liveCopies = [O, T].filter((S) => live(S, x)).map((S) => S.items[x]);
+    const copies = liveCopies.length ? liveCopies
+      : [O, T].map((S) => eOf(S, x)).filter((e) => e && entryKind(e.meta) === 'F').map((e) => e.json);
     if (copies.length && copies.every((v) => fullEntryRid(via.from, v) === via.rid)) reachedTwins.push([x, via]);
   }
   for (const [x, via] of reachedTwins) {

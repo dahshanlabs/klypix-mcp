@@ -1372,6 +1372,25 @@ const B_ROWS = [
     },
   },
   {
+    // Review round 4: B44 with the twin already deleted on ours — its
+    // Deleted-cards entry holds exactly the restored bytes. Left there, every
+    // copy that synced kept the purged text in its bin, for anyone to restore.
+    name: 'B46 a purge reaches a deleted twin of the landing that holds the restored bytes',
+    args: async () => {
+      const tw = twinIdFor(kRestoredAs('v0'), pj('v0'));
+      return {
+        base: await side({ bin: { txt_k: pFe(k0, 'v0') } }),
+        ours: await side({ live: { [kRestoredAs('v0')]: pj('vS stale rescued') }, bin: { txt_k: pRe(k0, 'v0', kRestoredAs('v0')), [tw]: pFe(tw, 'v0') } }),
+        theirs: await side({ bin: { txt_k: pPe(k0, 'v0') } }),
+      };
+    },
+    want: {
+      union: 'live[k′=vS stale rescued] bin[k:P k′~:F(v0)] c[]',
+      receipts: 'live[] bin[k:P k′:P k′~:P] c[purge-vs-edit]',
+      '3way': 'live[] bin[k:P k′:P k′~:P] c[purge-vs-edit]',
+    },
+  },
+  {
     // A twin of the landing holding other text is someone's text kept beside
     // the card, not the card: the purge takes the landing and leaves it.
     name: 'B45 a purge leaves a twin of the landing that holds other text',
@@ -1413,6 +1432,7 @@ const B_ROWS = [
     'B43 a purge reaches a restore landing deleted after an edit, and says so',
     'B44 a purge reaches a twin of the landing that holds the restored bytes',
     'B45 a purge leaves a twin of the landing that holds other text',
+    'B46 a purge reaches a deleted twin of the landing that holds the restored bytes',
   ]);
   offBreaks('B', observed, B_ROWS, '3way', 'receipts', ['B8 exact deleted bytes over a base that holds the deletion']);
 
@@ -2336,6 +2356,12 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
       find: '  for (const [x, via] of reachedTwins) {',
       replace: '  for (const [x, via] of []) {',
       row: 'B44', options: { binMerge: 'receipts' },
+    },
+    {
+      rule: 'a purge reaches a deleted twin of the landing that holds the restored bytes',
+      find: '    const copies = liveCopies.length ? liveCopies',
+      replace: '    const copies = true ? liveCopies',
+      row: 'B46', options: { binMerge: 'receipts' },
     },
     {
       rule: 'a restored card a purge takes untouched is reported to the side that held it',

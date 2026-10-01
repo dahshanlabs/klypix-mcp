@@ -2620,17 +2620,29 @@ const CANON_CHECKS = {};   // name -> async (engine) => true when the check hold
   // ...and nobody else is told: a card its person edited on after settling, a
   // settle the base already holds, a machine that never settled (the copy is
   // not live on either side there).
+  // ...nor a card its person edited on after settling when the OTHER side's
+  // card says the settled text beside a still-live copy (an older desktop, or
+  // an agent, typed the copy's text and buried nothing): the later edit is on
+  // the card, nothing was undone (review round 7).
   const sMoved = await side({ live: { txt_k: 'Z later' }, bin: { [tT]: settledE } });
   const sStale = await side({ live: { txt_k: 'T1' } });
   const sOtherDone = await side({ live: { txt_k: 'O1' }, bin: { [tT]: settledE } });
-  const k12b = [];
-  for (const options of [SYNC, DRIVER]) {
-    const calm = await mergeBrains({ base: sSettled, ours: sMoved, theirs: sSettled, options });
-    const clash = await mergeBrains({ base: sBase, ours: sMoved, theirs: sOther, options });
-    const never = await mergeBrains({ base: sBase, ours: sStale, theirs: sOtherDone, options });
-    k12b.push([calm, clash, never].map((r) => `[${toldUndone(r)}]`).join(''));
-  }
-  ok(k12b.every((g) => g === '[][][]'), `K12b: only the merge that undoes a settle says so — not a later edit, not a settle the base holds, not a machine that never settled${k12b.every((g) => g === '[][][]') ? '' : `   (got ${k12b.join(' || ')})`}`);
+  const sTypedOnly = await side({ live: { txt_k: 'T1', [tT]: cj(k0, 'T1') } });
+  const k12bRun = async (engine) => {
+    const out = [];
+    for (const options of [SYNC, DRIVER]) {
+      const calm = await engine.mergeBrains({ base: sSettled, ours: sMoved, theirs: sSettled, options });
+      const clash = await engine.mergeBrains({ base: sBase, ours: sMoved, theirs: sOther, options });
+      const never = await engine.mergeBrains({ base: sBase, ours: sStale, theirs: sOtherDone, options });
+      const typedA = await engine.mergeBrains({ base: sBase, ours: sMoved, theirs: sTypedOnly, options });
+      const typedB = await engine.mergeBrains({ base: sBase, ours: sTypedOnly, theirs: sMoved, options });
+      out.push([calm, clash, never, typedA, typedB].map((r) => `[${toldUndone(r)}]`).join(''));
+    }
+    return out;
+  };
+  const k12b = await k12bRun({ mergeBrains });
+  ok(k12b.every((g) => g === '[][][][][]'), `K12b: only the merge that undoes a standing settle says so — not a later edit (whatever the other side's card says), not a settle the base holds, not a machine that never settled${k12b.every((g) => g === '[][][][][]') ? '' : `   (got ${k12b.join(' || ')})`}`);
+  CANON_CHECKS.settleStands = async (engine) => (await k12bRun(engine)).every((g) => g === '[][][][][]');
 
   // K13: a conflict twin one side rewrote while the card changed on both. The
   // placer asked "does a twin already hold this text?" of either side's copy
@@ -2685,6 +2697,29 @@ const CANON_CHECKS = {};   // name -> async (engine) => true when the check hold
     }
     return lost;
   };
+  // K13v: the same question with theirs UNVERIFIED (foreign bytes): ours
+  // rewrote the twin and the card, the foreign side put the twin's old text
+  // on the card. The placer read "both stay" for a twin only ours changed, so
+  // the foreign card's text counted as held by a twin that no longer said it.
+  const UNVER = { binMerge: 'receipts', theirsTrust: 'unverified', newOnBothSides: 'twin', manifestMerge: 'ours', adoptResolvedConflicts: true };
+  const k13v = async (engine) => {
+    const lost = [];
+    for (const twinId of [oldT, twinIdFor(k0, cj(k0, 'Y')), twinIdFor(k0, cj(k0, 'Z'))]) {
+      const mk = (st) => side({ live: { txt_k: st.card, [twinId]: cj(k0, st.twin) } });
+      const [B0, A0, T0] = [await mk({ card: 'X', twin: 'Y' }), await mk({ card: 'Z', twin: 'Z' }), await mk({ card: 'Y', twin: 'Y' })];
+      const res = await engine.mergeBrains({ base: B0, ours: A0, theirs: T0, options: UNVER });
+      const { zip, canvas } = await parseKlypix(res.buffer);
+      const seen = new Set();
+      for (const id of canvas.order || []) seen.add(JSON.parse(await zip.file(`items/${shard(id)}/${id}.json`).async('string')).content);
+      for (const id of Object.keys(await binIndex(res.buffer))) { const f = zip.file(`graveyard/${shard(id)}/${id}.json`); if (f) { try { seen.add(JSON.parse(await f.async('string')).content); } catch { /* a receipt */ } } }
+      for (const x of ['Z', 'Y']) if (!seen.has(x)) lost.push(`${x} (twin ${twinId.slice(-6)})`);
+    }
+    return lost;
+  };
+  const k13vLost = await k13v({ mergeBrains });
+  ok(k13vLost.length === 0, `K13v (unverified): a twin only ours rewrote holds ours' text — the foreign card's text is not counted as kept by it${k13vLost.length === 0 ? '' : `   (lost: ${k13vLost.join(', ')})`}`);
+  CANON_CHECKS.twinRewrittenUnverified = async (engine) => (await k13v(engine)).length === 0;
+
   const k13uLost = await k13u({ mergeBrains });
   ok(k13uLost.length === 0, `K13u (union): the app save keeps both cards' texts when the slot twin says something else${k13uLost.length === 0 ? '' : `   (lost: ${k13uLost.join(', ')})`}`);
   CANON_CHECKS.twinRewrittenUnion = async (engine) => (await k13u(engine)).length === 0;
@@ -3061,6 +3096,18 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
       find: "    if (settler) conflicts.push({ id: k, kind: 'settle-undone', keptLive: settler[1] === 'ours' ? 'theirs' : 'ours', twin: x, existing: true });",
       replace: '',
       canon: 'settleUndone', check: 'K12',
+    },
+    {
+      rule: 'a settle is undone only while the side that settled still shows the settled text',
+      find: "    const settler = [[O, 'ours'], [T, 'theirs']].find(([S]) => !live(S, x) && eOf(S, x)?.meta?.deletion?.cause === 'conflict-settled' && live(S, k) && sameMeaning(S.items[k], f.entry.json));",
+      replace: "    const settler = [[O, 'ours'], [T, 'theirs']].find(([S]) => live(S, k) && sameMeaning(S.items[k], f.entry.json));",
+      canon: 'settleStands', check: 'K12b',
+    },
+    {
+      rule: "a twin only ours rewrote holds ours' text, whatever the trust in theirs",
+      find: '        if (bx && sameMeaning(T.items[x], bx)) return [O.items[x]];',
+      replace: '        if (bx && !unverified && sameMeaning(T.items[x], bx)) return [O.items[x]];',
+      canon: 'twinRewrittenUnverified', check: 'K13v',
     },
     {
       rule: 'a slot twin that says something else on the side showing the text is no home for it',

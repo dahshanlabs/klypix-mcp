@@ -116,8 +116,11 @@
 //     the conflict (the twin came by the other transport, or a base write
 //     failed), so its choice read as unchanged and the other side's text as a
 //     one-sided change. The card goes back to that text and the chosen one is
-//     in Deleted cards. (Reading the settle as that side's change of the
-//     card, so that both texts stay, is a new merge rule: Stage 3.)
+//     in Deleted cards. Only the merge that buries the still-live copy says
+//     so; if that merge runs on the machine that never settled, the settling
+//     machine then takes the other text as an ordinary one-sided change, with
+//     no notice. (Reading the settle as that side's change of the card, so
+//     that both texts stay, is a new merge rule: Stage 3.)
 //   • Arrows, lines and strokes are written in id order, and of two arrows
 //     that mean the same the one with the smaller id stays: theirs-first
 //     wrote a different array on every machine, and git and Brain Sync then
@@ -1028,8 +1031,10 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
       const lo = live(O, x), lt = live(T, x);
       if (lo && lt && !sameMeaning(O.items[x], T.items[x])) {
         const bx = baseItem(x);
+        // (theirs unverified: its one-sided change is not taken on trust,
+        // so both stay; ours' one-sided change stands in both trust modes.)
         if (bx && !unverified && sameMeaning(O.items[x], bx)) return [T.items[x]];
-        if (bx && !unverified && sameMeaning(T.items[x], bx)) return [O.items[x]];
+        if (bx && sameMeaning(T.items[x], bx)) return [O.items[x]];
         return [O.items[x], T.items[x]];
       }
       return lo ? [O.items[x]] : lt ? [T.items[x]] : [];
@@ -1331,15 +1336,23 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
   // choice read as "unchanged", the other side's text as a one-sided change,
   // and the card goes back to it — the chosen text is then in Deleted cards
   // only. That is SAID (`settle-undone`), never silent (review round 6); the
-  // merge itself is unchanged. Only where this merge buries the copy (it was
-  // live on a side) and a side's card still says the settled text: a machine
-  // that never settled, and a card its person edited on since, are not told.
+  // merge itself is unchanged. `keptLive` names the side whose text the card
+  // keeps: the OTHER side settled (the caller words it by direction — on the
+  // side that never settled, the card does not change). Said only by the
+  // merge that buries the copy (it was live on the other side), and only
+  // while the settling side — the one that holds the receipt and no live
+  // copy — still shows the settled text: a card its person edited on since
+  // is not a settle undone, whatever the other side's card says.
+  // NOT said: when the side that never settled merges first, the settling
+  // machine later receives the other text as an ordinary one-sided change
+  // (the copy is live on neither side by then, and one merge cannot tell it
+  // from a later edit). STILL OPEN, with the edit counter (Stage 3).
   for (const [x, f] of fate) {
     if (f.alive || !f.wasLive || !f.entry || entryKind(f.entry.meta) !== 'F' || f.entry.meta?.deletion?.cause !== 'conflict-settled') continue;
     const k = TWIN_PARENT_RE.exec(x)?.[1];
     const card = k ? merged.get(k) : null;
     if (!card || sameMeaning(card.json, f.entry.json)) continue;
-    const settler = [[O, 'ours'], [T, 'theirs']].find(([S]) => live(S, k) && sameMeaning(S.items[k], f.entry.json));
+    const settler = [[O, 'ours'], [T, 'theirs']].find(([S]) => !live(S, x) && eOf(S, x)?.meta?.deletion?.cause === 'conflict-settled' && live(S, k) && sameMeaning(S.items[k], f.entry.json));
     if (settler) conflicts.push({ id: k, kind: 'settle-undone', keptLive: settler[1] === 'ours' ? 'theirs' : 'ours', twin: x, existing: true });
   }
 
@@ -1504,7 +1517,8 @@ async function finishMerge(B, O, T, opt, run) {
       conflicts.push({ id: null, kind: 'asset', path: p, kept: ours ? 'ours' : 'theirs' });
     }
   }
-  // With no base nothing says who repacked a file: theirs' bytes, as ever —
+  // With no base nothing says who repacked a file: the bytes are picked as
+  // ever (theirs'; ours' when theirs is unverified) —
   // but SAID, so the machine whose bytes go keeps a restore point and the
   // driver's summary names it (a first sync replaced a repacked file with the
   // cloud's older bytes and told nobody).

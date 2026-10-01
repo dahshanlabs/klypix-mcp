@@ -123,8 +123,9 @@ try {
   // A change that would have made a card say what its own conflict copy
   // already says is kept off the card (both texts stay): said, never silent.
   const heldInTwin = conflicts.filter((c) => c.kind === 'change-held-in-twin').length;
-  // A settle this merge undid: the card is back on the text its person had
-  // replaced, and the version they chose is in Deleted cards.
+  // A settle this merge did not keep: the card holds the other text, and
+  // the version a person chose is in Deleted cards (on the branch that never
+  // settled, the card did not change).
   const settlesUndone = conflicts.filter((c) => c.kind === 'settle-undone').length;
   // An embedded file both branches changed has no twin: one version is kept.
   const filesOurs = conflicts.filter((c) => c.kind === 'asset' && c.kept === 'ours').length;
@@ -149,7 +150,7 @@ try {
       ? '1 change to a card was not applied: its conflict copy already holds that text (both are on the board — delete the one you do not want)'
       : `${heldInTwin} changes to cards were not applied: their conflict copies already hold those texts (both are on the board — delete the ones you do not want)`);
   }
-  if (settlesUndone) bits.push(`${settlesUndone} card(s) went back to the text that had been replaced — the chosen version is in Deleted cards ("Conflict copy settled")`);
+  if (settlesUndone) bits.push(`${settlesUndone} settled conflict(s) not kept: the card holds the other text — the chosen version is in Deleted cards ("Conflict copy settled")`);
   if (filesOurs) bits.push(`${filesOurs} embedded file(s) differ on the two branches — this branch's version kept (the other branch's stays in its history)`);
   if (filesTheirs) bits.push(`${filesTheirs} embedded file(s) differ on the two branches — the other branch's version kept (this branch's stays in its history)`);
   if (title) {

@@ -537,10 +537,12 @@ one side edited takes that edit, and a card edited differently on both sides kee
 versions — the second as a linked twin, never a silent overwrite. Deletions travel too: a deleted
 card leaves a receipt in the brain's Deleted cards, and the driver merges those three-way, so a
 card deleted — or permanently deleted — on one branch stays out instead of coming back from the
-other, unless the other branch edited it: that edit comes back as a new card (a permanently
-deleted card stays out even then, and the driver's summary line counts the edits it dropped; they
-remain in that branch's git history). Before returning, the merge asserts it still contains every
-surviving card from both sides and refuses rather than hand back a result that lost one.
+other, unless the other branch edited it. That edit comes back as a new card when the deleting
+branch recorded the delete (a receipt in its Deleted cards); when it did not, the edited card
+simply stays. A permanently deleted card stays out even then: the driver's summary line counts the
+edits it dropped, and they remain in that branch's git history. Before returning, the merge asserts
+it still contains every surviving card from both sides and refuses rather than hand back a result
+that lost one.
 
 The honest boundary: a machine that has not run `git-driver install` simply gets the old binary
 conflict — safe degradation, not corruption — and git keeps both parents of every merge, so even a

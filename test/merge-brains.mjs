@@ -1391,6 +1391,28 @@ const B_ROWS = [
     },
   },
   {
+    // Found by the certifying soak (seed 93325). Ours' version history put an
+    // OLDER text back on the card; theirs deleted that card and restored it
+    // from Deleted cards, so the restored bytes live only on the landing and
+    // the bin holds the restore's content-free receipt. The fold reads ours
+    // as "my base held v5, I hold v1" — indistinguishable from typing v1 over
+    // v5 — and lands it on the landing, so v5 is live nowhere and in no bin.
+    // The bytes are unchanged (an edit replaces the text it was made on), but
+    // it is no longer SILENT: the person who restored the card is told, and
+    // the app takes a restore point on the report.
+    name: 'B47 a fold over bytes a restore put back is reported',
+    args: async () => ({
+      base: await side({ live: { txt_k: pj('v5') } }),
+      ours: await side({ live: { txt_k: pj('v1') } }),
+      theirs: await side({ live: { [kRestoredAs('v5')]: pj('v5') }, bin: { txt_k: pRe(k0, 'v5', kRestoredAs('v5')) } }),
+    }),
+    want: {
+      union: 'live[k=v1 k′=v5] bin[] c[]',
+      receipts: 'live[k′=v1] bin[k:R] c[fold-over-restore]',
+      '3way': 'live[k′=v1] bin[k:R] c[fold-over-restore]',
+    },
+  },
+  {
     // A twin of the landing holding other text is someone's text kept beside
     // the card, not the card: the purge takes the landing and leaves it.
     name: 'B45 a purge leaves a twin of the landing that holds other text',
@@ -1433,6 +1455,7 @@ const B_ROWS = [
     'B44 a purge reaches a twin of the landing that holds the restored bytes',
     'B45 a purge leaves a twin of the landing that holds other text',
     'B46 a purge reaches a deleted twin of the landing that holds the restored bytes',
+    'B47 a fold over bytes a restore put back is reported',
   ]);
   offBreaks('B', observed, B_ROWS, '3way', 'receipts', ['B8 exact deleted bytes over a base that holds the deletion']);
 
@@ -2523,6 +2546,12 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
       find: '  for (const [x, via] of reachedTwins) {',
       replace: '  for (const [x, via] of []) {',
       row: 'B44', options: { binMerge: 'receipts' },
+    },
+    {
+      rule: 'a fold over bytes a restore put back is reported',
+      find: "      if (asRestored(t, displaced) && ![...fate.values()].some((f) => f.entry && entryKind(f.entry.meta) === 'F' && sameMeaning(f.entry.json, displaced))) {",
+      replace: '      if (false) {',
+      row: 'B47', options: { binMerge: 'receipts' },
     },
     {
       rule: 'a purge reaches a deleted twin of the landing that holds the restored bytes',

@@ -972,6 +972,18 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
       return !!(eOf(O, x) || eOf(T, x));
     },
   });
+  // A restore receipt names the bytes it put back (its rid is the identity of
+  // the deletion it undid, minted from those bytes), so a copy of the card it
+  // landed on can be checked against them: card id -> [deleted id, rid].
+  const restoredBytes = new Map();
+  const restoredHere = new Map([[O, new Set()], [T, new Set()]]);   // side -> the cards its OWN bin says it restored
+  for (const S of [O, T, B]) for (const [d, e] of Object.entries(S?.graveyard || {})) {
+    const at = e?.meta && entryKind(e.meta) === 'R' ? e.meta.restoredAs : null;
+    if (typeof at !== 'string' || typeof e.meta.rid !== 'string') continue;
+    (restoredBytes.get(at) || restoredBytes.set(at, []).get(at)).push([d, e.meta.rid]);
+    restoredHere.get(S)?.add(at);
+  }
+  const asRestored = (id, v) => (restoredBytes.get(id) || []).some(([d, rid]) => fullEntryRid(d, v) === rid);
   const repoint = (S, from, to) => {
     for (const c of S.connections) { if (c.fromId === from) c.fromId = to; if (c.toId === from) c.toId = to; }
     for (const [cid, p] of Object.entries(S.positions)) if (p && p.parentId === from) S.positions[cid] = { ...p, parentId: to };
@@ -1019,6 +1031,23 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
     // Only onto a card the other side already held — never onto a value this
     // merge landed a moment ago (that value would then be lost, E-13).
     if (!unverified && madeOn != null && !landed.has(t) && (!live(mv.S, t) || sameMeaning(mv.S.items[t], madeOn)) && live(other, t) && !folded.has(t) && sameMeaning(other.items[t], madeOn)) {
+      // The landing's text goes, as the text an edit replaces always does —
+      // but when a RESTORE put it there, the bin holds only that restore's
+      // content-free receipt, so this is its last copy. The merge cannot tell
+      // an edit typed onto it from a version history restore that put an
+      // OLDER text back on this side's card (both read as "my base held that
+      // value, I hold this one"), and in the second case the restored text
+      // ends up live nowhere and in no bin. Whichever it is, it is told —
+      // the person who restored the card keeps it in their restore point
+      // (the app takes one on this report, as it does for a purged edit).
+      // Found by the certifying soak, seed 93325; before this it was silent.
+      // ...unless those bytes are still recoverable: a bin entry somewhere in
+      // this merge holds them (the restore's own entry survived because a side
+      // still held it, say). Then nothing is at stake and nothing is said.
+      const displaced = other.items[t];
+      if (asRestored(t, displaced) && ![...fate.values()].some((f) => f.entry && entryKind(f.entry.meta) === 'F' && sameMeaning(f.entry.json, displaced))) {
+        conflicts.push({ id: t, kind: 'fold-over-restore', keptLive: mv.side, from: mv.from, side: mv.side, restored: displaced });
+      }
       folded.set(t, mv);
       return arrive(mv, t);
     }
@@ -1069,18 +1098,6 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
   const keptBeside = (S, other, k, val) =>
     twins.twinsOf(k).find((x) => fate.get(x)?.alive && !folded.has(x) && !landed.has(x) && live(S, x) && sameMeaning(S.items[x], val)
       && (!live(other, x) || sameMeaning(other.items[x], val))) ?? null;
-  // A restore receipt names the bytes it put back (its rid is the identity of
-  // the deletion it undid, minted from those bytes), so a copy of the card it
-  // landed on can be checked against them: card id -> [deleted id, rid].
-  const restoredBytes = new Map();
-  const restoredHere = new Map([[O, new Set()], [T, new Set()]]);   // side -> the cards its OWN bin says it restored
-  for (const S of [O, T, B]) for (const [d, e] of Object.entries(S?.graveyard || {})) {
-    const at = e?.meta && entryKind(e.meta) === 'R' ? e.meta.restoredAs : null;
-    if (typeof at !== 'string' || typeof e.meta.rid !== 'string') continue;
-    (restoredBytes.get(at) || restoredBytes.set(at, []).get(at)).push([d, e.meta.rid]);
-    restoredHere.get(S)?.add(at);
-  }
-  const asRestored = (id, v) => (restoredBytes.get(id) || []).some(([d, rid]) => fullEntryRid(d, v) === rid);
   // The other side's text is an edit of the restored bytes only when that
   // side restored the card itself: a rescue of an older text lands on the
   // very id a restore of that deletion uses (both come from revivedIdFor), and

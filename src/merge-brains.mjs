@@ -42,6 +42,11 @@
 //   • Every bin entry the engine mints carries its identity (`rid`, see
 //     receiptIdentity in klypix-format.mjs) — a name for the deletion that two
 //     machines derive without talking, and that never orders anything.
+//   • An edge both sides hold takes theirs' copy when ours' names a card this
+//     merge removed and theirs' names cards that live: the app save, which
+//     tombstones the tab's stale copy of a card the disk moved, otherwise
+//     dropped the edge the disk had re-pointed. Ours' copy would dangle, so
+//     this only keeps an edge 1.86.3 lost.
 // Everything else about a call WITHOUT options is 1.86.3's union, verbatim:
 // the desktop app's merge-on-save sends renderer bytes that carry no bin, so
 // any rule that read a missing bin as meaningful would delete the human's
@@ -1041,16 +1046,20 @@ async function finishMerge(B, O, T, opt, run) {
   const liveIds = new Set(order);
   const tConn = byId(T.connections);
   const connMap = new Map(tConn);
-  // Ours wins an edge both sides hold. In the option modes, not when ours
-  // still points at a card this merge retired while theirs already follows it
-  // to where it went (a revival re-points the edges of the side it came from,
-  // and a later merge meets the other side's old copy): taking ours, the
-  // dangling filter below dropped the edge, and a round later the other
-  // machine put it back. Union mode keeps 1.86.3's rule.
+  // Ours wins an edge both sides hold — not when ours still points at a card
+  // this merge removed while theirs already points at cards that live. A
+  // revival re-points the edges of the side it came from, and an arrange
+  // re-points a buried duplicate's edges onto its survivor; the other side's
+  // copy of the edge still names the old card. Taking ours, the dangling
+  // filter below dropped the edge: in Brain Sync the other machine put it
+  // back a round later, and the app save (union), which tombstones the tab's
+  // stale copy of a card the disk moved, lost it for good. Ours' copy dangles
+  // there whatever we pick, so in union mode this only keeps an edge 1.86.3
+  // dropped.
   const endsLive = (c) => liveIds.has(c.fromId) && liveIds.has(c.toId);
   for (const [id, c] of byId(O.connections)) {
     const t = tConn.get(id);
-    connMap.set(id, opt.binMerge !== 'union' && t && !endsLive(c) && endsLive(t) ? t : c);
+    connMap.set(id, t && !endsLive(c) && endsLive(t) ? t : c);
   }
   // And an end a move retired follows its card to where it went, whichever
   // side moved it: the two ends of one edge can move on different sides (each

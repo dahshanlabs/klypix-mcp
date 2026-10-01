@@ -1,7 +1,7 @@
 // Concurrency-critical merge regressions found by the 2026-08-01 audit, the
 // Stage-2 all-callers rules (deterministic twins E-1, receipt identities E-2,
 // the option plumbing), and one truth table per option-mode option with its
-// mutation checks (S2-B, S2-N, S2-M, S2-V, S2-A, S2-X). Pure buffers only, except the git-driver agreement
+// mutation checks (S2-B, S2-L, S2-N, S2-M, S2-V, S2-A, S2-X). Pure buffers only, except the git-driver agreement
 // check, which runs the real driver on files under os.tmpdir().
 //
 // Every Stage-2 rule is also run through a FROZEN copy of the 1.86.3 engine
@@ -498,6 +498,10 @@ console.log('\n— S2-E1 deterministic twins —');
 // and renderer bytes that carry no bin; any behaviour change there beyond the
 // twin ids and the rid would reach the human's cards. A seeded differential
 // over app-save and sync shapes: both engines must agree on everything else.
+// One deliberate exception, which these shapes never meet (no side re-points
+// an edge here): an edge whose copy on our side names a card the merge
+// removed, while theirs' copy names live cards, is kept from theirs where
+// 1.86.3 dropped it (case B-E and table S2-L).
 console.log('\n— S2-U no options ⇒ unchanged (differential against 1.86.3) —');
 {
   const mulberry = (seed) => () => {
@@ -669,7 +673,7 @@ const side = async ({ live = {}, bin = {}, manifest = null } = {}) => {
 };
 
 const short = (id) => id.replace(/^txt_/, '').replace(/__r_[0-9a-f]{12}/g, '′').replace(/__agconf_[0-9a-z]+/gi, '~');
-const summarize = async (res, { withX = false } = {}) => {
+const summarize = async (res, { withX = false, withEdges = false } = {}) => {
   const { zip, canvas } = await parseKlypix(res.buffer);
   const liveParts = [];
   for (const id of canvas.order || []) {
@@ -684,7 +688,9 @@ const summarize = async (res, { withX = false } = {}) => {
     binParts.push(`${short(id)}:${kind}${kind === 'F' ? `(${body})` : ''}`);
   }
   const kinds = [...new Set(res.conflicts.map((c) => c.kind))].sort();
-  return `live[${liveParts.sort().join(' ')}] bin[${binParts.sort().join(' ')}] c[${kinds.join(' ')}]`;
+  // e[…]: the edges, id:from->to (con_ dropped from the id).
+  const edges = withEdges ? ` e[${(canvas.connections || []).map((c) => `${String(c.id).replace(/^con_/, '')}:${short(c.fromId)}->${short(c.toId)}`).sort().join(' ')}]` : '';
+  return `live[${liveParts.sort().join(' ')}] bin[${binParts.sort().join(' ')}] c[${kinds.join(' ')}]${edges}`;
 };
 
 // Run one table: every row under every value of `option`. Returns
@@ -1169,7 +1175,10 @@ const B_ROWS = [
       ok(await edgeFrom(await mergeBrains({ ...(await eArgs()), options: { binMerge } })) === kR,
         `B-E (${binMerge}): an edge both sides hold follows the card to its revived id, over our copy that points at the retired id`);
     }
-    ok(await edgeFrom(await mergeBrains(await eArgs())) === null, 'B-E (union): no options keep 1.86.3\'s rule (ours wins, and the dangling edge is dropped)');
+    // The app save (no options) meets the same shape whenever it tombstones the
+    // tab's stale copy of a card the disk moved; 1.86.3 dropped the edge there.
+    ok(await edgeFrom(await mergeBrains(await eArgs())) === kR, 'B-E (union): with no options the edge follows the card too (1.86.3 dropped it)');
+    ok(await edgeFrom(await OLD.mergeBrains(await eArgs())) === null, 'B-E (union) bite: the 1.86.3 engine drops that edge');
     EDGE_ARGS.push(eArgs);
   }
 
@@ -1300,6 +1309,85 @@ const B_ROWS = [
     'B: ((X·Y)·Z), (X·(Y·Z)) and (Z·(Y·X)) keep the same entry — the purge');
   ok((await Promise.all([left, right, swapped].map(async (b) => entryKind((await binIndex(b))[kRev('va')] ?? {}) === 'P' && !(await liveIds(b)).includes(kRev('va'))))).every(Boolean),
     'B: … and in every grouping the purge reaches Y\'s restore of k');
+}
+
+// ── S2-L links (edges) whose card moved under the other side's copy ──────────
+// Every mode, the app save's union included: an edge both sides hold takes
+// theirs' copy when ours' names a card this merge removed and theirs' names
+// cards that live. The strings add e[id:from->to]. Found on a copy of the real
+// brain: the app save, tombstoning the tab's stale copy of a card the disk had
+// moved, took the tab's copy of the card's edge and dropped it as dangling —
+// 12 of 12 edges of rescued cards, 5 that an arrange elsewhere had re-pointed.
+console.log('\n— S2-L edges that followed a moved card —');
+const withEdges = async (buf, edges) => {
+  const { zip, canvas } = await parseKlypix(buf);
+  canvas.connections = edges.map(([id, fromId, toId]) => ({ id, fromId, toId, relationship: 'relates_to' }));
+  zip.file('canvas.json', JSON.stringify(canvas));
+  return rezip(zip);
+};
+const L_ROWS = [
+  {
+    // A sync moved k's edit to k′ and re-pointed its edge; ours still holds k
+    // untouched, and the app save's tombstone (staleCopiesOf) removes it.
+    name: 'L1 an edge the disk re-pointed onto a revived card survives the stale copy\'s tombstone',
+    args: async () => ({
+      base: await withEdges(await side({ live: { txt_k: pj('v0') } }), [['con_e', 'txt_k', 'txt_anchor']]),
+      ours: await withEdges(await side({ live: { txt_k: pj('v0') } }), [['con_e', 'txt_k', 'txt_anchor']]),
+      theirs: await withEdges(await side({ live: { [kRev('v0')]: pj('v1') }, bin: { txt_k: Fe(k0, 'v0') } }), [['con_e', kRev('v0'), 'txt_anchor']]),
+      deletedIds: ['txt_k'],
+    }),
+    want: {
+      union: 'live[k′=v1] bin[k:F(v0)] c[] e[e:k′->anchor]',
+      receipts: 'live[k′=v1] bin[k:F(v0)] c[] e[e:k′->anchor]',
+      '3way': 'live[k′=v1] bin[k:F(v0)] c[] e[e:k′->anchor]',
+    },
+  },
+  {
+    // An arrange elsewhere buried duplicate d2 into d1 and re-pointed d2's
+    // edge onto d1; ours still holds both, and the save tombstones d2.
+    name: 'L2 an edge an arrange re-pointed onto the survivor survives the duplicate\'s tombstone',
+    args: async () => ({
+      base: await withEdges(await side({ live: { txt_d1: pj('dup'), txt_d2: pj('dup') } }), [['con_a', 'txt_d2', 'txt_anchor']]),
+      ours: await withEdges(await side({ live: { txt_d1: pj('dup'), txt_d2: pj('dup') } }), [['con_a', 'txt_d2', 'txt_anchor']]),
+      theirs: await withEdges(await side({ live: { txt_d1: pj('dup') }, bin: { txt_d2: binEntryFor({ id: 'txt_d2', json: pj('dup'), now: 1000, extra: { mergedInto: 'txt_d1' } }) } }), [['con_a', 'txt_d1', 'txt_anchor']]),
+      deletedIds: ['txt_d2'],
+    }),
+    want: {
+      union: 'live[d1=dup] bin[d2:F(dup)] c[] e[a:d1->anchor]',
+      receipts: 'live[d1=dup] bin[d2:F(dup)] c[] e[a:d1->anchor]',
+      '3way': 'live[d1=dup] bin[d2:F(dup)] c[] e[a:d1->anchor]',
+    },
+  },
+  {
+    // Both copies name the removed card: nothing to follow, the edge goes.
+    name: 'L3 an edge whose every copy names a removed card is still dropped',
+    args: async () => ({
+      base: await withEdges(await side({ live: { txt_k: pj('v0') } }), [['con_e', 'txt_k', 'txt_anchor']]),
+      ours: await withEdges(await side({ live: { txt_k: pj('v0') } }), [['con_e', 'txt_k', 'txt_anchor']]),
+      theirs: await withEdges(await side({ bin: { txt_k: Fe(k0, 'v0') } }), [['con_e', 'txt_k', 'txt_anchor']]),
+      deletedIds: ['txt_k'],
+    }),
+    want: { union: 'live[] bin[k:F(v0)] c[] e[]', receipts: 'live[] bin[k:F(v0)] c[] e[]', '3way': 'live[] bin[k:F(v0)] c[] e[]' },
+  },
+  {
+    // Ours' copy names live cards: ours wins, as it always has.
+    name: 'L4 our copy of an edge that lives still wins',
+    args: async () => ({
+      base: await withEdges(await side({ live: { txt_a: pj('a'), txt_b: pj('b'), txt_c: pj('c') } }), [['con_x', 'txt_a', 'txt_b']]),
+      ours: await withEdges(await side({ live: { txt_a: pj('a'), txt_b: pj('b'), txt_c: pj('c') } }), [['con_x', 'txt_a', 'txt_c']]),
+      theirs: await withEdges(await side({ live: { txt_a: pj('a'), txt_b: pj('b'), txt_c: pj('c') } }), [['con_x', 'txt_a', 'txt_b']]),
+    }),
+    want: { union: 'live[a=a b=b c=c] bin[] c[] e[x:a->c]', receipts: 'live[a=a b=b c=c] bin[] c[] e[x:a->c]', '3way': 'live[a=a b=b c=c] bin[] c[] e[x:a->c]' },
+  },
+];
+{
+  await runTable('L', 'binMerge', ['union', 'receipts', '3way'], L_ROWS, {}, { withEdges: true });
+  // The 1.86.3 engine: the union column of L1 and L2 drops the edge.
+  for (const name of ['L1', 'L2']) {
+    const row = L_ROWS.find((r) => r.name.startsWith(name));
+    const old = await summarize(await OLD.mergeBrains(await row.args()), { withEdges: true });
+    ok(old !== row.want.union && / e\[\]$/.test(old), `L bite: the 1.86.3 engine drops the edge of row ${row.name} (${old})`);
+  }
 }
 
 // ── S2-N newOnBothSides (E-5) ─────────────────────────────────────────────────
@@ -1546,7 +1634,7 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
     fs.writeFileSync(file, SRC.replace(find, replace).replaceAll("from './", "from '../../src/"));
     return import(pathToFileURL(file).href);
   };
-  const rowOf = (name) => B_ROWS.find((r) => r.name.startsWith(name)) || V_ROWS.find((r) => r.name.startsWith(name)) || N_ROWS.find((r) => r.name.startsWith(name));
+  const rowOf = (name) => B_ROWS.find((r) => r.name.startsWith(name)) || V_ROWS.find((r) => r.name.startsWith(name)) || N_ROWS.find((r) => r.name.startsWith(name)) || L_ROWS.find((r) => r.name.startsWith(name));
   const runWith = async (engine, rowName, options, view = {}) => {
     const row = rowOf(rowName);
     try { return await summarize(await engine.mergeBrains({ ...(await row.args()), options }), view); } catch (e) { return `threw ${e.message}`; }
@@ -1614,9 +1702,15 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
     },
     {
       rule: 'an edge follows the card that moved, over a copy pointing at the retired id',
-      find: "    connMap.set(id, opt.binMerge !== 'union' && t && !endsLive(c) && endsLive(t) ? t : c);",
+      find: '    connMap.set(id, t && !endsLive(c) && endsLive(t) ? t : c);',
       replace: '    connMap.set(id, c);',
       edge: true,
+    },
+    {
+      rule: 'union too: an edge the disk re-pointed survives the stale copy\'s tombstone',
+      find: '    connMap.set(id, t && !endsLive(c) && endsLive(t) ? t : c);',
+      replace: "    connMap.set(id, opt.binMerge !== 'union' && t && !endsLive(c) && endsLive(t) ? t : c);",
+      row: 'L1', options: {}, key: 'union', view: { withEdges: true },
     },
     {
       rule: 'an edge end follows a move made on the other side',

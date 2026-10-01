@@ -69,7 +69,7 @@ import JSZip from 'jszip';
 import { createHash } from 'node:crypto';
 import {
   parseKlypix, shard, sameMeaning, itemSignature, twinIdFor, binEntryFor,
-  entryKind, receiptIdentity, revivedIdFor, pickBinEntry, contentFreeReceiptFor, PURGED_BODY,
+  entryKind, receiptIdentity, revivedIdFor, pickBinEntry, contentFreeReceiptFor, PURGED_BODY, fullEntryRid,
 } from './klypix-format.mjs';
 import { generateKeyBetween } from 'fractional-indexing';
 
@@ -791,6 +791,15 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
   // already resolved on S's side, with `val` kept beside the card.
   const liveTwinHolding = (S, k, val) =>
     twins.twinsOf(k).find((x) => fate.get(x)?.alive && live(S, x) && sameMeaning(S.items[x], val)) ?? null;
+  // A restore receipt names the bytes it put back (its rid is the identity of
+  // the deletion it undid, minted from those bytes), so a copy of the card it
+  // landed on can be checked against them: card id -> [deleted id, rid].
+  const restoredBytes = new Map();
+  for (const S of [O, T, B]) for (const [d, e] of Object.entries(S?.graveyard || {})) {
+    const at = e?.meta && entryKind(e.meta) === 'R' ? e.meta.restoredAs : null;
+    if (typeof at === 'string' && typeof e.meta.rid === 'string') (restoredBytes.get(at) || restoredBytes.set(at, []).get(at)).push([d, e.meta.rid]);
+  }
+  const asRestored = (id, v) => (restoredBytes.get(id) || []).some(([d, rid]) => fullEntryRid(d, v) === rid);
   for (const [id, f] of fate) {
     if (!f.alive) continue;
     const inO = live(O, id), inT = live(T, id);
@@ -825,6 +834,14 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
           json = O.items[id]; side = 'ours';
           twinOf(id, T.items[id], srcPos, 'content-unverified');
         } else { json = T.items[id]; side = 'theirs'; delta.updated.push(id); }
+      } else if (!cb && diverged && B && !unverified && asRestored(id, O.items[id]) !== asRestored(id, T.items[id])) {
+        // One restore made on both sides — the same deletion, so the same id —
+        // is new on both since the base, yet its receipt names the bytes it
+        // came back with: the side still holding them has not touched the
+        // card, so the other side's text is an edit of it, not a conflict.
+        // (With no base, both are kept as ever: such a copy may be a revert.)
+        if (asRestored(id, O.items[id])) { json = T.items[id]; side = 'theirs'; delta.updated.push(id); }
+        else { json = O.items[id]; side = 'ours'; }
       } else if (!cb && diverged) {
         if (!B) {
           json = O.items[id]; side = 'ours';

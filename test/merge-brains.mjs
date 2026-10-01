@@ -620,6 +620,10 @@ const Pe = (id, text, now = 2000) => ({ meta: contentFreeReceiptFor(id, Fe(id, t
 const Re = (id, text, as, now = 2000) => ({ meta: contentFreeReceiptFor(id, Fe(id, text), { kind: 'restored', restoredAs: as, now }), json: PURGED_BODY });
 const kRev = (text) => revivedIdFor('txt_k', Fe('txt_k', text).meta, cj('txt_k', text));   // where a delete of k(text) revives
 const pj = (text) => JSON.stringify({ type: 'text', content: text, width: 240, height: 80 });   // a card as brains store it: no id inside
+// A restore of k(text) as brains store cards, and the id that restore lands on.
+const pFe = (id, text) => binEntryFor({ id, json: pj(text), now: 1000 });
+const pRe = (id, text, as, now = 2000) => ({ meta: contentFreeReceiptFor(id, pFe(id, text), { kind: 'restored', restoredAs: as, now }), json: PURGED_BODY });
+const kRestoredAs = (text) => revivedIdFor('txt_k', pFe('txt_k', text).meta, pj(text));
 const EDGE_ARGS = [];   // the B-E case, for its S2-X mutation
 
 const withBin = async (buffer, bin) => {
@@ -1203,6 +1207,40 @@ const N_ROWS = [
     args: async () => ({ base: TEMPLATE, ours: TEMPLATE, theirs: await side({ live: { txt_n: 'agent card' } }) }),
     want: { theirs: 'live[n=agent card] bin[] c[]', twin: 'live[n=agent card] bin[] c[]' },
   },
+  {
+    // Found by the simulator's soak (I9, seed 172): both sides restored k from
+    // one deletion (so both landed on the same k′, new on both since the
+    // base) and theirs edited it since. The restore receipt names the bytes
+    // it put back; ours still holds them, so theirs' text is an edit, not a
+    // conflict (k′ kept the old text and the edit went beside it).
+    name: 'N5 a card both sides restored from one deletion takes the edit made on it since',
+    args: async () => ({
+      base: await side({ live: { txt_k: pj('v0') } }),
+      ours: await side({ live: { [kRestoredAs('v0')]: pj('v0') }, bin: { txt_k: pRe(k0, 'v0', kRestoredAs('v0'), 2000) } }),
+      theirs: await side({ live: { [kRestoredAs('v0')]: pj('v3') }, bin: { txt_k: pRe(k0, 'v0', kRestoredAs('v0'), 2500) } }),
+    }),
+    want: { theirs: 'live[k′=v3] bin[k:R] c[]', twin: 'live[k′=v3] bin[k:R] c[]' },
+  },
+  {
+    // The same with the edit on our side — which 'theirs' alone would drop.
+    name: 'N6 the same, with the edit on our side',
+    args: async () => ({
+      base: await side({ live: { txt_k: pj('v0') } }),
+      ours: await side({ live: { [kRestoredAs('v0')]: pj('v3') }, bin: { txt_k: pRe(k0, 'v0', kRestoredAs('v0'), 2000) } }),
+      theirs: await side({ live: { [kRestoredAs('v0')]: pj('v0') }, bin: { txt_k: pRe(k0, 'v0', kRestoredAs('v0'), 2500) } }),
+    }),
+    want: { theirs: 'live[k′=v3] bin[k:R] c[]', twin: 'live[k′=v3] bin[k:R] c[]' },
+  },
+  {
+    // Both sides edited the restored card: a real conflict.
+    name: 'N7 a card both sides restored and both edited is new on both',
+    args: async () => ({
+      base: await side({ live: { txt_k: pj('v0') } }),
+      ours: await side({ live: { [kRestoredAs('v0')]: pj('v3') }, bin: { txt_k: pRe(k0, 'v0', kRestoredAs('v0'), 2000) } }),
+      theirs: await side({ live: { [kRestoredAs('v0')]: pj('v4') }, bin: { txt_k: pRe(k0, 'v0', kRestoredAs('v0'), 2500) } }),
+    }),
+    want: { theirs: 'live[k′=v4] bin[k:R] c[]', twin: 'live[k′=v3 k′~=v4] bin[k:R] c[content-new-both]' },
+  },
 ];
 {
   for (const binMerge of ['receipts', '3way']) {
@@ -1390,7 +1428,7 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
     fs.writeFileSync(file, SRC.replace(find, replace).replaceAll("from './", "from '../../src/"));
     return import(pathToFileURL(file).href);
   };
-  const rowOf = (name) => B_ROWS.find((r) => r.name.startsWith(name)) || V_ROWS.find((r) => r.name.startsWith(name));
+  const rowOf = (name) => B_ROWS.find((r) => r.name.startsWith(name)) || V_ROWS.find((r) => r.name.startsWith(name)) || N_ROWS.find((r) => r.name.startsWith(name));
   const runWith = async (engine, rowName, options, view = {}) => {
     const row = rowOf(rowName);
     try { return await summarize(await engine.mergeBrains({ ...(await row.args()), options }), view); } catch (e) { return `threw ${e.message}`; }
@@ -1499,6 +1537,12 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
       row: 'B28', options: { binMerge: 'receipts' },
     },
     {
+      rule: "the side still holding a restore's bytes has not edited the card",
+      find: '      } else if (!cb && diverged && B && !unverified && asRestored(id, O.items[id]) !== asRestored(id, T.items[id])) {',
+      replace: '      } else if (false) {',
+      row: 'N5', options: { binMerge: 'receipts', newOnBothSides: 'twin' }, key: 'twin',
+    },
+    {
       rule: 'a restore sends the copy after the card',
       find: "    if (kind === 'R') { moves.push({ S, side, from: id, v, target: E.meta.restoredAs, via: 'restore' }); return; }",
       replace: '',
@@ -1546,7 +1590,7 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
       continue;
     }
     const row = rowOf(m.row);
-    const want = row.want[m.options.theirsTrust === 'unverified' ? 'unverified' : m.options.binMerge];
+    const want = row.want[m.key ?? (m.options.theirsTrust === 'unverified' ? 'unverified' : m.options.binMerge)];
     const real = await runWith({ mergeBrains }, m.row, m.options, m.view);
     const got = await runWith(engine, m.row, m.options, m.view);
     ok(real === want && got !== want, `X "${m.rule}" off ⇒ row ${row.name} fails${got !== want ? ` (mutant: ${got})` : ' — IT DID NOT'}`);

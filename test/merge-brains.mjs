@@ -2597,38 +2597,40 @@ const CANON_CHECKS = {};   // name -> async (engine) => true when the check hold
   // K12: a settled conflict twin. The desktop buried the twin because its
   // card had been made to say what it held (receipt cause conflict-settled).
   // The settling side's base predates the conflict (the twin came by the
-  // other transport), so its choice read as unchanged and the other side's
-  // text as a one-sided change: the choice was undone and the chosen text was
-  // live nowhere, with nothing said. A settle made since the base is that
-  // side's change of the card: both changed, so both texts stay (ours on the
-  // card, theirs beside it — the first-conflict rule), and it is reported.
+  // other transport), so its choice reads as unchanged and the other side's
+  // text as a one-sided change: the card goes back, the chosen text is in
+  // Deleted cards only — and that is SAID, either way round, in both modes.
   const settledE = binEntryFor({ id: tT, json: cj(k0, 'T1'), receipt: { initiator: 'user', cause: 'conflict-settled', source: 'desktop', confidence: 'inferred' }, now: 2000 });
   const sBase = await side({ live: { txt_k: 'T1' } });
   const sSettled = await side({ live: { txt_k: 'T1' }, bin: { [tT]: settledE } });
   const sOther = await side({ live: { txt_k: 'O1', [tT]: cj(k0, 'T1') } });
+  const toldUndone = (res) => res.conflicts.filter((c) => c.kind === 'settle-undone' && c.twin === tT && c.existing === true).map((c) => c.keptLive).join(',');
   const k12 = async (engine) => {
     const out = [];
     for (const options of [SYNC, DRIVER]) for (const [o, t] of [[sSettled, sOther], [sOther, sSettled]]) {
       const res = await engine.mergeBrains({ base: sBase, ours: o, theirs: t, options });
-      out.push(`${await texts(res)} told[${res.conflicts.filter((c) => c.kind === 'content' && typeof c.twin === 'string' && !c.existing).length}]`);
+      out.push(`${await texts(res)} told[${toldUndone(res)}]`);
     }
     return out;
   };
-  const K12_WANT = ['k=T1 k~=O1 told[1]', 'k=O1 k~=T1 told[1]', 'k=T1 k~=O1 told[1]', 'k=O1 k~=T1 told[1]'];
+  const K12_WANT = ['k=O1 told[theirs]', 'k=O1 told[ours]', 'k=O1 told[theirs]', 'k=O1 told[ours]'];
   const k12Got = await k12({ mergeBrains });
-  ok(k12Got.join(' | ') === K12_WANT.join(' | '), `K12: a settle made over a base that predates the conflict is the settling side's change — both texts stay, and it is said${k12Got.join(' | ') === K12_WANT.join(' | ') ? '' : `   (got ${k12Got.join(' | ')})`}`);
-  CANON_CHECKS.settleCounts = async (engine) => (await k12(engine)).join(' | ') === K12_WANT.join(' | ');
-  // ...but not when the settle is in the base already (the card moved on
-  // since: its person's later edit), nor when the settling side's card no
-  // longer says the settled text.
+  ok(k12Got.join(' | ') === K12_WANT.join(' | '), `K12: a settle made over a base that predates the conflict is undone by the merge — and said (settle-undone), either way round${k12Got.join(' | ') === K12_WANT.join(' | ') ? '' : `   (got ${k12Got.join(' | ')})`}`);
+  CANON_CHECKS.settleUndone = async (engine) => (await k12(engine)).join(' | ') === K12_WANT.join(' | ');
+  // ...and nobody else is told: a card its person edited on after settling, a
+  // settle the base already holds, a machine that never settled (the copy is
+  // not live on either side there).
   const sMoved = await side({ live: { txt_k: 'Z later' }, bin: { [tT]: settledE } });
+  const sStale = await side({ live: { txt_k: 'T1' } });
+  const sOtherDone = await side({ live: { txt_k: 'O1' }, bin: { [tT]: settledE } });
   const k12b = [];
   for (const options of [SYNC, DRIVER]) {
     const calm = await mergeBrains({ base: sSettled, ours: sMoved, theirs: sSettled, options });
     const clash = await mergeBrains({ base: sBase, ours: sMoved, theirs: sOther, options });
-    k12b.push(`${await texts(calm)} told[${calm.conflicts.length}] | ${(await texts(clash)).includes('=T1') ? 'T1 BACK' : 'T1 stays buried'}`);
+    const never = await mergeBrains({ base: sBase, ours: sStale, theirs: sOtherDone, options });
+    k12b.push([calm, clash, never].map((r) => `[${toldUndone(r)}]`).join(''));
   }
-  ok(k12b.every((g) => g === 'k=Z later told[0] | T1 stays buried'), `K12b: a card its person edited on after settling keeps that edit; the settled text stays in Deleted cards${k12b.every((g) => g === 'k=Z later told[0] | T1 stays buried') ? '' : `   (got ${k12b.join(' || ')})`}`);
+  ok(k12b.every((g) => g === '[][][]'), `K12b: only the merge that undoes a settle says so — not a later edit, not a settle the base holds, not a machine that never settled${k12b.every((g) => g === '[][][]') ? '' : `   (got ${k12b.join(' || ')})`}`);
 
   // K13: a conflict twin one side rewrote while the card changed on both. The
   // placer asked "does a twin already hold this text?" of either side's copy
@@ -2657,11 +2659,35 @@ const CANON_CHECKS = {};   // name -> async (engine) => true when the check hold
     [twinIdFor(k0, cj(k0, 'Y')), { card: 'X', twin: 'Y' }, { card: 'Y', twin: 'Y' }, { card: 'Z', twin: 'Z' }],
     [oldT, { card: 'X', twin: 'Y' }, { card: 'Q', twin: 'Y' }, { card: 'Z', twin: 'Q' }],
     [oldT, { card: 'current', twin: 'earlier' }, { card: 'earlier', twin: 'current' }, { card: 'B rewrote', twin: 'earlier' }],
+    // the swap again, on a copy this engine minted (a deterministic id)
+    [twinIdFor(k0, cj(k0, 'earlier')), { card: 'current', twin: 'earlier' }, { card: 'earlier', twin: 'current' }, { card: 'B rewrote', twin: 'earlier' }],
+    // the slot of the text one side's card shows is held, on that very side, by a copy that says something else
+    [twinIdFor(k0, cj(k0, 'Y')), { card: 'B0', twin: 'X' }, { card: 'Z', twin: 'X' }, { card: 'Y', twin: 'X' }],
   ];
   const k13 = async (engine) => { const lost = []; for (const sh of K13_SHAPES) lost.push(...await everyTextKept(engine, ...sh)); return lost; };
   const k13Lost = await k13({ mergeBrains });
   ok(k13Lost.length === 0, `K13: a conflict twin one side rewrote while the card changed on both — every text someone chose is still on a card, in a twin or in the bin${k13Lost.length === 0 ? '' : `   (lost: ${k13Lost.join(', ')})`}`);
   CANON_CHECKS.twinRewritten = async (engine) => (await k13(engine)).length === 0;
+  // K13u: the app save (union) on the last shape: the tab rewrote the card, the
+  // disk's card took a text whose slot twin says something else. 1.86.3 minted
+  // a copy for the disk's text; the slot rule dropped it.
+  const k13u = async (engine) => {
+    const [twinId, base, a, b2] = K13_SHAPES.at(-1);
+    const mk = (st) => side({ live: { txt_k: st.card, [twinId]: cj(k0, st.twin) } });
+    const [B0, A0, T0] = [await mk(base), await mk(a), await mk(b2)];
+    const lost = [];
+    for (const [o, t] of [[A0, T0], [T0, A0]]) {
+      const res = await engine.mergeBrains({ base: B0, ours: o, theirs: t });
+      const { zip, canvas } = await parseKlypix(res.buffer);
+      const seen = new Set();
+      for (const id of canvas.order || []) seen.add(JSON.parse(await zip.file(`items/${shard(id)}/${id}.json`).async('string')).content);
+      for (const x of [a.card, b2.card]) if (!seen.has(x)) lost.push(x);
+    }
+    return lost;
+  };
+  const k13uLost = await k13u({ mergeBrains });
+  ok(k13uLost.length === 0, `K13u (union): the app save keeps both cards' texts when the slot twin says something else${k13uLost.length === 0 ? '' : `   (lost: ${k13uLost.join(', ')})`}`);
+  CANON_CHECKS.twinRewrittenUnion = async (engine) => (await k13u(engine)).length === 0;
 
   ok(await bytesOf(await mergeBrains({ base: null, ours: fX, theirs: fY, options: SYNC })) === 'YYYY-BYTES' && await bytesOf(await mergeBrains({ base: null, ours: fY, theirs: fX, options: SYNC })) === 'XXXX-BYTES',
     'K10: with no base nothing says who repacked it — theirs\' bytes, as ever');
@@ -3031,10 +3057,28 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
       canon: 'drawings', check: 'K9d',
     },
     {
-      rule: "a settle made since the base is the settling side's change of the card",
-      find: "    if (e?.meta?.deletion?.cause !== 'conflict-settled' || e.json == null || eOf(B, x)) continue;",
-      replace: '    if (true) continue;',
-      canon: 'settleCounts', check: 'K12',
+      rule: 'a settle the merge undoes is said',
+      find: "    if (settler) conflicts.push({ id: k, kind: 'settle-undone', keptLive: settler[1] === 'ours' ? 'theirs' : 'ours', twin: x, existing: true });",
+      replace: '',
+      canon: 'settleUndone', check: 'K12',
+    },
+    {
+      rule: 'a slot twin that says something else on the side showing the text is no home for it',
+      find: '        if (strict && ((heldAtBase && heldAtBase(x, v)) || (saysElseThere && saysElseThere(x, v, side)))) continue;',
+      replace: '        if (strict && heldAtBase && heldAtBase(x, v)) continue;',
+      canon: 'twinRewritten', check: 'K13',
+    },
+    {
+      rule: 'a resolution is adopted only if this merge leaves our text in that twin',
+      find: '        const adoptTwin = adoptTwin0 && (!live(O, adoptTwin0) || sameMeaning(O.items[adoptTwin0], T.items[adoptTwin0])) ? adoptTwin0 : null;',
+      replace: '        const adoptTwin = adoptTwin0;',
+      canon: 'twinRewritten', check: 'K13',
+    },
+    {
+      rule: 'the app save places its twins against what the slot holds too',
+      find: '  for (const req of twinRequests) Object.assign(req.record, twins.place(req.k, req.v, req.srcPos, null, true));',
+      replace: '  for (const req of twinRequests) Object.assign(req.record, twins.place(req.k, req.v, req.srcPos));',
+      canon: 'twinRewrittenUnion', check: 'K13u',
     },
     {
       rule: 'a twin holds a text only if it still does after the merge',

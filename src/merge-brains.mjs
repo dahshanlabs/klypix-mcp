@@ -111,13 +111,13 @@
 //     nested one group into the other): the loop is opened at one member, the
 //     same one on every machine.
 //   • A conflict twin the desktop buried as SETTLED (its card had been made to
-//     say what it held; receipt cause conflict-settled) counts as that side's
-//     change of the card, when the burial was made since the base. The
-//     settling side's base can predate the conflict (the twin came by the
-//     other transport, or a base write failed): its choice then read as
-//     "unchanged", the other side's text as a one-sided change, and the
-//     choice was undone with the chosen text live nowhere. Read as changed on
-//     both sides it is a conflict like any other: both texts stay.
+//     say what it held; receipt cause conflict-settled) whose settle a merge
+//     undoes is reported (`settle-undone`): the settling side's base predated
+//     the conflict (the twin came by the other transport, or a base write
+//     failed), so its choice read as unchanged and the other side's text as a
+//     one-sided change. The card goes back to that text and the chosen one is
+//     in Deleted cards. (Reading the settle as that side's change of the
+//     card, so that both texts stay, is a new merge rule: Stage 3.)
 //   • Arrows, lines and strokes are written in id order, and of two arrows
 //     that mean the same the one with the smaller id stays: theirs-first
 //     wrote a different array on every machine, and git and Brain Sync then
@@ -429,7 +429,7 @@ function descendantPosition(O, T, B, id, canonical = false) {
 // brain with thousands of simultaneous conflicts. `liveValues(x)` and
 // `slotState(x)` describe the merge's own cards; twins minted here are tracked
 // by the placer itself.
-function makeTwinPlacer({ seedIds, liveValues, slotState, suppressDeleted = null, keptValues = null, heldAtBase = null }) {
+function makeTwinPlacer({ seedIds, liveValues, slotState, suppressDeleted = null, keptValues = null, heldAtBase = null, saysElseThere = null }) {
   const index = new Map();
   const extras = [];                 // twins minted by this merge, in mint order
   const extraById = new Map();
@@ -465,8 +465,9 @@ function makeTwinPlacer({ seedIds, liveValues, slotState, suppressDeleted = null
         if (has(x)) return { twin: x, existing: true };
         // It says something else: a person edited it and v counts as seen —
         // unless the edit was made since the base (the base's copy still held
-        // v): then this merge is what replaces v, and v still needs a home.
-        if (strict && heldAtBase && heldAtBase(x, v)) continue;
+        // v), or the very side that shows v on the card holds this slot with
+        // another text: then v is on no twin, and still needs a home.
+        if (strict && ((heldAtBase && heldAtBase(x, v)) || (saysElseThere && saysElseThere(x, v, side)))) continue;
         return { twin: x, existing: true, edited: true };
       }
       if (state === 'free') return mint(x, k, v, srcPos);
@@ -649,13 +650,17 @@ function mergeUnion(B, O, T, del, deletedMeta) {
   const twins = makeTwinPlacer({
     seedIds: allIds,
     liveValues: (x) => (merged.has(x) ? [merged.get(x).json] : []),
+    // The app save too: a slot twin the tab rewrote does not hold the text the
+    // disk's card brings (1.86.3 minted a copy; the slot rule dropped it).
+    heldAtBase: (x, v) => !!B && B.items[x] != null && sameMeaning(B.items[x], v),
+    saysElseThere: (x, v) => T.items[x] != null && !sameMeaning(T.items[x], v),
     slotState: (x) => {
       if (merged.has(x)) return 'alive';
       if ((O.items[x] != null || T.items[x] != null) && removedSet.has(x)) return 'dying';
       return graveyard[x] ? 'dead' : 'free';
     },
   });
-  for (const req of twinRequests) Object.assign(req.record, twins.place(req.k, req.v, req.srcPos));
+  for (const req of twinRequests) Object.assign(req.record, twins.place(req.k, req.v, req.srcPos, null, true));
 
   // Every id that survived on either side (minus honored deletes) must be in
   // the result — 1.86.3's superset check, unchanged.
@@ -1030,6 +1035,7 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
       return lo ? [O.items[x]] : lt ? [T.items[x]] : [];
     },
     heldAtBase: (x, v) => !!B && B.items[x] != null && sameMeaning(B.items[x], v),
+    saysElseThere: (x, v, side) => { const S = side === 'ours' ? O : T; return live(S, x) && !sameMeaning(S.items[x], v); },
     slotState: (x) => {
       const f = fate.get(x);
       if (!f) return 'free';
@@ -1167,16 +1173,6 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
   const merged = new Map();
   // Every content twin holds theirs' text (ours stays live on the card).
   const twinOf = (k, v, srcPos, kind) => conflicts.push({ id: k, kind, keptLive: 'ours', ...twins.place(k, v, srcPos, 'theirs', true) });
-  // A conflict twin a person SETTLED since the base (the desktop buried it
-  // because its card had been made to say what it held: receipt cause
-  // conflict-settled) is that side's change of the card, whatever the base
-  // says: card id -> the sides that settled it and still show the settled text.
-  const settledSince = new Map();
-  for (const [S, name] of [[O, 'ours'], [T, 'theirs']]) for (const [x, e] of Object.entries(S.graveyard || {})) {
-    if (e?.meta?.deletion?.cause !== 'conflict-settled' || e.json == null || eOf(B, x)) continue;
-    const k = TWIN_PARENT_RE.exec(x)?.[1];
-    if (k && live(S, k) && sameMeaning(S.items[k], e.json)) (settledSince.get(k) || settledSince.set(k, new Set()).get(k)).add(name);
-  }
   // E-1b: S holds a live twin of k whose value is `val` — the conflict was
   // already resolved on S's side, with `val` kept beside the card.
   const liveTwinHolding = (S, k, val) =>
@@ -1210,8 +1206,8 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
       json = fold.v; side = fold.side;
       if (side === 'theirs') delta.updated.push(id);
     } else if (inO && inT) {
-      const oChg = !cb || !sameMeaning(O.items[id], cb) || !!settledSince.get(id)?.has('ours');
-      const tChg = !cb || !sameMeaning(T.items[id], cb) || !!settledSince.get(id)?.has('theirs');
+      const oChg = !cb || !sameMeaning(O.items[id], cb);
+      const tChg = !cb || !sameMeaning(T.items[id], cb);
       const diverged = !sameMeaning(O.items[id], T.items[id]);
       // A text of this card that a twin beside it holds too (on either side,
       // and still after this merge) is safe wherever the card goes.
@@ -1326,6 +1322,25 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
       if (side === 'theirs' && r.tParentChg && ARCHIVE.test(parentTitle(T, r.tP))) delta.archived.push(id);
     }
     merged.set(id, { json, pos });
+  }
+
+  // A conflict twin a person SETTLED (the desktop buried it because its card
+  // had been made to say what it held: receipt cause conflict-settled) whose
+  // settle this merge undoes: the settling side's base predated the conflict
+  // (the twin came by the other transport, or a base write failed), so its
+  // choice read as "unchanged", the other side's text as a one-sided change,
+  // and the card goes back to it — the chosen text is then in Deleted cards
+  // only. That is SAID (`settle-undone`), never silent (review round 6); the
+  // merge itself is unchanged. Only where this merge buries the copy (it was
+  // live on a side) and a side's card still says the settled text: a machine
+  // that never settled, and a card its person edited on since, are not told.
+  for (const [x, f] of fate) {
+    if (f.alive || !f.wasLive || !f.entry || entryKind(f.entry.meta) !== 'F' || f.entry.meta?.deletion?.cause !== 'conflict-settled') continue;
+    const k = TWIN_PARENT_RE.exec(x)?.[1];
+    const card = k ? merged.get(k) : null;
+    if (!card || sameMeaning(card.json, f.entry.json)) continue;
+    const settler = [[O, 'ours'], [T, 'theirs']].find(([S]) => live(S, k) && sameMeaning(S.items[k], f.entry.json));
+    if (settler) conflicts.push({ id: k, kind: 'settle-undone', keptLive: settler[1] === 'ours' ? 'theirs' : 'ours', twin: x, existing: true });
   }
 
   const removedSet = new Set(delta.removed);

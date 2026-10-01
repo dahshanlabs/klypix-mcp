@@ -597,9 +597,65 @@ export function summarizeReceipts({ messages, sessions, selfId, now = Date.now()
       consumedByLeaseIds: consumedByLease.map((id) => String(id).slice(0, 8)),
       failedIds: failed.map((id) => String(id).slice(0, 8)),
       deadLetterReason: m.deadLetter?.reason ? String(m.deadLetter.reason) : null,
+      // WHY each failed recipient failed ("… (never delivered)" vs "… (offered
+      // once, unconfirmed)") — the per-recipient truth the message-level
+      // reason cannot carry.
+      failedReasons: failed.map((id) => String(records.get(id)?.reason || '')),
+      // Mailbox (1.88.0): a note queued for a session that was not running
+      // carries the target it waits for, so the sender's line can say
+      // "waiting for it to start" instead of "consumed 0 of 1".
+      queuedOffline: Boolean(m.offline),
+      offlineTarget: m.offline?.target
+        ? {
+          id: String(m.offline.target.id || ''),
+          client: String(m.offline.target.client || 'unknown'),
+          lastSeen: Number(m.offline.target.lastSeen || 0) || null,
+          endedAt: Number(m.offline.target.endedAt || 0) || null,
+        }
+        : null,
+      expiresAt: Number(m.expiresAt || 0) || null,
     };
   });
   return { sent: receipts.length, receipts };
+}
+
+// The two mailbox phrasings, shared by both renderers below: a queued note
+// nobody has been offered yet is WAITING (not undelivered), and a queued note
+// that expired never met its session again — say that, not "failed".
+const ageWord = (ms) => {
+  const m = Math.max(0, Math.round(Number(ms || 0) / 60_000));
+  if (m < 1) return 'just now';
+  if (m < 60) return `${m}m ago`;
+  const h = Math.round(m / 60);
+  return h < 48 ? `${h}h ago` : `${Math.round(h / 24)}d ago`;
+};
+function offlinePhrase(receipt) {
+  if (!receipt?.queuedOffline || receipt.candidates !== 1) return null;
+  // Time is taken from the summary itself (ts + ageMs = the clock summarize
+  // ran on), so this renderer stays a pure function of its input.
+  const now = Number(receipt.ts || 0) + Number(receipt.ageMs || 0);
+  const target = receipt.offlineTarget || {};
+  const seen = target.lastSeen ? `last seen ${ageWord(now - target.lastSeen)}` : 'last seen unknown';
+  // Only a SessionEnd proves "closed"; otherwise the lane knows silence, not why.
+  const state = target.endedAt ? 'closed' : 'not on the lane';
+  const untouched = !receipt.offered && !receipt.acknowledged && !receipt.consumed;
+  if (untouched && receipt.failed) {
+    const reasons = (receipt.failedReasons || []).join(' ');
+    // The three ways a queued note ends without being consumed are different
+    // facts — never fold them into "expired".
+    if (/overflow/.test(String(receipt.deadLetterReason || ''))) {
+      return `not delivered — dropped when the lane was full before that session (${state}, ${seen}) came back`;
+    }
+    if (/offered once/.test(reasons)) {
+      return `shown once to that session after it came back, then expired without a later action confirming it`;
+    }
+    return `not delivered — that session (${state}, ${seen}) did not come back before the note expired`;
+  }
+  if (untouched) {
+    const left = receipt.expiresAt ? ` (kept ${Math.max(1, Math.round((receipt.expiresAt - now) / 86_400_000))}d more)` : '';
+    return `waiting — that session was ${state} when you sent it (${seen}); it is delivered the moment that session next acts${left}`;
+  }
+  return null;
 }
 
 // ONE phrase, shared by every receipt surface. Two renderers drifting apart is how
@@ -642,6 +698,8 @@ export function renderReceipt(receipt) {
     if (failure) return `- ${who}, ${age}: delivery failed (${failure}); no target consumed it. “${receipt.text}”`;
     return `- ${who}, ${age}: queued with no live local target snapshot; no local delivery is claimed. “${receipt.text}”`;
   }
+  const waiting = offlinePhrase(receipt);
+  if (waiting) return `- ${who}, ${age}: ${waiting}. “${receipt.text}”`;
   if (receipt.consumed === receipt.candidates && !receipt.failed) {
     return `- ${who}, ${age}: ${fullConsumptionPhrase(receipt)}. “${receipt.text}”`;
   }
@@ -667,6 +725,8 @@ export function renderReceiptSummary(summary) {
       ? `📬 Your last note${target} (${age}): delivery failed (${failure}); no target consumed it.`
       : `📬 Your last note${target} (${age}): queued with no live local target snapshot; no local delivery claimed.`;
   }
+  const waiting = offlinePhrase(receipt);
+  if (waiting) return `📬 Your last note${target} (${age}): ${waiting}.`;
   if (receipt.consumed === receipt.candidates && !receipt.failed) {
     return `📬 Your last note${target} (${age}): ${fullConsumptionPhrase(receipt)}.`;
   }

@@ -19,6 +19,30 @@ export const MESSAGE_RECEIPT_CAP = 100;
 export const SESSION_ALIAS_CAP = 8;
 export const ENDED_SESSION_CAP = 80;
 export const ENDED_SESSION_FRESH_MS = 24 * 60 * 60 * 1000;
+// ── Session directory (mailbox, 1.88.0) ──────────────────────────────────────
+// The lane forgets a session ten minutes after its last heartbeat and keeps
+// only a 24h tombstone for the (Codex-only) SessionEnd path, so a note to a
+// session that had closed was refused as "target-not-unique" and the human
+// became the courier between two agents (2026-09-30 field case). The
+// directory is an ADDITIVE lane key remembering every exactly-identified
+// session the lane has seen — its resume id, client, last intent, last scope,
+// when it was last live — for two weeks. It is what lets a directed note be
+// QUEUED for a session that is not running (delivered the moment that id
+// comes back) and what a doctor/CLI/app can list as "recent sessions, not
+// running". Provisional MCP connection ids are never remembered: they cannot
+// be resumed and do not name a conversation.
+export const DIRECTORY_FRESH_MS = 14 * 24 * 60 * 60 * 1000;
+export const DIRECTORY_CAP = 200;
+// A DIRECTED note waits a week, not a day: the promise is "a session that has
+// closed still receives it when it next starts", and that must hold whether
+// the session was already gone at send time or closed an hour later. Stored
+// per message (expiresAt); broadcasts keep the 24h rule.
+export const MESSAGE_DIRECTED_FRESH_MS = 7 * 24 * 60 * 60 * 1000;
+export const MESSAGE_OFFLINE_FRESH_MS = MESSAGE_DIRECTED_FRESH_MS;
+// "working" is believed only while the host keeps stamping it: an MCP-only
+// host never stamps idle (no Stop event), so a busy stamp older than this
+// renders as idle-for-N-minutes instead of "working" all afternoon.
+export const HOST_STATUS_BUSY_FRESH_MS = 10 * 60 * 1000;
 // Marker shared by the pure relay seam. A message carrying this prefix was
 // received from another computer, rather than authored on this local lane.
 // Revoking cross-computer presence must remove these notes as well as cloud
@@ -435,6 +459,128 @@ const endedMatches = (row, id) => {
   return key && (recipientKey(row?.id) === key || normalizeAliases(row?.aliases).includes(key));
 };
 
+// ── Session directory upkeep (mailbox) ───────────────────────────────────────
+// PARITY: global-brain-hook.mjs keeps a verbatim twin (dirPrune/dirRemember)
+// because that hook stays free of sibling imports — change both.
+const pruneDirectory = (rows, now) => (Array.isArray(rows) ? rows : [])
+  .filter((row) => row && recipientKey(row.id) && now - Number(row.lastSeen || 0) < DIRECTORY_FRESH_MS)
+  .map((row) => ({
+    id: recipientKey(row.id),
+    client: String(row.client || 'unknown').slice(0, 40),
+    surface: row.surface ? String(row.surface).slice(0, 40) : null,
+    branch: row.branch ? String(row.branch).slice(0, 120) : null,
+    intent: String(row.intent || '').replace(/\s+/g, ' ').trim().slice(0, 120),
+    files: normalizeFiles(row.files).slice(-8),
+    cwd: row.cwd ? String(row.cwd).slice(0, 400) : null,
+    aliases: normalizeAliases(row.aliases, row.id),
+    firstSeen: Number(row.firstSeen) || Number(row.lastSeen) || now,
+    lastSeen: Number(row.lastSeen) || now,
+    endedAt: Number(row.endedAt) || null,
+    hostStatus: row.hostStatus ? String(row.hostStatus).slice(0, 16) : null,
+  }))
+  .sort((left, right) => Number(left.lastSeen) - Number(right.lastSeen))
+  .slice(-DIRECTORY_CAP);
+
+// Remember (or refresh) the directory entry for one lane row. Only rows with an
+// EXACT logical identity are remembered — that id is the one a human can
+// resume and a note can wait for. `ended` stamps endedAt (SessionEnd); any
+// live touch clears it, because a revived session is running again.
+function rememberSession(directory, row, now, { ended = false } = {}) {
+  const rows = pruneDirectory(directory, now);
+  const id = recipientKey(row?.logicalSessionId || '');
+  if (!id || row?.via === 'cloud') return rows;
+  const index = rows.findIndex((entry) => entry.id === id);
+  const prev = index >= 0 ? rows[index] : null;
+  const scope = [...new Set([...normalizeFiles(row.files), ...normalizeFiles(row.observedFiles)])].slice(-8);
+  const intent = String(row.intent || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+  const entry = {
+    id,
+    client: String(row.client || prev?.client || 'unknown').slice(0, 40),
+    surface: row.surface ?? prev?.surface ?? null,
+    branch: row.branch ?? prev?.branch ?? null,
+    intent: intent || prev?.intent || '',
+    files: scope.length ? scope : (prev?.files || []),
+    cwd: row.cwd ? String(row.cwd).slice(0, 400) : (prev?.cwd || null),
+    aliases: normalizeAliases([...(prev?.aliases || []), ...normalizeAliases(row.aliases), recipientKey(row.id)], id),
+    firstSeen: Number(prev?.firstSeen) || now,
+    lastSeen: now,
+    endedAt: ended ? now : null,
+    hostStatus: row.hostStatus ? String(row.hostStatus).slice(0, 16) : (prev?.hostStatus || null),
+  };
+  if (index >= 0) rows[index] = entry; else rows.push(entry);
+  return rows
+    .sort((left, right) => Number(left.lastSeen) - Number(right.lastSeen))
+    .slice(-DIRECTORY_CAP);
+}
+
+// Directed-target resolution over the directory: exact id/alias, else a unique
+// >=8-character prefix. Branch names are deliberately NOT accepted here — over
+// two weeks of history a branch names many conversations. Returns the single
+// entry, or ambiguous=true when several match (fail closed).
+function resolveDirectoryTarget(target, directory) {
+  const wanted = String(target || '').trim().toLowerCase();
+  const rows = Array.isArray(directory) ? directory : [];
+  if (!wanted) return { entry: null, ambiguous: false };
+  const keysOf = (entry) => [entry.id, ...(entry.aliases || [])].map((value) => String(value).toLowerCase());
+  const exact = rows.filter((entry) => keysOf(entry).includes(wanted));
+  if (exact.length === 1) return { entry: exact[0], ambiguous: false };
+  if (exact.length > 1) return { entry: null, ambiguous: true };
+  if (wanted.length >= 8) {
+    const prefixed = rows.filter((entry) => keysOf(entry).some((key) => key.startsWith(wanted)));
+    if (prefixed.length === 1) return { entry: prefixed[0], ambiguous: false };
+    if (prefixed.length > 1) return { entry: null, ambiguous: true };
+  }
+  return { entry: null, ambiguous: false };
+}
+
+// Host activity status from the event that touched the row. A prompt or tool
+// call means the model is working; a Stop/complete means it is waiting for the
+// human. Heartbeats carry no status and keep the previous one. This is the
+// difference between "inactive" (which the founder read as "closed") and
+// "idle for 14 minutes — it will read your note the next time it is prompted".
+const hostStatusFromEvent = (event) => {
+  const name = String(event || '');
+  if (/^(?:UserPromptSubmit|PreToolUse|PostToolUse|McpToolUse|McpTaskStart|McpTaskCheckpoint)$/i.test(name)) return 'busy';
+  if (/^(?:Stop|McpTaskComplete|SessionStart)$/i.test(name)) return 'idle';
+  return null;
+};
+
+// "working" | "idle" | "idle 14m" | "" (unknown). Shared by every renderer so
+// the peer footer, brain_sync, doctor and the send receipt agree on one word.
+export function sessionStatusLabel(session, now = Date.now()) {
+  const status = String(session?.hostStatus || '');
+  if (!status) return '';
+  const at = Number(session?.hostStatusAt || session?.lastSeen || now);
+  if (status === 'busy' && now - at < HOST_STATUS_BUSY_FRESH_MS) return 'working';
+  const min = Math.max(0, Math.round((now - at) / 60_000));
+  return min <= 0 ? 'idle' : `idle ${min}m`;
+}
+
+// "2h ago" for receipts and labels — one helper so every surface agrees.
+export function agoLabel(ms) {
+  const m = Math.max(0, Math.round(Number(ms || 0) / 60_000));
+  if (m < 1) return 'just now';
+  if (m < 60) return `${m}m ago`;
+  const h = Math.round(m / 60);
+  return h < 48 ? `${h}h ago` : `${Math.round(h / 24)}d ago`;
+}
+
+// The command a human can paste to bring a closed session back, when the host
+// has one. Only the two hosts whose resume-by-id was verified (2026-09-30):
+// Claude Code `claude --resume <id>` and Codex `codex resume <id>`; both
+// accept the exact id the lane stores. Anything else returns ''.
+export function resumeCommandFor(client, id) {
+  const key = String(client || '').toLowerCase();
+  const sid = recipientKey(id);
+  // The command is shown to a model and may be pasted by a human: only an id
+  // made of identifier characters may ever appear in it (the lane is
+  // same-user-writable, so the id is not trusted as shell-safe by origin).
+  if (!sid || !/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(sid)) return '';
+  if (key === 'claude-code' || key === 'claude') return `claude --resume ${sid}`;
+  if (key === 'codex') return `codex resume ${sid}`;
+  return '';
+}
+
 export function sessionDeliveryReachability(session) {
   const channels = new Set(Array.isArray(session?.channels) ? session.channels.map(String) : []);
   const transport = session?.transport && typeof session.transport === 'object' ? session.transport : {};
@@ -663,7 +809,13 @@ function pruneMessages(messages, now) {
     if (!message) continue;
     const terminalAt = Number(message.deadLetter?.at || message.retiredAt || 0);
     if (terminalAt && now - terminalAt >= MESSAGE_RECEIPT_FRESH_MS) continue;
-    if (!terminalAt && now - Number(message.ts || 0) >= MESSAGE_FRESH_MS) {
+    // A note queued for a session that was not running carries its own
+    // deadline (MESSAGE_OFFLINE_FRESH_MS from send); every other note keeps
+    // the 24h rule. PARITY: global-brain-hook.mjs maintainMsgs.
+    const deadline = Number(message.expiresAt) > 0
+      ? Number(message.expiresAt)
+      : Number(message.ts || 0) + MESSAGE_FRESH_MS;
+    if (!terminalAt && now >= deadline) {
       message = terminalizeMessage(message, now, 'expired-before-consumption');
     }
     out.push(message);
@@ -771,6 +923,9 @@ export function upsertSession({
   // pointer instead of the same ~5k chars. ADDITIVE — written only when a
   // writer passes it; kept verbatim by every other touch (…previous spread).
   statusDigestHash,
+  // Host activity status (mailbox, 1.88.0): 'busy' | 'idle'. Derived from
+  // `event` when a writer does not pass it; heartbeats keep the previous value.
+  hostStatus = null,
   now = Date.now(),
 }) {
   if (!brainPath || !id) return withWriteVerdict([], false, 'no-brain-or-id');
@@ -869,6 +1024,7 @@ export function upsertSession({
     const activityEvent = /^(?:McpToolUse|McpTaskStart|McpTaskCheckpoint|UserPromptSubmit|PreToolUse|PostToolUse)$/i.test(String(event || ''))
       ? String(event)
       : null;
+    const nextHostStatus = hostStatus ? String(hostStatus).slice(0, 16) : hostStatusFromEvent(event);
     const next = {
       ...previous,
       id: String(id),
@@ -932,6 +1088,11 @@ export function upsertSession({
           ...(taskCompleted ? { completedAt: now } : (previous.completedAt ? { completedAt: previous.completedAt } : {})),
         }),
       ...(statusDigestHash !== undefined ? { statusDigestHash: String(statusDigestHash || '').slice(0, 16) } : {}),
+      // ADDITIVE host status: stamped only when this touch carries one, kept
+      // verbatim otherwise, so a heartbeat never turns "working" into unknown.
+      ...(nextHostStatus
+        ? { hostStatus: nextHostStatus, hostStatusAt: now }
+        : (previous.hostStatus ? { hostStatus: previous.hostStatus, hostStatusAt: previous.hostStatusAt || null } : {})),
       lastSeen: now,
     };
     const kept = sessions.filter((session) => session.id !== id);
@@ -942,6 +1103,7 @@ export function upsertSession({
       sessions: kept.slice(-40),
       messages: maintainMessages(data.messages, now),
       endedSessions,
+      directory: rememberSession(data.directory, next, now),
     }));
     return withWriteVerdict(kept.sort((a, b) => Number(b.lastSeen || 0) - Number(a.lastSeen || 0)), true);
   } finally {
@@ -1200,12 +1362,18 @@ export function endSession({ brainPath, id, home, now = Date.now(), expectedPid 
     const kept = sessions.filter((session) => !identities.includes(recipientKey(session.id))
       && !normalizeAliases(session.aliases).some((alias) => identities.includes(alias))
       && !(session.logicalSessionId && identities.includes(recipientKey(session.logicalSessionId))));
+    // The directory keeps the closed conversation as a door a note can wait at
+    // ("closed 2h ago"), stamped ended so readers never call it merely idle.
+    const directory = row
+      ? rememberSession(data.directory, { ...row, logicalSessionId: row.logicalSessionId || row.id, hostStatus: 'idle' }, now, { ended: true })
+      : pruneDirectory(data.directory, now);
     fs.mkdirSync(path.dirname(laneFile), { recursive: true });
     writeLaneFileAtomic(laneFile, JSON.stringify({
       ...data,
       sessions: kept,
       messages: maintainMessages(data.messages, now),
       endedSessions,
+      directory,
     }));
     return { ok: true, changed: kept.length !== sessions.length, reason: null, sessions: kept };
   } finally {
@@ -2077,29 +2245,39 @@ export function shortestUniqueSessionPrefix(sessions, sessionId, minLength = 8) 
   return canonical;
 }
 
-export function resolveMessageTargetIds(message, sessions) {
+// Live-target resolution with its verdict: `ids` is the resolved audience and
+// `ambiguous` says whether an empty result means "nobody matched" or "several
+// matched" — the mailbox needs the difference, because only a target that
+// matched NO live row may fall through to the directory. PARITY:
+// global-brain-hook.mjs resolveMsgTarget.
+export function resolveMessageTarget(message, sessions) {
   const rows = Array.isArray(sessions) ? sessions : [];
   const target = String(message?.to || '').trim().toLowerCase();
-  if (!target || target === 'all' || target === '*') return rows.map((row) => String(row.id));
+  if (!target || target === 'all' || target === '*') return { ids: rows.map((row) => String(row.id)), ambiguous: false };
 
   // Full canonical ids and aliases are accepted only when they resolve to one
   // row. This also makes a retained provisional id useful after atomic rekey.
   const exactIdentity = rows.filter((row) => sessionIdentityKeys(row).includes(target));
-  if (exactIdentity.length === 1) return [String(exactIdentity[0].id)];
-  if (exactIdentity.length > 1) return [];
+  if (exactIdentity.length === 1) return { ids: [String(exactIdentity[0].id)], ambiguous: false };
+  if (exactIdentity.length > 1) return { ids: [], ambiguous: true };
 
   // Prefixes are intentionally fail-closed and require >=8 characters.
   if (target.length >= 8) {
     const prefixMatches = rows.filter((row) => sessionIdentityKeys(row)
       .some((key) => key.startsWith(target)));
-    if (prefixMatches.length === 1) return [String(prefixMatches[0].id)];
-    if (prefixMatches.length > 1) return [];
+    if (prefixMatches.length === 1) return { ids: [String(prefixMatches[0].id)], ambiguous: false };
+    if (prefixMatches.length > 1) return { ids: [], ambiguous: true };
   }
 
   // Human-friendly branch targeting remains, but only exact and unique. Intent,
   // client and surface substring matching are deliberately forbidden.
   const branchMatches = rows.filter((row) => String(row?.branch || '').trim().toLowerCase() === target);
-  return branchMatches.length === 1 ? [String(branchMatches[0].id)] : [];
+  if (branchMatches.length === 1) return { ids: [String(branchMatches[0].id)], ambiguous: false };
+  return { ids: [], ambiguous: branchMatches.length > 1 };
+}
+
+export function resolveMessageTargetIds(message, sessions) {
+  return resolveMessageTarget(message, sessions).ids;
 }
 
 function messageTargetsSession(message, session, sessionId, sessions = []) {
@@ -2421,6 +2599,12 @@ export function postPresenceMessage({
   // hand-typed targets: the exactly-one-live-row refusal below is what keeps an
   // ambiguous prefix from queuing a note nobody will ever receive.
   allowOfflineTarget = false,
+  // Mailbox (1.88.0): a hand-typed target that matches NO live row may still
+  // name exactly one session the directory remembers (closed, or gone from the
+  // lane). The note is then QUEUED for that id — delivered the moment the
+  // session is back — instead of refused. Ambiguity still fails closed, and a
+  // target nobody remembers is 'target-unknown', never a silent queue.
+  allowKnownOfflineTarget = false,
 }) {
   const body = neutralizeMarkers(String(text || '').replace(/\s+/g, ' ').trim().slice(0, 400));
   if (!brainPath || !from || !body) return { posted: false, message: null, reason: 'invalid-message' };
@@ -2440,15 +2624,19 @@ export function postPresenceMessage({
       if (existing) return { posted: false, message: existing, reason: 'duplicate' };
     }
     const senderId = String(from).slice(0, 160);
-    const target = String(to || 'all').replace(/\s+/g, ' ').trim().slice(0, 160) || 'all';
+    // The broadcast verdict is decided on the same folded value the resolver
+    // uses ("ALL" is a broadcast everywhere, including the hook twin), and the
+    // stored `to` is the canonical 'all' so every later reader agrees.
+    const rawTarget = String(to || 'all').replace(/\s+/g, ' ').trim().slice(0, 160) || 'all';
+    const broadcast = /^(?:all|\*)$/i.test(rawTarget);
+    const target = broadcast ? 'all' : rawTarget;
     // Receipt truth must survive peers ending before the sender checks doctor.
     // Snapshot only recipient session ids (already lane metadata) at SEND time;
     // old messages without this additive field retain reconstruction fallback.
-    const resolvedTargets = resolveMessageTargetIds({ to: target }, sessions);
-    const candidateIds = resolvedTargets
+    const resolution = resolveMessageTarget({ to: target }, sessions);
+    const candidateIds = resolution.ids
       .filter((id) => id && id !== senderId)
       .map((id) => String(id).slice(0, 160));
-    const broadcast = target === 'all' || target === '*';
     // A broadcast with no OTHER live recipient is not a successful handoff.
     // Refuse before constructing/persisting a message so no zero-audience row
     // can later be mistaken for queued or delivered work.
@@ -2457,13 +2645,37 @@ export function postPresenceMessage({
     }
     // A targeted hint that does not resolve to exactly one OTHER live row is
     // unsafe: it may be an ambiguous UUID prefix or duplicated branch. Refuse
-    // instead of queuing a note whose visible `to` never had a recipient.
+    // instead of queuing a note whose visible `to` never had a recipient —
+    // unless the target matched NOBODY live and is (a) an exact id a machine
+    // caller vouched for, or (b) one session the directory remembers.
+    let offline = null;
     if (!broadcast && candidateIds.length !== 1) {
-      if (!(allowOfflineTarget && candidateIds.length === 0)) {
+      const selfOnly = resolution.ids.length > 0 && resolution.ids.every((id) => id === senderId);
+      const nobodyLive = candidateIds.length === 0 && !resolution.ambiguous && !selfOnly;
+      if (nobodyLive && allowKnownOfflineTarget) {
+        const known = resolveDirectoryTarget(target, pruneDirectory(data.directory, now));
+        if (known.ambiguous) return { posted: false, message: null, reason: 'target-not-unique' };
+        if (!known.entry) return { posted: false, message: null, reason: 'target-unknown' };
+        if (known.entry.id === senderId) return { posted: false, message: null, reason: 'target-not-unique' };
+        candidateIds.push(known.entry.id);
+        offline = {
+          queuedAt: now,
+          target: {
+            id: known.entry.id,
+            client: known.entry.client,
+            intent: known.entry.intent,
+            lastSeen: known.entry.lastSeen,
+            endedAt: known.entry.endedAt || null,
+          },
+        };
+      } else if (allowOfflineTarget && candidateIds.length === 0) {
+        // Offline machine-known recipient: address the exact id we were handed
+        // (1.87 semantics kept verbatim — a logical id split across two live
+        // rows still resolves through candidateIds, so it is not refused).
+        candidateIds.push(String(target).slice(0, 160));
+      } else {
         return { posted: false, message: null, reason: 'target-not-unique' };
       }
-      // Offline machine-known recipient: address the exact id we were handed.
-      candidateIds.push(String(target).slice(0, 160));
     }
     const message = {
       id: sha16(`${from}|${to}|${body}|${now}|${crypto.randomBytes(4).toString('hex')}`),
@@ -2476,6 +2688,10 @@ export function postPresenceMessage({
       deliveries: candidateIds.map((recipientId) => ({ recipientId, state: 'pending', attempts: 0 })),
       candidateIds,
       ...(key ? { dedupeKey: key } : {}),
+      // Every directed note keeps for a week (see MESSAGE_DIRECTED_FRESH_MS);
+      // `offline` additionally records that the target was away at send time.
+      ...(broadcast ? {} : { expiresAt: now + MESSAGE_DIRECTED_FRESH_MS }),
+      ...(offline ? { offline } : {}),
     };
     messages.push(message);
     fs.mkdirSync(path.dirname(laneFile), { recursive: true });
@@ -2484,10 +2700,80 @@ export function postPresenceMessage({
       sessions,
       messages: capMessages(messages, MESSAGE_LANE_CAP, now),
     }));
-    return { posted: true, message, reason: null };
+    // Who will actually see this, and in what state — the sender's reply to the
+    // human is built from this, so it must say "idle 14m" or "not running",
+    // never just "queued".
+    const recipients = candidateIds.map((id) => {
+      const row = sessions.find((session) => String(session.id) === id);
+      if (row) {
+        return {
+          id,
+          live: true,
+          client: row.client || 'unknown',
+          intent: String(row.intent || '').slice(0, 120),
+          branch: row.branch || null,
+          deliveryReachability: row.deliveryReachability || sessionDeliveryReachability(row),
+          hostStatus: row.hostStatus || null,
+          statusLabel: sessionStatusLabel(row, now),
+          lastSeen: Number(row.lastSeen || 0) || null,
+          endedAt: null,
+          resumeCommand: '',
+        };
+      }
+      const known = offline?.target?.id === id ? offline.target : null;
+      // "not seen for 2h" — honest about what the lane knows: ten minutes of
+      // silence means closed OR idle with no KLYPIX heartbeat; only a
+      // SessionEnd (Codex) proves "closed". Either way the note is delivered
+      // the moment that session next acts.
+      return {
+        id,
+        live: false,
+        client: known?.client || 'unknown',
+        intent: known?.intent || '',
+        branch: null,
+        deliveryReachability: 'not-running',
+        hostStatus: null,
+        statusLabel: known?.endedAt ? 'closed' : (known?.lastSeen ? `not seen for ${agoLabel(now - known.lastSeen).replace(/ ago$/, '')}` : 'not running'),
+        lastSeen: known?.lastSeen || null,
+        endedAt: known?.endedAt || null,
+        resumeCommand: resumeCommandFor(known?.client, id),
+      };
+    });
+    return { posted: true, message, reason: null, queuedOffline: Boolean(offline), recipients };
   } finally {
     releaseLock(lockFile);
   }
+}
+
+// Every session the directory remembers (two weeks), joined with the live lane:
+// `live` says whether a row is heartbeating now, `status` is the shared word
+// ("working", "idle 14m", "closed", "not running"), and `waitingNotes` counts
+// notes queued for that id that nobody has offered yet. Read-only; this is the
+// data behind "recent sessions" in doctor, a CLI verb, or an app switchboard.
+export function listKnownSessions({ brainPath, home, now = Date.now() } = {}) {
+  if (!brainPath) return [];
+  const lane = readLane(laneFileFor(brainPath, home));
+  const live = pruneSessions(lane.sessions, now);
+  const messages = (Array.isArray(lane.messages) ? lane.messages : [])
+    .map((message) => normalizeMessageDelivery(message, now))
+    .filter((message) => message && !isTerminalMessage(message));
+  return pruneDirectory(lane.directory, now).map((entry) => {
+    const wanted = entry.id.toLowerCase();
+    const row = live.find((session) => sessionIdentityKeys(session).includes(wanted)) || null;
+    const waitingNotes = messages.filter((message) => Array.isArray(message.candidateIds)
+      && message.candidateIds.map(recipientKey).includes(entry.id)
+      && messageDeliveryState(message, entry.id) === 'pending').length;
+    return {
+      ...entry,
+      live: Boolean(row),
+      status: row ? (sessionStatusLabel(row, now) || 'live')
+        : (entry.endedAt ? 'closed' : `not seen for ${agoLabel(now - entry.lastSeen).replace(/ ago$/, '')}`),
+      lastSeen: row ? Number(row.lastSeen || entry.lastSeen) : entry.lastSeen,
+      deliveryReachability: row ? (row.deliveryReachability || sessionDeliveryReachability(row)) : 'not-running',
+      waitingNotes,
+      resumeCommand: row ? '' : resumeCommandFor(entry.client, entry.id),
+    };
+  }).sort((left, right) => Number(right.lastSeen) - Number(left.lastSeen));
 }
 
 const clientLabel = (session) => {
@@ -2610,8 +2896,14 @@ export function formatPresenceMessage(sessions, selfId, { includeSolo = false, n
     // 100-minute-old task line can never read as "what they're doing right now".
     const intentAgeMin = group.intentAt ? Math.max(0, Math.round((now - Number(group.intentAt)) / 60_000)) : null;
     const intentAge = intentAgeMin !== null && intentAgeMin - ageMin > 3 ? ` (intent set ${intentAgeMin}m ago)` : '';
+    // Host status rides the row that carries it (a lifecycle row knows Stop /
+    // prompt; an MCP-only row may not) — take the freshest stamped one.
+    const statusRow = group.rows
+      .filter((row) => row.hostStatus)
+      .sort((a, b) => Number(b.hostStatusAt || b.lastSeen || 0) - Number(a.hostStatusAt || a.lastSeen || 0))[0] || null;
     const details = [
       clientLabel(session),
+      statusRow ? sessionStatusLabel(statusRow, now) : null,
       group.rows.length > 1 ? `${group.rows.length} connections` : null,
       group.branch ? `branch ${group.branch}` : null,
       group.intent ? `"${String(group.intent).slice(0, 90)}"${intentAge}` : null,
@@ -2693,7 +2985,10 @@ export function formatReceivedMessages(messages, now = Date.now(), decay = {}, s
     const senderLabel = senders.length <= 3 ? senders.join(', ') : `${senders.slice(0, 3).join(', ')} +${senders.length - 3}`;
     const oldestTs = Math.min(...group.map(item => Number(item?.ts) || now));
     const ageMin = Math.max(0, Math.round((now - oldestTs) / 60_000));
-    lines.push(`- from ${senderLabel} (${ageMin}m ago): ${neutralizeMarkers(String(message.text || '').replace(/\s+/g, ' ').trim().slice(0, 400))}`);
+    // A note that waited for this session while it was not running says so:
+    // the reader should treat it as the sender's state THEN, not a live ping.
+    const waited = group.some((item) => item?.offline) ? ', left while this session was not running' : '';
+    lines.push(`- from ${senderLabel} (${ageMin}m ago${waited}): ${neutralizeMarkers(String(message.text || '').replace(/\s+/g, ' ').trim().slice(0, 400))}`);
     const receipts = group.map((item) => messageDeliveryReceipt(item, sessionId)).filter(Boolean);
     if (receipts.length) {
       lines.push(`  Receipt(s): ${receipts.map((receipt) => `${receipt.messageId}:${receipt.offerToken}`).join(', ')}. After incorporating ${receipts.length === 1 ? 'it' : 'them'}, call brain_message_receipt with each exact message_id and offer_token — that is the ONLY way the sender learns you acted on ${receipts.length === 1 ? 'it' : 'them'}. If you skip it, your next independent action auto-consumes ${receipts.length === 1 ? 'this note' : 'these notes'} and the sender is told only that ${receipts.length === 1 ? 'it was' : 'they were'} auto-consumed.`);

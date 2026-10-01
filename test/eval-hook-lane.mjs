@@ -4,10 +4,12 @@
 //   HL1  build-hook-eval-set turns a sidecar into two strata: capture-pair
 //        (gate passed, live gold found) and no-inject (gate failed), skipping
 //        orphans whose card is gone, with a receipt naming brain + sidecar.
-//   HL2  eval-hook-lane runs the SAME lane sequence the hook runs — status
-//        digest, token derivation, lexical top-5 at minScore 3 — through the
-//        production exports, in lexical mode with no model, and reports
-//        per-stratum recall / injection with strict and twin-aware golds.
+//   HL2  eval-hook-lane runs the SAME lane sequence the hook runs (1.87
+//        unified policy) — status digest, token derivation, then the WORDS
+//        lane (rankHookWords at HOOK_WORDS_BAR; lexical mode has no model, the
+//        hook's exact no-model degradation) — through the production exports,
+//        and reports per-stratum recall / injection with strict and twin-aware
+//        golds. Bars are read from the engine, never restated by the harness.
 //   HL3  receipts: inputs hashed, prompt text omitted by default, output must
 //        be a new file, a changed input is refused.
 import fs from 'fs';
@@ -15,7 +17,7 @@ import os from 'os';
 import path from 'path';
 import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
-import { buildKlypix, parseKlypix } from '../src/klypix-format.mjs';
+import { buildKlypix, parseKlypix, HOOK_WORDS_BAR, HOOK_MODEL_MIN_TOKENS, HOOK_FUSED_SHOW_BAR } from '../src/klypix-format.mjs';
 import { enrichmentFileFor, enrichmentKeyFor } from '../src/enrichment.mjs';
 
 let failures = 0;
@@ -87,8 +89,8 @@ try {
   const report = JSON.parse(fs.readFileSync(outFile, 'utf8'));
   const rowFor = (needle) => report.rows.find((row) => set.questions[row.index] && new RegExp(needle).test(set.questions[row.index].q));
   const pan = rowFor('pan hand tool');
-  ok(pan && pan.lane === 'lexical' && pan.lexRankStrict === 1 && pan.injected >= 1,
-    `HL2: a prompt sharing title/body words with its card is a lexical hit at rank 1 (${JSON.stringify({ lane: pan?.lane, rank: pan?.lexRankStrict })})`);
+  ok(pan && pan.lane === 'words-shown' && pan.rankStrict === 1 && pan.injected >= 1,
+    `HL2: a prompt sharing title/body words with its card is a words-lane show at rank 1 (${JSON.stringify({ lane: pan?.lane, rank: pan?.rankStrict })})`);
   const status = rowFor('what is remaining');
   ok(status && status.lane === 'status-digest' && status.injected === 0, 'HL2: a strong status question takes the digest lane and injects no cards — as the hook does');
   const ack = rowFor('^ok do them$');
@@ -96,19 +98,25 @@ try {
   const authRow = rowFor('long session expire');
   ok(authRow && authRow.strategy === 'capture-pair' && authRow.twinGold.includes(authId), 'HL2: gold sets are recorded per row (strict and twin-aware)');
   ok(report.summary.capturePair.n === 2 && report.summary.noInject.n === 3, `HL2: strata counted (${report.summary.capturePair.n}/${report.summary.noInject.n})`);
-  ok(report.summary.capturePair.lexicalRecallAt5.strict >= 33 && report.summary.capturePair.lexicalRecallAt5.twinAware >= report.summary.capturePair.lexicalRecallAt5.strict,
-    `HL2: lexical recall@5 is reported strict and twin-aware (${JSON.stringify(report.summary.capturePair.lexicalRecallAt5)})`);
-  // The console echo carries one real title word ("release"). At the pre-1.86
-  // bar of 3 that alone injected the Release card; at the shipping bar of 4 it
-  // does not — and the sweep shows both, so the decision stays visible.
+  ok(report.summary.capturePair.systemRecallAt5.strict >= 33 && report.summary.capturePair.systemRecallAt5.twinAware >= report.summary.capturePair.systemRecallAt5.strict,
+    `HL2: system recall@5 is reported strict and twin-aware (${JSON.stringify(report.summary.capturePair.systemRecallAt5)})`);
+  // The console echo carries one rare title word ("release"). In a TINY brain
+  // (N=4) a single rare title word is worth TITLE_BOOST in near-unit idf, so
+  // evidence (2.2) clears the 1.8 bar and the Release card shows — a known
+  // small-N property of the rarity units; on the real brain "release" is
+  // common and worth far less. The sweep shows the bar dependence: at +0.6
+  // over shipping the same row goes silent.
   const echo = rowFor('release:register');
-  ok(echo && echo.lexSweep && echo.lexSweep[3].injected >= 1 && echo.injected === 0 && echo.lane !== 'lexical',
-    `HL2: one title word injected at bar 3 and does not at the shipping bar (lane ${echo?.lane}, sweep@3 ${echo?.lexSweep?.[3]?.injected})`);
-  ok(report.configuration.lexical.minScore === 4 && report.configuration.fallback.minContentTokens === 4, 'HL2: the configuration carries the engine\'s measured bars, not restated constants');
-  ok(report.summary.noInject.zeroInjectedRate === 100, `HL2: at the shipping bars the no-inject stratum injects nothing (${report.summary.noInject.zeroInjectedRate}%)`);
-  ok(report.summary.lexicalSweep && report.summary.lexicalSweep.table.some((r) => r.minScore === 3) && report.summary.lexicalSweep.table.some((r) => r.minScore === 4),
-    'HL2: the lexical sweep table includes the old and the shipping bar');
-  ok(report.configuration.lexical.topK === 5 && report.configuration.fallback.ranker === 'rankLexicalMissFallback',
+  ok(echo && echo.lane === 'words-shown' && echo.wordsEvidence >= HOOK_WORDS_BAR && echo.wordsEvidence < HOOK_WORDS_BAR + 0.6,
+    `HL2: one rare title word clears the bar at N=4 (evidence ${echo?.wordsEvidence}) and the sweep records the bar that silences it`);
+  const highBar = report.summary.wordsBarSweep.table.find((r) => r.bar > echo.wordsEvidence);
+  ok(highBar && highBar.noInjectZeroRate === 100 && report.summary.wordsBarSweep.table.some((r) => r.shipping),
+    `HL2: the words-bar sweep brackets the shipping bar and shows the echo silenced above its evidence (${JSON.stringify(highBar)})`);
+  ok(report.configuration.words.evidenceBar === HOOK_WORDS_BAR && report.configuration.model.minUniqueContentTokens === HOOK_MODEL_MIN_TOKENS
+    && report.configuration.model.showBar === HOOK_FUSED_SHOW_BAR,
+    'HL2: the configuration carries the engine\'s measured bars, not restated constants');
+  ok(report.summary.noInject.zeroInjectedRate === 67, `HL2: no-inject zero rate reflects the echo's small-N show (${report.summary.noInject.zeroInjectedRate}%)`);
+  ok(report.configuration.words.ranker === 'rankHookWords' && report.configuration.model.ranker === 'rankHookFused',
     'HL2: the configuration names the production rankers');
 
   // ── HL3 — receipts and refusals ───────────────────────────────────────

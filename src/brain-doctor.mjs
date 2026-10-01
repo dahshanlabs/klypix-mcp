@@ -57,6 +57,11 @@ try { repoStateLib = await import('./repo-state.mjs'); } catch { repoStateLib = 
 // (the exact drift that once produced three different live-session counts).
 let presenceLib = null;
 try { presenceLib = await import('./agent-presence.mjs'); } catch { presenceLib = null; }
+// provenance powers the informational JUDGMENTS line (confirm/dismiss verdict
+// counts + rejected-prompt pool). Same failure-tolerant idiom; absence of the
+// module OR of any records is a fact, never drift.
+let provenanceLib = null;
+try { provenanceLib = await import('./provenance.mjs'); } catch { provenanceLib = null; }
 
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -332,6 +337,9 @@ function inspectPeers(brainDir, brainPath, now, selfId = null) {
         && Number(s.activityAt || 0) > 0
         && now - Number(s.activityAt) < SESSION_FRESH_MS,
       lastSeenMin: Math.round((now - liveness.lastSeen) / 60000),
+      // Mailbox (1.88.0): host activity as the shared word every surface uses.
+      hostStatus: s.hostStatus || null,
+      statusLabel: typeof presenceLib?.sessionStatusLabel === 'function' ? presenceLib.sessionStatusLabel(s, now) : '',
     }));
   // Display IDs must stay usable when time-ordered UUIDs share a long prefix.
   // Eight characters is only the floor: grow each prefix until it is unique.
@@ -388,9 +396,69 @@ function inspectPeers(brainDir, brainPath, now, selfId = null) {
   });
   const syncedCount = logicalStates.filter((state) => state.synced).length;
   const activeUnscopedCount = logicalStates.filter((state) => state.activeUnscoped).length;
+  // Mailbox (1.88.0): the sessions the lane REMEMBERS but that are not running
+  // (two-week directory) and the notes queued for them — the doors with mail.
+  // Read straight off the lane so a bundle whose engine predates the directory
+  // simply reports none.
+  const directoryFreshMs = Number(presenceLib?.DIRECTORY_FRESH_MS) > 0
+    ? Number(presenceLib.DIRECTORY_FRESH_MS) : 14 * 24 * 60 * 60 * 1000;
+  const liveKeys = new Set(liveRows.flatMap((row) => [row.rawId, row.logicalSessionId]
+    .filter(Boolean).map((value) => String(value).toLowerCase())));
+  const messages = Array.isArray(data?.messages) ? data.messages : [];
+  // THIS note's own state for THIS recipient — never "some pending note to it".
+  const notePendingFor = (m, id) => m && !m.deadLetter && !m.retiredAt
+    && Array.isArray(m.candidateIds) && m.candidateIds.map(String).includes(id)
+    && !(Array.isArray(m.deliveries) && m.deliveries.some((d) => String(d?.recipientId || d?.id) === id
+      && d?.state && d.state !== 'pending'));
+  const pendingNotesFor = (id) => messages.filter((m) => notePendingFor(m, id)).length;
+  const directoryRows = (Array.isArray(data?.directory) ? data.directory : [])
+    .filter((e) => e && e.id && now - Number(e.lastSeen || 0) < directoryFreshMs);
+  // Shown ids must be valid message targets: grow each prefix (floor 8) until
+  // it names ONE session across the directory and the live lane — two UUIDv7
+  // threads opened in the same minute share far more than 8 characters.
+  const allIds = [...new Set([...directoryRows.map((e) => String(e.id)), ...liveRows.map((row) => row.rawId)])];
+  const uniquePrefix = (id) => {
+    const lower = id.toLowerCase();
+    let width = Math.min(8, id.length);
+    while (width < id.length && allIds.some((other) => other !== id
+      && other.toLowerCase().startsWith(lower.slice(0, width)))) width++;
+    return id.slice(0, width);
+  };
+  const known = directoryRows
+    .filter((e) => !liveKeys.has(String(e.id).toLowerCase()))
+    .sort((a, b) => Number(b.lastSeen || 0) - Number(a.lastSeen || 0))
+    .map((e) => ({
+      id: String(e.id),
+      shortId: uniquePrefix(String(e.id)),
+      client: e.client || 'unknown',
+      intent: String(e.intent || '').slice(0, 80),
+      branch: e.branch || null,
+      lastSeenMin: Math.round((now - Number(e.lastSeen || 0)) / 60000),
+      endedAt: Number(e.endedAt || 0) || null,
+      waitingNotes: pendingNotesFor(String(e.id)),
+      resumeCommand: typeof presenceLib?.resumeCommandFor === 'function' ? presenceLib.resumeCommandFor(e.client, e.id) : '',
+    }));
+  // A note counts as "waiting for a session not on the lane" only while THIS
+  // note is still pending for its target AND that target is not live now (a
+  // live target gets it at its next action — that is ordinary delivery).
+  const waitingOffline = messages
+    .filter((m) => m && m.offline
+      && Array.isArray(m.candidateIds) && m.candidateIds.length === 1
+      && notePendingFor(m, String(m.candidateIds[0]))
+      && !liveKeys.has(String(m.candidateIds[0]).toLowerCase()))
+    .map((m) => ({
+      id: String(m.id),
+      from: String(m.from || '').slice(0, 8),
+      to: uniquePrefix(String(m.candidateIds[0])),
+      client: m.offline?.target?.client || 'unknown',
+      ageMin: Math.round((now - Number(m.ts || 0)) / 60000),
+    }));
   return {
     file,
     live,
+    known,
+    knownCount: known.length,
+    waitingOffline,
     // `count` remains the user-facing active-session count. The additive
     // connectionCount/laneRowCount fields keep transport topology inspectable.
     count: logicalGroups.size,
@@ -533,6 +601,13 @@ export function inspect(opts = {}) {
       const points = historyLib.listBrainHistory(brainPath, { home });
       history = { available: true, count: points.length, newestAt: points[0]?.ts || null };
     } catch { history = { available: true, count: 0, newestAt: null }; }
+  }
+  // Judgment provenance (2026-09-29). Informational only: a brain with zero
+  // recorded verdicts is NEW, not drifted (same doctrine as history above).
+  let provenance = null;
+  if (hasBrain && provenanceLib && typeof provenanceLib.provenanceCounts === 'function') {
+    try { provenance = { available: true, ...provenanceLib.provenanceCounts(brainPath, { home }) }; }
+    catch { provenance = null; }
   }
   const tools = inspectTools(brainDir, PKG_ROOT);
   // ── CHECKOUT (release-state visibility, 2026-08-14 incident) ──────────────
@@ -714,7 +789,7 @@ export function inspect(opts = {}) {
 
   // `checkout` is additive (schema-stable): downstream renderers keep parsing
   // every existing field; it never feeds layers/verdict/actions by design.
-  return { verdict, layers, drifted, readinessWarnings, version, running, supervisors, autoUpdate, hooks, codexSmart, codexHooks, gitCapture, history, tools, peers, sessions: peers, receipts: peers.receipts, receiptSessionId, harness, npm, decayGuard, mergeEngine, checkout, project: { dir: projectDir, brainPath, hasBrain }, brainDir, actions };
+  return { verdict, layers, drifted, readinessWarnings, version, running, supervisors, autoUpdate, hooks, codexSmart, codexHooks, gitCapture, history, provenance, tools, peers, sessions: peers, receipts: peers.receipts, receiptSessionId, harness, npm, decayGuard, mergeEngine, checkout, project: { dir: projectDir, brainPath, hasBrain }, brainDir, actions };
 }
 
 // One-line drift summary (empty when clean) — for a footer / status line.
@@ -886,6 +961,17 @@ export function render(r, opts = {}) {
     const age = r.history.newestAt ? `${Math.max(0, Math.round((Date.now() - r.history.newestAt) / 60000))}m ago` : 'none yet';
     L.push(`${ok} ${c.bold}HISTORY${c.rst}  ${r.history.count} restore point(s) · newest ${age} ${c.dim}(npx klypix-mcp brain-history list)${c.rst}`);
   }
+  // Judgment provenance — say what confirm/dismiss verdicts this machine has
+  // recorded, by verdict and surface, because "the trail exists" is only
+  // believable with the counts on the table. Zero records = a new sidecar,
+  // never a warning.
+  if (r.provenance?.available) {
+    const j = r.provenance.judgments || { total: 0, byVerdict: {}, bySource: {} };
+    const rej = r.provenance.rejected || { total: 0 };
+    const since = j.firstTs ? ` · since ${new Date(j.firstTs).toISOString().slice(0, 10)}` : '';
+    const srcBits = Object.entries(j.bySource || {}).map(([source, n]) => `${source} ${n}`).join(' · ');
+    L.push(`${ok} ${c.bold}JUDGMENTS${c.rst} ${j.total} recorded (${j.byVerdict?.yes || 0} yes / ${j.byVerdict?.no || 0} no)${since} · rejected-prompt pool ${rej.total}${srcBits ? ` ${c.dim}(${srcBits})${c.rst}` : ''}`);
+  }
 
   // TOOLS
   L.push(`${ok} ${c.bold}TOOLS${c.rst}    ${r.tools.count} MCP verb(s)${r.tools.hash ? ` ${c.dim}[#${r.tools.hash}, ${r.tools.source}]${c.rst}` : ''}${r.tools.count ? `: ${c.dim}${r.tools.names.join(', ')}${c.rst}` : ''}`);
@@ -939,10 +1025,26 @@ export function render(r, opts = {}) {
         : (p.activeUnscoped
           ? ` ${c.yel}· active sync-silent (used KLYPIX without brain_sync scope)${c.rst}`
           : ` ${c.dim}· idle connection (no task activity to grade)${c.rst}`);
-      L.push(`        · ${p.client}:${p.id}${p.branch ? ' @' + p.branch : ''}${p.channels.length ? ` [${p.channels.join('+')}]` : ''}${p.intent ? ` “${p.intent.slice(0, 50)}”${intentAge}` : ''}${scopeState} ${c.dim}(${p.lastSeenMin}m ago)${c.rst}`);
+      L.push(`        · ${p.client}:${p.id}${p.branch ? ' @' + p.branch : ''}${p.channels.length ? ` [${p.channels.join('+')}]` : ''}${p.statusLabel ? ` · ${p.statusLabel}` : ''}${p.intent ? ` “${p.intent.slice(0, 50)}”${intentAge}` : ''}${scopeState} ${c.dim}(${p.lastSeenMin}m ago)${c.rst}`);
     }
     for (const g of (r.sessions.identityMergeGaps || [])) {
       L.push(`        ${c.yel}⚠ explicit logical identity ${g.logicalSessionId} remains split across ${g.ids.join(' + ')}${c.rst}`);
+    }
+  }
+  // MAILBOX: notes waiting for sessions that are not running, and the recent
+  // sessions the lane remembers (two weeks) — the doors a note can wait at.
+  {
+    const waiting = Array.isArray(r.sessions.waitingOffline) ? r.sessions.waitingOffline : [];
+    if (waiting.length) {
+      L.push(`        ${c.yel}📬 ${waiting.length} note(s) waiting for session(s) not on the lane: ${waiting.slice(0, 4)
+        .map((w) => `${w.to} ← ${w.from} (${w.ageMin}m ago)`).join(' · ')}${waiting.length > 4 ? ' · …' : ''}${c.rst}`);
+    }
+    const known = Array.isArray(r.sessions.known) ? r.sessions.known : [];
+    if (known.length) {
+      const age = (min) => (min >= 120 ? `${Math.round(min / 60)}h` : `${min}m`) + ' ago';
+      L.push(`        ${c.dim}· recent, not on the lane (${known.length} in the last 14d): ${known.slice(0, 5)
+        .map((k) => `${k.client}:${k.shortId || k.id.slice(0, 8)}${k.intent ? ` “${k.intent.slice(0, 40)}”` : ''} · ${age(k.lastSeenMin)}${k.endedAt ? ' · closed' : ''}${k.waitingNotes ? ` · ✉ ${k.waitingNotes} waiting` : ''}`)
+        .join(' · ')}${known.length > 5 ? ' · …' : ''}${c.rst}`);
     }
   }
 

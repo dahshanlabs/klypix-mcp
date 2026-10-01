@@ -83,6 +83,9 @@ const CODEX_GLOBAL_BODY = [
   'the task work genuinely ends.',
   'Read `.claude/brain-brief.md` only when `brain_sync` says context is insufficient or the task asks',
   'for broad history/status; otherwise use `brain_ask` for deeper targeted retrieval.',
+  'To reach another agent session on this project, call `brain_message` with its session id (from',
+  '`brain_sync` or `brain_doctor`); a session that has closed receives the note when it next starts.',
+  'Never ask the human to carry a message between agents — send it and say it was sent or queued.',
   'Capture durable decisions and milestones with `brain_note`. Never hand-edit `brain.klypix`.',
   'If the project has no `brain.klypix`, ignore this section.',
   CODEX_GLOBAL_END,
@@ -466,12 +469,16 @@ memory the whole team and every agent reads, not a private scratchpad only you c
 project decision live *only* in your host's memory or a scratch file — put it here so the next
 session/agent has it.
 
-**Working alongside other live sessions?** Send a one-time coordination note with the
-\`brain_message\` MCP tool ("merged the hook refactor — rebase before you commit"). Sessions with
-a KLYPIX presence adapter (Claude Code, Codex, and any MCP client) see it once through their
-lifecycle adapter or on the next \`brain_sync\` / KLYPIX tool call. Use
-\`brain_doctor\` for the all-host active-session count; saved/recent chats are history, not presence.
-Notes are ephemeral (24h), NOT brain cards — durable decisions still go through \`brain_note\`.
+**Working alongside other sessions?** Send a coordination note with the \`brain_message\` MCP
+tool ("merged the hook refactor — rebase before you commit"), addressed to a session id from
+\`brain_sync\` / \`brain_doctor\`, or to "all". A live session gets it on its next lifecycle event or
+KLYPIX tool call and it replays until that session records uptake with \`brain_message_receipt\`
+or moves on; a session that has CLOSED still receives a directed note the moment it next starts
+(kept up to 7 days). **Never make the human carry a message between agents:** if you would
+otherwise ask the human to relay or paste something to another agent session, send it with
+\`brain_message\` instead and tell the human it was sent or queued — hand them the text only if
+\`brain_message\` refuses. Notes are ephemeral, NOT brain cards — durable decisions still go
+through \`brain_note\`.
 
 **Don't** hand-edit \`brain.klypix\` (it's a packaged canvas — use the tools) or dump file contents into it; capture the *decision*, not the file.`;
 

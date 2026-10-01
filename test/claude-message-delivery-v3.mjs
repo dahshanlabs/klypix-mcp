@@ -253,23 +253,25 @@ try {
   writeLane(afterCorruptAudienceLane);
   fs.unlinkSync(MSG_OUTBOX_FILE);
 
-  // Targeted marker sends are accepted only when exactly one OTHER live row
-  // resolves. Missing ids, ambiguous branches, and the sender itself cannot
-  // enter or clear the outbox and never claim a post.
+  // Targeted marker sends are accepted only when exactly one OTHER row
+  // resolves — live, or (mailbox, 1.88.0) remembered by the directory. An id
+  // nobody has ever seen is 'target-unknown'; ambiguous branches and the
+  // sender itself stay 'target-not-unique'. None can enter or clear the
+  // outbox or claim a post.
   const ambiguousOne = 'ambiguous-peer-0004';
   const ambiguousTwo = 'ambiguous-peer-0005';
   upsertSession({ brainPath, home, now: now + 1, id: ambiguousOne, branch: 'shared-target', channel: 'lifecycle', event: 'SessionStart' });
   upsertSession({ brainPath, home, now: now + 1, id: ambiguousTwo, branch: 'shared-target', channel: 'lifecycle', event: 'SessionStart' });
-  for (const [id, target] of [
-    ['missing-target-message', 'not-a-live-peer'],
-    ['ambiguous-target-message', 'shared-target'],
-    ['self-target-message', sender],
+  for (const [id, target, reason] of [
+    ['missing-target-message', 'not-a-live-peer', 'target-unknown'],
+    ['ambiguous-target-message', 'shared-target', 'target-not-unique'],
+    ['self-target-message', sender, 'target-not-unique'],
   ]) {
     const result = postMessages([markerMessage(id, target)]);
     assert.equal(result.ok, false);
     assert.equal(result.posted, 0);
     assert.equal(result.durable, false);
-    assert.equal(result.reason, 'target-not-unique');
+    assert.equal(result.reason, reason);
     assert.equal(readMessage(id), undefined);
   }
   assert.equal(fs.existsSync(MSG_OUTBOX_FILE), false);

@@ -445,9 +445,16 @@ have to have declared their files for the overlap to be visible at all.
 
 ## Handoffs and messages
 
-`brain_message` leaves one-time coordination notes for other sessions. A supported KLYPIX action
-offers the note in model-visible context; the next independent supported action replays it and
-records an acknowledgement. That acknowledgement proves only that a later action followed the
+`brain_message` leaves one-time coordination notes for other sessions — live, idle, or recently
+closed. Address a session by id: a live session gets the note on its next action; a session
+KLYPIX has identified before that is **not on the lane now** (closed, or quiet) still receives a
+directed note the moment it next acts — a directed note is kept 7 days, and the sender is told it
+is *queued*, not delivered. That is what stops the human from being the courier between two
+agents: the standing rule every host receives is that a message it would otherwise ask the person
+to relay or paste is sent this way instead. Nothing here starts or wakes a session — the note
+waits until a person opens it. A supported
+KLYPIX action offers the note in model-visible context; the next independent supported action
+replays it and records an acknowledgement. That acknowledgement proves only that a later action followed the
 offer — never that a person read it or that an agent acted on it. The note keeps replaying until the
 receiving model calls `brain_message_receipt` with the exact message id and per-recipient offer
 token; only that token-bound action records `consumed`. Pending, offered, and acknowledged notes
@@ -636,7 +643,7 @@ The MCP verbs below are what agents call. These are what **you** call:
 | `brain_lens` | Machine-readable freshness, provenance, activity, timeline, orrery and unresolved views |
 | `brain_garden` | Maintenance pass — proposes first; consolidation cannot apply without an approval code the human generates. The separate `repair:"duplicate-partials"` pass is dry-run first and needs no code (it removes only exact repeats and archives nothing) |
 | `brain_doctor` | Self-diagnosis: version, core/enhanced host adapters, active sessions, tool count, projection drift |
-| `brain_message` | Session-to-session coordination notes with a fixed send-time audience and per-recipient pending / offer / acknowledgement / consumption / failure receipts (24h TTL, never written into the brain) |
+| `brain_message` | Session-to-session coordination notes — to a live session, or queued for one that is not running until it next starts — with a fixed send-time audience and per-recipient pending / offer / acknowledgement / consumption / failure receipts (a directed note is kept 7 days, a broadcast 24h; never written into the brain) |
 | `brain_message_receipt` | Explicitly record model-side consumption using the exact message id and per-recipient offer token; acknowledgement alone never consumes a note |
 | `brain_sync` | Context Gateway: task capsule, active-task peers, exact-file overlap, one-time alerts, timing, and optional result-manifest reconciliation |
 | `brain_connect` | Find and draw related-but-unlinked cards |

@@ -35,6 +35,7 @@ import {
   rotateEndedSessionIdentity,
   removeSession,
   sessionDeliveryReachability,
+  sessionStatusLabel,
   shortestUniqueSessionPrefix,
   switchMcpSessionIdentity,
   upsertSession,
@@ -67,6 +68,7 @@ export const KLYPIX_MCP_INSTRUCTIONS = [
   'A session that never calls brain_sync appears to every peer as a connection with no declared scope — sync early so concurrent sessions can coordinate with you.',
   'Use its active-task, message, and file-overlap report to coordinate concurrent work.',
   'A coordination note is not consumed merely because it was offered: after a later independent KLYPIX action acknowledges the offer, call brain_message_receipt with its exact message id and offer token only when you actually incorporated it into your work. If you do not, a further independent action auto-consumes the note without a receipt — which records activity, not uptake — so the sender is told it was auto-consumed rather than acted on. Sending an explicit receipt is what makes your uptake visible to them.',
+  'Never make the human carry a message between agents: if you would otherwise ask the human to relay or paste something to another agent session on this project — live, idle, or recently closed — send it with brain_message addressed to that session id instead, and tell the human it was sent or queued; a closed session receives a directed note the moment it next starts. Hand the human the text only if brain_message refuses.',
   'Call brain_sync again when your file scope materially changes, and with phase "complete" before your final response.',
   'When a task publishes a quantified or otherwise machine-checkable claim, include its validated result manifest in the completion sync; conflicting or incomparable peer results retain the task scope until reconciled.',
   'A session preparing a RELEASE of the project should declare it by adding releaseIntent {version, ref} to brain_sync: the first declarer takes an exclusive lease every peer sees, and a second declarer gets a hard conflict naming the holder.',
@@ -815,6 +817,10 @@ const publicSession = (session, now) => {
     ageMs: Math.max(0, now - Number(session?.lastSeen || now)),
     deliveryReachability: session?.deliveryReachability || sessionDeliveryReachability(session),
     transport,
+    // ADDITIVE (mailbox, 1.88.0): host activity — "working" / "idle 14m" — so a
+    // sender knows whether a note lands on the next action or the next prompt.
+    hostStatus: session?.hostStatus || null,
+    statusLabel: sessionStatusLabel(session, now),
   };
 };
 
@@ -904,6 +910,7 @@ export function formatTaskPresence(snapshot, now = Date.now()) {
     });
     const details = [
       peer.client,
+      peer.statusLabel || null,
       peer.deliveryReachability && peer.deliveryReachability !== 'connected'
         ? `delivery ${peer.deliveryReachability}` : null,
       peer.branch ? `branch ${peer.branch}` : null,

@@ -185,7 +185,34 @@ try {
   ok(side8 && side8.q.some((q) => /paraphrase nobody typed/.test(q)) && side8.q.some((q) => /audit the brain/.test(q)) && !side8.q.some((q) => /ok do them/.test(q)),
     'EN8: both the authored question and the intent are recorded; the acknowledgement is not');
 
+  // ── EN10 — the discard point forwards rejects to the provenance pool ─────
+  // (2026-09-29) A rejected text is still signal: recordEnrichment forwards
+  // each discard, WITH its refusal reason, to the privacy-screened rejected
+  // log — with zero call-site changes and the {recorded, rejected} contract
+  // untouched (EN7 above already pins the counts).
+  const { readRejected } = await import('../src/provenance.mjs');
+  const fwdBrain = path.join(path.dirname(brain), 'forward.klypix');
+  fs.writeFileSync(fwdBrain, 'fixture');
+  const fwdBody = 'the enrichment discard point forwards its rejects to the provenance sidecar now';
+  const r10 = recordEnrichment(fwdBrain, [
+    { body: fwdBody, question: 'ok do them' },
+    { body: fwdBody, question: '> npm run test ✔ 12 passed' },
+  ], { home });
+  ok(r10.recorded === 0 && r10.rejected === 2, 'EN10: the {recorded, rejected} contract is unchanged');
+  await new Promise((resolve) => setTimeout(resolve, 300));   // the forward is a lazy fire-and-forget import
+  const fwdPool = readRejected(fwdBrain, { home });
+  ok(fwdPool.some((e) => e.reason === 'low-content' && e.t === 'ok do them'),
+    'EN10: the acknowledgement reaches the rejected pool with its reason and text');
+  ok(fwdPool.some((e) => e.reason === 'console' && e.h && !e.t),
+    'EN10: the console class arrives hash-only (the privacy screen runs in the pool, not the caller)');
+
   // ── EN9 — the hook's `q:` marker suffix ─────────────────────────────────
+  // The hook runs main() (and process.exit(0)s) on import unless the hermetic
+  // opt-out is set FIRST — without it this suite silently truncated here and
+  // never reached its failures-based exit gate, so EN9/EN10 red output could
+  // not fail the chain (2026-09-29 review; the truncation predated this
+  // branch — master ended after EN8 with no summary line either).
+  process.env.KLYPIX_BRAIN_NO_MAIN = '1';
   const { splitMarkerSuffixes } = await import('../src/global-brain-hook.mjs');
   const parsed = splitMarkerSuffixes('Pan = dedicated hand tool in toolbar; Zoom = steppers in the status bar q: how do I move around the board and change magnification? closes: [[Canvas navigation]] ev: src/canvas/Toolbar.tsx');
   ok(parsed.body === 'Pan = dedicated hand tool in toolbar; Zoom = steppers in the status bar', 'EN9: the q: suffix never leaks into the card text');

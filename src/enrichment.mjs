@@ -120,17 +120,33 @@ export function enrichmentQuestionQuality(question) {
  * pruned — enrichment is a rolling quality window, not an archive, and unlike
  * the claims lane nothing downstream depends on any single entry existing.
  * Returns { recorded, rejected } — `rejected` counts texts the quality gate
- * refused (see enrichmentQuestionQuality); they are never written.
+ * refused (see enrichmentQuestionQuality); they never reach the enrichment
+ * sidecar or the embedder. Since 2026-09-29 each refusal is forwarded, with its
+ * reason, to the privacy-screened rejected-log in provenance.mjs (best-effort).
  */
 export function recordEnrichment(brainPath, items, { home = os.homedir(), now = Date.now() } = {}) {
   const list = [];
+  const discarded = [];
   let rejected = 0;
   for (const item of (Array.isArray(items) ? items : [])) {
     const key = enrichmentKeyFor(item?.body);
     if (key.length < 24) continue;
     const quality = enrichmentQuestionQuality(item?.question);
-    if (!quality.ok) { rejected++; continue; }
+    if (!quality.ok) { rejected++; discarded.push({ text: quality.text, reason: quality.reason }); continue; }
     list.push({ key, q: quality.text });
+  }
+  // A discard is still SIGNAL — the acknowledgement class is exactly the
+  // negative pool a judge study needs — so the text goes, WITH its refusal
+  // reason, to the bounded rejected-log sidecar (provenance.mjs applies the
+  // privacy screen: machine/console/pasted-doc classes store hash+length only).
+  // Lazy fire-and-forget import, never-throw: a stale deployment without
+  // provenance.mjs just skips, costing training data, never a capture.
+  if (discarded.length) {
+    try {
+      import('./provenance.mjs')
+        .then((prov) => { try { prov.recordRejectedEnrichment(brainPath, discarded, { home, now }); } catch { /* additive */ } })
+        .catch(() => { /* stale deployment — additive signal only */ });
+    } catch { /* dynamic import unavailable — additive signal only */ }
   }
   if (!list.length) return { recorded: 0, rejected };
   const file = enrichmentFileFor(brainPath, home);

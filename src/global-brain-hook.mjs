@@ -1028,6 +1028,134 @@ function deriveIntentFromPrompt(raw) {
     return text;
 }
 
+// ── Session directory + host status (mailbox, 1.88.0) ────────────────────────
+// PARITY with agent-presence.mjs pruneDirectory / rememberSession /
+// resolveDirectoryTarget / sessionStatusLabel / resumeCommandFor — duplicated
+// because this hook stays free of sibling imports. The directory is the lane's
+// two-week memory of every exactly-identified session (its resume id, client,
+// last intent, last scope, when it was last live): a `🧠 MSG [id]` to a session
+// that has CLOSED is queued for that id instead of refused, and a peer's row
+// can say "idle 14m" instead of nothing.
+const dirKey = (value) => String(value || '').trim().slice(0, 160);
+const dirAliases = (aliases, exclude = '') => [...new Set((Array.isArray(aliases) ? aliases : [])
+    .map(dirKey).filter(v => v && v !== dirKey(exclude)))].slice(-8);
+const dirFiles = (files) => [...new Set((Array.isArray(files) ? files : []).map(f => String(f || '').trim()).filter(Boolean))].slice(-20);
+function dirPrune(rows, now) {
+    return (Array.isArray(rows) ? rows : [])
+        .filter(row => row && dirKey(row.id) && now - Number(row.lastSeen || 0) < DIR_FRESH_MS)
+        .map(row => ({
+            id: dirKey(row.id),
+            client: String(row.client || 'unknown').slice(0, 40),
+            surface: row.surface ? String(row.surface).slice(0, 40) : null,
+            branch: row.branch ? String(row.branch).slice(0, 120) : null,
+            intent: String(row.intent || '').replace(/\s+/g, ' ').trim().slice(0, 120),
+            files: dirFiles(row.files).slice(-8),
+            cwd: row.cwd ? String(row.cwd).slice(0, 400) : null,
+            aliases: dirAliases(row.aliases, row.id),
+            firstSeen: Number(row.firstSeen) || Number(row.lastSeen) || now,
+            lastSeen: Number(row.lastSeen) || now,
+            endedAt: Number(row.endedAt) || null,
+            hostStatus: row.hostStatus ? String(row.hostStatus).slice(0, 16) : null,
+        }))
+        .sort((a, b) => Number(a.lastSeen) - Number(b.lastSeen))
+        .slice(-DIR_CAP);
+}
+function dirRemember(directory, row, now) {
+    const rows = dirPrune(directory, now);
+    const id = dirKey(row?.logicalSessionId || '');
+    if (!id) return rows;
+    const index = rows.findIndex(e => e.id === id);
+    const prev = index >= 0 ? rows[index] : null;
+    const scope = [...new Set([...dirFiles(row.files), ...dirFiles(row.observedFiles)])].slice(-8);
+    const intent = String(row.intent || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+    const entry = {
+        id,
+        client: String(row.client || prev?.client || 'unknown').slice(0, 40),
+        surface: row.surface ?? prev?.surface ?? null,
+        branch: row.branch ?? prev?.branch ?? null,
+        intent: intent || prev?.intent || '',
+        files: scope.length ? scope : (prev?.files || []),
+        cwd: row.cwd ? String(row.cwd).slice(0, 400) : (prev?.cwd || null),
+        aliases: dirAliases([...(prev?.aliases || []), ...dirAliases(row.aliases), dirKey(row.id)], id),
+        firstSeen: Number(prev?.firstSeen) || now,
+        lastSeen: now,
+        endedAt: null,   // a live touch means it is running again
+        hostStatus: row.hostStatus ? String(row.hostStatus).slice(0, 16) : (prev?.hostStatus || null),
+    };
+    if (index >= 0) rows[index] = entry; else rows.push(entry);
+    return rows.sort((a, b) => Number(a.lastSeen) - Number(b.lastSeen)).slice(-DIR_CAP);
+}
+// Exact id/alias, else a unique >=8-char prefix; branches deliberately NOT
+// accepted over two weeks of history. Ambiguity fails closed.
+function dirResolve(target, directory) {
+    const wanted = String(target || '').trim().toLowerCase();
+    const rows = Array.isArray(directory) ? directory : [];
+    if (!wanted) return { entry: null, ambiguous: false };
+    const keysOf = (e) => [e.id, ...(e.aliases || [])].map(v => String(v).toLowerCase());
+    const exact = rows.filter(e => keysOf(e).includes(wanted));
+    if (exact.length === 1) return { entry: exact[0], ambiguous: false };
+    if (exact.length > 1) return { entry: null, ambiguous: true };
+    if (wanted.length >= 8) {
+        const prefixed = rows.filter(e => keysOf(e).some(k => k.startsWith(wanted)));
+        if (prefixed.length === 1) return { entry: prefixed[0], ambiguous: false };
+        if (prefixed.length > 1) return { entry: null, ambiguous: true };
+    }
+    return { entry: null, ambiguous: false };
+}
+// "working" | "idle" | "idle 14m" | "" (unknown). A busy stamp is believed for
+// ten minutes only: an MCP-only host never stamps idle, and "working" all
+// afternoon would be a lie (PARITY: HOST_STATUS_BUSY_FRESH_MS).
+const statusLabelOf = (s, now) => {
+    const status = String(s?.hostStatus || '');
+    if (!status) return '';
+    const at = Number(s?.hostStatusAt || s?.lastSeen || now);
+    if (status === 'busy' && now - at < 10 * 60 * 1000) return 'working';
+    const min = Math.max(0, Math.round((now - at) / 60000));
+    return min <= 0 ? 'idle' : `idle ${min}m`;
+};
+// Lane text is same-user-writable and is rendered into a model's prompt: a
+// peer's intent must never be able to carry a live capture marker.
+const neutralMarkers = (s) => String(s || '').replace(/🧠(\s*)(BRAIN|MSG)/gi, '🧠·$2');
+// One outcome per posted note, built from the copy that was actually drained
+// into the lane (never from a fresh re-resolution): sent to whom and in what
+// state, or queued for a session that was away.
+function msgOutcome(m, live, now) {
+    if (m?.offline?.target) {
+        const t = m.offline.target;
+        return {
+            id: String(m.id), to: String(m.to || ''), status: 'queued-offline',
+            recipient: { id: String(t.id || ''), client: t.client || 'unknown', intent: String(t.intent || ''), lastSeen: Number(t.lastSeen || 0) || null, endedAt: Number(t.endedAt || 0) || null, resumeCommand: resumeCmdFor(t.client, t.id) },
+        };
+    }
+    const rows = (Array.isArray(m?.candidateIds) ? m.candidateIds : []).map(id => live.find(s => String(s.id) === String(id))).filter(Boolean);
+    return {
+        id: String(m.id), to: String(m.to || ''), status: 'sent',
+        recipients: rows.map(s => ({ id: String(s.id), client: s.client || 'unknown', intent: String(s.intent || '').slice(0, 80), statusLabel: statusLabelOf(s, now) })),
+    };
+}
+const resumeCmdFor = (client, id) => {
+    const key = String(client || '').toLowerCase(); const sid = dirKey(id);
+    // Shown to a model, maybe pasted by a human: identifier characters only.
+    if (!sid || !/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(sid)) return '';
+    if (key === 'claude-code' || key === 'claude') return `claude --resume ${sid}`;
+    if (key === 'codex') return `codex resume ${sid}`;
+    return '';
+};
+const clientWordOf = (client) => {
+    const key = String(client || '').toLowerCase();
+    if (key === 'claude-code' || key === 'claude') return 'Claude Code';
+    if (key === 'codex') return 'Codex';
+    return key ? key.replace(/(^|[-_ ])([a-z])/g, (_m, p, c) => `${p}${c.toUpperCase()}`) : 'Unknown';
+};
+const agoWord = (ms) => {
+    const m = Math.max(0, Math.round(Number(ms || 0) / 60000));
+    if (m < 1) return 'just now';
+    if (m < 60) return `${m}m ago`;
+    const h = Math.round(m / 60);
+    return h < 48 ? `${h}h ago` : `${Math.round(h / 24)}d ago`;
+};
+const readLaneMessages = () => { try { const d = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8')); return Array.isArray(d.messages) ? d.messages : []; } catch { return []; } };
+
 function touchSession(sid, patch = {}) {
     if (!sid) return { ok: false, reason: 'no-session-id' };
     try {
@@ -1085,7 +1213,7 @@ function touchSession(sid, patch = {}) {
                 || patch.files !== undefined
                 || patch.ships !== undefined
                 || patch.activity === true;
-            list.push({
+            const nextRow = {
                 ...prev,   // unknown/foreign keys (an MCP writer's, a future field) survive this touch
                 id: sid, pid: process.pid, project: path.basename(CWD),
                 client: 'claude-code', surface: prev.surface || 'claude-code',
@@ -1163,9 +1291,15 @@ function touchSession(sid, patch = {}) {
                 ...(recordsActivity
                     ? { activityAt: now, activityKind: patch.intent !== undefined ? 'UserPromptSubmit' : 'ObservedWork' }
                     : (prev.activityAt ? { activityAt: prev.activityAt, activityKind: prev.activityKind || null } : {})),
+                // Host status (mailbox): 'busy' on a prompt/tool event, 'idle' at
+                // Stop/SessionStart; a touch without one keeps the previous value.
+                ...(patch.hostStatus
+                    ? { hostStatus: String(patch.hostStatus).slice(0, 16), hostStatusAt: now }
+                    : (prev.hostStatus ? { hostStatus: prev.hostStatus, hostStatusAt: prev.hostStatusAt || null } : {})),
                 channels: Object.keys(channelSeen), channelSeen, channelOwners,
                 startedAt: prev.startedAt || now, lastSeen: now,
-            });
+            };
+            list.push(nextRow);
             fs.mkdirSync(SESSIONS_DIR, { recursive: true });
             // Preserve the messages lane — touchSession runs AFTER postMessages in a
             // capture, and dropping the field here would clobber a just-posted note.
@@ -1173,7 +1307,10 @@ function touchSession(sid, patch = {}) {
             // MCP-written rows on every heartbeat). Message eviction prefers
             // terminal notes (capMsgs) so an unconsumed note is never silently lost.
             const keptMsgs = maintainMsgs(data0.messages, now);
-            const lanePayload = JSON.stringify({ ...data0, sessions: list.slice(-40), messages: keptMsgs });
+            const lanePayload = JSON.stringify({
+                ...data0, sessions: list.slice(-40), messages: keptMsgs,
+                directory: dirRemember(data0.directory, nextRow, now),
+            });
             // Hostmap: host-pid → CURRENT session id, re-read by the MCP server on
             // every touch so its lane row follows /clear + resume id rotation. The
             // file is per-PROJECT (all host pids write it), so its read-modify-write
@@ -1300,6 +1437,16 @@ function peerFooter(sid) {
     const myBranch = me && me.branch;
     const ago = (ts) => { const m = Math.max(0, Math.round((now - (ts || now)) / 60000)); return m <= 0 ? 'just now' : `${m}m ago`; };
     const asOf = new Date(now).toISOString().slice(11, 16) + 'Z';
+    // Notes THIS session sent that a live peer has not been OFFERED yet (state
+    // pending — an offered note has already been printed into that peer's
+    // context) — "📨 your note waiting" tells the sender the door is still
+    // shut, so it never re-sends or asks the human to relay. Read-only.
+    let myOpenNotes = [];
+    try {
+        myOpenNotes = readLaneMessages().filter(m => m && m.from === sid && !m.deadLetter && !m.retiredAt && Array.isArray(m.candidateIds));
+    } catch { myOpenNotes = []; }
+    const noteWaitingFor = (p) => myOpenNotes.some(m => m.candidateIds.includes(String(p.id))
+        && msgDeliveryState(m, p.id) === 'pending');
     const lines = ['', `## ⚠️ Other live session(s) in this project — ${peers.length} total, as of ${asOf}${hiddenIdle ? ` (+${hiddenIdle} inactive not shown)` : ''} — coordinate (the brain is shared, NOT live-merged)`];
     const releaseLine = releaseLeaseFooterLine(list, now);
     if (releaseLine) lines.push(releaseLine);
@@ -1307,6 +1454,10 @@ function peerFooter(sid) {
         const bits = [];
         if (p.branch) bits.push(`branch \`${p.branch}\``);
         bits.push(`active ${ago(p.lastSeen)}`);
+        // "working" / "idle 14m": the difference between a peer that will see a
+        // note on its next action and one that reads it at its next prompt.
+        const status = statusLabelOf(p, now);
+        if (status) bits.push(status);
         if (p.intent) {
             // A heartbeat refreshes lastSeen while carrying the old intent — show the
             // intent's OWN age when it lags, so it can't read as "doing this right now".
@@ -1319,6 +1470,7 @@ function peerFooter(sid) {
         if (ships.length) bits.push(`🏁 shipped: ${ships.slice(-3).join('; ')}`);
         const pScope = scopeOf(p);
         if (pScope.length) bits.push(`✏️ ${pScope.slice(-4).join(', ')}${pScope.length > 4 ? ` (+${pScope.length - 4})` : ''}`);
+        if (noteWaitingFor(p)) bits.push('📨 your note waiting');
         const pObservedKeys = observedKeysOf(p);
         const shared = pScope.filter(f => myFiles.has(fileKey(f)));
         let warn = '';
@@ -1343,7 +1495,7 @@ function peerFooter(sid) {
     // v1.32.0 law: a truncated list must never render as a complete one. This
     // overflow line is unconditional — never subject to any budget.
     if (peers.length > 4) lines.push(`- …and ${peers.length - 4} more live session(s) not shown — \`npx klypix-mcp doctor\` or brain_sync lists all.`);
-    lines.push('Coordinate BEFORE touching shared files: reply with `🧠 MSG [<their id-prefix or branch>]: <text>` (or call `brain_message`). KLYPIX queues it for supported lifecycle/MCP actions and replays it until the offer is acknowledged; the receiver then either records uptake with `brain_message_receipt` or a further independent action auto-consumes it without one. Check the brain for durable decisions/ships.');
+    lines.push('Coordinate BEFORE touching shared files: reply with `🧠 MSG [<their id-prefix or branch>]: <text>` (or call `brain_message`). If you would otherwise ask the human to relay or paste something to another agent session, send it this way instead and say it was sent or queued: an idle peer reads it at its next prompt, and a session that has closed receives a directed note when it next starts. KLYPIX replays it until the receiver records uptake with `brain_message_receipt` or a further independent action auto-consumes it. Check the brain for durable decisions/ships.');
     return lines.join('\n');
 }
 
@@ -1361,6 +1513,11 @@ const MSG_FRESH_MS = 24 * 60 * 60 * 1000;
 const MSG_RECEIPT_FRESH_MS = 7 * 24 * 60 * 60 * 1000;
 const MSG_DELIVERY_VERSION = 3;
 const MSG_RECEIPT_CAP = 100;
+// Mailbox (1.88.0) — PARITY with agent-presence.mjs MESSAGE_OFFLINE_FRESH_MS /
+// DIRECTORY_FRESH_MS / DIRECTORY_CAP (duplicated: this hook stays import-free).
+const MSG_OFFLINE_FRESH_MS = 7 * 24 * 60 * 60 * 1000;
+const DIR_FRESH_MS = 14 * 24 * 60 * 60 * 1000;
+const DIR_CAP = 200;
 const MSG_OUTBOX_FILE = path.join(os.homedir(), '.claude', 'project-brain', 'pending', `${sha(normBrainPath(laneCanon(BRAIN)))}.messages`);
 const MSG_OUTBOX_LOCK = MSG_OUTBOX_FILE + '.lock';
 // Cap active work WITHOUT silently destroying undelivered notes (mirrors
@@ -1501,7 +1658,11 @@ function maintainMsgs(list, now = Date.now()) {
         if (!m) continue;
         const terminalAt = Number(m.deadLetter?.at || m.retiredAt || 0);
         if (terminalAt && now - terminalAt >= MSG_RECEIPT_FRESH_MS) continue;
-        if (!terminalAt && now - Number(m.ts || 0) >= MSG_FRESH_MS) m = terminalizeMsg(m, now, 'expired-before-consumption');
+        // A note queued for a session that was not running carries its own
+        // deadline (expiresAt); every other note keeps the 24h rule. PARITY:
+        // agent-presence.mjs pruneMessages.
+        const deadline = Number(m.expiresAt) > 0 ? Number(m.expiresAt) : Number(m.ts || 0) + MSG_FRESH_MS;
+        if (!terminalAt && now >= deadline) m = terminalizeMsg(m, now, 'expired-before-consumption');
         normalized.push(m);
     }
     return capMsgs(normalized, 30, now);
@@ -1578,19 +1739,36 @@ function snapshotMsgAudience(messages) {
     if (!laneRead.ok) return { ok: false, messages: [], reason: laneRead.reason };
     const now = Date.now();
     const live = pruneSessions(laneRead.data.sessions, now);
+    const directory = dirPrune(laneRead.data.directory, now);
     const snapped = [];
     for (const raw of messages) {
         const m = normalizeMsg(raw, now);
         if (!m) return { ok: false, messages: [], reason: 'invalid-message', failedMessageId: String(raw?.id || '') };
+        const target = String(m.to || '').trim().toLowerCase();
+        const broadcast = !target || target === 'all' || target === '*';
         if (!Array.isArray(m.candidateIds)) {
-            m.candidateIds = [...new Set(resolveMsgTargetIds(m, live)
+            const resolution = resolveMsgTarget(m, live);
+            m.candidateIds = [...new Set(resolution.ids
                 .filter(id => id && id !== m.from)
                 .map(id => String(id).slice(0, 160)))];
+            // Mailbox: a directed target that matched NO live row (not an
+            // ambiguous one, not the sender itself) may name exactly one session
+            // the directory remembers — queue the note for its next start.
+            const selfOnly = resolution.ids.length > 0 && resolution.ids.every(id => id === m.from);
+            if (!broadcast && m.candidateIds.length === 0 && !resolution.ambiguous && !selfOnly) {
+                const known = dirResolve(target, directory);
+                if (known.ambiguous) return { ok: false, messages: [], reason: 'target-not-unique', failedMessageId: String(m.id || '') };
+                if (!known.entry) return { ok: false, messages: [], reason: 'target-unknown', failedMessageId: String(m.id || '') };
+                if (known.entry.id === dirKey(m.from)) return { ok: false, messages: [], reason: 'target-not-unique', failedMessageId: String(m.id || '') };
+                m.candidateIds = [known.entry.id];
+                m.offline = {
+                    queuedAt: now,
+                    target: { id: known.entry.id, client: known.entry.client, intent: known.entry.intent, lastSeen: known.entry.lastSeen, endedAt: known.entry.endedAt || null },
+                };
+            }
         } else {
             m.candidateIds = [...new Set(m.candidateIds.map(msgRecipientKey).filter(id => id && id !== m.from))];
         }
-        const target = String(m.to || '').trim().toLowerCase();
-        const broadcast = !target || target === 'all' || target === '*';
         // Empty broadcasts are not durable handoffs. Fail before touching the
         // outbox so a solo marker cannot be reported queued/posted and cannot
         // be inherited by a session that starts later.
@@ -1598,7 +1776,7 @@ function snapshotMsgAudience(messages) {
             return { ok: false, messages: [], reason: 'no-live-recipients', failedMessageId: String(m.id || '') };
         }
         // Full id, prefix, alias, and branch targeting all fail closed unless
-        // they identify exactly one OTHER live logical session. In particular,
+        // they identify exactly one OTHER logical session. In particular,
         // targeting the sender is not a successful post with a zero audience.
         if (!broadcast && m.candidateIds.length !== 1) {
             return { ok: false, messages: [], reason: 'target-not-unique', failedMessageId: String(m.id || '') };
@@ -1607,6 +1785,10 @@ function snapshotMsgAudience(messages) {
         for (const recipientId of m.candidateIds) {
             if (!msgDeliveryRecord(m, recipientId)) m.deliveries.push({ recipientId, state: 'pending', attempts: 0 });
         }
+        // Every DIRECTED note keeps for a week — whether its session was away
+        // at send time or closes an hour later (PARITY: agent-presence.mjs
+        // MESSAGE_DIRECTED_FRESH_MS). Broadcasts keep the 24h rule.
+        if (!broadcast && !(Number(m.expiresAt) > 0)) m.expiresAt = now + MSG_OFFLINE_FRESH_MS;
         snapped.push(m);
     }
     return { ok: true, messages: snapped, reason: null };
@@ -1689,7 +1871,7 @@ function postMessages(msgs) {
         return [...byId.values()];
     });
     if (!staged.ok) return { ok: false, durable: false, posted: 0, pending: incoming.length, reason: staged.reason || staged.error || 'outbox-write-failed' };
-    if (!staged.rows.length) return { ok: true, durable: true, posted: 0, pending: 0 };
+    if (!staged.rows.length) return { ok: true, durable: true, posted: 0, pending: 0, outcomes: [] };
     const now = Date.now();
     const stagedMessages = [];
     for (const raw of staged.rows) {
@@ -1704,6 +1886,7 @@ function postMessages(msgs) {
     if (!got) return { ok: false, durable: true, posted: 0, pending: staged.rows.length, reason: 'lane-lock-timeout' };
     let posted = 0;
     let failed = 0;
+    let outcomes = [];
     const drainedIds = new Set();
     try {
         const laneRead = readSharedLaneChecked();
@@ -1713,6 +1896,13 @@ function postMessages(msgs) {
         }
         const data = laneRead.data;
         const sessions = Array.isArray(data.sessions) ? data.sessions : [];
+        // Sender receipts describe the copy that is DRAINED (the first-staged
+        // one wins a retry), for the notes handed in on this call only.
+        const incomingIds = new Set(incoming.map(m => String(m.id)));
+        const liveNow = pruneSessions(sessions, now);
+        outcomes = stagedMessages
+            .filter(m => incomingIds.has(String(m.id)) && !msgTerminal(m))
+            .map(m => msgOutcome(m, liveNow, now));
         const kept = maintainMsgs(data.messages, now);
         const existingIds = new Set(kept.map(m => String(m?.id || '')).filter(Boolean));
         for (const m of stagedMessages) {
@@ -1746,7 +1936,7 @@ function postMessages(msgs) {
     } finally { releaseLock(SESSIONS_LOCK); }
     const cleared = updateMsgOutbox((current) => current.filter(m => !drainedIds.has(String(m?.id || ''))));
     if (!cleared.ok) return { ok: false, durable: true, posted, pending: staged.rows.length, reason: cleared.reason || cleared.error || 'outbox-clear-failed' };
-    return { ok: true, durable: true, posted, failed, pending: cleared.rows.length };
+    return { ok: true, durable: true, posted, failed, pending: cleared.rows.length, outcomes };
 }
 // Full id, unique >=8-char id prefix, or exact unique branch. Intent/client/
 // surface substring matching is unsafe: a fuzzy target can consume a warning
@@ -1757,21 +1947,26 @@ const msgSessionIdentityKeys = (session) => [...new Set([
     msgRecipientKey(session?.logicalSessionId),
     ...(Array.isArray(session?.aliases) ? session.aliases.map(msgRecipientKey) : []),
 ].filter(Boolean).map(value => value.toLowerCase()))];
-function resolveMsgTargetIds(m, sessions) {
+// `ambiguous` distinguishes "nobody matched" from "several matched": only the
+// former may fall through to the directory (PARITY: agent-presence.mjs
+// resolveMessageTarget).
+function resolveMsgTarget(m, sessions) {
     const rows = Array.isArray(sessions) ? sessions.filter(row => row?.id) : [];
     const to = String(m?.to || '').trim().toLowerCase();
-    if (!to || to === 'all' || to === '*') return rows.map(row => String(row.id));
+    if (!to || to === 'all' || to === '*') return { ids: rows.map(row => String(row.id)), ambiguous: false };
     const exact = rows.filter(row => msgSessionIdentityKeys(row).includes(to));
-    if (exact.length === 1) return [String(exact[0].id)];
-    if (exact.length > 1) return [];
+    if (exact.length === 1) return { ids: [String(exact[0].id)], ambiguous: false };
+    if (exact.length > 1) return { ids: [], ambiguous: true };
     if (to.length >= 8) {
         const prefixed = rows.filter(row => msgSessionIdentityKeys(row).some(key => key.startsWith(to)));
-        if (prefixed.length === 1) return [String(prefixed[0].id)];
-        if (prefixed.length > 1) return [];
+        if (prefixed.length === 1) return { ids: [String(prefixed[0].id)], ambiguous: false };
+        if (prefixed.length > 1) return { ids: [], ambiguous: true };
     }
     const branches = rows.filter(row => String(row?.branch || '').trim().toLowerCase() === to);
-    return branches.length === 1 ? [String(branches[0].id)] : [];
+    if (branches.length === 1) return { ids: [String(branches[0].id)], ambiguous: false };
+    return { ids: [], ambiguous: branches.length > 1 };
 }
+function resolveMsgTargetIds(m, sessions) { return resolveMsgTarget(m, sessions).ids; }
 function msgTargetsMe(m, me, sid, sessions = []) {
     // candidateIds is the send-time audience snapshot for every v3 writer. It
     // is authoritative: a chat that starts later must not receive an old
@@ -1964,7 +2159,10 @@ function messageFooter(sid, tp, lib, actionId = messageActionId(readHookInput(),
         const senders = [...new Set(group.map(item => String(item.from || '?').slice(0, 8)))];
         const senderLabel = senders.length <= 3 ? senders.join(', ') : `${senders.slice(0, 3).join(', ')} +${senders.length - 3}`;
         const oldestTs = Math.min(...group.map(item => Number(item.ts) || now));
-        out.push(`- from ${senderLabel} · ${ago(oldestTs)}: ${neutral(String(m.text)).replace(/\s+/g, ' ').trim().slice(0, 400)}`);
+        // A note that waited for this session while it was not running says so:
+        // the sender's state THEN, not a live ping.
+        const waited = group.some(item => item?.offline) ? ' · left while this session was not running' : '';
+        out.push(`- from ${senderLabel} · ${ago(oldestTs)}${waited}: ${neutral(String(m.text)).replace(/\s+/g, ' ').trim().slice(0, 400)}`);
         const receipts = group.map(item => {
             const record = msgDeliveryRecord(item, sid);
             return record?.offerToken ? { messageId: String(item.id), offerToken: String(record.offerToken) } : null;
@@ -2427,7 +2625,7 @@ function observeFileScope(input, sid) {
         // files[], which the pre-check above just cleared) → automatic scope
         // ADOPTION: the row gains the path as an OBSERVED file, distinct from a
         // declaration, while still joining files[] for pre-1.70 readers.
-        touchSession(sid, { addFiles: [rel], addObservedFiles: [rel] });
+        touchSession(sid, { addFiles: [rel], addObservedFiles: [rel], hostStatus: 'busy' });
     } catch { /* observation is best-effort */ }
 }
 
@@ -2743,13 +2941,19 @@ function draftRulesFromFixes(lib, cards, verified, sid) {
                 candidates.push({ area: c.area || '', text: seed, source: c.createdVia || 'marker' });
             }
         }
-        if (!candidates.length && !skillCards.length) return { drafted: 0, approved: 0 };
+        if (!candidates.length && !skillCards.length) return { drafted: 0, approved: 0, approvedDrafts: [] };
         let added = 0, approved = 0;
+        const approvedDrafts = [];   // which draft each skill retired — the shown-then-promoted provenance signal
         persistDrafts((drafts, now) => {
             if (skillCards.length) {   // approval: a captured 🛠️ skill retires the draft it fulfils
-                const before = drafts.length;
-                drafts = drafts.filter(d => !skillCards.some(sc => draftMatches(d, String(sc.text || ''))));
-                approved = before - drafts.length;
+                const kept = [];
+                for (const d of drafts) {
+                    const sc = skillCards.find(sc => draftMatches(d, String(sc.text || '')));
+                    if (sc) approvedDrafts.push({ area: d.area || '', text: String(d.text || ''), skillText: String(sc.text || '') });
+                    else kept.push(d);
+                }
+                approved = drafts.length - kept.length;
+                drafts = kept;
             }
             const handled = new Set();
             for (const cand of candidates) {
@@ -2764,8 +2968,8 @@ function draftRulesFromFixes(lib, cards, verified, sid) {
             }
             return drafts;
         });
-        return { drafted: added, approved };
-    } catch { return { drafted: 0, approved: 0 }; }
+        return { drafted: added, approved, approvedDrafts };
+    } catch { return { drafted: 0, approved: 0, approvedDrafts: [] }; }
 }
 // Pending drafts: TTL-fresh, not already covered by a live 🛠️ skill, and NOT decayed
 // (a draft surfaced-and-ignored across ≥ RULE_DRAFT_MAX_SURFACINGS distinct sessions
@@ -3007,7 +3211,7 @@ function recordCaptureReceipts(sid, items) {
             for (const it of items) {
                 if (!it || !it.key || !it.line || have.has(it.key)) continue;
                 have.add(it.key);
-                list.push({ key: it.key, sid: String(sid), ts: now, line: String(it.line).slice(0, 700), shown: false, ...receiptHost() });
+                list.push({ key: it.key, sid: String(sid), ts: now, line: String(it.line).slice(0, 700), shown: false, ...(it.kind ? { kind: String(it.kind).slice(0, 16) } : {}), ...receiptHost() });
             }
             return list;
         });
@@ -3081,19 +3285,30 @@ function captureReceiptsFooter(sid) {
             return list;
         });
         if (res !== 'written' || !display.length) return '';
-        const adopted = display.filter(r => r.adoptedFrom);
-        const from = [...new Set(adopted.map(r => r.adoptedWhy || 'idle'))].map(why => why === 'predecessor'
-            ? 'the conversation this one replaced in this terminal (/clear or /resume)'
-            : why === 'ended' ? 'a session that is no longer running'
-                : 'a session with no activity for 30+ minutes (it may have ended)');
-        const lines = ['', '---',
-            adopted.length === 0 ? '## ⚠️ Brain capture — what your last 🧠 BRAIN markers actually did'
-                : adopted.length === display.length ? '## ⚠️ Brain capture — markers from an earlier session that did not do what they said'
-                : '## ⚠️ Brain capture — markers that did not do what they said',
-            adopted.length === 0
-                ? 'The Stop hook captured these, but not the way the marker reads. If it matters, re-emit a corrected marker; nothing else is needed.'
-                : `The Stop hook captured these, but not the way the marker reads. Lines marked (earlier session) came from ${from.join(' or ')}: check the card before acting, and re-emit a corrected marker only when you know what it meant — never a closes: you cannot verify.`];
-        for (const r of display) lines.push(`- ${r.adoptedFrom ? '(earlier session) ' : ''}${r.line}`);
+        // Message receipts (mailbox) get their own block: "your note was sent /
+        // queued / refused" is not a capture correction.
+        const noteRows = display.filter(r => r.kind === 'message');
+        const cardRows = display.filter(r => r.kind !== 'message');
+        const lines = [];
+        if (cardRows.length) {
+            const adopted = cardRows.filter(r => r.adoptedFrom);
+            const from = [...new Set(adopted.map(r => r.adoptedWhy || 'idle'))].map(why => why === 'predecessor'
+                ? 'the conversation this one replaced in this terminal (/clear or /resume)'
+                : why === 'ended' ? 'a session that is no longer running'
+                    : 'a session with no activity for 30+ minutes (it may have ended)');
+            lines.push('', '---',
+                adopted.length === 0 ? '## ⚠️ Brain capture — what your last 🧠 BRAIN markers actually did'
+                    : adopted.length === cardRows.length ? '## ⚠️ Brain capture — markers from an earlier session that did not do what they said'
+                    : '## ⚠️ Brain capture — markers that did not do what they said',
+                adopted.length === 0
+                    ? 'The Stop hook captured these, but not the way the marker reads. If it matters, re-emit a corrected marker; nothing else is needed.'
+                    : `The Stop hook captured these, but not the way the marker reads. Lines marked (earlier session) came from ${from.join(' or ')}: check the card before acting, and re-emit a corrected marker only when you know what it meant — never a closes: you cannot verify.`);
+            for (const r of cardRows) lines.push(`- ${r.adoptedFrom ? '(earlier session) ' : ''}${r.line}`);
+        }
+        if (noteRows.length) {
+            lines.push('', '---', '## 📨 Your notes to other sessions — what happened at your last turn');
+            for (const r of noteRows) lines.push(`- ${r.adoptedFrom ? '(earlier session) ' : ''}${r.line}`);
+        }
         if (remaining > 0) lines.push(`- …and ${remaining} more, shown on the next prompt.`);
         return '\n' + lines.join('\n') + '\n';
     } catch { return ''; }
@@ -3131,8 +3346,9 @@ async function receiptFooter(sid) {
 async function capture(lib) {
     const input = readHookInput();
     // Keep this session's coordination lane warm at every Stop (a turn ended; the
-    // session lives on between turns). Files/ships are set after the transcript scan.
-    touchSession(input.session_id, { branch: gitBranch() });
+    // session lives on between turns — IDLE until the next prompt). Files/ships
+    // are set after the transcript scan.
+    touchSession(input.session_id, { branch: gitBranch(), hostStatus: 'idle' });
     const tp = input.transcript_path || '';
     if (!tp || !fs.existsSync(tp)) return;
     let transcriptBuffer, lines;
@@ -3510,7 +3726,7 @@ async function capture(lib) {
     }
     const messagePost = postMessages(messages);   // durable outbox → shared lane
     const terminalAudienceFailure = new Set([
-        'no-live-recipients', 'target-not-unique', 'self-target',
+        'no-live-recipients', 'target-not-unique', 'target-unknown', 'self-target',
         'outbox-corrupt:empty-audience', 'outbox-corrupt:target-not-unique', 'outbox-corrupt:self-audience',
     ]).has(String(messagePost?.reason || ''));
     const handledMessageIds = messagePost?.ok
@@ -3521,6 +3737,43 @@ async function capture(lib) {
         persistHandledMessageKeys(handledKeys);
         for (const key of handledKeys) seen.add(key);
     }
+    // Sender-side visibility (mailbox, 1.88.0): a successful send printed
+    // NOTHING at Stop, so the model's "sent" was a guess and a refused note was
+    // invisible to it (exit-0 stderr never reaches the model). Record one
+    // receipt per note from THIS turn; the next prompt prints them.
+    try {
+        const items = [];
+        const thisTurn = new Set(messages.map(m => String(m.id)));
+        if (messagePost?.ok && Array.isArray(messagePost.outcomes)) {
+            for (const o of messagePost.outcomes) {
+                if (!thisTurn.has(String(o.id))) continue;
+                const to = o.to || 'all';
+                if (o.status === 'queued-offline' && o.recipient) {
+                    const r = o.recipient;
+                    const quiet = r.lastSeen ? agoWord(Date.now() - r.lastSeen).replace(/ ago$/, '') : '';
+                    // Ten minutes of silence means closed OR idle with no KLYPIX
+                    // heartbeat; only a SessionEnd proves "closed".
+                    const state = r.endedAt ? 'closed' : (quiet ? `not seen for ${quiet} (closed, or idle with no KLYPIX heartbeat)` : 'not running');
+                    const reopen = r.resumeCommand ? ` If it was closed, the human can reopen it with \`${r.resumeCommand}\`.` : '';
+                    items.push({ key: `message:${o.id}`, kind: 'message', line: neutralMarkers(`📬 Your note to ${to} is QUEUED — ${clientWordOf(r.client)} ${String(r.id).slice(0, 8)}${r.intent ? ` ("${String(r.intent).slice(0, 60)}")` : ''} is ${state}; it is delivered the moment that session next acts (kept 7d). Say "queued", not "delivered".${reopen}`) });
+                } else if (o.status === 'sent') {
+                    const who = (o.recipients || []).map(r => `${clientWordOf(r.client)} ${String(r.id).slice(0, 8)}${r.statusLabel ? ` (${r.statusLabel})` : ''}`).join(', ') || to;
+                    items.push({ key: `message:${o.id}`, kind: 'message', line: neutralMarkers(`📨 Your note to ${to} was sent — ${who} sees it at its next KLYPIX tool call or prompt; no relay by the human is needed.`) });
+                }
+            }
+        } else if (messages.length && terminalAudienceFailure) {
+            const why = messagePost?.reason === 'target-unknown'
+                ? 'no live session matches that target and it is not a session id the lane remembers — use an id from the peer list'
+                : messagePost?.reason === 'no-live-recipients'
+                    ? 'no other session is live, so a broadcast has nobody to reach — address one session by id'
+                    : 'the target did not identify exactly one other session — use its full id or a unique prefix of at least 8 characters';
+            for (const id of (messagePost?.failedMessageIds || [])) {
+                const m = messages.find(x => String(x.id) === String(id));
+                if (m) items.push({ key: `message:${id}`, kind: 'message', line: `📨 Your note to ${m.to || 'all'} was NOT sent: ${why}. Re-emit the marker with a valid target.` });
+            }
+        }
+        if (items.length) recordCaptureReceipts(input.session_id, items);
+    } catch { /* receipts are best-effort; the note itself is already handled above */ }
     if (messages.length && !messagePost?.ok) {
         const state = terminalAudienceFailure
             ? `${handledKeys.length} terminal audience failure(s) marked handled; only other/new markers remain retryable`
@@ -3600,7 +3853,7 @@ async function capture(lib) {
     // match Codex/brain_sync paths in either overlap detector.
     {
         const laneFiles = recentPaths.slice(-20);
-        touchSession(input.session_id, { branch: gitBranch(), ...(laneFiles.length ? { addFiles: laneFiles } : {}), ...(shipSummaries.length ? { ships: shipSummaries } : {}) });
+        touchSession(input.session_id, { branch: gitBranch(), hostStatus: 'idle', ...(laneFiles.length ? { addFiles: laneFiles } : {}), ...(shipSummaries.length ? { ships: shipSummaries } : {}) });
     }
     // Commit-body auto-capture: rationale-bearing feat/fix/perf commits since
     // the last run (independent of markers), pushed into the SAME capture batch.
@@ -3642,7 +3895,38 @@ async function capture(lib) {
     {
         const hadFixCommit = commitCards.some(cc => cc.createdVia === 'commit' && !/🏁/.test(String(cc.text || '')));
         const verified = sessionVerified(shellCmds, errorIds, hadFixCommit);
-        draftRulesFromFixes(lib, cards, verified, sid);
+        const draftRes = draftRulesFromFixes(lib, cards, verified, sid);
+        // Draft-rule provenance (2026-09-29): the shown-then-promoted (and
+        // shown-then-ignored) loop is the one DETERMINISTIC yes/no signal the
+        // hook owns — record both verdicts in the sidecar. Best-effort and
+        // skew-safe: a bundle without provenance.mjs just skips. Repeat
+        // observations of the same decayed draft dedup into count++ (jid).
+        try {
+            const judgments = [];
+            for (const a of (draftRes.approvedDrafts || [])) {
+                judgments.push({
+                    kind: 'rule', direction: 'rule-covers', verdict: 'yes', source: 'draft-promotion',
+                    actor: 'agent', session: sid, from: { text: a.text }, to: { text: a.skillText },
+                });
+            }
+            // A draft surfaced across RULE_DRAFT_MAX_SURFACINGS distinct
+            // sessions and still unpromoted has EARNED its silence — that "no"
+            // is a verdict too (the decay itself only stops the nagging).
+            const nowTs = Date.now();
+            for (const d of readRuleDrafts()) {
+                if (!d || !d.id || !d.text) continue;
+                if ((nowTs - (d.lastSeen || d.firstSeen || 0)) >= RULE_DRAFT_TTL_MS) continue;
+                if ((Array.isArray(d.shownSessions) ? d.shownSessions.length : 0) < RULE_DRAFT_MAX_SURFACINGS) continue;
+                judgments.push({
+                    kind: 'rule', direction: 'silence', verdict: 'no', source: 'draft-decay',
+                    actor: 'agent', session: sid, from: { text: String(d.text || '') },
+                });
+            }
+            if (judgments.length) {
+                const prov = await import(new URL('./provenance.mjs', import.meta.url).href);
+                prov.recordJudgments(BRAIN, judgments);
+            }
+        } catch { /* stale deployment or unwritable sidecar — additive signal only */ }
         // Cross-lane FINDING routing rides the SAME verify gate: a finding this
         // session verified about a file outside its own scope is drafted and
         // routed to whoever declared that file. Nothing is sent. `recentPaths`
@@ -3888,7 +4172,13 @@ async function capture(lib) {
         if (drainedLanded) clearDrained();
         reportBatch();
         try { await refreshAgentsBrief(lib, out); } catch { /* AGENTS.md refresh is best-effort */ }
-        return { ...res.stats, batchScope: scope, ...(batchError ? { batchError: String(batchError.message || batchError).slice(0, 160) } : {}), ...(quarantined.length ? { quarantined } : {}) };
+        // ownCounts marks the OWN/DRAINED boundary for the judgment writer
+        // below: drained batches are APPENDED to the shared cards/resolutions
+        // arrays (and land at the same tail indices), so "index < own length"
+        // is exactly "this session's marker". Without it, scope 'all' stamped
+        // THIS session's prompt hash and actor grade onto verdicts whose
+        // markers came from ANOTHER session's queued batch (2026-09-29 review).
+        return { ...res.stats, batchScope: scope, ownCounts: { cards: ownCards.length, resolutions: ownResolutions.length }, ...(batchError ? { batchError: String(batchError.message || batchError).slice(0, 160) } : {}), ...(quarantined.length ? { quarantined } : {}) };
     };
     // Canonical cross-process lock (heartbeat + token-checked release, shared
     // with the MCP engine and the desktop app). Stale bundles missing the module
@@ -3941,6 +4231,82 @@ async function capture(lib) {
             else if (outcome === 'partial') d.action = 'resolve-partial';
             else if (outcome === 'fallback-milestone') d.action = 'resolve-unmatched';
         }
+    }
+    // Marker-verdict provenance (2026-09-29): what this Stop's markers ACTUALLY
+    // retired — closes: fulfillments (stats.closedCards), archived ✓ resolves
+    // (per-outcome cardIds), and the hint edges a full resolve settled — goes
+    // to the machine-local provenance sidecar with an honest actor grade: a
+    // terminal marker is agent-emittable, so the strongest attainable class is
+    // 'agent-human-adjacent' (a machine-turn-guarded human prompt sat above
+    // it), never 'human'. The prompt itself rides as a hash only.
+    //
+    // ATTRIBUTION BOUNDARY (2026-09-29 review): scope 'all' — the NORMAL
+    // success path — means the landed arrays are this session's markers (the
+    // prefix) PLUS queued batches from EARLIER sessions appended by the drain.
+    // This session's prompt hash, session id and human-adjacency grade may
+    // only ever stamp the own prefix; a drained batch's verdict is recorded
+    // with the honest bare 'agent' grade and NO session/prompt — its human,
+    // if one existed, sat above a different transcript this hook never saw.
+    // Scope 'drained' (own half failed entirely) is skipped outright, as
+    // before. Best-effort + skew-safe.
+    if (stats.batchScope !== 'drained') {
+        try {
+            const ownCardCount = stats.ownCounts ? stats.ownCounts.cards : cards.length;
+            const ownResolutionCount = stats.ownCounts ? stats.ownCounts.resolutions : resolutions.length;
+            const hasDrained = cards.length > ownCardCount || resolutions.length > ownResolutionCount;
+            const ownStamp = { actor: lastUserPrompt ? 'agent-human-adjacent' : 'agent', humanPromptText: lastUserPrompt, session: sid };
+            const drainedStamp = { actor: 'agent' };   // another session's marker: agent-asserted, nothing stronger provable
+            const judgments = [];
+            for (const cc of (stats.closedCards || [])) {
+                // The closing card is the captured card whose closes: named this
+                // target (stats.closedCards carries the closed card, not the
+                // closer). findIndex against the shared array places the closer
+                // on the own/drained side of the boundary; an own closer with
+                // the same closes text as a drained one wins the prefix scan,
+                // which is correct — this session really did carry the marker.
+                const closerIdx = cards.findIndex(c => c && c.closes && String(c.closes).trim().slice(0, 80) === cc.target);
+                if (closerIdx === -1) continue;   // unidentifiable closer (engine skew) — never guess attribution
+                judgments.push({
+                    kind: 'pair', direction: 'closes', verdict: 'yes', source: 'marker-closes',
+                    ...(closerIdx < ownCardCount ? ownStamp : drainedStamp),
+                    from: { id: cc.id, text: cc.title || '' },
+                    to: { text: cards[closerIdx].text },
+                });
+            }
+            const seenResolved = new Set();
+            for (const o of (stats.resolutionOutcomes || [])) {
+                if (o.outcome !== 'archived') continue;
+                const cardId = o.cardId || o.id;
+                if (!cardId || seenResolved.has(cardId)) continue;
+                seenResolved.add(cardId);
+                const r = resolutions[o.i] || {};
+                judgments.push({
+                    kind: 'pair', direction: 'closes', verdict: 'yes', source: 'marker-resolve',
+                    ...(o.i < ownResolutionCount ? ownStamp : drainedStamp),
+                    from: { id: cardId },
+                    to: { text: r.text || '' },
+                });
+            }
+            for (const s of (stats.settledHints || [])) {
+                if (s.via !== 'resolve') continue;   // a byId settle is the reconcile-confirm's record, not the hook's
+                // `ri` joins the settle to the resolution that caused it (the
+                // engine mirrors resolutionOutcomes' indexing). Without the
+                // join — a stale engine bundle — a merged capture cannot place
+                // the settle on either side of the boundary, so it is skipped
+                // rather than guessed.
+                if (!Number.isInteger(s.ri) && hasDrained) continue;
+                judgments.push({
+                    kind: 'pair', direction: 'closes', verdict: 'yes', source: 'hint-settle',
+                    ...((Number.isInteger(s.ri) ? s.ri < ownResolutionCount : true) ? ownStamp : drainedStamp),
+                    from: { id: s.fromId, text: s.fromText || '' },
+                    to: { id: s.toId, text: s.toText || '' },
+                });
+            }
+            if (judgments.length) {
+                const prov = await import(new URL('./provenance.mjs', import.meta.url).href);
+                prov.recordJudgments(BRAIN, judgments);
+            }
+        } catch { /* stale deployment or unwritable sidecar — additive signal only */ }
     }
     // Same honesty for ~: a thin update was APPENDED to its card, not a
     // replacement, and one the card already says changed nothing — a ledger
@@ -4128,6 +4494,31 @@ async function cachedStruct(lib) {
 // SessionStart already paid for. typeof-guarded: an older engine falls back
 // to the uncached pure function, then to null (renderers compute their own).
 const STATUS_CACHE = CACHE.replace(/\.json$/, '.status.json');
+// ── Unified-lane index cache (1.87) ──────────────────────────────────────────
+// rankHookWords / rankHookFused each build a per-struct index that the engine
+// caches in a WeakMap — useless to THIS one-shot process, which would rebuild
+// both on every prompt (measured on the 2,984-card brain: ~250-300ms of a
+// ~740ms end-to-end prompt; ~470ms with this cache — machine-dependent, the
+// review probe saw ~1s of builds). So the built indexes are persisted next to
+// the struct cache,
+// keyed on the brain file's mtimeMs AND size, and re-seeded into the engine's
+// WeakMaps before ranking. Behaviour-neutral: the doc holds only derived
+// stats re-linked to live cards by id, and ANY problem (stale key, unknown
+// id, parse error, version-skewed engine) falls back to an in-memory rebuild.
+// Named .brief-cache-…hookix.json so pruneCacheDir covers it too.
+const HOOK_IX_CACHE = CACHE.replace(/\.json$/, '.hookix.json');
+function seedHookIndexes(lib, struct) {
+    if (typeof lib.seedHookIndexCache !== 'function' || typeof lib.hookIndexCacheDoc !== 'function') return;
+    let st = null; try { st = fs.statSync(BRAIN); } catch { return; }
+    try {
+        const doc = JSON.parse(fs.readFileSync(HOOK_IX_CACHE, 'utf8'));
+        if (doc && doc.mtimeMs === st.mtimeMs && doc.size === st.size && lib.seedHookIndexCache(struct, doc)) return;
+    } catch { /* miss/corrupt → rebuild below */ }
+    try {
+        const doc = lib.hookIndexCacheDoc(struct);   // builds both indexes once, warming the WeakMaps
+        fs.writeFileSync(HOOK_IX_CACHE, JSON.stringify({ mtimeMs: st.mtimeMs, size: st.size, ...doc }));
+    } catch { /* cache is best-effort — the rankers rebuild in memory */ }
+}
 function cachedOpenStatusSummary(lib, struct, opts = {}) {
     if (!struct) return null;
     try {
@@ -4396,8 +4787,9 @@ async function promptRetrieve(lib) {
             branch,
             humanPrompt: true,
             transcriptBytes: transcriptSizeBytes(input.transcript_path),
+            hostStatus: 'busy',
         }
-        : { activity: true, branch });
+        : { activity: true, branch, hostStatus: 'busy' });
     // The git-diff fallback exists for TERSE HUMAN prompts ("go on") — a machine
     // turn must not fall through to it and retrieve against the whole diff.
     const fileToks = (ptoks.length < 2 && !statusShaped && humanText !== null) ? changedPaths.flatMap(fileQueryTokens) : [];
@@ -4406,13 +4798,30 @@ async function promptRetrieve(lib) {
     // nothing (a peer's presence/ship is itself the signal). Empty string when solo.
     const peers = peerFooter(sid);
     const messages = messageFooter(sid, input.transcript_path, lib);   // 📨 durable notes: offer, acknowledge, replay until explicit consumption
-    let hits = [], repeats = [], struct = null;
-    if (tokens.length) {
+    // ── Unified recall (1.87) — the bench-measured two-lane policy ──────────
+    // Ported line-for-line from the 2026-09-28 "unified balanced" bench winner
+    // (dev/held-out split of real founder prompts; parity-proven against the
+    // reference policy). Routing: a STRONG status prompt keeps the computed
+    // digest below; a prompt whose UNIQUE CONTENT tokens reach
+    // HOOK_MODEL_MIN_TOKENS takes the MODEL lane (rankHookFused over the warm
+    // vector cache) when the embedder answers in budget and any card vector
+    // exists, else the WORDS lane (rankHookWords, BM25-idf rarity with an
+    // evidence bar) decides. Git-diff fileToks still feed the WORDS lane for
+    // terse prompts but never count toward the model gate — they are not the
+    // asker's words. A repeat nudge suppresses the model lane (and its
+    // embedder cost) exactly as it suppressed the old semantic fallback.
+    let repeats = [], struct = null, freshHits = [];
+    // lane + its deciding evidence are logged for every HUMAN decision — the
+    // silent rows are precisely the data the bars get re-fitted from in the
+    // field (the 2026-09-16 audit had only "hits: 5" ×165 to go on); machine
+    // turns are skipped at the write below (no refit signal, and they would
+    // rotate real rows out of the cap). Note the health log keeps its 500-row
+    // cap, and per-prompt rows still fill it faster than the old sem-only
+    // rows did — a field audit sees a shorter window per file, and the
+    // vocabulary changed: `lane`/`evidence` succeed `top1` (`sem` still lands).
+    let lane = statusStrong ? 'status-digest' : 'no-tokens', laneEvidence = null;
+    if (!statusStrong && tokens.length) {
         struct = await cachedStruct(lib);
-        // The lexical bar is the engine's measured export (1.86: 4 — one title
-        // word alone no longer injects; see HOOK_LEXICAL_MIN_SCORE). An older
-        // engine keeps the pre-1.86 bar of 3.
-        hits = lib.scoreCardsAgainstQuery(struct, tokens, { topK: 5, minScore: Number.isFinite(lib.HOOK_LEXICAL_MIN_SCORE) ? lib.HOOK_LEXICAL_MIN_SCORE : 3 });
         // PRECISION-first repeat nudge ("you already did this in another session"):
         // only on a do/build request, only completed-work cards, only high confidence.
         // Matched on the PROMPT's stated intent (ptoks), not the git-diff fallback. A
@@ -4420,66 +4829,64 @@ async function promptRetrieve(lib) {
         if (looksLikeWorkRequest(humanText || '') && typeof lib.detectRepeatWork === 'function') {
             try { repeats = lib.detectRepeatWork(struct, ptoks, { topK: 2 }); } catch { /* best-effort */ }
         }
-    }
-    const repeatIds = new Set(repeats.map(r => r.card.id));
-    let freshHits = hits.filter(h => !repeatIds.has(h.card.id));
-    // SEMANTIC fallback — runs ONLY on a lexical MISS (paraphrase / no keyword
-    // overlap, where you'd otherwise get zero recall). Gated behind the OPTIONAL
-    // on-device model, timeout-bounded (~1.2s), READ-ONLY (never embeds cards in
-    // this one-shot process — that's a 10s–195s stall). The common lexical-HIT
-    // prompt never enters this lane → zero added latency. Bulletproof: not installed
-    // / timeout / any failure → stays exactly today's pure-lexical behavior. The
-    // helper is optional+deploy-gated, so a missing copy degrades cleanly to lexical.
-    let semMode = 'lexical', semTop = null;
-    // Prompt-side admission (1.86): the fallback is an UNCORROBORATED five-card
-    // guess, and the measured cosines cannot tell an acknowledgement from a
-    // real question — but the prompt can. Fewer than FALLBACK_MIN_CONTENT_TOKENS
-    // content tokens ("build best in class", "continue where needed") skips the
-    // lane; the git-diff file tokens do not count, they are not the asker's words.
-    const fallbackEligible = typeof lib.lexicalMissFallbackEligible === 'function' ? lib.lexicalMissFallbackEligible(ptoks) : true;
-    if (!repeats.length && !freshHits.length && tokens.length && struct && !fallbackEligible) semMode = 'sem-skipped';
-    if (!repeats.length && !freshHits.length && tokens.length && struct && fallbackEligible) {
-        try {
-            const semlib = await import(new URL('./brain-semantic.mjs', import.meta.url).href);
-            if (typeof semlib.semanticVecs === 'function') {
-                // Embed the DERIVED human text, never the raw prompt — a mixed
-                // turn's stripped machine block must not re-contaminate the
-                // semantic query (parity with the lexical path above).
-                const sem = await semlib.semanticVecs(BRAIN, struct, humanText || '', { timeoutMs: 1500 });
-                if (!sem) semMode = 'sem-unavailable';
-                else {
-                    // ONE production primitive for this lane (1.86). The ranking
-                    // used to live inline here, which meant the surface every
-                    // session actually receives was the one no harness could
-                    // measure — an eval must IMPORT the ranker, never re-implement
-                    // it. rankLexicalMissFallback in klypix-format.mjs is that
-                    // primitive (scripts/eval-hook-lane.mjs measures it); its
-                    // defaults are the measured ones. An older engine without the
-                    // export degrades to the pre-1.86 inline ranking.
-                    let ranked;
-                    if (typeof lib.rankLexicalMissFallback === 'function') {
-                        const r = lib.rankLexicalMissFallback(struct, sem, { topK: 5 });
-                        ranked = r.hits; semTop = r.topCos;
-                    } else {
-                        const fresh = Date.now() - 30 * 86_400_000;
-                        ranked = struct.cards
-                            .filter(c => c.type !== 'container' && (c.text || '').trim() && !/^archive$/i.test(c.area || ''))
-                            .map(c => { const v = sem.vecsMap.get(c.id); return { card: c, s: v ? sem.dot(sem.qv, v) : null }; })
-                            .filter(x => x.s != null && x.s >= 0.30)
-                            .map(x => { let score = x.s * 10; if ((x.card.createdAt || 0) >= fresh) score += 0.5; return { card: x.card, score }; })
-                            .sort((a, b) => b.score - a.score).slice(0, 5);
+        const repeatIds = new Set(repeats.map(r => r.card.id));
+        if (typeof lib.rankHookWords === 'function' && typeof lib.rankHookFused === 'function') {
+            seedHookIndexes(lib, struct);
+            let decided = false;
+            // MODEL lane gate, in this order: repeat-nudge check, then the
+            // unique-content-token bar — semanticVecs (and its embedder load)
+            // is never paid for a terse prompt or a nudged repeat.
+            if (!repeats.length && new Set(ptoks).size >= lib.HOOK_MODEL_MIN_TOKENS) {
+                try {
+                    const semlib = await import(new URL('./brain-semantic.mjs', import.meta.url).href);
+                    if (typeof semlib.semanticVecs === 'function') {
+                        // Embed the DERIVED human text, never the raw prompt — a
+                        // mixed turn's stripped machine block must not
+                        // re-contaminate the semantic query. semanticVecs
+                        // lowercases, reads the warm card-vector cache read-only,
+                        // and returns null on ANY failure (not installed /
+                        // timeout / empty cache) → the words lane decides.
+                        const sem = await semlib.semanticVecs(BRAIN, struct, humanText || '', { timeoutMs: 1500 });
+                        if (sem) {
+                            const fused = lib.rankHookFused(struct, sem, tokens, { topK: 5 });
+                            if (fused.hits.length) {   // pool > 0; an empty pool is "no vectors" → words lane
+                                decided = true;
+                                laneEvidence = fused.best;
+                                if (fused.best >= fused.bar) { lane = 'model-shown'; freshHits = fused.hits; }
+                                else lane = 'model-silent';   // below-bar is a DECISION, never rescued by words
+                            }
+                        }
                     }
-                    freshHits = ranked;
-                    semMode = ranked.length ? 'sem-hit' : 'sem-empty';
-                }
+                } catch { /* any model-lane failure degrades to the words lane */ }
             }
-        } catch { semMode = 'sem-error'; }
+            if (!decided) {
+                const w = lib.rankHookWords(struct, tokens, { topK: 5 });
+                laneEvidence = w.evidence;
+                if (w.hits.length && w.evidence >= w.bar) { lane = 'words-shown'; freshHits = w.hits; }
+                else lane = 'words-silent';
+            }
+        } else {
+            // Version-skew fallback (older klypix-format without the 1.87
+            // exports): the pre-unified lexical lane at HOOK_LEXICAL_MIN_SCORE.
+            freshHits = lib.scoreCardsAgainstQuery(struct, tokens, { topK: 5, minScore: Number.isFinite(lib.HOOK_LEXICAL_MIN_SCORE) ? lib.HOOK_LEXICAL_MIN_SCORE : 3 });
+            lane = freshHits.length ? 'lexical' : 'lexical-silent';
+        }
+        // Repeat ids are filtered from the SHOWN hits — the nudge block renders
+        // those cards itself, with their correction overlays.
+        freshHits = freshHits.filter(h => !repeatIds.has(h.card.id));
     }
-    // The health row carries the best cosine the lane saw (`top1`) so the
-    // admission rule can be re-fitted from the field later without a
-    // transcript — the 2026-09-16 audit had only "hits: 5" ×165 to go on. A
-    // skipped lane is logged too (`sem-skipped`, with the content-token count).
-    if (semMode !== 'lexical') { try { appendJsonl(HEALTH, { ts: nowIso(), project: path.basename(CWD), mode: 'prompt', sem: semMode, hits: freshHits.length, ...(Number.isFinite(semTop) ? { top1: Math.round(semTop * 1000) / 1000 } : {}), ...(semMode === 'sem-skipped' ? { content: ptoks.length } : {}) }, 500); } catch { /* */ } }
+    // Header choice downstream: only a model-lane show is a "semantic match".
+    const semMode = lane === 'model-shown' ? 'sem-hit' : 'lexical';
+    // Health row: HUMAN decisions only. A machine turn (humanText === null —
+    // harness-injected reminders, task notifications) always lands 'no-tokens'
+    // and carries zero refit signal, but an agent-team session generates
+    // hundreds of them a day — logged, they would rotate the evidence-bearing
+    // words-silent/model-silent rows out of the 500-row cap (2026-09-29
+    // review). `sem` is kept for grep continuity with the pre-1.87 rows; the
+    // old `top1` field's successor is `evidence` (the deciding lane value).
+    if (humanText !== null) {
+        try { appendJsonl(HEALTH, { ts: nowIso(), project: path.basename(CWD), mode: 'prompt', sem: semMode, lane, hits: freshHits.length, mtok: new Set(ptoks).size, ...(Number.isFinite(laneEvidence) ? { evidence: Math.round(laneEvidence * 1000) / 1000 } : {}) }, 500); } catch { /* health log is best-effort */ }
+    }
     // T8 STATUS-DIGEST INJECTION (2026-07-23): a status-shaped prompt gets the
     // COMPUTED current-state digest INSTEAD of card hits — so an agent that
     // never queried the brain still answers "what is remaining?" from state,
@@ -4958,11 +5365,15 @@ function staleOpenFooter(stale) {
         const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
         const lines = [];
         if (gaps && gaps.length) {
+            // The id-addressed confirm is the PREFERRED channel (2026-09-29):
+            // it names exact ids, settles the dashed hint to a solid 'closed
+            // by', and records the confirmation trail — the bare ✓ marker
+            // resolves by prose match and stays the human-typed fallback.
             lines.push('', '---',
                 `## 🔧 Self-heal — ${total} open card(s) look DONE (a later milestone covers them)`,
-                `These ❓/🎯 cards still read as open, but a shipped 🏁 milestone appears to fulfil them — so recall keeps surfacing already-done goals as "next". Confirm + close each:`,
-                '· done → `🧠 BRAIN [Area] ✓: <what it resolved to>` — stamps ✅ + archives the open card (or add `closes: <its title>` to the milestone marker).');
-            for (const g of gaps) lines.push(`- ⚠️ [${flat(g.open.area) || '?'}] ${flat(g.open.text).slice(0, 90)}  ·  likely closed by → ${flat(g.by.text).slice(0, 70)}`);
+                `These ❓/🎯 cards still read as open, but a shipped 🏁 milestone appears to fulfil them — so recall keeps surfacing already-done goals as "next". Verify, then confirm + close each:`,
+                '· done → the per-card `brain_reconcile mode:"claims" confirm:[{ id, milestoneId }]` call below — stamps ✅, archives the open card, and settles its hint with a recorded confirmation. Human-typed fallback: `🧠 BRAIN [Area] ✓: <what it resolved to>` (or add `closes: <its title>` to the milestone marker).');
+            for (const g of gaps) lines.push(`- ⚠️ [${flat(g.open.area) || '?'}] ${flat(g.open.text).slice(0, 90)}  ·  likely closed by → ${flat(g.by.text).slice(0, 70)}\n  confirm: \`brain_reconcile mode:"claims" confirm:[{ id:"${g.open.id}", milestoneId:"${g.by.id}" }]\``);
         }
         // Plan-shaped cards (2026-08-23): the same leak for proposals that never
         // carried a ❓ — recall serves them as current intent ("only a proposal")
@@ -4994,7 +5405,7 @@ function legendFooter() {
         + '**Session brief:** the SessionStart hook prints a ≤2KB ultra brief and writes the FULL brief to `.claude/brain-brief.md` — read that file when planning non-trivial work.\n'
         + '**Routing:** capture project decisions / milestones / open questions / gotchas HERE, *at the moment you decide* — this brain is the shared, portable memory that survives context resets and the next agent reads.\n'
         + '⚠️ **Your own memory directory is NOT this brain.** Claude Code\'s `~/.claude/projects/<project>/memory/` (and any equivalent host store) is PRIVATE to this host: no other session, agent, or human can read it. Both feel like "saving"; only `brain.klypix` is shared. A host store is for *user* preferences — never leave project state only there. (2026-08-16 field report: a whole workstream, ending in a registered IANA media type, went to the private store and reached the brain only because a human happened to ask.)\n'
-        + 'Coordinate with a concurrent session: `🧠 MSG [<their-id or all>]: <text>` — a queued note (NOT a brain card), offered/acknowledged on supported model-context actions and replayed until the receiving model calls `brain_message_receipt` with its exact token.\n';
+        + 'Coordinate with another session: `🧠 MSG [<their-id or all>]: <text>` — a queued note (NOT a brain card), offered/acknowledged on supported model-context actions and replayed until the receiving model calls `brain_message_receipt` with its exact token or moves on. A session that has CLOSED still receives a directed note the moment it next starts (kept 7d). **Never make the human carry a message between agents:** if you would otherwise ask the human to relay or paste something to another agent session, send it this way instead and say it was sent or queued — your next prompt shows what happened to it.\n';
 }
 
 // ── Self-update on SessionStart (auto-propagation, part B — the lever) ────────
@@ -5089,7 +5500,7 @@ async function read(lib) {
     maybeSelfUpdate();
     // Register presence at session start so a peer already running sees this session
     // immediately. Files/ships come from live observation + Stop.
-    const laneTouch = touchSession(input.session_id, { branch: gitBranch() });
+    const laneTouch = touchSession(input.session_id, { branch: gitBranch(), hostStatus: 'idle' });
     const laneWarning = laneTouch?.ok === false && !['no-session-id', 'lane-lock-timeout'].includes(laneTouch.reason)
         ? laneFailureFooter(laneTouch.reason) : '';
     // One-line presence summary — session start is exactly when an agent decides

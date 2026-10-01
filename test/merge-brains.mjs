@@ -1053,17 +1053,35 @@ const B_ROWS = [
     want: { union: 'live[k=v15 k′=v9] bin[] c[]', receipts: 'live[k′=v15] bin[k:F(v0)] c[]', '3way': 'live[k′=v15] bin[k:F(v0)] c[]' },
   },
   {
-    // Found by the simulator's soak (I9, seed 80642): ours' base holds k
-    // deleted (v0), yet ours holds k live with v1 — a tab with no watcher typed
-    // into it and the app save kept the edit. Elsewhere k was restored as k′,
-    // still v0: the edit was made on exactly those bytes, and lands on k′.
-    name: 'B28 an edit of a card the base holds deleted lands on its restore when that still holds the deleted bytes',
+    // The simulator's soak (I9, seed 80642): ours' base holds k deleted (v0),
+    // yet ours holds k live with v1 — a tab with no watcher typed into it and
+    // the app save kept the edit. Elsewhere k was restored as k′, still v0.
+    // The edit stays beside k′ as a twin, both texts kept: what the copy was
+    // made on is known only from a LIVE base value. The bin's bytes are what
+    // the deleter last held, and a tab can hold an older text than that —
+    // folding on them overwrote a version nobody saw replaced (row B33).
+    name: 'B28 an edit of a card the base holds deleted stays beside its restore (the bin cannot say what it was made on)',
     args: async () => ({
       base: await side({ bin: { txt_k: binEntryFor({ id: k0, json: pj('v0'), now: 1000 }) } }),
       ours: await side({ live: { txt_k: pj('v1') } }),
       theirs: await side({ live: { txt_elsewhere: pj('v0') }, bin: { txt_k: Re(k0, 'v0', 'txt_elsewhere') } }),
     }),
-    want: { union: 'live[elsewhere=v0 k=v1] bin[] c[]', receipts: 'live[elsewhere=v1] bin[k:R] c[]', '3way': 'live[elsewhere=v1] bin[k:R] c[]' },
+    want: { union: 'live[elsewhere=v0 k=v1] bin[] c[]', receipts: 'live[elsewhere=v0 elsewhere~=v1] bin[k:R] c[revived]', '3way': 'live[elsewhere=v0 elsewhere~=v1] bin[k:R] c[revived]' },
+  },
+  {
+    // Found by the proposals review (round 2) against B28's first rule, which
+    // read "made on" from the base's bin bytes: A edited k (v0 → v1) and then
+    // deleted it; elsewhere k was restored, holding v1; a tab with no watcher
+    // still held v0 and typed v2 into it, and the app save kept k live. The
+    // restore still holds the bin's bytes, so the fold put v2 over v1 — and v1
+    // was then live nowhere and in no bin, with no conflict reported.
+    name: 'B33 an edit typed into an older text than the one deleted stays beside its restore',
+    args: async () => ({
+      base: await side({ bin: { txt_k: pFe(k0, 'v1') } }),
+      ours: await side({ live: { txt_k: pj('v2') } }),
+      theirs: await side({ live: { [kRestoredAs('v1')]: pj('v1') }, bin: { txt_k: pRe(k0, 'v1', kRestoredAs('v1')) } }),
+    }),
+    want: { union: 'live[k=v2 k′=v1] bin[] c[]', receipts: 'live[k′=v1 k′~=v2] bin[k:R] c[revived]', '3way': 'live[k′=v1 k′~=v2] bin[k:R] c[revived]' },
   },
   {
     // The landing was edited since the value ours' edit was made on: a real
@@ -1228,6 +1246,15 @@ const B_ROWS = [
   ok(b8.delta.revived[0]?.via === 'resurrection', 'B8: the 3way revival is reported as a resurrection');
   const b15 = await mergeBrains({ ...(await B_ROWS[14].args()), options: { binMerge: 'receipts' } });
   ok(b15.conflicts.some((c) => c.suppressed === 'deleted-twin'), 'B15: the suppressed twin is reported, not silent');
+  // B33 the other way round: the restore is ours, the typed copy theirs.
+  {
+    const r = B_ROWS.find((x) => x.name.startsWith('B33'));
+    const a = await r.args();
+    for (const binMerge of ['receipts', '3way']) {
+      const got = await summarize(await mergeBrains({ base: a.base, ours: a.theirs, theirs: a.ours, options: { binMerge } }));
+      ok(got === 'live[k′=v1 k′~=v2] bin[k:R] c[revived]', `B33 swapped (${binMerge}): v1 and v2 both survive (${got})`);
+    }
+  }
 
   // P-a reaching a restore (B29–B32): what the strings cannot show.
   {
@@ -1743,10 +1770,10 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
       row: 'B26', options: { binMerge: 'receipts' },
     },
     {
-      rule: 'a copy of an id the base holds deleted was made on the deleted bytes',
-      find: "    const madeOn = baseItem(mv.from) ?? (eb && entryKind(eb.meta) === 'F' ? eb.json : null);",
-      replace: '    const madeOn = baseItem(mv.from);',
-      row: 'B28', options: { binMerge: 'receipts' },
+      rule: 'what a copy was made on comes from a live base value, never from bin bytes',
+      find: '    const madeOn = baseItem(mv.from);',
+      replace: "    const madeOn = baseItem(mv.from) ?? (eOf(B, mv.from) && entryKind(eOf(B, mv.from).meta) === 'F' ? eOf(B, mv.from).json : null);",
+      row: 'B33', options: { binMerge: 'receipts' },
     },
     {
       rule: "the side still holding a restore's bytes has not edited the card",

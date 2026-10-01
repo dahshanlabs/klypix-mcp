@@ -1169,6 +1169,28 @@ const B_ROWS = [
     },
   },
   {
+    // P-a for a value that moves (review round 2: no row isolated it). Theirs
+    // deleted k; a merge rescued an edit of it to k′, where that delete
+    // revives, and a person then purged k′. Ours edited k without seeing any
+    // of it: the edit routes to k′ and drops with the purge, reported (it
+    // survives in ours' restore point).
+    name: 'B35 an edit routed onto a permanently deleted card drops, and says so',
+    args: async () => {
+      const kR = kRestoredAs('v0');
+      const fR = binEntryFor({ id: kR, json: pj('k′ text'), now: 2000 });
+      return {
+        base: await side({ live: { txt_k: pj('v0') } }),
+        ours: await side({ live: { txt_k: pj('v1 with a pasted secret') } }),
+        theirs: await side({ bin: { txt_k: pFe(k0, 'v0'), [kR]: { meta: contentFreeReceiptFor(kR, fR, { kind: 'purged', now: 3000 }), json: PURGED_BODY } } }),
+      };
+    },
+    want: {
+      union: 'live[k=v1 with a pasted secret] bin[k′:P] c[]',
+      receipts: 'live[] bin[k:F(v0) k′:P] c[purge-vs-edit]',
+      '3way': 'live[] bin[k:F(v0) k′:P] c[purge-vs-edit]',
+    },
+  },
+  {
     // Nothing in any bin: the option modes are the familiar 3-way.
     name: 'B16 no bins anywhere: an ordinary content conflict',
     args: async () => ({ base: await side({ live: { txt_k: 'v0' } }), ours: await side({ live: { txt_k: 'v1' } }), theirs: await side({ live: { txt_k: 'v2' } }) }),
@@ -1190,6 +1212,7 @@ const B_ROWS = [
     'B29 a purge reaches a restore the purging machine never saw (P-a)', 'B30 a purge reaches a restore the other side made',
     'B31 a purge reaches a restore edited since', 'B32 a purge follows a restore chain',
     'B34 a purge follows a restore chain through an edited card, and says so',
+    'B35 an edit routed onto a permanently deleted card drops, and says so',
   ]);
   offBreaks('B', observed, B_ROWS, '3way', 'receipts', ['B8 exact deleted bytes over a base that holds the deletion']);
 
@@ -1895,6 +1918,12 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
       find: '    if (P) reach(y, root, P, null, null);',
       replace: '',
       groupings: true,
+    },
+    {
+      rule: 'a value routed onto a permanently deleted card drops (P-a)',
+      find: "        drops.push({ ...mv, at: t, kind: 'P', chain: true });",
+      replace: '        return landFresh(mv, revivedIdFor(t, E.meta, E.json));',
+      row: 'B35', options: { binMerge: 'receipts' },
     },
     {
       rule: 'unverified: a foreign entry never kills our card',

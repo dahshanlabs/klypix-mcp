@@ -1147,6 +1147,28 @@ const B_ROWS = [
     want: { union: 'live[k′=v0] bin[k:P k′:R] c[]', receipts: 'live[] bin[k:P k′:P k′:P] c[]', '3way': 'live[] bin[k:P k′:P k′:P] c[]' },
   },
   {
+    // The same chain, but k′ was edited before it was deleted, so k″ came
+    // back holding that edit: not the purged card's bytes. It goes (P-a),
+    // and is reported — the purging machine never saw that text.
+    name: 'B34 a purge follows a restore chain through an edited card, and says so',
+    args: async () => {
+      const k1 = kRestoredAs('v0');
+      const f1 = binEntryFor({ id: k1, json: pj('v1 edited before the second delete'), now: 1500 });
+      const k2 = revivedIdFor(k1, f1.meta, pj('v1 edited before the second delete'));
+      const r2 = { meta: contentFreeReceiptFor(k1, f1, { kind: 'restored', restoredAs: k2, now: 2500 }), json: PURGED_BODY };
+      return {
+        base: await side({ bin: { txt_k: pFe(k0, 'v0') } }),
+        ours: await side({ live: { [k2]: pj('v1 edited before the second delete') }, bin: { txt_k: pRe(k0, 'v0', k1), [k1]: r2 } }),
+        theirs: await side({ bin: { txt_k: pPe(k0, 'v0') } }),
+      };
+    },
+    want: {
+      union: 'live[k′=v1 edited before the second delete] bin[k:P k′:R] c[]',
+      receipts: 'live[] bin[k:P k′:P k′:P] c[purge-vs-edit]',
+      '3way': 'live[] bin[k:P k′:P k′:P] c[purge-vs-edit]',
+    },
+  },
+  {
     // Nothing in any bin: the option modes are the familiar 3-way.
     name: 'B16 no bins anywhere: an ordinary content conflict',
     args: async () => ({ base: await side({ live: { txt_k: 'v0' } }), ours: await side({ live: { txt_k: 'v1' } }), theirs: await side({ live: { txt_k: 'v2' } }) }),
@@ -1167,6 +1189,7 @@ const B_ROWS = [
     'B17 a copy follows a restore that landed elsewhere',
     'B29 a purge reaches a restore the purging machine never saw (P-a)', 'B30 a purge reaches a restore the other side made',
     'B31 a purge reaches a restore edited since', 'B32 a purge follows a restore chain',
+    'B34 a purge follows a restore chain through an edited card, and says so',
   ]);
   offBreaks('B', observed, B_ROWS, '3way', 'receipts', ['B8 exact deleted bytes over a base that holds the deletion']);
 
@@ -1857,9 +1880,15 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
     },
     {
       rule: 'a purge reaches a restore the purging machine never saw (P-a)',
-      find: '        reach(y, k, P, x, receiptIdentity(x, r.meta, r.json));',
+      find: '        reach(y, k, P, k, rid);',
       replace: '',
       row: 'B29', options: { binMerge: 'receipts' },
+    },
+    {
+      rule: "a chain's landing is judged against the purged card's own bytes",
+      find: '        reach(y, k, P, k, rid);',
+      replace: '        reach(y, k, P, x, receiptIdentity(x, r.meta, r.json));',
+      row: 'B34', options: { binMerge: 'receipts' },
     },
     {
       rule: 'a derived receipt is derived again from the purge that wins now',

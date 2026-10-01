@@ -660,16 +660,21 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
     const P = purgeOf(k);
     if (!P) continue;
     const seen = new Set([k]);
-    const queue = [k];
+    // [card, the rid of the restore of k its chain began with]. A copy is the
+    // purge working only while it holds k's own bytes — the ones that first
+    // restore put back. Down the chain, a landing restored from an edit of the
+    // card holds news the purging machine never saw, and is reported.
+    const queue = [[k, null]];
     while (queue.length && seen.size <= ROUTE_STEPS) {
-      const x = queue.shift();
+      const [x, first] = queue.shift();
       for (const S of [O, T, B]) {
         const r = eOf(S, x);
         if (!r || entryKind(r.meta) !== 'R' || seen.has(String(r.meta.restoredAs))) continue;
         const y = String(r.meta.restoredAs);
+        const rid = first ?? receiptIdentity(x, r.meta, r.json);
         seen.add(y);
-        queue.push(y);
-        reach(y, k, P, x, receiptIdentity(x, r.meta, r.json));
+        queue.push([y, rid]);
+        reach(y, k, P, k, rid);
       }
     }
   }

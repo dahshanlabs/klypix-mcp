@@ -1281,6 +1281,24 @@ const B_ROWS = [
     want: { union: 'live[k=v0] bin[] c[]', receipts: 'live[k=v0] bin[] c[]', '3way': 'live[k=v0] bin[] c[]' },
   },
   {
+    // An edit a merge rescued from k's delete lives at k′ (where that delete
+    // revives), with no receipt naming it; ours, holding it live, then purged
+    // k. The purge does not reach it — deliberately, for now: see the P-a
+    // note in mergeOptionMode (no link survives the bytes without a hash of
+    // them, and an age purge would take live work). Pinned so a change to
+    // that is a decision, not an accident.
+    name: 'B41 a purge does not reach an edit a merge rescued from the delete',
+    args: async () => {
+      const kR = kRestoredAs('v0');
+      return {
+        base: await side({ live: { [kR]: pj('v1') }, bin: { txt_k: pFe(k0, 'v0') } }),
+        ours: await side({ live: { [kR]: pj('v1') }, bin: { txt_k: pPe(k0, 'v0') } }),
+        theirs: await side({ live: { [kR]: pj('v1') }, bin: { txt_k: pFe(k0, 'v0') } }),
+      };
+    },
+    want: { union: 'live[k′=v1] bin[k:P] c[]', receipts: 'live[k′=v1] bin[k:P] c[]', '3way': 'live[k′=v1] bin[k:P] c[]' },
+  },
+  {
     // Nothing in any bin: the option modes are the familiar 3-way.
     name: 'B16 no bins anywhere: an ordinary content conflict',
     args: async () => ({ base: await side({ live: { txt_k: 'v0' } }), ours: await side({ live: { txt_k: 'v1' } }), theirs: await side({ live: { txt_k: 'v2' } }) }),

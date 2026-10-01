@@ -630,7 +630,13 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
   // content) with the landing, and its stamps are the purge's, so every
   // replica and both transports write the same entry and a re-merge changes
   // nothing. Conflict twins of a landing are not followed: they are other
-  // texts, kept beside the card, not the card.
+  // texts, kept beside the card, not the card. Nor is an edit a merge rescued
+  // from the delete (it lands on that same revival id, and no receipt names
+  // it): only the deleted bytes lead there, so whether a purge reached it
+  // would depend on which copies a merge happened to meet (a purge receipt
+  // must not carry a hash of them); and the purging machine usually holds
+  // that card live and works on it, so a purge, an age purge included, would
+  // take live work with it.
   const purgeOf = (k) => {
     const e = ownAll(k);
     // Only a purge someone made: a derived receipt is the reach of its own root.

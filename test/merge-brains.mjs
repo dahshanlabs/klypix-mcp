@@ -654,6 +654,7 @@ const kChain = (text) => {
 };
 const EDGE_ARGS = [];   // the B-E case, for its S2-X mutation
 const PURGE_GROUPINGS = [];   // the B-P check, for its S2-X mutation
+const REACH_ROOTS = [];       // the B-P2 check, for its S2-X mutation
 const N9_CHECK = [];          // the N9 case, for its S2-X mutation
 const CYCLE_CHECK = [];       // the B-C case, for its S2-X mutation
 const TITLE_CHECK = [];       // the M6 case, for its S2-X mutation
@@ -1525,6 +1526,31 @@ const B_ROWS = [
     ok(await groupingsAgree({ mergeBrains }),
       'B-P: two purges of one card and a restore of it — every grouping keeps the same receipts and purges the landing');
     PURGE_GROUPINGS.push(groupingsAgree);
+
+    // Two purges reach one landing (review round 3): k restored as k1, k1
+    // deleted and restored again as k2 on Y while X purged k1, and Z purged
+    // k. Both roots reach k2; the receipt k2 gets is the one the total order
+    // picks — the same whichever side is ours, never the one a loop met first.
+    const fk = pFe(k0, 'v0');
+    const k1 = revivedIdFor(k0, fk.meta, pj('v0'));
+    const f1 = binEntryFor({ id: k1, json: pj('v0'), now: 2500 });
+    const k2 = revivedIdFor(k1, f1.meta, pj('v0'));
+    const rec = (id, e, kind, now, extra = {}) => ({ meta: contentFreeReceiptFor(id, e, { kind, now, ...extra }), json: PURGED_BODY });
+    const baseR = await side({ bin: { [k0]: rec(k0, fk, 'restored', 2000, { restoredAs: k1 }), [k1]: f1 } });
+    const purgedXZ = await side({ bin: { [k1]: rec(k1, f1, 'purged', 3100), [k0]: rec(k0, fk, 'purged', 3200) } });
+    const restoredY = await side({ live: { [k2]: pj('v0') }, bin: { [k0]: rec(k0, fk, 'restored', 2000, { restoredAs: k1 }), [k1]: rec(k1, f1, 'restored', 3000, { restoredAs: k2 }) } });
+    const rootsAgree = async (engine) => {
+      const binOf = async (o, t) => {
+        const r = await engine.mergeBrains({ base: baseR, ours: o, theirs: t, options: { binMerge: 'receipts' } });
+        const b = await binIndex(r.buffer);
+        return { live: (await liveIds(r.buffer)).includes(k2), bin: JSON.stringify(Object.entries(b).map(([id, e]) => [id, entryKind(e), e.rid, e.purgedWith ?? null]).sort()), k2: b[k2] };
+      };
+      const a = await binOf(purgedXZ, restoredY), b = await binOf(restoredY, purgedXZ);
+      return a.bin === b.bin && !a.live && !b.live && entryKind(a.k2 ?? {}) === 'P';
+    };
+    ok(await rootsAgree({ mergeBrains }),
+      'B-P2: two purges reaching one restore landing — the same receipt whichever side is ours, and the landing is purged');
+    REACH_ROOTS.push(rootsAgree);
   }
 
   // Determinism and idempotence: the same inputs give the same bytes-level
@@ -2238,6 +2264,12 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
       order: 1,
     },
     {
+      rule: 'two purges reaching one landing: the total order picks its receipt',
+      find: '    if (!had || pickBinEntry(landing, had.entry, entry) === entry) reached.set(landing, { entry, root, from, rid });',
+      replace: '    if (!had) reached.set(landing, { entry, root, from, rid });',
+      roots: true,
+    },
+    {
       rule: 'with no base, the title is theirs',
       find: '        manifest.title = tT;',
       replace: '        manifest.title = tO;',
@@ -2275,6 +2307,12 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
       try { got = await FOLD_OWN_CHECK[0](engine); } catch (e) { got = `threw ${e.message}`; }
       const kept = ['v9', 'v11', 'v15'].every((v) => got.includes(`=${v}`));
       ok(!kept, `X "${m.rule}" off ⇒ check B-F fails${!kept ? ` (mutant: ${got})` : ' — IT DID NOT'}`);
+      continue;
+    }
+    if (m.roots) {
+      let held;
+      try { held = await REACH_ROOTS[0](engine); } catch { held = false; }
+      ok(!held, `X "${m.rule}" off ⇒ check B-P2 fails${!held ? '' : ' — IT DID NOT'}`);
       continue;
     }
     if (m.order != null) {

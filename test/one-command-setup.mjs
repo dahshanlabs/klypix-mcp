@@ -153,6 +153,8 @@ try {
   const fakeHome = tmpdir('home-setup');
   for (const k of ['HOME', 'USERPROFILE', 'KLYPIX_BRAIN_DIR']) savedEnv[k] = process.env[k];
   Object.assign(process.env, { HOME: fakeHome, USERPROFILE: fakeHome, KLYPIX_BRAIN_DIR: path.join(fakeHome, '.claude', 'project-brain') });
+  // The positive setup case needs a detected host even on a bare CI runner.
+  fs.mkdirSync(path.join(fakeHome, '.claude'), { recursive: true });
   const fresh = tmpdir('setup');
   git(fresh, 'init', '-q');
   fs.writeFileSync(path.join(fresh, 'README.md'), '# fixture\n');

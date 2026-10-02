@@ -373,6 +373,10 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
   baked('1.87.0');
   r = at();
   ok(r.layers.mergeEngine === 'n/a', 'MERGE: a 1.87.0 brain with its own api-1 engine is not drift');
+  // ...nor 1.88.0, the session mailbox alone (review 14: the boundary itself).
+  baked('1.88.0');
+  r = at();
+  ok(r.layers.mergeEngine === 'n/a', 'MERGE: a 1.88.0 brain (the mailbox release) with its api-1 engine is not drift');
   put('merge-brains.mjs', path.join(SRC, 'merge-brains.mjs'));
 
   baked('1.89.0');

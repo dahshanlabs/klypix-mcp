@@ -245,7 +245,8 @@ const OPTION_DEFAULTS = Object.freeze({
 
 /** What this engine can do — callers feature-check this rather than a version
  *  string, because installs mix file generations (a 1.89 driver beside a 1.86
- *  engine, a desktop bundle beside a dev-owned ~/.claude). Absent ⇒ ≤ 1.86.
+ *  engine, a desktop bundle beside a dev-owned ~/.claude). Absent ⇒ ≤ 1.88
+ *  (1.88.0 is the session mailbox alone: no Stage 2 engine).
  *  A flag turns true only when the thing it names runs. */
 export const MERGE_ENGINE_FEATURES = Object.freeze({
   api: 3,                            // absent ⇒ 1. Bump only when an option's meaning changes. (2 was never published: the option modes before sideFreeTies.)
@@ -752,7 +753,7 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
   const maxEntry = (id, list) => list.reduce((w, e) => (e ? pickBinEntry(id, w, e) : w), null);
   // The entry a dead card ends with. The base's own entry counts: "no receipt,
   // no purge" — an entry a side merely LACKS (a git checkout of an older file,
-  // a ≤1.86 CLI purge that dropped it) comes back instead of vanishing.
+  // a ≤1.88 CLI purge that dropped it) comes back instead of vanishing.
   // Unverified: a foreign bin never replaces an entry we or the base hold.
   const ownAll = (id) => (unverified
     ? (maxEntry(id, [eOf(O, id), eOf(B, id)]) ?? eOf(T, id))
@@ -1277,13 +1278,16 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
       // an edit typed onto it from a version history restore that put an
       // OLDER text back on this side's card (both read as "my base held that
       // value, I hold this one"), and in the second case the restored text
-      // ends up live nowhere and in no bin. Whichever it is, it is told —
-      // the person who restored the card keeps it in their restore point
-      // (the app takes one on this report, as it does for a purged edit).
+      // ends up live nowhere and in no bin. Whichever it is, the merge
+      // reports it, and the person who restored the card keeps it in their
+      // restore point (the app takes one on this report, as it does for a
+      // purged edit; no desktop surface shows the report itself yet).
       // Found by the certifying soak, seed 93325; before this it was silent.
       // ...unless those bytes are still recoverable: a bin entry somewhere in
-      // this merge holds them (the restore's own entry survived because a side
-      // still held it, say). Then nothing is at stake and nothing is said.
+      // this merge holds them — the restore's own entry survived because a
+      // side still held it, say, or ANOTHER card's entry holds the same text
+      // (a conflict copy a history restore buried: soak seed 100383). Then
+      // nothing is at stake and nothing is said.
       const displaced = other.items[at];
       if (asRestored(at, displaced) && ![...fate.values()].some((f) => f.entry && entryKind(f.entry.meta) === 'F' && sameMeaning(f.entry.json, displaced))) {
         conflicts.push({ id: at, kind: 'fold-over-restore', keptLive: mv.side, from: mv.from, side: mv.side, restored: displaced });

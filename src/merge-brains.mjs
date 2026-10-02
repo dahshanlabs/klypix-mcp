@@ -132,15 +132,12 @@
 //     as a copy of the copy. A card a fold rewrote holds the folded value for
 //     every later question of the same merge, and a card a value arrived at
 //     is never folded over (certifying soak, seed 98381; review 8).
-//   • A purge of a card that was itself a restore's landing reaches every
-//     OTHER landing of that restore (the same deletion restored on another
-//     machine: a copy beside the id where an edit the deleter never saw had
-//     taken it, or the card where the purged one was the copy, or one a
-//     restore-of-the-restore chain leads up to), and a twin of the purged
-//     id, where it holds exactly the bytes that restore put back (seed
-//     98843; review 9). Where the other side holds other text at that
-//     landing, only the restored copy goes. Never a copy the purging side
-//     itself holds live: its person kept that card.
+//   • A purge of a card that was itself a restore's landing reaches a twin
+//     of it holding exactly the bytes that restore put back: the same
+//     deletion restored on another machine, landed as a copy because an edit
+//     the deleter never saw had taken the id (seed 98843). Never a twin the
+//     purging side itself holds live. The purge does not follow the restore
+//     further (the mirror, a chain, an edited copy): limits, see there.
 //   • A routed value counts as "seen and edited away" only by a twin that
 //     held it at the base; a slot merely taken by other text is skipped, and
 //     a resolution is never adopted from a twin a fold has just rewritten.
@@ -920,69 +917,40 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
   // every copy's bin, for anyone to restore (review round 4).
   // The purged card can ITSELF be a restore's landing: a person restored k
   // (it landed at k′), deleted that card again and purged it. On another
-  // machine the same deletion was restored too, and landed somewhere else: as
-  // a copy beside k′, because an edit the deleter never saw had taken the id
-  // there — or the other way round, the purged card being the copy and the
-  // other machine's restore the card. No receipt chain leads DOWN from the
-  // purged id to that other landing: the purge took whatever lived at its
-  // own id and left the restored bytes, the text the purge was for, live in
-  // the other one (certifying soak, seed 98843; review 9, M1).
-  // So a purged id that a restore receipt names as its landing stands for
-  // that restore: every OTHER landing a receipt for the same deleted card
-  // names (any side's, or the base's), and a twin of the purged id itself,
-  // is the purged card where it holds exactly the bytes that restore put
-  // back — and so on up the chain, when the restored card was itself a
-  // restore's landing (restored, deleted, restored again, purged).
-  //   • Never a copy the purging side holds live: the person who purged had
-  //     that card in front of them and kept it (they purged another card of
-  //     the family — the edit at the id, say — not this text).
-  //   • Where every side holding the landing holds those bytes, the landing
-  //     dies under a receipt derived from the purge, as a reached landing
-  //     does. Where one side holds them and the other holds other text at
-  //     that id (the rescued edit), only the restored copy goes: the card
-  //     keeps the other side's text, and the restorer is told.
-  const landedBy = new Map();        // a landing -> [{ from, rid }]: the restores that put a card there
-  const landingsFrom = new Map();    // a deleted id -> every landing a restore receipt names for it
-  // (Under 'unverified' a foreign receipt widens nothing: only ours and the base's count.)
+  // machine the same deletion was restored too, and landed as a copy beside
+  // k′ because an edit the deleter never saw had taken the id (the very case
+  // above, with the purge made one step later). No receipt chain leads from
+  // k′ to that copy: the purge of k′ took the edit living at k′ and left the
+  // restored bytes — the text the purge was for — live in the copy
+  // (certifying soak, seed 98843). So a purged id that a restore receipt
+  // names as its landing stands for that restore here: a twin of it holding
+  // exactly the bytes that restore put back is the purged card.
+  //   • Never a twin the purging side itself holds live: its person had that
+  //     card in front of them and kept it (they purged another card of the
+  //     family — the edit at the id — not this text).
+  //   • Under 'unverified' a foreign receipt widens nothing: only ours and
+  //     the base's are read.
+  // LIMITS, written down and pinned as such (K15L): the purge does not follow
+  // the restore any further than that twin. It does not reach the same
+  // deletion restored elsewhere when the purged card was the COPY and the
+  // other machine's restore is the card; nor a landing a restore-of-a-restore
+  // chain leads to; nor a copy that was resized or edited since. A wider
+  // reach that walked the receipts was tried and withdrawn: it replaced a
+  // restorable entry of a text nobody had purged, and what it reached
+  // depended on which of two restore receipts had kept the bin's one slot
+  // (review 10). Closing these needs a durable mark on the purge itself
+  // (Stage 3).
+  const ownsPurge = (S, k) => { const e = S?.graveyard?.[k]; return !!e && entryKind(e.meta) === 'P'; };
+  const rootRestores = new Map();    // a purged landing -> [{ root, from, rid }] of the restores that landed there
   for (const S of (unverified ? [O, B] : [O, T, B])) for (const [x, e] of Object.entries(S?.graveyard || {})) {
     if (!e || entryKind(e.meta) !== 'R') continue;
-    const y = String(e.meta.restoredAs);
+    const k = String(e.meta.restoredAs);
+    if (!purgeOf(k)) continue;
     const rid = receiptIdentity(x, e.meta, e.json);
-    const list = landedBy.get(y) || landedBy.set(y, []).get(y);
-    if (!list.some((c) => c.from === x && c.rid === rid)) list.push({ from: x, rid });
-    (landingsFrom.get(x) || landingsFrom.set(x, new Set()).get(x)).add(y);
+    const list = rootRestores.get(k) || rootRestores.set(k, []).get(k);
+    if (!list.some((c) => c.from === x && c.rid === rid)) list.push({ root: k, from: x, rid });
   }
-  for (const list of landedBy.values()) list.sort((p, q) => (`${p.from}\n${p.rid}` < `${q.from}\n${q.rid}` ? -1 : 1));
-  const ownsPurge = (S, k) => { const e = S?.graveyard?.[k]; return !!e && entryKind(e.meta) === 'P'; };
-  const sidePurged = new Set();      // `${side}\n${id}`: that side's copy alone is the purged card
-  const sidePurgeReports = [];
-  const rootRestores = new Map();    // a purged landing -> [{ root, from, rid }]: for its own twins, below
-  for (const k of [...allIds].sort()) {
-    const P = purgeOf(k);
-    if (!P) continue;
-    const seen = new Set([k]);
-    let frontier = [k];
-    for (let step = 0; frontier.length && step < ROUTE_STEPS; step++) {
-      const next = [];
-      for (const y of frontier) for (const { from: x, rid } of landedBy.get(y) || []) {
-        if (y === k) (rootRestores.get(k) || rootRestores.set(k, []).get(k)).push({ root: k, from: x, rid });
-        for (const y2 of [...(landingsFrom.get(x) || [])].sort()) {
-          if (seen.has(y2) || reached.get(y2)?.rid || purgeOf(y2)) continue;
-          const restoredCopy = (S) => live(S, y2) && fullEntryRid(x, S.items[y2]) === rid;
-          const holders = [[O, 'ours'], [T, 'theirs']].filter(([S]) => restoredCopy(S));
-          if (!holders.length) continue;
-          if ([O, T].some((S) => ownsPurge(S, k) && restoredCopy(S))) continue;      // the purger kept it
-          if ([O, T].every((S) => !live(S, y2) || restoredCopy(S))) reach(y2, k, P, x, rid);
-          else for (const [S, side] of holders) {
-            sidePurged.add(`${side}\n${y2}`);
-            sidePurgeReports.push({ S, side, id: y2, root: k });
-          }
-        }
-        if (!seen.has(x)) { seen.add(x); next.push(x); }
-      }
-      frontier = next;
-    }
-  }
+  for (const list of rootRestores.values()) list.sort((p, q) => (`${p.from}\n${p.rid}` < `${q.from}\n${q.rid}` ? -1 : 1));
   const reachedTwins = [];
   for (const x of new Set([...O.ids, ...T.ids, ...Object.keys(O.graveyard), ...Object.keys(T.graveyard)])) {
     const parent = TWIN_PARENT_RE.exec(x)?.[1];
@@ -1109,12 +1077,6 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
     conflicts.push({ id: y, kind: 'purge-vs-edit', side: 'bin', purgedWith: via.root }); binEditsPurged++;
   }
 
-  for (const r of sidePurgeReports) {
-    if (!fate.get(r.id)?.alive) continue;
-    drops.push({ S: r.S, side: r.side, from: r.id, v: r.S.items[r.id], at: r.id, kind: 'P' });
-    conflicts.push({ id: r.id, kind: 'purge-reached-restore', side: r.side, purgedWith: r.root });
-  }
-
   // ── Pass B: routing ───────────────────────────────────────────────────────
   const landed = new Set();
   // A card a moved value folded onto holds THAT value after this merge, and
@@ -1131,8 +1093,8 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
     const fold = folded.get(x);
     if (fold) return [fold.v];
     const out = [];
-    if (live(O, x) && !sidePurged.has(`ours\n${x}`)) out.push(O.items[x]);
-    if (live(T, x) && !sidePurged.has(`theirs\n${x}`)) out.push(T.items[x]);
+    if (live(O, x)) out.push(O.items[x]);
+    if (live(T, x)) out.push(T.items[x]);
     return out;
   };
   const twins = makeTwinPlacer({
@@ -1263,7 +1225,6 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
     const willHold = (x) => {
       if (!twins.holds(x, mv.v)) return false;
       if (folded.has(x) || !live(O, x) || !live(T, x) || sameMeaning(O.items[x], T.items[x])) return true;
-      if (sidePurged.has(`ours\n${x}`) || sidePurged.has(`theirs\n${x}`)) return false;
       // The two sides show different texts there. Only a one-sided change is
       // decided here; where both changed, or nothing says who did, the
       // content pass keeps one on the card and looks for a home for the
@@ -1368,14 +1329,9 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
     const srcPos = T.positions[id] || O.positions[id];
     let json, side;
     const fold = folded.get(id);
-    const goneO = inO && sidePurged.has(`ours\n${id}`), goneT = inT && sidePurged.has(`theirs\n${id}`);
     if (fold) {
       json = fold.v; side = fold.side;
       if (side === 'theirs') delta.updated.push(id);
-    } else if (inO && inT && goneO !== goneT) {
-      // One side's copy is a restored copy a purge reached (above): the card
-      // is the other side's text, with no twin for the purged one.
-      if (goneO) { json = T.items[id]; side = 'theirs'; delta.updated.push(id); } else { json = O.items[id]; side = 'ours'; }
     } else if (inO && inT) {
       const oChg = !cb || !sameMeaning(O.items[id], cb);
       const tChg = !cb || !sameMeaning(T.items[id], cb);

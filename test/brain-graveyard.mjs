@@ -8,7 +8,7 @@
 // — a buried card must be absent from `order`, `positions`, `struct.cards`, the
 // card count, and every text surface derived from them.
 //
-// Stage 2 (1.88): "Delete permanently" leaves a CONTENT-FREE RECEIPT instead
+// Stage 2 (1.89): "Delete permanently" leaves a CONTENT-FREE RECEIPT instead
 // of dropping the entry, so a copy that still holds the bytes cannot carry
 // them back. The load-bearing assertions for that are negative too: the secret
 // is nowhere in the file, and a merge with a stale copy does not return it.
@@ -293,7 +293,7 @@ ok(again.restored.length === 0 && again.skipped[0]?.reason === `already restored
     'restore refuses a purge receipt — it would come back as an empty card');
   ok(!(await parseKlypix(refused.buffer)).canvas.order.includes(victim.id), 'and the brain is unchanged');
 
-  // A restore receipt (written by a 1.88 restore, or a desktop) is refused too.
+  // A restore receipt (written by a 1.89 restore, or a desktop) is refused too.
   const rZip = await JSZip.loadAsync(after);
   const rIdx = JSON.parse(await rZip.file('graveyard.json').async('string'));
   const body = await rZip.file(`graveyard/${shard(victim.id)}/${victim.id}.json`).async('string');

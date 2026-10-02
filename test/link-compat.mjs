@@ -1,4 +1,4 @@
-// link-compat — mixed install generations (Stage 2, 1.88). The engine files
+// link-compat — mixed install generations (Stage 2, 1.89). The engine files
 // reach ~/.claude/project-brain from four channels (full install, desktop
 // bundle, auto-update, `git-driver install`), each renames files one at a
 // time, and an interrupted or partial update leaves a mix on disk. Every mix
@@ -7,8 +7,8 @@
 // stops Brain Sync. Each case assembles a directory exactly as it would sit on
 // disk, then imports or runs what is there.
 //
-// Covered elsewhere: a 1.88 driver beside a 1.86.3 engine (git-tools E-10);
-// 1.88 brain-history beside a 1.86.3 engine or none (brain-history E-9). The
+// Covered elsewhere: a 1.89 driver beside a 1.86.3 engine (git-tools E-10);
+// 1.89 brain-history beside a 1.86.3 engine or none (brain-history E-9). The
 // KLYPIX desktop's API-5 sync core beside this engine is tested in the KLYPIX
 // repo, where that core lives.
 //
@@ -89,14 +89,14 @@ try {
       `mid-update, ${label}: the engine links and merges, and the git driver runs${err || r.err ? ` (${err || r.err})` : ''}`);
   }
 
-  // The 1.88 set, complete: the engine advertises what brain-history and the
+  // The 1.89 set, complete: the engine advertises what brain-history and the
   // KLYPIX core feature-check before using it.
   {
     const dir = mix({ 'klypix-format.mjs': NEW('klypix-format.mjs'), 'brain-graveyard.mjs': NEW('brain-graveyard.mjs'), 'merge-brains.mjs': NEW('merge-brains.mjs'), 'klypix-merge-driver.mjs': fs.readFileSync(path.join(ROOT, 'src', 'klypix-merge-driver.mjs'), 'utf8') });
     const eng = await import(pathToFileURL(path.join(dir, 'merge-brains.mjs')).href);
     const r = runDriver(dir);
     ok(eng.MERGE_ENGINE_FEATURES?.api === 3 && eng.MERGE_ENGINE_FEATURES.restoreAsMerge === true && r.code === 0 && await unionOk(r.out),
-      'the complete 1.88 set links, advertises api 3, and its driver merges');
+      'the complete 1.89 set links, advertises api 3, and its driver merges');
   }
 } finally {
   for (const dir of MIXES) fs.rmSync(dir, { recursive: true, force: true });

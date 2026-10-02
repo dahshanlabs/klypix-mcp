@@ -440,7 +440,7 @@ console.log('\n— S2-E1 deterministic twins —');
   const folded = await mergeBrains({ base, ours: oursWithLegacy, theirs });
   const foldedTwins = await twinsOf(folded.buffer, 'txt_A');
   ok(foldedTwins.length === 1 && foldedTwins[0] === legacyTwin && folded.conflicts.some((c) => c.twin === legacyTwin && c.existing),
-    'D6: a value already held by a live pre-1.88 random twin is not twinned again');
+    'D6: a value already held by a live pre-1.89 random twin is not twinned again');
 
   // X1: a person edited the twin since. It is never overwritten and the value
   // is not twinned again — the edit descends from it.
@@ -2929,6 +2929,60 @@ const CANON_CHECKS = {};   // name -> async (engine) => true when the check hold
   ok(k14mGot.every((g) => g === 'kept'), `K14m: a value matched to a card that then loses the card keeps a home of its own, whichever order the moves run in — the merge completes${k14mGot.every((g) => g === 'kept') ? '' : `   (got ${k14mGot.join(' | ')})`}`);
   CANON_CHECKS.twinHoldsArrivedValue = async (engine) => (await k14m(engine)).every((g) => g === 'kept');
 
+  // K14n: X1 ("a person edited the conflict twin since: the value counts as
+  // seen") in the OPTION modes, where `arrivedWith` decides whether a value
+  // is placed as a routed one. Base c=A; ours c=Y and the slot twin of c for
+  // W edited by a person ("tidied", made since the base); theirs c=W. W is
+  // not twinned again — with no move (P1), with a carrier of ours' text that
+  // arrives at c (P2), and with a carrier of W that arrives at ANOTHER card
+  // (P3). (Review 13: each looser form of `arrivedWith` brought W back.)
+  const k14n = async (engine) => {
+    const c = 'txt_c', d = 'txt_d', slot0 = twinIdFor(c, pjn('W'));
+    const { receiptFor } = await fam(engine);
+    const shapes = [
+      [await plainOf({ [c]: 'A' }), await plainOf({ [c]: 'Y', [slot0]: 'tidied' }), await plainOf({ [c]: 'W' })],
+      [await plainOf({ [c]: 'A', [jz]: 'Y' }), await plainOf({ [c]: 'Y', [slot0]: 'tidied', [jz]: 'Y' }), await withBin(await plainOf({ [c]: 'W' }), { [jz]: receiptFor(jz, c, 'Y') })],
+      [await plainOf({ [c]: 'A', [jz]: 'W' }), await plainOf({ [c]: 'Y', [slot0]: 'tidied', [jz]: 'W' }), await withBin(await plainOf({ [c]: 'W', [d]: 'W' }), { [jz]: receiptFor(jz, d, 'W') })],
+    ];
+    const out = [];
+    for (const [base, ours, theirs] of shapes) for (const options of [SYNC, DRIVER]) {
+      const res = await engine.mergeBrains({ base, ours, theirs, options });
+      const { canvas } = await parseKlypix(res.buffer);
+      const twinsOfC = (canvas.order || []).filter((id) => id.startsWith(`${c}__agconf_`));
+      out.push(twinsOfC.length === 1 && twinsOfC[0] === slot0 && res.conflicts.some((x) => x.twin === slot0 && x.existing && x.edited) ? 'seen' : `twins[${twinsOfC.length}]`);
+    }
+    return out;
+  };
+  const k14nGot = await k14n({ mergeBrains });
+  ok(k14nGot.every((g) => g === 'seen'), `K14n: in the option modes a value a person edited away in its twin is not twinned again — with no move, with a carrier that arrives with the other text, with a carrier that arrives at another card${k14nGot.every((g) => g === 'seen') ? '' : `   (got ${k14nGot.join(' | ')})`}`);
+  CANON_CHECKS.arrivedWithIsNarrow = async (engine) => (await k14n(engine)).every((g) => g === 'seen');
+
+  // K14o: a value arrives at a card, and a moved edit made on that value then
+  // folds onto a TWIN of the card holding it (one step up from the twin's
+  // copy). The fold is made — the edit lands on the twin, not in a copy of a
+  // copy — whichever carrier id (review 13: a round-11 hold on such twins,
+  // since removed, blocked this fold).
+  const k14o = async (engine) => {
+    const { rest, KP, KT, receiptK, receiptFor, withLive } = await fam(engine);
+    const KTT = twinIdFor(KT, pjn('zz'));
+    const out = [];
+    for (const carrier of [jz, zz]) {
+      const base = await plainOf({ txt_k: 'X', [carrier]: 'X', [KP]: 'X' });
+      const E = await plainOf({ txt_k: 'F', [carrier]: 'X', [KP]: 'a' });
+      const R = await withBin(await withLive(rest, { [KP]: 'X', [KT]: 'X', [KTT]: 'r' }),
+        { [k0]: { meta: { ...receiptK.meta, restoredAs: KTT }, json: receiptK.json }, [carrier]: receiptFor(carrier, KP, 'X') });
+      out.push(...await eachWay(engine, base, E, R, async (res) => {
+        const { zip } = await parseKlypix(res.buffer);
+        const f = zip.file(`items/${shard(KT)}/${KT}.json`);
+        return f && JSON.parse(await f.async('string')).content === 'F' ? 'folded' : 'not folded';
+      }));
+    }
+    return out;
+  };
+  const k14oGot = await k14o({ mergeBrains });
+  ok(k14oGot.every((g) => g === 'folded'), `K14o: an edit made on a value folds onto the twin holding it even after that value arrived at the twin's card${k14oGot.every((g) => g === 'folded') ? '' : `   (got ${k14oGot.join(' | ')})`}`);
+  CANON_CHECKS.foldOntoTwinOfArrival = async (engine) => (await k14o(engine)).every((g) => g === 'folded');
+
   // K14h: "the card already holds the value" counts only if it still will
   // after this merge: the other side edited that text away, so the value
   // routed there stays a copy (as it did before the step up).
@@ -3086,9 +3140,40 @@ const CANON_CHECKS = {};   // name -> async (engine) => true when the check hold
     out.push(...await eachWay(engine, merged, merged, merged, kept));
     return out;
   };
+  // ...and the history review 11 found it in (N1c): real tools and true bases
+  // only. The other machine restores k first (its receipt keeps the bin's one
+  // slot); the purging machine has the rescued edit at k′, restores k later
+  // (a copy beside k′), purges the edit and keeps the copy; both sync; the
+  // purging machine later plain-deletes the copy and syncs; the other pulls
+  // and then syncs an unrelated card. Every merge, sync and driver, with the
+  // bases those machines really hold: the copy stays a full entry.
+  const k15hFleet = async (engine) => {
+    const buf = (r) => Buffer.from(r.buffer);
+    const T0 = 1_700_000_000_000;
+    const s0 = await side({ live: { txt_k: pjn('v3') } });
+    const D = buf(await engine.mergeBrains({ base: s0, ours: s0, theirs: s0, deletedIds: [k0] }));
+    const other = Buffer.from((await restoreFromGraveyard(D, [k0], { now: T0 + 1000 })).buffer);
+    const resc = buf(await engine.mergeBrains({ base: s0, ours: D, theirs: await side({ live: { txt_k: pjn('v8') } }), options: SYNC }));
+    const kr = (await parseKlypix(resc)).canvas.order.find((id) => id.startsWith('txt_k__r_'));
+    const a2 = Buffer.from((await restoreFromGraveyard(resc, [k0], { now: T0 + 5000 })).buffer);
+    const copy = (await parseKlypix(a2)).canvas.order.find((id) => /__agconf_/.test(id));
+    const P1 = Buffer.from((await purgeGraveyard(buf(await engine.mergeBrains({ base: a2, ours: a2, theirs: a2, deletedIds: [kr] })), { ids: [kr] })).buffer);
+    const out = [];
+    for (const options of [SYNC, DRIVER]) {
+      const M1 = buf(await engine.mergeBrains({ base: D, ours: P1, theirs: other, options }));
+      const P2 = buf(await engine.mergeBrains({ base: M1, ours: M1, theirs: M1, deletedIds: [copy] }));
+      const M2 = buf(await engine.mergeBrains({ base: M1, ours: P2, theirs: M1, options }));
+      const M3 = buf(await engine.mergeBrains({ base: M1, ours: M1, theirs: M2, options }));
+      const M4 = buf(await engine.mergeBrains({ base: M2, ours: await putItem(M3, 'txt_new', pjn('an unrelated card')), theirs: M2, options }));
+      for (const m of [M2, M3, M4]) out.push(entryKind((await binIndex(m))[copy] ?? {}) === 'F' ? 'kept' : `copy:${entryKind((await binIndex(m))[copy] ?? {})}`);
+    }
+    return out;
+  };
+  const k15hFleetGot = await k15hFleet({ mergeBrains });
+  ok(k15hFleetGot.every((g) => g === 'kept'), `K15h (fleet history, true bases): the purging machine's plain-deleted copy stays restorable through every later sync, in both modes${k15hFleetGot.every((g) => g === 'kept') ? '' : `   (got ${k15hFleetGot.join(' | ')})`}`);
   const k15hGot = await k15h({ mergeBrains });
   ok(k15hGot.every((g) => g === 'kept'), `K15h: a copy the purging machine deleted without purging stays a full, restorable entry — it is not turned into a purge receipt, on this merge or the next${k15hGot.every((g) => g === 'kept') ? '' : `   (got ${k15hGot.join(' | ')})`}`);
-  CANON_CHECKS.purgerKeepsItsBinEntry = async (engine) => (await k15h(engine)).every((g) => g === 'kept');
+  CANON_CHECKS.purgerKeepsItsBinEntry = async (engine) => (await k15h(engine)).every((g) => g === 'kept') && (await k15hFleet(engine)).every((g) => g === 'kept');
 
   // K15g: a twin whose copies DIFFER between the sides is someone's text. The
   // original k is purged on one machine; the other restored it, a rescued
@@ -3686,6 +3771,18 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
       find: "  const twinOf = (k, v, srcPos, kind) => conflicts.push({ id: k, kind, keptLive: 'ours', ...twins.place(k, v, srcPos, 'theirs', true, arrivedWith(k, v)) });",
       replace: "  const twinOf = (k, v, srcPos, kind) => conflicts.push({ id: k, kind, keptLive: 'ours', ...twins.place(k, v, srcPos, 'theirs', true) });",
       canon: 'twinHoldsArrivedValue', check: 'K14m',
+    },
+    {
+      rule: 'the twins of a card a value arrived at are not held against a fold',
+      find: '  const arriveAtHolder = (mv, x) => { heldFor.add(x); return arrive(mv, x); };',
+      replace: '  const arriveAtHolder = (mv, x) => { heldFor.add(x); for (const y of twins.twinsOf(x)) if (twins.holds(y, mv.v)) heldFor.add(y); return arrive(mv, x); };',
+      canon: 'foldOntoTwinOfArrival', check: 'K14o',
+    },
+    {
+      rule: 'a value is placed as routed only when a move arrived with that very value at that very card',
+      find: '  const arrivedWith = (k, v) => delta.revived.some((r) => r.as === k && moves.some((m) => m.from === r.id && m.side === r.side && sameMeaning(m.v, v)));',
+      replace: '  const arrivedWith = (k, v) => delta.revived.some((r) => moves.some((m) => m.from === r.id && m.side === r.side));',
+      canon: 'arrivedWithIsNarrow', check: 'K14n',
     },
     {
       rule: "only the purging side's own entries count as kept",

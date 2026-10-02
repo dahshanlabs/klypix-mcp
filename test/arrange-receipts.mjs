@@ -1,4 +1,4 @@
-// arrange-receipts — E-8 (Stage 2, 1.88). Arrange collapses duplicate cards
+// arrange-receipts — E-8 (Stage 2, 1.89). Arrange collapses duplicate cards
 // and containers. It used to REMOVE the losers and nothing else, which no other
 // copy of the brain could see: the next Brain Sync or git merge read the
 // absence as nothing and carried every duplicate back. And the survivor was

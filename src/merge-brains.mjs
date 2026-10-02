@@ -36,7 +36,7 @@
 // copy is GENERATED. It flattens into ~/.claude/project-brain on install, where
 // jszip + fractional-indexing already live.
 //
-// STAGE 2 (klypix-mcp 1.88) — rules that hold for EVERY caller, options or not:
+// STAGE 2 (klypix-mcp 1.89) — rules that hold for EVERY caller, options or not:
 //   • Conflict twins get DETERMINISTIC ids (twinIdFor: the conflicted card's id
 //     plus a hash of the value being preserved). A random id meant the same
 //     conflict merged twice — by the git driver and by Brain Sync, or on two
@@ -244,7 +244,7 @@ const OPTION_DEFAULTS = Object.freeze({
 });
 
 /** What this engine can do — callers feature-check this rather than a version
- *  string, because installs mix file generations (a 1.88 driver beside a 1.86
+ *  string, because installs mix file generations (a 1.89 driver beside a 1.86
  *  engine, a desktop bundle beside a dev-owned ~/.claude). Absent ⇒ ≤ 1.86.
  *  A flag turns true only when the thing it names runs. */
 export const MERGE_ENGINE_FEATURES = Object.freeze({
@@ -314,7 +314,7 @@ const sha12 = (s) => createHash('sha256').update(String(s)).digest('hex').slice(
 // fallback for anything unparseable — a malformed item must never crash a merge.
 //
 // The comparator itself — sameMeaning, itemSignature and the VOLATILE field
-// list (updatedAt, zIndex, editedAt) — lives in klypix-format.mjs since 1.88,
+// list (updatedAt, zIndex, editedAt) — lives in klypix-format.mjs since 1.89,
 // so the bin identity (receiptIdentity) and twin ids hash exactly the meaning
 // this merge compares.
 

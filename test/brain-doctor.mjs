@@ -341,20 +341,20 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
   const baked = (v) => fs.writeFileSync(path.join(brainDir, 'klypix-mcp-server.mjs'), `const PKG_VERSION = '${v}';\n`);
   const at = () => inspect({ home, projectDir: project, fmtLib: null });
 
-  baked('1.88.0');
+  baked('1.89.0');
   put('merge-brains.mjs', path.join(SRC, 'merge-brains.mjs'));
   put('klypix-merge-driver.mjs', path.join(SRC, 'klypix-merge-driver.mjs'));
   let r = at();
   ok(r.layers.mergeEngine === 'ok' && r.mergeEngine.engine.api >= 2 && r.mergeEngine.driver.api >= 2
     && /MERGE\s+engine api \d+ · git driver api \d+/.test(render(r, { color: false })),
-  'MERGE: a current engine and driver under a 1.88 brain read ok, with their api levels');
+  'MERGE: a current engine and driver under a 1.89 brain read ok, with their api levels');
 
   put('merge-brains.mjs', path.join(OLD, 'merge-brains.mjs'));
   r = at();
   ok(r.layers.mergeEngine === 'drift' && r.mergeEngine.engine.api === 1 && r.verdict === 'DRIFTED'
-    && r.actions.some((a) => a.startsWith('npx klypix-mcp install') && a.includes('merge-brains.mjs predates brain v1.88.0'))
+    && r.actions.some((a) => a.startsWith('npx klypix-mcp install') && a.includes('merge-brains.mjs predates brain v1.89.0'))
     && /merge engine older than the brain/.test(driftLine(r)),
-  'MERGE: a 1.86 engine under a 1.88 brain is drift, and the fix is named');
+  'MERGE: a 1.86 engine under a 1.89 brain is drift, and the fix is named');
 
   put('merge-brains.mjs', path.join(SRC, 'merge-brains.mjs'));
   fs.writeFileSync(path.join(brainDir, 'klypix-merge-driver.mjs'), "import * as engine from './merge-brains.mjs';\n// a 1.86 driver: no options constant\n");
@@ -368,14 +368,14 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
   ok(r.layers.mergeEngine === 'n/a' && !/MERGE\s/.test(render(r, { color: false })),
     'MERGE: an older brain is not judged against the new engine');
   // 1.87.0 shipped with the api-1 engine: an install of it must not read as
-  // drifted (the Stage 2 engine first ships in 1.88.0).
+  // drifted (the Stage 2 engine first ships in 1.89.0).
   put('merge-brains.mjs', path.join(OLD, 'merge-brains.mjs'));
   baked('1.87.0');
   r = at();
   ok(r.layers.mergeEngine === 'n/a', 'MERGE: a 1.87.0 brain with its own api-1 engine is not drift');
   put('merge-brains.mjs', path.join(SRC, 'merge-brains.mjs'));
 
-  baked('1.88.0');
+  baked('1.89.0');
   fs.rmSync(path.join(brainDir, 'merge-brains.mjs'));
   fs.rmSync(path.join(brainDir, 'klypix-merge-driver.mjs'));
   r = at();

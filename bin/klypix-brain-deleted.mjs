@@ -3,7 +3,7 @@
 // The recycle bin for a brain: cards a human deleted are kept recoverable
 // instead of destroyed. Standalone: node bin/klypix-brain-deleted.mjs <args>
 //
-// Receipts (1.88): "Delete permanently" keeps a content-free receipt in the bin
+// Receipts (1.89): "Delete permanently" keeps a content-free receipt in the bin
 // so every other copy of the brain drops the card too (see brain-graveyard.mjs).
 // Receipts are not deleted cards — `list` hides them, restore refuses them, and
 // `list <id>` names what happened to one.

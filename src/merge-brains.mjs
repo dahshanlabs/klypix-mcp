@@ -927,17 +927,22 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
   // names as its landing stands for that restore here: a twin of it holding
   // exactly the bytes that restore put back is the purged card.
   //   • Never a twin the purging side itself holds — live, or deleted in its
-  //     own Deleted cards: its person had that card in front of them and
-  //     kept it, or deleted it without purging it (they purged another card
-  //     of the family — the edit at the id — not this text).
+  //     own Deleted cards (any full entry there, whatever its bytes): its
+  //     person usually had that card in front of them and kept it, or
+  //     deleted it without purging it. Not always: the other machine's
+  //     deleted copy can reach the purger's bin by sync before the purge, and
+  //     then the purger meant exactly that text; the merge cannot tell the
+  //     two apart, and the text stays restorable there (a LIMIT, below).
   //   • Under 'unverified' a foreign receipt widens nothing: only ours and
   //     the base's are read.
   // What this reach takes with the twin: its Deleted-cards entry too, when
   // no side holds it live and every entry holds those bytes (the purged text
   // must not stay restorable); and a twin of the purged id that someone typed
   // independently with exactly the same bytes (indistinguishable).
-  // LIMITS, written down and pinned as such (K15L): the purge does not follow
-  // the restore any further than that twin. It does not reach
+  // LIMITS (pinned: the mirror, the chain and a resized copy by K15L; a copy
+  // the purging side holds by K15d and K15h; the copy of a copy by none):
+  // the purge does not follow the restore any further than that twin. It
+  // does not reach
   //   - the other machine's restore when the purged card was itself the COPY
   //     (the other restore is then the card);
   //   - the other machine's copy of an EARLIER restore, when the purged card
@@ -947,8 +952,10 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
   //   - a copy of a copy (the slot beside the card held other text when the
   //     restore landed), or a purged card that is itself such a copy;
   //   - a copy that was resized or edited since;
-  //   - a copy the purging side itself holds: the text then stays on every
-  //     machine, not only on the other one.
+  //   - a copy the purging side itself holds, live or in its own Deleted
+  //     cards (whatever bytes that entry holds): the text then stays on every
+  //     machine, not only on the other one, and stays restorable where it is
+  //     deleted.
   // A wider reach that walked the receipts was tried and withdrawn (review
   // 10): what it reached depended on which of two restore receipts had kept
   // the bin's one slot. Closing these needs a durable mark on the purge
@@ -1206,16 +1213,13 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
   // ids routed to one card, one carrying the card's text and one an edit of
   // it: the fold displaced the text the first had just been matched to, and
   // the merge refused itself, E-13 - review 8, S2).
-  // ...nor over a twin of it holding that same value: when the content pass
-  // then puts another text on the card, that twin is the value's home (a
-  // step-up fold took it, the value's slot was taken, and the merge refused
-  // itself — review 11, S1).
+  // (A twin of that card holding the same value may still take a fold: if
+  // the card then loses the value in the content pass, the value is placed
+  // as a routed one there — `arrivedWith` — whichever order the moves ran in.
+  // Holding those twins too blocked correct folds and only worked in one
+  // order: review 11 S1, review 12.)
   const heldFor = new Set();
-  const arriveAtHolder = (mv, x) => {
-    heldFor.add(x);
-    for (const y of twins.twinsOf(x)) if (twins.holds(y, mv.v)) heldFor.add(y);
-    return arrive(mv, x);
-  };
+  const arriveAtHolder = (mv, x) => { heldFor.add(x); return arrive(mv, x); };
   const landIntoAlive = (mv, t) => {
     if (twins.holds(t, mv.v)) return arriveAtHolder(mv, t);
     for (const x of twins.twinsOf(t)) if (twins.holds(x, mv.v)) return arriveAtHolder(mv, x);
@@ -1324,7 +1328,15 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
   // ── Pass C: content, over the ids still alive ─────────────────────────────
   const merged = new Map();
   // Every content twin holds theirs' text (ours stays live on the card).
-  const twinOf = (k, v, srcPos, kind) => conflicts.push({ id: k, kind, keptLive: 'ours', ...twins.place(k, v, srcPos, 'theirs', true) });
+  // A value a move of this merge ARRIVED with at k (it matched what k holds
+  // on one side), which then loses k's content decision, is placed as a
+  // routed value: a slot merely taken by other text is no proof anyone saw
+  // it. Whether a fold of the same merge had already taken the twin that
+  // also held it depends on the order the moves run in; counted as seen, the
+  // value was on no card and the merge refused itself in one orientation
+  // (review 12: K14m with the carrier routed after the fold).
+  const arrivedWith = (k, v) => delta.revived.some((r) => r.as === k && moves.some((m) => m.from === r.id && m.side === r.side && sameMeaning(m.v, v)));
+  const twinOf = (k, v, srcPos, kind) => conflicts.push({ id: k, kind, keptLive: 'ours', ...twins.place(k, v, srcPos, 'theirs', true, arrivedWith(k, v)) });
   // E-1b: S holds a live twin of k whose value is `val` — the conflict was
   // already resolved on S's side, with `val` kept beside the card.
   // (A twin a moved value folded onto holds that value now, not S's: adopting

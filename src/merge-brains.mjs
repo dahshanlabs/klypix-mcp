@@ -125,6 +125,18 @@
 //     that mean the same the one with the smaller id stays: theirs-first
 //     wrote a different array on every machine, and git and Brain Sync then
 //     rewrote each other's file for ever.
+//   • A moved value whose landing is a conflict copy is also offered to the
+//     card that copy stands beside (one step up, the fold's own guards): a
+//     restore that finds the card's revival live lands beside it, its
+//     receipt names the copy, and an edit made on the revival's text ended
+//     as a copy of the copy. A card a fold rewrote holds the folded value for
+//     every later question of the same merge, and a card a value arrived at
+//     is never folded over (certifying soak, seed 98381; review 8).
+//   • A purge of a card that was itself a restore's landing reaches a twin
+//     of it holding exactly the bytes that restore put back: the same
+//     deletion restored on another machine, landed as a copy because an edit
+//     the deleter never saw had taken the id (seed 98843). The purged text
+//     stayed live in that copy.
 //   STILL OPEN with two transports on one brain (git and Brain Sync): a value
 //   only ONE side changed is decided from that transport's base, and the two
 //   do not share one. Two values of one field that pass each other between
@@ -432,7 +444,7 @@ function descendantPosition(O, T, B, id, canonical = false) {
 // brain with thousands of simultaneous conflicts. `liveValues(x)` and
 // `slotState(x)` describe the merge's own cards; twins minted here are tracked
 // by the placer itself.
-function makeTwinPlacer({ seedIds, liveValues, slotState, suppressDeleted = null, keptValues = null, heldAtBase = null, saysElseThere = null }) {
+function makeTwinPlacer({ seedIds, liveValues, slotState, suppressDeleted = null, keptValues = null, heldAtBase = null, saysElseThere = null, rewrittenHere = null }) {
   const index = new Map();
   const extras = [];                 // twins minted by this merge, in mint order
   const extraById = new Map();
@@ -466,6 +478,10 @@ function makeTwinPlacer({ seedIds, liveValues, slotState, suppressDeleted = null
       const state = stateOf(x);
       if (state === 'alive') {
         if (has(x)) return { twin: x, existing: true };
+        // A slot this very merge rewrote (a moved value folded onto it) says
+        // something else because of this merge, not because a person saw v
+        // and edited it away: v still needs a home.
+        if (rewrittenHere && rewrittenHere(x)) continue;
         // It says something else: a person edited it and v counts as seen —
         // unless the edit was made since the base (the base's copy still held
         // v), or the very side that shows v on the card holds this slot with
@@ -889,15 +905,38 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
   // holds live is judged by the bytes its Deleted-cards entries hold: deleted
   // holding the restored bytes, it kept the very text the purge was for in
   // every copy's bin, for anyone to restore (review round 4).
+  // The purged card can ITSELF be a restore's landing: a person restored k
+  // (it landed at k′), deleted that card again and purged it. On another
+  // machine the same deletion was restored too, and landed as a copy beside
+  // k′ because an edit the deleter never saw had taken the id (the very case
+  // above, with the purge made one step later). No receipt chain leads from
+  // k′ to that copy: the purge of k′ took the edit living at k′ and left the
+  // restored bytes — the text the purge was for — live in the copy
+  // (certifying soak, seed 98843). So a purged id that some side's restore
+  // receipt names as its landing stands for that restore here: a twin of it
+  // holding exactly the bytes that restore put back is the purged card.
+  const rootRestores = new Map();    // a purged landing -> [{ from, rid }] of the restores that landed there
+  for (const S of [O, T, B]) for (const [x, e] of Object.entries(S?.graveyard || {})) {
+    if (!e || entryKind(e.meta) !== 'R') continue;
+    const k = String(e.meta.restoredAs);
+    if (!purgeOf(k)) continue;
+    const rid = receiptIdentity(x, e.meta, e.json);
+    const list = rootRestores.get(k) || rootRestores.set(k, []).get(k);
+    if (!list.some((c) => c.from === x && c.rid === rid)) list.push({ root: k, from: x, rid });
+  }
+  for (const list of rootRestores.values()) list.sort((a, b) => (`${a.from}\n${a.rid}` < `${b.from}\n${b.rid}` ? -1 : 1));
   const reachedTwins = [];
   for (const x of new Set([...O.ids, ...T.ids, ...Object.keys(O.graveyard), ...Object.keys(T.graveyard)])) {
     const parent = TWIN_PARENT_RE.exec(x)?.[1];
-    const via = parent ? reached.get(parent) : null;
-    if (!via?.rid || reached.get(x)?.rid) continue;
+    if (!parent || reached.get(x)?.rid) continue;
     const liveCopies = [O, T].filter((S) => live(S, x)).map((S) => S.items[x]);
     const copies = liveCopies.length ? liveCopies
       : [O, T].map((S) => eOf(S, x)).filter((e) => e && entryKind(e.meta) === 'F').map((e) => e.json);
-    if (copies.length && copies.every((v) => fullEntryRid(via.from, v) === via.rid)) reachedTwins.push([x, via]);
+    if (!copies.length) continue;
+    const reachedVia = reached.get(parent);
+    const via = [...(reachedVia?.rid ? [reachedVia] : []), ...(rootRestores.get(parent) || [])]
+      .find((c) => copies.every((v) => fullEntryRid(c.from, v) === c.rid));
+    if (via) reachedTwins.push([x, via]);
   }
   for (const [x, via] of reachedTwins) {
     const had = reached.get(x);
@@ -1013,8 +1052,19 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
 
   // ── Pass B: routing ───────────────────────────────────────────────────────
   const landed = new Set();
+  // A card a moved value folded onto holds THAT value after this merge, and
+  // only that: the text it replaced is gone from it. Every later question
+  // "does x hold v" must hear so. Read from the sides' copies, a folded card
+  // still "held" the text the fold had just replaced: a second value arrived
+  // at it and was on no card (the merge refused itself, E-13), and a conflict
+  // was kept "in" a twin a fold had rewritten, its text then on no card, in
+  // no twin and in no bin (review 8, S1 and S2; both older than the fold's
+  // step up to the card a landing stands beside).
+  const folded = new Map();          // landing id -> the move whose value it takes
   const liveValuesAt = (x) => {
     if (!fate.get(x)?.alive) return [];
+    const fold = folded.get(x);
+    if (fold) return [fold.v];
     const out = [];
     if (live(O, x)) out.push(O.items[x]);
     if (live(T, x)) out.push(T.items[x]);
@@ -1028,6 +1078,7 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
     // says → both stay live somewhere.
     keptValues: (x) => {
       if (!fate.get(x)?.alive) return [];
+      if (folded.has(x)) return [folded.get(x).v];
       const lo = live(O, x), lt = live(T, x);
       if (lo && lt && !sameMeaning(O.items[x], T.items[x])) {
         const bx = baseItem(x);
@@ -1040,7 +1091,8 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
       return lo ? [O.items[x]] : lt ? [T.items[x]] : [];
     },
     heldAtBase: (x, v) => !!B && B.items[x] != null && sameMeaning(B.items[x], v),
-    saysElseThere: (x, v, side) => { const S = side === 'ours' ? O : T; return live(S, x) && !sameMeaning(S.items[x], v); },
+    saysElseThere: (x, v, side) => { const S = side === 'ours' ? O : T; return folded.has(x) ? !sameMeaning(folded.get(x).v, v) : live(S, x) && !sameMeaning(S.items[x], v); },
+    rewrittenHere: (x) => folded.has(x),
     slotState: (x) => {
       const f = fate.get(x);
       if (!f) return 'free';
@@ -1103,10 +1155,16 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
   // KLYPIX soak's I9: an edit of a card a sync had meanwhile revived or a
   // person restored). Never over other text of this side's own at the landing,
   // and never from foreign bytes.
-  const folded = new Map();          // landing id -> the move whose value it takes
+  // A card a moved value ARRIVED at because it already holds that value must
+  // keep holding it: a later move of this merge never folds over it (two old
+  // ids routed to one card, one carrying the card's text and one an edit of
+  // it: the fold displaced the text the first had just been matched to, and
+  // the merge refused itself, E-13 - review 8, S2).
+  const heldFor = new Set();
+  const arriveAtHolder = (mv, x) => { heldFor.add(x); return arrive(mv, x); };
   const landIntoAlive = (mv, t) => {
-    if (twins.holds(t, mv.v)) return arrive(mv, t);
-    for (const x of twins.twinsOf(t)) if (twins.holds(x, mv.v)) return arrive(mv, x);
+    if (twins.holds(t, mv.v)) return arriveAtHolder(mv, t);
+    for (const x of twins.twinsOf(t)) if (twins.holds(x, mv.v)) return arriveAtHolder(mv, x);
     const other = mv.side === 'ours' ? T : O;
     // What this side's copy was made on: the id's value at the base, and only
     // that. When the base holds the id deleted, its bin bytes are what the
@@ -1119,7 +1177,36 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
     const madeOn = baseItem(mv.from);
     // Only onto a card the other side already held — never onto a value this
     // merge landed a moment ago (that value would then be lost, E-13).
-    if (!unverified && madeOn != null && !landed.has(t) && (!live(mv.S, t) || sameMeaning(mv.S.items[t], madeOn)) && live(other, t) && !folded.has(t) && sameMeaning(other.items[t], madeOn)) {
+    const takes = (x) => !unverified && madeOn != null && !landed.has(x) && !heldFor.has(x) && (!live(mv.S, x) || sameMeaning(mv.S.items[x], madeOn)) && live(other, x) && !folded.has(x) && sameMeaning(other.items[x], madeOn);
+    // The landing can itself be a conflict COPY. A restore that finds the
+    // card's revival live (an edit the deleter never saw came back first)
+    // lands beside it, and the restore's receipt names that copy. An edit of
+    // the old id made on the text the revival holds then belongs on the
+    // revival: routed to the receipt's landing alone, it ended as a copy of
+    // the restore's copy, beside the very text it was typed on (certifying
+    // soak, seed 98381: card v6, restored copy v2, the edit v6 → v8 a copy of
+    // the copy). So when the landing does not take the value, the card it
+    // stands beside is asked the same two questions: does it already hold
+    // the value (another machine's merge put it there), and would the edit
+    // land on it as a one-sided change. One step up only; the same guards.
+    const beside = TWIN_PARENT_RE.exec(t)?.[1] ?? null;
+    const besideAlive = !!beside && !!fate.get(beside)?.alive;
+    // "Already holds the value" counts only if the card still does once the
+    // content pass has decided it: a side's copy the other side edited away,
+    // or one a new-on-both-sides rule other than 'twin' drops, is no home
+    // (the value then stays a copy beside the landing, as before).
+    const willHold = (x) => {
+      if (!twins.holds(x, mv.v)) return false;
+      if (folded.has(x) || !live(O, x) || !live(T, x) || sameMeaning(O.items[x], T.items[x])) return true;
+      const bx = baseItem(x);
+      if (!bx) return opt.newOnBothSides === 'twin';
+      if (sameMeaning(O.items[x], bx)) return unverified || sameMeaning(T.items[x], mv.v);
+      if (sameMeaning(T.items[x], bx)) return sameMeaning(O.items[x], mv.v);
+      return true;                       // both changed: one stays on the card, the other in a twin
+    };
+    if (!takes(t) && besideAlive && willHold(beside)) return arriveAtHolder(mv, beside);
+    const at = takes(t) ? t : (besideAlive && takes(beside) ? beside : null);
+    if (at) {
       // The landing's text goes, as the text an edit replaces always does —
       // but when a RESTORE put it there, the bin holds only that restore's
       // content-free receipt, so this is its last copy. The merge cannot tell
@@ -1133,12 +1220,12 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
       // ...unless those bytes are still recoverable: a bin entry somewhere in
       // this merge holds them (the restore's own entry survived because a side
       // still held it, say). Then nothing is at stake and nothing is said.
-      const displaced = other.items[t];
-      if (asRestored(t, displaced) && ![...fate.values()].some((f) => f.entry && entryKind(f.entry.meta) === 'F' && sameMeaning(f.entry.json, displaced))) {
-        conflicts.push({ id: t, kind: 'fold-over-restore', keptLive: mv.side, from: mv.from, side: mv.side, restored: displaced });
+      const displaced = other.items[at];
+      if (asRestored(at, displaced) && ![...fate.values()].some((f) => f.entry && entryKind(f.entry.meta) === 'F' && sameMeaning(f.entry.json, displaced))) {
+        conflicts.push({ id: at, kind: 'fold-over-restore', keptLive: mv.side, from: mv.from, side: mv.side, restored: displaced });
       }
-      folded.set(t, mv);
-      return arrive(mv, t);
+      folded.set(at, mv);
+      return arrive(mv, at);
     }
     const r = twins.place(t, mv.v, mv.S.positions[mv.from] || O.positions[t] || T.positions[t], mv.side);
     conflicts.push({ id: t, kind: 'revived', keptLive: 'ours', from: mv.from, side: mv.side, ...r });
@@ -1913,6 +2000,10 @@ async function revivalMapOf(file, lastKnown) {
     for (const x of [...twinsOf(t)].sort()) {
       if (sameMeaning(await liveJson(x), v)) { revived.push({ id: k, as: x }); return true; }
     }
+    // One step up, as the merge does (landIntoAlive): the landing is a copy
+    // standing beside a card, and the value went onto that card.
+    const beside = TWIN_PARENT_RE.exec(t)?.[1];
+    if (beside && liveIds.has(beside) && sameMeaning(await liveJson(beside), v)) { revived.push({ id: k, as: beside }); return true; }
     return true;   // live, but nothing here holds the value: report nothing
   };
   const entries = lastKnown instanceof Map ? lastKnown.entries() : Object.entries(lastKnown || {});

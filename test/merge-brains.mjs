@@ -2803,21 +2803,81 @@ const CANON_CHECKS = {};   // name -> async (engine) => true when the check hold
   ok(await k14f({ mergeBrains, revivalMap }), 'K14f: revivalMap follows a value to the card its landing stands beside, as the merge does');
   CANON_CHECKS.revivalMapStepUp = k14f;
 
-  // K14g: a copy's slot. The value X is routed to the card p; the slot X
-  // would take beside p is a twin this very merge has just folded an edit
-  // onto. That twin says something else because of this merge, not because
-  // someone saw X and edited it away: X still gets a home.
+  // K14g: a copy's slot. The card is in conflict and theirs' text X must go
+  // to a copy; the slot X would take beside the card is a twin this very
+  // merge has just folded an edit onto. That twin says something else
+  // because of this merge, not because someone saw X and edited it away: X
+  // still gets a home.
   const k14g = async (engine) => {
-    const { rest, KP, receiptK, receiptFor, withLive } = await fam(engine);
+    const { rest, KP, receiptK, withLive } = await fam(engine);
     const slot = twinIdFor(KP, pjn('X'));
-    const base = await plainOf({ txt_k: 'X', [zz]: 'q' });
-    const E = await plainOf({ txt_k: 'F', [zz]: 'X' });
-    const R = await withBin(await withLive(rest, { [KP]: 'p0', [slot]: 'X' }), { [k0]: { meta: { ...receiptK.meta, restoredAs: slot }, json: receiptK.json }, [zz]: receiptFor(zz, KP, 'w') });
-    return eachWay(engine, base, E, R, async (res) => { const t = await liveTexts(res); return t.includes('F') && t.includes('X') ? 'kept' : t.join(','); });
+    const base = await plainOf({ txt_k: 'X', [KP]: 'c' });
+    const E = await plainOf({ txt_k: 'F', [KP]: 'Y' });
+    const R = await withBin(await withLive(rest, { [KP]: 'X', [slot]: 'X' }), { [k0]: { meta: { ...receiptK.meta, restoredAs: slot }, json: receiptK.json } });
+    return eachWay(engine, base, E, R, async (res) => { const t = await liveTexts(res); return ['X', 'Y', 'F'].every((v) => t.includes(v)) ? 'kept' : t.join(','); });
   };
   const k14gGot = await k14g({ mergeBrains });
   ok(k14gGot.every((g) => g === 'kept'), `K14g: a twin this merge rewrote by a fold is no proof that anyone saw the text its slot was for${k14gGot.every((g) => g === 'kept') ? '' : `   (got ${k14gGot.join(' | ')})`}`);
   CANON_CHECKS.slotRewrittenHere = async (engine) => (await k14g(engine)).every((g) => g === 'kept');
+
+  // K14i: a ROUTED value whose slot beside the landing is taken by unrelated
+  // text (never that value: not "seen and edited away"). It needs a home of
+  // its own; counted as seen, it was on no card and the merge refused itself
+  // (review 9: fuzz). An edit folded onto the copy that held the value first.
+  const k14i = async (engine) => {
+    const { rest, KP, KT, receiptK, receiptFor, withLive } = await fam(engine);
+    const KTT = twinIdFor(KT, pjn('zz')), slot = twinIdFor(KP, pjn('X'));
+    const base = await plainOf({ txt_k: 'X', [jz]: 'X', [KP]: 'c', [KT]: 'X' });
+    const E = await plainOf({ txt_k: 'X', [jz]: 'G', [KP]: 'a', [KT]: 'X' });
+    const R = await withBin(await withLive(rest, { [KP]: 'a', [KT]: 'X', [KTT]: 'r', [slot]: 'e' }),
+      { [k0]: { meta: { ...receiptK.meta, restoredAs: KP }, json: receiptK.json }, [jz]: receiptFor(jz, KTT, 'q') });
+    return eachWay(engine, base, E, R, async (res) => { const t = await liveTexts(res); return ['G', 'X', 'a', 'e', 'r'].every((v) => t.includes(v)) ? 'kept' : t.join(','); });
+  };
+  const k14iGot = await k14i({ mergeBrains });
+  ok(k14iGot.every((g) => g === 'kept'), `K14i: a routed value whose slot is taken by unrelated text gets a home of its own — the merge completes${k14iGot.every((g) => g === 'kept') ? '' : `   (got ${k14iGot.join(' | ')})`}`);
+  CANON_CHECKS.routedNeedsHome = async (engine) => (await k14i(engine)).every((g) => g === 'kept');
+
+  // K14j: "the card beside the landing already holds the value" only where
+  // the card ITSELF will after this merge. Both sides changed the card (or
+  // nothing says who did): the content pass keeps one text on it and looks
+  // for a home for the other, and the slot may be a twin someone edited — no
+  // home at all. The value then stays a copy beside its landing (review 9,
+  // M3: the merge refused itself).
+  const k14j = async (engine) => {
+    const { rest, KP, withLive } = await fam(engine);
+    const slot = twinIdFor(KP, pjn('X'));
+    const out = [];
+    for (const base of [await plainOf({ txt_k: 'X' }), await plainOf({ txt_k: 'X', [KP]: 'c' })]) {
+      const E = await plainOf({ txt_k: 'X', [KP]: 'X' });
+      out.push(...await eachWay(engine, base, E, await withLive(rest, { [KP]: 'b', [slot]: 'e' }), async (res) => { const t = await liveTexts(res); return ['X', 'b', 'e', 'r'].every((v) => t.includes(v)) ? 'kept' : t.join(','); }));
+    }
+    return out;
+  };
+  const k14jGot = await k14j({ mergeBrains });
+  ok(k14jGot.every((g) => g === 'kept'), `K14j: a value is matched to the card beside its landing only where that card itself will hold it — where both sides changed the card it stays a copy, and the merge completes${k14jGot.every((g) => g === 'kept') ? '' : `   (got ${k14jGot.join(' | ')})`}`);
+  CANON_CHECKS.arrivesOnlyOnTheCard = async (engine) => (await k14j(engine)).every((g) => g === 'kept');
+
+  // K14k: the adopt rule and a fold. Theirs' twin holds our text (the
+  // conflict was resolved the other way round there) — but a moved edit has
+  // just folded onto that twin, so it holds the edit now. Adopting "their
+  // twin holds our text" left our text on no card (review 9, M2; the older
+  // direct form lost it too).
+  const k14k = async (engine) => {
+    const { rest, KP, KT, receiptK, withLive } = await fam(engine);
+    const KTT = twinIdFor(KT, pjn('zz'));
+    const base = await plainOf({ txt_k: 'X', [KP]: 'c' });
+    const E = await plainOf({ txt_k: 'F', [KP]: 'X' });
+    const out = [];
+    for (const direct of [false, true]) {
+      const R = direct ? await withLive(rest, { [KP]: 'b', [KT]: 'X' })
+        : await withBin(await withLive(rest, { [KP]: 'b', [KT]: 'X', [KTT]: 'r' }), { [k0]: { meta: { ...receiptK.meta, restoredAs: KTT }, json: receiptK.json } });
+      out.push(...await eachWay(engine, base, E, R, async (res) => { const t = await liveTexts(res); return ['X', 'b', 'F'].every((v) => t.includes(v)) ? 'kept' : t.join(','); }));
+    }
+    return out;
+  };
+  const k14kGot = await k14k({ mergeBrains });
+  ok(k14kGot.every((g) => g === 'kept'), `K14k: a resolution is not adopted from a twin a fold has just rewritten — our text, theirs and the folded edit all stay${k14kGot.every((g) => g === 'kept') ? '' : `   (got ${k14kGot.join(' | ')})`}`);
+  CANON_CHECKS.adoptHearsFolds = async (engine) => (await k14k(engine)).every((g) => g === 'kept');
 
   // K14h: "the card already holds the value" counts only if it still will
   // after this merge: the other side edited that text away, so the value
@@ -2876,6 +2936,97 @@ const CANON_CHECKS = {};   // name -> async (engine) => true when the check hold
   };
   const k15bGot = await k15b({ mergeBrains });
   ok(k15bGot.every((g) => g === 'stays'), `K15b: a copy beside the purged card that holds other text is someone's text, and stays${k15bGot.every((g) => g === 'stays') ? '' : `   (got ${k15bGot.join(' | ')})`}`);
+
+  // K15c–e: the same purge, the other shapes (review 9). One deletion (k at
+  // v3) restored on two machines; `rescued` is the machine where an edit the
+  // deleter never saw (v8) had taken the revival id, so its restore landed as
+  // a copy; `plain` is the machine where the id was free.
+  const k15fam = async (engine) => {
+    const buf = (r) => Buffer.from(r.buffer);
+    const del = async (b, id) => buf(await engine.mergeBrains({ base: b, ours: b, theirs: b, deletedIds: [id] }));
+    const purge = async (b, id) => buf(await purgeGraveyard(b, { ids: [id] }));
+    const ids = async (b) => (await parseKlypix(b)).canvas.order.filter((id) => id !== 'txt_anchor');
+    const s0 = await side({ live: { txt_k: pjn('v3') } });
+    const D = await del(s0, k0);
+    const plain = buf(await restoreFromGraveyard(D, [k0]));                                   // k′ = v3
+    const kr = (await ids(plain)).find((id) => /__r_[0-9a-f]+$/.test(id));
+    const rescue = buf(await engine.mergeBrains({ base: s0, ours: D, theirs: await side({ live: { txt_k: pjn('v8') } }), options: SYNC }));   // k′ = v8
+    const rescued = buf(await restoreFromGraveyard(rescue, [k0]));                            // k′ = v8, copy = v3
+    const copy = (await ids(rescued)).find((id) => /__agconf_/.test(id));
+    return { D, plain, rescued, kr, copy, del, purge, ids };
+  };
+  const afterPurge = async (engine, base, a, b2, want) => eachWay(engine, base, a, b2, async (res) => {
+    const t = (await liveTexts(res)).sort().join(',');
+    const told = res.conflicts.filter((c) => c.kind === 'purge-reached-restore').length;
+    return t === want.live && told === want.told ? 'ok' : `live[${t}] told=${told}`;
+  });
+  // K15c, the mirror: the purged card is the COPY (the rescued machine deletes
+  // and purges its restore copy); the other machine's restore is the card.
+  // Only the restored copy of that card goes: the card keeps the rescued edit.
+  const k15c = async (engine) => {
+    const { D, plain, rescued, copy, del, purge } = await k15fam(engine);
+    const A = await purge(await del(rescued, copy), copy);
+    const out = [];
+    for (const base of [D, null]) out.push(...await afterPurge(engine, base, A, plain, { live: 'v8', told: 1 }));
+    // ...and a third machine still holding the restored card syncs with the merged result: the
+    // restored text goes there too. (Whether that machine is TOLD depends on which of the two
+    // restore receipts the merged bin kept - one slot per id: with the other one the rescued
+    // text reads as an edit of its restored card, which it replaces without a report.)
+    const merged = Buffer.from((await engine.mergeBrains({ base: D, ours: A, theirs: plain, options: SYNC })).buffer);
+    out.push(...await eachWay(engine, D, plain, merged, async (res) => ((await liveTexts(res)).join(',') === 'v8' ? 'ok' : `live[${(await liveTexts(res)).join(',')}]`)));
+    return out;
+  };
+  const k15cGot = await k15c({ mergeBrains });
+  ok(k15cGot.every((g) => g === 'ok'), `K15c: the mirror — the purged card is the restore's copy, the other machine's restore is the card: the restored text goes, the card keeps the rescued edit, the restorer is told${k15cGot.every((g) => g === 'ok') ? '' : `   (got ${k15cGot.join(' | ')})`}`);
+  CANON_CHECKS.purgeMirror = async (engine) => (await k15c(engine)).every((g) => g === 'ok');
+  // K15d, the copy the purger kept: the rescued machine purges the v8 card
+  // and KEEPS its restore copy (v3). The other machine's restore sits on the
+  // purged id and goes with it, as ever; the purger's own copy stays.
+  const k15d = async (engine) => {
+    const { D, plain, rescued, kr, del, purge } = await k15fam(engine);
+    const O6 = await purge(await del(rescued, kr), kr);
+    const out = [];
+    for (const base of [D, null]) out.push(...await afterPurge(engine, base, O6, plain, { live: 'v3', told: 0 }));
+    const merged = Buffer.from((await engine.mergeBrains({ base: D, ours: O6, theirs: plain, options: SYNC })).buffer);
+    out.push(...await afterPurge(engine, merged, merged, merged, { live: 'v3', told: 0 }));       // and it stays kept on the next round
+    return out;
+  };
+  const k15dGot = await k15d({ mergeBrains });
+  ok(k15dGot.every((g) => g === 'ok'), `K15d: a copy the purging machine itself holds is one its person kept — it stays, on this merge and the next${k15dGot.every((g) => g === 'ok') ? '' : `   (got ${k15dGot.join(' | ')})`}`);
+  CANON_CHECKS.purgerKeepsItsCopy = async (engine) => (await k15d(engine)).every((g) => g === 'ok');
+  // K15e, up a chain: restored, deleted, restored again, deleted, purged. The
+  // other machine's copy of the FIRST restore is still the purged card.
+  const k15e = async (engine) => {
+    const { D, plain, rescued, kr, del, purge, ids } = await k15fam(engine);
+    const again = Buffer.from((await restoreFromGraveyard(await del(plain, kr), [kr])).buffer);
+    const krr = (await ids(again)).find((id) => id !== kr && /__r_/.test(id));
+    const A5 = await purge(await del(again, krr), krr);
+    const out = [];
+    for (const base of [D, null]) out.push(...await eachWay(engine, base, rescued, A5, async (res) => ((await liveTexts(res)).includes('v3') ? `live[${(await liveTexts(res)).join(',')}]` : 'ok')));
+    return out;
+  };
+  const k15eGot = await k15e({ mergeBrains });
+  ok(k15eGot.every((g) => g === 'ok'), `K15e: a purge reaches up a chain — restored, deleted, restored again, purged: the other machine's copy of the first restore goes too${k15eGot.every((g) => g === 'ok') ? '' : `   (got ${k15eGot.join(' | ')})`}`);
+  CANON_CHECKS.purgeUpTheChain = async (engine) => (await k15e(engine)).every((g) => g === 'ok');
+
+  // K15f: the same copy once no receipt names it any more. One bin slot per
+  // id: after an earlier merge the bin holds only ONE restore receipt for k,
+  // and it may be the purger's (naming the purged card). The copy is still a
+  // twin of the purged landing holding exactly the restored bytes: reached.
+  const k15f = async (engine) => {
+    const { D, plain, rescued, kr, copy, del, purge } = await k15fam(engine);
+    const A = await purge(await del(plain, kr), kr);
+    // the other machine's file with the purger's receipt for k in place of its own
+    const zipA = (await parseKlypix(A)).zip;
+    const receipt = { meta: JSON.parse(await zipA.file('graveyard.json').async('string')).entries[k0], json: await zipA.file(`graveyard/${shard(k0)}/${k0}.json`).async('string') };
+    const B = await withBin(rescued, { [k0]: receipt });
+    const out = [];
+    for (const base of [D, null]) out.push(...await eachWay(engine, base, B, A, async (res) => ((await liveTexts(res)).includes('v3') ? `live[${(await liveTexts(res)).join(',')}]` : 'ok')));
+    return out;
+  };
+  const k15fGot = await k15f({ mergeBrains });
+  ok(k15fGot.every((g) => g === 'ok'), `K15f: the copy is reached as a twin of the purged landing even when no restore receipt names it any more${k15fGot.every((g) => g === 'ok') ? '' : `   (got ${k15fGot.join(' | ')})`}`);
+  CANON_CHECKS.purgeReachesTwinOfRoot = async (engine) => (await k15f(engine)).every((g) => g === 'ok');
 
   // K13: a conflict twin one side rewrote while the card changed on both. The
   // placer asked "does a twin already hold this text?" of either side's copy
@@ -3380,9 +3531,57 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
     },
     {
       rule: 'a purge of a restored card reaches the copy another restore of it left beside it',
-      find: '    const via = [...(reachedVia?.rid ? [reachedVia] : []), ...(rootRestores.get(parent) || [])]',
+      find: '          if ([O, T].every((S) => !live(S, y2) || restoredCopy(S))) reach(y2, k, P, x, rid);',
+      replace: '          if (false) reach(y2, k, P, x, rid);',
+      canon: 'purgeUpTheChain', check: 'K15e',
+    },
+    {
+      rule: "a twin of the purged landing holding the restored bytes is the purged card",
+      find: "    const via = [...(reachedVia?.rid ? [reachedVia] : []), ...(rootRestores.get(parent) || []).filter((c) => !keptByPurger(c.root))]",
       replace: '    const via = [...(reachedVia?.rid ? [reachedVia] : [])]',
-      canon: 'purgeReachesSiblingRestore', check: 'K15',
+      canon: 'purgeReachesTwinOfRoot', check: 'K15f',
+    },
+    {
+      rule: 'a twin of the purged landing that the purging side itself holds is kept',
+      find: "...(rootRestores.get(parent) || []).filter((c) => !keptByPurger(c.root))]",
+      replace: '...(rootRestores.get(parent) || [])]',
+      canon: 'purgerKeepsItsCopy', check: 'K15d',
+    },
+    {
+      rule: 'where the other side holds other text at that landing, only the restored copy goes',
+      find: '            sidePurged.add(`${side}\\n${y2}`);',
+      replace: '',
+      canon: 'purgeMirror', check: 'K15c',
+    },
+    {
+      rule: 'a restored copy the purging side itself holds is kept',
+      find: '          if ([O, T].some((S) => ownsPurge(S, k) && restoredCopy(S))) continue;      // the purger kept it',
+      replace: '',
+      canon: 'purgerKeepsItsCopy', check: 'K15d',
+    },
+    {
+      rule: 'a purge follows the restores up a chain',
+      find: '        if (!seen.has(x)) { seen.add(x); next.push(x); }',
+      replace: '        if (!seen.has(x)) seen.add(x);',
+      canon: 'purgeUpTheChain', check: 'K15e',
+    },
+    {
+      rule: 'a routed value counts as seen only by a twin that held it at the base',
+      find: '        if (routed && !(heldAtBase && heldAtBase(x, v))) continue;',
+      replace: '',
+      canon: 'routedNeedsHome', check: 'K14i',
+    },
+    {
+      rule: 'where both sides changed the card beside the landing, the value is not counted as already there',
+      find: '      if (!bx || unverified) return false;',
+      replace: "      if (!bx || unverified) return opt.newOnBothSides === 'twin';",
+      canon: 'arrivesOnlyOnTheCard', check: 'K14j',
+    },
+    {
+      rule: 'a resolution is not adopted from a twin a fold rewrote',
+      find: '    twins.twinsOf(k).find((x) => fate.get(x)?.alive && !folded.has(x) && live(S, x) && sameMeaning(S.items[x], val)) ?? null;',
+      replace: '    twins.twinsOf(k).find((x) => fate.get(x)?.alive && live(S, x) && sameMeaning(S.items[x], val)) ?? null;',
+      canon: 'adoptHearsFolds', check: 'K14k',
     },
     {
       rule: "an edit made on the text the landing's own card holds lands on that card",

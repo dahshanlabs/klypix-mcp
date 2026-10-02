@@ -6,3 +6,4 @@ node_modules/
 .claude/brain-pending-ships.jsonl
 klypix-map/
 .demo-repo/
+test/.mutants-*/

@@ -116,7 +116,7 @@ await runVerb('doctor', './klypix-doctor.mjs');
 await runVerb('conformance', './klypix-conformance.mjs');
 
 // `npx klypix-mcp git-driver | diff | pr-brief` — the GitHub lane: register the
-// lossless .klypix merge driver for any repo, render a readable brain diff vs a
+// card-level .klypix merge driver for any repo, render a readable brain diff vs a
 // git ref, and print the brain cards touching a PR's changed files. One module,
 // three verbs (it reads argv[2] itself).
 await runVerb('git-driver', './klypix-git-driver.mjs');

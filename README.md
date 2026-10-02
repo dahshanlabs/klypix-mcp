@@ -133,7 +133,7 @@ npx klypix-mcp install
 
 One command for supported editors detected on this machine. It finds the project root (walking up,
 so running it from `src/` is fine), gives the project a brain if it doesn't have one, wires the
-agent tools you actually have installed, registers the lossless `.klypix` merge driver if it's a
+agent tools you actually have installed, registers the card-level `.klypix` merge driver if it's a
 git repo, and then **proves the result** before it exits:
 
 ```text
@@ -141,7 +141,7 @@ git repo, and then **proves the result** before it exits:
   brain     created brain.klypix — a starter brain, ready for its first decision
   editors   Claude Code · Cursor · Codex · Gemini CLI · Antigravity · VS Code
   wired     9 file(s) · 9 updated   (skipped 5 for tools you don't have)
-  git       lossless .klypix merge driver registered
+  git       .klypix merge driver registered
   verified  ✓ 22 tools reachable via .mcp.json (892ms)
 ```
 
@@ -541,9 +541,18 @@ That registers a merge driver for `*.klypix` (a per-machine git config line plus
 rule you commit) and provisions the engine it needs. When two people change the brain and one
 pulls, git calls the engine instead of stopping: new cards from both sides are kept, a card only
 one side edited takes that edit, and a card edited differently on both sides keeps **both**
-versions — the second as a linked twin, never a silent overwrite. Before returning, the merge
-asserts it still contains every surviving card from both sides and refuses rather than hand back a
-result that lost one.
+versions — the second as a linked twin, never a silent overwrite. (One exception to "takes that
+edit": a card is never changed to mean exactly what its own conflict twin beside it already means
+(the whole card, not only its words) — both versions stay as they are and the driver's summary line
+says so. Delete the one you do not want.) Deletions travel too: a deleted
+card leaves a receipt in the brain's Deleted cards, and the driver merges those three-way, so a
+card deleted — or permanently deleted — on one branch stays out instead of coming back from the
+other, unless the other branch edited it. That edit comes back as a new card when the deleting
+branch recorded the delete (a receipt in its Deleted cards); when it did not, the edited card
+simply stays. A permanently deleted card stays out even then: the driver's summary line counts the
+edits it dropped, and they remain in that branch's git history. Before returning, the merge asserts
+it still contains every surviving card from both sides and refuses rather than hand back a result
+that lost one.
 
 The honest boundary: a machine that has not run `git-driver install` simply gets the old binary
 conflict — safe degradation, not corruption — and git keeps both parents of every merge, so even a
@@ -570,7 +579,12 @@ was judged worse — but it is a real limit, not a guarantee.
 
 ### Restore points
 
-Merging, tidying and gardening are lossless by contract. What none of them can undo is a
+Merging, tidying and gardening are built to keep every card nobody deleted (one deliberate exception: a
+card deleted permanently also leaves the other copies of the brain when they sync, an edited copy
+included, and the merge reports that edit). Deleting permanently is not a guarantee that the text is
+gone everywhere: a copy of the card that someone restored on another machine at about the same time,
+or resized or edited after restoring it, can stay there and has to be deleted there too; and restore
+points and git history keep what they already held. What none of them can undo is a
 *deliberate-looking* deletion: you select a dozen cards, delete them, and save. That is not a bug
 to prevent — a brain has to stay correctable, and an uncorrectable memory is worse than none — but
 it deserves a way back, because the brain is **co-owned**: hooks, the MCP server, commit capture
@@ -583,6 +597,12 @@ So every brain write takes a restore point of the previous bytes first:
 npx klypix-mcp brain-history list          # age, card count, delta against the brain now
 npx klypix-mcp brain-history restore <id>  # and this is itself undoable
 ```
+
+A restore is a merge into the brain as it is now, not a copy over the file, and it prints what it
+changed. The point's cards come back — a card deleted since returns under a new id, so every other
+copy of the brain agrees the old one was deleted — and cards written after the point move to
+Deleted cards (`npx klypix-mcp brain-deleted list`), where each one can be restored. Permanently
+deleted cards stay out unless you pass `--include-purged`.
 
 They live under `~/.claude/project-brain/history/`, never beside the brain — nothing lands in git,
 in the merge driver's path, or in your diffs, and they survive deletion of the `.klypix` file
@@ -608,7 +628,7 @@ The MCP verbs below are what agents call. These are what **you** call:
 | `npx klypix-mcp doctor` | One verdict: version, hosts, live sessions, tool count, drift. Exits non-zero — usable as a CI gate |
 | `npx klypix-mcp runtime` | Passive per-connection process/RAM attribution (`--json`, optional `--watch seconds`); never kills or deduplicates |
 | `npx klypix-mcp conformance` | Launch two real MCP clients against this build and verify coordination behaviour |
-| `npx klypix-mcp git-driver` | Register the lossless `.klypix` merge driver for a repo (`status` to check) |
+| `npx klypix-mcp git-driver` | Register the card-level `.klypix` merge driver for a repo (`status` to check) |
 | `npx klypix-mcp git-hook` | Wire the agent-neutral commit-capture hook: rationale-bearing `feat`/`fix`/`perf` commits from any agent, branch, or worktree card into the brain at commit time (`install`/`remove`/`status`; sessions auto-install it where the hook slots are free) |
 | `npx klypix-mcp brain-history` | Restore points for this brain — `list` them, `restore <id>` one. Written automatically before every brain write, kept machine-local, and never throttled away for a write that removes cards |
 | `npx klypix-mcp diff [ref]` | Card-level brain diff against a git ref, as markdown |

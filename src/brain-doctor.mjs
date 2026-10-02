@@ -523,6 +523,43 @@ export function inspectDecayGuard(brainDir, lib, now = Date.now()) {
   };
 }
 
+// ── MERGE ENGINE layer (Stage 2, brain 1.89) ─────────────────────────────────
+// Brain Sync, the git driver, history restore and arrange rely on the
+// receipt-aware engine (merge-brains.mjs, MERGE_ENGINE_FEATURES.api ≥ 2) and on
+// a driver that asks for it (DRIVER_OPTIONS_API ≥ 2). Installs mix file
+// generations — a desktop bundle beside a dev-owned ~/.claude, an older
+// `git-driver install` — and an api-1 file under a 1.89 brain runs pre-1.89 rules:
+// a card deleted here comes back from a copy that still has it. Read the
+// DEPLOYED text, no import (the doctor stays synchronous and must diagnose a
+// broken bundle). A file without the marker is api 1; a marker that does not
+// parse is unknown, never a guess.
+const MERGE_ENGINE_SINCE = '1.89.0';
+export function inspectMergeEngine(brainDir) {
+  const scan = (file, marker, re) => {
+    const src = readText(path.join(brainDir, file));
+    if (src == null) return { present: false, api: null };
+    if (!src.includes(marker)) return { present: true, api: 1 };
+    const m = src.match(re);
+    return { present: true, api: m ? Number(m[1]) : null };
+  };
+  return {
+    engine: scan('merge-brains.mjs', 'MERGE_ENGINE_FEATURES', /MERGE_ENGINE_FEATURES\s*=\s*Object\.freeze\(\{[^}]*?\bapi:\s*(\d+)/),
+    driver: scan('klypix-merge-driver.mjs', 'DRIVER_OPTIONS_API', /\bDRIVER_OPTIONS_API\s*=\s*(\d+)/),
+  };
+}
+// ok | drift (an api-1 file under a ≥ 1.89 brain) | absent (no engine file) |
+// unknown (a marker that does not parse) | n/a (brain older than 1.89, or no
+// baked version to compare).
+function mergeEngineLayer(mergeEngine, baked) {
+  if (!baked || cmpSemver(baked, MERGE_ENGINE_SINCE) < 0) return 'n/a';
+  const { engine, driver } = mergeEngine;
+  const low = (x) => x.present && x.api != null && x.api < 2;
+  if (low(engine) || low(driver)) return 'drift';
+  if (!engine.present) return 'absent';
+  if (engine.api == null || (driver.present && driver.api == null)) return 'unknown';
+  return 'ok';
+}
+
 /**
  * Inspect this machine's brain (+ a project's harness projection) as one report.
  * @param {{ projectDir?: string, home?: string, now?: number, npmLatest?: string|null }} [opts]
@@ -608,6 +645,7 @@ export function inspect(opts = {}) {
   const peers = inspectPeers(brainDir, brainPath, now, receiptSessionId);
   // opts.fmtLib is a test seam (stub engines); production uses the module lib.
   const decayGuard = inspectDecayGuard(brainDir, opts.fmtLib !== undefined ? opts.fmtLib : fmtLib, now);
+  const mergeEngine = inspectMergeEngine(brainDir);
 
   // Harness drift only counts toward the verdict for a real brain project; auditProject
   // against the BAKED brain version (the deployed truth) when available.
@@ -688,6 +726,9 @@ export function inspect(opts = {}) {
     decayGuard: !decayGuard.libLoaded ? 'unknown'
       : (!decayGuard.exported || decayGuard.rendererStamps === false
         || decayGuard.deployedFmtCurrent === false || decayGuard.deployedHookCurrent === false) ? 'drift' : 'ok',
+    // MERGE drifts only on an engine or driver provably OLDER than the brain;
+    // a missing or unreadable file is a fact to show, not a verdict flip.
+    mergeEngine: mergeEngineLayer(mergeEngine, version.baked),
   };
   const drifted = Object.values(layers).filter(s => s === 'drift').length;
   // A live session that has not declared task scope cannot contribute overlap
@@ -726,6 +767,10 @@ export function inspect(opts = {}) {
     if (hooks.missing.length) actions.push(`npx klypix-mcp install   # half-wired: hooks not active — ${hooks.missing.join(', ')}`);
     if (hasBrain && !harness.ok) actions.push('automatic harness repair pending   # retried at the next brain_sync/update check; no manual link command required');
     if (layers.decayGuard === 'drift') actions.push('npx klypix-mcp install   # decay-aware status guard missing/stale — stale build/deploy claims can render as CURRENT state');
+    if (layers.mergeEngine === 'drift') {
+      const old = [mergeEngine.engine.api < 2 && 'merge-brains.mjs', mergeEngine.driver.api < 2 && 'klypix-merge-driver.mjs'].filter(Boolean).join(' + ');
+      actions.push(`${version.dev ? 'npx klypix-mcp install --force (or re-deploy from the checkout that owns this dev install)' : 'npx klypix-mcp install'}   # ${old} predates brain v${version.baked} — restores, Arrange and the git driver run pre-1.89 rules, so a deleted card can come back from another copy`);
+    }
     for (const s of supervisors.impaired || []) {
       const why = s.workerImpaired ? 'has no live worker; tool calls cannot complete' : `cannot confirm host delivery (${s.deliveryStatus})`;
       actions.push(`/mcp reconnect   # supervisor pid ${s.pid} ${why}`);
@@ -744,7 +789,7 @@ export function inspect(opts = {}) {
 
   // `checkout` is additive (schema-stable): downstream renderers keep parsing
   // every existing field; it never feeds layers/verdict/actions by design.
-  return { verdict, layers, drifted, readinessWarnings, version, running, supervisors, autoUpdate, hooks, codexSmart, codexHooks, gitCapture, history, provenance, tools, peers, sessions: peers, receipts: peers.receipts, receiptSessionId, harness, npm, decayGuard, checkout, project: { dir: projectDir, brainPath, hasBrain }, brainDir, actions };
+  return { verdict, layers, drifted, readinessWarnings, version, running, supervisors, autoUpdate, hooks, codexSmart, codexHooks, gitCapture, history, provenance, tools, peers, sessions: peers, receipts: peers.receipts, receiptSessionId, harness, npm, decayGuard, mergeEngine, checkout, project: { dir: projectDir, brainPath, hasBrain }, brainDir, actions };
 }
 
 // One-line drift summary (empty when clean) — for a footer / status line.
@@ -766,6 +811,7 @@ export function driftLine(r) {
   if (r.hooks.missing.length) bits.push(`${r.hooks.missing.length} hook(s) unwired`);
   if (r.project.hasBrain && !r.harness.ok) bits.push(`${r.harness.drift.length} harness file(s) drifted`);
   if (r.layers?.decayGuard === 'drift') bits.push('decay-guard stale (fast-decay status claims unstamped)');
+  if (r.layers?.mergeEngine === 'drift') bits.push('merge engine older than the brain (deleted cards can come back)');
   return bits.length ? `⚠️ brain DRIFTED: ${bits.join(' · ')}` : '';
 }
 
@@ -945,6 +991,18 @@ export function render(r, opts = {}) {
             : 'deployed global-brain-hook.mjs predates message stamps';
       L.push(`${dmark} ${c.bold}DECAY${c.rst}    ${c.red}${why} — stale status claims can render as CURRENT state${c.rst}`);
     }
+  }
+
+  // MERGE ENGINE (Stage 2: receipts, restore as a merge, arrange burials)
+  if (r.mergeEngine && r.layers.mergeEngine && r.layers.mergeEngine !== 'n/a') {
+    const m = r.mergeEngine;
+    const said = (x) => (!x.present ? 'missing' : x.api == null ? 'api ?' : `api ${x.api}`);
+    const state = r.layers.mergeEngine;
+    const mmark = state === 'ok' ? ok : warn;
+    const tail = state === 'drift' ? `  ${c.red}older than brain v${r.version.baked} — a deleted card can come back from another copy${c.rst}`
+      : state === 'absent' ? `  ${c.dim}history restore replaces the whole file; \`npx klypix-mcp install\` adds the engine${c.rst}`
+        : state === 'unknown' ? `  ${c.dim}(version marker unreadable)${c.rst}` : '';
+    L.push(`${mmark} ${c.bold}MERGE${c.rst}    engine ${said(m.engine)} · git driver ${said(m.driver)}${tail}`);
   }
 
   // SESSIONS: logical sessions are deduplicated only by explicit identity.

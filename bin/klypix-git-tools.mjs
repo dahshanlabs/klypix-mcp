@@ -2,7 +2,7 @@
 // klypix-git-tools — the GitHub lane: three verbs that put the brain where
 // dev teams actually live (the repo and the PR page).
 //
-//   git-driver [install|status] [repo]   register the lossless .klypix merge
+//   git-driver [install|status] [repo]   register the card-level .klypix merge
 //                                        driver for a repo, zero-command
 //   diff [ref] [--brain <path>]          readable brain diff vs a git ref
 //   pr-brief [baseRef] [--brain <path>]  brain cards touching the files
@@ -85,21 +85,51 @@ async function loadEngine() {
 
 // ── git-driver ──────────────────────────────────────────────────────────────
 
-const ENGINE_FILES = ['klypix-merge-driver.mjs', 'merge-brains.mjs', 'klypix-format.mjs', 'brain-graveyard.mjs'];
+// Dependencies first: klypix-format ← brain-graveyard ← merge-brains ← driver.
+// Each file is swapped in atomically, so at every moment the set on disk can
+// link — a new merge-brains beside an old klypix-format is the one mix that
+// cannot (it imports names the old file lacks).
+const ENGINE_FILES = ['klypix-format.mjs', 'brain-graveyard.mjs', 'merge-brains.mjs', 'klypix-merge-driver.mjs'];
 const ENGINE_DEPS = ['jszip', 'fractional-indexing'];
+
+const readJson = (p) => { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; } };
 
 // Make sure the INSTALLED runtime can actually run the driver: the four
 // engine files plus their two runtime deps. This is deliberately a
 // light provision — it never touches hooks or servers; the full installer
 // remains `npx klypix-mcp install`.
-function ensureDriverRuntime() {
+//
+// Never a downgrade. The same files arrive from the full installer, the
+// desktop bundle and auto-update; an older `npx klypix-mcp git-driver install`
+// (or a pinned devDependency) must not put its engine under a newer one. So
+// the files are copied only when the install gate says this package may
+// install (brainInstallDecision — the same rule the full installer uses), and
+// then always as the whole set.
+async function ensureDriverRuntime() {
   const provisioned = [];
   fs.mkdirSync(BRAIN_DIR, { recursive: true });
-  for (const f of ENGINE_FILES) {
-    const dest = path.join(BRAIN_DIR, f);
-    const srcFile = path.join(SRC, f);
-    if (!fs.existsSync(dest) || fs.readFileSync(dest, 'utf8') !== fs.readFileSync(srcFile, 'utf8')) {
-      fs.copyFileSync(srcFile, dest);
+  const { brainInstallDecision } = await import(new URL('../src/install-version.mjs', import.meta.url).href);
+  const pkg = readJson(path.join(HERE, '..', 'package.json'));
+  const stamp = readJson(path.join(BRAIN_DIR, '.brain-version.json'));
+  const runtime = readJson(path.join(BRAIN_DIR, '.mcp-runtime.json'));
+  const decision = brainInstallDecision({ candidateVersion: pkg?.version, stamp, runtime });
+  const result = { provisioned };
+  if (decision.action === 'preserve') {
+    const owner = decision.reason === 'dev-owned' ? 'a dev deploy' : `v${decision.installedVersion}${stamp?.via ? ` (via ${stamp.via})` : ''}`;
+    result.kept = `kept the engine installed by ${owner}; this package is v${decision.candidateVersion}`;
+    const missing = ENGINE_FILES.filter((f) => !fs.existsSync(path.join(BRAIN_DIR, f)));
+    if (missing.length) result.missing = missing;
+  } else {
+    // Only files that differ are written, so what is on disk afterwards is
+    // exactly this package's set.
+    for (const f of ENGINE_FILES) {
+      const dest = path.join(BRAIN_DIR, f);
+      const body = fs.readFileSync(path.join(SRC, f), 'utf8');
+      if (fs.existsSync(dest) && fs.readFileSync(dest, 'utf8') === body) continue;
+      const tmp = `${dest}.klypix-new-${process.pid}`;
+      fs.writeFileSync(tmp, body);
+      try { fs.renameSync(tmp, dest); }
+      catch (err) { try { fs.unlinkSync(tmp); } catch { /* */ } throw err; }
       provisioned.push(f);
     }
   }
@@ -152,7 +182,7 @@ function ensureDriverRuntime() {
   };
   const seen = new Set();
   for (const dep of ENGINE_DEPS) provisionDep(dep, path.join(HERE, '..'), seen);
-  return provisioned;
+  return result;
 }
 
 const DRIVER_ATTR_RULE = '*.klypix merge=klypix -text';
@@ -180,21 +210,23 @@ async function gitDriver() {
     process.exit(configured && gaHasRule && runtimeOk ? 0 : 1);
   }
 
-  const provisioned = ensureDriverRuntime();
+  const { provisioned, kept, missing } = await ensureDriverRuntime();
   let already = false;
   try { already = (await gitText(toplevel, 'config', '--get', 'merge.klypix.driver')) === driverCmd; } catch { /* unset */ }
   if (!already) {
-    await git(toplevel, ['config', 'merge.klypix.name', 'KLYPIX lossless brain merge (union by card id)']);
+    await git(toplevel, ['config', 'merge.klypix.name', 'KLYPIX brain merge (3-way, card by card)']);
     await git(toplevel, ['config', 'merge.klypix.driver', driverCmd]);
   }
   let gaState = 'present';
   if (!gaHasRule) {
-    const rule = `${gaText && !gaText.endsWith('\n') ? '\n' : ''}# .klypix brains merge losslessly via the KLYPIX 3-way union driver\n# (per-machine registration: npx klypix-mcp git-driver install).\n${DRIVER_ATTR_RULE}\n`;
+    const rule = `${gaText && !gaText.endsWith('\n') ? '\n' : ''}# .klypix brains merge card by card via the KLYPIX 3-way driver\n# (per-machine registration: npx klypix-mcp git-driver install).\n${DRIVER_ATTR_RULE}\n`;
     fs.appendFileSync(gaPath, rule);
     gaState = 'added';
   }
   console.log(`✓ ${already ? 'Already registered' : 'Registered'} the .klypix merge driver for ${toplevel}`);
   console.log(`    driver: ${driverPath}${provisioned.length ? `  (provisioned: ${provisioned.join(', ')})` : ''}`);
+  if (kept) console.log(`    engine: ${kept}`);
+  if (missing?.length) console.log(`    ! the installed engine is missing ${missing.join(', ')} — repair it with: npx klypix-mcp@latest install`);
   console.log(`    .gitattributes rule: ${gaState}${gaState === 'added' ? ' — commit it so every teammate\'s clone routes .klypix merges here' : ''}`);
   console.log('  Teammates run the same command once per machine; unregistered machines fall back to a normal conflict.');
 }

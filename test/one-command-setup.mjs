@@ -47,6 +47,7 @@ const CLI = path.join(__dirname, '..', 'bin', 'klypix-mcp.mjs');
 let pass = 0;
 const ok = (label, cond) => { assert.ok(cond, label); pass++; };
 const tmps = [];
+const savedEnv = {};
 function tmpdir(name) {
   const d = fs.mkdtempSync(path.join(os.tmpdir(), `klypix-${name}-`));
   tmps.push(d);
@@ -143,6 +144,15 @@ try {
   ok('S9 a config without a klypix entry fails closed', readLaunchSpec(path.join(shapes, 'empty.json')).ok === false);
 
   // ---- S12 — the whole command, on a fresh repo --------------------------
+  // From here on the command runs for real: it installs the git driver's
+  // engine and starts the server to prove it works. On the REAL home that
+  // replaced the live ~/.claude/project-brain engine with this checkout's
+  // (2 Oct 2026, a gate run of an unreleased branch) and left cache and
+  // session files for the fixture repos there. Every write outside the
+  // fixture repos now lands in a throwaway home; finally{} restores the env.
+  const fakeHome = tmpdir('home-setup');
+  for (const k of ['HOME', 'USERPROFILE', 'KLYPIX_BRAIN_DIR']) savedEnv[k] = process.env[k];
+  Object.assign(process.env, { HOME: fakeHome, USERPROFILE: fakeHome, KLYPIX_BRAIN_DIR: path.join(fakeHome, '.claude', 'project-brain') });
   const fresh = tmpdir('setup');
   git(fresh, 'init', '-q');
   fs.writeFileSync(path.join(fresh, 'README.md'), '# fixture\n');
@@ -207,5 +217,6 @@ try {
 
   console.log(`✓ one-command setup — ${pass}/${pass} assertions`);
 } finally {
+  for (const [k, v] of Object.entries(savedEnv)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
   for (const d of tmps) { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* temp */ } }
 }

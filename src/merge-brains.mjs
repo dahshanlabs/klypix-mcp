@@ -136,8 +136,9 @@
 //     of it holding exactly the bytes that restore put back: the same
 //     deletion restored on another machine, landed as a copy because an edit
 //     the deleter never saw had taken the id (seed 98843). Never a twin the
-//     purging side itself holds live. The purge does not follow the restore
-//     further (the mirror, a chain, an edited copy): limits, see there.
+//     purging side itself holds, live or in its own Deleted cards. The
+//     purge does not follow the restore further (the mirror, a chain, a copy
+//     of a copy, an edited copy): the LIMITS listed above `rootRestores`.
 //   • A routed value counts as "seen and edited away" only by a twin that
 //     held it at the base; a slot merely taken by other text is skipped, and
 //     a resolution is never adopted from a twin a fold has just rewritten.
@@ -925,21 +926,33 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
   // (certifying soak, seed 98843). So a purged id that a restore receipt
   // names as its landing stands for that restore here: a twin of it holding
   // exactly the bytes that restore put back is the purged card.
-  //   • Never a twin the purging side itself holds live: its person had that
-  //     card in front of them and kept it (they purged another card of the
-  //     family — the edit at the id — not this text).
+  //   • Never a twin the purging side itself holds — live, or deleted in its
+  //     own Deleted cards: its person had that card in front of them and
+  //     kept it, or deleted it without purging it (they purged another card
+  //     of the family — the edit at the id — not this text).
   //   • Under 'unverified' a foreign receipt widens nothing: only ours and
   //     the base's are read.
+  // What this reach takes with the twin: its Deleted-cards entry too, when
+  // no side holds it live and every entry holds those bytes (the purged text
+  // must not stay restorable); and a twin of the purged id that someone typed
+  // independently with exactly the same bytes (indistinguishable).
   // LIMITS, written down and pinned as such (K15L): the purge does not follow
-  // the restore any further than that twin. It does not reach the same
-  // deletion restored elsewhere when the purged card was the COPY and the
-  // other machine's restore is the card; nor a landing a restore-of-a-restore
-  // chain leads to; nor a copy that was resized or edited since. A wider
-  // reach that walked the receipts was tried and withdrawn: it replaced a
-  // restorable entry of a text nobody had purged, and what it reached
-  // depended on which of two restore receipts had kept the bin's one slot
-  // (review 10). Closing these needs a durable mark on the purge itself
-  // (Stage 3).
+  // the restore any further than that twin. It does not reach
+  //   - the other machine's restore when the purged card was itself the COPY
+  //     (the other restore is then the card);
+  //   - the other machine's copy of an EARLIER restore, when the purged card
+  //     was restored, deleted and restored again (the older walk reaches the
+  //     landings DOWN a receipt chain from the purged id, not the other
+  //     copies of the restores above it);
+  //   - a copy of a copy (the slot beside the card held other text when the
+  //     restore landed), or a purged card that is itself such a copy;
+  //   - a copy that was resized or edited since;
+  //   - a copy the purging side itself holds: the text then stays on every
+  //     machine, not only on the other one.
+  // A wider reach that walked the receipts was tried and withdrawn (review
+  // 10): what it reached depended on which of two restore receipts had kept
+  // the bin's one slot. Closing these needs a durable mark on the purge
+  // itself (Stage 3).
   const ownsPurge = (S, k) => { const e = S?.graveyard?.[k]; return !!e && entryKind(e.meta) === 'P'; };
   const rootRestores = new Map();    // a purged landing -> [{ root, from, rid }] of the restores that landed there
   for (const S of (unverified ? [O, B] : [O, T, B])) for (const [x, e] of Object.entries(S?.graveyard || {})) {
@@ -960,7 +973,13 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
       : [O, T].map((S) => eOf(S, x)).filter((e) => e && entryKind(e.meta) === 'F').map((e) => e.json);
     if (!copies.length) continue;
     const reachedVia = reached.get(parent);
-    const keptByPurger = (root) => [O, T].some((S) => ownsPurge(S, root) && live(S, x));
+    // ...kept: the purging side holds this twin live, or holds it deleted in
+    // its OWN Deleted cards (a full entry: it deleted the copy, it did not
+    // purge it — that text is restorable and nobody purged it; replaced by a
+    // derived purge receipt it was on no card and in no bin, and nothing was
+    // said: review 11, M1).
+    const ownsFullEntry = (S) => { const e = S?.graveyard?.[x]; return !!e && entryKind(e.meta) === 'F'; };
+    const keptByPurger = (root) => [O, T].some((S) => ownsPurge(S, root) && (live(S, x) || ownsFullEntry(S)));
     const via = [...(reachedVia?.rid ? [reachedVia] : []), ...(rootRestores.get(parent) || []).filter((c) => !keptByPurger(c.root))]
       .find((c) => copies.every((v) => fullEntryRid(c.from, v) === c.rid));
     if (via) reachedTwins.push([x, via]);
@@ -1187,8 +1206,16 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
   // ids routed to one card, one carrying the card's text and one an edit of
   // it: the fold displaced the text the first had just been matched to, and
   // the merge refused itself, E-13 - review 8, S2).
+  // ...nor over a twin of it holding that same value: when the content pass
+  // then puts another text on the card, that twin is the value's home (a
+  // step-up fold took it, the value's slot was taken, and the merge refused
+  // itself — review 11, S1).
   const heldFor = new Set();
-  const arriveAtHolder = (mv, x) => { heldFor.add(x); return arrive(mv, x); };
+  const arriveAtHolder = (mv, x) => {
+    heldFor.add(x);
+    for (const y of twins.twinsOf(x)) if (twins.holds(y, mv.v)) heldFor.add(y);
+    return arrive(mv, x);
+  };
   const landIntoAlive = (mv, t) => {
     if (twins.holds(t, mv.v)) return arriveAtHolder(mv, t);
     for (const x of twins.twinsOf(t)) if (twins.holds(x, mv.v)) return arriveAtHolder(mv, x);

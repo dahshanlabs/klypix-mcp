@@ -3404,7 +3404,7 @@ export function createMcpPresence({
         modelContext: shouldDeliverMessages ? 'supported-klypix-action' : 'deferred',
         stateMachine: 'pending -> offered -> acknowledged -> consumed (auto-lease on the next independent action, or explicit receipt) | failed',
         acknowledgement: 'a later independent supported action followed an offer; a further independent action auto-consumes the lease, and explicit token-bound brain_message_receipt records the stronger acted-on-it claim',
-        retention: 'machine-local; 24h TTL and bounded lane capacity; expiry fails only never-delivered or offered-once records — an acknowledged note retires as delivered-unconfirmed, never as failed',
+        retention: 'machine-local; a directed note is kept 7 days, a broadcast 24h, within bounded lane capacity; expiry fails only never-delivered or offered-once records — an acknowledged note retires as delivered-unconfirmed, never as failed',
         writeOk: shouldDeliverMessages ? report.deliveryWriteOk : null,
         ...(report.deliveryWriteSkippedReason ? { writeFailure: report.deliveryWriteSkippedReason } : {}),
       },

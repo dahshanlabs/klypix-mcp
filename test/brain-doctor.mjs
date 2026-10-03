@@ -659,11 +659,12 @@ const supervisorReceipt = (brainDir, name, state) => writeJson(path.join(brainDi
   const run = (extra = {}) => inspect({ home, projectDir: project, now: NOW, fmtLib: null, env: ON, ...extra });
   const textOf = (r) => render(r, { color: false });
   const auLine = (text) => text.split('\n').find((line) => /AUTO-UPDATE/.test(line)) || '';
-  // Every supervisor receipt carries bootedAt; overdue counts from when a
-  // session was open to run the check (F9, 2026-10-03 review).
+  // A live supervisor that polled the update schedule 5 min ago: since K3 its
+  // receipt's lastPollAt is the evidence that a session was there to run a due
+  // check (F9's "open since" no longer counts on its own).
   const liveSupervisor = (extra = {}) => supervisorReceipt(brainDir, 'live', {
     bootedAt: iso(NOW - 10 * HOUR), updatedAt: iso(NOW - 30_000), active: { pid: process.pid, version: PKG_VERSION },
-    autoUpdate: { enabled: true }, supervisorVersion: PKG_VERSION, ...extra,
+    autoUpdate: { enabled: true, lastPollAt: iso(NOW - 5 * 60_000) }, supervisorVersion: PKG_VERSION, ...extra,
   });
   const current = (checkedAgo, extra = {}) => ({
     protocol: 1, result: 'current', checkedAt: iso(NOW - checkedAgo),
@@ -765,20 +766,40 @@ const supervisorReceipt = (brainDir, name, state) => writeJson(path.join(brainDi
   liveSupervisor();
   r = run();
   ok(r.autoUpdate.overdue === true && /check overdue by 2h — no running session performed the check/.test(auLine(textOf(r)))
-    && r.verdict === 'PARTIAL',
-  'A5: the same check with a live connection is overdue by 2h → PARTIAL');
-  // F9 (2026-10-03 review): a session that opened a second ago has not had its
-  // chance to run the check (its 2 s start delay), so it is no evidence of a
-  // stuck updater — "overdue by 2h" in the first seconds after an idle night.
-  liveSupervisor({ bootedAt: iso(NOW - 1_000) });
+    && r.verdict === 'PARTIAL' && r.autoUpdate.overdueEvidence?.lastPollAt === iso(NOW - 5 * 60_000),
+  'A5: the same check, polled by a live connection since it fell due, is overdue by 2h → PARTIAL');
+  // K3 (2026-10-03): the evidence is a POLL after the check fell due, never a
+  // session merely open since before it.
+  liveSupervisor({ autoUpdate: { enabled: true, lastPollAt: iso(NOW - 2 * HOUR - 20 * 60_000) } });
   r = run();
-  ok(r.autoUpdate.overdue === false && r.autoUpdate.overdueSuppressed === 'session-too-new'
+  ok(r.autoUpdate.overdue === false && r.autoUpdate.overdueSuppressed === 'no-poll-evidence'
     && r.verdict === 'ALIGNED' && /check due now/.test(auLine(textOf(r))),
-  'F9: a check due 2 h ago with only a just-started session is due now, not overdue');
-  liveSupervisor({ bootedAt: iso(NOW - 40 * 60_000) });
+  'K3: a machine that slept across the due time (last poll before it) reads "due now" on waking, not overdue — though its session has been open 10 h');
+  supervisorReceipt(brainDir, 'live', {
+    bootedAt: iso(NOW - 10 * HOUR), updatedAt: iso(NOW - 30_000), active: { pid: process.pid, version: PKG_VERSION },
+    autoUpdate: { enabled: true },
+  });
   r = run();
-  ok(r.autoUpdate.overdue === true && /check overdue by 40m/.test(auLine(textOf(r))),
-    'F9: … once that session has been open 30 min without running it, it is overdue — by the time it was open');
+  ok(r.supervisors.preFix.length === 1 && r.autoUpdate.overdue === false && r.autoUpdate.overdueSuppressed === 'no-poll-evidence'
+    && r.verdict === 'ALIGNED',
+  'K3: only pre-fix receipts (no lastPollAt) → overdue is not judged');
+  // F9 (2026-10-03 review): a session that opened seconds ago — the first
+  // SessionStart after an idle night — has polled, but the helper its poll
+  // launched has not taken the lock yet. That poll is no evidence yet.
+  liveSupervisor({ bootedAt: iso(NOW - 4_000), autoUpdate: { enabled: true, lastPollAt: iso(NOW - 2_000) } });
+  r = run();
+  ok(r.autoUpdate.overdue === false && r.autoUpdate.overdueSuppressed === 'no-poll-evidence'
+    && r.verdict === 'ALIGNED' && /check due now/.test(auLine(textOf(r))),
+  'K3/F9: a check due 2 h ago with only a session that polled seconds ago is due now, not overdue');
+  writeJson(files.stamp, { protocol: 1, lastCheck: NOW - 6 * HOUR - 30 * 60_000, failures: 0, nextCheckAt: NOW - 30 * 60_000, identity: npmIdentity });
+  liveSupervisor({ autoUpdate: { enabled: true, lastPollAt: iso(NOW - 25 * 60_000) } });
+  r = run();
+  ok(r.autoUpdate.overdue === true && /check overdue by 30m — no running session performed the check/.test(auLine(textOf(r))),
+    'K3: a tick 5 min after the check fell due that left the stamp unmoved → overdue once it is 30 min past due');
+  writeJson(files.stamp, { protocol: 1, lastCheck: NOW - 6 * HOUR - 29 * 60_000, failures: 0, nextCheckAt: NOW - 29 * 60_000, identity: npmIdentity });
+  liveSupervisor({ autoUpdate: { enabled: true, lastPollAt: iso(NOW - 24 * 60_000) } });
+  r = run();
+  ok(r.autoUpdate.overdue === false && /check due now/.test(auLine(textOf(r))), 'K3: … and not a minute sooner');
   liveSupervisor({ autoUpdate: { enabled: false } });
   r = run();
   ok(r.autoUpdate.overdue === false && r.layers.autoUpdate === 'off'
@@ -873,18 +894,18 @@ const supervisorReceipt = (brainDir, name, state) => writeJson(path.join(brainDi
     && r.autoUpdate.consecutiveFailures === 0 && /^\[ok\]/.test(line),
   `A9: a check in progress is shown as such, and its pessimistic pre-stamp is not a failure yet (${line})`);
   reset();
-  liveSupervisor({ bootedAt: iso(NOW - 5 * 60_000) });
+  liveSupervisor({ bootedAt: iso(NOW - 40_000), autoUpdate: { enabled: true, lastPollAt: iso(NOW - 38_000) } });
   r = run();
   ok(r.autoUpdate.overdue === false && /no check recorded yet · check due now/.test(auLine(textOf(r))),
-    'A9: never checked, with a session open 5 min, is "due now"');
+    'A9: never checked, with a session whose first poll is seconds old, is "due now"');
   // F9 (2026-10-03 review): never-checked is due "now" by construction, so it
   // could never read overdue — a helper that never starts sat at "check due
-  // now" forever. A session open 10 h that never ran it is evidence.
+  // now" forever. A session that polled 5 min ago and left no stamp is evidence.
   liveSupervisor();
   r = run();
   ok(r.autoUpdate.overdue === true && /no check recorded yet · check overdue by 10h — no running session performed the check/.test(auLine(textOf(r)))
     && r.verdict === 'PARTIAL',
-  'F9: never checked while a session has been open 10 h is overdue by 10h (measured from that session\'s start)');
+  'F9/K3: never checked, though a session open 10 h polled 5 min ago, is overdue by 10h (measured from that session\'s start)');
   reset();
   writeJson(files.stamp, { protocol: 1, lastCheck: NOW - 30 * 60_000, failures: 1, nextCheckAt: NOW - 15 * 60_000, identity: npmIdentity });
   writeJson(files.status, current(7 * HOUR));

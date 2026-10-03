@@ -1385,12 +1385,45 @@ try {
     }
   };
 
+  // ── K3 (2026-10-03): every auto-update poll tick is receipted as
+  // autoUpdate.lastPollAt — the overdue rule's evidence that a session was there
+  // to run a due check. Nothing here may contact npm: a fresh check AND a live
+  // lock owned by this test process keep the schedule from being due, so the
+  // poll launches no helper (one started anyway would exit throttled or busy).
+  const pollIsReceipted = () => scenario('poll-receipt', async (track) => {
+    const dir = runtimeDir('poll-receipt');
+    install(dir, '90.0.0', { identity: true });
+    const now = Date.now();
+    const identity = { version: '90.0.0', managed: true, dev: false };
+    const stampFile = path.join(dir, '.autoupdate-check.json');
+    const lockFile = path.join(dir, '.autoupdate.lock');
+    fs.writeFileSync(stampFile, JSON.stringify({ protocol: 1, lastCheck: now - 60_000, failures: 0, nextCheckAt: now + 6 * 3_600_000, identity }));
+    fs.writeFileSync(path.join(dir, '.autoupdate-status.json'), JSON.stringify({
+      protocol: 1, result: 'current', checkedAt: new Date(now - 60_000).toISOString(), currentVersion: '90.0.0', latestVersion: '90.0.0', identity,
+    }));
+    fs.writeFileSync(lockFile, JSON.stringify({ protocol: 1, token: `${process.pid}-k3-fixture`, pid: process.pid, acquiredAt: now }));
+    const stampBefore = fs.readFileSync(stampFile, 'utf8');
+    const lockBefore = fs.readFileSync(lockFile, 'utf8');
+    const started = Date.now();
+    const pair = track(await openPair(dir, 'k3-poll', {
+      env: { KLYPIX_AUTO_UPDATE: '', KLYPIX_MCP_AUTO_UPDATE_START_DELAY_MS: '300', KLYPIX_WORKER_HIBERNATE_MS: '0' },
+    }));
+    ok(await answer(pair) === '90.0.0', 'K3: a pair with automatic updates on serves its worker');
+    const receipt = await waitFor(async () => { const s = pair.state(); return s?.autoUpdate?.lastPollAt ? s : null; }, 15000);
+    const polledAt = Date.parse(receipt.autoUpdate.lastPollAt);
+    ok(receipt.autoUpdate.enabled === true && polledAt >= started - 1000 && polledAt <= Date.now() && receipt.autoUpdate.due === false,
+      `K3: the supervisor receipts its auto-update poll as autoUpdate.lastPollAt (${receipt.autoUpdate.lastPollAt})`);
+    ok(fs.readFileSync(stampFile, 'utf8') === stampBefore && fs.readFileSync(lockFile, 'utf8') === lockBefore,
+      'K3: that poll launched no helper here — the schedule was not due; the stamp and the lock are untouched');
+  });
+
   await Promise.all([
     bootDuringInstallStartsPrev(),
     bootWaitsForInstallToFinish(),
     bootWithoutPrevStartsOwnWorker(),
     bootDirectPackageAtOnce(),
     bootReceiptsNameTheError(),
+    pollIsReceipted(),
   ]);
 
   // CF-2 — only a missing manifest is absent, unit level.

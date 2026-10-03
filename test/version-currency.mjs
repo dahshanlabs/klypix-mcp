@@ -189,7 +189,8 @@ ok(/last automatic attempt failed \(npm installer exited 1, attempt 1\); next re
 // Overdue is the UPDATER's rule (autoUpdateOverdue, K2 2026-10-03) — the one the
 // doctor applies — judged inside autoUpdateFooterInputs from the live
 // supervisors' receipts under this brainDir. The real module decides; only its
-// plan is literal. Receipts are literal too; pid = this process.
+// plan is literal. Receipts are literal too; pid = this process. Since K3 the
+// evidence is a receipt's autoUpdate.lastPollAt after the check fell due.
 const realUpdater = await import('../src/mcp-auto-update.mjs');
 const judged = async (plan, extra = {}) => {
     const inputs = await autoUpdateFooterInputs({
@@ -200,14 +201,19 @@ const judged = async (plan, extra = {}) => {
 };
 const supDir = path.join(dir, '.supervisors');
 const writeSupervisor = (name, receipt) => { fs.mkdirSync(supDir, { recursive: true }); fs.writeFileSync(path.join(supDir, name), JSON.stringify(receipt)); };
+// A live supervisor that polled the schedule 20 min ago.
+const liveReceipt = (over = {}) => ({
+    protocol: 1, pid: process.pid, parentPid: process.pid, bootedAt: iso(NOW - 5 * HOUR), updatedAt: iso(NOW - 60_000), status: 'ready',
+    autoUpdate: { enabled: true, lastPollAt: iso(NOW - 20 * 60_000) }, ...over,
+});
 const overduePlan = planFor({ due: true, dueAt: iso(NOW - 3 * HOUR) });
-writeSupervisor(`${process.pid}.json`, { protocol: 1, pid: process.pid, parentPid: process.pid, bootedAt: iso(NOW - 5 * HOUR), updatedAt: iso(NOW - 60_000), status: 'ready' });
+writeSupervisor(`${process.pid}.json`, liveReceipt());
 const overdueLine = await judged(overduePlan);
 // F2/F3 (2026-10-03 review): the notice states only what is known, and points
 // at the doctor that judges THIS install — a bare `npx klypix-mcp doctor` runs
 // whatever copy npx resolves (a project's pinned 1.67.0, or npm's latest).
-ok(/Automatic check overdue \(due for 3h; a KLYPIX session open ≥ 30 min did not run it\) — run `brain_doctor` \(or `npx -y klypix-mcp@1\.13\.0 doctor`\)\./.test(overdueLine) && !/no action required/.test(overdueLine),
-   'overdue (due 3 h ago, a session open all along) → "automatic check overdue" with what is known, pointing at the installed doctor');
+ok(/Automatic check overdue \(due for 3h; a running KLYPIX session looked at the schedule 20m ago and the check still did not run\) — run `brain_doctor` \(or `npx -y klypix-mcp@1\.13\.0 doctor`\)\./.test(overdueLine) && !/no action required/.test(overdueLine),
+   'K3: overdue (due 3 h, polled 20 min ago, stamp unmoved) → "automatic check overdue" with what is known, pointing at the installed doctor');
 const startedLine = await judged(overduePlan, { spawned: true });
 ok(/The automatic update check was overdue \(due for 3h; .*\) and was started just now; if this notice repeats, run `brain_doctor`/.test(startedLine)
     && !/Automatic check overdue —/.test(startedLine),
@@ -221,27 +227,37 @@ const changedPlan = (floorAgoMs, installedAgoMs) => planFor({
 });
 ok(/\(due now\); no action required/.test(await judged(changedPlan(55 * 60_000, 10 * 60_000))),
    'install-changed 10 min ago (floor 55 min ago) → "due now", not overdue');
-ok(/Automatic check overdue \(due for 2h; a KLYPIX session open ≥ 30 min did not run it\)/.test(await judged(changedPlan(175 * 60_000, 2 * HOUR))),
-   'install-changed 2 h ago (floor 2 h 55 min ago) with a session open → overdue by 2h, measured from the install');
+ok(/Automatic check overdue \(due for 2h; a running KLYPIX session looked at the schedule 20m ago and the check still did not run\)/.test(await judged(changedPlan(175 * 60_000, 2 * HOUR))),
+   'install-changed 2 h ago (floor 2 h 55 min ago), polled since → overdue, due for 2h measured from the install');
 // K2: the notice used to judge only dated checks, so a helper that never started
 // sat at "(due now)" here forever while the doctor already called it overdue.
 const neverPlan = planFor({ due: true, dueAt: iso(NOW), dueReason: 'never-checked', checkedAt: null, result: null, stampWrittenAt: null });
-ok(/Automatic check overdue \(no check recorded on this machine; a KLYPIX session open ≥ 30 min did not run it\)/.test(await judged(neverPlan)),
-   'K2: a check never recorded, with a session open for hours, is overdue in the notice too — the doctor\'s rule');
-writeSupervisor(`${process.pid}.json`, { protocol: 1, pid: process.pid, parentPid: process.pid, bootedAt: iso(NOW - 5 * HOUR), updatedAt: iso(NOW - 60_000), status: 'ready', autoUpdate: { enabled: false } });
+ok(/Automatic check overdue \(no check recorded on this machine; a running KLYPIX session looked at the schedule 20m ago and the check still did not run\)/.test(await judged(neverPlan)),
+   'K2: a check never recorded, polled by a live session 20 min ago, is overdue in the notice too — the doctor\'s rule');
+// K3: a session open for hours is no evidence by itself. A machine asleep across
+// the due time wakes with every session "open since" — and none had polled.
+writeSupervisor(`${process.pid}.json`, liveReceipt({ autoUpdate: { enabled: true, lastPollAt: iso(NOW - 3 * HOUR - 20 * 60_000) } }));
+ok(/\(due now\); no action required/.test(await judged(overduePlan)),
+   'K3: a machine that slept across the due time (its last poll before it) is "due now" on waking, not "overdue"');
+writeSupervisor(`${process.pid}.json`, liveReceipt({ autoUpdate: { enabled: true } }));
+ok(/\(due now\); no action required/.test(await judged(overduePlan)),
+   'K3: a receipt without lastPollAt (supervisor code from before the rule) is never evidence');
+// F9/K3: the first SessionStart after an idle night reads its own supervisor's
+// first poll (2 s after it starts) before the helper that poll launched has run.
+writeSupervisor(`${process.pid}.json`, liveReceipt({ bootedAt: iso(NOW - 4_000), autoUpdate: { enabled: true, lastPollAt: iso(NOW - 2_000) } }));
+ok(/\(due now\); no action required/.test(await judged(overduePlan)),
+   'K3: a session that polled seconds ago (this session\'s own) does not make a check "overdue" yet');
+writeSupervisor(`${process.pid}.json`, liveReceipt({ autoUpdate: { enabled: false, lastPollAt: iso(NOW - 20 * 60_000) } }));
 ok(/\(due now\)/.test(await judged(overduePlan)),
    'a session whose own auto-update is off never runs the check → it does not make one "overdue"');
-writeSupervisor(`${process.pid}.json`, { protocol: 1, pid: process.pid, parentPid: process.pid, bootedAt: iso(NOW - 2 * 60_000), updatedAt: iso(NOW - 60_000), status: 'starting' });
-ok(/\(due now\); no action required/.test(await judged(overduePlan)),
-   'a supervisor that only just started (this session\'s own) does not make a check "overdue"');
 // A reused-pid phantom: the pid answers, but its recorded host is dead and the
 // receipt has not been rewritten for 10 min (the doctor's dead-receipt rule).
-writeSupervisor(`${process.pid}.json`, { protocol: 1, pid: process.pid, parentPid: 2147483646, bootedAt: iso(NOW - 5 * HOUR), updatedAt: iso(NOW - 10 * 60_000), status: 'ready' });
+writeSupervisor(`${process.pid}.json`, liveReceipt({ parentPid: 2147483646, updatedAt: iso(NOW - 10 * 60_000) }));
 ok(/\(due now\)/.test(await judged(overduePlan)), 'a dead supervisor receipt (dead host, stale updatedAt) is not a live session');
 fs.rmSync(supDir, { recursive: true, force: true });
 ok(/\(due now\)/.test(await judged(overduePlan)), 'no session open → a long-due check is "due now", not "overdue"');
 // An updater module without the rule (older) judges nothing: never "overdue".
-writeSupervisor(`${process.pid}.json`, { protocol: 1, pid: process.pid, parentPid: process.pid, bootedAt: iso(NOW - 5 * HOUR), updatedAt: iso(NOW - 60_000), status: 'ready' });
+writeSupervisor(`${process.pid}.json`, liveReceipt());
 const withoutRule = { ...realUpdater, inspectAutoUpdate: () => overduePlan, autoUpdateOverdue: undefined };
 const olderInputs = await autoUpdateFooterInputs({ file: cacheFile, brainDir: dir, env: ON, now: NOW, loadUpdater: async () => withoutRule });
 ok(olderInputs.overdue === null && /\(due now\)/.test(at({ ...olderInputs, decision: 'install' })),

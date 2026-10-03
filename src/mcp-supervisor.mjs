@@ -537,6 +537,11 @@ class Supervisor {
     const hintEnv = Number(process.env.KLYPIX_MCP_WAKE_REINSTALL_HINT_MS);
     this.wakeReinstallHintMs = Number.isFinite(hintEnv) && hintEnv >= 0 ? hintEnv : DEFAULT_WAKE_REINSTALL_HINT_MS;
     this.runtimeWatch = createRuntimeWatch(this.runtimeManifest, { allowExternal: this.allowExternal });
+    // K3 (2026-10-03): when this supervisor last polled the update schedule.
+    // The overdue rule (autoUpdateOverdue) needs proof that a session was there
+    // to run a due check; being open since before it fell due is not that proof
+    // after a machine has slept.
+    this.lastAutoUpdatePollAt = null;
     // The integrity error the poller last recorded, and the lastError it
     // replaced, so a runtime that verifies again does not keep reporting it.
     this.runtimeError = null;
@@ -607,6 +612,8 @@ class Supervisor {
           // to overwrite it, so a supervisor embedded with autoUpdate:false
           // (the klypix-mcp/supervisor API) claimed to run them.
           enabled: this.autoUpdate,
+          // K3: this supervisor's last poll of the schedule (null: none yet).
+          lastPollAt: this.lastAutoUpdatePollAt,
         },
         runtimeManifest: this.runtimeManifest.replace(/\\/g, '/'),
         active: this.active ? {
@@ -1805,6 +1812,11 @@ class Supervisor {
       brainDir: path.dirname(this.runtimeManifest),
       currentVersion: this.active?.version || this.fallbackTarget.version,
     });
+    // K3: receipted on every tick — one small write per poll (10 min). A due
+    // check this tick found has its helper launched by now, and that helper
+    // pre-stamps within seconds; a stamp still unmoved later is a real stall.
+    this.lastAutoUpdatePollAt = new Date().toISOString();
+    this.writeState();
   }
 
   flushHostQueue() {

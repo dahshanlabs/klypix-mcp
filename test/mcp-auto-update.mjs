@@ -11,7 +11,9 @@ import { fileURLToPath, pathToFileURL } from 'url';
 import {
   AUTO_UPDATE_HARNESS_REFRESH_MS,
   AUTO_UPDATE_OVERDUE_GRACE_MS,
+  AUTO_UPDATE_POLL_EVIDENCE_MS,
   AUTO_UPDATE_POLL_MS,
+  AUTO_UPDATE_POLL_SETTLE_MS,
   AUTO_UPDATE_RECHECK_FLOOR_MS,
   AUTO_UPDATE_RETRY_MS,
   AUTO_UPDATE_SPAWN_RETRY_MS,
@@ -1162,19 +1164,16 @@ try {
       installedIdentity: { version: '1.4.0', managed: true, dev: false, installedAt: null, unknown: false },
       stampWrittenAt: iso(t - 8 * HOUR), runtimeCommittedAt: null, ...over,
     });
-    const session = (over = {}) => ({ bootedAt: iso(t - 10 * HOUR), autoUpdate: { enabled: true }, ...over });
+    // A live session that polled the schedule 5 min ago (K3's evidence).
+    const session = (over = {}) => ({ bootedAt: iso(t - 10 * HOUR), autoUpdate: { enabled: true, lastPollAt: iso(t - 5 * MINUTE) }, ...over });
     const judge = (p, supervisors = [session()], extra = {}) => autoUpdateOverdue({ plan: p, supervisors, now: t, ...extra });
 
     const late = judge(plan());
     ok(late.overdue && late.overdueByMs === 2 * HOUR && late.dueForMs === 2 * HOUR && late.evidence?.sessions === 1 && late.suppressed === null,
-      'K2: due 2 h with a session open all along → overdue by 2 h');
+      'K2: due 2 h, polled by a live session since → overdue by 2 h');
     ok(judge(plan({ dueAt: iso(t - AUTO_UPDATE_OVERDUE_GRACE_MS) })).overdue
       && !judge(plan({ dueAt: iso(t - AUTO_UPDATE_OVERDUE_GRACE_MS + 1000) })).overdue,
     'K2: overdue from exactly 30 min past due (now ≥ due + 30 min), not a second sooner');
-    const opened = judge(plan(), [session({ bootedAt: iso(t - 40 * MINUTE) })]);
-    const fresh = judge(plan(), [session({ bootedAt: iso(t - 10 * MINUTE) })]);
-    ok(opened.overdue && opened.overdueByMs === 40 * MINUTE && !fresh.overdue && fresh.suppressed === 'session-too-new',
-      'K2: late only for a session that was open to run it — measured from its start; a 10-min-old session is not evidence yet');
     ok(judge(plan(), []).suppressed === 'no-live-session'
       && judge(plan(), [session({ autoUpdate: { enabled: false } })]).suppressed === 'no-live-session'
       && !judge(plan(), [session({ autoUpdate: { enabled: false } })]).overdue,
@@ -1216,6 +1215,46 @@ try {
     ok(before.stampWrittenAt === null && Number.isFinite(Date.parse(before.runtimeCommittedAt))
       && Number.isFinite(Date.parse(after.stampWrittenAt)),
     'K2: inspectAutoUpdate reports when the stamp (null: never written) and the runtime receipt were written');
+  }
+
+  {
+    // K3 (2026-10-03): overdue needs EVIDENCE that a poller ran after the check
+    // fell due — a live supervisor's autoUpdate.lastPollAt at least 2 min after
+    // it — not a session merely open since before. That closes the post-sleep
+    // false positive: on waking, every session reads "open for hours".
+    const due = Date.UTC(2026, 9, 6, 2, 0, 0);
+    const iso = (ms) => new Date(ms).toISOString();
+    const plan = {
+      dueAt: iso(due), dueReason: 'interval', inProgress: null, scheduleError: null, helperApi: 2,
+      installedIdentity: { version: '1.4.0', managed: true, dev: false, installedAt: null, unknown: false },
+      stampWrittenAt: iso(due - 6 * HOUR), runtimeCommittedAt: null,
+    };
+    const polled = (pollAt, over = {}) => ({ bootedAt: iso(due - 12 * HOUR), autoUpdate: { enabled: true, lastPollAt: iso(pollAt) }, ...over });
+    const judge = (now, supervisors) => autoUpdateOverdue({ plan, supervisors, now });
+
+    const slept = judge(due + 7 * HOUR, [polled(due - 20 * MINUTE)]);
+    ok(!slept.overdue && slept.suppressed === 'no-poll-evidence',
+      'K3: a machine asleep across dueAt (its last poll was before it) is not overdue on waking, though its sessions were open for hours');
+    const tick = [polled(due + 5 * MINUTE)];
+    ok(!judge(due + 29 * MINUTE, tick).overdue && judge(due + 30 * MINUTE, tick).overdue
+      && judge(due + 30 * MINUTE, tick).evidence?.lastPollAt === iso(due + 5 * MINUTE),
+    'K3: a tick 5 min after due that left the stamp unmoved → overdue once 30 min past due, naming that poll');
+    const preFix = judge(due + 3 * HOUR, [{ bootedAt: iso(due - 12 * HOUR), autoUpdate: { enabled: true } }, { bootedAt: iso(due - 12 * HOUR) }]);
+    ok(!preFix.overdue && preFix.suppressed === 'no-poll-evidence',
+      'K3: receipts without lastPollAt (supervisor code from before this rule) are never evidence — not judged');
+    ok(!judge(due + HOUR, [polled(due + AUTO_UPDATE_POLL_EVIDENCE_MS - 1000)]).overdue
+      && judge(due + HOUR, [polled(due + AUTO_UPDATE_POLL_EVIDENCE_MS)]).overdue,
+    'K3: only a poll at least 2 min after the check fell due counts');
+    const now = due + HOUR;
+    ok(!judge(now, [polled(now - AUTO_UPDATE_POLL_SETTLE_MS + 1000)]).overdue
+      && judge(now, [polled(now - AUTO_UPDATE_POLL_SETTLE_MS)]).overdue,
+    'K3: a poll younger than the settle time is not evidence yet — the helper it launched may still be taking the lock');
+    ok(!judge(now, [polled(now + 5 * MINUTE)]).overdue
+      && !judge(now, [polled(due + 5 * MINUTE, { autoUpdate: { enabled: false, lastPollAt: iso(due + 5 * MINUTE) } })]).overdue,
+    'K3: a poll stamped in the future, or by a supervisor with updates off, is not evidence');
+    const mixed = judge(now, [polled(due - 10 * MINUTE), polled(due + 20 * MINUTE, { bootedAt: iso(due + 18 * MINUTE) })]);
+    ok(mixed.overdue && mixed.evidence?.sessions === 1 && mixed.overdueByMs === HOUR,
+      'K3: one session that polled after due is enough; overdue is measured from when the check fell due');
   }
 
   {

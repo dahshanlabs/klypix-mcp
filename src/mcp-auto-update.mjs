@@ -98,8 +98,17 @@ export const AUTO_UPDATE_STALE_REGISTRATION_MS = 14 * 24 * 60 * 60 * 1000;
 // launching another (MV-3, 2026-10-03 review).
 export const AUTO_UPDATE_SPAWN_RETRY_MS = AUTO_UPDATE_TTL_MS / 2;
 // A due check runs within one poll (10 min) while any session is open, so a
-// check due this long — three polls — is OVERDUE (autoUpdateOverdue).
+// check due this long — three polls — is OVERDUE (autoUpdateOverdue), when a
+// poll proves a session was there to run it (K3): a supervisor's
+// autoUpdate.lastPollAt at least AUTO_UPDATE_POLL_EVIDENCE_MS after the check
+// fell due. That tick launched the helper, which takes the lock and pre-stamps
+// within seconds, so a tick at least AUTO_UPDATE_POLL_SETTLE_MS old that left
+// the stamp unmoved is a real stall. A younger one is not evidence yet: the
+// first SessionStart after an idle night reads its own supervisor's first tick
+// (2 s after it starts) before the helper that tick launched has run.
 export const AUTO_UPDATE_OVERDUE_GRACE_MS = 30 * 60 * 1000;
+export const AUTO_UPDATE_POLL_EVIDENCE_MS = 2 * 60 * 1000;
+export const AUTO_UPDATE_POLL_SETTLE_MS = 60 * 1000;
 export const AUTO_UPDATE_WORKER_ARG = '--klypix-auto-update-worker';
 
 const MAX_DATE_MS = 8.64e15;
@@ -903,13 +912,14 @@ export function inspectAutoUpdate(brainDir, { now = Date.now(), env = process.en
 // this function, with the plan above and the live supervisors' receipts.
 
 /**
- * Is the automatic check OVERDUE: due past the grace, with a session that was
- * open to run it? Pure and TOTAL (never throws).
+ * Is the automatic check OVERDUE: due past the grace, although a running
+ * session polled the schedule after it fell due? Pure and TOTAL (never throws).
  *
  *   plan         inspectAutoUpdate(brainDir)
  *   supervisors  the LIVE supervisors' receipts as written — the caller drops
  *                dead ones (own pid gone, or host gone and the receipt silent
- *                for > 120 s: the B7 rule) — each {bootedAt, autoUpdate}
+ *                for > 120 s: the B7 rule) — each {bootedAt, autoUpdate:
+ *                {enabled, lastPollAt}}
  *   helperApi    AUTO_UPDATE_API of the helper spawners launch (default
  *                plan.helperApi); a pre-hold updater (1) is never judged
  *
@@ -950,17 +960,28 @@ export function autoUpdateOverdue(input = {}) {
     const pollers = (Array.isArray(supervisors) ? supervisors : [])
       .filter((state) => isRecord(state) && !(isRecord(state.autoUpdate) && state.autoUpdate.enabled === false));
     if (!pollers.length) return verdict('no-live-session', dueForMs);
-    // Late only for a session that was open to run it (F9): from the later of
-    // when the check fell due and when the longest-running such session began.
-    const boots = pollers.map((state) => at(state.bootedAt)).filter((value) => value !== null);
-    const openSince = boots.length ? Math.min(...boots) : null;
-    const lateSince = openSince === null ? null : Math.max(since, openSince);
-    if (lateSince === null || t - lateSince < AUTO_UPDATE_OVERDUE_GRACE_MS) return verdict('session-too-new', dueForMs);
+    // K3 (2026-10-03): evidence that one of them polled after the check fell
+    // due, from its receipt's lastPollAt. "Open since before the check fell
+    // due" was not: a machine asleep across dueAt woke with every session
+    // "open for hours" and read overdue before any of them had polled. A
+    // receipt without lastPollAt (supervisor code from before this rule) is
+    // never evidence.
+    const polls = pollers.map((state) => ({
+      state,
+      polledAt: isRecord(state.autoUpdate) ? at(state.autoUpdate.lastPollAt) : null,
+    })).filter(({ polledAt }) => polledAt !== null
+      && polledAt >= since + AUTO_UPDATE_POLL_EVIDENCE_MS
+      && polledAt <= t - AUTO_UPDATE_POLL_SETTLE_MS);
+    if (!polls.length) return verdict('no-poll-evidence', dueForMs);
+    // How late: since the check fell due — or, due since before any record,
+    // since the longest-running of these sessions began (it polls 2 s in).
+    const boots = polls.map(({ state }) => at(state.bootedAt)).filter((value) => value !== null);
+    const lateSince = Number.isFinite(since) ? since : (boots.length ? Math.min(...boots) : null);
     return {
       overdue: true,
-      overdueByMs: t - lateSince,
+      overdueByMs: lateSince === null ? null : t - lateSince,
       dueForMs,
-      evidence: { sessions: pollers.length, openSince: isoAt(openSince) },
+      evidence: { sessions: polls.length, lastPollAt: isoAt(Math.max(...polls.map(({ polledAt }) => polledAt))) },
       suppressed: null,
     };
   } catch { return verdict(); }

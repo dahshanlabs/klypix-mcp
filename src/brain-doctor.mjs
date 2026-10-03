@@ -424,6 +424,9 @@ function inspectSupervisors(brainDir, baked, now = Date.now()) {
       // Each process reads KLYPIX_AUTO_UPDATE from its OWN environment; the
       // receipt is the only place a host's setting is visible.
       autoUpdateEnabled: typeof state.autoUpdate?.enabled === 'boolean' ? state.autoUpdate.enabled : null,
+      // K3: when this supervisor last polled the update schedule — the overdue
+      // rule's evidence. Absent from receipts written by older supervisor code.
+      lastPollAt: typeof state.autoUpdate?.lastPollAt === 'string' ? state.autoUpdate.lastPollAt : null,
       hibernation: state.hibernation || null,
     });
   }
@@ -605,16 +608,20 @@ function autoUpdateView({ au, brainDir, supervisors, version, hooks, npmLatest, 
     : (installedApi === null ? versionSkew : null);
   // K2 (2026-10-03): OVERDUE is the updater's own rule (autoUpdateOverdue), the
   // one the SessionStart notice applies too, judged from the live supervisors
-  // (dead receipts are already excluded above). The doctor adds only what is
-  // about itself: a schedule computed by rules other than the installed
-  // updater's (a newer `npx klypix-mcp@latest doctor` on an older install) is
-  // never judged, and an updater module without the rule judges nothing.
+  // (dead receipts are already excluded above) and, since K3, from when each
+  // last polled the schedule. The doctor adds only what is about itself: a
+  // schedule computed by rules other than the installed updater's (a newer
+  // `npx klypix-mcp@latest doctor` on an older install) is never judged, and an
+  // updater module without the rule judges nothing.
   let rule = { overdue: false, overdueByMs: null, evidence: null, suppressed: null };
   if (effectiveEnabled && typeof autoUpdateLib.autoUpdateOverdue === 'function') {
     try {
       rule = autoUpdateLib.autoUpdateOverdue({
         plan: au,
-        supervisors: live.map((state) => ({ bootedAt: state.bootedAt, autoUpdate: { enabled: state.autoUpdateEnabled } })),
+        supervisors: live.map((state) => ({
+          bootedAt: state.bootedAt,
+          autoUpdate: { enabled: state.autoUpdateEnabled, lastPollAt: state.lastPollAt },
+        })),
         now,
         helperApi: installedApi,
       }) || rule;
@@ -668,7 +675,8 @@ function autoUpdateView({ au, brainDir, supervisors, version, hooks, npmLatest, 
     overdue,
     overdueByMs: overdue ? rule.overdueByMs : null,
     overdueSuppressed,
-    // What the overdue rule saw (K2): the live sessions that should have run it.
+    // What the overdue rule saw: the live sessions that polled after the check
+    // fell due, and the latest such poll (K3).
     overdueEvidence: overdue ? rule.evidence || null : null,
     scheduleSkew: skew,
     knownLatest,
@@ -1322,7 +1330,7 @@ const STRUCTURED_PAIR_FIELDS = [
   'pid', 'status', 'impaired', 'workerImpaired', 'deliveryImpaired', 'degraded', 'deliveryStatus', 'transition',
   'activePid', 'activeVersion', 'candidateVersion', 'effectiveVersion', 'wakeVersion', 'pendingWakeVersion',
   'alignment', 'hotReloads', 'lastSwapAt', 'lastError', 'updatedAt', 'supervisorGeneration', 'supervisorVersion',
-  'preFix', 'autoUpdateEnabled',
+  'preFix', 'autoUpdateEnabled', 'lastPollAt',
 ];
 const STRUCTURED_HARNESS_FIELDS = ['checked', 'updated', 'unchanged', 'failed', 'skipped', 'skippedReasons', 'checkedAt', 'version', 'error'];
 const pickFields = (source, keys) => {

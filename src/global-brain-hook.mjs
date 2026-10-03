@@ -5462,11 +5462,13 @@ function updateRemedy({ plan, decision, overdue = null, latest, baked, now, spaw
     // K2: the updater's own overdue rule (autoUpdateOverdue), the doctor's too.
     if (overdue && overdue.overdue === true) {
         // F3 (2026-10-03 review): say only what is known — how long it has been
-        // due, and that a session open ≥ 30 min did not run it (not that one was
-        // open when it fell due) — and that this session has just started it,
-        // when it has: the notice used to print right after that spawn.
+        // due, and (K3) that a running session looked at the schedule after it
+        // fell due while the check still did not run — and that this session has
+        // just started it, when it has: the notice used to print right after that spawn.
         const dueFor = Number.isFinite(overdue.dueForMs) ? `due for ${spanLabel(overdue.dueForMs)}` : 'no check recorded on this machine';
-        const late = `${dueFor}; a KLYPIX session open ≥ 30 min did not run it`;
+        const polledAt = Date.parse(overdue.evidence && overdue.evidence.lastPollAt);
+        const ago = Number.isFinite(polledAt) && polledAt <= now ? ` ${spanLabel(now - polledAt)} ago` : '';
+        const late = `${dueFor}; a running KLYPIX session looked at the schedule${ago} and the check still did not run`;
         if (spawned) {
             return { mark: '⚠️', text: `The automatic update check was overdue (${late}) and was started just now; if this notice repeats, run ${installedDoctorHint(baked)}.` };
         }

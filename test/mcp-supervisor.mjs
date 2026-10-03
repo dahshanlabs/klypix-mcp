@@ -595,14 +595,17 @@ try {
     : []);
   const samePath = (a, b) => path.resolve(String(a || '')).toLowerCase() === path.resolve(String(b || '')).toLowerCase();
   const fromPrev = (entry) => /[\\/]\.prev[\\/]worker\.mjs$/.test(String(entry?.file || ''));
-  const deadPid = await (async () => {
+  // A pid that is dead NOW. Windows reuses pids within minutes under load, so a
+  // check that runs much later takes a fresh one (obtainDeadPid) instead of this.
+  const obtainDeadPid = async () => {
     for (let attempt = 0; attempt < 5; attempt++) {
       const child = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' });
       await new Promise(resolve => child.once('exit', resolve));
       if (supervisorTest.pidState(child.pid) === 'dead') return child.pid;
     }
     throw new Error('could not obtain a dead pid');
-  })();
+  };
+  const deadPid = await obtainDeadPid();
 
   async function openPair(dir, name, { env = {}, args = [], entry = BIN, pollMs = null } = {}) {
     const stateDir = path.join(dir, 'states');
@@ -1270,8 +1273,11 @@ try {
       'TQ-5: a non-retryable rename error is rethrown at once and the tmp is removed');
   }
 
-  // B7 — exactly which receipts a starting supervisor removes.
+  // B7 — exactly which receipts a starting supervisor removes. The scenarios
+  // above spawn hundreds of processes, so the dead pid is taken afresh here: one
+  // from the start of the run was reused under load (2026-10-03 review round).
   {
+    const deadPid = await obtainDeadPid();
     const dir = runtimeDir('receipts');
     const now = Date.now();
     const stale = new Date(now - 10 * 60_000).toISOString();

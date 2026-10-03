@@ -10,9 +10,12 @@ import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath, pathToFileURL } from 'url';
+import { spawn } from 'child_process';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { listActiveSessions } from '../src/agent-presence.mjs';
+import { laneFileFor, listActiveSessions } from '../src/agent-presence.mjs';
+import { AUTO_UPDATE_POLL_MS } from '../src/mcp-auto-update.mjs';
+import { __test as supervisorTest } from '../src/mcp-supervisor.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BIN = path.join(HERE, '..', 'bin', 'klypix-mcp.mjs');
@@ -30,7 +33,7 @@ const isAlive = (pid) => {
   catch { return false; }
 };
 
-function workerSource(version, { extraTool = false, removeVersion = false, presence = null } = {}) {
+function workerSource(version, { extraTool = false, removeVersion = false, presence = null, identity = false, bootAudit = null } = {}) {
   const toolNames = [
     ...(removeVersion ? [] : ['version']),
     'slow',
@@ -42,8 +45,16 @@ function workerSource(version, { extraTool = false, removeVersion = false, prese
   return `#!/usr/bin/env node
 import fs from 'fs';
 import readline from 'readline';
-const VERSION = ${JSON.stringify(version)};
+// Baked like the flat bundle's worker, so readBakedVersion (.prev) can read it.
+const PKG_VERSION = ${JSON.stringify(version)};
+const VERSION = PKG_VERSION;
 const PRESENCE = ${JSON.stringify(presence)};
+// identity: answers the supervisor's identity-only hibernation probe, like a
+// worker from 2026-10-03 on. Without it the fixture is an OLDER worker: like
+// every SDK server it answers unknown requests with "Method not found".
+const IDENTITY = ${JSON.stringify(identity)};
+const BOOT_AUDIT = ${JSON.stringify(bootAudit)};
+if (BOOT_AUDIT) fs.appendFileSync(BOOT_AUDIT, JSON.stringify({ pid: process.pid, version: VERSION, file: process.argv[1] }) + '\\n');
 // A presence-owning fixture must behave like the REAL worker: it registers its
 // lane row and REMOVES it on shutdown. Without the removal, a supervisor that
 // fails to hold the row still looks correct — exactly how the first takeover
@@ -89,7 +100,16 @@ rl.on('line', async line => {
     send({ jsonrpc: '2.0', id: msg.id, result: { tools: TOOLS } });
     return;
   }
-  if (msg.method !== 'tools/call') return;
+  if (msg.method === 'klypix/presenceIdentity' && IDENTITY) {
+    send({ jsonrpc: '2.0', id: msg.id, result: PRESENCE
+      ? { schemaVersion: 1, brain: PRESENCE.brain, self: { id: process.env.KLYPIX_SESSION_ID || PRESENCE.id, client: 'stub-client', surface: 'stub', branch: 'main' } }
+      : { schemaVersion: 1, reason: 'no-project-brain', brain: null, self: null } });
+    return;
+  }
+  if (msg.method !== 'tools/call') {
+    if (msg.method && msg.id !== undefined) send({ jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: 'Method not found' } });
+    return;
+  }
   const name = msg.params?.name;
   const args = msg.params?.arguments || {};
   if (name === 'crash') {
@@ -503,6 +523,459 @@ try {
       'hibernation OFF (=0): an idle worker stays resident — instant rollback to pre-Phase-2 behavior');
   } finally {
     await offClient.close().catch(() => {});
+  }
+}
+
+// ── 2026-10-03: a hibernated pair stays asleep; its wake is gated (SPEC B1-B10) ─
+// Production shape on purpose: npm-channel (non-dev) manifests at the default
+// 1000 ms poll. The fixtures above are dev:true and poll every 10 s, which is
+// how the wake loop hid from 1.57.0 on: nothing polled while a pair slept, and a
+// dev target skips the never-downgrade guard anyway. Each runtime directory is
+// shaped like ~/.claude/project-brain: one worker file name, a .prev snapshot
+// taken before every install, the manifest committed last. Fixture versions sit
+// far above this package's own (90.x): selectInitialTarget never boots an npm
+// runtime older than the package's bundled worker.
+{
+  const PKG_VERSION = JSON.parse(fs.readFileSync(path.join(HERE, '..', 'package.json'), 'utf8')).version;
+  const SPEC_RECONNECT_ERROR = 'KLYPIX core changed incompatibly while idle — /mcp reconnect';
+  const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+  const writeAtomic = (file, text) => {
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, text, 'utf8');
+    for (let attempt = 0; ; attempt++) {   // same EPERM retry as activate()
+      try { fs.renameSync(tmp, file); return; }
+      catch (err) {
+        if (attempt >= 20) { try { fs.unlinkSync(tmp); } catch { /* */ } throw err; }
+        const until = Date.now() + 25;
+        while (Date.now() < until) { /* sync by contract */ }
+      }
+    }
+  };
+  const runtimeDir = (name) => {
+    const dir = path.join(root, 'b', name);
+    fs.mkdirSync(dir, { recursive: true });
+    return dir;
+  };
+  const manifestOf = (dir) => path.join(dir, '.mcp-runtime.json');
+  const commitManifest = (dir, version) => writeAtomic(manifestOf(dir), `${JSON.stringify({
+    protocol: 1,
+    version,
+    worker: 'worker.mjs',
+    channel: 'npm',
+    installedAt: new Date().toISOString(),
+    files: { 'worker.mjs': hash(path.join(dir, 'worker.mjs')) },
+  }, null, 2)}\n`);
+  // bin/klypix-install.mjs in miniature: snapshot the live file to .prev, rename
+  // the new one in, commit the manifest last (commit:false = it stopped there).
+  const install = (dir, version, { commit = true, ...options } = {}) => {
+    const worker = path.join(dir, 'worker.mjs');
+    if (fs.existsSync(worker)) {
+      fs.mkdirSync(path.join(dir, '.prev'), { recursive: true });
+      fs.copyFileSync(worker, path.join(dir, '.prev', 'worker.mjs'));
+    }
+    writeAtomic(worker, workerSource(version, options));
+    if (commit) commitManifest(dir, version);
+  };
+  const boots = (file) => (fs.existsSync(file)
+    ? fs.readFileSync(file, 'utf8').split(/\r?\n/).filter(Boolean).map(line => JSON.parse(line))
+    : []);
+  const samePath = (a, b) => path.resolve(String(a || '')).toLowerCase() === path.resolve(String(b || '')).toLowerCase();
+  const fromPrev = (entry) => /[\\/]\.prev[\\/]worker\.mjs$/.test(String(entry?.file || ''));
+  const deadPid = await (async () => {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const child = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' });
+      await new Promise(resolve => child.once('exit', resolve));
+      if (supervisorTest.pidState(child.pid) === 'dead') return child.pid;
+    }
+    throw new Error('could not obtain a dead pid');
+  })();
+
+  async function openPair(dir, name, { env = {}, args = [], entry = BIN } = {}) {
+    const stateDir = path.join(dir, 'states');
+    fs.mkdirSync(stateDir, { recursive: true });
+    let listChanged = 0;
+    let tools = [];
+    const client = new Client({ name, version: '1.0.0' }, {
+      listChanged: {
+        tools: {
+          onChanged: (error, next) => {
+            if (error) return;
+            listChanged++;
+            tools = next?.tools || next || [];
+          },
+        },
+      },
+    });
+    const childEnv = {
+      ...process.env,
+      KLYPIX_MCP_RUNTIME_MANIFEST: manifestOf(dir),
+      KLYPIX_MCP_STATE_DIR: stateDir,
+      KLYPIX_AUTO_UPDATE: '0',
+      KLYPIX_WORKER_HIBERNATE_MS: '1000',
+      KLYPIX_MCP_ROLLBACK_GRACE_MS: '500',
+      ...env,
+    };
+    delete childEnv.KLYPIX_MCP_SUPERVISOR_POLL_MS;   // the production 1000 ms poll
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [entry, ...args],
+      cwd: dir,
+      env: childEnv,
+      stderr: 'pipe',
+    });
+    const logs = [];
+    transport.stderr?.on('data', (chunk) => { logs.push(String(chunk)); if (logs.length > 400) logs.shift(); });
+    await client.connect(transport);
+    const state = () => fs.readdirSync(stateDir)
+      .filter(entry => /^\d+\.json$/.test(entry))
+      .map(entry => { try { return JSON.parse(fs.readFileSync(path.join(stateDir, entry), 'utf8')); } catch { return null; } })
+      .find(Boolean) || null;
+    return {
+      stateDir,
+      state,
+      call: async (tool = 'version') => textOf(await client.callTool({ name: tool, arguments: {} })),
+      callError: async (tool = 'version') => {
+        try { await client.callTool({ name: tool, arguments: {} }); return null; }
+        catch (error) { return error; }
+      },
+      listChanged: () => listChanged,
+      tools: () => tools,
+      logs: () => logs.join(''),
+      close: () => client.close().catch(() => {}),
+    };
+  }
+  // A failing scenario prints its supervisor's log tail instead of a bare ✗
+  // (KLYPIX_SUPERVISOR_TEST_LOGS=1 prints every scenario's log).
+  const scenario = async (name, run) => {
+    let pair = null;
+    const dump = () => pair && console.error(`--- ${name} supervisor log ---\n${pair.logs().split(/\r?\n/).slice(-40).join('\n')}`);
+    try {
+      await run((opened) => { pair = opened; return opened; });
+      if (process.env.KLYPIX_SUPERVISOR_TEST_LOGS === '1') dump();
+    } catch (error) {
+      ok(false, `${name}: ${error?.message || error}`);
+      dump();
+    } finally {
+      await pair?.close();
+    }
+  };
+
+  // B1 + B3 + B5 + B9 (+ B7 boot wiring).
+  const asleepThenWakeIntoNewer = () => scenario('asleep', async (track) => {
+    const dir = runtimeDir('asleep');
+    const audit = path.join(dir, 'boots.jsonl');
+    install(dir, '90.0.0', { identity: true, bootAudit: audit });
+    // What the founder's .supervisors held on 2026-10-02: a receipt whose pid
+    // was reused by another program (live pid, dead host, stale) and a tmp file
+    // whose writer is gone. The next supervisor to start removes both.
+    const stateDir = path.join(dir, 'states');
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(path.join(stateDir, '424242.json'), JSON.stringify({
+      pid: process.pid, parentPid: deadPid, updatedAt: new Date(Date.now() - 10 * 60_000).toISOString(),
+    }));
+    fs.writeFileSync(path.join(stateDir, `424242.json.${deadPid}.tmp`), '{}');
+    const pair = track(await openPair(dir, 'b1-asleep'));
+    ok(!fs.existsSync(path.join(stateDir, '424242.json')) && !fs.existsSync(path.join(stateDir, `424242.json.${deadPid}.tmp`)),
+      'B7: a starting supervisor removes a reused-pid receipt whose host is gone, and a dead writer\'s tmp file');
+    ok(await pair.call() === '90.0.0', 'B1: an npm-channel pair serves v90.0.0 at the production 1000 ms poll');
+    await waitFor(async () => pair.state()?.status === 'hibernated', 20000);
+    const count = pair.state().hibernation?.count;
+    const bootCount = boots(audit).length;
+    await sleep(5000);
+    const later = pair.state();
+    ok(later?.status === 'hibernated' && later.active === null && later.hibernation?.count === count && boots(audit).length === bootCount,
+      'B1: a hibernated pair stays asleep across five 1 s polls — no wake, no worker spawned');
+    install(dir, '90.1.0', { identity: true, bootAudit: audit, extraTool: true });
+    await waitFor(async () => pair.state()?.hibernation?.pendingWakeTarget?.version === '90.1.0', 10000);
+    await sleep(2500);
+    const noted = pair.state();
+    ok(noted?.status === 'hibernated' && noted.hibernation?.count === count && boots(audit).length === bootCount,
+      'B1: a newer install that lands while hibernated is noted, and the pair stays asleep');
+    ok(noted?.hibernation?.target?.version === '90.0.0' && noted.hibernation.pendingWakeTarget?.validated === false,
+      'B1: the receipt keeps the version the pair last ran; the newer install is pending, not yet validated');
+    ok(await pair.call() === '90.1.0', 'B3: the next request wakes the pair into the newer install through the gates');
+    const awake = pair.state();
+    ok(awake?.status === 'ready' && awake.hotReloads === 1 && awake.hibernation?.pendingWakeTarget === null,
+      'B5: a wake into a new version counts as a hot reload');
+    const notified = await waitFor(async () => pair.listChanged() > 0, 10000).then(() => true, () => false);
+    ok(notified && pair.tools().some(tool => tool.name === 'new_tool'),
+      'B5: the host receives tools/list_changed and sees the woken worker\'s new tool');
+    ok(awake?.supervisorVersion === PKG_VERSION, 'B9: the receipt names the version of the supervisor code itself');
+  });
+
+  // B2 + B4: a breaking core with no .prev to resume.
+  const breakingWakeWithoutPrev = () => scenario('breaking', async (track) => {
+    const dir = runtimeDir('breaking');
+    const audit = path.join(dir, 'boots.jsonl');
+    install(dir, '90.0.0', { identity: true, bootAudit: audit });
+    const pair = track(await openPair(dir, 'b4-breaking'));
+    await pair.call();
+    await waitFor(async () => pair.state()?.status === 'hibernated', 20000);
+    install(dir, '90.1.0', { identity: true, bootAudit: audit, removeVersion: true });
+    fs.rmSync(path.join(dir, '.prev'), { recursive: true, force: true });
+    const error = await pair.callError();
+    ok(String(error?.message || '').includes(SPEC_RECONNECT_ERROR),
+      'B4: a wake whose new core removes a tool answers the queued request with the retryable reconnect error');
+    const settled = pair.state();
+    ok(settled?.status === 'restart-required' && settled.active === null && /removed tools: version/.test(settled.lastError || ''),
+      'B2/B4: the woken candidate is gated against the last committed worker; the pair settles restart-required with the reason');
+    const bootCount = boots(audit).length;
+    ok(boots(audit).filter(entry => entry.version === '90.1.0').length === 1, 'B4: the breaking core was started exactly once');
+    await sleep(4000);   // the old recovery backoff retried at 1 s and 2 s
+    ok(boots(audit).length === bootCount && pair.state()?.status === 'restart-required',
+      'B4: no respawn loop — nothing is retried while the pair waits for a reconnect');
+    const started = Date.now();
+    const again = await pair.callError();
+    ok(String(again?.message || '').includes(SPEC_RECONNECT_ERROR) && Date.now() - started < 3000 && boots(audit).length === bootCount,
+      'B4: later requests are answered at once, without starting a worker');
+  });
+
+  // B2 + B4: a new MAJOR, with .prev holding the version the pair ran.
+  const majorWakeResumesPrev = () => scenario('major', async (track) => {
+    const dir = runtimeDir('major');
+    const audit = path.join(dir, 'boots.jsonl');
+    install(dir, '90.0.0', { identity: true, bootAudit: audit });
+    const pair = track(await openPair(dir, 'b4-major'));
+    await pair.call();
+    await waitFor(async () => pair.state()?.status === 'hibernated', 20000);
+    install(dir, '91.0.0', { identity: true, bootAudit: audit });   // .prev now holds v90.0.0
+    ok(await pair.call() === '90.0.0', 'B4: a wake into a new major resumes the version the pair last ran, from .prev');
+    const resumed = pair.state();
+    ok(resumed?.status === 'restart-required' && /major upgrade v90\.0\.0 .+ v91\.0\.0 requires reconnect/.test(resumed.lastError || '')
+      && /\/\.prev\/worker\.mjs$/.test(resumed.active?.path || ''),
+    'B4: it serves from .prev and still reports restart-required with the exact reason');
+    const bootCount = boots(audit).length;
+    await sleep(3000);
+    ok(boots(audit).length === bootCount && boots(audit).filter(entry => entry.version === '91.0.0').length === 1,
+      'B4: the new major was tried once and never respawned');
+  });
+
+  // B8 swap at 1 s + B1/B3: a --force rollback while asleep.
+  const swapThenRollbackWhileAsleep = () => scenario('rollback', async (track) => {
+    const dir = runtimeDir('rollback');
+    const audit = path.join(dir, 'boots.jsonl');
+    install(dir, '90.0.0', { identity: true, bootAudit: audit });
+    const pair = track(await openPair(dir, 'b3-rollback'));
+    await pair.call();
+    install(dir, '90.1.0', { identity: true, bootAudit: audit });
+    await waitFor(async () => (await pair.call()) === '90.1.0', 15000);
+    ok(pair.state()?.hotReloads === 1, 'B8: the stat-gated 1 s poll still hot-swaps a live pair when an install commits');
+    await waitFor(async () => pair.state()?.status === 'hibernated', 20000);
+    const count = pair.state().hibernation.count;
+    const bootCount = boots(audit).length;
+    install(dir, '90.0.0', { identity: true, bootAudit: audit });   // --force rollback: .prev now holds v90.1.0
+    await sleep(2500);
+    const asleep = pair.state();
+    ok(asleep?.status === 'hibernated' && asleep.hibernation.count === count
+      && asleep.hibernation.pendingWakeTarget === null && boots(audit).length === bootCount,
+    'B1: a rollback installed while hibernated is not a wake target and does not wake the pair');
+    ok(await pair.call() === '90.1.0', 'B3: the wake does not adopt the rollback — it resumes v90.1.0, the version the pair last ran');
+    const woke = boots(audit).slice(bootCount);
+    ok(woke.length === 1 && woke[0].version === '90.1.0' && fromPrev(woke[0]),
+      'B3: that wake booted only .prev — the rolled-back v90.0.0 never started');
+  });
+
+  // B3: an install that stopped half-way.
+  const integrityFailureNeverBootsSleepingPath = () => scenario('integrity', async (track) => {
+    const dir = runtimeDir('integrity');
+    const audit = path.join(dir, 'boots.jsonl');
+    install(dir, '90.0.0', { identity: true, bootAudit: audit });
+    const pair = track(await openPair(dir, 'b3-integrity'));
+    await pair.call();
+    await waitFor(async () => pair.state()?.status === 'hibernated', 20000);
+    const sleepingPath = pair.state().hibernation.target.path;
+    const bootCount = boots(audit).length;
+    install(dir, '90.1.0', { identity: true, bootAudit: audit, commit: false });
+    const started = Date.now();
+    ok(await pair.call() === '90.0.0', 'B3: a wake into a runtime that fails integrity resumes the version it ran, from .prev');
+    const waited = Date.now() - started;
+    ok(waited >= 4000, `B3: the wake first waited for a possible install to settle (${waited} ms)`);
+    const woke = boots(audit).slice(bootCount);
+    ok(woke.length >= 1 && woke.every(entry => !samePath(entry.file, sleepingPath)) && woke.some(fromPrev),
+      'B3: integrity failure during a wake never boots the sleeping target\'s path (a mixed module graph)');
+  });
+
+  // B3: the install finishes while the wake waits.
+  const integrityWaitAdoptsFinishedInstall = () => scenario('settles', async (track) => {
+    const dir = runtimeDir('settles');
+    install(dir, '90.0.0', { identity: true });
+    const pair = track(await openPair(dir, 'b3-settles'));
+    await pair.call();
+    await waitFor(async () => pair.state()?.status === 'hibernated', 20000);
+    install(dir, '90.1.0', { identity: true, commit: false });
+    const wake = pair.call();
+    await sleep(1200);
+    commitManifest(dir, '90.1.0');
+    ok(await wake === '90.1.0', 'B3: a wake that meets an install mid-rename waits for it and wakes into the finished install');
+  });
+
+  // B3, flat-bundle shape: the supervisor's own fallback worker IS the managed
+  // worker (klypix-mcp-server.mjs passes <brainDir>/klypix-mcp-worker.mjs), so
+  // "fall back to the package worker" would boot the failing runtime itself.
+  const flatBundleDefersWake = () => scenario('flat-defer', async (track) => {
+    const dir = runtimeDir('flat-defer');
+    const audit = path.join(dir, 'boots.jsonl');
+    install(dir, '90.0.0', { identity: true, bootAudit: audit });
+    const entry = path.join(dir, 'server.mjs');
+    fs.writeFileSync(entry, [
+      `import { runMcpSupervisor } from ${JSON.stringify(pathToFileURL(path.join(HERE, '..', 'src', 'mcp-supervisor.mjs')).href)};`,
+      `await runMcpSupervisor({ fallbackWorker: ${JSON.stringify(path.join(dir, 'worker.mjs'))}, fallbackVersion: '90.0.0', workerArgs: [] });`,
+      '',
+    ].join('\n'));
+    const pair = track(await openPair(dir, 'b3-flat', { entry }));
+    await pair.call();
+    await waitFor(async () => pair.state()?.status === 'hibernated', 20000);
+    install(dir, '90.1.0', { identity: true, bootAudit: audit, commit: false });
+    fs.rmSync(path.join(dir, '.prev'), { recursive: true, force: true });   // nothing to resume
+    const bootCount = boots(audit).length;
+    const error = await pair.callError();
+    ok(/KLYPIX core files do not verify .*retry shortly/.test(String(error?.message || '')) && boots(audit).length === bootCount,
+      'B3: flat bundle, no .prev — a wake into a runtime failing integrity boots nothing and answers with a retryable error');
+    const deferred = pair.state();
+    ok(deferred?.status === 'hibernated' && /integrity mismatch: worker\.mjs/.test(deferred.lastError || ''),
+      'B3: the pair stays hibernated (presence held) and reports the integrity error');
+    commitManifest(dir, '90.1.0');   // the interrupted install is re-run to completion
+    ok(await pair.call() === '90.1.0' && pair.state()?.lastError === null,
+      'B3: the next request wakes into the completed install, with no reconnect');
+  });
+
+  // B6: the REAL worker (no installed runtime → this checkout's worker).
+  const realWorkerProbeStampsNoActivity = () => scenario('identity-probe', async (track) => {
+    const dir = runtimeDir('identity-probe');
+    const project = path.join(dir, 'project');
+    const home = path.join(dir, 'home');
+    fs.mkdirSync(project, { recursive: true });
+    fs.mkdirSync(home, { recursive: true });
+    fs.writeFileSync(path.join(project, 'brain.klypix'), 'identity probe fixture');
+    const sessionId = 'b6-identity-probe';
+    const pair = track(await openPair(dir, 'b6-probe', {
+      args: ['--vault', project],
+      env: { HOME: home, USERPROFILE: home, KLYPIX_SESSION_ID: sessionId },
+    }));
+    const lane = laneFileFor(path.join(project, 'brain.klypix'), home);
+    const row = () => {
+      try { return JSON.parse(fs.readFileSync(lane, 'utf8')).sessions?.find(session => session.id === sessionId) || null; }
+      catch { return null; }
+    };
+    await waitFor(async () => row(), 30000);
+    await waitFor(async () => pair.state()?.status === 'hibernated', 30000);
+    await waitFor(async () => row()?.event === 'McpHibernated', 10000);
+    const held = row();
+    ok(held && !held.activityAt && !held.activityKind,
+      'B6: hibernating an idle connection stamps no activity on its lane row (identity-only probe, not a brain_sync checkpoint)');
+    ok(held?.transport?.mcp?.status === 'pull-only',
+      'B6: the supervisor still identified and holds that row while the worker sleeps');
+  });
+
+  // B8: an integrity failure is written once, and cleared once it verifies.
+  const integrityErrorWrittenOnce = () => scenario('integrity-writes', async (track) => {
+    const dir = runtimeDir('integrity-writes');
+    install(dir, '90.0.0', { identity: true });
+    const pair = track(await openPair(dir, 'b8-writes', { env: { KLYPIX_WORKER_HIBERNATE_MS: '0' } }));
+    await pair.call();
+    const committed = fs.readFileSync(manifestOf(dir), 'utf8');
+    writeAtomic(manifestOf(dir), committed.replace(/("worker\.mjs": ")[0-9a-f]{64}/, `$1${'0'.repeat(64)}`));
+    await waitFor(async () => /integrity mismatch: worker\.mjs/.test(pair.state()?.lastError || ''), 10000);
+    const firstWrite = pair.state().updatedAt;
+    await sleep(3500);
+    ok(pair.state()?.updatedAt === firstWrite, 'B8: an ongoing integrity failure is written to the receipt once, not on every 1 s poll');
+    writeAtomic(manifestOf(dir), committed);
+    const cleared = await waitFor(async () => pair.state()?.lastError === null, 10000).then(() => true, () => false);
+    const healed = pair.state();
+    ok(cleared && healed?.status === 'ready' && healed.hotReloads === 0 && healed.active?.pid,
+      'B8: once the same manifest verifies again its integrity error is cleared, and nothing swaps');
+  });
+
+  await Promise.all([
+    asleepThenWakeIntoNewer(),
+    breakingWakeWithoutPrev(),
+    majorWakeResumesPrev(),
+    swapThenRollbackWhileAsleep(),
+    integrityFailureNeverBootsSleepingPath(),
+    integrityWaitAdoptsFinishedInstall(),
+    flatBundleDefersWake(),
+    realWorkerProbeStampsNoActivity(),
+    integrityErrorWrittenOnce(),
+  ]);
+
+  // B7 — exactly which receipts a starting supervisor removes.
+  {
+    const dir = runtimeDir('receipts');
+    const now = Date.now();
+    const stale = new Date(now - 10 * 60_000).toISOString();
+    const fresh = new Date(now).toISOString();
+    const foreignPid = process.platform === 'win32' ? 4 : 1;   // exists; usually not ours to signal (EPERM)
+    const receipts = {
+      [`${deadPid}.json`]: { pid: deadPid },                                         // its own pid is gone
+      '1001.json': { pid: process.pid, parentPid: deadPid, updatedAt: stale },       // pid reused, host gone, stale
+      '1002.json': { pid: process.pid, parentPid: deadPid, updatedAt: fresh },       // host just died: 120 s to close itself
+      '1003.json': { pid: process.pid, parentPid: process.pid, updatedAt: stale },   // idle, but its host lives
+      '1004.json': { pid: foreignPid, parentPid: foreignPid, updatedAt: stale },     // EPERM-owned pids are alive
+    };
+    for (const [name, value] of Object.entries(receipts)) fs.writeFileSync(path.join(dir, name), JSON.stringify(value));
+    fs.writeFileSync(path.join(dir, '1005.json'), '{"pid": 1');   // torn
+    fs.writeFileSync(path.join(dir, `1006.json.${deadPid}.tmp`), '{}');
+    fs.writeFileSync(path.join(dir, `1007.json.${process.pid}.tmp`), '{}');
+    fs.writeFileSync(path.join(dir, `1008.json.dead-${deadPid}-0a1b2c3d`), '{}');
+    const removed = supervisorTest.cleanSupervisorStateDir(dir, { now });
+    const left = new Set(fs.readdirSync(dir));
+    ok(!left.has(`${deadPid}.json`) && !left.has('1005.json'), 'B7: receipts of dead or torn supervisors are removed');
+    ok(!left.has('1001.json'), 'B7: a receipt whose pid was reused is removed once its host is gone and it is >120 s stale');
+    ok(left.has('1002.json') && left.has('1003.json'),
+      'B7: a fresh receipt whose host just died, and an idle receipt whose host lives, are kept');
+    ok(supervisorTest.pidState(foreignPid) === 'alive' && left.has('1004.json'),
+      'B7: a pid we may not signal (EPERM) counts as alive and its receipt is never deleted');
+    ok(!left.has(`1006.json.${deadPid}.tmp`) && !left.has(`1008.json.dead-${deadPid}-0a1b2c3d`) && left.has(`1007.json.${process.pid}.tmp`),
+      'B7: leftover tmp files are removed only when their writer is dead');
+    ok(removed.receipts.length === 3 && removed.tmp.length === 2, 'B7: the cleanup reports exactly what it removed');
+  }
+
+  // B8 — the poller's stat gate, unit level.
+  {
+    const dir = runtimeDir('watch');
+    const worker = path.join(dir, 'worker.mjs');
+    fs.writeFileSync(worker, 'export const generation = 1;\n');
+    commitManifest(dir, '1.0.0');
+    let clock = 1_000_000;
+    const watch = supervisorTest.createRuntimeWatch(manifestOf(dir), { reverifyMs: 60_000, now: () => clock });
+    const first = watch.read();
+    const second = watch.read();
+    ok(first.ok && !first.cached && second.ok && second.cached && second.target.signature === first.target.signature,
+      'B8: an unchanged manifest is served from the stat gate without re-hashing the runtime');
+    fs.writeFileSync(worker, 'export const generation = 2;\n');   // a runtime file changes, no new manifest
+    const skipped = watch.read();
+    clock += 60_000;
+    const reverified = watch.read();
+    ok(skipped.ok && skipped.cached && !reverified.ok && /integrity mismatch: worker\.mjs/.test(reverified.error || ''),
+      'B8: a runtime file mutated without a manifest change is reported at the next full re-verify');
+    const again = watch.read();
+    ok(!again.ok && !again.cached, 'B8: a failed verification is never cached');
+    commitManifest(dir, '1.0.1');
+    const committed = watch.read();
+    ok(committed.ok && !committed.cached && committed.target.signature !== first.target.signature,
+      'B8: a newly committed manifest is read in full on the next poll');
+    ok(watch.read().cached && !watch.read({ force: true }).cached, 'B8: a full read can be forced before any candidate starts');
+  }
+
+  // B8 — a state write that fails leaves nothing behind.
+  {
+    const dir = runtimeDir('atomic');
+    const blocked = path.join(dir, `${process.pid}.json`);
+    fs.mkdirSync(blocked);   // a directory where the receipt belongs: the rename cannot succeed
+    let threw = false;
+    try { supervisorTest.atomicJson(blocked, { protocol: 1 }); } catch { threw = true; }
+    ok(threw && !fs.readdirSync(dir).some(entry => entry.endsWith('.tmp')), 'B8: a failed supervisor state write unlinks its tmp file');
+  }
+
+  // B10 — one poll cadence for every spawner.
+  {
+    const source = fs.readFileSync(path.join(HERE, '..', 'src', 'mcp-supervisor.mjs'), 'utf8').replace(/\r/g, '');
+    ok(supervisorTest.DEFAULT_AUTO_UPDATE_POLL_MS === AUTO_UPDATE_POLL_MS && AUTO_UPDATE_POLL_MS <= 15 * 60_000,
+      'B10: the supervisor polls the update schedule at AUTO_UPDATE_POLL_MS (10 min)');
+    ok(/import \* as (\w+) from '\.\/mcp-auto-update\.mjs';/.test(source) && /Number\(\w+\.AUTO_UPDATE_POLL_MS\)/.test(source)
+      && !/\{[^}]*\bAUTO_UPDATE_POLL_MS\b[^}]*\} from '\.\/mcp-auto-update\.mjs'/.test(source),
+    'B10: it reads AUTO_UPDATE_POLL_MS as a namespace member, so a mid-install module pair still links');
+    ok(supervisorTest.RESTART_REQUIRED_IDLE === SPEC_RECONNECT_ERROR, 'B4: the reconnect error text is the one the doctor and docs quote');
   }
 }
 if (lastActivePid) {

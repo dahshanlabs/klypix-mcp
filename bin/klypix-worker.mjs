@@ -32,8 +32,8 @@ import {
 } from '../src/klypix-core.mjs';
 import { compareProjectGraphResults, projectGraphContextMarkdown, queryProjectGraph, suggestProjectGraphBrainLinks, scanNativeProjectMap, checkBrainDrift, brainDriftMarkdown } from '../src/project-graph.mjs';
 import { auditProject, compactAgentsBrief, linkProject, mcpServerEntry } from '../src/agent-rules.mjs';
-import { createMcpPresence, KLYPIX_MCP_INSTRUCTIONS } from '../src/mcp-presence.mjs';
-import { consumeMessageReceipt, findProjectBrain } from '../src/agent-presence.mjs';
+import { createMcpPresence, KLYPIX_MCP_INSTRUCTIONS, normalizeMcpClient } from '../src/mcp-presence.mjs';
+import { consumeMessageReceipt, findProjectBrain, listActiveSessions } from '../src/agent-presence.mjs';
 import { collectRepoState, commitsInRange, makeContainmentProbe } from '../src/repo-state.mjs';
 import {
   reconcileRegisteredProjects,
@@ -1272,6 +1272,44 @@ if (!canvasViewAsApp) {
     inputSchema: CANVAS_VIEW_SCHEMA,
   }, canvasViewHandler);
 }
+
+// ── Supervisor hibernation probe (2026-10-03) ────────────────────────────────
+// Before it retires an idle worker, the supervisor asks which lane row this
+// connection owns, so it can keep that row fresh while the worker sleeps. It
+// used to ask with an internal brain_sync checkpoint, which the lane records as
+// McpTaskCheckpoint — WORK — so every hibernation made an idle connection look
+// busy (6 idle Codex connections on the founder's PC read as active sessions
+// with no declared scope). This internal request is not a tool: hosts never see
+// it, and it reads the binding and the lane row without writing anything.
+// Supervisors from before it never send it; a worker from before it answers
+// "Method not found", and the supervisor falls back to the checkpoint.
+const SUPERVISOR_IDENTITY_METHOD = 'klypix/presenceIdentity';
+server.server.setRequestHandler(z.object({
+  method: z.literal(SUPERVISOR_IDENTITY_METHOD),
+  params: z.unknown().optional(),
+}), () => {
+  const brainPath = mcpPresence.brainPath;
+  if (!brainPath) return { schemaVersion: 1, reason: 'no-project-brain', brain: null, self: null };
+  const id = String(mcpPresence.id || '');
+  let row = null;
+  try { row = listActiveSessions({ brainPath }).find((session) => session.id === id) || null; }
+  catch { /* unreadable lane: the binding alone still names the row */ }
+  // No row (pruned, or a lane write that never landed): describe the client the
+  // way the worker's own heartbeat would, so the supervisor's upsert recreates
+  // an accurate row instead of an 'unknown' one.
+  let clientName = '';
+  try { clientName = String(server.server.getClientVersion?.()?.name || ''); } catch { /* optional */ }
+  return {
+    schemaVersion: 1,
+    brain: brainPath,
+    self: id ? {
+      id,
+      client: row?.client || normalizeMcpClient(clientName),
+      surface: row?.surface ?? (clientName.replace(/\s+/g, ' ').trim() || 'mcp'),
+      branch: row?.branch ?? null,
+    } : null,
+  };
+});
 
 const transport = new StdioServerTransport();
 let runningHeartbeat = null;

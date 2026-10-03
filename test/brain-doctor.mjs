@@ -550,6 +550,59 @@ const supervisorReceipt = (brainDir, name, state) => writeJson(path.join(brainDi
     && /restart-required: breaking tool manifest .* — \/mcp reconnect \(still serving v1\.88\.0\)/.test(text)
     && r.actions.some((a) => /restart-required: kept v1\.88\.0/.test(a)),
   'S9: a rejected update with the old worker still serving is listed with a reconnect action (it had none)');
+  // F11 (2026-10-03 review): that pair is not "healthy", and zero-restart
+  // activation is exactly what failed for it.
+  ok(/SUPERVISOR\s+0 healthy · 1 need \/mcp reconnect/.test(text) && !/zero-restart core activation ready/.test(text),
+    'F11: the header counts a restart-required pair as needing a reconnect, not as healthy "zero-restart … ready"');
+
+  // F5 (2026-10-03 review): a recorded wake target in a new MAJOR is refused by
+  // the wake's own gate; it read "[ok] ALIGNED … wakes into vN on the next request".
+  clear();
+  installNpm(brainDir, { version: NEXT_MAJOR, installedAt: iso(NOW - HOUR) });
+  supervisorReceipt(brainDir, 'major', {
+    status: 'hibernated', active: null, updatedAt: at(20 * 60_000), supervisorVersion: PKG_VERSION,
+    transport: { host: 'connected', delivery: 'pull-only' },
+    hibernation: { hibernated: true, target: { version: PKG_VERSION }, pendingWakeTarget: { version: NEXT_MAJOR, validated: false } },
+  });
+  r = run();
+  text = render(r, { color: false });
+  ok(r.supervisors.live[0]?.alignment === 'reconnect-on-wake' && r.layers.supervisor === 'drift' && r.verdict === 'DRIFTED'
+    && new RegExp(`hibernated v${PKG_VERSION.replace(/\./g, '\\.')} — the installed v${NEXT_MAJOR.replace(/\./g, '\\.')} is a new major: its next request answers "core changed incompatibly" — /mcp reconnect`).test(text)
+    && /RUNNING\s+all 1 connection hibernated; 1 cannot wake as installed/.test(text)
+    && /SUPERVISOR\s+0 healthy · 1 need \/mcp reconnect/.test(text)
+    && r.actions.some((a) => a.startsWith('/mcp reconnect') && /is a new major, which its next request would refuse/.test(a)),
+  'F5: a hibernated pair whose wake target is a new major needs /mcp reconnect — never ALIGNED "wakes into" it');
+  installNpm(brainDir, { installedAt: iso(NOW - HOUR) });
+
+  // F6 (2026-10-03 review): a pair whose wake was refused because the core files
+  // do not verify answers every request with an error until they do.
+  clear();
+  const deferredPair = {
+    status: 'hibernated', active: null, updatedAt: at(10_000), supervisorVersion: PKG_VERSION,
+    lastError: 'runtime integrity mismatch: worker.mjs', transport: { host: 'connected', delivery: 'pull-only' },
+    hibernation: {
+      hibernated: true, target: { version: PKG_VERSION },
+      wakeDeferred: { reason: 'runtime integrity mismatch: worker.mjs', count: 2, since: at(5 * 60_000), lastAt: at(10_000) },
+    },
+  };
+  supervisorReceipt(brainDir, 'deferred', deferredPair);
+  r = run();
+  text = render(r, { color: false });
+  ok(r.supervisors.live[0]?.wakeBlocked === true && r.supervisors.impaired.length === 1 && r.layers.supervisor === 'drift'
+    && /hibernated: its last wake found no consistent core to boot \(runtime integrity mismatch: worker\.mjs, 2 attempts since \S+\) — requests fail until they verify; npx -y klypix-mcp@latest install --force/.test(text)
+    && /RUNNING\s+all 1 connection hibernated; 1 cannot wake as installed/.test(text)
+    && !/wakes on the next request/.test(text)
+    && r.actions.some((a) => a.startsWith('npx -y klypix-mcp@latest install --force') && /cannot wake/.test(a))
+    && /cannot wake — the core files do not verify/.test(driftLine(r)),
+  'F6: a refused wake is IMPAIRED with the reinstall named — never "wakes on the next request"');
+  const noted = { ...deferredPair, hibernation: { ...deferredPair.hibernation, wakeDeferred: null } };
+  supervisorReceipt(brainDir, 'deferred', { ...noted, updatedAt: at(2 * 60_000) });
+  ok(run().supervisors.live[0]?.wakeBlocked === true,
+    'F6: an integrity failure its poller has reported for longer than an install takes also blocks the wake');
+  supervisorReceipt(brainDir, 'deferred', noted);
+  r = run();
+  ok(r.supervisors.live[0]?.wakeBlocked === false && r.supervisors.impaired.length === 0,
+    'F6: a fresh integrity error (an install mid-flight) is not yet a blocked wake');
 
   clear();
   supervisorReceipt(brainDir, 'pending', {
@@ -606,8 +659,10 @@ const supervisorReceipt = (brainDir, name, state) => writeJson(path.join(brainDi
   const run = (extra = {}) => inspect({ home, projectDir: project, now: NOW, fmtLib: null, env: ON, ...extra });
   const textOf = (r) => render(r, { color: false });
   const auLine = (text) => text.split('\n').find((line) => /AUTO-UPDATE/.test(line)) || '';
+  // Every supervisor receipt carries bootedAt; overdue counts from when a
+  // session was open to run the check (F9, 2026-10-03 review).
   const liveSupervisor = (extra = {}) => supervisorReceipt(brainDir, 'live', {
-    updatedAt: iso(NOW - 30_000), active: { pid: process.pid, version: PKG_VERSION },
+    bootedAt: iso(NOW - 10 * HOUR), updatedAt: iso(NOW - 30_000), active: { pid: process.pid, version: PKG_VERSION },
     autoUpdate: { enabled: true }, supervisorVersion: PKG_VERSION, ...extra,
   });
   const current = (checkedAgo, extra = {}) => ({
@@ -626,6 +681,22 @@ const supervisorReceipt = (brainDir, name, state) => writeJson(path.join(brainDi
   ok(new RegExp(`^\\[ok\\] AUTO-UPDATE  enabled · checks every ${ttlHours}h · last result current — npm v${PKG_VERSION.replace(/\./g, '\\.')} \\(\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}Z, 2h ago\\) · next check \\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}Z \\(in 4h\\)$`).test(line)
     && !/24h/.test(line) && r.layers.autoUpdate === 'ok' && r.verdict === 'ALIGNED',
   `A1: a fresh result renders cadence, result time + age and the next check ETA (${line})`);
+
+  // TQ-4 (2026-10-03 review): the first state of every npm machine after this
+  // release lands, written by the 1.89.0 helper that installed it: 'updated',
+  // no identity, currentVersion = the old version, installedVersion = this one.
+  reset();
+  const PREV = `${PKG_MAJOR}.${Math.max(0, PKG_MINOR - 1)}.0`;
+  writeJson(files.stamp, { protocol: 1, lastCheck: NOW - 2 * HOUR, checkedAt: iso(NOW - 2 * HOUR) });
+  writeJson(files.status, {
+    protocol: 1, result: 'updated', checkedAt: iso(NOW - 2 * HOUR), currentVersion: PREV,
+    latestVersion: PKG_VERSION, installedVersion: PKG_VERSION, lastUpdatedAt: iso(NOW - 2 * HOUR),
+  });
+  r = run();
+  line = auLine(textOf(r));
+  ok(r.autoUpdate.stale === false
+    && new RegExp(`last result updated — installed v${PKG_VERSION.replace(/\./g, '\\.')} \\(from v${PREV.replace(/\./g, '\\.')}\\) \\(\\S+, 2h ago\\) · next check \\S+ \\(in 4h\\)`).test(line),
+  `TQ-4: a legacy "updated" result describes the installed version, with its origin (${line})`);
 
   // A2 — the founder's case: a legacy dev-owned result, then an npm install.
   reset();
@@ -696,6 +767,18 @@ const supervisorReceipt = (brainDir, name, state) => writeJson(path.join(brainDi
   ok(r.autoUpdate.overdue === true && /check overdue by 2h — no running session performed the check/.test(auLine(textOf(r)))
     && r.verdict === 'PARTIAL',
   'A5: the same check with a live connection is overdue by 2h → PARTIAL');
+  // F9 (2026-10-03 review): a session that opened a second ago has not had its
+  // chance to run the check (its 2 s start delay), so it is no evidence of a
+  // stuck updater — "overdue by 2h" in the first seconds after an idle night.
+  liveSupervisor({ bootedAt: iso(NOW - 1_000) });
+  r = run();
+  ok(r.autoUpdate.overdue === false && r.autoUpdate.overdueSuppressed === 'session-too-new'
+    && r.verdict === 'ALIGNED' && /check due now/.test(auLine(textOf(r))),
+  'F9: a check due 2 h ago with only a just-started session is due now, not overdue');
+  liveSupervisor({ bootedAt: iso(NOW - 40 * 60_000) });
+  r = run();
+  ok(r.autoUpdate.overdue === true && /check overdue by 40m/.test(auLine(textOf(r))),
+    'F9: … once that session has been open 30 min without running it, it is overdue — by the time it was open');
   liveSupervisor({ autoUpdate: { enabled: false } });
   r = run();
   ok(r.autoUpdate.overdue === false && r.layers.autoUpdate === 'off'
@@ -790,10 +873,18 @@ const supervisorReceipt = (brainDir, name, state) => writeJson(path.join(brainDi
     && r.autoUpdate.consecutiveFailures === 0 && /^\[ok\]/.test(line),
   `A9: a check in progress is shown as such, and its pessimistic pre-stamp is not a failure yet (${line})`);
   reset();
-  liveSupervisor();
+  liveSupervisor({ bootedAt: iso(NOW - 5 * 60_000) });
   r = run();
   ok(r.autoUpdate.overdue === false && /no check recorded yet · check due now/.test(auLine(textOf(r))),
-    'A9: never checked is "due now", never overdue');
+    'A9: never checked, with a session open 5 min, is "due now"');
+  // F9 (2026-10-03 review): never-checked is due "now" by construction, so it
+  // could never read overdue — a helper that never starts sat at "check due
+  // now" forever. A session open 10 h that never ran it is evidence.
+  liveSupervisor();
+  r = run();
+  ok(r.autoUpdate.overdue === true && /no check recorded yet · check overdue by 10h — no running session performed the check/.test(auLine(textOf(r)))
+    && r.verdict === 'PARTIAL',
+  'F9: never checked while a session has been open 10 h is overdue by 10h (measured from that session\'s start)');
   reset();
   writeJson(files.stamp, { protocol: 1, lastCheck: NOW - 30 * 60_000, failures: 1, nextCheckAt: NOW - 15 * 60_000, identity: npmIdentity });
   writeJson(files.status, current(7 * HOUR));
@@ -834,6 +925,97 @@ const supervisorReceipt = (brainDir, name, state) => writeJson(path.join(brainDi
   fs.rmSync(home, { recursive: true, force: true });
 }
 
+// MV-2/F1 (2026-10-03 review) — the AUTO-UPDATE line follows the INSTALLED
+// updater's rules (AUTO_UPDATE_API in <brainDir>/mcp-auto-update.mjs), not this
+// doctor's sibling module: after `npx klypix-mcp@<pre-hold> install --force` the
+// installed helper is that release's, which has no hold and re-installs.
+{
+  const NOW = Date.now();
+  const { home, brainDir, project } = doctorHome('installed-updater-rules');
+  const files = {
+    stamp: path.join(brainDir, '.autoupdate-check.json'),
+    status: path.join(brainDir, '.autoupdate-status.json'),
+    cache: path.join(brainDir, '.npm-currency.json'),
+  };
+  const esc = (value) => value.replace(/\./g, '\\.');
+  const install = (updaterText) => {
+    fs.writeFileSync(path.join(brainDir, 'mcp-auto-update.mjs'), updaterText);   // receipted with the rest
+    installNpm(brainDir, { installedAt: iso(NOW - 9 * HOUR) });
+  };
+  // A --force downgrade from NEXT to this version that no check has seen yet.
+  const downgraded = () => {
+    writeJson(files.stamp, { protocol: 1, lastCheck: NOW - 2 * HOUR, checkedAt: iso(NOW - 2 * HOUR) });
+    writeJson(files.status, {
+      protocol: 1, result: 'current', checkedAt: iso(NOW - 2 * HOUR), currentVersion: NEXT, latestVersion: NEXT,
+      identity: { version: NEXT, managed: true, dev: false },
+    });
+    writeJson(files.cache, { pkg: 'klypix-mcp', latest: NEXT, checkedAt: NOW - HOUR, latestAt: NOW - HOUR });
+  };
+  const run = () => inspect({ home, projectDir: project, now: NOW, fmtLib: null, env: {} });
+
+  install('// a 1.89.0-era updater: 24 h stamp, no hold\nexport const AUTO_UPDATE_TTL_MS = 24 * 60 * 60 * 1000;\nexport async function runAutoUpdateCheck() {}\n');
+  downgraded();
+  let r = run();
+  let text = render(r, { color: false });
+  ok(r.autoUpdate.updaterRules === 'older' && r.autoUpdate.holdIgnored?.version === NEXT && r.autoUpdate.knownDecision === 'install'
+    && /\[!\] AUTO-UPDATE  enabled · checks every 24h/.test(text)
+    && new RegExp(`the downgrade to v${esc(PKG_VERSION)} is NOT held: the installed v${esc(PKG_VERSION)} updater predates the hold and re-installs v${esc(NEXT)} at its next check`).test(text)
+    && !/will NOT install automatically: held/.test(text)
+    && r.verdict === 'PARTIAL' && r.readinessWarnings.some((w) => /is not held: the installed .* updater predates the hold/.test(w))
+    && r.actions.some((a) => a.startsWith('set KLYPIX_AUTO_UPDATE=0')),
+  'MV-2/F1: with a pre-hold updater installed, the doctor never promises a hold — it says the downgrade will be re-installed and how to stay');
+  ok(r.autoUpdate.dueAt === iso(NOW - 2 * HOUR + 24 * HOUR)
+    && /these times and decisions follow the installed v\S+ updater's rules \(checks every 24h, no downgrade hold\), so overdue is not judged/.test(text),
+  'F1: the next check and the cadence follow the installed api-1 rules (lastCheck + 24 h)');
+
+  install(fs.readFileSync(path.join(__dirname, '..', 'src', 'mcp-auto-update.mjs'), 'utf8'));
+  downgraded();
+  r = run();
+  text = render(r, { color: false });
+  ok(r.autoUpdate.updaterRules === 'own' && r.autoUpdate.knownDecision === 'held' && !r.autoUpdate.holdIgnored
+    && /will NOT install automatically: held after a manual downgrade/.test(text) && !/these times/.test(text),
+  'F1: an installed updater with this doctor\'s rules (same AUTO_UPDATE_API) is judged by them — the hold stands');
+
+  install('export const AUTO_UPDATE_API = 99;\nexport async function runAutoUpdateCheck() {}\n');
+  downgraded();
+  r = run();
+  text = render(r, { color: false });
+  ok(r.autoUpdate.updaterRules === 'newer' && r.autoUpdate.knownDecision === 'unknown' && r.autoUpdate.cadenceMs === null
+    && /newer than this doctor: its schedule and decisions are not shown — run npx -y klypix-mcp@latest doctor/.test(text)
+    && /next check unknown/.test(text) && !/checks every/.test(text.split('\n').find((l) => /AUTO-UPDATE/.test(l)) || ''),
+  'F1: an installed updater newer than this doctor gets no schedule or decision from it');
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
+// F4 (2026-10-03 review) — the Claude Code SessionStart hook launches the
+// updater with ITS environment. With the opt-out only in the MCP entries,
+// brain-project sessions still update; the doctor said "off … disabled".
+{
+  const NOW = Date.now();
+  const { home, brainDir, project } = doctorHome('hooks-only');
+  installNpm(brainDir, { installedAt: iso(NOW - HOUR) });
+  writeJson(path.join(home, '.claude', 'settings.json'), {
+    hooks: Object.fromEntries(['SessionStart', 'UserPromptSubmit', 'Stop', 'PostToolUse', 'PreToolUse']
+      .map((event) => [event, [{ hooks: [{ type: 'command', command: 'node ~/.claude/project-brain/global-brain-hook.mjs' }] }]])),
+  });
+  supervisorReceipt(brainDir, 'off', {
+    bootedAt: iso(NOW - HOUR), updatedAt: iso(NOW - 30_000), active: { pid: process.pid, version: PKG_VERSION },
+    autoUpdate: { enabled: false }, supervisorVersion: PKG_VERSION,
+  });
+  writeJson(path.join(brainDir, '.npm-currency.json'), { pkg: 'klypix-mcp', latest: NEXT, checkedAt: NOW - HOUR, latestAt: NOW - HOUR });
+  let r = inspect({ home, projectDir: project, now: NOW, fmtLib: null, env: {} });
+  let text = render(r, { color: false });
+  ok(r.autoUpdate.hooksOnly === true && r.layers.autoUpdate !== 'off' && r.autoUpdate.knownDecision === 'install'
+    && /AUTO-UPDATE  enabled for Claude Code sessions in brain projects only — off by KLYPIX_AUTO_UPDATE in all 1 live MCP connection/.test(text)
+    && !/will NOT install automatically: disabled/.test(text),
+  'F4: MCP connections off but the Claude Code hooks on → updates still run there; never "will NOT install: disabled"');
+  r = inspect({ home, projectDir: project, now: NOW, fmtLib: null, env: { KLYPIX_AUTO_UPDATE: '0' } });
+  text = render(r, { color: false });
+  ok(r.layers.autoUpdate === 'off' && /off by KLYPIX_AUTO_UPDATE in all 1 live connection \(the Claude Code hooks read their own environment\)/.test(text),
+    'F4: with this environment off too it reads off — and says the hooks read their own environment');
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
 // C7 — unreceipted engine code: a module in the managed directory that no
 // install receipt covers is a readiness warning naming the merge-driver risk.
 {
@@ -844,21 +1026,40 @@ const supervisorReceipt = (brainDir, name, state) => writeJson(path.join(brainDi
   ok(r.engineCode.checked && r.engineCode.unreceipted.length === 0 && r.layers.engineCode === 'ok'
     && /ENGINE\s+all 2 engine module\(s\) covered by the v\S+ install receipt/.test(render(r, { color: false })),
   'C7: a fully receipted directory reads ok');
-  fs.writeFileSync(path.join(brainDir, 'remote-client.mjs'), '// left by an older release\n');
+  fs.writeFileSync(path.join(brainDir, 'stray-helper.mjs'), '// added by hand\n');
   fs.writeFileSync(path.join(brainDir, 'klypix-brain.mjs'), '// the desktop installer adds this one\n');
   r = run();
   let text = render(r, { color: false });
-  ok(r.engineCode.unreceipted.join(',') === 'remote-client.mjs' && r.engineCode.desktopExtras.join(',') === 'klypix-brain.mjs'
+  ok(r.engineCode.unreceipted.join(',') === 'stray-helper.mjs' && r.engineCode.desktopExtras.join(',') === 'klypix-brain.mjs'
     && r.layers.engineCode === 'warning' && r.verdict === 'PARTIAL' && r.drifted === 0
-    && r.readinessWarnings.some((w) => /1 unreceipted engine file in the managed directory \(remote-client\.mjs\).*git merge driver/.test(w))
-    && /\[!\] ENGINE\s+1 module\(s\) outside the v\S+ install receipt: remote-client\.mjs/.test(text)
-    && r.actions.some((a) => a.startsWith('review, then remove remote-client.mjs')),
-  'C7: an unreceipted module is PARTIAL with the merge-driver risk named; a desktop-installed script is allowlisted');
-  fs.writeFileSync(path.join(brainDir, 'klypix-merge-driver.mjs'), '// a driver no receipt covers\n');
+    && r.readinessWarnings.some((w) => /^1 unreceipted engine file in the managed directory \(stray-helper\.mjs\) — no installer vouches for it$/.test(w))
+    && /\[!\] ENGINE\s+1 module\(s\) outside the v\S+ install receipt: stray-helper\.mjs — no installer vouches for this code$/m.test(text)
+    && r.actions.some((a) => a.startsWith('review, then remove stray-helper.mjs')),
+  'C7: an unreceipted module is PARTIAL; a desktop-installed script is allowlisted');
+  ok(!r.readinessWarnings.some((w) => /merge driver/.test(w)) && !/merge driver/.test(text.split('\n').find((line) => /ENGINE/.test(line)) || ''),
+    'F7: the git merge-driver risk is not claimed for a file the driver never loads');
+  // F7 (2026-10-03 review): a module a release staged and a later one dropped
+  // without deleting. remote-client.mjs sits on every machine that ever ran
+  // v1.66.1–v1.72.0; as an "unreceipted engine file" it read PARTIAL forever.
+  fs.rmSync(path.join(brainDir, 'stray-helper.mjs'));
+  fs.writeFileSync(path.join(brainDir, 'remote-client.mjs'), '// left by v1.66.1–v1.72.0\n');
   r = run();
-  ok(r.engineCode.mergeDriverFiles.join(',') === 'klypix-merge-driver.mjs'
-    && /including klypix-merge-driver\.mjs/.test(render(r, { color: false })),
+  text = render(r, { color: false });
+  ok(r.engineCode.unreceipted.length === 0 && r.engineCode.retired.map((item) => item.name).join(',') === 'remote-client.mjs'
+    && r.layers.engineCode === 'ok' && !r.readinessWarnings.some((w) => /unreceipted/.test(w))
+    && /remote-client\.mjs: retired \(KLYPIX Remote, staged by v1\.66\.1–v1\.72\.0\); nothing imports it — safe to delete/.test(text),
+  'F7: a retired module is a leftover to delete, never a permanent readiness warning');
+  fs.writeFileSync(path.join(brainDir, 'klypix-merge-driver.mjs'), '// a driver no receipt covers\n');
+  fs.writeFileSync(path.join(brainDir, 'merge-brains.mjs'), '// its engine\n');
+  r = run();
+  text = render(r, { color: false });
+  ok(r.engineCode.mergeDriverFiles.join(',') === 'klypix-merge-driver.mjs,merge-brains.mjs'
+    && /including the git merge driver's own code \(klypix-merge-driver\.mjs, merge-brains\.mjs\), which runs on every brain merge/.test(text)
+    && r.readinessWarnings.some((w) => /the KLYPIX git merge driver runs klypix-merge-driver\.mjs, merge-brains\.mjs on every brain merge/.test(w)),
   'C7: an unreceipted git merge driver is called out by name');
+  ok(r.actions.some((a) => a.startsWith('npx -y klypix-mcp@latest install --force') && /git merge driver's own code/.test(a))
+    && !r.actions.some((a) => /remove [^#]*(klypix-merge-driver|merge-brains)\.mjs/.test(a)),
+  'F7: the driver\'s own files get a reinstall (which receipts them), never "remove" — merge.klypix.driver runs them');
   fs.rmSync(path.join(brainDir, '.mcp-runtime.json'));
   r = run();
   ok(!r.engineCode.checked && r.layers.engineCode === 'n/a' && !r.readinessWarnings.some((w) => /unreceipted/.test(w)),

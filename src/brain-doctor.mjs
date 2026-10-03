@@ -101,9 +101,12 @@ const timeOf = (value) => {
   return typeof value === 'string' ? Date.parse(value) : NaN;
 };
 
-// The updater's cadence, read from the module that is actually installed. The
-// fallbacks are the pre-2026-10-03 values, which are exactly what an older
-// mcp-auto-update.mjs (the only kind that lacks these exports) runs.
+// The cadence of this doctor's SIBLING updater module. In the flat bundle that
+// is the installed one; run from npx it is the package's own copy, and after a
+// rollback the installed one can be older — autoUpdateView reads the installed
+// file's AUTO_UPDATE_API and follows ITS rules (2026-10-03 review). The
+// fallbacks are the pre-2026-10-03 values, which is what an older sibling (the
+// only kind that lacks these exports) runs.
 const AUTO_UPDATE_TTL_MS = Number(autoUpdateLib.AUTO_UPDATE_TTL_MS) > 0
   ? Number(autoUpdateLib.AUTO_UPDATE_TTL_MS) : 24 * 60 * 60 * 1000;
 const AUTO_UPDATE_POLL_MS = Number(autoUpdateLib.AUTO_UPDATE_POLL_MS) > 0
@@ -297,6 +300,13 @@ function inspectRunning(brainDir, baked, now, self) {
 const SUPERVISOR_DEAD_RECEIPT_MS = 120 * 1000;
 const SUPERVISOR_TRANSITION_MS = 45 * 1000;
 const WAKING_STATUSES = new Set(['validating-update', 'update-ready', 'recovering', 'recovery-ready']);
+// readRuntimeTarget's failures (mcp-supervisor.mjs): the core files on disk do
+// not verify, so a sleeping pair has nothing consistent to wake into.
+const RUNTIME_INTEGRITY_ERROR = /^(runtime (manifest|worker|file|integrity)\b|unsupported runtime protocol)/;
+const majorOf = (version) => {
+  const match = String(version || '').match(/^v?(\d+)\.\d+\.\d+/);
+  return match ? Number(match[1]) : null;
+};
 // 'alive' | 'dead' | 'foreign' | 'unknown'. Only ESRCH proves a process gone.
 // EPERM is a live process this user may not signal: never a supervisor of ours
 // to count (the isAlivePid rule), and never a dead parent either.
@@ -350,15 +360,29 @@ function inspectSupervisors(brainDir, baked, now = Date.now()) {
     // queue. A broken or backpressured host pipe stays what it is.
     const deliveryStatus = transition === 'waking' && !['impaired', 'backpressured'].includes(state.transport?.host)
       ? 'queued' : recordedDelivery;
-    const workerImpaired = !state.active && !intentionallyHibernated && transition !== 'waking'
-      && status !== 'starting' && status !== 'awaiting-initialize';
+    // F6 (2026-10-03 review): a sleeping pair whose last wake found the core
+    // files failing verification (wakeDeferred), or whose poller has reported
+    // them failing for longer than an install takes, answers every request with
+    // an error until they verify. It used to read "wakes on the next request".
+    const wakeDeferred = intentionallyHibernated && state.hibernation?.wakeDeferred
+      && typeof state.hibernation.wakeDeferred === 'object' ? state.hibernation.wakeDeferred : null;
+    const wakeBlocked = intentionallyHibernated
+      && (Boolean(wakeDeferred) || (RUNTIME_INTEGRITY_ERROR.test(String(state.lastError || '')) && !fresh));
+    const workerImpaired = (!state.active && !intentionallyHibernated && transition !== 'waking'
+      && status !== 'starting' && status !== 'awaiting-initialize') || wakeBlocked;
     const deliveryImpaired = deliveryStatus === 'impaired' || state.transport?.host === 'impaired';
     // The version this pair serves, is switching to, or wakes into next.
     const effectiveVersion = transition ? (candidate.version || null)
       : (state.active ? (state.active.version || null) : (pendingWake?.version || sleepingTarget?.version || null));
+    // F5 (2026-10-03 review): a recorded wake target in another MAJOR than the
+    // version the pair last ran is refused by the wake's own gate (a reconnect
+    // error, or a .prev resume that still needs one). Not benign.
+    const wakeCrossesMajor = Boolean(pendingWake && sleepingTarget?.version
+      && majorOf(pendingWake.version) !== null && majorOf(pendingWake.version) !== majorOf(sleepingTarget.version));
     const alignment = !baked || !effectiveVersion ? 'unknown'
-      : (cmpSemver(effectiveVersion, baked) !== 0 ? 'mismatch'
-        : (pendingWake && sleepingTarget?.version && cmpSemver(sleepingTarget.version, baked) !== 0 ? 'pending-wake' : 'match'));
+      : (wakeCrossesMajor ? 'reconnect-on-wake'
+        : (cmpSemver(effectiveVersion, baked) !== 0 ? 'mismatch'
+          : (pendingWake && sleepingTarget?.version && cmpSemver(sleepingTarget.version, baked) !== 0 ? 'pending-wake' : 'match')));
     live.push({
       pid: state.pid,
       status,
@@ -369,6 +393,9 @@ function inspectSupervisors(brainDir, baked, now = Date.now()) {
       impaired: workerImpaired || deliveryImpaired,
       workerImpaired,
       deliveryImpaired,
+      wakeBlocked,
+      wakeDeferred,
+      bootedAt: typeof state.bootedAt === 'string' ? state.bootedAt : null,
       degraded: deliveryStatus === 'backpressured' || state.transport?.host === 'backpressured',
       deliveryStatus,
       transport: state.transport || null,
@@ -378,7 +405,7 @@ function inspectSupervisors(brainDir, baked, now = Date.now()) {
       activePath: state.active?.path || sleepingTarget?.path || null,
       candidateVersion: candidate?.version || null,
       effectiveVersion,
-      wakeVersion: intentionallyHibernated ? (pendingWake?.version || sleepingTarget?.version || null) : null,
+      wakeVersion: intentionallyHibernated && !wakeBlocked && !wakeCrossesMajor ? (pendingWake?.version || sleepingTarget?.version || null) : null,
       pendingWakeVersion: pendingWake?.version || null,
       alignment,
       hotReloads: Number(state.hotReloads || 0),
@@ -435,10 +462,18 @@ function inspectSupervisors(brainDir, baked, now = Date.now()) {
 const DESKTOP_EXTRA_SCRIPTS = new Set(['klypix-brain.mjs', 'brain-sync-core.mjs', 'export-klypix.mjs', 'import-jsoncanvas.mjs']);
 // What `node klypix-merge-driver.mjs` loads from this directory.
 const MERGE_DRIVER_CLOSURE = new Set(['klypix-merge-driver.mjs', 'merge-brains.mjs', 'brain-graveyard.mjs', 'klypix-format.mjs']);
+// Modules a release staged and a later one dropped without deleting (F7,
+// 2026-10-03 review). Nothing current imports them, so they are leftovers to
+// delete, not a readiness gap: remote-client.mjs sat on every machine that ever
+// ran v1.66.1–v1.72.0 and would have read PARTIAL there forever.
+const RETIRED_ENGINE_MODULES = new Map([
+  ['remote-client.mjs', 'KLYPIX Remote, staged by v1.66.1–v1.72.0'],
+]);
+const NO_ENGINE_CODE = { checked: false, receiptVersion: null, total: 0, desktopExtras: [], retired: [], unreceipted: [], mergeDriverFiles: [] };
 export function inspectEngineCode(brainDir) {
   const receipt = readJson(path.join(brainDir, '.mcp-runtime.json'), null);
   const files = receipt && typeof receipt.files === 'object' && !Array.isArray(receipt.files) ? receipt.files : null;
-  if (!files) return { checked: false, receiptVersion: null, total: 0, desktopExtras: [], unreceipted: [], mergeDriverFiles: [] };
+  if (!files) return { ...NO_ENGINE_CODE };
   const key = (name) => String(name).toLowerCase();
   const covered = new Set(Object.keys(files).map(key));
   let names = [];
@@ -447,14 +482,16 @@ export function inspectEngineCode(brainDir) {
       .filter((entry) => (entry.isFile() || entry.isSymbolicLink()) && /\.mjs$/i.test(entry.name))
       .map((entry) => entry.name)
       .sort();
-  } catch { return { checked: false, receiptVersion: null, total: 0, desktopExtras: [], unreceipted: [], mergeDriverFiles: [] }; }
+  } catch { return { ...NO_ENGINE_CODE }; }
   const outside = names.filter((name) => !covered.has(key(name)));
-  const unreceipted = outside.filter((name) => !DESKTOP_EXTRA_SCRIPTS.has(key(name)));
+  const retired = outside.filter((name) => RETIRED_ENGINE_MODULES.has(key(name)));
+  const unreceipted = outside.filter((name) => !DESKTOP_EXTRA_SCRIPTS.has(key(name)) && !RETIRED_ENGINE_MODULES.has(key(name)));
   return {
     checked: true,
     receiptVersion: typeof receipt.version === 'string' ? receipt.version : null,
     total: names.length,
     desktopExtras: outside.filter((name) => DESKTOP_EXTRA_SCRIPTS.has(key(name))),
+    retired: retired.map((name) => ({ name, origin: RETIRED_ENGINE_MODULES.get(key(name)) })),
     unreceipted,
     mergeDriverFiles: unreceipted.filter((name) => MERGE_DRIVER_CLOSURE.has(key(name))),
   };
@@ -512,7 +549,22 @@ function predictedHold(au) {
   return highest && cmpSemver(current.version, highest) < 0 ? { version: highest, since: null, predicted: true } : null;
 }
 
-function autoUpdateView({ au, brainDir, supervisors, version, npmLatest, doctorVersion, now }) {
+// The rules of the updater that spawners actually launch: AUTO_UPDATE_API in
+// the INSTALLED <brainDir>/mcp-auto-update.mjs, read as text (MV-2/F1,
+// 2026-10-03 review). This doctor's own sibling module is not that file when it
+// runs from npx, and after a rollback the installed one is older. 1 = an updater
+// from before the marker (≤ 1.89.0); null = no installed updater, or unreadable.
+function installedUpdaterApi(brainDir) {
+  const text = readText(path.join(brainDir, 'mcp-auto-update.mjs'));
+  if (text == null) return null;
+  const marker = text.match(/^export const AUTO_UPDATE_API = (\d+);/m);
+  if (marker) return Number(marker[1]);
+  return /\brunAutoUpdateCheck\b/.test(text) ? 1 : null;
+}
+// What an api-1 updater (≤ 1.89.0) does: one 24 h stamp, no backoff, no hold.
+const LEGACY_UPDATER_TTL_MS = 24 * 60 * 60 * 1000;
+
+function autoUpdateView({ au, brainDir, supervisors, version, hooks, npmLatest, doctorVersion, now }) {
   const live = supervisors?.live || [];
   const recorded = live.filter((state) => typeof state.autoUpdateEnabled === 'boolean');
   const connections = recorded.length
@@ -520,7 +572,22 @@ function autoUpdateView({ au, brainDir, supervisors, version, npmLatest, doctorV
     : null;
   // Live connections are what run the checks; with none, the next host to start
   // decides, and this process's own environment is the best available guess.
-  const effectiveEnabled = connections ? connections.enabled > 0 : au.enabled !== false;
+  // F4 (2026-10-03 review): the Claude Code SessionStart hook launches the
+  // helper with ITS environment. With the opt-out set only in the MCP server
+  // entries, brain-project sessions still update; "off … will NOT install" was
+  // false there. This doctor's environment stands in for the hooks' one.
+  const hooksWired = Array.isArray(hooks?.wired) && hooks.wired.includes('SessionStart');
+  const hooksOnly = Boolean(connections) && connections.enabled === 0 && hooksWired && au.enabled !== false;
+  const effectiveEnabled = (connections ? connections.enabled > 0 : au.enabled !== false) || hooksOnly;
+  // Whose rules: the installed updater's. Same api → this doctor's rules hold;
+  // an older (pre-hold) one → 24 h checks and no hold; a newer one → unknown.
+  const ownApi = Number(autoUpdateLib.AUTO_UPDATE_API) > 0 ? Number(autoUpdateLib.AUTO_UPDATE_API) : 1;
+  const installedApi = installedUpdaterApi(brainDir);
+  const rules = installedApi === null || installedApi === ownApi ? 'own' : (installedApi < ownApi ? 'older' : 'newer');
+  const cadenceMs = rules === 'own' ? AUTO_UPDATE_TTL_MS : (rules === 'older' && installedApi === 1 ? LEGACY_UPDATER_TTL_MS : null);
+  let dueAtMs = timeOf(au.dueAt);
+  if (rules === 'older' && installedApi === 1) dueAtMs = Number.isFinite(au.lastCheck) ? au.lastCheck + LEGACY_UPDATER_TTL_MS : now;
+  else if (rules !== 'own') dueAtMs = NaN;
   const stampFailures = Number.isInteger(au.failures) && au.failures > 0 ? au.failures : 0;
   // A running check pre-stamps ITSELF as failed (A7); it has not failed yet.
   const settledFailures = au.inProgress ? Math.max(0, stampFailures - 1) : stampFailures;
@@ -537,7 +604,7 @@ function autoUpdateView({ au, brainDir, supervisors, version, npmLatest, doctorV
   // the installed updater runs (a newer `npx klypix-mcp@latest doctor` on an
   // older install would otherwise call a check "overdue" that the installed
   // 24 h updater correctly has not reached).
-  const dueMs = timeOf(au.dueAt);
+  const dueMs = dueAtMs;
   let dueSinceMs = dueMs;
   if (au.dueReason === 'install-changed') {
     // The schedule re-opened when the receipts changed, not at lastCheck + 5 min.
@@ -546,18 +613,45 @@ function autoUpdateView({ au, brainDir, supervisors, version, npmLatest, doctorV
       try { changedAt = fs.statSync(path.join(brainDir, '.mcp-runtime.json')).mtimeMs; } catch { changedAt = NaN; }
     }
     if (Number.isFinite(changedAt)) dueSinceMs = Math.max(dueMs, changedAt);
+  } else if (rules === 'own' && ['never-checked', 'invalid-stamp'].includes(au.dueReason) && dueMs >= now - 1000) {
+    // F9 (2026-10-03 review): these are due "now" by construction, so they
+    // could never be late — a helper that never starts sat at "check due now"
+    // forever. They have been due since the stamp went bad, or since always.
+    let stampAt = NaN;
+    try { stampAt = fs.statSync(path.join(brainDir, '.autoupdate-check.json')).mtimeMs; } catch { /* never written */ }
+    dueSinceMs = Number.isFinite(stampAt) ? stampAt : -Infinity;
   }
-  const triggers = live.filter((state) => state.autoUpdateEnabled !== false).length;
-  const skew = doctorVersion && version.baked && cmpSemver(doctorVersion, version.baked) !== 0
+  const triggerStates = live.filter((state) => state.autoUpdateEnabled !== false);
+  const triggers = triggerStates.length;
+  // A check is late only for a session that was open to run it (F9): from the
+  // later of when it fell due and when the longest-running such session
+  // started. A supervisor that started a second ago has not had its chance —
+  // the rule the SessionStart notice already applies (supervisorOpenSince).
+  const bootTimes = triggerStates.map((state) => timeOf(state.bootedAt)).filter(Number.isFinite);
+  const openSinceMs = bootTimes.length ? Math.min(...bootTimes) : NaN;
+  const versionSkew = doctorVersion && version.baked && cmpSemver(doctorVersion, version.baked) !== 0
     ? { doctor: doctorVersion, installed: version.baked } : null;
-  const late = effectiveEnabled && !au.inProgress && !au.scheduleError
-    && Number.isFinite(dueSinceMs) && now - dueSinceMs > AUTO_UPDATE_OVERDUE_GRACE_MS;
-  const overdueSuppressed = !late ? null : (!triggers ? 'no-live-session' : (skew ? 'version-skew' : null));
+  // An installed updater whose api matches this doctor's runs these rules,
+  // whatever the version numbers; without one, versions are the only hint.
+  const skew = rules !== 'own'
+    ? { doctor: doctorVersion, installed: version.baked, rules, api: installedApi }
+    : (installedApi === null ? versionSkew : null);
+  const dueLong = effectiveEnabled && !au.inProgress && !au.scheduleError
+    && (dueSinceMs === -Infinity || Number.isFinite(dueSinceMs)) && now - dueSinceMs > AUTO_UPDATE_OVERDUE_GRACE_MS;
+  const lateSinceMs = Math.max(dueSinceMs, openSinceMs);
+  const late = dueLong && Number.isFinite(lateSinceMs) && now - lateSinceMs > AUTO_UPDATE_OVERDUE_GRACE_MS;
+  const overdueSuppressed = !dueLong ? null
+    : (!triggers ? 'no-live-session' : (skew ? 'version-skew' : (late ? null : 'session-too-new')));
   const overdue = late && !overdueSuppressed;
 
   const knownLatest = knownNpmLatest(brainDir, au, npmLatest, now);
-  const hold = au.hold || predictedHold(au);
-  const decide = typeof autoUpdateLib.autoUpdateDecision === 'function' ? autoUpdateLib.autoUpdateDecision : null;
+  // MV-2: a pre-hold updater re-installs whatever the owner rolled back from;
+  // decide as it will, and say so, instead of promising a hold it cannot keep.
+  const ruleHold = au.hold || predictedHold(au);
+  const hold = rules === 'older' ? null : ruleHold;
+  const holdIgnored = rules === 'older' && ruleHold ? ruleHold : null;
+  const decide = rules === 'newer' ? null
+    : (typeof autoUpdateLib.autoUpdateDecision === 'function' ? autoUpdateLib.autoUpdateDecision : null);
   // When no receipt names a version, the helper decides with the version its
   // spawner passed (KLYPIX_MCP_AUTO_UPDATE_CURRENT: the running or baked one),
   // and so does the SessionStart notice. Deciding with the bare receipts said
@@ -579,13 +673,20 @@ function autoUpdateView({ au, brainDir, supervisors, version, npmLatest, doctorV
   const knownNewer = Boolean(knownLatest && installedVersion && cmpSemver(knownLatest.version, installedVersion) > 0);
   return {
     effectiveEnabled,
+    hooksOnly,
+    hooksWired,
     connections,
-    cadenceMs: AUTO_UPDATE_TTL_MS,
+    // The installed updater's rules (MV-2/F1): 'own' | 'older' | 'newer'.
+    updaterRules: rules,
+    updaterApi: installedApi,
+    cadenceMs,
     pollMs: AUTO_UPDATE_POLL_MS,
+    // When the installed updater checks next, by its own rules.
+    dueAt: Number.isFinite(dueAtMs) ? new Date(dueAtMs).toISOString() : null,
     consecutiveFailures,
     unfinishedAttempt,
     overdue,
-    overdueByMs: overdue ? now - dueSinceMs : null,
+    overdueByMs: overdue ? now - lateSinceMs : null,
     overdueSuppressed,
     scheduleSkew: skew,
     knownLatest,
@@ -593,7 +694,9 @@ function autoUpdateView({ au, brainDir, supervisors, version, npmLatest, doctorV
     knownNewer,
     // Paused for a reason other than "off": a newer release this install will not take.
     blocked: knownNewer && ['dev-owned', 'major-blocked', 'held', 'unknown'].includes(knownDecision),
-    predictedHold: au.hold ? null : (hold || null),
+    predictedHold: au.hold ? null : (ruleHold || null),
+    // A hold the installed (pre-hold) updater will not keep: it re-installs it.
+    holdIgnored,
     // What the updater would do with the version `--npm` just fetched.
     npmDecision: STRICT_SEMVER.test(String(npmLatest || '')) ? decisionFor(String(npmLatest)) : null,
   };
@@ -917,15 +1020,15 @@ export function inspect(opts = {}) {
       scheduleError: 'auto-update module unavailable', moduleUnavailable: true,
     };
   }
+  const hooks = inspectHooks(home);
   const autoUpdate = {
     ...auBase,
     ...autoUpdateView({
-      au: auBase, brainDir, supervisors, version, now, doctorVersion,
+      au: auBase, brainDir, supervisors, version, hooks, now, doctorVersion,
       npmLatest: opts.npmLatest && !String(opts.npmLatest).startsWith('(') ? opts.npmLatest : null,
     }),
   };
   const engineCode = inspectEngineCode(brainDir);
-  const hooks = inspectHooks(home);
   const codexHooks = codexPresenceHookStatus(home);
   const codexSmart = {
     mcpInstructions: true,
@@ -1050,7 +1153,7 @@ export function inspect(opts = {}) {
     autoUpdate: !autoUpdate.effectiveEnabled
       ? 'off'
       : (autoUpdate.overdue || autoUpdate.consecutiveFailures > 0 || autoUpdate.blocked || autoUpdate.scheduleError
-        || Number(autoUpdate.harness?.failed || 0) > 0 ? 'warning' : 'ok'),
+        || autoUpdate.holdIgnored || Number(autoUpdate.harness?.failed || 0) > 0 ? 'warning' : 'ok'),
     // Unreceipted modules are a readiness gap (code no installer vouches for),
     // not drift: nothing about the receipted runtime is wrong.
     engineCode: !engineCode.checked ? 'n/a' : (engineCode.unreceipted.length ? 'warning' : 'ok'),
@@ -1105,6 +1208,9 @@ export function inspect(opts = {}) {
   if (autoUpdate.overdue) {
     readinessWarnings.push(`automatic update check overdue by ${durationText(autoUpdate.overdueByMs)} — no running session performed it`);
   }
+  if (autoUpdate.effectiveEnabled && autoUpdate.holdIgnored) {
+    readinessWarnings.push(`the downgrade to v${autoUpdate.installedIdentity?.version || version.baked} is not held: the installed v${version.baked} updater predates the hold and re-installs v${autoUpdate.holdIgnored.version} at its next check`);
+  }
   // One failure is a retry 15 min away; two in a row is a pattern. Failures
   // recorded against a previous install (stale) say nothing about this one.
   if (autoUpdate.effectiveEnabled && !autoUpdate.stale && autoUpdate.consecutiveFailures >= 2) {
@@ -1112,7 +1218,12 @@ export function inspect(opts = {}) {
   }
   if (engineCode.unreceipted.length) {
     const n = engineCode.unreceipted.length;
-    readinessWarnings.push(`${n} unreceipted engine file${n === 1 ? '' : 's'} in the managed directory (${engineCode.unreceipted.join(', ')}) — no installer vouches for ${n === 1 ? 'it' : 'them'}; the KLYPIX git merge driver runs code from this directory on every brain merge`);
+    // The merge-driver risk is named only for the driver's own code (F7): it is
+    // the one thing that runs these files without any installer involved.
+    const driver = engineCode.mergeDriverFiles.length
+      ? `; the KLYPIX git merge driver runs ${engineCode.mergeDriverFiles.join(', ')} on every brain merge`
+      : '';
+    readinessWarnings.push(`${n} unreceipted engine file${n === 1 ? '' : 's'} in the managed directory (${engineCode.unreceipted.join(', ')}) — no installer vouches for ${n === 1 ? 'it' : 'them'}${driver}`);
   }
   const verdict = !version.installed
     ? 'NOT-INSTALLED'
@@ -1157,6 +1268,11 @@ export function inspect(opts = {}) {
         actions.push(`/mcp reconnect   # supervisor pid ${s.pid} restart-required: ${s.lastError || 'KLYPIX core changed incompatibly while idle'}`);
         continue;
       }
+      if (s.wakeBlocked) {
+        // F6: a reconnect meets the same files; only a reinstall repairs them.
+        actions.push(`npx -y klypix-mcp@latest install --force   # supervisor pid ${s.pid} cannot wake: the core files do not verify (${s.wakeDeferred?.reason || s.lastError || 'runtime integrity'}) — its requests fail until they do`);
+        continue;
+      }
       const why = s.workerImpaired ? 'has no live worker; tool calls cannot complete' : `cannot confirm host delivery (${s.deliveryStatus})`;
       actions.push(`/mcp reconnect   # supervisor pid ${s.pid} ${why}`);
     }
@@ -1166,6 +1282,9 @@ export function inspect(opts = {}) {
     for (const s of supervisors.live.filter(state => !state.impaired && !state.degraded && !state.transition)) {
       if (s.status === 'restart-required') {
         actions.push(`/mcp reconnect   # supervisor pid ${s.pid} restart-required: kept v${s.activeVersion || '?'}${s.lastError ? ` — ${s.lastError}` : ''}`);
+      } else if (s.alignment === 'reconnect-on-wake') {
+        // F5: the wake's own major gate refuses this target.
+        actions.push(`/mcp reconnect   # supervisor pid ${s.pid} sleeps on v${s.activeVersion || '?'}; the installed v${s.pendingWakeVersion} is a new major, which its next request would refuse ("KLYPIX core changed incompatibly while idle")`);
       } else if (s.alignment === 'mismatch') {
         actions.push(`/mcp reconnect if it persists   # supervisor pid ${s.pid} serves v${s.effectiveVersion} ≠ installed v${version.baked} (a newer install hot-swaps within seconds; an older one never does)`);
       }
@@ -1176,15 +1295,22 @@ export function inspect(opts = {}) {
     if (autoUpdate.moduleUnavailable) {
       actions.push('npx klypix-mcp install   # mcp-auto-update.mjs could not be loaded — automatic updates cannot run until the bundle is repaired');
     }
+    if (autoUpdate.effectiveEnabled && autoUpdate.holdIgnored) {
+      actions.push(`set KLYPIX_AUTO_UPDATE=0 in each KLYPIX MCP server entry's env and in the environment Claude Code runs its hooks in   # to stay on v${autoUpdate.installedIdentity?.version || version.baked}: the installed v${version.baked} updater predates the downgrade hold and re-installs v${autoUpdate.holdIgnored.version} within 24 h of its last check`);
+    }
     if (autoUpdate.effectiveEnabled && !autoUpdate.stale && autoUpdate.consecutiveFailures >= 2
       && autoUpdate.knownNewer && autoUpdate.knownDecision === 'install') {
       actions.push(`npx -y klypix-mcp@latest install --runtime-only   # the automatic update to v${autoUpdate.knownLatest.version} failed ${autoUpdate.consecutiveFailures} times in a row${autoUpdate.error ? ` (${autoUpdate.error})` : ''} — a manual run retries it now`);
     }
-    if (engineCode.unreceipted.length) {
-      const driver = engineCode.mergeDriverFiles.length
-        ? ` — including the git merge driver's own code (${engineCode.mergeDriverFiles.join(', ')}), which runs on every brain merge`
-        : ' — the KLYPIX git merge driver runs code from this directory';
-      actions.push(`review, then remove ${engineCode.unreceipted.join(', ')} from ${brainDir}   # not in the ${engineCode.receiptVersion ? `v${engineCode.receiptVersion} ` : ''}install receipt (left by an older release or added by hand)${driver}`);
+    if (engineCode.mergeDriverFiles.length) {
+      // F7: never "remove" the driver's own files — merge.klypix.driver runs
+      // <brainDir>/klypix-merge-driver.mjs. Installers from 1.89.0 on stage and
+      // receipt them, so a reinstall is what makes them vouched-for.
+      actions.push(`npx -y klypix-mcp@latest install --force   # re-stages and receipts the git merge driver's own code (${engineCode.mergeDriverFiles.join(', ')}), which runs on every brain merge — removing it would break the configured driver`);
+    }
+    const strays = engineCode.unreceipted.filter((name) => !engineCode.mergeDriverFiles.includes(name));
+    if (strays.length) {
+      actions.push(`review, then remove ${strays.join(', ')} from ${brainDir}   # not in the ${engineCode.receiptVersion ? `v${engineCode.receiptVersion} ` : ''}install receipt (left by an older release or added by hand); nothing installed imports it`);
     }
     if (peers.activeCodexConnectionScopedCount > 0) actions.push('/mcp reconnect   # active Codex connection lacks exact request-derived thread identity');
     if (peers.identityMergeGaps?.length) actions.push(`/mcp reconnect   # ${peers.identityMergeGaps.length} explicitly identified logical session(s) remain split across connection rows`);
@@ -1269,14 +1395,18 @@ export function driftLine(r) {
   if (r.npm && r.npm.matches === false) bits.push(`v${r.version.baked}<${r.npm.latest}`);
   if (r.running && r.running.matchesInstalled === false) bits.push(`live server v${r.running.version}≠installed v${r.version.baked} (/mcp reconnect)`);
   if (r.supervisors?.impaired?.length) {
-    const workerless = r.supervisors.impaired.filter(state => state.workerImpaired).length;
-    const transport = r.supervisors.impaired.length - workerless;
+    const blocked = r.supervisors.impaired.filter(state => state.wakeBlocked).length;
+    const workerless = r.supervisors.impaired.filter(state => state.workerImpaired && !state.wakeBlocked).length;
+    const transport = r.supervisors.impaired.length - workerless - blocked;
     if (workerless) bits.push(`${workerless} supervisor(s) have no live worker — tool calls cannot complete (/mcp reconnect)`);
+    if (blocked) bits.push(`${blocked} hibernated supervisor(s) cannot wake — the core files do not verify (npx -y klypix-mcp@latest install --force)`);
     if (transport) bits.push(`${transport} supervisor transport(s) cannot confirm host delivery (/mcp reconnect)`);
   }
   if (r.supervisors?.live?.some(state => state.degraded)) bits.push('supervisor host delivery backpressured');
   const misaligned = (r.supervisors?.live || []).filter(state => state.alignment === 'mismatch' && !state.impaired);
   if (misaligned.length) bits.push(`${misaligned.length} connection(s) serve a version ≠ installed v${r.version.baked}`);
+  const crossing = (r.supervisors?.live || []).filter(state => state.alignment === 'reconnect-on-wake' && !state.impaired);
+  if (crossing.length) bits.push(`${crossing.length} hibernated connection(s) cannot wake into the new major v${r.version.baked} (/mcp reconnect)`);
   if (r.hooks.missing.length) bits.push(`${r.hooks.missing.length} hook(s) unwired`);
   if (r.project.hasBrain && !r.harness.ok) bits.push(`${r.harness.drift.length} harness file(s) drifted`);
   if (r.layers?.decayGuard === 'drift') bits.push('decay-guard stale (fast-decay status claims unstamped)');
@@ -1325,11 +1455,22 @@ export function render(r, opts = {}) {
       // Every pair asleep is the healthy idle state: no worker means no
       // heartbeat, and a reconnect would only wake them for nothing.
       const n = run.allHibernated;
-      const wakes = [...new Set((r.supervisors?.live || []).map((state) => state.wakeVersion).filter(Boolean))];
+      const pairs = r.supervisors?.live || [];
+      // Pairs whose wake would fail (F5: a new major; F6: core files that do
+      // not verify) are not promised a wake.
+      const stuck = pairs.filter((state) => state.wakeBlocked || state.alignment === 'reconnect-on-wake').length;
+      const wakes = [...new Set(pairs.map((state) => state.wakeVersion).filter(Boolean))];
       const into = wakes.length && r.version.baked && wakes.every((v) => cmpSemver(v, r.version.baked) === 0)
         ? `v${r.version.baked}`
         : (wakes.length ? wakes.map((v) => `v${v}`).join(' / ') : 'the installed runtime');
-      L.push(`${ok} ${c.bold}RUNNING${c.rst}  all ${n} connection${n === 1 ? '' : 's'} hibernated; ${n === 1 ? 'it wakes' : 'they wake'} into ${into} on the next request`);
+      // A wake into a version the pair has not run yet passes the gates first.
+      const unvalidated = pairs.some((state) => state.alignment === 'pending-wake') ? ' (not yet validated)' : '';
+      if (!stuck) {
+        L.push(`${ok} ${c.bold}RUNNING${c.rst}  all ${n} connection${n === 1 ? '' : 's'} hibernated; ${n === 1 ? 'it wakes' : 'they wake'} into ${into} on the next request${unvalidated}`);
+      } else {
+        const wakeable = n - stuck;
+        L.push(`${warn} ${c.bold}RUNNING${c.rst}  all ${n} connection${n === 1 ? '' : 's'} hibernated; ${wakeable ? `${wakeable} wake${wakeable === 1 ? 's' : ''} into ${into} on the next request${unvalidated}, ` : ''}${c.yel}${stuck} cannot wake as installed (see SUPERVISOR)${c.rst}`);
+      }
     } else if (!run.known) L.push(`${ok} ${c.bold}RUNNING${c.rst}  ${c.dim}live server version unknown — no server has booted since the heartbeat shipped; /mcp reconnect to populate${c.rst}`);
     else if (run.matchesInstalled === false) L.push(`${rm} ${c.bold}RUNNING${c.rst}  ${c.red}${who}live MCP server v${run.version} ≠ installed v${r.version.baked} — STALE; /mcp reconnect${c.rst}`);
     else L.push(`${rm} ${c.bold}RUNNING${c.rst}  ${who}live MCP server v${run.version} ✓ matches installed`);
@@ -1350,12 +1491,26 @@ export function render(r, opts = {}) {
     // The mark follows the LAYER (2026-10-03): a pair serving an old version is
     // drift with nothing impaired, and used to print [ok] beside DRIFTED.
     const smark = r.layers.supervisor === 'drift' ? warn : ok;
-    const healthy = sup.count - impaired.length - degraded.length - moving.length;
-    L.push(`${smark} ${c.bold}SUPERVISOR${c.rst}  ${healthy} healthy${moving.length ? ` · ${moving.length} transitioning` : ''}${impaired.length ? ` · ${c.red}${impaired.length} IMPAIRED${c.rst}` : ' · zero-restart core activation ready'}${degraded.length ? ` · ${c.yel}${degraded.length} delivery-backpressured${c.rst}` : ''}${totalReloads ? ` · ${totalReloads} hot-swap${totalReloads === 1 ? '' : 's'}` : ''}`);
+    // F11 (2026-10-03 review): a pair that rejected an update (still serving
+    // the old worker) or cannot wake into a new major is not "healthy", and
+    // zero-restart activation is exactly what did not happen for it.
+    const reconnecting = sup.live.filter(state => !state.impaired && !state.degraded && !state.transition
+      && (state.status === 'restart-required' || state.alignment === 'reconnect-on-wake'));
+    const healthy = sup.count - impaired.length - degraded.length - moving.length - reconnecting.length;
+    const activation = impaired.length || reconnecting.length ? '' : ' · zero-restart core activation ready';
+    L.push(`${smark} ${c.bold}SUPERVISOR${c.rst}  ${healthy} healthy${moving.length ? ` · ${moving.length} transitioning` : ''}${reconnecting.length ? ` · ${c.yel}${reconnecting.length} need /mcp reconnect${c.rst}` : ''}${impaired.length ? ` · ${c.red}${impaired.length} IMPAIRED${c.rst}` : ''}${activation}${degraded.length ? ` · ${c.yel}${degraded.length} delivery-backpressured${c.rst}` : ''}${totalReloads ? ` · ${totalReloads} hot-swap${totalReloads === 1 ? '' : 's'}` : ''}`);
     for (const state of sup.live) {
       if (state.impaired) {
         if (state.status === 'restart-required') {
           L.push(`        ${c.red}· pid ${state.pid} restart-required: ${state.lastError || 'KLYPIX core changed incompatibly while idle'} — /mcp reconnect${c.rst}`);
+          continue;
+        }
+        if (state.wakeBlocked) {
+          const deferred = state.wakeDeferred;
+          const why = deferred
+            ? `its last wake found no consistent core to boot (${deferred.reason || 'runtime integrity'}${Number(deferred.count) > 1 ? `, ${deferred.count} attempts since ${deferred.since}` : ''})`
+            : `the core files fail verification (${state.lastError})`;
+          L.push(`        ${c.red}· pid ${state.pid} hibernated: ${why} — requests fail until they verify; npx -y klypix-mcp@latest install --force${c.rst}`);
           continue;
         }
         const reason = state.workerImpaired
@@ -1371,6 +1526,7 @@ export function render(r, opts = {}) {
         L.push(`        ${c.dim}· pid ${state.pid} ${crash ? 'recovering after a worker exit' : 'waking'} into ${vText(state.candidateVersion)} — requests are queued (${state.status})${c.rst}`);
       }
       else if (state.transition === 'swapping') L.push(`        ${c.dim}· pid ${state.pid} swapping to ${vText(state.candidateVersion)} (from ${vText(state.activeVersion)})${c.rst}`);
+      else if (state.alignment === 'reconnect-on-wake') L.push(`        ${c.yel}· pid ${state.pid} hibernated ${vText(state.activeVersion)} — the installed ${vText(state.pendingWakeVersion)} is a new major: its next request answers "core changed incompatibly" — /mcp reconnect${c.rst}`);
       else if (state.alignment === 'pending-wake') L.push(`        ${c.dim}· pid ${state.pid} hibernated ${vText(state.activeVersion)} — wakes into ${vText(state.pendingWakeVersion)} on next request (not yet validated)${c.rst}`);
       else if (state.status === 'restart-required') L.push(`        ${c.yel}· pid ${state.pid} restart-required: ${state.lastError || 'an update was rejected'} — /mcp reconnect (still serving ${vText(state.activeVersion)})${c.rst}`);
       else if (state.alignment === 'mismatch') L.push(`        ${c.yel}· pid ${state.pid} ${state.status} on ${vText(state.effectiveVersion)} — installed ${vText(r.version.baked)}${state.lastError ? `; ${state.lastError}` : ''}${c.rst}`);
@@ -1386,7 +1542,8 @@ export function render(r, opts = {}) {
     // pre-fix pair caught asleep has released nothing that lasts.
     const preFix = sup.preFix || [];
     const pre157 = sup.pendingReconnect || [];
-    const sleeping = sup.hibernated || [];
+    // Only pairs a request can actually wake are credited with "wakes on the next request".
+    const sleeping = (sup.hibernated || []).filter(state => !state.wakeBlocked && state.alignment !== 'reconnect-on-wake');
     const released = sleeping.filter(state => !state.preFix);
     const napping = sleeping.filter(state => state.preFix);
     const releasedText = released.length ? `${released.length} hibernated (worker released, presence held, wakes on the next request)` : '';
@@ -1435,14 +1592,18 @@ export function render(r, opts = {}) {
       // Nothing about the schedule can be known without the updater itself.
       L.push(`${warn} ${c.bold}AUTO-UPDATE${c.rst}  ${c.yel}state unknown — mcp-auto-update.mjs could not be loaded (a half-applied install?); automatic updates cannot run${c.rst}`);
     } else if (!(au.effectiveEnabled ?? au.enabled)) {
-      L.push(`${c.dim}· ${c.bold}AUTO-UPDATE${c.rst}  off by KLYPIX_AUTO_UPDATE${conn ? ` in all ${conn.live} live connection${conn.live === 1 ? '' : 's'}` : ''}${c.rst}`);
+      // F4: the Claude Code hooks launch the helper from their own environment.
+      const hookNote = au.hooksWired ? ' (the Claude Code hooks read their own environment)' : '';
+      L.push(`${c.dim}· ${c.bold}AUTO-UPDATE${c.rst}  off by KLYPIX_AUTO_UPDATE${conn ? ` in all ${conn.live} live connection${conn.live === 1 ? '' : 's'}` : ''}${hookNote}${c.rst}`);
       if (known && au.knownNewer) L.push(knownLine('disabled'));
     } else {
       const at = (ms) => (Number.isFinite(ms) ? `${isoMinute(ms)}, ${durationText(nowMs - ms)} ago` : 'time unknown');
       const checkedMs = timeOf(au.checkedAt);
       const parts = [
-        conn && conn.enabled < conn.live ? `enabled in ${conn.enabled} of ${conn.live} connections` : 'enabled',
-        `checks every ${durationText(au.cadenceMs || AUTO_UPDATE_TTL_MS)}`,
+        au.hooksOnly && conn
+          ? `enabled for Claude Code sessions in brain projects only — off by KLYPIX_AUTO_UPDATE in all ${conn.live} live MCP connection${conn.live === 1 ? '' : 's'}`
+          : (conn && conn.enabled < conn.live ? `enabled in ${conn.enabled} of ${conn.live} connections` : 'enabled'),
+        au.cadenceMs === null ? 'checks on the installed updater\'s schedule' : `checks every ${durationText(au.cadenceMs || AUTO_UPDATE_TTL_MS)}`,
       ];
       // What the last result says — and whether it describes THIS install.
       if (au.unfinishedAttempt) {
@@ -1483,10 +1644,17 @@ export function render(r, opts = {}) {
       } else {
         parts.push(`${au.stale ? 'check due' : (au.consecutiveFailures > 0 ? 'next retry' : 'next check')} ${isoMinute(dueMs)} (in ${durationText(dueMs - nowMs)})`);
       }
-      const amark = au.overdue || au.consecutiveFailures > 0 || au.scheduleError || au.blocked ? warn : ok;
+      const amark = au.overdue || au.consecutiveFailures > 0 || au.scheduleError || au.blocked || au.holdIgnored ? warn : ok;
       L.push(`${amark} ${c.bold}AUTO-UPDATE${c.rst}  ${parts.join(' · ')}`);
-      if (au.scheduleSkew) {
+      if (au.scheduleSkew?.rules === 'older') {
+        L.push(`        ${c.dim}· these times and decisions follow the installed v${au.scheduleSkew.installed} updater's rules${au.updaterApi === 1 ? ' (checks every 24h, no downgrade hold)' : ''}, so overdue is not judged${c.rst}`);
+      } else if (au.scheduleSkew?.rules === 'newer') {
+        L.push(`        ${c.dim}· the installed v${au.scheduleSkew.installed} updater is newer than this doctor: its schedule and decisions are not shown — run npx -y klypix-mcp@latest doctor${c.rst}`);
+      } else if (au.scheduleSkew) {
         L.push(`        ${c.dim}· these times follow this doctor's v${au.scheduleSkew.doctor} rules; the installed updater is v${au.scheduleSkew.installed}${au.overdueSuppressed === 'version-skew' ? ', so overdue is not judged' : ''}${c.rst}`);
+      }
+      if (au.holdIgnored) {
+        L.push(`        ${c.yel}· the downgrade to ${vText(installedV)} is NOT held: the installed v${r.version.baked} updater predates the hold and re-installs v${au.holdIgnored.version} at its next check — to stay, set KLYPIX_AUTO_UPDATE=0 in each host's MCP server env and in Claude Code's hook environment${c.rst}`);
       }
       if (known && au.knownDecision && au.knownDecision !== 'current') L.push(knownLine(au.knownDecision));
     }
@@ -1600,10 +1768,17 @@ export function render(r, opts = {}) {
   if (r.engineCode?.checked) {
     const e = r.engineCode;
     const receipt = `${e.receiptVersion ? `v${e.receiptVersion} ` : ''}install receipt`;
+    const retired = Array.isArray(e.retired) ? e.retired : [];
     if (e.unreceipted.length) {
-      L.push(`${warn} ${c.bold}ENGINE${c.rst}   ${e.unreceipted.length} module(s) outside the ${receipt}: ${c.yel}${e.unreceipted.join(', ')}${c.rst} — no installer vouches for this code, and the KLYPIX git merge driver runs code from this directory on every brain merge${e.mergeDriverFiles.length ? ` (${c.red}including ${e.mergeDriverFiles.join(', ')}${c.rst})` : ''}`);
+      const driver = e.mergeDriverFiles.length
+        ? ` — ${c.red}including the git merge driver's own code (${e.mergeDriverFiles.join(', ')}), which runs on every brain merge${c.rst}`
+        : '';
+      L.push(`${warn} ${c.bold}ENGINE${c.rst}   ${e.unreceipted.length} module(s) outside the ${receipt}: ${c.yel}${e.unreceipted.join(', ')}${c.rst} — no installer vouches for this code${driver}`);
     } else {
-      L.push(`${ok} ${c.bold}ENGINE${c.rst}   all ${e.total - e.desktopExtras.length} engine module(s) covered by the ${receipt}${e.desktopExtras.length ? ` ${c.dim}(+${e.desktopExtras.length} desktop-app script(s))${c.rst}` : ''}`);
+      L.push(`${ok} ${c.bold}ENGINE${c.rst}   all ${e.total - e.desktopExtras.length - retired.length} engine module(s) covered by the ${receipt}${e.desktopExtras.length ? ` ${c.dim}(+${e.desktopExtras.length} desktop-app script(s))${c.rst}` : ''}`);
+    }
+    for (const item of retired) {
+      L.push(`        ${c.dim}· ${item.name}: retired (${item.origin}); nothing imports it — safe to delete${c.rst}`);
     }
   }
 

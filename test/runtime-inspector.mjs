@@ -96,5 +96,55 @@ ok(formatRuntimeReport(report).includes('no process was changed or terminated'),
   'C4: the human report credits only the fixed pair and names the pre-fix one');
 }
 
+// K4 (2026-10-03): the hibernated line promised that every sleeping connection
+// "wakes on its next request". Three kinds cannot: a wake that found no
+// consistent core (wakeDeferred), an installed new major that the wake refuses
+// (reconnect-on-wake), and a restart-required pair with no worker. They leave
+// that promise and the saving, and are named on their own line with the reason.
+{
+  const rows = [
+    proc(1, 0, 'codex.exe', 'codex.exe app-server', 220),
+    proc(10, 1, 'node.exe', 'node C:/brain/klypix-mcp-server.mjs --vault E:/A', 60),
+    proc(11, 10, 'node.exe', 'node C:/brain/klypix-mcp-worker.mjs --vault E:/A', 400),
+    ...[20, 21, 22, 23, 24].map((pid) => proc(pid, 1, 'node.exe', `node C:/brain/klypix-mcp-server.mjs --vault E:/V${pid}`, 60)),
+  ];
+  const asleep = (extra = {}) => ({ hibernated: true, count: 1, target: { version: '1.90.0' }, ...extra });
+  const report = buildRuntimeReport({
+    processRows: rows,
+    sampledAt,
+    platform: 'win32',
+    supervisorStates: [
+      { pid: 10, status: 'ready', active: { pid: 11, version: '1.90.0' }, supervisorVersion: '1.90.0' },
+      { pid: 20, status: 'hibernated', active: null, hibernation: asleep(), supervisorVersion: '1.90.0' },
+      { pid: 21, status: 'hibernated', active: null, lastError: 'runtime integrity mismatch: klypix-mcp-worker.mjs', supervisorVersion: '1.90.0',
+        hibernation: asleep({ wakeDeferred: { reason: 'runtime integrity mismatch: klypix-mcp-worker.mjs', count: 2, since: '2026-08-04T00:00:00.000Z', lastAt: '2026-08-04T00:05:00.000Z' } }) },
+      { pid: 22, status: 'hibernated', active: null, hibernation: asleep({ pendingWakeTarget: { version: '2.0.0', validated: false } }), supervisorVersion: '1.90.0' },
+      { pid: 23, status: 'restart-required', active: null, lastError: 'major upgrade v1.90.0 → v2.0.0 requires reconnect',
+        hibernation: { hibernated: false, count: 1 }, supervisorVersion: '1.90.0' },
+      { pid: 24, status: 'hibernated', active: null, hibernation: asleep({ pendingWakeTarget: { version: '1.91.0', validated: false } }), supervisorVersion: '1.90.0' },
+    ],
+    runningServers: [{ pid: 11, version: '1.90.0', vault: 'E:/A' }],
+  });
+  const pair = (pid) => report.connections.find((item) => item.supervisor?.pid === pid);
+  ok(report.totals.hibernatedConnections === 4 && report.totals.cannotWakeConnections === 3
+    && report.totals.wakeableHibernatedConnections === 2 && report.totals.estimatedHibernationSavingsMb === 800,
+  `K4: pairs that cannot wake leave the wake count and the saving (${JSON.stringify(report.totals)})`);
+  ok(pair(21)?.cannotWake?.reason === 'wake-deferred' && pair(22)?.cannotWake?.reason === 'reconnect-on-wake'
+    && pair(23)?.cannotWake?.reason === 'restart-required'
+    && [21, 22, 23].every((pid) => pair(pid).flags.includes('cannot-wake'))
+    && [10, 20, 24].every((pid) => !pair(pid).cannotWake && !pair(pid).flags.includes('cannot-wake')),
+  'K4: each such pair is flagged with its reason; a same-major pending wake still wakes');
+  const text = formatRuntimeReport(report);
+  ok(text.includes('Hibernated 2 connection(s) — about 800 MB not resident (mean resident worker 400 MB); each wakes on its next request.'),
+    'K4: "each wakes on its next request" counts only the pairs that can');
+  ok(/3 asleep connection\(s\) will not wake into the installed core on their next request — /.test(text)
+    && /pid 21: its last wake found no consistent core to boot \(runtime integrity mismatch: klypix-mcp-worker\.mjs, 2 attempts\) — requests fail until the core files verify; npx -y klypix-mcp@latest doctor shows the fix/.test(text)
+    && /pid 22: sleeps on v1\.90\.0; the installed v2\.0\.0 is a new major, which its wake refuses — \/mcp reconnect to adopt it/.test(text)
+    && /pid 23: restart-required \(major upgrade v1\.90\.0 → v2\.0\.0 requires reconnect\) — every request is answered with a reconnect error; \/mcp reconnect/.test(text),
+  'K4: those pairs are stated separately, each with its reason and what to do');
+  ok(!/install --force|klypix-mcp@\S+ install|--runtime-only/.test(text),
+    'K4: the report never names an installer command (agents read it too)');
+}
+
 console.log(failures ? `\n✗ ${failures} runtime-inspector assertion(s) failed` : '\n✓ runtime-inspector: all assertions passed');
 process.exit(failures ? 1 : 0);

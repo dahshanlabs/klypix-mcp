@@ -62,6 +62,50 @@ const readJson = (file, fallback) => {
   catch { return fallback; }
 };
 
+const majorOf = (version) => {
+  const match = String(version || '').match(/^v?(\d+)\.\d+\.\d+/);
+  return match ? Number(match[1]) : null;
+};
+
+// K4 (2026-10-03): an asleep pair whose next request will NOT wake it into the
+// installed core, from the receipt fields the doctor reads → {reason, detail},
+// or null. The report used to promise that every hibernated connection "wakes on
+// its next request", these included. The texts name the remedy's owner and the
+// read-only diagnosis, never an installer: agents read this report too.
+export function wakeBlock(state) {
+  if (!state || typeof state !== 'object') return null;
+  const hibernation = state.hibernation && typeof state.hibernation === 'object' ? state.hibernation : {};
+  if (state.status === 'hibernated') {
+    // Its last wake found no consistent core to boot (the supervisor's deferWake).
+    const deferred = hibernation.wakeDeferred && typeof hibernation.wakeDeferred === 'object' ? hibernation.wakeDeferred : null;
+    if (deferred) {
+      const attempts = Number(deferred.count) > 1 ? `, ${Number(deferred.count)} attempts` : '';
+      return {
+        reason: 'wake-deferred',
+        detail: `its last wake found no consistent core to boot (${deferred.reason || 'runtime integrity'}${attempts}) — requests fail until the core files verify; npx -y klypix-mcp@latest doctor shows the fix`,
+      };
+    }
+    // The install it would wake into is another major: the wake's gate refuses it.
+    const ran = hibernation.target?.version || null;
+    const pending = hibernation.pendingWakeTarget?.version || null;
+    if (ran && pending && majorOf(ran) !== null && majorOf(pending) !== null && majorOf(ran) !== majorOf(pending)) {
+      return {
+        reason: 'reconnect-on-wake',
+        detail: `sleeps on v${ran}; the installed v${pending} is a new major, which its wake refuses — /mcp reconnect to adopt it`,
+      };
+    }
+    return null;
+  }
+  // No worker and none will start: every request is answered with a reconnect error.
+  if (state.status === 'restart-required' && !state.active) {
+    return {
+      reason: 'restart-required',
+      detail: `restart-required (${state.lastError || 'KLYPIX core changed incompatibly while idle'}) — every request is answered with a reconnect error; /mcp reconnect`,
+    };
+  }
+  return null;
+}
+
 export function readRuntimeReceipts(brainDir) {
   const root = path.resolve(brainDir || path.join(os.homedir(), '.claude', 'project-brain'));
   const supervisorDir = path.join(root, '.supervisors');
@@ -190,6 +234,8 @@ export function buildRuntimeReport({
     // sleeping pairs release no RAM that lasts — never count them as savings.
     const preFixSupervisor = Boolean(state) && !Object.prototype.hasOwnProperty.call(state, 'supervisorVersion');
     if (preFixSupervisor) flags.push('pre-fix-supervisor');
+    const cannotWake = wakeBlock(state);
+    if (cannotWake) flags.push('cannot-wake');
     connections.push({
       id: state?.connectionId || `pid-${supervisor?.pid || worker?.pid}`,
       client: state?.clientInfo?.name || (host ? classifyHostProcess(host) : 'unknown'),
@@ -220,6 +266,8 @@ export function buildRuntimeReport({
       hibernation: state?.hibernation
         ? { hibernated: hibernating, idleMs: state.hibernation.idleMs ?? null, since: state.hibernation.since || null, count: state.hibernation.count || 0 }
         : null,
+      // K4: why its next request will not wake it into the installed core.
+      cannotWake,
       flags,
       processIds,
     });
@@ -261,7 +309,10 @@ export function buildRuntimeReport({
   // number is always derived from this machine rather than a guess.
   const residentWorkers = connections.filter((item) => item.worker);
   const hibernated = connections.filter((item) => item.hibernation?.hibernated);
-  const released = hibernated.filter((item) => !item.flags.includes('pre-fix-supervisor'));
+  // K4: only a pair that wakes on its next request counts as a saving; one that
+  // cannot (cannotWake) is a broken connection, reported on its own line.
+  const released = hibernated.filter((item) => !item.flags.includes('pre-fix-supervisor') && !item.cannotWake);
+  const cannotWake = connections.filter((item) => item.cannotWake);
   const avgWorkerMb = residentWorkers.length
     ? Math.round((residentWorkers.reduce((sum, item) => sum + number(item.worker.rssMb), 0) / residentWorkers.length) * 10) / 10
     : null;
@@ -277,7 +328,12 @@ export function buildRuntimeReport({
       totalMb,
       hibernatedConnections: hibernated.length,
       // Asleep at this instant but on pre-fix supervisor code: not a saving.
-      preFixHibernatedConnections: hibernated.length - released.length,
+      preFixHibernatedConnections: hibernated.filter((item) => item.flags.includes('pre-fix-supervisor')).length,
+      // K4: asleep pairs (hibernated, or restart-required with no worker) whose
+      // next request will not wake them into the installed core.
+      cannotWakeConnections: cannotWake.length,
+      // Hibernated on fixed supervisor code and able to wake: the saving below.
+      wakeableHibernatedConnections: released.length,
       avgResidentWorkerMb: avgWorkerMb,
       estimatedHibernationSavingsMb: avgWorkerMb !== null && released.length
         ? Math.round(avgWorkerMb * released.length * 10) / 10
@@ -308,7 +364,9 @@ export function inspectKlypixRuntime({ brainDir, platform = process.platform, ex
 export function formatRuntimeReport(report) {
   const t = report?.totals || {};
   const preFixAsleep = number(t.preFixHibernatedConnections);
-  const releasing = number(t.hibernatedConnections) - preFixAsleep;
+  // K4: the wake promise covers only pairs that can keep it.
+  const releasing = number(t.wakeableHibernatedConnections);
+  const blocked = (report?.connections || []).filter((item) => item?.cannotWake);
   const lines = [
     `KLYPIX RUNTIME V2 — PASSIVE — ${report?.sampledAt || ''}`,
     `Connections ${t.connections || 0} · workers ${t.workersMb || 0} MB · supervisors ${t.supervisorsMb || 0} MB · launchers ${t.launchersMb || 0} MB · total ${t.totalMb || 0} MB`,
@@ -317,6 +375,10 @@ export function formatRuntimeReport(report) {
       : []),
     ...(preFixAsleep > 0
       ? [`${preFixAsleep} more connection(s) asleep right now run pre-fix supervisor code that re-wakes idle workers within seconds — not counted as a saving; /mcp reconnect to apply.`]
+      : []),
+    ...(blocked.length
+      ? [`${blocked.length} asleep connection(s) will not wake into the installed core on their next request — ${blocked
+        .map((item) => `pid ${item.supervisor?.pid ?? item.worker?.pid ?? '?'}: ${item.cannotWake.detail}`).join('; ')}.`]
       : []),
     '',
   ];

@@ -111,9 +111,6 @@ const AUTO_UPDATE_TTL_MS = Number(autoUpdateLib.AUTO_UPDATE_TTL_MS) > 0
   ? Number(autoUpdateLib.AUTO_UPDATE_TTL_MS) : 24 * 60 * 60 * 1000;
 const AUTO_UPDATE_POLL_MS = Number(autoUpdateLib.AUTO_UPDATE_POLL_MS) > 0
   ? Number(autoUpdateLib.AUTO_UPDATE_POLL_MS) : 60 * 60 * 1000;
-// "Overdue" needs more than one missed poll: a due check runs within one poll
-// (10 min) while any connection lives. 30 min is three polls.
-const AUTO_UPDATE_OVERDUE_GRACE_MS = 30 * 60 * 1000;
 
 // C6 (2026-10-03): say WHICH doctor is talking. A bare `npx klypix-mcp doctor`
 // inside a project that pins klypix-mcp as a devDependency runs THAT copy —
@@ -599,36 +596,6 @@ function autoUpdateView({ au, brainDir, supervisors, version, hooks, npmLatest, 
   const unfinishedAttempt = !au.inProgress && stampFailures > 0 && lastCheckMs !== null
     && (!Number.isFinite(checkedMs) || lastCheckMs > checkedMs + 1000);
 
-  // Overdue needs evidence that someone should have run the check: a live
-  // supervisor with updates enabled, and a schedule computed by the same rules
-  // the installed updater runs (a newer `npx klypix-mcp@latest doctor` on an
-  // older install would otherwise call a check "overdue" that the installed
-  // 24 h updater correctly has not reached).
-  const dueMs = dueAtMs;
-  let dueSinceMs = dueMs;
-  if (au.dueReason === 'install-changed') {
-    // The schedule re-opened when the receipts changed, not at lastCheck + 5 min.
-    let changedAt = timeOf(au.installedIdentity?.installedAt);
-    if (!Number.isFinite(changedAt)) {
-      try { changedAt = fs.statSync(path.join(brainDir, '.mcp-runtime.json')).mtimeMs; } catch { changedAt = NaN; }
-    }
-    if (Number.isFinite(changedAt)) dueSinceMs = Math.max(dueMs, changedAt);
-  } else if (rules === 'own' && ['never-checked', 'invalid-stamp'].includes(au.dueReason) && dueMs >= now - 1000) {
-    // F9 (2026-10-03 review): these are due "now" by construction, so they
-    // could never be late — a helper that never starts sat at "check due now"
-    // forever. They have been due since the stamp went bad, or since always.
-    let stampAt = NaN;
-    try { stampAt = fs.statSync(path.join(brainDir, '.autoupdate-check.json')).mtimeMs; } catch { /* never written */ }
-    dueSinceMs = Number.isFinite(stampAt) ? stampAt : -Infinity;
-  }
-  const triggerStates = live.filter((state) => state.autoUpdateEnabled !== false);
-  const triggers = triggerStates.length;
-  // A check is late only for a session that was open to run it (F9): from the
-  // later of when it fell due and when the longest-running such session
-  // started. A supervisor that started a second ago has not had its chance —
-  // the rule the SessionStart notice already applies (supervisorOpenSince).
-  const bootTimes = triggerStates.map((state) => timeOf(state.bootedAt)).filter(Number.isFinite);
-  const openSinceMs = bootTimes.length ? Math.min(...bootTimes) : NaN;
   const versionSkew = doctorVersion && version.baked && cmpSemver(doctorVersion, version.baked) !== 0
     ? { doctor: doctorVersion, installed: version.baked } : null;
   // An installed updater whose api matches this doctor's runs these rules,
@@ -636,13 +603,26 @@ function autoUpdateView({ au, brainDir, supervisors, version, hooks, npmLatest, 
   const skew = rules !== 'own'
     ? { doctor: doctorVersion, installed: version.baked, rules, api: installedApi }
     : (installedApi === null ? versionSkew : null);
-  const dueLong = effectiveEnabled && !au.inProgress && !au.scheduleError
-    && (dueSinceMs === -Infinity || Number.isFinite(dueSinceMs)) && now - dueSinceMs > AUTO_UPDATE_OVERDUE_GRACE_MS;
-  const lateSinceMs = Math.max(dueSinceMs, openSinceMs);
-  const late = dueLong && Number.isFinite(lateSinceMs) && now - lateSinceMs > AUTO_UPDATE_OVERDUE_GRACE_MS;
-  const overdueSuppressed = !dueLong ? null
-    : (!triggers ? 'no-live-session' : (skew ? 'version-skew' : (late ? null : 'session-too-new')));
-  const overdue = late && !overdueSuppressed;
+  // K2 (2026-10-03): OVERDUE is the updater's own rule (autoUpdateOverdue), the
+  // one the SessionStart notice applies too, judged from the live supervisors
+  // (dead receipts are already excluded above). The doctor adds only what is
+  // about itself: a schedule computed by rules other than the installed
+  // updater's (a newer `npx klypix-mcp@latest doctor` on an older install) is
+  // never judged, and an updater module without the rule judges nothing.
+  let rule = { overdue: false, overdueByMs: null, evidence: null, suppressed: null };
+  if (effectiveEnabled && typeof autoUpdateLib.autoUpdateOverdue === 'function') {
+    try {
+      rule = autoUpdateLib.autoUpdateOverdue({
+        plan: au,
+        supervisors: live.map((state) => ({ bootedAt: state.bootedAt, autoUpdate: { enabled: state.autoUpdateEnabled } })),
+        now,
+        helperApi: installedApi,
+      }) || rule;
+    } catch { /* never judged */ }
+  }
+  const overdueSuppressed = rule.suppressed === 'no-live-session' ? 'no-live-session'
+    : (skew && (rule.overdue || rule.suppressed) ? 'version-skew' : (rule.suppressed || null));
+  const overdue = rule.overdue === true && !skew;
 
   const knownLatest = knownNpmLatest(brainDir, au, npmLatest, now);
   // MV-2: a pre-hold updater re-installs whatever the owner rolled back from;
@@ -686,8 +666,10 @@ function autoUpdateView({ au, brainDir, supervisors, version, hooks, npmLatest, 
     consecutiveFailures,
     unfinishedAttempt,
     overdue,
-    overdueByMs: overdue ? now - lateSinceMs : null,
+    overdueByMs: overdue ? rule.overdueByMs : null,
     overdueSuppressed,
+    // What the overdue rule saw (K2): the live sessions that should have run it.
+    overdueEvidence: overdue ? rule.evidence || null : null,
     scheduleSkew: skew,
     knownLatest,
     knownDecision,

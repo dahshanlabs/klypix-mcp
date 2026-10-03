@@ -10,6 +10,7 @@ import { EventEmitter } from 'events';
 import { fileURLToPath, pathToFileURL } from 'url';
 import {
   AUTO_UPDATE_HARNESS_REFRESH_MS,
+  AUTO_UPDATE_OVERDUE_GRACE_MS,
   AUTO_UPDATE_POLL_MS,
   AUTO_UPDATE_RECHECK_FLOOR_MS,
   AUTO_UPDATE_RETRY_MS,
@@ -17,6 +18,7 @@ import {
   AUTO_UPDATE_TTL_MS,
   __test,
   autoUpdateDecision,
+  autoUpdateOverdue,
   autoUpdatePaths,
   autoUpdateSchedule,
   installExactRuntime,
@@ -1148,6 +1150,72 @@ try {
     fs.writeFileSync(autoUpdatePaths(dir).stamp, JSON.stringify({ protocol: 1, lastCheck: t - 7 * HOUR, failures: 0 }));
     ok(!!spawn(t + AUTO_UPDATE_SPAWN_RETRY_MS + AUTO_UPDATE_POLL_MS) && launches === 3,
       'MV-3: … or as soon as the stamp or the status changes');
+  }
+
+  {
+    // K2 (2026-10-03): ONE overdue rule, pure and total. The doctor and the
+    // SessionStart notice used to judge "overdue" with their own conditions.
+    const t = Date.UTC(2026, 9, 5, 12, 0, 0);
+    const iso = (ms) => new Date(ms).toISOString();
+    const plan = (over = {}) => ({
+      dueAt: iso(t - 2 * HOUR), dueReason: 'interval', inProgress: null, scheduleError: null, helperApi: 2,
+      installedIdentity: { version: '1.4.0', managed: true, dev: false, installedAt: null, unknown: false },
+      stampWrittenAt: iso(t - 8 * HOUR), runtimeCommittedAt: null, ...over,
+    });
+    const session = (over = {}) => ({ bootedAt: iso(t - 10 * HOUR), autoUpdate: { enabled: true }, ...over });
+    const judge = (p, supervisors = [session()], extra = {}) => autoUpdateOverdue({ plan: p, supervisors, now: t, ...extra });
+
+    const late = judge(plan());
+    ok(late.overdue && late.overdueByMs === 2 * HOUR && late.dueForMs === 2 * HOUR && late.evidence?.sessions === 1 && late.suppressed === null,
+      'K2: due 2 h with a session open all along → overdue by 2 h');
+    ok(judge(plan({ dueAt: iso(t - AUTO_UPDATE_OVERDUE_GRACE_MS) })).overdue
+      && !judge(plan({ dueAt: iso(t - AUTO_UPDATE_OVERDUE_GRACE_MS + 1000) })).overdue,
+    'K2: overdue from exactly 30 min past due (now ≥ due + 30 min), not a second sooner');
+    const opened = judge(plan(), [session({ bootedAt: iso(t - 40 * MINUTE) })]);
+    const fresh = judge(plan(), [session({ bootedAt: iso(t - 10 * MINUTE) })]);
+    ok(opened.overdue && opened.overdueByMs === 40 * MINUTE && !fresh.overdue && fresh.suppressed === 'session-too-new',
+      'K2: late only for a session that was open to run it — measured from its start; a 10-min-old session is not evidence yet');
+    ok(judge(plan(), []).suppressed === 'no-live-session'
+      && judge(plan(), [session({ autoUpdate: { enabled: false } })]).suppressed === 'no-live-session'
+      && !judge(plan(), [session({ autoUpdate: { enabled: false } })]).overdue,
+    'K2: no live session with updates on → never overdue');
+    ok(!judge(plan({ dueAt: iso(t - 20 * MINUTE) })).overdue && judge(plan({ dueAt: iso(t - 20 * MINUTE) })).suppressed === null
+      && !judge(plan({ inProgress: { pid: 7, startedAt: iso(t - MINUTE) } })).overdue
+      && !judge(plan({ scheduleError: 'boom' })).overdue && !judge(plan({ dueAt: null })).overdue,
+    'K2: a check due < 30 min, running, or with an unknown schedule is not judged');
+    ok(judge(plan({ helperApi: 1 })).suppressed === 'pre-hold-updater' && !judge(plan({ helperApi: 1 })).overdue
+      && judge(plan(), [session()], { helperApi: 1 }).suppressed === 'pre-hold-updater' && judge(plan({ helperApi: 1 }), [session()], { helperApi: 2 }).overdue,
+    'K2: a pre-hold updater (helperApi 1) is never judged; the caller can name the helper spawners launch');
+    const changed = (installedAt, runtimeCommittedAt = null) => judge(plan({
+      dueAt: iso(t - 5 * HOUR), dueReason: 'install-changed', runtimeCommittedAt,
+      installedIdentity: { version: '1.4.0', managed: true, dev: false, installedAt, unknown: false },
+    }));
+    ok(changed(iso(t - HOUR)).overdueByMs === HOUR && !changed(iso(t - 10 * MINUTE)).overdue
+      && changed(null, iso(t - HOUR)).overdueByMs === HOUR,
+    'K2: an install-changed check is late from the install (receipt installedAt, else the runtime manifest mtime), not from its lastCheck floor');
+    const never = (stampWrittenAt) => judge(plan({ dueAt: iso(t), dueReason: 'never-checked', stampWrittenAt }));
+    ok(never(null).overdue && never(null).dueForMs === null && never(null).overdueByMs === 10 * HOUR
+      && never(iso(t - 3 * HOUR)).dueForMs === 3 * HOUR && never(iso(t - 3 * HOUR)).overdueByMs === 3 * HOUR,
+    'K2: a check due "now" by construction is due since its stamp was written, or since before any record (measured from the session start)');
+    let threw = null;
+    try {
+      for (const input of [undefined, null, {}, { plan: 'x' }, { plan: { dueAt: 5 } }, { plan: plan(), supervisors: 'x', now: NaN },
+        { plan: plan({ dueReason: 'never-checked', dueAt: iso(t) }), supervisors: [null, 7, { bootedAt: 1e20 }, { autoUpdate: 'x' }], now: t }]) {
+        const result = autoUpdateOverdue(input);
+        if (typeof result?.overdue !== 'boolean') throw new Error(`no verdict for ${JSON.stringify(input)}`);
+      }
+    } catch (error) { threw = error; }
+    ok(!threw, `K2: autoUpdateOverdue is total over arbitrary input${threw ? ` (${threw.message})` : ''}`);
+
+    // The schedule view carries the two file times the rule needs, so callers do no I/O for it.
+    const dir = scenario('overdue-file-times');
+    writeRuntime(dir, '1.4.0');
+    const before = view(dir, t);
+    fs.writeFileSync(autoUpdatePaths(dir).stamp, JSON.stringify({ protocol: 1, lastCheck: t - HOUR, failures: 0 }));
+    const after = view(dir, t);
+    ok(before.stampWrittenAt === null && Number.isFinite(Date.parse(before.runtimeCommittedAt))
+      && Number.isFinite(Date.parse(after.stampWrittenAt)),
+    'K2: inspectAutoUpdate reports when the stamp (null: never written) and the runtime receipt were written');
   }
 
   {

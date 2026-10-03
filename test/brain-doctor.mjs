@@ -907,6 +907,21 @@ const supervisorReceipt = (brainDir, name, state) => writeJson(path.join(brainDi
   fs.rmSync(home, { recursive: true, force: true });
 }
 
+// K2 (2026-10-03) — ONE overdue rule. The doctor and the SessionStart notice used
+// to compute "overdue" separately, with different conditions. Both now ask the
+// updater's autoUpdateOverdue; neither keeps a private grace or session clock.
+// (CR stripped: Windows checkouts are CRLF.)
+{
+  const src = (name) => fs.readFileSync(path.join(__dirname, '..', 'src', name), 'utf8').replace(/\r/g, '');
+  const doctor = src('brain-doctor.mjs');
+  const hook = src('global-brain-hook.mjs');
+  ok(/autoUpdateLib\.autoUpdateOverdue\(/.test(doctor) && /updater\.autoUpdateOverdue\(/.test(hook),
+    'K2: the doctor and the SessionStart notice both judge overdue with the updater\'s autoUpdateOverdue');
+  ok(!/OVERDUE_(GRACE_)?MS\s*=/.test(doctor) && !/OVERDUE_(GRACE_)?MS\s*=/.test(hook)
+    && !/timeOf\(state\.bootedAt\)/.test(doctor) && !/supervisorOpenSince/.test(hook),
+  'K2: neither keeps a private copy of the rule (no grace constant of its own, no session clock)');
+}
+
 // C6 — the doctor names its own engine version and warns when it is older
 // than the brain it is judging (a pinned devDependency copy, 2026-10-03).
 {

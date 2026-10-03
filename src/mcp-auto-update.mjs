@@ -97,6 +97,9 @@ export const AUTO_UPDATE_STALE_REGISTRATION_MS = 14 * 24 * 60 * 60 * 1000;
 // exited 'throttled' or 'busy', or could not start) waits this long before
 // launching another (MV-3, 2026-10-03 review).
 export const AUTO_UPDATE_SPAWN_RETRY_MS = AUTO_UPDATE_TTL_MS / 2;
+// A due check runs within one poll (10 min) while any session is open, so a
+// check due this long — three polls — is OVERDUE (autoUpdateOverdue).
+export const AUTO_UPDATE_OVERDUE_GRACE_MS = 30 * 60 * 1000;
 export const AUTO_UPDATE_WORKER_ARG = '--klypix-auto-update-worker';
 
 const MAX_DATE_MS = 8.64e15;
@@ -808,6 +811,12 @@ export function inspectAutoUpdate(brainDir, { now = Date.now(), env = process.en
     // (MV-2, 2026-10-03 review), never "held" on its behalf.
     const helperApi = updaterApiOf(fileURLToPath(import.meta.url));
     const helperHolds = helperApi === null || helperApi >= 2;
+    // When the stamp and the runtime receipt were last written, for the overdue
+    // rule (autoUpdateOverdue): a check due "now" by construction has been due
+    // since its stamp went bad, and an install-changed check since the install.
+    const writtenAt = (file) => {
+      try { return isoAt(fs.statSync(file).mtimeMs); } catch { return null; }
+    };
     return {
       enabled,
       lastCheck,
@@ -847,6 +856,9 @@ export function inspectAutoUpdate(brainDir, { now = Date.now(), env = process.en
         hold: helperHolds ? upcomingHold : null,
       }),
       scheduleError: plan.error || null,
+      // Since K2 (2026-10-03): null when the file does not exist.
+      stampWrittenAt: writtenAt(files.stamp),
+      runtimeCommittedAt: writtenAt(files.runtime),
     };
   } catch (error) {
     return {
@@ -878,8 +890,80 @@ export function inspectAutoUpdate(brainDir, { now = Date.now(), env = process.en
       helperApi: null,
       decision: 'unknown',
       scheduleError: cleanError(error),
+      stampWrittenAt: null,
+      runtimeCommittedAt: null,
     };
   }
+}
+
+// ── Overdue: one rule for every surface (K2, 2026-10-03) ─────────────────────
+// The doctor and the SessionStart notice each decided "overdue" with their own
+// conditions: the notice never judged a check that was never recorded, and a
+// machine could read overdue in one and "due now" in the other. Both now ask
+// this function, with the plan above and the live supervisors' receipts.
+
+/**
+ * Is the automatic check OVERDUE: due past the grace, with a session that was
+ * open to run it? Pure and TOTAL (never throws).
+ *
+ *   plan         inspectAutoUpdate(brainDir)
+ *   supervisors  the LIVE supervisors' receipts as written — the caller drops
+ *                dead ones (own pid gone, or host gone and the receipt silent
+ *                for > 120 s: the B7 rule) — each {bootedAt, autoUpdate}
+ *   helperApi    AUTO_UPDATE_API of the helper spawners launch (default
+ *                plan.helperApi); a pre-hold updater (1) is never judged
+ *
+ * → {overdue, overdueByMs, dueForMs, evidence, suppressed}: `dueForMs` is how
+ * long the check has been due (null: since before any record); `suppressed`
+ * names why a check due past the grace is not called overdue.
+ */
+export function autoUpdateOverdue(input = {}) {
+  const verdict = (suppressed = null, dueForMs = null) => ({ overdue: false, overdueByMs: null, dueForMs, evidence: null, suppressed });
+  try {
+    // Destructured here, not in the signature: a null argument must not throw.
+    const { plan = null, supervisors = [], now = Date.now(), helperApi } = isRecord(input) ? input : {};
+    if (!isRecord(plan) || plan.scheduleError || plan.inProgress) return verdict();
+    const t = validNow(now);
+    const at = (value) => {
+      const ms = typeof value === 'string' ? Date.parse(value) : NaN;
+      return Number.isFinite(ms) ? ms : null;
+    };
+    const dueAt = at(plan.dueAt);
+    if (dueAt === null) return verdict();
+    // When the check really fell due. Two reasons make dueAt a stand-in: an
+    // install-changed check re-opened when the receipts changed, not at
+    // lastCheck + 5 min; a never-checked or invalid-stamp check is due "now" by
+    // construction, so it could never be late — it has been due since its stamp
+    // was written, or, with no stamp at all, since before anything was recorded.
+    let since = dueAt;
+    if (plan.dueReason === 'install-changed') {
+      const changedAt = at(plan.installedIdentity?.installedAt) ?? at(plan.runtimeCommittedAt);
+      if (changedAt !== null) since = Math.max(dueAt, changedAt);
+    } else if (['never-checked', 'invalid-stamp'].includes(plan.dueReason) && dueAt <= t + 1000) {
+      since = at(plan.stampWrittenAt) ?? -Infinity;
+    }
+    if (t - since < AUTO_UPDATE_OVERDUE_GRACE_MS) return verdict();
+    const dueForMs = Number.isFinite(since) ? t - since : null;
+    // Its times and decisions are not this module's: never judged (MV-2).
+    if ((helperApi === undefined ? plan.helperApi : helperApi) === 1) return verdict('pre-hold-updater', dueForMs);
+    // The sessions that run checks: live supervisors with updates on.
+    const pollers = (Array.isArray(supervisors) ? supervisors : [])
+      .filter((state) => isRecord(state) && !(isRecord(state.autoUpdate) && state.autoUpdate.enabled === false));
+    if (!pollers.length) return verdict('no-live-session', dueForMs);
+    // Late only for a session that was open to run it (F9): from the later of
+    // when the check fell due and when the longest-running such session began.
+    const boots = pollers.map((state) => at(state.bootedAt)).filter((value) => value !== null);
+    const openSince = boots.length ? Math.min(...boots) : null;
+    const lateSince = openSince === null ? null : Math.max(since, openSince);
+    if (lateSince === null || t - lateSince < AUTO_UPDATE_OVERDUE_GRACE_MS) return verdict('session-too-new', dueForMs);
+    return {
+      overdue: true,
+      overdueByMs: t - lateSince,
+      dueForMs,
+      evidence: { sessions: pollers.length, openSince: isoAt(openSince) },
+      suppressed: null,
+    };
+  } catch { return verdict(); }
 }
 
 // The AUTO_UPDATE_API a file declares: a number, 1 for an updater from before

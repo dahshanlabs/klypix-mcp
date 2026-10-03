@@ -5325,22 +5325,23 @@ function knownNpmLatest({ file = NPM_CURRENCY, brainDir = path.dirname(NPM_CURRE
 }
 
 // The INSTALLED updater's own view, for the version notice (D1) and the
-// SessionStart self-update spawn (D4), 2026-10-03: its schedule (inspectAutoUpdate)
-// and what it would do with the freshest local npm figure (autoUpdateDecision), so
-// neither surface has to guess. A guarded dynamic import, never a static one: the
-// --live / --guard fast paths and an older flat deployment must keep working when
-// the module or its exports are missing — then plan/decision are null and the
-// notice stays neutral. Zero network: the module has no import side effects
-// outside its worker argv, and inspectAutoUpdate reads only local files.
-// `loadUpdater` is injectable for tests. → {known, plan, decision}; never throws.
+// SessionStart self-update spawn (D4), 2026-10-03: its schedule (inspectAutoUpdate),
+// what it would do with the freshest local npm figure (autoUpdateDecision) and
+// whether its check is overdue (autoUpdateOverdue, K2), so no surface has to
+// guess. A guarded dynamic import, never a static one: the --live / --guard fast
+// paths and an older flat deployment must keep working when the module or its
+// exports are missing — then plan/decision/overdue are null and the notice stays
+// neutral. Zero network: the module has no import side effects outside its worker
+// argv, and inspectAutoUpdate reads only local files. `loadUpdater` is injectable
+// for tests. → {known, plan, decision, overdue}; never throws.
 async function autoUpdateFooterInputs({ file = NPM_CURRENCY, brainDir = path.dirname(NPM_CURRENCY), env = process.env, now = Date.now(), loadUpdater = () => import('./mcp-auto-update.mjs') } = {}) {
     let known = null;
     try {
         known = knownNpmLatest({ file, brainDir });
         const updater = await loadUpdater();
-        if (typeof updater?.inspectAutoUpdate !== 'function') return { known, plan: null, decision: null };
+        if (typeof updater?.inspectAutoUpdate !== 'function') return { known, plan: null, decision: null, overdue: null };
         const plan = updater.inspectAutoUpdate(brainDir, { env, now });
-        if (!plan || typeof plan !== 'object') return { known, plan: null, decision: null };
+        if (!plan || typeof plan !== 'object') return { known, plan: null, decision: null, overdue: null };
         let decision = null;
         // A --force downgrade the updater has not evaluated yet ('manual-downgrade')
         // gets its hold at the NEXT check (A4), so the decision cannot be known
@@ -5355,8 +5356,16 @@ async function autoUpdateFooterInputs({ file = NPM_CURRENCY, brainDir = path.dir
                 : id;
             decision = updater.autoUpdateDecision({ installed, latestVersion: known ? known.latest : null, hold: plan.hold });
         }
-        return { known, plan, decision: typeof decision === 'string' ? decision : null };
-    } catch { return { known, plan: null, decision: null }; }
+        // K2 (2026-10-03): overdue is the updater's own rule — the one the doctor
+        // applies — judged from the live supervisors' receipts. An updater without
+        // it (an older module) judges nothing, so the notice never says overdue.
+        let overdue = null;
+        if (typeof updater.autoUpdateOverdue === 'function') {
+            try { overdue = updater.autoUpdateOverdue({ plan, supervisors: liveSupervisorReceipts(brainDir, now), now }) || null; }
+            catch { overdue = null; }
+        }
+        return { known, plan, decision: typeof decision === 'string' ? decision : null, overdue };
+    } catch { return { known, plan: null, decision: null, overdue: null }; }
 }
 
 // Read the BAKED brain-core version from the deployed klypix-mcp-server.mjs — the
@@ -5369,10 +5378,6 @@ function bakedBrainVersion(brainDir = path.dirname(NPM_CURRENCY)) {
         return m ? m[1] : null;
     } catch { return null; }
 }
-
-// A check that fell due this long ago while a KLYPIX session was open is OVERDUE —
-// the same 30 minutes the doctor's AUTO-UPDATE line uses.
-const AUTO_UPDATE_OVERDUE_MS = 30 * 60 * 1000;
 
 // "45m", "3h 20m", "2d 4h" — one-line notice spans.
 function spanLabel(ms) {
@@ -5390,32 +5395,28 @@ function etaLabel(atMs, now) {
     return `≈ ${new Date(atMs).toISOString().slice(0, 16).replace('T', ' ')} UTC, in ${spanLabel(atMs - now)}`;
 }
 
-// Has a KLYPIX MCP supervisor been running on this machine since `sinceMs`? Such a
-// session polls the shared schedule (2 s after start, then every poll interval),
-// so a check that stayed due through its lifetime is genuinely stuck. A supervisor
-// that started later — typically the one the host launched for THIS session — has
-// not had its chance yet: counting it made every first session after a quiet day
-// read "overdue". A receipt counts only while its pid answers a signal (EPERM is
-// another user's process, never ours), its host is not provably gone (the
-// doctor's dead-receipt rule: a dead recorded parent and an updatedAt > 120 s old
-// mark a reused-pid phantom), and its own auto-update is not switched off (that
-// session never runs the check). Only consulted when a check already looks overdue.
-function supervisorOpenSince(brainDir, sinceMs, now = Date.now()) {
+// The receipts of the KLYPIX MCP supervisors running on this machine — the
+// sessions that poll the shared update schedule — for the updater's overdue rule
+// (autoUpdateOverdue), which decides from them which sessions could have run a
+// check. A receipt counts only while its pid answers a signal (EPERM is another
+// user's process, never ours) and its host is not provably gone (the doctor's
+// dead-receipt rule: a dead recorded parent and an updatedAt > 120 s old mark a
+// reused-pid phantom).
+function liveSupervisorReceipts(brainDir, now = Date.now()) {
     let names = [];
-    try { names = fs.readdirSync(path.join(brainDir, '.supervisors')).filter((name) => /^\d+\.json$/.test(name)); } catch { return false; }
+    try { names = fs.readdirSync(path.join(brainDir, '.supervisors')).filter((name) => /^\d+\.json$/.test(name)); } catch { return []; }
+    const live = [];
     for (const name of names) {
         try {
             const state = JSON.parse(fs.readFileSync(path.join(brainDir, '.supervisors', name), 'utf8'));
             const pid = Number(state?.pid);
             if (!Number.isInteger(pid) || pid <= 0) continue;
-            if (state.autoUpdate && state.autoUpdate.enabled === false) continue;
             try { process.kill(pid, 0); } catch { continue; }
             if (isProcessAlive(state.parentPid) === false && !(now - Date.parse(state.updatedAt) <= 120_000)) continue;
-            const bootedAt = Date.parse(state.bootedAt);
-            if (Number.isFinite(bootedAt) && bootedAt <= sinceMs) return true;
+            live.push(state);
         } catch { /* a receipt mid-rewrite: skip it */ }
     }
-    return false;
+    return live;
 }
 
 // The doctor that judges THIS install (F2, 2026-10-03 review). A bare
@@ -5428,10 +5429,10 @@ function installedDoctorHint(baked) {
 }
 
 // The remedy half of the version notice: what the installed updater will actually
-// do with `latest`, from its own plan and decision → {mark, text}. Each branch
-// states only what the updater's state supports; without a plan it promises
-// nothing. `spawned`: this SessionStart has just launched the update check.
-function updateRemedy({ plan, decision, latest, baked, brainDir, now, spawned = false }) {
+// do with `latest`, from its own plan, decision and overdue verdict → {mark, text}.
+// Each branch states only what the updater's state supports; without a plan it
+// promises nothing. `spawned`: this SessionStart has just launched the update check.
+function updateRemedy({ plan, decision, overdue = null, latest, baked, now, spawned = false }) {
     const neutral = { mark: '⬆️', text: `${installedDoctorHint(baked)} shows whether it installs automatically.` };
     if (!plan || typeof plan !== 'object' || plan.scheduleError) return neutral;
     // Every SessionStart puts this text in an AGENT's context, and agents on shared
@@ -5458,20 +5459,14 @@ function updateRemedy({ plan, decision, latest, baked, brainDir, now, spawned = 
     const promise = (when) => ({ mark: '⬆️', text: `KLYPIX will install it automatically in the background at the next update check (${when}); no action required.` });
     // A live helper holds the lock: the check is happening as this session starts.
     if (plan.inProgress) return promise('running now');
-    // An install-changed check fell due when the receipts changed, not at its
-    // lastCheck + 5 min floor (the doctor's rule): measure lateness from the install.
-    let dueSince = dueAt;
-    if (plan.dueReason === 'install-changed') {
-        let changedAt = Date.parse(plan.installedIdentity && plan.installedIdentity.installedAt);
-        if (!Number.isFinite(changedAt)) { try { changedAt = fs.statSync(path.join(brainDir, '.mcp-runtime.json')).mtimeMs; } catch { changedAt = NaN; } }
-        if (Number.isFinite(changedAt)) dueSince = Math.max(dueAt, changedAt);
-    }
-    if (now - dueSince > AUTO_UPDATE_OVERDUE_MS && supervisorOpenSince(brainDir, now - AUTO_UPDATE_OVERDUE_MS, now)) {
+    // K2: the updater's own overdue rule (autoUpdateOverdue), the doctor's too.
+    if (overdue && overdue.overdue === true) {
         // F3 (2026-10-03 review): say only what is known — how long it has been
         // due, and that a session open ≥ 30 min did not run it (not that one was
         // open when it fell due) — and that this session has just started it,
         // when it has: the notice used to print right after that spawn.
-        const late = `due for ${spanLabel(now - dueSince)}; a KLYPIX session open ≥ 30 min did not run it`;
+        const dueFor = Number.isFinite(overdue.dueForMs) ? `due for ${spanLabel(overdue.dueForMs)}` : 'no check recorded on this machine';
+        const late = `${dueFor}; a KLYPIX session open ≥ 30 min did not run it`;
         if (spawned) {
             return { mark: '⚠️', text: `The automatic update check was overdue (${late}) and was started just now; if this notice repeats, run ${installedDoctorHint(baked)}.` };
         }
@@ -5500,16 +5495,17 @@ function updateRemedy({ plan, decision, latest, baked, brainDir, now, spawned = 
 // is missing or unknown ("(offline)" sentinel), or when there's no baked version to
 // compare against — no nag, no noise.
 //
-// The remedy states what the UPDATER will do, from `plan` (its inspectAutoUpdate)
-// and `decision` (its autoUpdateDecision for this `latest`), both loaded by
-// autoUpdateFooterInputs (2026-10-03). It used to promise "KLYPIX will install it
+// The remedy states what the UPDATER will do, from `plan` (its inspectAutoUpdate),
+// `decision` (its autoUpdateDecision for this `latest`) and `overdue` (its
+// autoUpdateOverdue verdict), all loaded by autoUpdateFooterInputs (2026-10-03).
+// It used to promise "KLYPIX will install it
 // automatically in the background; no action required" unconditionally: 25+
 // SessionStarts (2026-09-29 → 10-01) promised 1.86.3 and 1.87.0 while the updater
 // refused them as dev-owned, and the 1.89.0 promise ran ~7 h ahead of the first
 // check that could act. No plan (an older or unreadable updater) → a neutral
 // pointer to the doctor, never a promise. `known` is the {latest, at} figure the
 // decision was made for; when omitted it is read here.
-function versionCurrencyFooter({ file = NPM_CURRENCY, brainDir = path.dirname(NPM_CURRENCY), env = process.env, now = Date.now(), known, plan = null, decision = null, spawned = false } = {}) {
+function versionCurrencyFooter({ file = NPM_CURRENCY, brainDir = path.dirname(NPM_CURRENCY), env = process.env, now = Date.now(), known, plan = null, decision = null, overdue = null, spawned = false } = {}) {
     try {
         const figure = known === undefined ? knownNpmLatest({ file, brainDir }) : known;
         if (!figure) return '';
@@ -5542,7 +5538,7 @@ function versionCurrencyFooter({ file = NPM_CURRENCY, brainDir = path.dirname(NP
         if (!autoUpdateEnabled(env)) {
             return `\n\n---\n⚠️ ${head} Automatic updates are off; run \`npx klypix-mcp install\`.\n`;
         }
-        const { mark, text } = updateRemedy({ plan, decision, latest, baked, brainDir, now, spawned });
+        const { mark, text } = updateRemedy({ plan, decision, overdue, latest, baked, now, spawned });
         return `\n\n---\n${mark} ${head} ${text}\n`;
     } catch { return ''; }
 }

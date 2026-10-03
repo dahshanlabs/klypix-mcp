@@ -5408,18 +5408,27 @@ function supervisorOpenSince(brainDir, sinceMs, now = Date.now()) {
     return false;
 }
 
+// The doctor that judges THIS install (F2, 2026-10-03 review). A bare
+// `npx klypix-mcp doctor` runs whatever copy npx resolves: inside a project that
+// pins klypix-mcp (1.67.0 in the KLYPIX app checkout) that is an old doctor with
+// no schedule or decision to show; elsewhere it is npm's latest, judging by
+// rules the installed updater may not run. brain_doctor runs the installed one.
+function installedDoctorHint(baked) {
+    return `\`brain_doctor\` (or \`npx -y klypix-mcp@${baked} doctor\`)`;
+}
+
 // The remedy half of the version notice: what the installed updater will actually
 // do with `latest`, from its own plan and decision → {mark, text}. Each branch
 // states only what the updater's state supports; without a plan it promises
-// nothing.
-function updateRemedy({ plan, decision, latest, baked, brainDir, now }) {
-    const neutral = { mark: '⬆️', text: '`npx klypix-mcp doctor` shows whether it installs automatically.' };
+// nothing. `spawned`: this SessionStart has just launched the update check.
+function updateRemedy({ plan, decision, latest, baked, brainDir, now, spawned = false }) {
+    const neutral = { mark: '⬆️', text: `${installedDoctorHint(baked)} shows whether it installs automatically.` };
     if (!plan || typeof plan !== 'object' || plan.scheduleError) return neutral;
     if (decision === 'dev-owned') {
         return { mark: '⚠️', text: 'Automatic updates are paused: developer-owned install — re-deploy from your checkout, or `npx -y klypix-mcp@latest install --force` to return to npm releases.' };
     }
     if (decision === 'major-blocked') {
-        return { mark: '⚠️', text: `Automatic updates will NOT install it: \`v${latest}\` is a new major version, which needs a manual install — the owner's decision; \`npx klypix-mcp doctor\` shows the details.` };
+        return { mark: '⚠️', text: `Automatic updates will NOT install it: \`v${latest}\` is a new major version, which needs a manual install — the owner's decision: \`npx -y klypix-mcp@latest install\`.` };
     }
     if (decision === 'held') {
         const from = plan.hold && plan.hold.version;
@@ -5443,7 +5452,15 @@ function updateRemedy({ plan, decision, latest, baked, brainDir, now }) {
         if (Number.isFinite(changedAt)) dueSince = Math.max(dueAt, changedAt);
     }
     if (now - dueSince > AUTO_UPDATE_OVERDUE_MS && supervisorOpenSince(brainDir, now - AUTO_UPDATE_OVERDUE_MS, now)) {
-        return { mark: '⚠️', text: `Automatic check overdue — run \`npx klypix-mcp doctor\` (it fell due ${spanLabel(now - dueSince)} ago while a KLYPIX session was open).` };
+        // F3 (2026-10-03 review): say only what is known — how long it has been
+        // due, and that a session open ≥ 30 min did not run it (not that one was
+        // open when it fell due) — and that this session has just started it,
+        // when it has: the notice used to print right after that spawn.
+        const late = `due for ${spanLabel(now - dueSince)}; a KLYPIX session open ≥ 30 min did not run it`;
+        if (spawned) {
+            return { mark: '⚠️', text: `The automatic update check was overdue (${late}) and was started just now; if this notice repeats, run ${installedDoctorHint(baked)}.` };
+        }
+        return { mark: '⚠️', text: `Automatic check overdue (${late}) — run ${installedDoctorHint(baked)}.` };
     }
     // A failed result written by a pre-2026-10-03 updater has no count in its
     // stamp; it is still one failed attempt, never a clean slate.
@@ -5477,7 +5494,7 @@ function updateRemedy({ plan, decision, latest, baked, brainDir, now }) {
 // check that could act. No plan (an older or unreadable updater) → a neutral
 // pointer to the doctor, never a promise. `known` is the {latest, at} figure the
 // decision was made for; when omitted it is read here.
-function versionCurrencyFooter({ file = NPM_CURRENCY, brainDir = path.dirname(NPM_CURRENCY), env = process.env, now = Date.now(), known, plan = null, decision = null } = {}) {
+function versionCurrencyFooter({ file = NPM_CURRENCY, brainDir = path.dirname(NPM_CURRENCY), env = process.env, now = Date.now(), known, plan = null, decision = null, spawned = false } = {}) {
     try {
         const figure = known === undefined ? knownNpmLatest({ file, brainDir }) : known;
         if (!figure) return '';
@@ -5510,7 +5527,7 @@ function versionCurrencyFooter({ file = NPM_CURRENCY, brainDir = path.dirname(NP
         if (!autoUpdateEnabled(env)) {
             return `\n\n---\n⚠️ ${head} Automatic updates are off; run \`npx klypix-mcp install\`.\n`;
         }
-        const { mark, text } = updateRemedy({ plan, decision, latest, baked, brainDir, now });
+        const { mark, text } = updateRemedy({ plan, decision, latest, baked, brainDir, now, spawned });
         return `\n\n---\n${mark} ${head} ${text}\n`;
     } catch { return ''; }
 }
@@ -5689,7 +5706,7 @@ function maybeSelfUpdate(plan = null) {
             // disabled, throttled, backing off, or another helper holds the lock.
             // When the plan could not be loaded (an older or unreadable module),
             // keep the old spawn: the helper's own lock and schedule still decide.
-            if (plan && typeof plan === 'object' && plan.due === false) return;
+            if (plan && typeof plan === 'object' && plan.due === false) return false;
             spawnDetached(process.execPath, [helper, '--klypix-auto-update-worker'], {
                 cwd: os.tmpdir(),
                 env: {
@@ -5700,7 +5717,8 @@ function maybeSelfUpdate(plan = null) {
                 },
                 shell: false,
             });
-            return;
+            // The version notice says so (F3): "overdue" printed next to this spawn.
+            return true;
         }
 
         // Pre-host-neutral installations retain their original cache-driven
@@ -5716,7 +5734,9 @@ function maybeSelfUpdate(plan = null) {
         // Apply: detached, fail-open. cwd=CWD so install also migrates THIS project's
         // .mcp.json off npx. install self-enforces never-downgrade + dev gates.
         if (d.act) spawnDetached('npx', ['-y', `klypix-mcp@${d.latest}`, 'install']);
+        return d.act === true;
     } catch { /* self-update is best-effort — never break a session */ }
+    return false;
 }
 
 async function read(lib) {
@@ -5728,7 +5748,7 @@ async function read(lib) {
     // Auto-propagation lever: fire-and-forget a self-update check (detached, only
     // when the shared schedule says one is due, fail-open) so a newer published
     // brain installs itself for the next session.
-    maybeSelfUpdate(update.plan);
+    update.spawned = maybeSelfUpdate(update.plan);
     // Register presence at session start so a peer already running sees this session
     // immediately. Files/ships come from live observation + Stop.
     const laneTouch = touchSession(input.session_id, { branch: gitBranch(), hostStatus: 'idle' });

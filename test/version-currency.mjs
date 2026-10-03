@@ -164,6 +164,8 @@ ok(!/no action required/.test(devLine) && !/automatically in the background/.tes
 const majorLine = at({ plan: planFor(), decision: 'major-blocked', known: { latest: '2.0.0', at: NOW - HOUR } });
 ok(/will NOT install it: `v2\.0\.0` is a new major version, which needs a manual install/.test(majorLine) && !/no action required/.test(majorLine),
    'major-blocked → names the manual install, promises nothing');
+ok(/the owner's decision: `npx -y klypix-mcp@latest install`\./.test(majorLine),
+   'F2: major-blocked names the command that installs it');
 
 const heldLine = at({ plan: planFor({ hold: { version: '1.14.0', since: iso(NOW - HOUR) } }), decision: 'held' });
 ok(/held after a manual downgrade to `v1\.13\.0` — only a release newer than `v1\.14\.0` installs automatically/.test(heldLine) && !/no action required/.test(heldLine),
@@ -187,8 +189,15 @@ const writeSupervisor = (name, receipt) => { fs.mkdirSync(supDir, { recursive: t
 const overduePlan = planFor({ due: true, dueAt: iso(NOW - 3 * HOUR) });
 writeSupervisor(`${process.pid}.json`, { protocol: 1, pid: process.pid, parentPid: process.pid, bootedAt: iso(NOW - 5 * HOUR), updatedAt: iso(NOW - 60_000), status: 'ready' });
 const overdueLine = at({ plan: overduePlan, decision: 'install' });
-ok(/Automatic check overdue — run `npx klypix-mcp doctor` \(it fell due 3h ago while a KLYPIX session was open\)/.test(overdueLine) && !/no action required/.test(overdueLine),
-   'overdue (due 3 h ago, a session open all along) → "automatic check overdue — run npx klypix-mcp doctor"');
+// F2/F3 (2026-10-03 review): the notice states only what is known, and points
+// at the doctor that judges THIS install — a bare `npx klypix-mcp doctor` runs
+// whatever copy npx resolves (a project's pinned 1.67.0, or npm's latest).
+ok(/Automatic check overdue \(due for 3h; a KLYPIX session open ≥ 30 min did not run it\) — run `brain_doctor` \(or `npx -y klypix-mcp@1\.13\.0 doctor`\)\./.test(overdueLine) && !/no action required/.test(overdueLine),
+   'overdue (due 3 h ago, a session open all along) → "automatic check overdue" with what is known, pointing at the installed doctor');
+const startedLine = at({ plan: overduePlan, decision: 'install', spawned: true });
+ok(/The automatic update check was overdue \(due for 3h; .*\) and was started just now; if this notice repeats, run `brain_doctor`/.test(startedLine)
+    && !/Automatic check overdue —/.test(startedLine),
+   'F3: when this SessionStart has just started the overdue check, the notice says so instead of "run the doctor"');
 // An install-changed check is due from the moment the receipts changed, not from
 // its lastCheck + 5 min floor (the doctor measures it the same way): an install
 // 10 min ago after a check 1 h ago is not 55 min late.
@@ -198,7 +207,7 @@ const changedPlan = (floorAgoMs, installedAgoMs) => planFor({
 });
 ok(/\(due now\); no action required/.test(at({ plan: changedPlan(55 * 60_000, 10 * 60_000), decision: 'install' })),
    'install-changed 10 min ago (floor 55 min ago) → "due now", not overdue');
-ok(/Automatic check overdue .* \(it fell due 2h ago while a KLYPIX session was open\)/.test(at({ plan: changedPlan(175 * 60_000, 2 * HOUR), decision: 'install' })),
+ok(/Automatic check overdue \(due for 2h; a KLYPIX session open ≥ 30 min did not run it\)/.test(at({ plan: changedPlan(175 * 60_000, 2 * HOUR), decision: 'install' })),
    'install-changed 2 h ago (floor 2 h 55 min ago) with a session open → overdue by 2h, measured from the install');
 writeSupervisor(`${process.pid}.json`, { protocol: 1, pid: process.pid, parentPid: process.pid, bootedAt: iso(NOW - 5 * HOUR), updatedAt: iso(NOW - 60_000), status: 'ready', autoUpdate: { enabled: false } });
 ok(/\(due now\)/.test(at({ plan: overduePlan, decision: 'install' })),
@@ -214,7 +223,8 @@ fs.rmSync(supDir, { recursive: true, force: true });
 ok(/\(due now\)/.test(at({ plan: overduePlan, decision: 'install' })), 'no session open → a long-due check is "due now", not "overdue"');
 
 // No plan → the updater's view is unknown → a neutral pointer, never a promise.
-const NEUTRAL = /`npx klypix-mcp doctor` shows whether it installs automatically\./;
+// F2: the installed doctor, never a bare `npx klypix-mcp doctor` (baked here: 1.13.0).
+const NEUTRAL = /`brain_doctor` \(or `npx -y klypix-mcp@1\.13\.0 doctor`\) shows whether it installs automatically\./;
 for (const [label, extra] of [
     ['no plan (the updater module could not be loaded)', {}],
     ['a plan without a decision (an older updater module)', { plan: planFor() }],

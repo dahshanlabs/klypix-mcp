@@ -61,6 +61,11 @@ const DEFAULT_AUTO_UPDATE_START_DELAY_MS = 2000;
 const RECOVERY_MAX_ATTEMPTS = 5;
 const RECOVERY_BACKOFF_BASE_MS = 1000;
 const RECOVERY_BACKOFF_MAX_MS = 60_000;
+// Hot-swap retry policy (2026-10-03): a candidate that fails TRANSIENTLY while
+// the old worker keeps serving is retried after base × 1, 4, 20 (30 s, 2 min,
+// 10 min by default); only then is it kept rejected until a reconnect.
+const DEFAULT_SWAP_RETRY_BASE_MS = 30_000;
+const SWAP_RETRY_FACTORS = [1, 4, 20];
 // Unbounded queue growth is its own failure mode while a recovery is running.
 const HOST_QUEUE_MAX = 200;
 // A wake that finds the manifest failing integrity is usually racing an install:
@@ -490,6 +495,10 @@ class Supervisor {
     this.pollMs = Number(options.pollMs || process.env.KLYPIX_MCP_SUPERVISOR_POLL_MS || DEFAULT_POLL_MS);
     this.timeoutMs = Number(options.timeoutMs || process.env.KLYPIX_MCP_SUPERVISOR_TIMEOUT_MS || DEFAULT_TIMEOUT_MS);
     this.rollbackGraceMs = Number(options.rollbackGraceMs || process.env.KLYPIX_MCP_ROLLBACK_GRACE_MS || DEFAULT_ROLLBACK_GRACE_MS);
+    this.swapRetryBaseMs = Math.max(1000, Number(options.swapRetryBaseMs || process.env.KLYPIX_MCP_SWAP_RETRY_BASE_MS || DEFAULT_SWAP_RETRY_BASE_MS) || DEFAULT_SWAP_RETRY_BASE_MS);
+    this.swapRetryAttempts = 0;
+    this.swapRetrySignature = null;
+    this.swapRetryTimer = null;
     this.autoUpdate = options.autoUpdate !== false && autoUpdateEnabled();
     this.autoUpdatePollMs = Number(
       options.autoUpdatePollMs
@@ -1588,6 +1597,37 @@ class Supervisor {
     }
   }
 
+  // A hot-swap that failed while the old worker still serves. A deterministic
+  // rejection (new major, breaking tools) stays rejected until a new install or a
+  // reconnect. A TRANSIENT one — an initialize timeout under load, a spawn error,
+  // an exit before activation — used to pin the connection to its old version
+  // just the same (field, 2026-10-03: one 15 s initialize timeout during a
+  // test-heavy hour left a Codex pair on v1.88.0 beside a v1.89.0 install until it
+  // reconnected). It now retries the same target on the swap backoff while the
+  // old worker keeps serving; the signature stays rejected meanwhile so the 1 s
+  // poller cannot restart it early, and the timer lifts it.
+  scheduleSwapRetry(candidate, reason) {
+    const signature = candidate.target.signature;
+    if (this.swapRetrySignature !== signature) {
+      this.swapRetrySignature = signature;
+      this.swapRetryAttempts = 0;
+    }
+    if (this.swapRetryAttempts >= SWAP_RETRY_FACTORS.length) return false;
+    const delay = this.swapRetryBaseMs * SWAP_RETRY_FACTORS[this.swapRetryAttempts++];
+    const rejectedVersion = candidate.version || candidate.target.version;
+    this.rejectedSignature = signature;
+    this.status = 'ready';
+    if (this.swapRetryTimer) clearTimeout(this.swapRetryTimer);
+    this.swapRetryTimer = setTimeout(() => {
+      this.swapRetryTimer = null;
+      if (!this.closed && this.rejectedSignature === signature) this.rejectedSignature = null;
+    }, delay);
+    this.swapRetryTimer.unref?.();
+    this.writeState({ rejectedVersion, swapRetry: { attempt: this.swapRetryAttempts, of: SWAP_RETRY_FACTORS.length, inMs: delay } });
+    log(`kept v${this.active?.version || 'none'}; v${rejectedVersion} failed transiently (${reason}) — retrying in ${Math.round(delay / 1000)} s (${this.swapRetryAttempts}/${SWAP_RETRY_FACTORS.length})`);
+    return true;
+  }
+
   rejectCandidate(reason, terminate = true, { deterministic = false } = {}) {
     const candidate = this.candidate;
     if (!candidate) return;
@@ -1598,6 +1638,7 @@ class Supervisor {
       this.rejectWhileIdle(candidate, reason);
       return;
     }
+    if (this.active && !deterministic && this.scheduleSwapRetry(candidate, reason)) return;
     this.status = this.active ? 'restart-required' : 'recovery-failed';
     if (!this.active) {
       // RECOVERY rejection: transient spawn failures (0xC0000142-class) must
@@ -1702,6 +1743,9 @@ class Supervisor {
     this.rejectedSignature = rejection ? rejection.signature : null;
     this.recoveryAttempts = 0;   // a committed worker resets the retry budget
     if (this.recoveryTimer) { clearTimeout(this.recoveryTimer); this.recoveryTimer = null; }
+    this.swapRetryAttempts = 0;   // and the hot-swap retry budget
+    this.swapRetrySignature = null;
+    if (this.swapRetryTimer) { clearTimeout(this.swapRetryTimer); this.swapRetryTimer = null; }
     this.status = rejection ? 'restart-required' : 'ready';
     this.lastError = rejection ? rejection.reason : null;
     this.runtimeError = null;
@@ -1997,6 +2041,7 @@ class Supervisor {
     clearTimeout(this.autoUpdateStarter);
     clearInterval(this.autoUpdatePoller);
     if (this.recoveryTimer) { clearTimeout(this.recoveryTimer); this.recoveryTimer = null; }
+    if (this.swapRetryTimer) { clearTimeout(this.swapRetryTimer); this.swapRetryTimer = null; }
     // Real shutdown grace: stdin EOF lets the worker run its own presence
     // cleanup (stopRuntimePresence/removeSession). An instant SIGTERM is
     // TerminateProcess on Windows — the cleanup never runs and every normally

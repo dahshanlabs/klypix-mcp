@@ -1127,6 +1127,41 @@ try {
     `TQ-2: an initialize timeout on wake is transient — the backoff retry serves v90.1.0, status clean (${woken.slice(0, 120)}; ${s?.status}; ${bootList(woke)})`);
   });
 
+  // SWAP-RETRY (2026-10-03, field): a HOT-SWAP candidate that times out while the
+  // old worker keeps serving used to be rejected for good — restart-required,
+  // its signature blacklisted — so one initialize timeout under load pinned the
+  // connection to its old version until a reconnect. It now retries on the swap
+  // backoff (base 1 s here) and lands the new version without a reconnect.
+  const timeoutOnSwapRetries = () => scenario('swap-hang-once', async (track) => {
+    const dir = runtimeDir('swap-hang-once');
+    const audit = path.join(dir, 'boots.jsonl');
+    const marker = path.join(dir, 'swap-hang-once.marker');
+    install(dir, '90.0.0', { identity: true, bootAudit: audit });
+    const pair = track(await openPair(dir, 'swap-hang-once', {
+      env: { KLYPIX_MCP_SUPERVISOR_TIMEOUT_MS: '2000', KLYPIX_MCP_SWAP_RETRY_BASE_MS: '4000', KLYPIX_WORKER_HIBERNATE_MS: '0' },
+    }));
+    ok(await pair.call() === '90.0.0', 'SWAP-RETRY: the pair serves v90.0.0 before the update');
+    fs.writeFileSync(marker, 'x');   // the first v90.1.0 candidate never answers its initialize
+    install(dir, '90.1.0', { identity: true, bootAudit: audit, extraTool: true, hangOnce: marker });
+    // The 4 s retry window opens once the hung first attempt times out (2 s).
+    let sawRetry = null;
+    try {
+      await waitFor(async () => {
+        const s = pair.state();
+        if (s?.swapRetry) sawRetry = { status: s.status, swapRetry: s.swapRetry, served: await pair.call() };
+        return Boolean(sawRetry);
+      }, 15000);
+    } catch { /* reported below */ }
+    let landed = false;
+    try { await waitFor(async () => (await pair.call()) === '90.1.0', 20000); landed = true; } catch { /* reported below */ }
+    const s = pair.state();
+    ok(landed && s?.status === 'ready' && !s.lastError && s.hotReloads >= 1
+      && boots(audit).filter(item => item.version === '90.1.0').length >= 2,
+    `SWAP-RETRY: after a transient initialize timeout the swap is retried and lands v90.1.0 with no reconnect (${s?.status}; hot ${s?.hotReloads}; ${s?.lastError || 'no error'}; ${bootList(boots(audit))})`);
+    ok(Boolean(sawRetry) && sawRetry.status === 'ready' && sawRetry.served === '90.0.0' && sawRetry.swapRetry.attempt === 1,
+      `SWAP-RETRY: while the retry waits, the old worker keeps serving and the pair reads ready, not restart-required (${JSON.stringify(sawRetry)})`);
+  });
+
   // TQ-6: the stat gate only ever SKIPS work. A breaking B is rejected while A
   // serves; B's worker is then edited with no new manifest (the stat gate still
   // says "verified"), and A's crash recovery clears the rejection. The next poll
@@ -1225,6 +1260,7 @@ try {
     runtimePairWakesPackageOnIntegrity(),
     crashOnWakeRetriesInstalled(),
     timeoutOnWakeRetriesInstalled(),
+    timeoutOnSwapRetries(),
     forcedReadBeforeCandidate(),
     unreadableManifestWaitsOnWake(),
     flatAbsentManifestDefers(),

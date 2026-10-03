@@ -561,6 +561,19 @@ function rolledBackFrom(status, identity) {
   return highest && compareSemver(identity.version, highest) < 0 ? highest : null;
 }
 
+// The hold a check applies (A4): the recorded one, raised to the version a
+// deliberate downgrade left, and dropped once the install has reached it. The
+// helper records it; inspectAutoUpdate decides with it too, so no view promises
+// to re-install a version the next check will hold (until the helper had run, a
+// --force downgrade read 'install' there — 2026-10-03 integration review).
+function nextHold(status, identity, since = null) {
+  let hold = sanitizeHold(isRecord(status) ? status.hold : null);
+  const from = rolledBackFrom(status, identity);
+  if (from && (!hold || compareSemver(from, hold.version) > 0)) hold = { version: from, since };
+  if (hold && strictSemver(identity?.version) && compareSemver(identity.version, hold.version) >= 0) hold = null;
+  return hold;
+}
+
 /**
  * What the updater does with `latestVersion` for this install — pure, shared by
  * runAutoUpdateCheck, the doctor and the hook so they can never disagree.
@@ -685,8 +698,13 @@ export function autoUpdateSchedule({
 /**
  * Diagnostic view for the doctor, supervisor receipts and the hook. Keeps every
  * historical field; never throws.
+ *
+ * `currentVersion` is what a spawner would pass the helper
+ * (KLYPIX_MCP_AUTO_UPDATE_CURRENT: its running or baked version). It never
+ * touches the schedule (A1: receipts only); it lets `decision` decide a
+ * runtime no receipt names exactly as the helper will.
  */
-export function inspectAutoUpdate(brainDir, { now = Date.now(), env = process.env } = {}) {
+export function inspectAutoUpdate(brainDir, { now = Date.now(), env = process.env, currentVersion = null } = {}) {
   let enabled = true;
   try { enabled = autoUpdateEnabled(env); } catch { /* default on */ }
   try {
@@ -708,6 +726,15 @@ export function inspectAutoUpdate(brainDir, { now = Date.now(), env = process.en
     const lastCheck = isRecord(stamp) ? readTime(stamp.lastCheck, t).ms : null;
     const hold = sanitizeHold(status.hold);
     const evaluated = evaluatedIdentity(rawStatus);
+    // `decision` is what the NEXT check does with latestVersion (2026-10-03
+    // integration review): with the hold that check applies, and with the
+    // version the helper falls back to when no receipt names one. It used to
+    // read 'install' for a --force downgrade the helper would hold, and for a
+    // new major the helper would block on a receipt-less runtime.
+    const upcomingHold = nextHold(rawStatus, installed);
+    const decidingAs = isRecord(installed) && !installed.unknown && !installed.version && strictSemver(currentVersion)
+      ? { ...installed, version: String(currentVersion).trim() }
+      : installed;
     return {
       enabled,
       lastCheck,
@@ -735,11 +762,14 @@ export function inspectAutoUpdate(brainDir, { now = Date.now(), env = process.en
       identity: evaluated ? { ...evaluated } : null,
       installedIdentity: installed,
       hold,
+      // The hold the next check applies: `hold`, or the version a deliberate
+      // downgrade left that the helper has not recorded yet.
+      nextHold: upcomingHold,
       // What the updater would do with the last fetched npm version.
       decision: autoUpdateDecision({
-        installed,
+        installed: decidingAs,
         latestVersion: strictSemver(status.latestVersion) ? status.latestVersion : null,
-        hold,
+        hold: upcomingHold,
       }),
       scheduleError: plan.error || null,
     };
@@ -769,6 +799,7 @@ export function inspectAutoUpdate(brainDir, { now = Date.now(), env = process.en
       identity: null,
       installedIdentity: null,
       hold: null,
+      nextHold: null,
       decision: 'unknown',
       scheduleError: cleanError(error),
     };
@@ -1227,9 +1258,7 @@ async function checkWhileLocked({
 
   // A4: a managed npm install that is now older than the install the last
   // result described was rolled back on purpose; hold the version it left.
-  const from = rolledBackFrom(priorStatus, identity);
-  if (from && (!hold || compareSemver(from, hold.version) > 0)) hold = { version: from, since: checkedAt };
-  if (hold && identity.version && compareSemver(identity.version, hold.version) >= 0) hold = null;
+  hold = nextHold(priorStatus, identity, checkedAt);
 
   if (installed.dev) {
     // Never fetched for: the developer's deploy owns these files.

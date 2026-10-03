@@ -487,6 +487,18 @@ try {
   }
 
   {
+    // 2026-10-03 integration review: with no receipt naming a version, the
+    // helper decides with its spawner's version. The view, given that version,
+    // must decide the same — the doctor and the receipts read it.
+    const dir = scenario('receiptless-major');
+    const t = Date.UTC(2026, 9, 3, 14, 0, 0);
+    const helper = await check({ brainDir: dir, currentVersion: '1.6.0', now: t, fetchLatest: async () => '2.0.0', installVersion: noInstall });
+    const informed = inspectAutoUpdate(dir, { now: t + MINUTE, env: {}, currentVersion: '1.6.0' });
+    ok(helper.result === 'major-blocked' && informed.decision === 'major-blocked' && informed.installedIdentity?.version === null,
+      "A5: a receipt-less runtime's view, given the spawner's version, decides what the helper decided (major-blocked); its identity stays receipts-only");
+  }
+
+  {
     const dir = scenario('downgrade-hold');
     writeRuntime(dir, '1.9.0');
     const t = Date.UTC(2026, 9, 3, 12, 0, 0);
@@ -497,6 +509,8 @@ try {
     const soon = view(dir, t + 6 * MINUTE);
     ok(!soon.due && soon.stale && soon.staleReason === 'manual-downgrade',
       'A3: a deliberate --force downgrade is not due at +6 min (reported as manual-downgrade)');
+    ok(soon.hold === null && soon.nextHold?.version === '1.9.1' && soon.decision === 'held',
+      'A5: before the next check runs, the view already decides with the hold that check applies — never "install" for the rolled-back-from version');
     const held = await check({ brainDir: dir, now: t + AUTO_UPDATE_TTL_MS, fetchLatest: async () => '1.9.1', installVersion: install });
     ok(held.result === 'held' && readStatus(dir).hold?.version === '1.9.1' && installs.length === 1,
       'A4: the next scheduled check holds the rolled-back-from version instead of re-installing it');

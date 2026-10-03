@@ -766,20 +766,26 @@ still run older supervisor code) and the automatic-update schedule: the last res
 it describes, and when the next check runs. The MCP tool also returns these as structured data.
 
 The updater checks npm **once per machine every 6 hours**, however many sessions are open. It
-checks once more, never sooner than 5 minutes after the last attempt, when another install changes
-this runtime's version or ownership. Examples are a manual `npx klypix-mcp install`, or a release
-replacing a developer deploy. A failed check retries after 15 minutes, then 1 hour, then 4 hours,
-then returns to the 6-hour cadence. Each attempt is recorded as failed before it touches the
-network, so a check that dies part-way backs off instead of retrying in a loop. Checks run from the
-open KLYPIX sessions: the supervisor and worker look every 10 minutes, and a new session looks 2
-seconds after it starts.
+checks once more, never sooner than 5 minutes after the last attempt, when another install upgrades
+this runtime or moves it from a developer deploy to a released install. Examples are a manual
+`npx klypix-mcp install` of a newer release, or a release replacing a developer deploy. A failed
+check retries after 15 minutes, then 1 hour, then 4 hours, then returns to the 6-hour cadence. Each
+attempt is recorded as failed before it touches the network, so a check that dies part-way backs
+off instead of retrying in a loop. Checks run from the open KLYPIX sessions: the supervisor and
+worker look every 10 minutes, and a new session looks 2 seconds after it starts.
 
 The updater installs an exact stable release of the **same major version** in `--runtime-only`
 mode, preserving host settings and project files; a new major always needs a manual install. It
-never downgrades. A deliberate downgrade (`npx klypix-mcp@<older> install --force`) is **held**:
-the updater does not re-install the version it was rolled back from, only a newer release
-(`KLYPIX_AUTO_UPDATE_FORCE=1` overrides the hold). Developer-owned installs are never fetched for
-or touched. The check is detached and fail-open, and concurrent sessions collapse behind one lock.
+never downgrades. A deliberate downgrade (`npx klypix-mcp@<older> install --force`) onto a release
+newer than 1.89.0 is **held**: the updater does not re-install the version it was rolled back from,
+only a newer release. To take the held version back, run `npx -y klypix-mcp@latest install` (or set
+`KLYPIX_AUTO_UPDATE_FORCE=1` where `KLYPIX_AUTO_UPDATE` is set, below, for one check, then remove
+it). A rollback onto 1.89.0 or earlier also rolls the updater back, and those releases have no
+hold: they re-install the newest same-major release within 24 hours of their last check. To stay
+on such a release, set `KLYPIX_AUTO_UPDATE=0` in every place listed below for as long as you stay;
+`brain_doctor` warns when a downgrade is not held. The updater never fetches anything for a
+developer-owned install and never installs over it. The check is detached and fail-open, and
+concurrent sessions collapse behind one lock.
 
 `KLYPIX_AUTO_UPDATE=0` opts out. Every process reads its own environment, so set it in each host's
 launch environment: the `env` of each KLYPIX MCP server entry, and the environment Claude Code runs
@@ -790,11 +796,12 @@ Claude Code Stop hook refreshes a local npm-version cache, which the next Sessio
 whether an update is available. That notice also says what the updater will do with the update,
 and when. The probe:
 
-- runs at most once a day;
-- makes the same anonymous request the updater makes, a GET of
+- runs at most once a day, developer-owned installs included;
+- makes the same kind of anonymous request the updater makes, a GET of
   `https://registry.npmjs.org/klypix-mcp/latest` that carries no user or machine identifier;
-- is skipped while the updater's own result is less than a day old;
-- is off with the same `KLYPIX_AUTO_UPDATE=0`;
+- is skipped while the updater fetched npm's latest version less than a day ago;
+- is off with the same `KLYPIX_AUTO_UPDATE=0`, read from the environment Claude Code runs its hooks
+  in;
 - never installs anything.
 
 When the optional semantic runtime is already enabled, an update also schedules one detached,
@@ -809,10 +816,11 @@ keep lazy first-use indexing instead.
 - **The brain engine makes no network calls and sends no telemetry.** All engine intelligence is
   deterministic and local; the only LLM anywhere is *your* agent. The exceptions in this package
   are the two update probes described above. One is the updater's npm version check, every 6
-  hours, plus one re-check after another install changes the runtime; when it finds a newer
-  same-major release, it also runs that release's npm install. The other is the Claude Code Stop
-  hook's version probe, at most once a day in brain projects. Both probes are the same anonymous GET
-  of the package's `latest` version, and `KLYPIX_AUTO_UPDATE=0` turns both off.
+  hours, plus one re-check after another install upgrades the runtime, and retries after a failed
+  check (15 minutes, 1 hour, 4 hours); when it finds a newer same-major release, it also runs that
+  release's npm install. The other is the Claude Code Stop hook's version probe, at most once a day
+  in brain projects. Both are the same kind of anonymous GET of the package's `latest` version, and
+  `KLYPIX_AUTO_UPDATE=0` turns both off.
 - **The optional semantic model runs on device.** Enabling it (or upgrading its model) can fetch
   model weights from Hugging Face; retrieval inference and brain data stay local.
 - **Coordination state is local files.** The brain is a file in your repo; the presence lane is a

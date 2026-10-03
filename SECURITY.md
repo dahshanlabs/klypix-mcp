@@ -38,11 +38,12 @@ report might concern:
   home directory. Both are readable by anything running as your user; neither is
   encrypted at rest, and neither is intended to hold secrets.
 - **The engine makes no network calls**, with documented exceptions: the two anonymous
-  npm version probes (the updater's check every 6 hours, which also installs a newer
-  same-major release, and the Claude Code Stop hook's at-most-daily probe in brain
-  projects; `KLYPIX_AUTO_UPDATE=0` turns both off), and — only after explicit,
-  per-brain, default-off consent given in the KLYPIX desktop app — the cross-PC presence
-  relay.
+  npm version probes (the updater's check every 6 hours — plus a re-check after another
+  install upgrades the runtime, and retries 15 minutes, 1 hour and 4 hours after a failed
+  check — which also installs a newer same-major release, and the Claude Code Stop hook's
+  at-most-daily probe in brain projects; `KLYPIX_AUTO_UPDATE=0` turns both off), and —
+  only after explicit, per-brain, default-off consent given in the KLYPIX desktop app —
+  the cross-PC presence relay.
 - **Coordination between sessions is advisory.** Overlap warnings are a coordination
   aid, not an access control. Nothing here is a security boundary between agents
   running as the same user, and it should not be relied on as one.

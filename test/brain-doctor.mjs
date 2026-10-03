@@ -930,6 +930,17 @@ const supervisorReceipt = (brainDir, name, state) => writeJson(path.join(brainDi
   ok(r.autoUpdate.overdue === true && /no check recorded yet · check overdue by 10h — no running session performed the check/.test(auLine(textOf(r)))
     && r.verdict === 'PARTIAL',
   'F9/K3: never checked, though a session open 10 h polled 5 min ago, is overdue by 10h (measured from that session\'s start)');
+  // TQ-2 (2026-10-03 review): the same never-checked install, no stamp at all,
+  // with only a pre-fix receipt (no lastPollAt): nothing is evidence, and no
+  // poll "in 1970" is invented from the missing one.
+  supervisorReceipt(brainDir, 'live', {
+    bootedAt: iso(NOW - 10 * HOUR), updatedAt: iso(NOW - 30_000), active: { pid: process.pid, version: PKG_VERSION },
+    autoUpdate: { enabled: true },
+  });
+  r = run();
+  ok(r.autoUpdate.overdue === false && r.autoUpdate.overdueSuppressed === 'no-poll-evidence' && r.verdict === 'ALIGNED'
+    && !/overdue|1970/.test(auLine(textOf(r))),
+  `TQ-2: never checked, no stamp, only a pre-fix receipt → overdue is not judged (${auLine(textOf(r))})`);
   reset();
   writeJson(files.stamp, { protocol: 1, lastCheck: NOW - 30 * 60_000, failures: 1, nextCheckAt: NOW - 15 * 60_000, identity: npmIdentity });
   writeJson(files.status, current(7 * HOUR));

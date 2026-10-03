@@ -65,7 +65,8 @@ const RECOVERY_BACKOFF_MAX_MS = 60_000;
 const HOST_QUEUE_MAX = 200;
 // A wake that finds the manifest failing integrity is usually racing an install:
 // the installer renames ~38 files one at a time and commits the manifest last,
-// which takes seconds. The wake waits this long for it to settle.
+// which takes seconds. The wake waits this long for it to settle, and so does a
+// fresh connection whose own worker sits inside the managed directory (K1).
 const WAKE_INTEGRITY_WAIT_MS = 5000;
 const WAKE_INTEGRITY_POLL_MS = 250;
 // A wake refused this many times, over at least this long, is not an install
@@ -164,6 +165,17 @@ const workerFileVersion = (file) => {
     const pkg = JSON.parse(fs.readFileSync(path.join(path.dirname(file), '..', 'package.json'), 'utf8'));
     return pkg?.name === 'klypix-mcp' && typeof pkg.version === 'string' ? pkg.version : null;
   } catch { return null; }
+};
+// The installer's snapshot of a worker file: `.prev/<name>` beside it. Every
+// live file is copied there before the first new one is renamed in, so it is a
+// complete copy of the previous install. Null when there is none, or when its
+// version is not baked in (only the flat bundle bakes it).
+const prevSnapshotTarget = (workerPath) => {
+  const previousPath = path.join(path.dirname(workerPath), '.prev', path.basename(workerPath));
+  if (!fs.existsSync(previousPath)) return null;
+  const version = readBakedVersion(previousPath);
+  if (!version) return null;
+  return { path: previousPath, version, signature: `previous:${previousPath}:${version}`, source: 'rollback', dev: false };
 };
 
 function createLineReader(onMessage, onError) {
@@ -532,6 +544,11 @@ class Supervisor {
   }
 
   writeState(extra = {}) {
+    // No receipt before the first worker is chosen. K1's boot can wait seconds
+    // for an install to settle, and a receipt with no worker and no version
+    // reads to the doctor as an impaired pair that does not match the install.
+    // The first receipt follows the spawn in run(), with any boot error in it.
+    if (this.status === 'starting') return;
     try {
       atomicJson(this.stateFile, {
         protocol: 1,
@@ -740,18 +757,10 @@ class Supervisor {
   // whatever .prev held.
   previousBaselineTarget(anchor) {
     if (!anchor?.path || anchor.source === 'rollback') return null;
-    const previousPath = path.join(path.dirname(anchor.path), '.prev', path.basename(anchor.path));
-    if (!fs.existsSync(previousPath)) return null;
-    const previousVersion = readBakedVersion(previousPath);
+    const previous = prevSnapshotTarget(anchor.path);
     const baseVersion = this.baselineVersion();
-    if (!previousVersion || !baseVersion || previousVersion !== String(baseVersion)) return null;
-    return {
-      path: previousPath,
-      version: previousVersion,
-      signature: `previous:${previousPath}:${previousVersion}`,
-      source: 'rollback',
-      dev: false,
-    };
+    if (!previous || !baseVersion || previous.version !== String(baseVersion)) return null;
+    return previous;
   }
 
   // The package's own worker as it is on disk NOW. fallbackTarget carries the
@@ -870,18 +879,24 @@ class Supervisor {
       });
   }
 
+  // A full read of the manifest, repeated while it fails integrity (or cannot be
+  // read) for up to WAKE_INTEGRITY_WAIT_MS: an install renames its files one at
+  // a time and commits the manifest last. Wakes (B3) and boots (K1) wait alike.
+  async settledRuntime(runtime = this.runtimeWatch.read({ force: true })) {
+    const deadline = Date.now() + WAKE_INTEGRITY_WAIT_MS;
+    while (!runtime.ok && !runtime.absent && !this.closed && Date.now() < deadline) {
+      await sleep(WAKE_INTEGRITY_POLL_MS);
+      runtime = this.runtimeWatch.read({ force: true });
+    }
+    return runtime;
+  }
+
   // B3 (2026-10-03): the wake re-reads the manifest instead of trusting the
   // target the pair went to sleep on. That target may be stale (an install
   // landed while it slept), and its path may sit in a directory an install is
   // renaming right now — booting it then loads a mixed module graph.
   async resolveWakeTarget() {
-    const read = () => this.runtimeWatch.read({ force: true });
-    let runtime = read();
-    const deadline = Date.now() + WAKE_INTEGRITY_WAIT_MS;
-    while (!runtime.ok && !runtime.absent && !this.closed && Date.now() < deadline) {
-      await sleep(WAKE_INTEGRITY_POLL_MS);
-      runtime = read();
-    }
+    const runtime = await this.settledRuntime();
     // What the pair last ran, and the package's own worker when it lives
     // outside the managed directory (CF-1: a direct-package launch).
     const anchor = this.baseline?.target || this.hibernatedTarget;
@@ -1012,8 +1027,40 @@ class Supervisor {
     return `${RESTART_REQUIRED_IDLE}${this.lastError ? ` (${this.lastError})` : ''}`;
   }
 
-  selectInitialTarget() {
-    const runtime = readRuntimeTarget(this.runtimeManifest, { allowExternal: this.allowExternal });
+  // What a fresh connection boots: the installed runtime when its manifest
+  // verifies (never older than the package's own worker, unless dev), else the
+  // package's own worker.
+  //
+  // K1 (2026-10-03): a manifest that fails integrity, or cannot be read, is
+  // usually an install mid-rename. In the flat bundle the package's own worker
+  // is <brainDir>/klypix-mcp-worker.mjs — inside the directory being renamed —
+  // and booting it at once could load a mixed module graph (a new worker beside
+  // an old engine, or the reverse). So the boot waits for the install to settle,
+  // as a wake does (B3), and then boots .prev's complete pre-install copy; only
+  // without one does it boot the package's own worker, as before. Either way the
+  // integrity error is recorded from the first receipt. A direct-package launch
+  // keeps its worker outside the managed directory, which no install touches: it
+  // boots at once. The host's first requests queue meanwhile (run()).
+  async selectInitialTarget() {
+    let runtime = this.runtimeWatch.read({ force: true });
+    if (!runtime.ok && !runtime.absent && within(path.dirname(this.runtimeManifest), this.fallbackTarget.path)) {
+      log(`runtime fails integrity at start (${runtime.error}) — waiting up to ${WAKE_INTEGRITY_WAIT_MS} ms for an install to settle`);
+      runtime = await this.settledRuntime(runtime);
+      if (!runtime.ok && !runtime.absent && !this.closed) {
+        // Recorded the way the poller records it (noteRuntimeError), so a
+        // manifest that verifies later clears it (clearRuntimeError).
+        this.errorBeforeRuntime = this.lastError;
+        this.runtimeError = runtime.error;
+        this.lastError = runtime.error;
+        const previous = prevSnapshotTarget(this.fallbackTarget.path);
+        if (previous) {
+          log(`runtime still fails integrity after ${WAKE_INTEGRITY_WAIT_MS} ms (${runtime.error}) — starting v${previous.version} from .prev, the complete copy of the previous install`);
+          return previous;
+        }
+        log(`runtime still fails integrity after ${WAKE_INTEGRITY_WAIT_MS} ms (${runtime.error}) and .prev holds no worker — starting the package's own worker v${this.fallbackTarget.version}`);
+        return this.fallbackTarget;
+      }
+    }
     if (!runtime.ok) return this.fallbackTarget;
     const cmp = compareSemver(runtime.target.version, this.fallbackTarget.version);
     return runtime.target.dev || cmp === null || cmp >= 0 ? runtime.target : this.fallbackTarget;
@@ -1772,11 +1819,18 @@ class Supervisor {
     // (cleanSupervisorStateDir has the rules).
     try { cleanSupervisorStateDir(this.stateDir); } catch { /* */ }
 
-    const initial = this.selectInitialTarget();
-    this.active = this.spawnWorker(initial, 'active');
-    this.status = 'awaiting-initialize';
-    this.writeState();
-    this.flushHostQueue();
+    // The host transport is wired BEFORE the first worker is chosen (K1): the
+    // choice may wait out an install mid-rename, and meanwhile the host's first
+    // requests queue (onHostMessage queues while no worker is active) and flush
+    // to the worker below. A host that goes away during the wait still closes
+    // this process, so its end/close handlers are registered first too.
+    const finished = new Promise(resolve => {
+      this.resolveRun = resolve;
+      process.stdin.once('end', () => this.close());
+      process.stdin.once('close', () => this.close());
+      process.once('SIGINT', () => this.close());
+      process.once('SIGTERM', () => this.close());
+    });
 
     process.stdout.on('error', (error) => {
       if (this.closed) return;
@@ -1803,6 +1857,13 @@ class Supervisor {
         this.sendHost({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } });
       },
     ));
+
+    const initial = await this.selectInitialTarget();
+    if (this.closed) return finished;
+    this.active = this.spawnWorker(initial, 'active');
+    this.status = 'awaiting-initialize';
+    this.writeState();
+    this.flushHostQueue();
 
     this.poller = setInterval(() => this.checkForUpdate(), Math.max(50, this.pollMs));
     this.poller.unref?.();
@@ -1836,13 +1897,7 @@ class Supervisor {
       this.parentWatchdog.unref?.();
     }
 
-    await new Promise(resolve => {
-      this.resolveRun = resolve;
-      process.stdin.once('end', () => this.close());
-      process.stdin.once('close', () => this.close());
-      process.once('SIGINT', () => this.close());
-      process.once('SIGTERM', () => this.close());
-    });
+    await finished;
   }
 
   close() {

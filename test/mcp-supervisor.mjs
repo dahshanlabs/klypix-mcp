@@ -607,7 +607,7 @@ try {
   };
   const deadPid = await obtainDeadPid();
 
-  async function openPair(dir, name, { env = {}, args = [], entry = BIN, pollMs = null } = {}) {
+  async function openPair(dir, name, { env = {}, args = [], entry = BIN, pollMs = null, onLog = null } = {}) {
     const stateDir = path.join(dir, 'states');
     fs.mkdirSync(stateDir, { recursive: true });
     let listChanged = 0;
@@ -642,7 +642,11 @@ try {
       stderr: 'pipe',
     });
     const logs = [];
-    transport.stderr?.on('data', (chunk) => { logs.push(String(chunk)); if (logs.length > 400) logs.shift(); });
+    transport.stderr?.on('data', (chunk) => {
+      logs.push(String(chunk));
+      if (logs.length > 400) logs.shift();
+      onLog?.(logs.join(''));   // the whole tail: a log line can span chunks
+    });
     await client.connect(transport);
     const state = () => fs.readdirSync(stateDir)
       .filter(entry => /^\d+\.json$/.test(entry))
@@ -1221,6 +1225,172 @@ try {
     unreadableManifestWaitsOnWake(),
     flatAbsentManifestDefers(),
     packageRefreshedWakesNewVersion(),
+  ]);
+
+  // ── K1 (2026-10-03): a FRESH connection that starts while an install is
+  // half-applied. In the flat bundle the supervisor's own worker IS the managed
+  // worker, so the old boot (integrity failure → the package's own worker)
+  // started a file in the middle of the install's renames. Polls are pinned at
+  // 60 s so no poll-driven swap interferes; the post-handshake update check still
+  // runs, so only the raw first-receipt check below proves what the boot records.
+  const stateIn = (dir) => {
+    try {
+      return fs.readdirSync(path.join(dir, 'states'))
+        .filter(entry => /^\d+\.json$/.test(entry))
+        .map(entry => { try { return JSON.parse(fs.readFileSync(path.join(dir, 'states', entry), 'utf8')); } catch { return null; } })
+        .find(Boolean) || null;
+    } catch { return null; }
+  };
+  const quiet = { pollMs: 60_000, env: { KLYPIX_WORKER_HIBERNATE_MS: '0' } };
+
+  const bootDuringInstallStartsPrev = () => scenario('boot-prev', async (track) => {
+    const dir = runtimeDir('boot-prev');
+    const audit = path.join(dir, 'boots.jsonl');
+    install(dir, '90.0.0', { identity: true, bootAudit: audit });
+    install(dir, '90.1.0', { identity: true, bootAudit: audit, commit: false });   // stopped before its manifest; .prev holds v90.0.0
+    // Every receipt status written while the boot waits (it waits ~5 s here).
+    const seen = new Set();
+    const watcher = setInterval(() => { const s = stateIn(dir); if (s) seen.add(s.status); }, 40);
+    const started = Date.now();
+    let pair;
+    try { pair = track(await openPair(dir, 'k1-boot-prev', { entry: flatEntry(dir, '90.1.0'), ...quiet })); }
+    finally { clearInterval(watcher); }
+    const waited = Date.now() - started;
+    ok(!seen.has('starting'),
+      `K1: nothing is receipted while the boot waits — a pair with no worker would read as impaired and unaligned (${[...seen].join(', ') || 'none'})`);
+    const booted = boots(audit);
+    ok(await answer(pair) === '90.0.0' && booted.length === 1 && fromPrev(booted[0]),
+      `K1: a connection starting during a half-applied install boots .prev's complete copy, never the directory being renamed (${bootList(booted)})`);
+    ok(waited >= 4000, `K1: it first waited for the install to settle (${waited} ms)`);
+    const s = pair.state();
+    ok(s?.active?.source === 'rollback' && /integrity mismatch: worker\.mjs/.test(s?.lastError || ''),
+      `K1: its receipt names the .prev worker it serves and the integrity error (${s?.active?.source}; ${s?.lastError})`);
+  });
+
+  const bootWaitsForInstallToFinish = () => scenario('boot-settles', async (track) => {
+    const dir = runtimeDir('boot-settles');
+    const audit = path.join(dir, 'boots.jsonl');
+    install(dir, '90.0.0', { identity: true, bootAudit: audit });
+    install(dir, '90.1.0', { identity: true, bootAudit: audit, commit: false });
+    // The installer commits once this supervisor says it is waiting for it.
+    let committed = false;
+    const onLog = (text) => {
+      if (committed || !/runtime fails integrity at start .* waiting up to \d+ ms for an install to settle/.test(text)) return;
+      committed = true;
+      commitManifest(dir, '90.1.0');
+    };
+    const pair = track(await openPair(dir, 'k1-boot-settles', { entry: flatEntry(dir, '90.1.0'), onLog, ...quiet }));
+    ok(committed, 'K1: a boot that meets an install mid-rename says it waits for the install to settle');
+    const booted = boots(audit);
+    const s = pair.state();
+    ok(await answer(pair) === '90.1.0' && booted.length === 1 && !fromPrev(booted[0])
+      && s?.active?.source === 'installed' && !s.lastError,
+    `K1: an install that commits inside the wait is booted as the verified runtime (${bootList(booted)}; ${s?.active?.source}; ${s?.lastError})`);
+  });
+
+  const bootWithoutPrevStartsOwnWorker = () => scenario('boot-noprev', async (track) => {
+    const dir = runtimeDir('boot-noprev');
+    install(dir, '90.0.0', { identity: true });
+    install(dir, '90.1.0', { identity: true, commit: false });
+    fs.rmSync(path.join(dir, '.prev'), { recursive: true, force: true });
+    const started = Date.now();
+    const pair = track(await openPair(dir, 'k1-boot-noprev', { entry: flatEntry(dir, '90.1.0'), ...quiet }));
+    const waited = Date.now() - started;
+    const s = pair.state();
+    ok(await answer(pair) === '90.1.0' && waited >= 4000 && s?.active?.source === 'package'
+      && /integrity mismatch: worker\.mjs/.test(s?.lastError || ''),
+    `K1: with no .prev, the boot still waits, then starts the package's own worker as before and records why (${waited} ms; ${s?.active?.source}; ${s?.lastError})`);
+  });
+
+  const bootDirectPackageAtOnce = () => scenario('boot-pkg', async (track) => {
+    const dir = runtimeDir('boot-pkg');
+    const audit = path.join(dir, 'boots.jsonl');
+    install(dir, '90.0.0', { identity: true, bootAudit: audit });
+    install(dir, '90.1.0', { identity: true, bootAudit: audit, commit: false });
+    const { entry, worker } = packageEntry('boot-pkg', '90.1.0', { identity: true, bootAudit: audit });
+    const started = Date.now();
+    const pair = track(await openPair(dir, 'k1-boot-pkg', { entry, env: { KLYPIX_WORKER_HIBERNATE_MS: '0' } }));
+    const connected = Date.now() - started;
+    const booted = boots(audit);
+    ok(await answer(pair) === '90.1.0' && booted.length === 1 && samePath(booted[0].file, worker)
+      && connected < 4500 && !/still fails integrity/.test(pair.logs()),
+    `K1: a direct-package launch boots its own worker at once — it lives outside the directory being installed (${connected} ms; ${bootList(booted)})`);
+  });
+
+  // The FIRST receipt such a boot writes already names the integrity error. A
+  // raw host sends `initialize` and nothing else, and the receipt is read the
+  // moment that is answered: without notifications/initialized the
+  // post-handshake update check never runs, and the poll is pinned at 60 s, so
+  // only the boot can have recorded the error.
+  const firstReceiptAfterBoot = async (name, { prev }) => {
+    const dir = runtimeDir(name);
+    install(dir, '90.0.0', { identity: true });
+    install(dir, '90.1.0', { identity: true, commit: false });
+    if (!prev) fs.rmSync(path.join(dir, '.prev'), { recursive: true, force: true });
+    const stateDir = path.join(dir, 'states');
+    fs.mkdirSync(stateDir, { recursive: true });
+    const child = spawn(process.execPath, [flatEntry(dir, '90.1.0')], {
+      cwd: dir,
+      env: {
+        ...process.env,
+        KLYPIX_MCP_RUNTIME_MANIFEST: manifestOf(dir),
+        KLYPIX_MCP_STATE_DIR: stateDir,
+        KLYPIX_AUTO_UPDATE: '0',
+        KLYPIX_WORKER_HIBERNATE_MS: '0',
+        KLYPIX_MCP_SUPERVISOR_POLL_MS: '60000',
+      },
+      stdio: ['pipe', 'pipe', 'ignore'],
+      windowsHide: true,
+    });
+    try {
+      const answered = new Promise((resolve, reject) => {
+        let buffered = '';
+        const timer = setTimeout(() => reject(new Error('initialize was not answered within 30 s')), 30000);
+        child.stdout.on('data', (chunk) => {
+          buffered += chunk;
+          const lines = buffered.split('\n');
+          buffered = lines.pop();
+          for (const line of lines) {
+            let message = null;
+            try { message = JSON.parse(line); } catch { continue; }
+            if (message?.id === 1) { clearTimeout(timer); resolve(message); }
+          }
+        });
+        child.once('exit', () => { clearTimeout(timer); reject(new Error('the supervisor exited before answering initialize')); });
+      });
+      child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name, version: '1.0.0' } } })}\n`);
+      await answered;
+      return stateIn(dir);
+    } finally {
+      try { child.stdin.end(); } catch { /* already gone */ }
+      if (child.exitCode === null && child.signalCode === null) {
+        await new Promise(resolve => { child.once('exit', resolve); setTimeout(resolve, 3000).unref?.(); });
+      }
+    }
+  };
+  const bootReceiptsNameTheError = async () => {
+    try {
+      const [withPrev, withoutPrev] = await Promise.all([
+        firstReceiptAfterBoot('boot-receipt-prev', { prev: true }),
+        firstReceiptAfterBoot('boot-receipt-noprev', { prev: false }),
+      ]);
+      const view = (s) => `${s?.status}/${s?.active?.source}/${s?.lastError}`;
+      ok(withPrev?.status === 'awaiting-initialize' && withPrev.active?.source === 'rollback'
+        && /integrity mismatch: worker\.mjs/.test(withPrev.lastError || '')
+        && withoutPrev?.status === 'awaiting-initialize' && withoutPrev.active?.source === 'package'
+        && /integrity mismatch: worker\.mjs/.test(withoutPrev.lastError || ''),
+      `K1: the first receipt after the boot already names the integrity error, whether it started .prev or its own worker (${view(withPrev)}; ${view(withoutPrev)})`);
+    } catch (error) {
+      ok(false, `K1: the first receipt after the boot — ${error?.message || error}`);
+    }
+  };
+
+  await Promise.all([
+    bootDuringInstallStartsPrev(),
+    bootWaitsForInstallToFinish(),
+    bootWithoutPrevStartsOwnWorker(),
+    bootDirectPackageAtOnce(),
+    bootReceiptsNameTheError(),
   ]);
 
   // CF-2 — only a missing manifest is absent, unit level.

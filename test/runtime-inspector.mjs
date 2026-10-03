@@ -60,5 +60,41 @@ ok(report.connections[0].flags.includes('default-root') && report.connections[0]
 ok(report.parallelConnectionGroups[0]?.verdict === 'parallel-not-proven-duplicate', 'parallel sessions are never mislabeled as duplicates');
 ok(formatRuntimeReport(report).includes('no process was changed or terminated'), 'human report states the safety boundary');
 
+// C4 (2026-10-03): pre-fix supervisor code re-woke an idle pair about 1 s after
+// it hibernated, so a pre-fix pair caught asleep is flagged and never counted
+// as a RAM saving; only supervisors that write supervisorVersion are.
+{
+  const sleepRows = [
+    proc(1, 0, 'codex.exe', 'codex.exe app-server', 220),
+    proc(10, 1, 'node.exe', 'node C:/brain/klypix-mcp-server.mjs --vault E:/A', 60),
+    proc(11, 10, 'node.exe', 'node C:/brain/klypix-mcp-worker.mjs --vault E:/A', 400),
+    proc(20, 1, 'node.exe', 'node C:/brain/klypix-mcp-server.mjs --vault E:/B', 60),
+    proc(30, 1, 'node.exe', 'node C:/brain/klypix-mcp-server.mjs --vault E:/C', 60),
+  ];
+  const sleepReport = buildRuntimeReport({
+    processRows: sleepRows,
+    sampledAt,
+    platform: 'win32',
+    supervisorStates: [
+      { pid: 10, status: 'ready', active: { pid: 11, version: '1.90.0' }, supervisorVersion: '1.90.0' },
+      { pid: 20, status: 'hibernated', active: null, hibernation: { hibernated: true, count: 1 }, supervisorVersion: '1.90.0' },
+      { pid: 30, status: 'hibernated', active: null, hibernation: { hibernated: true, count: 731 } },
+    ],
+    runningServers: [{ pid: 11, version: '1.90.0', vault: 'E:/A' }],
+  });
+  const flagsOf = (pid) => sleepReport.connections.find((item) => item.supervisor?.pid === pid)?.flags || [];
+  ok(sleepReport.totals.hibernatedConnections === 2 && sleepReport.totals.preFixHibernatedConnections === 1,
+    'C4: both sleeping pairs are visible; one is counted as pre-fix');
+  ok(sleepReport.totals.estimatedHibernationSavingsMb === 400,
+    `C4: only the fixed pair counts as a RAM saving (got ${sleepReport.totals.estimatedHibernationSavingsMb} MB)`);
+  ok(flagsOf(30).includes('pre-fix-supervisor') && !flagsOf(20).includes('pre-fix-supervisor')
+    && sleepReport.connections.find((item) => item.supervisor?.pid === 20)?.supervisor.codeVersion === '1.90.0',
+  'C4: pre-fix supervisor code is flagged per connection; fixed code reports its own version');
+  const sleepText = formatRuntimeReport(sleepReport);
+  ok(sleepText.includes('Hibernated 1 connection(s) — about 400 MB not resident')
+    && sleepText.includes('1 more connection(s) asleep right now run pre-fix supervisor code that re-wakes idle workers within seconds — not counted as a saving'),
+  'C4: the human report credits only the fixed pair and names the pre-fix one');
+}
+
 console.log(failures ? `\n✗ ${failures} runtime-inspector assertion(s) failed` : '\n✓ runtime-inspector: all assertions passed');
 process.exit(failures ? 1 : 0);

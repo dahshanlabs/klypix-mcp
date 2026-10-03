@@ -13,7 +13,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import {
@@ -25,6 +25,7 @@ import {
 } from '../src/agent-rules.mjs';
 import { driftLine, inspect, render } from '../src/brain-doctor.mjs';
 import { laneFileFor } from '../src/agent-presence.mjs';
+import { AUTO_UPDATE_TTL_MS } from '../src/mcp-auto-update.mjs';
 import { makeVault, seedBrain } from './_harness.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -267,7 +268,7 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
   fs.writeFileSync(path.join(brainDir, 'klypix-mcp-server.mjs'), "const PKG_VERSION = '1.65.0';\nrunMcpSupervisor();\n");
   fs.writeFileSync(path.join(brainDir, 'mcp-supervisor.mjs'), '// supervisor fixture');
   const stateFile = path.join(supervisorsDir, `${process.pid}.json`);
-  fs.writeFileSync(stateFile, JSON.stringify({
+  const sleepingState = {
     pid: process.pid,
     status: 'hibernated',
     active: null,
@@ -276,7 +277,10 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
       target: { version: '1.65.0', path: 'C:/runtime/klypix-mcp-worker.mjs', source: 'managed' },
     },
     transport: { host: 'connected', delivery: 'pull-only' },
-  }));
+  };
+  // supervisorVersion marks supervisor code carrying the 2026-10-03 fix
+  // (hibernation that stays asleep): only those may claim a RAM release.
+  fs.writeFileSync(stateFile, JSON.stringify({ ...sleepingState, supervisorVersion: '1.65.0' }));
   const sleeping = inspect({ home, projectDir: project, fmtLib: null });
   const sleepingText = render(sleeping, { color: false });
   ok(sleeping.layers.supervisor === 'ok'
@@ -285,6 +289,18 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
     && sleeping.supervisors.live[0]?.activeVersion === '1.65.0'
     && /hibernated \(worker released, presence held, wakes on the next request\)/.test(sleepingText),
   'doctor treats intentional pull-only hibernation as healthy and version-aligned');
+  // C4: pre-fix supervisor code re-woke an idle pair ~1 s after it hibernated
+  // (750-800 worker spawns an hour on the founder's PC). A pre-fix pair caught
+  // asleep is still healthy, but must not be credited with releasing RAM.
+  fs.writeFileSync(stateFile, JSON.stringify(sleepingState));
+  const napping = inspect({ home, projectDir: project, fmtLib: null });
+  const nappingText = render(napping, { color: false });
+  ok(napping.layers.supervisor === 'ok'
+    && napping.supervisors.preFix.length === 1
+    && !/worker released/.test(nappingText)
+    && /1 of 1 connection\(s\) still run pre-fix supervisor code — \/mcp reconnect to apply/.test(nappingText)
+    && /pre-fix pair\(s\) asleep at this instant — that code re-wakes an idle worker within seconds, so no RAM release is claimed/.test(nappingText),
+  'C4: a pre-fix supervisor caught hibernated is healthy but never credited with a RAM release; pre-fix code is named with /mcp reconnect');
 
   fs.writeFileSync(stateFile, JSON.stringify({
     pid: process.pid,
@@ -385,6 +401,485 @@ const statusOf = (audit, file) => (audit.files.find(f => f.file === file) || {})
   r = at();
   ok(r.layers.mergeEngine === 'absent' && r.drifted === 0 && /MERGE\s+engine missing/.test(render(r, { color: false })),
     'MERGE: a missing engine is shown, not counted as drift');
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
+// ── 2026-10-03 fixtures: an npm install of THIS package's version ────────────
+// Literal JSON in temp homes only — never the developer's ~/.claude. The baked
+// version equals the doctor's own (package.json), so no version-skew caveat
+// changes what the doctor may judge.
+const PKG_VERSION = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')).version;
+const [PKG_MAJOR, PKG_MINOR] = PKG_VERSION.split('.').map(Number);
+const NEXT = `${PKG_MAJOR}.${PKG_MINOR + 1}.0`;
+const NEXT_MAJOR = `${PKG_MAJOR + 1}.0.0`;
+const DEAD_PID = 2147483646;          // a pid that does not exist
+const HOUR = 60 * 60 * 1000;
+const iso = (ms) => new Date(ms).toISOString();
+const sha256 = (file) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+const doctorHome = (tag) => {
+  const home = path.join(os.tmpdir(), `klypix-doctor-${tag}-${process.pid}`);
+  fs.rmSync(home, { recursive: true, force: true });
+  const brainDir = path.join(home, '.claude', 'project-brain');
+  fs.mkdirSync(path.join(brainDir, '.supervisors'), { recursive: true });
+  const project = path.join(home, 'project');
+  fs.mkdirSync(project, { recursive: true });
+  return { home, brainDir, project };
+};
+// Receipts exactly as bin/klypix-install.mjs writes them, `files` covering every
+// module present (so ENGINE stays quiet unless a case adds one on purpose).
+const installNpm = (brainDir, { version = PKG_VERSION, dev = false, installedAt } = {}) => {
+  fs.writeFileSync(path.join(brainDir, 'klypix-mcp-server.mjs'), `const PKG_VERSION = '${version}';\nrunMcpSupervisor();\n`);
+  fs.writeFileSync(path.join(brainDir, 'mcp-supervisor.mjs'), '// supervisor fixture\n');
+  const files = Object.fromEntries(fs.readdirSync(brainDir).filter((f) => f.endsWith('.mjs'))
+    .map((f) => [f, sha256(path.join(brainDir, f))]));
+  const channel = dev ? 'dev' : 'npm';
+  fs.writeFileSync(path.join(brainDir, '.mcp-runtime.json'), JSON.stringify({
+    protocol: 1, version, worker: 'klypix-mcp-worker.mjs', channel, ...(dev ? { dev: true } : {}), installedAt, files,
+  }));
+  fs.writeFileSync(path.join(brainDir, '.brain-version.json'), JSON.stringify({
+    brainVersion: version, via: channel, dirty: false, ...(dev ? { dev: true } : {}), installedAt,
+  }));
+};
+const writeJson = (file, value) => fs.writeFileSync(file, JSON.stringify(value));
+const supervisorReceipt = (brainDir, name, state) => writeJson(path.join(brainDir, '.supervisors', `${name}.json`), {
+  protocol: 1, pid: process.pid, parentPid: process.pid, status: 'ready',
+  transport: { host: 'connected', delivery: 'connected' }, hotReloads: 0, ...state,
+});
+
+// SUPERVISOR truth (C2/C3, 2026-10-03). 921 samples on the founder's PC: every
+// IMPAIRED reading was a pair mid-wake, and a dead receipt whose pid Windows had
+// reused (ChatGPT.exe) kept the verdict DRIFTED on a version nothing ran.
+{
+  const NOW = Date.now();
+  const { home, brainDir, project } = doctorHome('supervisor-truth');
+  installNpm(brainDir, { installedAt: iso(NOW - HOUR) });
+  const at = (agoMs) => iso(NOW - agoMs);
+  const run = () => inspect({ home, projectDir: project, now: NOW, fmtLib: null, env: { KLYPIX_AUTO_UPDATE: '0' } });
+  const clear = () => { for (const f of fs.readdirSync(path.join(brainDir, '.supervisors'))) fs.rmSync(path.join(brainDir, '.supervisors', f)); };
+  const phantom = {
+    parentPid: DEAD_PID, updatedAt: at(10 * 60_000), status: 'hibernated', active: null, supervisorVersion: PKG_VERSION,
+    hibernation: { hibernated: true, target: { version: '1.86.0' } }, transport: { host: 'connected', delivery: 'pull-only' },
+  };
+
+  supervisorReceipt(brainDir, 'phantom', phantom);
+  let r = run();
+  let text = render(r, { color: false });
+  ok(r.supervisors.count === 0 && r.supervisors.deadReceipts === 1
+    && r.layers.supervisor !== 'drift' && /1 dead supervisor receipt\(s\) ignored/.test(text),
+  'S1: a receipt whose host is gone and that has been silent > 120 s is dead — not counted, not drift, reported as ignored');
+
+  supervisorReceipt(brainDir, 'phantom', { ...phantom, updatedAt: at(10_000) });
+  r = run();
+  ok(r.supervisors.count === 1 && r.supervisors.deadReceipts === 0,
+    'S2: the same receipt written 10 s ago still counts (a live supervisor needs up to 30 s to notice its host died)');
+
+  clear();
+  supervisorReceipt(brainDir, 'gone', { pid: DEAD_PID, status: 'ready', active: { pid: DEAD_PID, version: '1.86.0' } });
+  r = run();
+  ok(r.supervisors.count === 0 && r.supervisors.deadReceipts === 1,
+    'S3: a receipt whose own pid is dead is counted as an ignored dead receipt');
+
+  clear();
+  const waking = {
+    status: 'recovering', active: null, updatedAt: at(3_000), lastError: null,
+    candidate: { pid: process.pid, version: PKG_VERSION, path: 'C:/runtime/klypix-mcp-worker.mjs' },
+    transport: { host: 'connected', delivery: 'impaired' }, supervisorVersion: PKG_VERSION,
+  };
+  supervisorReceipt(brainDir, 'waking', waking);
+  r = run();
+  text = render(r, { color: false });
+  let s = r.supervisors.live[0];
+  ok(s && !s.impaired && s.transition === 'waking' && s.deliveryStatus === 'queued'
+    && r.layers.supervisor === 'ok' && r.verdict !== 'DRIFTED'
+    && /SUPERVISOR\s+0 healthy · 1 transitioning/.test(text)
+    && new RegExp(`pid ${process.pid} waking into v${PKG_VERSION.replace(/\./g, '\\.')} — requests are queued`).test(text)
+    && !/IMPAIRED/.test(text),
+  'S4: a pair mid-wake (no active worker, live candidate, fresh receipt) is transitioning with queued delivery, never IMPAIRED');
+
+  supervisorReceipt(brainDir, 'waking', { ...waking, lastError: 'active worker exited (3221225794)' });
+  ok(/recovering after a worker exit into v/.test(render(run(), { color: false })),
+    'S4b: a crash recovery in the same window is labelled as a recovery, never as a wake');
+
+  supervisorReceipt(brainDir, 'waking', { ...waking, updatedAt: at(2 * 60_000) });
+  r = run();
+  ok(r.supervisors.impaired.length === 1 && r.layers.supervisor === 'drift',
+    'S5: the same receipt silent for 2 min is stuck, not transitioning — IMPAIRED as before');
+
+  clear();
+  supervisorReceipt(brainDir, 'swap', {
+    status: 'validating-update', updatedAt: at(2_000),
+    active: { pid: process.pid, version: '1.88.0' }, candidate: { pid: process.pid, version: PKG_VERSION },
+    supervisorVersion: PKG_VERSION,
+  });
+  r = run();
+  text = render(r, { color: false });
+  ok(r.supervisors.live[0]?.transition === 'swapping' && r.supervisors.matchesInstalled === true
+    && r.layers.supervisor === 'ok' && /swapping to v\S+ \(from v1\.88\.0\)/.test(text),
+  'S6: a hot-swap to the installed version is transitioning and aligned, not drift');
+
+  clear();
+  supervisorReceipt(brainDir, 'stale', { active: { pid: process.pid, version: '1.88.0' }, updatedAt: at(5 * 60_000), supervisorVersion: PKG_VERSION });
+  r = run();
+  text = render(r, { color: false });
+  ok(r.layers.supervisor === 'drift' && /\[!\] SUPERVISOR/.test(text)
+    && /ready on v1\.88\.0 — installed v/.test(text)
+    && r.actions.some((a) => a.startsWith('/mcp reconnect if it persists') && a.includes('serves v1.88.0'))
+    && /1 connection\(s\) serve a version ≠ installed v/.test(driftLine(r)),
+  'S7: a pair serving an old version is drift, and the SUPERVISOR mark and the drift line say so (it printed [ok] beside DRIFTED)');
+
+  clear();
+  supervisorReceipt(brainDir, 'rr', {
+    status: 'restart-required', active: null, updatedAt: at(60_000),
+    lastError: `major upgrade v${PKG_VERSION} → v${NEXT_MAJOR} requires reconnect`,
+    transport: { host: 'connected', delivery: 'impaired' }, supervisorVersion: PKG_VERSION,
+  });
+  r = run();
+  text = render(r, { color: false });
+  ok(r.supervisors.impaired.length === 1 && r.layers.supervisor === 'drift'
+    && /restart-required: major upgrade .* requires reconnect — \/mcp reconnect/.test(text)
+    && r.actions.some((a) => a.startsWith('/mcp reconnect') && /restart-required: major upgrade/.test(a)),
+  'S8: a pair that refused an incompatible core while idle is restart-required with its reason and a reconnect action');
+
+  supervisorReceipt(brainDir, 'rr', {
+    status: 'restart-required', active: { pid: process.pid, version: '1.88.0' }, updatedAt: at(60_000),
+    lastError: 'breaking tool manifest requires reconnect (removed tools: brain_lens)', supervisorVersion: PKG_VERSION,
+  });
+  r = run();
+  text = render(r, { color: false });
+  ok(r.supervisors.impaired.length === 0
+    && /restart-required: breaking tool manifest .* — \/mcp reconnect \(still serving v1\.88\.0\)/.test(text)
+    && r.actions.some((a) => /restart-required: kept v1\.88\.0/.test(a)),
+  'S9: a rejected update with the old worker still serving is listed with a reconnect action (it had none)');
+
+  clear();
+  supervisorReceipt(brainDir, 'pending', {
+    status: 'hibernated', active: null, updatedAt: at(20 * 60_000), supervisorVersion: PKG_VERSION,
+    transport: { host: 'connected', delivery: 'pull-only' },
+    hibernation: { hibernated: true, target: { version: '1.88.0' }, pendingWakeTarget: { version: PKG_VERSION, validated: false } },
+  });
+  r = run();
+  text = render(r, { color: false });
+  ok(r.supervisors.live[0]?.alignment === 'pending-wake' && r.layers.supervisor === 'ok'
+    && new RegExp(`hibernated v1\\.88\\.0 — wakes into v${PKG_VERSION.replace(/\./g, '\\.')} on next request \\(not yet validated\\)`).test(text),
+  'S10: a hibernated pair whose recorded wake target is the installed version is benign, and says it is not yet validated');
+  ok(r.running.allHibernated === 1 && r.layers.running === 'unknown'
+    && new RegExp(`RUNNING\\s+all 1 connection hibernated; it wakes into v${PKG_VERSION.replace(/\./g, '\\.')} on the next request`).test(text)
+    && !/reconnect to populate/.test(text),
+  'C3: with every pair asleep, RUNNING says so instead of "unknown … /mcp reconnect to populate"');
+
+  supervisorReceipt(brainDir, 'pre-fix', {
+    status: 'hibernated', active: null, updatedAt: at(20 * 60_000),
+    transport: { host: 'connected', delivery: 'pull-only' },
+    hibernation: { hibernated: true, target: { version: PKG_VERSION } },
+  });
+  r = run();
+  text = render(r, { color: false });
+  ok(r.supervisors.preFix.length === 1
+    && /1 of 2 connection\(s\) still run pre-fix supervisor code — \/mcp reconnect to apply/.test(text)
+    && /· 1 hibernated \(worker released, presence held, wakes on the next request\)/.test(text)
+    && /1 pre-fix pair\(s\) asleep at this instant/.test(text)
+    && /all 2 connections hibernated; they wake into v/.test(text),
+  'C2/C4: pre-fix supervisor code is counted with /mcp reconnect, and only the fixed pair is credited with a RAM release');
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
+// AUTO-UPDATE truth (C1, 2026-10-03). The old line said '[ok] … machine-wide 24h
+// check · last result dev-owned v1.86.0' next to an npm-owned v1.88.0 runtime.
+{
+  const NOW = Date.now();
+  const ON = { KLYPIX_AUTO_UPDATE: '' };
+  const OFF = { KLYPIX_AUTO_UPDATE: '0' };
+  const { home, brainDir, project } = doctorHome('auto-update-truth');
+  const files = {
+    stamp: path.join(brainDir, '.autoupdate-check.json'),
+    status: path.join(brainDir, '.autoupdate-status.json'),
+    lock: path.join(brainDir, '.autoupdate.lock'),
+    cache: path.join(brainDir, '.npm-currency.json'),
+  };
+  const reset = (installOptions = {}) => {
+    for (const f of [...Object.values(files), ...fs.readdirSync(path.join(brainDir, '.supervisors')).map((f) => path.join(brainDir, '.supervisors', f))]) {
+      fs.rmSync(f, { force: true });
+    }
+    installNpm(brainDir, { installedAt: iso(NOW - 9 * HOUR), ...installOptions });
+  };
+  const npmIdentity = { version: PKG_VERSION, managed: true, dev: false };
+  const run = (extra = {}) => inspect({ home, projectDir: project, now: NOW, fmtLib: null, env: ON, ...extra });
+  const textOf = (r) => render(r, { color: false });
+  const auLine = (text) => text.split('\n').find((line) => /AUTO-UPDATE/.test(line)) || '';
+  const liveSupervisor = (extra = {}) => supervisorReceipt(brainDir, 'live', {
+    updatedAt: iso(NOW - 30_000), active: { pid: process.pid, version: PKG_VERSION },
+    autoUpdate: { enabled: true }, supervisorVersion: PKG_VERSION, ...extra,
+  });
+  const current = (checkedAgo, extra = {}) => ({
+    protocol: 1, result: 'current', checkedAt: iso(NOW - checkedAgo),
+    currentVersion: PKG_VERSION, latestVersion: PKG_VERSION, identity: npmIdentity, ...extra,
+  });
+  const ttlHours = AUTO_UPDATE_TTL_MS / HOUR;
+
+  // A1 — fresh current result: cadence from the updater's own constant, the
+  // result with its time and age, and the next check with its ETA.
+  reset();
+  writeJson(files.stamp, { protocol: 1, lastCheck: NOW - 2 * HOUR, failures: 0, nextCheckAt: NOW + 4 * HOUR, identity: npmIdentity });
+  writeJson(files.status, current(2 * HOUR));
+  let r = run();
+  let line = auLine(textOf(r));
+  ok(new RegExp(`^\\[ok\\] AUTO-UPDATE  enabled · checks every ${ttlHours}h · last result current — npm v${PKG_VERSION.replace(/\./g, '\\.')} \\(\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}Z, 2h ago\\) · next check \\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}Z \\(in 4h\\)$`).test(line)
+    && !/24h/.test(line) && r.layers.autoUpdate === 'ok' && r.verdict === 'ALIGNED',
+  `A1: a fresh result renders cadence, result time + age and the next check ETA (${line})`);
+
+  // A2 — the founder's case: a legacy dev-owned result, then an npm install.
+  reset();
+  writeJson(files.stamp, { lastCheck: NOW - 15 * HOUR });
+  writeJson(files.status, { protocol: 1, result: 'dev-owned', checkedAt: iso(NOW - 15 * HOUR), currentVersion: '1.86.0' });
+  r = run();
+  line = auLine(textOf(r));
+  ok(r.autoUpdate.stale === true
+    && /the last result \(dev-owned v1\.86\.0, \d{4}-\d{2}-\d{2}T\d{2}:\d{2}Z\) describes the previous install — this npm v\S+ install has not been checked yet · check due now — runs within 10 min while any KLYPIX session is open, or 2 s after the next one starts/.test(line)
+    && !/last result dev-owned/.test(line) && r.verdict === 'ALIGNED',
+  `A2: a result recorded for a previous install is named as such, never as this install's result (${line})`);
+
+  // A2b — the same, with a live connection that should have run it. The
+  // schedule re-opened when the receipts changed (9 h ago), not at the old
+  // lastCheck + 5 min (15 h ago).
+  liveSupervisor();
+  r = run();
+  line = auLine(textOf(r));
+  ok(r.autoUpdate.overdue === true && /^\[!\] AUTO-UPDATE/.test(line)
+    && /check overdue by 9h — no running session performed the check/.test(line)
+    && r.verdict === 'PARTIAL' && r.readinessWarnings.some((w) => /automatic update check overdue by 9h/.test(w))
+    && r.actions.some((a) => a.startsWith('/mcp reconnect one KLYPIX session')),
+  `A2b: overdue while a live connection exists is a warning that makes the verdict PARTIAL (${line})`);
+
+  // A2c — a doctor of another version computes the schedule with ITS rules.
+  r = run({ doctorVersion: '0.0.1' });
+  ok(r.autoUpdate.overdue === false && r.autoUpdate.overdueSuppressed === 'version-skew'
+    && /these times follow this doctor's v0\.0\.1 rules; the installed updater is v\S+, so overdue is not judged/.test(textOf(r))
+    && !r.readinessWarnings.some((w) => /overdue/.test(w)),
+  'A2c: a doctor whose version differs from the installed updater never claims overdue');
+
+  // A3 — failed once: a warning mark with the error, attempt and retry time;
+  // one failure is a 15-min retry, not a readiness gap.
+  reset();
+  writeJson(files.stamp, { protocol: 1, lastCheck: NOW - 5 * 60_000, failures: 1, nextCheckAt: NOW + 10 * 60_000, identity: npmIdentity });
+  writeJson(files.status, {
+    protocol: 1, result: 'failed', checkedAt: iso(NOW - 5 * 60_000), currentVersion: PKG_VERSION,
+    identity: npmIdentity, attempt: 1, nextRetryAt: iso(NOW + 10 * 60_000), error: 'npm registry timed out after 8000ms',
+  });
+  r = run();
+  line = auLine(textOf(r));
+  ok(/^\[!\] AUTO-UPDATE/.test(line)
+    && /last attempt failed safely \(\S+, 5m ago\): npm registry timed out after 8000ms · attempt 1 · next retry \S+ \(in 10m\)/.test(line)
+    && r.layers.autoUpdate === 'warning' && r.verdict === 'ALIGNED',
+  `A3: one failed attempt is a warning with the error, attempt and retry time — the verdict is unchanged (${line})`);
+
+  // A4 — failed twice in a row: a readiness warning, PARTIAL (exit 0).
+  writeJson(files.stamp, { protocol: 1, lastCheck: NOW - 5 * 60_000, failures: 2, nextCheckAt: NOW + 55 * 60_000, identity: npmIdentity });
+  writeJson(files.status, {
+    protocol: 1, result: 'failed', checkedAt: iso(NOW - 5 * 60_000), currentVersion: PKG_VERSION,
+    identity: npmIdentity, attempt: 2, error: 'EPERM: operation not permitted, rename',
+  });
+  r = run();
+  ok(r.verdict === 'PARTIAL' && r.drifted === 0
+    && r.readinessWarnings.some((w) => /automatic update check failed 2 times in a row \(last: EPERM/.test(w))
+    && /brain PARTIAL: .*failed 2 times in a row/.test(driftLine(r)),
+  'A4: two consecutive failures make the verdict PARTIAL, never DRIFTED');
+
+  // A5 — overdue needs a live connection with updates on; none → just "due now".
+  reset();
+  writeJson(files.stamp, { protocol: 1, lastCheck: NOW - 8 * HOUR, failures: 0, nextCheckAt: NOW - 2 * HOUR, identity: npmIdentity });
+  writeJson(files.status, current(8 * HOUR));
+  r = run();
+  ok(r.autoUpdate.overdue === false && r.verdict === 'ALIGNED' && /check due now — runs within 10 min/.test(auLine(textOf(r))),
+    'A5: a due check with no live connection is due, not overdue');
+  liveSupervisor();
+  r = run();
+  ok(r.autoUpdate.overdue === true && /check overdue by 2h — no running session performed the check/.test(auLine(textOf(r)))
+    && r.verdict === 'PARTIAL',
+  'A5: the same check with a live connection is overdue by 2h → PARTIAL');
+  liveSupervisor({ autoUpdate: { enabled: false } });
+  r = run();
+  ok(r.autoUpdate.overdue === false && r.layers.autoUpdate === 'off'
+    && /AUTO-UPDATE  off by KLYPIX_AUTO_UPDATE in all 1 live connection/.test(textOf(r)),
+  'A5: a host that runs with KLYPIX_AUTO_UPDATE=0 is off — the doctor reads the host\'s recorded setting, not its own shell');
+
+  // A6 — a newer npm version this machine already knows (no network), from
+  // the freshest local source, with its age and what the updater will do.
+  reset();
+  writeJson(files.stamp, { protocol: 1, lastCheck: NOW - 2 * HOUR, failures: 0, nextCheckAt: NOW + 4 * HOUR, identity: npmIdentity });
+  writeJson(files.status, current(2 * HOUR));
+  writeJson(files.cache, { pkg: 'klypix-mcp', latest: NEXT, checkedAt: NOW - HOUR, latestAt: NOW - HOUR });
+  r = run();
+  let text = textOf(r);
+  ok(new RegExp(`· npm v${NEXT.replace(/\./g, '\\.')} known locally \\(session-end npm cache, 1h ago\\) — installs at the next check`).test(text)
+    && r.autoUpdate.knownDecision === 'install' && r.layers.autoUpdate === 'ok',
+  'A6: a newer cached npm version is shown with its age and "installs at the next check"');
+  // A failed refresh stamps checkedAt but not latestAt: its age is unknown and
+  // it never outranks the updater's own fresh fetch.
+  writeJson(files.cache, { pkg: 'klypix-mcp', latest: NEXT, checkedAt: NOW - 60_000, lastError: 'timeout' });
+  r = run();
+  ok(r.autoUpdate.knownLatest?.version === PKG_VERSION && r.autoUpdate.knownLatest?.source === 'last update check'
+    && !/known locally/.test(textOf(r)),
+  'A6: a cache whose last refresh FAILED is not treated as fresh (latestAt rule)');
+
+  // A7 — what the updater will NOT do, and why.
+  reset({ dev: true });
+  writeJson(files.stamp, { protocol: 1, lastCheck: NOW - HOUR, failures: 0, nextCheckAt: NOW + 5 * HOUR, identity: { ...npmIdentity, dev: true } });
+  writeJson(files.status, { protocol: 1, result: 'dev-owned', checkedAt: iso(NOW - HOUR), currentVersion: PKG_VERSION, identity: { ...npmIdentity, dev: true } });
+  writeJson(files.cache, { pkg: 'klypix-mcp', latest: NEXT, checkedAt: NOW - HOUR, latestAt: NOW - HOUR });
+  r = run();
+  text = textOf(r);
+  ok(/^\[!\] AUTO-UPDATE/.test(auLine(text)) && /last result dev-owned — v\S+ at check time/.test(text)
+    && /will NOT install automatically: developer-owned/.test(text)
+    && r.layers.autoUpdate === 'warning' && r.verdict === 'ALIGNED',
+  'A7: a developer-owned install with a newer release says it will NOT install automatically (warning mark, no verdict change)');
+  reset();
+  writeJson(files.stamp, { protocol: 1, lastCheck: NOW - HOUR, failures: 0, nextCheckAt: NOW + 5 * HOUR, identity: npmIdentity });
+  writeJson(files.status, current(HOUR));
+  writeJson(files.cache, { pkg: 'klypix-mcp', latest: NEXT_MAJOR, checkedAt: NOW - 30 * 60_000, latestAt: NOW - 30 * 60_000 });
+  ok(/will NOT install automatically: new major/.test(textOf(run())), 'A7: a new major is never installed automatically, and the doctor says so');
+  writeJson(files.status, current(HOUR, { result: 'held', latestVersion: NEXT, hold: { version: NEXT, since: iso(NOW - HOUR) } }));
+  writeJson(files.cache, { pkg: 'klypix-mcp', latest: NEXT, checkedAt: NOW - 30 * 60_000, latestAt: NOW - 30 * 60_000 });
+  ok(new RegExp(`will NOT install automatically: held after a manual downgrade to v${PKG_VERSION.replace(/\./g, '\\.')}`).test(textOf(run())),
+    'A7: a recorded downgrade hold is named');
+  // Before the helper records the hold, a --force downgrade shows only as a
+  // stale manual-downgrade result; the decision must already account for it.
+  writeJson(files.status, current(HOUR, { latestVersion: NEXT, currentVersion: NEXT, identity: { version: NEXT, managed: true, dev: false } }));
+  r = run();
+  ok(r.autoUpdate.staleReason === 'manual-downgrade' && r.autoUpdate.knownDecision === 'held'
+    && !/installs at the next check/.test(textOf(r)),
+  'A7: a deliberate downgrade is predicted as held — the doctor never promises to re-install the version the owner left');
+  reset();
+  writeJson(files.cache, { pkg: 'klypix-mcp', latest: NEXT, checkedAt: NOW - HOUR, latestAt: NOW - HOUR });
+  r = run({ env: OFF });
+  ok(r.layers.autoUpdate === 'off' && /will NOT install automatically: disabled/.test(textOf(r)),
+    'A7: auto-update off + a newer release known → "will NOT install automatically: disabled"');
+
+  // A8 — `--npm` keeps its DRIFTED verdict but names the automatic path.
+  reset();
+  writeJson(files.stamp, { protocol: 1, lastCheck: NOW - 2 * HOUR, failures: 0, nextCheckAt: NOW + 4 * HOUR, identity: npmIdentity });
+  writeJson(files.status, current(2 * HOUR));
+  r = run({ npmLatest: NEXT });
+  ok(r.verdict === 'DRIFTED' && r.actions.some((a) => a.startsWith('npx klypix-mcp install')
+    && /— or wait: auto-update installs it at the next check \(due \d{4}-\d{2}-\d{2}T\d{2}:\d{2}Z, in 4h\)/.test(a)),
+  'A8: behind npm stays DRIFTED, and the action adds "or wait: auto-update installs it at the next check (due …)"');
+  reset({ dev: true });
+  r = run({ npmLatest: NEXT });
+  ok(r.actions.some((a) => a.startsWith('npx klypix-mcp install')) && !r.actions.some((a) => /or wait/.test(a)),
+    'A8: no "or wait" when the updater will not take the release (developer-owned)');
+
+  // A9 — a running check, a never-run check, an attempt that recorded nothing.
+  reset();
+  writeJson(files.stamp, { protocol: 1, lastCheck: NOW - 60_000, failures: 1, nextCheckAt: NOW + 14 * 60_000, identity: npmIdentity, inProgress: { pid: process.pid, startedAt: iso(NOW - 60_000) } });
+  writeJson(files.status, current(7 * HOUR));
+  writeJson(files.lock, { protocol: 1, token: `${process.pid}-fixture`, pid: process.pid, acquiredAt: NOW - 60_000 });
+  r = run();
+  line = auLine(textOf(r));
+  ok(new RegExp(`check in progress since \\S+ \\(pid ${process.pid}\\)`).test(line)
+    && r.autoUpdate.consecutiveFailures === 0 && /^\[ok\]/.test(line),
+  `A9: a check in progress is shown as such, and its pessimistic pre-stamp is not a failure yet (${line})`);
+  reset();
+  liveSupervisor();
+  r = run();
+  ok(r.autoUpdate.overdue === false && /no check recorded yet · check due now/.test(auLine(textOf(r))),
+    'A9: never checked is "due now", never overdue');
+  reset();
+  writeJson(files.stamp, { protocol: 1, lastCheck: NOW - 30 * 60_000, failures: 1, nextCheckAt: NOW - 15 * 60_000, identity: npmIdentity });
+  writeJson(files.status, current(7 * HOUR));
+  ok(/last attempt \(\S+, 30m ago\) stopped before recording a result — counted as failed · attempt 1/.test(auLine(textOf(run()))),
+    'A9: an attempt that recorded no result (helper killed) is shown as a failed attempt, not hidden behind the older result');
+
+  // A10 — corrupt state never breaks the doctor (inspect + render are total).
+  reset();
+  writeJson(files.stamp, { lastCheck: 1e20, nextCheckAt: 'x', failures: -1, identity: null });
+  fs.writeFileSync(files.status, '[]');
+  let threw = null;
+  try { r = run(); text = textOf(r); } catch (error) { threw = error; }
+  ok(!threw && /AUTO-UPDATE/.test(text), `A10: a corrupt stamp/status renders instead of throwing (${threw?.message || 'ok'})`);
+
+  // A11 — the harness pass reports WHY it skipped projects (stale registrations).
+  reset();
+  writeJson(files.status, current(HOUR, { harness: { checked: 5, updated: 1, unchanged: 1, failed: 0, skipped: 3, skippedReasons: { 'stale-registration': 3 }, projects: [] } }));
+  ok(/AUTO-HARNESS\s+5 registered project\(s\) checked · 1 refreshed · 1 current · 0 partial · 3 skipped \(3 stale-registration\)/.test(textOf(run())),
+    'A11: skipped harness projects are reported with their reason');
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
+// C6 — the doctor names its own engine version and warns when it is older
+// than the brain it is judging (a pinned devDependency copy, 2026-10-03).
+{
+  const { home, brainDir, project } = doctorHome('doctor-version');
+  installNpm(brainDir, { version: '99.0.0', installedAt: iso(Date.now() - HOUR) });
+  let r = inspect({ home, projectDir: project, fmtLib: null, env: { KLYPIX_AUTO_UPDATE: '0' } });
+  let text = render(r, { color: false });
+  ok(r.doctor.version === PKG_VERSION && r.doctor.olderThanInstalled === true
+    && text.split('\n')[0].includes(`(doctor engine v${PKG_VERSION})`)
+    && new RegExp(`this doctor \\(v${PKG_VERSION.replace(/\./g, '\\.')}\\) is older than the installed brain v99\\.0\\.0 — .*run npx -y klypix-mcp@latest doctor`).test(text),
+  'C6: the header names the doctor engine version and an older doctor says to run npx -y klypix-mcp@latest doctor');
+  installNpm(brainDir, { version: PKG_VERSION, installedAt: iso(Date.now() - HOUR) });
+  r = inspect({ home, projectDir: project, fmtLib: null, env: { KLYPIX_AUTO_UPDATE: '0' } });
+  ok(r.doctor.olderThanInstalled === false && !/is older than the installed brain/.test(render(r, { color: false })),
+    'C6: a doctor matching the installed brain does not warn');
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
+// C7 — unreceipted engine code: a module in the managed directory that no
+// install receipt covers is a readiness warning naming the merge-driver risk.
+{
+  const { home, brainDir, project } = doctorHome('engine-code');
+  installNpm(brainDir, { installedAt: iso(Date.now() - HOUR) });
+  const run = () => inspect({ home, projectDir: project, fmtLib: null, env: { KLYPIX_AUTO_UPDATE: '0' } });
+  let r = run();
+  ok(r.engineCode.checked && r.engineCode.unreceipted.length === 0 && r.layers.engineCode === 'ok'
+    && /ENGINE\s+all 2 engine module\(s\) covered by the v\S+ install receipt/.test(render(r, { color: false })),
+  'C7: a fully receipted directory reads ok');
+  fs.writeFileSync(path.join(brainDir, 'remote-client.mjs'), '// left by an older release\n');
+  fs.writeFileSync(path.join(brainDir, 'klypix-brain.mjs'), '// the desktop installer adds this one\n');
+  r = run();
+  let text = render(r, { color: false });
+  ok(r.engineCode.unreceipted.join(',') === 'remote-client.mjs' && r.engineCode.desktopExtras.join(',') === 'klypix-brain.mjs'
+    && r.layers.engineCode === 'warning' && r.verdict === 'PARTIAL' && r.drifted === 0
+    && r.readinessWarnings.some((w) => /1 unreceipted engine file in the managed directory \(remote-client\.mjs\).*git merge driver/.test(w))
+    && /\[!\] ENGINE\s+1 module\(s\) outside the v\S+ install receipt: remote-client\.mjs/.test(text)
+    && r.actions.some((a) => a.startsWith('review, then remove remote-client.mjs')),
+  'C7: an unreceipted module is PARTIAL with the merge-driver risk named; a desktop-installed script is allowlisted');
+  fs.writeFileSync(path.join(brainDir, 'klypix-merge-driver.mjs'), '// a driver no receipt covers\n');
+  r = run();
+  ok(r.engineCode.mergeDriverFiles.join(',') === 'klypix-merge-driver.mjs'
+    && /including klypix-merge-driver\.mjs/.test(render(r, { color: false })),
+  'C7: an unreceipted git merge driver is called out by name');
+  fs.rmSync(path.join(brainDir, '.mcp-runtime.json'));
+  r = run();
+  ok(!r.engineCode.checked && r.layers.engineCode === 'n/a' && !r.readinessWarnings.some((w) => /unreceipted/.test(w)),
+    'C7: without a receipt there is nothing to compare — no warning');
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
+// The doctor diagnoses half-applied installs (renames land one file at a time),
+// so it must load and render beside a MISSING mcp-auto-update.mjs. It imported
+// that module by name, which fails the whole doctor at link time.
+{
+  const flat = path.join(os.tmpdir(), `klypix-doctor-flat-${process.pid}`);
+  fs.rmSync(flat, { recursive: true, force: true });
+  fs.mkdirSync(flat, { recursive: true });
+  const srcDir = path.join(__dirname, '..', 'src');
+  for (const f of fs.readdirSync(srcDir).filter((name) => name.endsWith('.mjs') && name !== 'mcp-auto-update.mjs')) {
+    fs.copyFileSync(path.join(srcDir, f), path.join(flat, f));
+  }
+  const { home, brainDir, project } = doctorHome('flat-no-updater');
+  installNpm(brainDir, { installedAt: iso(Date.now() - HOUR) });
+  let report = null;
+  let text = '';
+  let threw = null;
+  try {
+    const flatDoctor = await import(pathToFileURL(path.join(flat, 'brain-doctor.mjs')).href);
+    report = flatDoctor.inspect({ home, projectDir: project, fmtLib: null, env: { KLYPIX_AUTO_UPDATE: '' } });
+    text = flatDoctor.render(report, { color: false });
+  } catch (error) { threw = error; }
+  ok(!threw && report?.autoUpdate?.moduleUnavailable === true && report.layers.autoUpdate === 'warning'
+    && /AUTO-UPDATE\s+state unknown — mcp-auto-update\.mjs could not be loaded/.test(text)
+    && report.actions.some((a) => /mcp-auto-update\.mjs could not be loaded/.test(a)),
+  `the doctor loads and renders beside a missing mcp-auto-update.mjs (${threw?.message || 'ok'})`);
+  fs.rmSync(flat, { recursive: true, force: true });
   fs.rmSync(home, { recursive: true, force: true });
 }
 

@@ -185,6 +185,11 @@ export function buildRuntimeReport({
     // design — without this flag it reads like a missing/crashed worker.
     const hibernating = state?.status === 'hibernated';
     if (hibernating) flags.push('worker-hibernated');
+    // Supervisors carrying the 2026-10-03 fix write `supervisorVersion`. Older
+    // code (1.57 on) re-woke an idle pair about 1 s after it hibernated, so its
+    // sleeping pairs release no RAM that lasts — never count them as savings.
+    const preFixSupervisor = Boolean(state) && !Object.prototype.hasOwnProperty.call(state, 'supervisorVersion');
+    if (preFixSupervisor) flags.push('pre-fix-supervisor');
     connections.push({
       id: state?.connectionId || `pid-${supervisor?.pid || worker?.pid}`,
       client: state?.clientInfo?.name || (host ? classifyHostProcess(host) : 'unknown'),
@@ -197,6 +202,8 @@ export function buildRuntimeReport({
         rssMb: roundMb(supervisor.rssBytes),
         status: state?.status || 'unreported',
         version: state?.active?.version || null,
+        // The supervisor's OWN code version (B9) — it only changes at reconnect.
+        codeVersion: typeof state?.supervisorVersion === 'string' ? state.supervisorVersion : null,
       } : null,
       worker: worker ? {
         pid: worker.pid,
@@ -254,6 +261,7 @@ export function buildRuntimeReport({
   // number is always derived from this machine rather than a guess.
   const residentWorkers = connections.filter((item) => item.worker);
   const hibernated = connections.filter((item) => item.hibernation?.hibernated);
+  const released = hibernated.filter((item) => !item.flags.includes('pre-fix-supervisor'));
   const avgWorkerMb = residentWorkers.length
     ? Math.round((residentWorkers.reduce((sum, item) => sum + number(item.worker.rssMb), 0) / residentWorkers.length) * 10) / 10
     : null;
@@ -268,9 +276,11 @@ export function buildRuntimeReport({
       ...roleTotals,
       totalMb,
       hibernatedConnections: hibernated.length,
+      // Asleep at this instant but on pre-fix supervisor code: not a saving.
+      preFixHibernatedConnections: hibernated.length - released.length,
       avgResidentWorkerMb: avgWorkerMb,
-      estimatedHibernationSavingsMb: avgWorkerMb !== null && hibernated.length
-        ? Math.round(avgWorkerMb * hibernated.length * 10) / 10
+      estimatedHibernationSavingsMb: avgWorkerMb !== null && released.length
+        ? Math.round(avgWorkerMb * released.length * 10) / 10
         : 0,
     },
     connections: connections.sort((a, b) => b.rssMb - a.rssMb),
@@ -297,14 +307,19 @@ export function inspectKlypixRuntime({ brainDir, platform = process.platform, ex
 
 export function formatRuntimeReport(report) {
   const t = report?.totals || {};
+  const preFixAsleep = number(t.preFixHibernatedConnections);
+  const releasing = number(t.hibernatedConnections) - preFixAsleep;
   const lines = [
     `KLYPIX RUNTIME V2 — PASSIVE — ${report?.sampledAt || ''}`,
     `Connections ${t.connections || 0} · workers ${t.workersMb || 0} MB · supervisors ${t.supervisorsMb || 0} MB · launchers ${t.launchersMb || 0} MB · total ${t.totalMb || 0} MB`,
-    t.hibernatedConnections
-      ? `Hibernated ${t.hibernatedConnections} connection(s) — about ${t.estimatedHibernationSavingsMb} MB not resident (mean resident worker ${t.avgResidentWorkerMb} MB); each wakes on its next request.`
-      : '',
+    ...(releasing > 0
+      ? [`Hibernated ${releasing} connection(s) — about ${t.estimatedHibernationSavingsMb} MB not resident (mean resident worker ${t.avgResidentWorkerMb} MB); each wakes on its next request.`]
+      : []),
+    ...(preFixAsleep > 0
+      ? [`${preFixAsleep} more connection(s) asleep right now run pre-fix supervisor code that re-wakes idle workers within seconds — not counted as a saving; /mcp reconnect to apply.`]
+      : []),
     '',
-  ].filter((line, index) => line !== '' || index > 1);
+  ];
   for (const item of report?.connections || []) {
     const host = item.host ? `${item.host.kind}:${item.host.pid}` : 'host:unknown';
     const processBits = [

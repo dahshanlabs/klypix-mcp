@@ -272,8 +272,10 @@ function runInstall(home, projectCwd, args = []) {
   // Sandboxed suite runs set KLYPIX_AUTO_UPDATE=0; this audit is about the receipts.
   const updateEnv = { ...process.env, KLYPIX_AUTO_UPDATE: '' };
   const updateAudit = inspect({ home, projectDir: proj, env: updateEnv });
+  // The cadence is printed from the updater's own constant (2026-10-03: the
+  // line used to hard-code "24h" whatever the updater actually ran).
   ok(updateAudit.autoUpdate.enabled && updateAudit.autoUpdate.result === 'current'
-    && /AUTO-UPDATE.*machine-wide 24h check.*current/.test(render(updateAudit, { color: false }))
+    && new RegExp(`AUTO-UPDATE.*checks every ${AUTO_UPDATE_TTL_MS / 3_600_000}h.*last result current`).test(render(updateAudit, { color: false }))
     && /AUTO-HARNESS.*2 registered project\(s\) checked.*1 refreshed.*1 current.*0 partial/.test(render(updateAudit, { color: false })),
   'D: doctor exposes the host-neutral update and automatic harness receipts');
   ok(updateAudit.autoUpdate.stale === false && updateAudit.autoUpdate.due === false

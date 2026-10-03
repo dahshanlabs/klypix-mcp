@@ -23,7 +23,7 @@ import {
   linkProject,
   safeReadCodexConfig,
 } from '../src/agent-rules.mjs';
-import { driftLine, inspect, render } from '../src/brain-doctor.mjs';
+import { driftLine, inspect, render, structuredReport } from '../src/brain-doctor.mjs';
 import { laneFileFor } from '../src/agent-presence.mjs';
 import { AUTO_UPDATE_TTL_MS } from '../src/mcp-auto-update.mjs';
 import { makeVault, seedBrain } from './_harness.mjs';
@@ -883,6 +883,74 @@ const supervisorReceipt = (brainDir, name, state) => writeJson(path.join(brainDi
   fs.rmSync(home, { recursive: true, force: true });
 }
 
+// ── E1 — the structured result brain_doctor returns next to its text ─────────
+// (2026-10-03) The same verdict as data. A projection, not the report: the
+// harness pass drops its per-project list and the supervisor sub-lists are pids
+// into `live`, so a host that hands structuredContent to the model pays little.
+{
+  const NOW = Date.now();
+  const { home, brainDir, project } = doctorHome('structured');
+  installNpm(brainDir, { installedAt: iso(NOW - 2 * HOUR) });
+  writeJson(path.join(brainDir, '.autoupdate-check.json'), {
+    protocol: 1, lastCheck: NOW - HOUR, failures: 0, nextCheckAt: NOW - HOUR + AUTO_UPDATE_TTL_MS,
+  });
+  writeJson(path.join(brainDir, '.autoupdate-status.json'), {
+    protocol: 1, result: 'current', checkedAt: iso(NOW - HOUR), currentVersion: PKG_VERSION, latestVersion: PKG_VERSION,
+    identity: { version: PKG_VERSION, managed: true, dev: false },
+    harness: {
+      checked: 2, updated: 0, unchanged: 2, failed: 0, skipped: 0, checkedAt: iso(NOW - HOUR),
+      projects: [{ project: 'E:/a', status: 'unchanged' }, { project: 'E:/b', status: 'unchanged' }],
+    },
+  });
+  // One fixed pair asleep on the installed version, one pre-fix pair serving it.
+  supervisorReceipt(brainDir, 'sleeping', {
+    status: 'hibernated', active: null, updatedAt: iso(NOW - 5_000), supervisorVersion: PKG_VERSION,
+    hibernation: { hibernated: true, target: { version: PKG_VERSION, path: 'C:/runtime/klypix-mcp-worker.mjs' } },
+    transport: { host: 'connected', delivery: 'pull-only' }, autoUpdate: { enabled: true },
+  });
+  supervisorReceipt(brainDir, 'prefix', {
+    pid: process.ppid, updatedAt: iso(NOW - 5_000),
+    active: { pid: process.ppid, version: PKG_VERSION, path: 'C:/runtime/klypix-mcp-worker.mjs' },
+    hibernation: { hibernated: false },
+  });
+  const r = inspect({ home, projectDir: project, now: NOW, fmtLib: null, env: {} });
+  const s = structuredReport(r);
+  const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  ok(same(Object.keys(s).sort(), ['actions', 'autoUpdate', 'layers', 'readinessWarnings', 'schemaVersion', 'supervisors', 'verdict', 'version']),
+    `E1: structuredContent carries exactly {schemaVersion, verdict, layers, version, autoUpdate, supervisors, readinessWarnings, actions} (got ${Object.keys(s).join(', ')})`);
+  ok(s.schemaVersion === 1 && s.verdict === r.verdict && same(s.layers, r.layers)
+    && same(s.readinessWarnings, r.readinessWarnings) && same(s.actions, r.actions),
+  'E1: the verdict, layers, readiness warnings and actions are the report\'s own');
+  ok(s.version.baked === PKG_VERSION && s.version.channel === 'npm' && s.version.installed === true
+    && s.version.doctor?.version === r.doctor.version && s.version.running?.known === r.running.known,
+  'E1: version names the installed core, the doctor engine and the running server');
+  ok(s.autoUpdate.result === 'current' && s.autoUpdate.dueAt === r.autoUpdate.dueAt
+    && s.autoUpdate.cadenceMs === AUTO_UPDATE_TTL_MS && s.autoUpdate.effectiveEnabled === true
+    && s.autoUpdate.decision === r.autoUpdate.decision && s.autoUpdate.overdue === false
+    && s.autoUpdate.harness?.checked === 2 && !('projects' in s.autoUpdate.harness),
+  'E1: autoUpdate carries the schedule and decision; the harness keeps its counts, not its per-project list');
+  const pair = (pid) => s.supervisors.live.find((item) => item.pid === pid);
+  ok(s.supervisors.count === 2 && s.supervisors.live.length === 2
+    && s.supervisors.live.every((item) => !('hibernation' in item) && !('transport' in item))
+    && pair(process.pid)?.status === 'hibernated' && pair(process.pid)?.supervisorVersion === PKG_VERSION
+    && pair(process.ppid)?.preFix === true
+    && same(s.supervisors.hibernated, [process.pid]) && same(s.supervisors.preFix, [process.ppid])
+    && same(s.supervisors.impaired, []),
+  'E1: supervisors list each live pair compactly; sub-lists are pids into live');
+  ok(same(JSON.parse(JSON.stringify(s)), s), 'E1: the structured result survives a JSON round trip unchanged');
+  let threw = null;
+  let minimal = null;
+  let hostile = null;
+  try {
+    minimal = structuredReport(null);
+    hostile = structuredReport({ verdict: 'ALIGNED', get layers() { throw new Error('boom'); } });
+  } catch (error) { threw = error; }
+  ok(!threw && minimal?.schemaVersion === 1 && minimal.verdict === null
+    && hostile?.verdict === 'ALIGNED' && hostile?.error === 'boom',
+  `E1: structuredReport is total — a missing or hostile report yields a minimal result, never a throw (${threw?.message || 'ok'})`);
+  fs.rmSync(home, { recursive: true, force: true });
+}
+
 // ── PART B — brain_doctor as a real MCP verb ─────────────────────────────────
 {
   const vault = makeVault();
@@ -958,6 +1026,15 @@ const supervisorReceipt = (brainDir, name, state) => writeJson(path.join(brainDi
     'the MCP connection and synthetic live peer are counted separately without hooks');
   ok(/your last note \(just now\): explicitly consumed by all 1 target peer\(s\) via receipt \(not human-read\)\./.test(text),
     'brain_doctor renders a real explicit consumption receipt without claiming a human read it');
+  // E1 (2026-10-03): the same verdict as data, over real MCP, next to the text.
+  const sc = r.structuredContent;
+  const head = text.split('\n')[0] || '';
+  ok(sc && sc.schemaVersion === 1
+    && ['verdict', 'layers', 'version', 'autoUpdate', 'supervisors', 'readinessWarnings', 'actions'].every((key) => key in sc)
+    && typeof sc.verdict === 'string' && head.includes(sc.verdict.replace('-', ' '))
+    && Array.isArray(sc.actions) && Array.isArray(sc.readinessWarnings) && Array.isArray(sc.supervisors?.live)
+    && typeof sc.layers?.autoUpdate === 'string' && 'dueAt' in (sc.autoUpdate || {}),
+  `E1: brain_doctor returns structuredContent whose verdict matches its text (${sc ? sc.verdict : 'none'} vs "${head}")`);
 
   const synced = await client.callTool({
     name: 'brain_sync',

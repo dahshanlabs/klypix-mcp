@@ -1134,7 +1134,7 @@ server.registerTool('brain_sync', {
 
 server.registerTool('brain_doctor', {
   title: 'Brain doctor — is this brain current, wired, and in sync?',
-  description: 'Read-only self-check of the installed klypix brain, as ONE verdict: VERSION (deployed brain-core + optional npm currency), CLAUDE (existing 5-hook capture readiness), CODEX (automatic MCP presence plus optional enhanced-hook status), TOOLS (discoverable MCP verbs), SESSIONS (all active presence-adapter sessions across hosts, never recent-chat history), and HARNESS (projection drift). Use to answer "is my brain current, correctly installed, in sync, and who is actually live?" without file-spelunking. Never writes: the only side effects are read-only subprocess queries (git rev-parse / tag --list / log / merge-base with fixed argument arrays, and `npm view` only when check_npm is true) — it creates, edits, and deletes nothing. SCOPE: only CLAUDE and CODEX get behavioural verdicts. HARNESS classifies the projected config/rules FILES on disk — a project can read fully ok while no other host has ever actually loaded them, so do not report a clean HARNESS as "Cursor/Cline/Windsurf/Copilot is working". The MCP-callable twin of `npx klypix-mcp doctor`.',
+  description: 'Read-only self-check of the installed klypix brain, as ONE verdict: VERSION (deployed brain-core + optional npm currency), CLAUDE (existing 5-hook capture readiness), CODEX (automatic MCP presence plus optional enhanced-hook status), TOOLS (discoverable MCP verbs), SESSIONS (all active presence-adapter sessions across hosts, never recent-chat history), and HARNESS (projection drift). Use to answer "is my brain current, correctly installed, in sync, and who is actually live?" without file-spelunking. Never writes: the only side effects are read-only subprocess queries (git rev-parse / tag --list / log / merge-base with fixed argument arrays, and `npm view` only when check_npm is true) — it creates, edits, and deletes nothing. SCOPE: only CLAUDE and CODEX get behavioural verdicts. HARNESS classifies the projected config/rules FILES on disk — a project can read fully ok while no other host has ever actually loaded them, so do not report a clean HARNESS as "Cursor/Cline/Windsurf/Copilot is working". The MCP-callable twin of `npx klypix-mcp doctor`. Besides the text, the result carries structuredContent {verdict, layers, version, autoUpdate, supervisors, readinessWarnings, actions}: the same verdict as data, including when the next automatic update check runs and what it will do.',
   inputSchema: {
     project: z.string().optional().describe('Project dir to audit harness + peers for. Defaults to the server\'s working directory.'),
     check_npm: z.boolean().optional().describe('Also fetch npm latest to flag a stale brain (default false — this one does a network `npm view`).'),
@@ -1143,7 +1143,7 @@ server.registerTool('brain_doctor', {
   try {
     // Lazy import so a flat runtime missing brain-doctor.mjs can't crash server STARTUP —
     // the tool degrades gracefully (errors only when called) instead of taking the server down.
-    const { inspect, render } = await import('../src/brain-doctor.mjs');
+    const { inspect, render, structuredReport } = await import('../src/brain-doctor.mjs');
     let npmLatest = null;
     if (check_npm) {
       try { const { execSync } = await import('child_process'); npmLatest = execSync('npm view klypix-mcp version', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 8000 }).trim(); }
@@ -1157,7 +1157,17 @@ server.registerTool('brain_doctor', {
       npmLatest,
       self: { pid: process.pid, version: PKG_VERSION, id: mcpPresence.id },
     });
-    return { content: [{ type: 'text', text: render(report, { color: false }) }] };
+    // E1 (2026-10-03): the same verdict as data next to the unchanged text — the
+    // layers, the auto-update schedule and each connection's state, without
+    // parsing rendered lines. A brain-doctor.mjs that predates the projection
+    // (an install that stopped half-way) leaves it out; the text still answers.
+    let structuredContent = null;
+    try { if (typeof structuredReport === 'function') structuredContent = structuredReport(report); }
+    catch { structuredContent = null; }
+    return {
+      content: [{ type: 'text', text: render(report, { color: false }) }],
+      ...(structuredContent ? { structuredContent } : {}),
+    };
   } catch (e) {
     return { content: [{ type: 'text', text: `brain_doctor unavailable: ${e?.message || e}` }], isError: true };
   }

@@ -1190,6 +1190,64 @@ export function inspect(opts = {}) {
   return { verdict, layers, drifted, readinessWarnings, version, running, supervisors, autoUpdate, hooks, codexSmart, codexHooks, gitCapture, history, provenance, tools, peers, sessions: peers, receipts: peers.receipts, receiptSessionId, harness, npm, decayGuard, mergeEngine, checkout, project: { dir: projectDir, brainPath, hasBrain }, brainDir, actions, doctor, engineCode, inspectedAt: now };
 }
 
+// ── Structured result (E1, 2026-10-03) ──────────────────────────────────────
+// brain_doctor's MCP result carries this next to its unchanged text, so a host
+// or an agent can act on the verdict, the update schedule and each connection's
+// state without parsing rendered lines (the AUTO-UPDATE line alone has a dozen
+// shapes). A projection, not the whole report: a host may hand a tool's
+// structuredContent to the model next to its text, so the harness pass drops its
+// per-project list and the supervisor sub-lists are pids into `live` instead of
+// copies of it. Field names are the report's own; schemaVersion moves only on a
+// breaking change. Total: a surprise yields {schemaVersion, verdict, error}.
+const STRUCTURED_PAIR_FIELDS = [
+  'pid', 'status', 'impaired', 'workerImpaired', 'deliveryImpaired', 'degraded', 'deliveryStatus', 'transition',
+  'activePid', 'activeVersion', 'candidateVersion', 'effectiveVersion', 'wakeVersion', 'pendingWakeVersion',
+  'alignment', 'hotReloads', 'lastSwapAt', 'lastError', 'updatedAt', 'supervisorGeneration', 'supervisorVersion',
+  'preFix', 'autoUpdateEnabled',
+];
+const STRUCTURED_HARNESS_FIELDS = ['checked', 'updated', 'unchanged', 'failed', 'skipped', 'skippedReasons', 'checkedAt', 'version', 'error'];
+const pickFields = (source, keys) => {
+  const out = {};
+  if (!source || typeof source !== 'object') return out;
+  for (const key of keys) if (source[key] !== undefined) out[key] = source[key];
+  return out;
+};
+export function structuredReport(r) {
+  try {
+    const au = r?.autoUpdate && typeof r.autoUpdate === 'object' ? r.autoUpdate : {};
+    const sup = r?.supervisors && typeof r.supervisors === 'object' ? r.supervisors : {};
+    const pids = (list) => (Array.isArray(list) ? list.map((state) => state?.pid ?? null) : []);
+    return {
+      schemaVersion: 1,
+      verdict: r?.verdict ?? null,
+      layers: { ...(r?.layers || {}) },
+      version: {
+        ...pickFields(r?.version, ['installed', 'baked', 'channel', 'stampVersion', 'dev', 'dirty', 'sourceSha', 'installedAt', 'supervisorCapable']),
+        running: r?.running ? pickFields(r.running, ['known', 'self', 'version', 'matchesInstalled']) : null,
+        npm: r?.npm ? pickFields(r.npm, ['latest', 'relation']) : null,
+        doctor: r?.doctor ? pickFields(r.doctor, ['version', 'olderThanInstalled', 'newerThanInstalled']) : null,
+      },
+      autoUpdate: {
+        ...au,
+        harness: au.harness && typeof au.harness === 'object' ? pickFields(au.harness, STRUCTURED_HARNESS_FIELDS) : null,
+      },
+      supervisors: {
+        ...pickFields(sup, ['active', 'count', 'deadReceipts', 'matchesInstalled']),
+        live: Array.isArray(sup.live) ? sup.live.map((state) => pickFields(state, STRUCTURED_PAIR_FIELDS)) : [],
+        pendingReconnect: pids(sup.pendingReconnect),
+        preFix: pids(sup.preFix),
+        hibernated: pids(sup.hibernated),
+        transitioning: pids(sup.transitioning),
+        impaired: pids(sup.impaired),
+      },
+      readinessWarnings: Array.isArray(r?.readinessWarnings) ? [...r.readinessWarnings] : [],
+      actions: Array.isArray(r?.actions) ? [...r.actions] : [],
+    };
+  } catch (error) {
+    return { schemaVersion: 1, verdict: r?.verdict ?? null, error: String(error?.message || error) };
+  }
+}
+
 // One-line drift summary (empty when clean) — for a footer / status line.
 export function driftLine(r) {
   if (r.verdict === 'ALIGNED') return '';

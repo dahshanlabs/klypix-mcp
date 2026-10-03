@@ -774,9 +774,9 @@ class Supervisor {
   // package's worker IS <brainDir>/klypix-mcp-worker.mjs — the managed runtime
   // itself — and nothing vouches for that file without a verifying manifest.
   packageWorker() {
-    const target = this.currentFallbackTarget();
-    if (within(path.dirname(this.runtimeManifest), target.path) || !fs.existsSync(target.path)) return null;
-    return target;
+    const file = this.fallbackTarget.path;
+    if (within(path.dirname(this.runtimeManifest), file) || !fs.existsSync(file)) return null;
+    return this.currentFallbackTarget();
   }
 
   // B1: a sleeping pair notes a newer install for the doctor and stays asleep.

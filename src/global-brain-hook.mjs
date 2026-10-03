@@ -532,8 +532,10 @@ const HEALTH = path.join(
     `${(String(path.basename(CWD) || 'project').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'project')}-${sha(CWD.toLowerCase()).slice(0, 8)}.jsonl`,
 );
 // npm-currency cache — the Stop hook refreshes this at most once/day (best-effort,
-// failure-silent); the SessionStart footer reads ONLY this file (zero network) to
-// surface a stale install. {pkg, latest, checkedAt, lastError?}.
+// failure-silent); the SessionStart footer reads it (zero network) to surface a
+// stale install. {pkg, latest, checkedAt, latestAt, lastError?}: checkedAt is the
+// last ATTEMPT (the throttle), latestAt the last SUCCESSFUL fetch (the age of
+// `latest`) — a failed fetch used to re-date an old figure as "checked just now".
 const NPM_CURRENCY = path.join(os.homedir(), '.claude', 'project-brain', '.npm-currency.json');
 const NPM_CURRENCY_TTL = 24 * 60 * 60 * 1000;   // ≤ once/day refresh throttle
 const LOCK = path.resolve(CWD, '.claude', 'brain-capture.lock');   // serialize concurrent captures
@@ -5203,24 +5205,36 @@ function selfCheckFooter() {
 // ── Version-currency — the brain surfaces its OWN staleness, ambiently ───────
 // doctorFooter (below) is deliberately network-free, so a stale install never
 // announced itself until someone ran `npx klypix-mcp doctor --npm` — the human was
-// the drift detector (the desktop-lag incident). These two functions close that gap
+// the drift detector (the desktop-lag incident). These functions close that gap
 // WITHOUT breaking the no-network-in-session-start rule:
 //   • refreshNpmCurrency() runs on the Stop hook (post-session), ≤ once/day,
-//     best-effort + failure-silent — it fetches npm `latest` into a local cache.
-//   • versionCurrencyFooter() runs at SessionStart and reads ONLY that cache
-//     (pure fs, NO fetcher) — so it CANNOT make a network call by construction.
+//     best-effort + failure-silent — it fetches npm `latest` into a local cache,
+//     unless the opt-out is set or the MCP updater already holds a fresh figure.
+//   • versionCurrencyFooter() runs at SessionStart and reads ONLY local files —
+//     that cache, the updater's status, and the updater's own schedule/decision
+//     (loaded by autoUpdateFooterInputs) — NO fetcher, so it CANNOT make a
+//     network call by construction.
 // `doctor` stays the authoritative on-demand full check (unchanged).
+
+const STRICT_SEMVER = /^\d+\.\d+\.\d+$/;
+// A status dated further ahead than this is a skewed clock, not a fresh figure.
+const NPM_CURRENCY_SKEW_MS = 5 * 60 * 1000;
+// Name this client to the registry, as the updater's own probe already does
+// (mcp-auto-update.mjs fetchLatestStableVersion); this GET sent no User-Agent at
+// all (2026-10-03 review).
+const NPM_PROBE_USER_AGENT = 'klypix-mcp-currency-check';
 
 // The ONLY network path (kept separate so the footer is fetcher-less). Resolves the
 // published `latest` via the registry's lightweight per-version endpoint. Zero deps
-// (node https), tight timeout, rejects on any failure. Injectable in tests.
-function httpsFetchLatest(pkg = 'klypix-mcp', timeoutMs = 4000) {
+// (node https), tight timeout, rejects on any failure. Injectable in tests —
+// `request` stands in for https.get, so the request itself is checkable offline.
+function httpsFetchLatest(pkg = 'klypix-mcp', timeoutMs = 4000, request = https.get) {
     return new Promise((resolve, reject) => {
         // GET /{pkg}/latest with the DEFAULT json accept — the abbreviated
         // `vnd.npm.install-v1+json` type is only served by the full packument
         // endpoint and 406s here. This returns the latest version manifest (~few KB).
-        const req = https.get(`https://registry.npmjs.org/${pkg}/latest`,
-            { headers: { accept: 'application/json' } }, (res) => {
+        const req = request(`https://registry.npmjs.org/${pkg}/latest`,
+            { headers: { accept: 'application/json', 'user-agent': NPM_PROBE_USER_AGENT } }, (res) => {
                 if (res.statusCode !== 200) { res.resume(); return reject(new Error('http ' + res.statusCode)); }
                 let body = '';
                 res.setEncoding('utf8');
@@ -5232,22 +5246,126 @@ function httpsFetchLatest(pkg = 'klypix-mcp', timeoutMs = 4000) {
     });
 }
 
-// Throttled (≤ once/day), best-effort, failure-silent refresh of the npm-latest
-// cache — runs on the Stop hook only. NEVER throws. `now`/`fetcher`/`file`/`ttl`
-// are injectable so tests stay hermetic (no real network). A failed fetch still
-// stamps `checkedAt` (so we don't hammer when offline) and keeps a prior good
-// `latest`. Returns a small status object; callers ignore it.
-async function refreshNpmCurrency({ now = Date.now(), fetcher = httpsFetchLatest, file = NPM_CURRENCY, ttl = NPM_CURRENCY_TTL, pkg = 'klypix-mcp' } = {}) {
+// The MCP updater's last npm figure, from the .autoupdate-status.json in `dir`:
+// {latest, at} when latestVersion is strict semver and checkedAt parses, else null.
+// Every updater version writes latestVersion only alongside a check whose fetch
+// SUCCEEDED (a failed fetch records none), so checkedAt dates the figure.
+function updaterNpmLatest(dir) {
     try {
+        const status = JSON.parse(fs.readFileSync(path.join(dir, '.autoupdate-status.json'), 'utf8'));
+        const latest = String(status?.latestVersion || '').trim();
+        const at = Date.parse(status?.checkedAt);
+        return STRICT_SEMVER.test(latest) && Number.isFinite(at) ? { latest, at } : null;
+    } catch { return null; }
+}
+
+// When the cache's `latest` was actually fetched (ms), or null when unknown. A cache
+// written before latestAt existed is dated by checkedAt only if that attempt
+// succeeded: after a failed one, the figure is older than checkedAt by an unknown
+// amount — never "just now".
+function cacheLatestAt(cache) {
+    if (!cache || typeof cache !== 'object') return null;
+    if (Object.prototype.hasOwnProperty.call(cache, 'latestAt')) return Number.isFinite(cache.latestAt) ? cache.latestAt : null;
+    return !cache.lastError && Number.isFinite(cache.checkedAt) ? cache.checkedAt : null;
+}
+
+// Throttled (≤ once/day), best-effort, failure-silent refresh of the npm-latest
+// cache — runs on the Stop hook only. NEVER throws. `now`/`fetcher`/`file`/`ttl`/
+// `env` are injectable so tests stay hermetic (no real network). A failed fetch
+// still stamps `checkedAt` (so we don't hammer when offline) and keeps a prior good
+// `latest` WITH its own latestAt, so a failure never re-dates an old figure.
+// Returns a small status object; callers ignore it.
+//
+// Two gates come before any request (2026-10-03):
+//   • KLYPIX_AUTO_UPDATE=0 turns this probe off too — the README promises the
+//     opt-out covers the network exception, and this GET ignored it;
+//   • one probe per machine: when the updater's .autoupdate-status.json next to
+//     this cache holds a strict-semver latestVersion younger than the TTL, the
+//     footer already reads that figure, so a second GET buys nothing. Nothing is
+//     written either, so the cache keeps its true dates.
+async function refreshNpmCurrency({ now = Date.now(), fetcher = httpsFetchLatest, file = NPM_CURRENCY, ttl = NPM_CURRENCY_TTL, pkg = 'klypix-mcp', env = process.env } = {}) {
+    try {
+        if (!autoUpdateEnabled(env)) return { skipped: 'disabled' };
         let prev = null;
         try { prev = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { /* no cache yet */ }
         if (prev && Number.isFinite(prev.checkedAt) && (now - prev.checkedAt) < ttl) return { skipped: 'throttled', prev };
-        let latest = (prev && prev.latest) || null, lastError = null;
-        try { latest = await fetcher(pkg); } catch (e) { lastError = String((e && e.message) || e).slice(0, 120); }
-        const next = { pkg, latest: latest || null, checkedAt: now, ...(lastError ? { lastError } : {}) };
+        const updater = updaterNpmLatest(path.dirname(file));
+        if (updater && now - updater.at < ttl && updater.at - now <= NPM_CURRENCY_SKEW_MS) return { skipped: 'updater-fresh', latest: updater.latest };
+        let latest = (prev && prev.latest) || null, latestAt = cacheLatestAt(prev), lastError = null;
+        try {
+            const fetched = String((await fetcher(pkg)) || '').trim();
+            if (!STRICT_SEMVER.test(fetched)) throw new Error(`invalid version ${JSON.stringify(fetched).slice(0, 40)}`);
+            latest = fetched;
+            latestAt = now;
+        } catch (e) { lastError = String((e && e.message) || e).slice(0, 120); }
+        const next = { pkg, latest: latest || null, checkedAt: now, latestAt: Number.isFinite(latestAt) ? latestAt : null, ...(lastError ? { lastError } : {}) };
         try { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, JSON.stringify(next, null, 2)); } catch { /* best-effort */ }
         return { fetched: !lastError, latest: next.latest, lastError };
     } catch { return { skipped: 'error' }; }
+}
+
+// What this machine knows about npm `latest`, from local files only. TWO
+// independent channels fetch it and neither knew about the other: this cache
+// (refreshed by the Claude Code Stop hook) and the MCP auto-updater's
+// .autoupdate-status.json. On a machine driven mostly through another host the
+// Stop hook rarely runs, so THIS cache can sit months behind while the updater's
+// is current — the field report's "latest" was ~29 minor versions stale. Take the
+// FRESHER of the two, by when each figure was FETCHED (latestAt): ranking by the
+// last attempt let a failed refresh make an old cache figure win (2026-10-03).
+// → {latest, at} (at = ms of the successful fetch, or null when unknown) | null.
+function knownNpmLatest({ file = NPM_CURRENCY, brainDir = path.dirname(NPM_CURRENCY) } = {}) {
+    let known = null;
+    try {
+        const cache = JSON.parse(fs.readFileSync(file, 'utf8'));
+        if (cache && typeof cache === 'object') known = { latest: cache.latest, at: cacheLatestAt(cache) };
+    } catch { /* no cache → the updater's figure stands alone */ }
+    const updater = updaterNpmLatest(brainDir);
+    if (updater && (!known || !Number.isFinite(known.at) || updater.at > known.at)) known = updater;
+    return known;
+}
+
+// The INSTALLED updater's own view, for the version notice (D1) and the
+// SessionStart self-update spawn (D4), 2026-10-03: its schedule (inspectAutoUpdate),
+// what it would do with the freshest local npm figure (autoUpdateDecision) and
+// whether its check is overdue (autoUpdateOverdue, K2), so no surface has to
+// guess. A guarded dynamic import, never a static one: the --live / --guard fast
+// paths and an older flat deployment must keep working when the module or its
+// exports are missing — then plan/decision/overdue are null and the notice stays
+// neutral. Zero network: the module has no import side effects outside its worker
+// argv, and inspectAutoUpdate reads only local files. `loadUpdater` is injectable
+// for tests. → {known, plan, decision, overdue}; never throws.
+async function autoUpdateFooterInputs({ file = NPM_CURRENCY, brainDir = path.dirname(NPM_CURRENCY), env = process.env, now = Date.now(), loadUpdater = () => import('./mcp-auto-update.mjs') } = {}) {
+    let known = null;
+    try {
+        known = knownNpmLatest({ file, brainDir });
+        const updater = await loadUpdater();
+        if (typeof updater?.inspectAutoUpdate !== 'function') return { known, plan: null, decision: null, overdue: null };
+        const plan = updater.inspectAutoUpdate(brainDir, { env, now });
+        if (!plan || typeof plan !== 'object') return { known, plan: null, decision: null, overdue: null };
+        let decision = null;
+        // A --force downgrade the updater has not evaluated yet ('manual-downgrade')
+        // gets its hold at the NEXT check (A4), so the decision cannot be known
+        // here: no decision → the neutral notice, never an install promise.
+        if (typeof updater.autoUpdateDecision === 'function' && plan.staleReason !== 'manual-downgrade') {
+            // The helper this hook spawns falls back to the baked version
+            // (KLYPIX_MCP_AUTO_UPDATE_CURRENT) when no receipt names one; decide
+            // with the same view so a new major is never mistaken for an install.
+            const id = plan.installedIdentity;
+            const installed = id && typeof id === 'object' && !id.unknown && !id.version
+                ? { ...id, version: bakedBrainVersion(brainDir) }
+                : id;
+            decision = updater.autoUpdateDecision({ installed, latestVersion: known ? known.latest : null, hold: plan.hold });
+        }
+        // K2 (2026-10-03): overdue is the updater's own rule — the one the doctor
+        // applies — judged from the live supervisors' receipts. An updater without
+        // it (an older module) judges nothing, so the notice never says overdue.
+        let overdue = null;
+        if (typeof updater.autoUpdateOverdue === 'function') {
+            try { overdue = updater.autoUpdateOverdue({ plan, supervisors: liveSupervisorReceipts(brainDir, now), now }) || null; }
+            catch { overdue = null; }
+        }
+        return { known, plan, decision: typeof decision === 'string' ? decision : null, overdue };
+    } catch { return { known, plan: null, decision: null, overdue: null }; }
 }
 
 // Read the BAKED brain-core version from the deployed klypix-mcp-server.mjs — the
@@ -5261,30 +5379,139 @@ function bakedBrainVersion(brainDir = path.dirname(NPM_CURRENCY)) {
     } catch { return null; }
 }
 
-// SessionStart footer — ambient version drift. Reads ONLY the local cache (zero
+// "45m", "3h 20m", "2d 4h" — one-line notice spans.
+function spanLabel(ms) {
+    const m = Math.max(0, Math.round(ms / 60_000));
+    if (m < 1) return '<1m';
+    if (m < 60) return `${m}m`;
+    const h = Math.floor(m / 60), rm = m % 60;
+    if (h < 48) return rm ? `${h}h ${rm}m` : `${h}h`;
+    const d = Math.floor(h / 24), rh = h % 24;
+    return rh ? `${d}d ${rh}h` : `${d}d`;
+}
+// "≈ 2026-10-03 14:05 UTC, in 3h 20m", or "due now" once that moment has passed.
+function etaLabel(atMs, now) {
+    if (atMs <= now) return 'due now';
+    return `≈ ${new Date(atMs).toISOString().slice(0, 16).replace('T', ' ')} UTC, in ${spanLabel(atMs - now)}`;
+}
+
+// The receipts of the KLYPIX MCP supervisors running on this machine — the
+// sessions that poll the shared update schedule — for the updater's overdue rule
+// (autoUpdateOverdue), which decides from them which sessions could have run a
+// check. A receipt counts only while its pid answers a signal (EPERM is another
+// user's process, never ours) and its host is not provably gone (the doctor's
+// dead-receipt rule: a dead recorded parent and an updatedAt > 120 s old mark a
+// reused-pid phantom).
+function liveSupervisorReceipts(brainDir, now = Date.now()) {
+    let names = [];
+    try { names = fs.readdirSync(path.join(brainDir, '.supervisors')).filter((name) => /^\d+\.json$/.test(name)); } catch { return []; }
+    const live = [];
+    for (const name of names) {
+        try {
+            const state = JSON.parse(fs.readFileSync(path.join(brainDir, '.supervisors', name), 'utf8'));
+            const pid = Number(state?.pid);
+            if (!Number.isInteger(pid) || pid <= 0) continue;
+            try { process.kill(pid, 0); } catch { continue; }
+            if (isProcessAlive(state.parentPid) === false && !(now - Date.parse(state.updatedAt) <= 120_000)) continue;
+            live.push(state);
+        } catch { /* a receipt mid-rewrite: skip it */ }
+    }
+    return live;
+}
+
+// The doctor that judges THIS install (F2, 2026-10-03 review). A bare
+// `npx klypix-mcp doctor` runs whatever copy npx resolves: inside a project that
+// pins klypix-mcp (1.67.0 in the KLYPIX app checkout) that is an old doctor with
+// no schedule or decision to show; elsewhere it is npm's latest, judging by
+// rules the installed updater may not run. brain_doctor runs the installed one.
+function installedDoctorHint(baked) {
+    return `\`brain_doctor\` (or \`npx -y klypix-mcp@${baked} doctor\`)`;
+}
+
+// The remedy half of the version notice: what the installed updater will actually
+// do with `latest`, from its own plan, decision and overdue verdict → {mark, text}.
+// Each branch states only what the updater's state supports; without a plan it
+// promises nothing. `spawned`: this SessionStart has just launched the update check.
+function updateRemedy({ plan, decision, overdue = null, latest, baked, now, spawned = false }) {
+    const neutral = { mark: '⬆️', text: `${installedDoctorHint(baked)} shows whether it installs automatically.` };
+    if (!plan || typeof plan !== 'object' || plan.scheduleError) return neutral;
+    // Every SessionStart puts this text in an AGENT's context, and agents on shared
+    // machines have run installers on their own before (a dev-owned install flipped
+    // to npm, a live install overwritten mid-session). So these two branches name the
+    // decision and who owns it, never an installer command; the doctor, which a
+    // person runs, carries the exact remedy.
+    if (decision === 'dev-owned') {
+        return { mark: '⚠️', text: `Automatic updates are paused: developer-owned install — it follows its checkout, not npm releases. Returning it to npm releases is the owner's decision (tell the user; do not run an installer yourself) — ${installedDoctorHint(baked)} shows how.` };
+    }
+    if (decision === 'major-blocked') {
+        return { mark: '⚠️', text: `Automatic updates will NOT install it: \`v${latest}\` is a new major version, which needs a manual install — the owner's decision (tell the user; do not run an installer yourself) — ${installedDoctorHint(baked)} shows how.` };
+    }
+    if (decision === 'held') {
+        const from = plan.hold && plan.hold.version;
+        const to = (plan.installedIdentity && plan.installedIdentity.version) || baked;
+        if (!from) return neutral;
+        return { mark: '⚠️', text: `Automatic updates will NOT install it: held after a manual downgrade to \`v${to}\` — only a release newer than \`v${from}\` installs automatically.` };
+    }
+    // unknown (unreadable receipts) / current / ahead (receipts already past the baked code)
+    if (decision !== 'install') return neutral;
+    const dueAt = Date.parse(plan.dueAt);
+    if (!Number.isFinite(dueAt)) return neutral;
+    const promise = (when) => ({ mark: '⬆️', text: `KLYPIX will install it automatically in the background at the next update check (${when}); no action required.` });
+    // A live helper holds the lock: the check is happening as this session starts.
+    if (plan.inProgress) return promise('running now');
+    // K2: the updater's own overdue rule (autoUpdateOverdue), the doctor's too.
+    if (overdue && overdue.overdue === true) {
+        // F3 (2026-10-03 review): say only what is known — how long it has been
+        // due, and (K3) that a running session looked at the schedule after it
+        // fell due while the check still did not run — and that this session has
+        // just started it, when it has: the notice used to print right after that spawn.
+        const dueFor = Number.isFinite(overdue.dueForMs) ? `due for ${spanLabel(overdue.dueForMs)}` : 'no check recorded on this machine';
+        const polledAt = Date.parse(overdue.evidence && overdue.evidence.lastPollAt);
+        const ago = Number.isFinite(polledAt) && polledAt <= now ? ` ${spanLabel(now - polledAt)} ago` : '';
+        const late = `${dueFor}; a running KLYPIX session looked at the schedule${ago} and the check still did not run`;
+        if (spawned) {
+            return { mark: '⚠️', text: `The automatic update check was overdue (${late}) and was started just now; if this notice repeats, run ${installedDoctorHint(baked)}.` };
+        }
+        return { mark: '⚠️', text: `Automatic check overdue (${late}) — run ${installedDoctorHint(baked)}.` };
+    }
+    // A failed result written by a pre-2026-10-03 updater has no count in its
+    // stamp; it is still one failed attempt, never a clean slate.
+    const failures = Math.max(
+        Number.isInteger(plan.failures) && plan.failures > 0 ? plan.failures : 0,
+        plan.result === 'failed' ? (Number.isInteger(plan.attempt) && plan.attempt > 0 ? plan.attempt : 1) : 0,
+    );
+    if (failures) {
+        // A pre-stamped attempt that died (sleep, shutdown, AV) leaves the count
+        // but no failed result: say so instead of quoting an older outcome.
+        const why = plan.result === 'failed' && plan.error
+            ? String(plan.error).replace(/[`\r\n]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120)
+            : 'it stopped before recording a result';
+        return { mark: '⚠️', text: `KLYPIX will retry automatically — last automatic attempt failed (${why}, attempt ${failures}); next retry ${etaLabel(dueAt, now)}.` };
+    }
+    return promise(etaLabel(dueAt, now));
+}
+
+// SessionStart footer — ambient version drift. Reads ONLY local files (zero
 // network, no fetcher) + the baked version, and emits ONE advisory line when the
 // installed brain is behind npm `latest`. SILENT when current/ahead, when the cache
 // is missing or unknown ("(offline)" sentinel), or when there's no baked version to
 // compare against — no nag, no noise.
-function versionCurrencyFooter({ file = NPM_CURRENCY, brainDir = path.dirname(NPM_CURRENCY), env = process.env } = {}) {
+//
+// The remedy states what the UPDATER will do, from `plan` (its inspectAutoUpdate),
+// `decision` (its autoUpdateDecision for this `latest`) and `overdue` (its
+// autoUpdateOverdue verdict), all loaded by autoUpdateFooterInputs (2026-10-03).
+// It used to promise "KLYPIX will install it
+// automatically in the background; no action required" unconditionally: 25+
+// SessionStarts (2026-09-29 → 10-01) promised 1.86.3 and 1.87.0 while the updater
+// refused them as dev-owned, and the 1.89.0 promise ran ~7 h ahead of the first
+// check that could act. No plan (an older or unreadable updater) → a neutral
+// pointer to the doctor, never a promise. `known` is the {latest, at} figure the
+// decision was made for; when omitted it is read here.
+function versionCurrencyFooter({ file = NPM_CURRENCY, brainDir = path.dirname(NPM_CURRENCY), env = process.env, now = Date.now(), known, plan = null, decision = null, overdue = null, spawned = false } = {}) {
     try {
-        // TWO independent channels already fetch npm `latest` onto this machine and
-        // neither knew about the other: this cache (refreshed by the Claude Code Stop
-        // hook) and the MCP auto-updater's .autoupdate-status.json. On a machine driven
-        // mostly through another host the Stop hook rarely runs, so THIS cache can sit
-        // months behind while the updater's is current — the field report's "latest"
-        // was ~29 minor versions stale. Take the FRESHER of the two.
-        let cache; try { cache = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { cache = null; }
-        try {
-            const au = JSON.parse(fs.readFileSync(path.join(brainDir, '.autoupdate-status.json'), 'utf8'));
-            const auAt = Date.parse(au?.checkedAt);
-            if (/^\d+\.\d+\.\d+/.test(String(au?.latestVersion || '')) && Number.isFinite(auAt)
-                && (!cache || !Number.isFinite(cache.checkedAt) || auAt > cache.checkedAt)) {
-                cache = { pkg: 'klypix-mcp', latest: String(au.latestVersion), checkedAt: auAt };
-            }
-        } catch { /* no auto-update stamp → the Stop-hook cache stands alone */ }
-        if (!cache) return '';
-        const latest = cache && cache.latest;
+        const figure = known === undefined ? knownNpmLatest({ file, brainDir }) : known;
+        if (!figure) return '';
+        const latest = figure.latest;
         // Require a well-formed semver before comparing — rejects missing, the
         // "(offline)" sentinel, and any hand-corrupted cache value (e.g. `123`,
         // `v1.14.0`) that could otherwise false-nag or false-silence. Silent.
@@ -5299,7 +5526,8 @@ function versionCurrencyFooter({ file = NPM_CURRENCY, brainDir = path.dirname(NP
         // and nothing in the wording said so. Age is always shown; a cache older than
         // the refresh TTL also says the refresh itself has stopped running, which is
         // the real defect to chase (the number being wrong is only its symptom).
-        const ageMs = Number.isFinite(cache.checkedAt) ? Math.max(0, Date.now() - cache.checkedAt) : null;
+        // The age is that of the last SUCCESSFUL fetch (latestAt), not the last try.
+        const ageMs = Number.isFinite(figure.at) ? Math.max(0, now - figure.at) : null;
         const ageLabel = ageMs === null ? 'age unknown'
             : ageMs < 90 * 60_000 ? 'checked just now'
                 : ageMs < 36 * 3_600_000 ? `checked ${Math.round(ageMs / 3_600_000)}h ago`
@@ -5308,10 +5536,12 @@ function versionCurrencyFooter({ file = NPM_CURRENCY, brainDir = path.dirname(NP
         const caveat = staleCache
             ? ` The registry check is overdue (${ageLabel}), so \`v${latest}\` is a FLOOR — the real gap may be larger. Confirm with \`npm view klypix-mcp version\`.`
             : ` (npm ${ageLabel}.)`;
+        const head = `**Brain update available** — installed brain core \`v${baked}\` < npm latest \`v${latest}\`.${caveat}`;
         if (!autoUpdateEnabled(env)) {
-            return `\n\n---\n⚠️ **Brain update available** — installed brain core \`v${baked}\` < npm latest \`v${latest}\`.${caveat} Automatic updates are off; run \`npx klypix-mcp install\`.\n`;
+            return `\n\n---\n⚠️ ${head} Automatic updates are off; run \`npx klypix-mcp install\`.\n`;
         }
-        return `\n\n---\n⬆️ **Brain update available** — installed brain core \`v${baked}\` < npm latest \`v${latest}\`.${caveat} KLYPIX will install it automatically in the background; no action required.\n`;
+        const { mark, text } = updateRemedy({ plan, decision, overdue, latest, baked, now, spawned });
+        return `\n\n---\n${mark} ${head} ${text}\n`;
     } catch { return ''; }
 }
 
@@ -5419,16 +5649,23 @@ function legendFooter() {
 }
 
 // ── Self-update on SessionStart (auto-propagation, part B — the lever) ────────
-// The one trigger that fires for EVERY user EVERY session. Turn the passive advisory
+// One of the updater's three triggers, next to the MCP supervisor and worker polls
+// — and NOT, as this comment used to claim, "the one trigger that fires for EVERY
+// user EVERY session": main() returns before reaching it unless ./brain.klypix
+// exists, so it runs only at SessionStart in a brain-project root, and Codex-only
+// machines never reach it (2026-10-03 review). Turn the passive advisory
 // ("an update is available", which is not itself delivery) into an ACTION: if a newer
 // version is on npm, spawn a DETACHED, fail-open updater so the NEXT session runs it —
 // "publish ⇒ everywhere, automatically." Non-negotiables, all enforced here:
 //   • fail-open — any error/offline/missing-npx degrades silently to the current version;
-//   • throttled — a global once/24h stamp (not per-project, not per-session);
+//   • throttled — the shared helper is spawned only when its own schedule says a
+//     check is due (inspectAutoUpdate().due: the 6 h cadence, a re-check after an
+//     install changes the runtime, failure backoff, no live lock owner); the legacy
+//     path below keeps its global once/24h stamp (not per-project, not per-session);
 //   • dev-safe — a dev deploy (dev:true) owns its brain and is NEVER auto-updated;
 //   • zero session-path cost — spawn detached+unref, never awaited;
 //   • honest — install respects never-downgrade + dev gates, so a mis-fire can't harm.
-// It reads the npm-latest CACHE the Stop hook already maintains (zero network here).
+// The legacy path reads the npm-latest CACHE the Stop hook maintains (zero network here).
 const AUTOUPDATE_STAMP = path.join(os.homedir(), '.claude', 'project-brain', '.autoupdate-check.json');
 const AUTOUPDATE_TTL = 24 * 60 * 60 * 1000;
 function autoUpdateEnabled(env = process.env) {
@@ -5465,15 +5702,24 @@ export function shouldSelfUpdate({ enabled, now, lastCheck, ttl = AUTOUPDATE_TTL
     if (cmpSemver(latest, installed) <= 0) return { act: false, reason: 'current' };          // current or ahead
     return { act: true, reason: 'update', latest };
 }
-function maybeSelfUpdate() {
+function maybeSelfUpdate(plan = null) {
     try {
         // New installations share the exact same host-neutral updater used by
         // Codex/Cursor/Cline/generic MCP supervisors. Starting it here preserves
         // Claude's bootstrap path even when no MCP connection is open, while the
-        // helper's machine lock + 24h stamp prevent duplicate work.
+        // helper's machine lock + shared schedule prevent duplicate work.
         const brainDir = path.join(os.homedir(), '.claude', 'project-brain');
         const helper = path.join(brainDir, 'mcp-auto-update.mjs');
         if (fs.existsSync(helper)) {
+            // Ask the shared schedule BEFORE spawning (2026-10-03). This used to
+            // start a node process at EVERY SessionStart and let the helper
+            // throttle itself — almost always to read a stamp and exit, or to
+            // answer 'busy' behind a live check. `plan` is the installed updater's
+            // own inspectAutoUpdate() (autoUpdateFooterInputs); it is not due while
+            // disabled, throttled, backing off, or another helper holds the lock.
+            // When the plan could not be loaded (an older or unreadable module),
+            // keep the old spawn: the helper's own lock and schedule still decide.
+            if (plan && typeof plan === 'object' && plan.due === false) return false;
             spawnDetached(process.execPath, [helper, '--klypix-auto-update-worker'], {
                 cwd: os.tmpdir(),
                 env: {
@@ -5484,7 +5730,8 @@ function maybeSelfUpdate() {
                 },
                 shell: false,
             });
-            return;
+            // The version notice says so (F3): "overdue" printed next to this spawn.
+            return true;
         }
 
         // Pre-host-neutral installations retain their original cache-driven
@@ -5500,14 +5747,21 @@ function maybeSelfUpdate() {
         // Apply: detached, fail-open. cwd=CWD so install also migrates THIS project's
         // .mcp.json off npx. install self-enforces never-downgrade + dev gates.
         if (d.act) spawnDetached('npx', ['-y', `klypix-mcp@${d.latest}`, 'install']);
+        return d.act === true;
     } catch { /* self-update is best-effort — never break a session */ }
+    return false;
 }
 
 async function read(lib) {
     const input = readHookInput();
-    // Auto-propagation lever: fire-and-forget a self-update check (detached, throttled,
-    // fail-open) so a newer published brain installs itself for the next session.
-    maybeSelfUpdate();
+    // The installed updater's schedule + decision, loaded ONCE (guarded dynamic
+    // import, local files only) and shared by the self-update spawn and the
+    // version notice, so both follow the same plan.
+    const update = await autoUpdateFooterInputs().catch(() => ({ plan: null, decision: null }));
+    // Auto-propagation lever: fire-and-forget a self-update check (detached, only
+    // when the shared schedule says one is due, fail-open) so a newer published
+    // brain installs itself for the next session.
+    update.spawned = maybeSelfUpdate(update.plan);
     // Register presence at session start so a peer already running sees this session
     // immediately. Files/ships come from live observation + Stop.
     const laneTouch = touchSession(input.session_id, { branch: gitBranch(), hostStatus: 'idle' });
@@ -5567,10 +5821,12 @@ async function read(lib) {
     // by this session and printed on its first prompt — never here, past the
     // preview (1.86.1; see adoptCaptureReceipts).
     adoptCaptureReceipts(input.session_id);
+    // ONE version notice for both tiers, built from the plan loaded above.
+    const versionLine = versionCurrencyFooter(update);
     const full = ((typeof lib.structToBrief === 'function') ? lib.structToBrief(struct, { freshness, summary }) : lib.structToMarkdown(struct))
         + inflightFooter(input.session_id, struct) + selfHealFooter(drifted) + reconcileFooter(lib, struct) + staleOpenFooter(stale)
         + ruleDraftsFooter(input.session_id, struct, { markShown: false })
-        + receiptLine + selfCheckFooter() + doctorFooter() + versionCurrencyFooter() + legendFooter() + memoryFooter();
+        + receiptLine + selfCheckFooter() + doctorFooter() + versionLine + legendFooter() + memoryFooter();
     const emitFull = () => {
         process.stdout.write(full + presenceLine + shipObsLine + gitHookNotice + laneWarning + messageFooter(input.session_id || '', input.transcript_path, lib));
         appendJsonl(HEALTH, { ts: nowIso(), project: path.basename(CWD), mode: 'read', ok: true, briefBytes: Buffer.byteLength(full), cards: struct?.counts?.cards ?? null }, 500);
@@ -5617,11 +5873,17 @@ async function read(lib) {
     // 📨 messages are at-least-once: offered, acknowledged on a later action,
     // then replayed until explicit token-bound consumption. They go right after
     // the ultra brief, never after footers that could push them past a preview cut.
+    // The one-line version notice follows them (2026-10-03), ahead of the
+    // presence / self-heal / draft / receipt footers whose length varies: it was
+    // the LAST item of an ultra output already ~2.2 KB on the founder's brain
+    // while the harness previews ~2 KB (whether that tail was ever cut from view
+    // is unverified — the reorder only stops it depending on footer lengths).
+    // The full brief keeps its order.
     const messages = messageFooter(input.session_id || '', input.transcript_path, lib);
-    const out = ultra + messages + presenceLine + shipObsLine + gitHookNotice + laneWarning + healLine + draftLine
+    const out = ultra + messages + versionLine + presenceLine + shipObsLine + gitHookNotice + laneWarning + healLine + draftLine
         + receiptLine
         + inflightFooter(input.session_id, struct)
-        + selfCheckFooter() + doctorFooter() + versionCurrencyFooter();
+        + selfCheckFooter() + doctorFooter();
     process.stdout.write(out);
     // Heartbeat: prove the brief actually injected (and how big) so a dead or
     // stale live-copy of the hook stops being a silent no-op.
@@ -5720,5 +5982,5 @@ if (!process.env.KLYPIX_BRAIN_NO_MAIN) {
 
 // Exported for hermetic unit tests only (gated by KLYPIX_BRAIN_NO_MAIN above so the
 // import doesn't run main()/exit the test). Not part of the runtime hook contract.
-export { refreshNpmCurrency, versionCurrencyFooter, bakedBrainVersion, httpsFetchLatest, cmpSemver, decayStampForMessage, messageActionId, messageFooter, postMessages, touchSession, writeHostmapAtomic, renameRetry, commitPresenceIdentityFiles, MSG_OUTBOX_FILE, HOSTMAP_FILE, SESSIONS_FILE, splitMarkerSuffixes, parseMarkerSuffixText, evidenceGitPath, gitBlobOid, computeFreshness, selfHealFooter };
+export { refreshNpmCurrency, versionCurrencyFooter, autoUpdateFooterInputs, knownNpmLatest, bakedBrainVersion, httpsFetchLatest, cmpSemver, decayStampForMessage, messageActionId, messageFooter, postMessages, touchSession, writeHostmapAtomic, renameRetry, commitPresenceIdentityFiles, MSG_OUTBOX_FILE, HOSTMAP_FILE, SESSIONS_FILE, splitMarkerSuffixes, parseMarkerSuffixText, evidenceGitPath, gitBlobOid, computeFreshness, selfHealFooter };
 // (shouldSelfUpdate is exported at its declaration above — the auto-propagation decision seam for tests)

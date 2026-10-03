@@ -32,14 +32,18 @@ import {
 } from '../src/klypix-core.mjs';
 import { compareProjectGraphResults, projectGraphContextMarkdown, queryProjectGraph, suggestProjectGraphBrainLinks, scanNativeProjectMap, checkBrainDrift, brainDriftMarkdown } from '../src/project-graph.mjs';
 import { auditProject, compactAgentsBrief, linkProject, mcpServerEntry } from '../src/agent-rules.mjs';
-import { createMcpPresence, KLYPIX_MCP_INSTRUCTIONS } from '../src/mcp-presence.mjs';
-import { consumeMessageReceipt, findProjectBrain } from '../src/agent-presence.mjs';
+import { createMcpPresence, KLYPIX_MCP_INSTRUCTIONS, normalizeMcpClient } from '../src/mcp-presence.mjs';
+import { consumeMessageReceipt, findProjectBrain, listActiveSessions } from '../src/agent-presence.mjs';
 import { collectRepoState, commitsInRange, makeContainmentProbe } from '../src/repo-state.mjs';
 import {
   reconcileRegisteredProjects,
   registerProjectBrain,
   spawnAutoUpdateHelper,
 } from '../src/mcp-auto-update.mjs';
+// Namespace import for constants added after 1.89.0 (AUTO_UPDATE_POLL_MS): a
+// worker that meets an older mcp-auto-update.mjs mid-install must degrade to a
+// fallback, not fail to link over a missing named export.
+import * as autoUpdateModule from '../src/mcp-auto-update.mjs';
 // Namespace import (already in-process via the klypix-core chain, so zero added
 // load cost) so a bundle whose klypix-format predates classifyDecay degrades
 // gracefully — a named import of a missing export would kill the whole server.
@@ -1130,7 +1134,7 @@ server.registerTool('brain_sync', {
 
 server.registerTool('brain_doctor', {
   title: 'Brain doctor — is this brain current, wired, and in sync?',
-  description: 'Read-only self-check of the installed klypix brain, as ONE verdict: VERSION (deployed brain-core + optional npm currency), CLAUDE (existing 5-hook capture readiness), CODEX (automatic MCP presence plus optional enhanced-hook status), TOOLS (discoverable MCP verbs), SESSIONS (all active presence-adapter sessions across hosts, never recent-chat history), and HARNESS (projection drift). Use to answer "is my brain current, correctly installed, in sync, and who is actually live?" without file-spelunking. Never writes: the only side effects are read-only subprocess queries (git rev-parse / tag --list / log / merge-base with fixed argument arrays, and `npm view` only when check_npm is true) — it creates, edits, and deletes nothing. SCOPE: only CLAUDE and CODEX get behavioural verdicts. HARNESS classifies the projected config/rules FILES on disk — a project can read fully ok while no other host has ever actually loaded them, so do not report a clean HARNESS as "Cursor/Cline/Windsurf/Copilot is working". The MCP-callable twin of `npx klypix-mcp doctor`.',
+  description: 'Read-only self-check of the installed klypix brain, as ONE verdict: VERSION (deployed brain-core + optional npm currency), CLAUDE (existing 5-hook capture readiness), CODEX (automatic MCP presence plus optional enhanced-hook status), TOOLS (discoverable MCP verbs), SESSIONS (all active presence-adapter sessions across hosts, never recent-chat history), and HARNESS (projection drift). Use to answer "is my brain current, correctly installed, in sync, and who is actually live?" without file-spelunking. Never writes: the only side effects are read-only subprocess queries (git rev-parse / tag --list / log / merge-base with fixed argument arrays, and `npm view` only when check_npm is true) — it creates, edits, and deletes nothing. SCOPE: only CLAUDE and CODEX get behavioural verdicts. HARNESS classifies the projected config/rules FILES on disk — a project can read fully ok while no other host has ever actually loaded them, so do not report a clean HARNESS as "Cursor/Cline/Windsurf/Copilot is working". The MCP-callable twin of `npx klypix-mcp doctor`. Besides the text, the result carries structuredContent {verdict, layers, version, autoUpdate, supervisors, readinessWarnings, actions}: the same verdict as data, including when the next automatic update check runs and what it will do.',
   inputSchema: {
     project: z.string().optional().describe('Project dir to audit harness + peers for. Defaults to the server\'s working directory.'),
     check_npm: z.boolean().optional().describe('Also fetch npm latest to flag a stale brain (default false — this one does a network `npm view`).'),
@@ -1139,7 +1143,7 @@ server.registerTool('brain_doctor', {
   try {
     // Lazy import so a flat runtime missing brain-doctor.mjs can't crash server STARTUP —
     // the tool degrades gracefully (errors only when called) instead of taking the server down.
-    const { inspect, render } = await import('../src/brain-doctor.mjs');
+    const { inspect, render, structuredReport } = await import('../src/brain-doctor.mjs');
     let npmLatest = null;
     if (check_npm) {
       try { const { execSync } = await import('child_process'); npmLatest = execSync('npm view klypix-mcp version', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 8000 }).trim(); }
@@ -1153,7 +1157,17 @@ server.registerTool('brain_doctor', {
       npmLatest,
       self: { pid: process.pid, version: PKG_VERSION, id: mcpPresence.id },
     });
-    return { content: [{ type: 'text', text: render(report, { color: false }) }] };
+    // E1 (2026-10-03): the same verdict as data next to the unchanged text — the
+    // layers, the auto-update schedule and each connection's state, without
+    // parsing rendered lines. A brain-doctor.mjs that predates the projection
+    // (an install that stopped half-way) leaves it out; the text still answers.
+    let structuredContent = null;
+    try { if (typeof structuredReport === 'function') structuredContent = structuredReport(report); }
+    catch { structuredContent = null; }
+    return {
+      content: [{ type: 'text', text: render(report, { color: false }) }],
+      ...(structuredContent ? { structuredContent } : {}),
+    };
   } catch (e) {
     return { content: [{ type: 'text', text: `brain_doctor unavailable: ${e?.message || e}` }], isError: true };
   }
@@ -1269,6 +1283,44 @@ if (!canvasViewAsApp) {
   }, canvasViewHandler);
 }
 
+// ── Supervisor hibernation probe (2026-10-03) ────────────────────────────────
+// Before it retires an idle worker, the supervisor asks which lane row this
+// connection owns, so it can keep that row fresh while the worker sleeps. It
+// used to ask with an internal brain_sync checkpoint, which the lane records as
+// McpTaskCheckpoint — WORK — so every hibernation made an idle connection look
+// busy (6 idle Codex connections on the founder's PC read as active sessions
+// with no declared scope). This internal request is not a tool: hosts never see
+// it, and it reads the binding and the lane row without writing anything.
+// Supervisors from before it never send it; a worker from before it answers
+// "Method not found", and the supervisor falls back to the checkpoint.
+const SUPERVISOR_IDENTITY_METHOD = 'klypix/presenceIdentity';
+server.server.setRequestHandler(z.object({
+  method: z.literal(SUPERVISOR_IDENTITY_METHOD),
+  params: z.unknown().optional(),
+}), () => {
+  const brainPath = mcpPresence.brainPath;
+  if (!brainPath) return { schemaVersion: 1, reason: 'no-project-brain', brain: null, self: null };
+  const id = String(mcpPresence.id || '');
+  let row = null;
+  try { row = listActiveSessions({ brainPath }).find((session) => session.id === id) || null; }
+  catch { /* unreadable lane: the binding alone still names the row */ }
+  // No row (pruned, or a lane write that never landed): describe the client the
+  // way the worker's own heartbeat would, so the supervisor's upsert recreates
+  // an accurate row instead of an 'unknown' one.
+  let clientName = '';
+  try { clientName = String(server.server.getClientVersion?.()?.name || ''); } catch { /* optional */ }
+  return {
+    schemaVersion: 1,
+    brain: brainPath,
+    self: id ? {
+      id,
+      client: row?.client || normalizeMcpClient(clientName),
+      surface: row?.surface ?? (clientName.replace(/\s+/g, ' ').trim() || 'mcp'),
+      branch: row?.branch ?? null,
+    } : null,
+  };
+});
+
 const transport = new StdioServerTransport();
 let runningHeartbeat = null;
 let autoUpdateStarter = null;
@@ -1318,7 +1370,7 @@ server.server.oninitialized = () => {
   });
   autoUpdateStarter = setTimeout(checkForCoreUpdate, 2000);
   autoUpdateStarter.unref?.();
-  autoUpdatePoller = setInterval(checkForCoreUpdate, 60 * 60 * 1000);
+  autoUpdatePoller = setInterval(checkForCoreUpdate, Math.max(60_000, Number(autoUpdateModule.AUTO_UPDATE_POLL_MS) || 60 * 60 * 1000));
   autoUpdatePoller.unref?.();
   log(`ready · vault=${VAULT} · presence=mcp`);
 };

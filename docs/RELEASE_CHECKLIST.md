@@ -296,7 +296,9 @@ npm view klypix-mcp@<version> --json | grep -A3 attestations
 
 1. `npm view klypix-mcp version` shows the new version.
 2. Install it clean somewhere neutral and run `klypix-mcp --help`.
-3. `npx klypix-mcp doctor` in a linked project — it should report aligned.
+3. `npx -y klypix-mcp@<version> doctor` in a linked project — it should report aligned. PARTIAL
+   (exit 0) is also clean: it means readiness warnings only — read them (sessions without a
+   declared scope, a retired leftover module). DRIFTED (exit 1) is not.
 4. Machines pick the new build up through the auto-propagation path; a fresh
    `npx klypix-mcp install` forces it.
 5. **Re-sync the DESKTOP bundle and prove it boots.** The KLYPIX repo carries its own
@@ -327,10 +329,10 @@ only when the immutable tarball integrity exactly matches the gate-cleared check
 
 State these plainly rather than assuming them away:
 
-- **It does not run on pull requests.** There is no PR-time CI for this repo, so a
-  contributor's first signal is the release gate. Adding a separate `ci.yml` that runs
-  `npm ci && npm test` on `push`/`pull_request` is the obvious next step; it was left out
-  here to keep the publish path's behaviour a single, reviewable change.
+- **Publication does not run on pull requests.** The separate `ci.yml` runs
+  `npm ci` and the full test chain on pull requests and pushes to `master`, with
+  read-only permissions. It does not publish packages or replace the tagged
+  release evidence and publication gates.
 - **It does not test on Windows.** The gate runs on `ubuntu-latest` only, while a large
   share of users — and the known `EPERM`/rename flakes — are on Windows. A matrix run is
   a follow-up.

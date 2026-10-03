@@ -15,6 +15,16 @@
 //
 // A broken or incompatible candidate never replaces the live worker. The old
 // worker remains warm for a short rollback grace after a successful switch.
+//
+// Idle hibernation follows the same contract (2026-10-03). A hibernated pair
+// stays asleep until its host sends a request: an install that lands meanwhile
+// is only noted (hibernation.pendingWakeTarget, never a downgrade). The wake
+// re-reads the manifest and gates the new worker against the last committed one
+// exactly like a live swap. A wake the gate rejects resumes the .prev copy of
+// the version the pair last ran, or answers with a retryable reconnect error —
+// never a respawn loop. Before this, the 1 s poller woke every idle pair about
+// a second after it hibernated (14 of 15 pairs on the founder's PC cycled every
+// 55-75 s, ~800 worker spawns an hour), and those wakes skipped both gates.
 
 import fs from 'fs';
 import os from 'os';
@@ -26,13 +36,24 @@ import {
   inspectAutoUpdate,
   spawnAutoUpdateHelper,
 } from './mcp-auto-update.mjs';
+// Namespace import for constants added after 1.89.0 (AUTO_UPDATE_POLL_MS). The
+// installer renames mcp-supervisor.mjs before mcp-auto-update.mjs, so a host
+// that launches mid-install can pair this file with the older module, and a
+// named import of a missing export fails at link time — the host's whole MCP
+// connection with it.
+import * as autoUpdateModule from './mcp-auto-update.mjs';
 import { formatReceivedMessages, peekMessages, removeSession, upsertSession } from './agent-presence.mjs';
 
 const INTERNAL_PREFIX = '__klypix_supervisor__';
 const DEFAULT_POLL_MS = 1000;
 const DEFAULT_TIMEOUT_MS = 15000;
 const DEFAULT_ROLLBACK_GRACE_MS = 3000;
-const DEFAULT_AUTO_UPDATE_POLL_MS = 60 * 60 * 1000;
+// The updater's own poll cadence, so supervisors and workers ask "is a check
+// due?" equally often (60 min before 2026-10-03, which left a due check waiting
+// up to an hour once hibernated pairs stopped waking every minute).
+const DEFAULT_AUTO_UPDATE_POLL_MS = Number(autoUpdateModule.AUTO_UPDATE_POLL_MS) > 0
+  ? Number(autoUpdateModule.AUTO_UPDATE_POLL_MS)
+  : 60 * 60 * 1000;
 const DEFAULT_AUTO_UPDATE_START_DELAY_MS = 2000;
 // Worker-recovery retry policy: capped exponential backoff (1s → 2s → 4s …,
 // ceiling 60s), bounded attempts. After the last attempt the supervisor answers
@@ -42,30 +63,83 @@ const RECOVERY_BACKOFF_BASE_MS = 1000;
 const RECOVERY_BACKOFF_MAX_MS = 60_000;
 // Unbounded queue growth is its own failure mode while a recovery is running.
 const HOST_QUEUE_MAX = 200;
+// A wake that finds the manifest failing integrity is usually racing an install:
+// the installer renames ~38 files one at a time and commits the manifest last,
+// which takes seconds. The wake waits this long for it to settle, and so does a
+// fresh connection whose own worker sits inside the managed directory (K1).
+const WAKE_INTEGRITY_WAIT_MS = 5000;
+const WAKE_INTEGRITY_POLL_MS = 250;
+// A wake refused this many times, over at least this long, is not an install
+// mid-flight: the answer then names the reinstall (F6, 2026-10-03 review).
+const WAKE_DEFERRAL_REINSTALL_COUNT = 3;
+const DEFAULT_WAKE_REINSTALL_HINT_MS = 10 * 60 * 1000;
+// The poller trusts an unchanged manifest stat for this long between full
+// re-verifications of every runtime file.
+const RUNTIME_REVERIFY_MS = 5 * 60 * 1000;
+// A live supervisor closes itself within 30 s of its host dying (the parent
+// watchdog in run()). A receipt whose host is provably gone and that nobody has
+// rewritten for this long belongs to no live supervisor, even when its own pid
+// answers again: Windows reuses pids (.supervisors/3228.json named ChatGPT.exe
+// on the founder's PC, 2026-10-02, and kept the doctor's verdict DRIFTED).
+const DEAD_RECEIPT_GRACE_MS = 120_000;
+// The retryable host error once the installed core can no longer be adopted
+// without a reconnect while the pair has no worker (B4, 2026-10-03).
+const RESTART_REQUIRED_IDLE = 'KLYPIX core changed incompatibly while idle — /mcp reconnect';
+// The identity-only hibernation probe (B6, 2026-10-03). Workers that predate it
+// answer JSON-RPC "Method not found", and the supervisor falls back to the
+// brain_sync checkpoint it used before.
+const PRESENCE_IDENTITY_METHOD = 'klypix/presenceIdentity';
+const METHOD_NOT_FOUND = -32601;
+// writeState runs on the stdio relay path, so its rename retry stays within a
+// few milliseconds; a state write that still fails is redone by the next one.
+const STATE_RENAME_RETRYABLE = new Set(['EPERM', 'EBUSY', 'EACCES']);
+const STATE_RENAME_BACKOFF_MS = [2, 5, 10];
 
 const log = (...args) => console.error('[klypix-supervisor]', ...args);
 const sha256 = (value) => crypto.createHash('sha256').update(value).digest('hex');
 const idKey = (id) => JSON.stringify(id);
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-const isAlivePid = (pid) => {
-  if (!pid) return false;
-  try { process.kill(pid, 0); return true; }
-  catch { return false; }
+const sleepSync = (ms) => {
+  try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
+  catch { /* best effort */ }
+};
+const isRecord = (value) => !!value && typeof value === 'object' && !Array.isArray(value);
+// Liveness of a process another supervisor recorded. Only ESRCH proves it gone:
+// EPERM means it exists but is not ours to signal (an elevated host), and the
+// boot cleanup deletes on 'dead', so every doubt must read as alive.
+const pidState = (pid) => {
+  if (!Number.isInteger(pid) || pid <= 0) return 'none';
+  try { process.kill(pid, 0); return 'alive'; }
+  catch (error) { return error?.code === 'ESRCH' ? 'dead' : 'alive'; }
 };
 const within = (root, target) => {
   const rel = path.relative(path.resolve(root), path.resolve(target));
   return rel === '' || (!rel.startsWith(`..${path.sep}`) && rel !== '..' && !path.isAbsolute(rel));
 };
-const readJson = (file) => {
-  try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
-  catch { return null; }
-};
+// A failed rename used to leave `<pid>.json.<pid>.tmp` behind for good (four
+// such files sat in the founder's .supervisors from 2026-08-12 on). Unlink the
+// tmp on any failure, and retry the rename briefly: on Windows it throws
+// EPERM/EBUSY/EACCES while a reader (the doctor, the runtime inspector) holds
+// the receipt open.
 const atomicJson = (file, value) => {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
-  fs.renameSync(tmp, file);
+  try {
+    fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+    for (let attempt = 0; ; attempt++) {
+      try { fs.renameSync(tmp, file); return; }
+      catch (error) {
+        if (attempt >= STATE_RENAME_BACKOFF_MS.length || !STATE_RENAME_RETRYABLE.has(error?.code)) throw error;
+        sleepSync(STATE_RENAME_BACKOFF_MS[attempt]);
+      }
+    }
+  } catch (error) {
+    try { fs.unlinkSync(tmp); } catch { /* nothing staged */ }
+    throw error;
+  }
 };
+// Rejections the same bytes produce on every attempt: a retry cannot help.
+const deterministicError = (message) => Object.assign(new Error(message), { deterministic: true });
 const parseSemver = (value) => {
   const match = String(value || '').trim().match(/^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/);
   return match ? match.slice(1).map(Number) : null;
@@ -81,6 +155,27 @@ const readBakedVersion = (file) => {
     const source = fs.readFileSync(file, 'utf8');
     return source.match(/const PKG_VERSION = ['"]([^'"]+)['"]/)?.[1] || null;
   } catch { return null; }
+};
+// The version a worker FILE carries now. The flat bundle bakes it into the file;
+// the package's bin/klypix-worker.mjs reads ../package.json at run time.
+const workerFileVersion = (file) => {
+  const baked = readBakedVersion(file);
+  if (baked) return baked;
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(path.dirname(file), '..', 'package.json'), 'utf8'));
+    return pkg?.name === 'klypix-mcp' && typeof pkg.version === 'string' ? pkg.version : null;
+  } catch { return null; }
+};
+// The installer's snapshot of a worker file: `.prev/<name>` beside it. Every
+// live file is copied there before the first new one is renamed in, so it is a
+// complete copy of the previous install. Null when there is none, or when its
+// version is not baked in (only the flat bundle bakes it).
+const prevSnapshotTarget = (workerPath) => {
+  const previousPath = path.join(path.dirname(workerPath), '.prev', path.basename(workerPath));
+  if (!fs.existsSync(previousPath)) return null;
+  const version = readBakedVersion(previousPath);
+  if (!version) return null;
+  return { path: previousPath, version, signature: `previous:${previousPath}:${version}`, source: 'rollback', dev: false };
 };
 
 function createLineReader(onMessage, onError) {
@@ -178,7 +273,16 @@ function manifestHash(tools = []) {
 export function readRuntimeTarget(manifestPath, { allowExternal = false } = {}) {
   let raw;
   try { raw = fs.readFileSync(manifestPath, 'utf8'); }
-  catch { return { ok: false, absent: true, error: 'runtime manifest is absent' }; }
+  catch (error) {
+    // Only a missing file is ABSENT. EBUSY/EPERM/EACCES while an installer
+    // renames the new manifest over the old one is a read that failed, and a
+    // wake that took it for "no runtime" skipped its integrity wait and booted a
+    // stale fallback (CF-2, 2026-10-03 review).
+    if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') {
+      return { ok: false, absent: true, error: 'runtime manifest is absent' };
+    }
+    return { ok: false, error: `runtime manifest is unreadable: ${error?.code || error?.message || 'read failed'}` };
+  }
   let manifest;
   try { manifest = JSON.parse(raw); }
   catch (error) { return { ok: false, error: `runtime manifest is invalid JSON: ${error.message}` }; }
@@ -212,6 +316,109 @@ export function readRuntimeTarget(manifestPath, { allowExternal = false } = {}) 
       manifestPath: path.resolve(manifestPath),
     },
   };
+}
+
+// The poller's view of readRuntimeTarget (B8, 2026-10-03). Every supervisor
+// re-hashed every runtime file (38 files, ~2.1 MiB) each second: ~31.6 MiB/s of
+// SHA-256 across the founder's 15 supervisors, contending with the installer's
+// renames — the documented EPERM source. Installs commit the manifest by
+// rename-over, which changes its file id, size or mtime, so a stat equal to the
+// one taken before the last VERIFIED read means nothing was committed since.
+// Only a verified read is remembered (a transient EBUSY just after a commit
+// must not pin a failure), a full re-verify still runs every 5 min (a runtime
+// file edited without a new manifest is caught there), and callers force a full
+// read before any candidate starts.
+function createRuntimeWatch(manifestPath, {
+  allowExternal = false,
+  reverifyMs = RUNTIME_REVERIFY_MS,
+  now = () => Date.now(),
+} = {}) {
+  let verified = null;
+  const statKey = () => {
+    try {
+      // bigint: NTFS file ids exceed 2^53 and must compare exactly.
+      const stat = fs.statSync(manifestPath, { bigint: true });
+      return `${stat.ino}:${stat.size}:${stat.mtimeNs}`;
+    } catch { return null; }
+  };
+  return {
+    read({ force = false } = {}) {
+      const key = statKey();
+      const at = now();
+      if (!force && key !== null && verified?.key === key && at >= verified.at && at - verified.at < reverifyMs) {
+        return { ok: true, target: verified.target, cached: true };
+      }
+      const runtime = readRuntimeTarget(manifestPath, { allowExternal });
+      verified = runtime.ok && key !== null ? { key, at, target: runtime.target } : null;
+      return runtime;
+    },
+  };
+}
+
+// Is this supervisor receipt provably dead? The boot cleanup deletes on a yes,
+// so every doubt keeps the receipt.
+function deadSupervisorReceipt(state, { now = Date.now(), probe = pidState } = {}) {
+  // atomicJson never leaves a torn receipt, so unparseable JSON has no owner.
+  if (!isRecord(state)) return true;
+  if (probe(Number(state.pid)) !== 'alive') return true;
+  // Its pid answers — but Windows reuses pids. The host it served being gone,
+  // with no rewrite since, means the supervisor is gone too.
+  const parentPid = Number(state.parentPid);
+  if (!Number.isInteger(parentPid) || parentPid <= 1 || probe(parentPid) !== 'dead') return false;
+  const updatedAt = Date.parse(state.updatedAt);
+  return !Number.isFinite(updatedAt) || now - updatedAt > DEAD_RECEIPT_GRACE_MS;
+}
+
+const observeFile = (file) => {
+  try { return { raw: fs.readFileSync(file, 'utf8'), mtimeMs: fs.statSync(file).mtimeMs }; }
+  catch { return null; }
+};
+
+// Compare-and-rename, the lock-stealing idiom (mcp-auto-update.mjs): a receipt
+// its owner rewrote after we judged it is never the one removed.
+function removeIfUnchanged(file, observed) {
+  const moved = `${file}.dead-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
+  try {
+    const current = observeFile(file);
+    if (!current || current.raw !== observed.raw || current.mtimeMs !== observed.mtimeMs) return false;
+    fs.renameSync(file, moved);
+  } catch { return false; }
+  if (observeFile(moved)?.raw !== observed.raw) {
+    try { if (!fs.existsSync(file)) fs.renameSync(moved, file); else fs.unlinkSync(moved); } catch { /* best effort */ }
+    return false;
+  }
+  try { fs.unlinkSync(moved); } catch { /* best effort */ }
+  return true;
+}
+
+// Boot-time cleanup of .supervisors (B7, 2026-10-03). It used to delete only
+// receipts whose own pid was dead, and read EPERM as dead — so a non-elevated
+// supervisor deleted an elevated pair's LIVE receipt, while a dead receipt whose
+// pid had been reused stayed forever. Leftover tmp files are removed once the
+// process that wrote them is gone.
+function cleanSupervisorStateDir(stateDir, { now = Date.now(), probe = pidState } = {}) {
+  const removed = { receipts: [], tmp: [] };
+  let names = [];
+  try { names = fs.readdirSync(stateDir); } catch { return removed; }
+  for (const name of names) {
+    const file = path.join(stateDir, name);
+    // `<pid>.json.<writer>.tmp` from atomicJson, `<pid>.json.dead-<pid>-<hex>`
+    // from an interrupted removal: the writer's pid is in the name.
+    const leftover = name.match(/\.json\.(?:(\d+)\.tmp|dead-(\d+)-[0-9a-f]+)$/);
+    if (leftover) {
+      if (probe(Number(leftover[1] || leftover[2])) === 'dead') {
+        try { fs.unlinkSync(file); removed.tmp.push(name); } catch { /* raced */ }
+      }
+      continue;
+    }
+    if (!name.endsWith('.json')) continue;
+    const observed = observeFile(file);
+    if (!observed) continue;
+    let state = null;
+    try { state = JSON.parse(observed.raw); } catch { /* torn: no owner */ }
+    if (deadSupervisorReceipt(state, { now, probe }) && removeIfUnchanged(file, observed)) removed.receipts.push(name);
+  }
+  return removed;
 }
 
 class Supervisor {
@@ -310,13 +517,48 @@ class Supervisor {
     this.hostTransportState = 'starting';
     this.lastHostWriteError = null;
     this.hostBackpressuredAt = null;
+    // B9 (2026-10-03): the version of THIS supervisor's code. Workers hot-swap;
+    // a supervisor runs the code its host launched until the next reconnect, so
+    // the doctor needs this to tell which connections still run pre-fix code.
+    // The entry point passes its own (baked, in the flat bundle) version.
+    this.supervisorVersion = String(options.fallbackVersion || readBakedVersion(options.fallbackWorker) || '') || null;
+    // B2 (2026-10-03): the last committed worker, {version, manifest,
+    // manifestHash, target}. A wake or a crash recovery has no live worker to
+    // compare a candidate with; the gates compare against this instead.
+    this.baseline = null;
+    // B1 (2026-10-03): a newer install noticed while hibernated. Recorded for
+    // the doctor ("wakes into vX, not yet validated"); only the wake acts on it.
+    this.pendingWakeTarget = null;
+    this.waking = false;
+    // F6 (2026-10-03 review): wakes refused because the core files fail
+    // verification, {reason, count, since}. The receipt carries it, so the
+    // doctor stops promising that this pair "wakes on the next request".
+    this.wakeDeferral = null;
+    const hintEnv = Number(process.env.KLYPIX_MCP_WAKE_REINSTALL_HINT_MS);
+    this.wakeReinstallHintMs = Number.isFinite(hintEnv) && hintEnv >= 0 ? hintEnv : DEFAULT_WAKE_REINSTALL_HINT_MS;
+    this.runtimeWatch = createRuntimeWatch(this.runtimeManifest, { allowExternal: this.allowExternal });
+    // K3 (2026-10-03): when this supervisor last polled the update schedule.
+    // The overdue rule (autoUpdateOverdue) needs proof that a session was there
+    // to run a due check; being open since before it fell due is not that proof
+    // after a machine has slept.
+    this.lastAutoUpdatePollAt = null;
+    // The integrity error the poller last recorded, and the lastError it
+    // replaced, so a runtime that verifies again does not keep reporting it.
+    this.runtimeError = null;
+    this.errorBeforeRuntime = null;
   }
 
   writeState(extra = {}) {
+    // No receipt before the first worker is chosen. K1's boot can wait seconds
+    // for an install to settle, and a receipt with no worker and no version
+    // reads to the doctor as an impaired pair that does not match the install.
+    // The first receipt follows the spawn in run(), with any boot error in it.
+    if (this.status === 'starting') return;
     try {
       atomicJson(this.stateFile, {
         protocol: 1,
         pid: process.pid,
+        supervisorVersion: this.supervisorVersion,
         connectionId: this.connectionId,
         parentPid: this.parentPid,
         vault: this.vaultArg ? this.vaultArg.replace(/\\/g, '/') : null,
@@ -327,11 +569,18 @@ class Supervisor {
           since: this.status === 'hibernated' ? this.hibernatedAt : null,
           count: this.hibernations,
           skipReason: this.hibernateSkipReason || null,
+          // The version the pair last RAN — never an install it has not validated.
           target: this.status === 'hibernated' && this.hibernatedTarget ? {
             version: this.hibernatedTarget.version || null,
             path: this.hibernatedTarget.path?.replace(/\\/g, '/') || null,
             source: this.hibernatedTarget.source || null,
           } : null,
+          pendingWakeTarget: this.status === 'hibernated' && this.pendingWakeTarget ? {
+            version: this.pendingWakeTarget.version || null,
+            validated: false,
+          } : null,
+          // The last wake(s) found no consistent worker to boot (deferWake).
+          wakeDeferred: this.status === 'hibernated' && this.wakeDeferral ? { ...this.wakeDeferral } : null,
         },
         cwd: process.cwd().replace(/\\/g, '/'),
         bootedAt: this.bootedAt,
@@ -351,8 +600,20 @@ class Supervisor {
         lastSwapAt: this.lastSwapAt,
         lastError: this.lastError,
         autoUpdate: {
+          // currentVersion: what scheduleAutoUpdate hands the helper, so the
+          // receipt's `decision` is the helper's decision.
+          ...inspectAutoUpdate(path.dirname(this.runtimeManifest), {
+            currentVersion: this.active?.version || this.fallbackTarget?.version || null,
+          }),
+          // This supervisor's OWN setting, spread last (2026-10-03 integration
+          // review). The doctor ("enabled in N of M connections") and the
+          // SessionStart notice ("overdue") read it to know which connections
+          // run checks; the environment's `enabled` from inspectAutoUpdate used
+          // to overwrite it, so a supervisor embedded with autoUpdate:false
+          // (the klypix-mcp/supervisor API) claimed to run them.
           enabled: this.autoUpdate,
-          ...inspectAutoUpdate(path.dirname(this.runtimeManifest)),
+          // K3: this supervisor's last poll of the schedule (null: none yet).
+          lastPollAt: this.lastAutoUpdatePollAt,
         },
         runtimeManifest: this.runtimeManifest.replace(/\\/g, '/'),
         active: this.active ? {
@@ -394,11 +655,7 @@ class Supervisor {
     let identity = null;
     let probeFailed = false;
     try {
-      const probe = await this.sendInternal(this.active, 'tools/call', {
-        name: 'brain_sync',
-        arguments: { phase: 'checkpoint', include_context: false },
-      }, 4000);
-      const structured = probe?.structuredContent || null;
+      const structured = await this.probePresenceIdentity(this.active);
       if (!structured || structured.reason === 'no-project-brain') {
         identity = null;                       // no lane row exists → nothing to keep alive
       } else if (structured.brain && structured.self?.id) {
@@ -427,7 +684,9 @@ class Supervisor {
     this.hibernateSkipReason = null;
     this.presenceIdentity = identity;
     const worker = this.active;
+    this.recordBaseline(worker);
     this.hibernatedTarget = worker.target;
+    this.pendingWakeTarget = null;
     this.hibernatedAt = new Date().toISOString();
     this.hibernations++;
     this.active = null;
@@ -438,6 +697,113 @@ class Supervisor {
     this.startPresenceHeartbeat();
     this.writeState();
     log(`worker hibernated after ${Math.round((Date.now() - last) / 1000)}s idle — wakes on the next request${this.presenceIdentity ? ' (presence held by the supervisor)' : ''}`);
+  }
+
+  // B6 (2026-10-03): ask the worker which lane row it owns WITHOUT doing work.
+  // The probe used to be an internal brain_sync checkpoint, which the lane
+  // records as McpTaskCheckpoint — activity — so every hibernation stamped an
+  // idle connection "working": 6 idle Codex connections on the founder's PC read
+  // as active sessions without declared scope and held the doctor's SESSIONS
+  // layer at a warning. Workers that predate the identity request answer
+  // "Method not found"; for them (mixed versions while an install rolls out)
+  // the checkpoint still answers the same question.
+  async probePresenceIdentity(worker) {
+    if (worker.identityProbe !== 'unsupported') {
+      try {
+        const result = await this.sendInternal(worker, PRESENCE_IDENTITY_METHOD, {}, 4000);
+        worker.identityProbe = 'supported';
+        // Anything but an object is unidentifiable (maybeHibernate refuses),
+        // never "no lane row" — that would let the worker remove a row it owns.
+        return isRecord(result) ? result : {};
+      } catch (error) {
+        if (error?.code !== METHOD_NOT_FOUND) throw error;
+        worker.identityProbe = 'unsupported';
+      }
+    }
+    const probe = await this.sendInternal(worker, 'tools/call', {
+      name: 'brain_sync',
+      arguments: { phase: 'checkpoint', include_context: false },
+    }, 4000);
+    return probe?.structuredContent || null;
+  }
+
+  // The last committed worker (B2). Called on every commit, when the first
+  // worker's tool manifest is known, on a standby rollback, and at hibernation.
+  recordBaseline(worker) {
+    if (!worker) return;
+    this.baseline = {
+      version: worker.version || worker.target?.version || null,
+      manifest: worker.manifest || null,
+      manifestHash: worker.manifestHash || null,
+      target: worker.target || null,
+    };
+  }
+
+  baselineVersion() {
+    return this.baseline?.version || this.baseline?.target?.version || this.hibernatedTarget?.version || null;
+  }
+
+  // Never-downgrade, the rule live pairs follow in checkForUpdate: an install
+  // is worth noting for a sleeping pair only when it is dev or newer.
+  newerThanBaseline(target) {
+    const cmp = compareSemver(target.version, this.baselineVersion());
+    return target.dev || cmp === null || cmp > 0;
+  }
+
+  // A wake may also resume the version it slept on (an equal-version reinstall).
+  acceptsWakeTarget(target) {
+    const cmp = compareSemver(target.version, this.baselineVersion());
+    return target.dev || cmp === null || cmp >= 0;
+  }
+
+  // The installer copies every live file to .prev before it renames new ones
+  // in, so .prev is a complete, consistent copy of the PREVIOUS install. It is a
+  // safe place to resume only when that copy is the version this connection
+  // last ran — the version the host's tool list still describes. Any other
+  // version would be a swap no gate has seen; crash recovery used to boot
+  // whatever .prev held.
+  previousBaselineTarget(anchor) {
+    if (!anchor?.path || anchor.source === 'rollback') return null;
+    const previous = prevSnapshotTarget(anchor.path);
+    const baseVersion = this.baselineVersion();
+    if (!previous || !baseVersion || previous.version !== String(baseVersion)) return null;
+    return previous;
+  }
+
+  // The package's own worker as it is on disk NOW. fallbackTarget carries the
+  // version this supervisor started with, but an install (flat bundle) or an
+  // npx cache refresh (direct-package launch) can replace the file since, and a
+  // candidate booted under the old tag failed every attempt with "candidate
+  // advertised vY, manifest says vX" (CF-2, 2026-10-03 review).
+  currentFallbackTarget() {
+    const target = this.fallbackTarget;
+    const onDisk = workerFileVersion(target.path);
+    if (!onDisk || onDisk === target.version) return target;
+    return { ...target, version: onDisk, signature: `fallback:${target.path}:${onDisk}` };
+  }
+
+  // The package's own worker as a WAKE target (CF-1, 2026-10-03 review), or
+  // null. A direct-package launch (`npx -y klypix-mcp`, the README's Claude
+  // Desktop config) runs it whenever the managed runtime is older or failing;
+  // it lives outside the managed directory, no install renames files under it,
+  // so it is consistent whatever the runtime holds. In the flat bundle the
+  // package's worker IS <brainDir>/klypix-mcp-worker.mjs — the managed runtime
+  // itself — and nothing vouches for that file without a verifying manifest.
+  packageWorker() {
+    const file = this.fallbackTarget.path;
+    if (within(path.dirname(this.runtimeManifest), file) || !fs.existsSync(file)) return null;
+    return this.currentFallbackTarget();
+  }
+
+  // B1: a sleeping pair notes a newer install for the doctor and stays asleep.
+  notePendingWake(target) {
+    const next = target.signature !== this.hibernatedTarget?.signature
+      && target.signature !== this.rejectedSignature
+      && this.newerThanBaseline(target) ? target : null;
+    if ((next?.signature || null) === (this.pendingWakeTarget?.signature || null)) return;
+    this.pendingWakeTarget = next;
+    this.writeState();
+    if (next) log(`hibernated on v${this.baselineVersion()}; v${next.version} is installed and is validated on the next request`);
   }
 
   // Re-register the sleeping connection's lane row on the SAME cadence the
@@ -503,14 +869,204 @@ class Supervisor {
   }
 
   wake() {
-    if (this.closed || this.active || this.candidate) return;
-    const target = this.hibernatedTarget || this.selectInitialTarget();
+    if (this.closed || this.active || this.candidate || this.waking) return;
+    this.waking = true;
+    this.pendingWakeTarget = null;
     log('waking hibernated worker');
-    this.startCandidate(target, { recovery: true });
+    this.resolveWakeTarget()
+      // resolveWakeTarget guards every read; a throw here is a bug, and booting
+      // an unverified file is never the answer to one.
+      .catch((error) => ({ target: null, retry: true, reason: `wake target unresolved: ${error?.message || error}` }))
+      .then((plan) => {
+        this.waking = false;
+        if (this.closed || this.active || this.candidate) return;
+        if (plan.target) this.startCandidate(plan.target, { recovery: true, wake: true });
+        else if (plan.retry) this.deferWake(plan.reason);
+        else this.settleRestartRequired(plan.reason);
+      });
   }
 
-  selectInitialTarget() {
-    const runtime = readRuntimeTarget(this.runtimeManifest, { allowExternal: this.allowExternal });
+  // A full read of the manifest, repeated while it fails integrity (or cannot be
+  // read) for up to WAKE_INTEGRITY_WAIT_MS: an install renames its files one at
+  // a time and commits the manifest last. Wakes (B3) and boots (K1) wait alike.
+  async settledRuntime(runtime = this.runtimeWatch.read({ force: true })) {
+    const deadline = Date.now() + WAKE_INTEGRITY_WAIT_MS;
+    while (!runtime.ok && !runtime.absent && !this.closed && Date.now() < deadline) {
+      await sleep(WAKE_INTEGRITY_POLL_MS);
+      runtime = this.runtimeWatch.read({ force: true });
+    }
+    return runtime;
+  }
+
+  // B3 (2026-10-03): the wake re-reads the manifest instead of trusting the
+  // target the pair went to sleep on. That target may be stale (an install
+  // landed while it slept), and its path may sit in a directory an install is
+  // renaming right now — booting it then loads a mixed module graph.
+  async resolveWakeTarget() {
+    const runtime = await this.settledRuntime();
+    // What the pair last ran, and the package's own worker when it lives
+    // outside the managed directory (CF-1: a direct-package launch).
+    const anchor = this.baseline?.target || this.hibernatedTarget;
+    const own = this.packageWorker();
+    if (runtime.ok) {
+      if (this.acceptsWakeTarget(runtime.target)) return { target: runtime.target };
+      // Valid but OLDER than what this connection last ran. A pair that ran the
+      // package's own worker (the runtime was older or failing when it started)
+      // resumes that worker — what it ran, and what a fresh connection would
+      // boot (selectInitialTarget prefers it over an older runtime). Before this
+      // (CF-1, 2026-10-03 review) such a pair settled restart-required on its
+      // first wake after every publish, with a "rollback" nobody had made.
+      const ownAcceptable = own && this.acceptsWakeTarget(own) ? own : null;
+      if (ownAcceptable && anchor?.source === 'package') return { target: ownAcceptable };
+      // Otherwise a deliberate rollback. A live pair never downgrades in place,
+      // so a sleeping one does not either: it resumes its own version from
+      // .prev, and the rollback reaches it at the next reconnect.
+      const previous = this.previousBaselineTarget(runtime.target);
+      if (previous) {
+        log(`installed runtime v${runtime.target.version} is older than v${previous.version}, which this connection ran — resuming v${previous.version} from .prev; the rollback applies at the next reconnect`);
+        return { target: previous };
+      }
+      // The package's own worker at the version this pair ran, or newer: what a
+      // fresh connection boots too, so no rollback is pending for this one.
+      if (ownAcceptable) {
+        log(`installed runtime v${runtime.target.version} is older than v${this.baselineVersion()}, which this connection ran — waking the package's own worker v${ownAcceptable.version}`);
+        return { target: ownAcceptable };
+      }
+      return {
+        target: null,
+        reason: anchor?.source === 'package'
+          ? `the package worker v${this.baselineVersion()} this connection ran changed on disk while idle, and the installed runtime v${runtime.target.version} is older than it`
+          : `installed runtime v${runtime.target.version} is older than v${this.baselineVersion()}, which this connection last ran; a rollback applies at the next reconnect`,
+      };
+    }
+    if (runtime.absent) {
+      // No manifest at all: what a fresh connection boots is the package's own
+      // worker. In the flat bundle that IS the managed worker, which nothing can
+      // verify without a manifest (an uninstall in progress, or deleted by hand)
+      // — a wake never boots it (CF-2).
+      if (own) return { target: own };
+      return { target: null, retry: true, reason: 'runtime manifest is absent' };
+    }
+    // Still failing after the wait: an install that stopped half-way. Never the
+    // sleeping target's path inside the managed directory — resume .prev when it
+    // holds this connection's version...
+    // A pair that already resumed from .prev resumes that same copy — while it
+    // still holds this connection's version (a new install overwrites .prev).
+    const previous = anchor?.source === 'rollback'
+      ? (fs.existsSync(anchor.path) && readBakedVersion(anchor.path) === String(this.baselineVersion()) ? anchor : null)
+      : this.previousBaselineTarget(anchor);
+    if (previous) {
+      log(`runtime still fails integrity after ${WAKE_INTEGRITY_WAIT_MS} ms (${runtime.error}) — waking v${previous.version} from .prev`);
+      return { target: previous };
+    }
+    // ...else whatever a fresh connection would boot: the package's own worker,
+    // when it lives outside the managed directory — even when it is the very
+    // target the pair slept on (CF-1: refusing that path deferred every wake of
+    // a direct-package pair while the managed runtime failed integrity, though
+    // its worker was never part of it).
+    if (own) {
+      log(`runtime still fails integrity after ${WAKE_INTEGRITY_WAIT_MS} ms (${runtime.error}) — waking the package's own worker v${own.version}`);
+      return { target: own };
+    }
+    // In the flat bundle the package's own worker IS the failing runtime:
+    // booting it is the mixed module graph this branch exists to avoid, and a
+    // reconnect would meet the same files.
+    return { target: null, retry: true, reason: runtime.error };
+  }
+
+  // Nothing consistent is left to boot: the runtime fails integrity and the
+  // only fallback lives inside it. Stay asleep, still holding presence, and
+  // answer what is queued with a retryable error. The next request tries again;
+  // an interrupted install is re-run by the updater (15 min after a failure)
+  // or by hand, and the wake then finds a verifying manifest.
+  deferWake(reason) {
+    // Recorded like the poller's integrity errors, so a manifest that verifies
+    // again clears it even if no request comes (clearRuntimeError).
+    if (reason && this.lastError !== reason) {
+      if (this.runtimeError === null) this.errorBeforeRuntime = this.lastError;
+      this.runtimeError = reason;
+      this.lastError = reason;
+    }
+    // F6 (2026-10-03 review): not every refusal is an install mid-flight. A file
+    // AV quarantined or edited by hand fails until a reinstall (an equal-version
+    // reinstall that stopped half-way is not re-run by the updater, whose
+    // receipts still read "current"). Count the refusals; once they span 10 min
+    // the answer names the reinstall instead of "retry shortly", and the doctor
+    // flags the pair from the first one. It stays asleep either way, so a
+    // runtime that verifies again still wakes it with no reconnect.
+    const now = new Date().toISOString();
+    this.wakeDeferral = {
+      reason: this.lastError || reason || 'runtime integrity',
+      count: (this.wakeDeferral?.count || 0) + 1,
+      since: this.wakeDeferral?.since || now,
+      lastAt: now,
+    };
+    this.writeState();
+    const persistent = this.wakeDeferral.count >= WAKE_DEFERRAL_REINSTALL_COUNT
+      && Date.now() - Date.parse(this.wakeDeferral.since) >= this.wakeReinstallHintMs;
+    const detail = persistent
+      // This text reaches the AGENT as a tool error, so it names the repair's owner
+      // and the read-only diagnosis, not an installer: reinstalling a shared live
+      // install is the user's call (the doctor prints the exact command).
+      ? `KLYPIX core files still do not verify (${this.lastError || 'runtime integrity'}) after ${this.wakeDeferral.count} attempts since ${this.wakeDeferral.since} — the install on this machine needs a repair: ask the user to run npx -y klypix-mcp@latest doctor, which shows the fix (do not run an installer yourself), then retry`
+      : `KLYPIX core files do not verify (${this.lastError || 'runtime integrity'}) — an update may be mid-install; retry shortly`;
+    for (const queued of this.hostQueue.splice(0)) this.failHostRequest(queued, detail);
+    log(`wake deferred (${this.wakeDeferral.count}×): ${this.lastError || 'runtime integrity'} — no consistent worker to boot; staying hibernated, the next request retries`);
+  }
+
+  // B4 (2026-10-03): the pair has no worker, and the installed core cannot be
+  // adopted without a reconnect. Keep presence held, answer every queued and
+  // later host request at once with a retryable error, and start nothing — the
+  // same bytes would fail the same gate on every attempt.
+  settleRestartRequired(reason, extra = {}) {
+    this.status = 'restart-required';
+    if (reason) this.lastError = reason;
+    this.pendingWakeTarget = null;
+    // Receipt first: whoever reads it after the host hears the error must see why.
+    this.writeState(extra);
+    const detail = this.restartRequiredDetail();
+    for (const queued of this.hostQueue.splice(0)) this.failHostRequest(queued, detail);
+    this.sendHost({ jsonrpc: '2.0', method: 'notifications/message', params: { level: 'error', logger: 'klypix-supervisor', data: detail } });
+    log(`no worker started (${this.lastError || 'incompatible runtime'}) — requests are answered with a reconnect error until the host reconnects`);
+  }
+
+  restartRequiredDetail() {
+    return `${RESTART_REQUIRED_IDLE}${this.lastError ? ` (${this.lastError})` : ''}`;
+  }
+
+  // What a fresh connection boots: the installed runtime when its manifest
+  // verifies (never older than the package's own worker, unless dev), else the
+  // package's own worker.
+  //
+  // K1 (2026-10-03): a manifest that fails integrity, or cannot be read, is
+  // usually an install mid-rename. In the flat bundle the package's own worker
+  // is <brainDir>/klypix-mcp-worker.mjs — inside the directory being renamed —
+  // and booting it at once could load a mixed module graph (a new worker beside
+  // an old engine, or the reverse). So the boot waits for the install to settle,
+  // as a wake does (B3), and then tries the previous worker snapshot. Without
+  // one it refuses the connection instead of loading the known-unverified live
+  // files. A direct-package launch
+  // keeps its worker outside the managed directory, which no install touches: it
+  // boots at once. The host's first requests queue meanwhile (run()).
+  async selectInitialTarget() {
+    let runtime = this.runtimeWatch.read({ force: true });
+    if (!runtime.ok && !runtime.absent && within(path.dirname(this.runtimeManifest), this.fallbackTarget.path)) {
+      log(`runtime fails integrity at start (${runtime.error}) — waiting up to ${WAKE_INTEGRITY_WAIT_MS} ms for an install to settle`);
+      runtime = await this.settledRuntime(runtime);
+      if (!runtime.ok && !this.closed) {
+        // Recorded the way the poller records it (noteRuntimeError), so a
+        // manifest that verifies later clears it (clearRuntimeError).
+        this.errorBeforeRuntime = this.lastError;
+        this.runtimeError = runtime.error;
+        this.lastError = runtime.error;
+        const previous = prevSnapshotTarget(this.fallbackTarget.path);
+        if (previous) {
+          log(`runtime still fails integrity after ${WAKE_INTEGRITY_WAIT_MS} ms (${runtime.error}) — starting v${previous.version} from .prev, the complete copy of the previous install`);
+          return previous;
+        }
+        throw new Error(`KLYPIX core files do not verify (${runtime.error}) and no previous worker is available — no worker was started; retry after the install finishes, then /mcp reconnect`);
+      }
+    }
     if (!runtime.ok) return this.fallbackTarget;
     const cmp = compareSemver(runtime.target.version, this.fallbackTarget.version);
     return runtime.target.dev || cmp === null || cmp >= 0 ? runtime.target : this.fallbackTarget;
@@ -529,6 +1085,11 @@ class Supervisor {
         // row the supervisor kept alive instead of minting a second one. Hosts
         // that export their own id already resolve to the same value.
         ...(this.presenceIdentity?.id ? { KLYPIX_SESSION_ID: this.presenceIdentity.id } : {}),
+        // The worker runs its own update poll, gated on its own environment. A
+        // supervisor embedded with autoUpdate:false (the klypix-mcp/supervisor
+        // API) receipted "off" while its worker still fetched and installed
+        // (CF-5, 2026-10-03 review): the worker inherits the supervisor's setting.
+        ...(this.autoUpdate ? {} : { KLYPIX_AUTO_UPDATE: '0' }),
       },
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
@@ -617,7 +1178,9 @@ class Supervisor {
       if (pending) {
         clearTimeout(pending.timer);
         worker.internal.delete(idKey(message.id));
-        if (message.error) pending.reject(new Error(message.error.message || `${pending.method} failed`));
+        // Keep the JSON-RPC code: "Method not found" is how an older worker
+        // says it predates an internal request (probePresenceIdentity).
+        if (message.error) pending.reject(Object.assign(new Error(message.error.message || `${pending.method} failed`), { code: message.error.code }));
         else pending.resolve(message.result);
         return;
       }
@@ -693,6 +1256,7 @@ class Supervisor {
       this.rejectedSignature = failedTarget.signature;
       rollback.role = 'active';
       this.active = rollback;
+      this.recordBaseline(rollback);
       this.status = 'rolled-back';
       this.lastError = `worker v${worker.version} exited during rollback grace`;
       this.sendHost({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' });
@@ -811,6 +1375,12 @@ class Supervisor {
       this.writeState();
     }
     if (!this.active) {
+      // A settled restart-required (B4): nothing is starting, so a queued
+      // request would wait forever. Same retryable-error contract as below.
+      if (this.status === 'restart-required' && !this.candidate && !this.recoveryTimer && !this.waking) {
+        this.failHostRequest(message, this.restartRequiredDetail());
+        return;
+      }
       // recovery-failed with no candidate in flight = a settled outage: answer
       // id-bearing requests with a retryable error (the host can surface it and
       // retry after /mcp reconnect); notifications are dropped. While a recovery
@@ -857,10 +1427,15 @@ class Supervisor {
       this.recoveryAttempts = 0;   // a completed handshake proves the worker healthy — fresh budget
       this.lastFailedSignature = null;
       this.writeState();
-      this.loadToolManifest(this.active).catch(error => {
+      const first = this.active;
+      this.loadToolManifest(first).catch(error => {
         this.lastError = `initial tool manifest unavailable: ${error.message}`;
         this.writeState();
-      }).finally(() => this.checkForUpdate());
+      }).finally(() => {
+        // The first worker is never "committed"; it is the first baseline.
+        if (first === this.active) this.recordBaseline(first);
+        this.checkForUpdate();
+      });
     }
   }
 
@@ -893,7 +1468,7 @@ class Supervisor {
     });
   }
 
-  async startCandidate(target, { recovery = false } = {}) {
+  async startCandidate(target, { recovery = false, afterRejection = null, wake = false } = {}) {
     if (this.closed || this.candidate) {
       this.pendingTarget = target;
       return;
@@ -905,6 +1480,11 @@ class Supervisor {
     this.pendingTarget = null;
     this.status = recovery ? 'recovering' : 'validating-update';
     const candidate = this.spawnWorker(target, 'candidate');
+    // Set when this candidate resumes .prev because the installed core was
+    // rejected while idle: it serves, but the connection still needs a reconnect.
+    candidate.afterRejection = afterRejection;
+    // A hibernated pair waking, as opposed to a crash recovery (the log says which).
+    candidate.wake = wake === true;
     this.candidate = candidate;
     this.writeState();
     try {
@@ -917,20 +1497,25 @@ class Supervisor {
       this.send(candidate, this.initializedNotification || { jsonrpc: '2.0', method: 'notifications/initialized' });
       await this.loadToolManifest(candidate);
 
-      const previousTools = this.active?.manifest || [];
+      // B2 (2026-10-03): a wake or a crash recovery has no live worker, and
+      // comparing with `this.active?.manifest || []` waved every such candidate
+      // through — no tool check, no major check. The last committed worker is
+      // what the host is still using, so it is what the candidate must accept.
+      const reference = this.active || this.baseline;
+      const previousTools = reference?.manifest || [];
       const compatibility = toolCompatibility(previousTools, candidate.manifest);
-      const oldVersion = this.active?.version || this.active?.target?.version;
+      const oldVersion = reference?.version || reference?.target?.version;
       const oldSemver = parseSemver(oldVersion);
       const nextSemver = parseSemver(candidate.version);
       if (oldSemver && nextSemver && oldSemver[0] !== nextSemver[0]) {
-        throw new Error(`major upgrade v${oldVersion} → v${candidate.version} requires reconnect`);
+        throw deterministicError(`major upgrade v${oldVersion} → v${candidate.version} requires reconnect`);
       }
       if (!compatibility.ok) {
         const details = [
           compatibility.removed.length ? `removed tools: ${compatibility.removed.join(', ')}` : '',
           compatibility.changed.length ? `incompatible schemas: ${compatibility.changed.join(', ')}` : '',
         ].filter(Boolean).join('; ');
-        throw new Error(`breaking tool manifest requires reconnect (${details})`);
+        throw deterministicError(`breaking tool manifest requires reconnect (${details})`);
       }
       await this.replayTaskScope(candidate);
       candidate.compatibility = compatibility;
@@ -939,18 +1524,25 @@ class Supervisor {
       this.writeState();
       this.maybeCommitCandidate();
     } catch (error) {
-      this.rejectCandidate(error.message);
-      if (recovery && !this.active) this.tryPreviousWorker(target);
+      const deterministic = error?.deterministic === true;
+      // An exit/error handler may already have rejected this candidate (and a
+      // retry may own the slot by now) — never reject a different one.
+      if (this.candidate === candidate) this.rejectCandidate(error.message, true, { deterministic });
+      if (!deterministic && recovery && !this.active) this.tryPreviousWorker(target, { wake: candidate.wake });
     }
   }
 
-  rejectCandidate(reason, terminate = true) {
+  rejectCandidate(reason, terminate = true, { deterministic = false } = {}) {
     const candidate = this.candidate;
     if (!candidate) return;
     this.candidate = null;
-    this.status = this.active ? 'restart-required' : 'recovery-failed';
     this.lastError = reason;
     if (terminate && !candidate.exited) this.retireWorker(candidate, 0);
+    if (!this.active && deterministic) {
+      this.rejectWhileIdle(candidate, reason);
+      return;
+    }
+    this.status = this.active ? 'restart-required' : 'recovery-failed';
     if (!this.active) {
       // RECOVERY rejection: transient spawn failures (0xC0000142-class) must
       // retry with backoff, not blacklist the only installed runtime forever.
@@ -972,7 +1564,7 @@ class Supervisor {
           this.recoveryTimer = null;
           if (this.closed || this.active || this.candidate) return;
           this.rejectedSignature = null;
-          this.startCandidate(candidate.target, { recovery: true });
+          this.startCandidate(candidate.target, { recovery: true, afterRejection: candidate.afterRejection || null, wake: candidate.wake });
         }, delay);
         this.recoveryTimer.unref?.();
         return;
@@ -1004,6 +1596,32 @@ class Supervisor {
     log(`kept v${this.active?.version || 'none'}; rejected v${candidate.version || candidate.target.version}: ${reason}`);
   }
 
+  // B4 (2026-10-03): a major-version or breaking-tool rejection is DETERMINISTIC:
+  // the same bytes fail the same gate on every attempt. With no live worker the
+  // old path retried them with backoff (1, 2, 4, 8 s), declared recovery-failed,
+  // and meanwhile booted whatever .prev held. Now: one attempt at the .prev copy
+  // of the version this connection last ran, else a settled restart-required.
+  rejectWhileIdle(candidate, reason) {
+    if (this.recoveryTimer) { clearTimeout(this.recoveryTimer); this.recoveryTimer = null; }
+    const rejectedVersion = candidate.version || candidate.target.version;
+    this.rejectedSignature = candidate.target.signature;
+    const previous = this.previousBaselineTarget(candidate.target);
+    if (!previous) {
+      this.settleRestartRequired(reason, { rejectedVersion });
+      return;
+    }
+    this.status = 'recovering';
+    this.writeState({ rejectedVersion });
+    log(`rejected v${rejectedVersion} while idle (${reason}); resuming v${previous.version} from .prev`);
+    const afterRejection = { signature: candidate.target.signature, reason, version: rejectedVersion };
+    this.recoveryTimer = setTimeout(() => {
+      this.recoveryTimer = null;
+      if (this.closed || this.active || this.candidate) return;
+      this.startCandidate(previous, { recovery: true, afterRejection, wake: candidate.wake });
+    }, 150);
+    this.recoveryTimer.unref?.();
+  }
+
   maybeCommitCandidate() {
     if (!this.candidate?.ready) return;
     // A woken worker owns its lane row again — hand presence back before it
@@ -1013,16 +1631,29 @@ class Supervisor {
     if (this.hostRequests.size || this.workerRequests.size) return;
     const next = this.candidate;
     const previous = this.active;
+    // B5 (2026-10-03): a worker that wakes or recovers into a version other than
+    // the last committed one is a swap too. It used to go uncounted and unnoticed
+    // by the host: no hotReloads, no tools/list_changed for its new tools.
+    const reference = previous || this.baseline;
+    const swappedWhileIdle = !previous && Boolean(this.baseline)
+      && String(this.baseline.version || '') !== String(next.version || '');
+    // A .prev resume after an idle rejection serves the old tools, but the
+    // installed core still needs the reconnect it was rejected for.
+    const rejection = next.afterRejection || null;
     this.candidate = null;
     next.role = 'active';
     this.active = next;
-    this.rejectedSignature = null;
+    this.rejectedSignature = rejection ? rejection.signature : null;
     this.recoveryAttempts = 0;   // a committed worker resets the retry budget
     if (this.recoveryTimer) { clearTimeout(this.recoveryTimer); this.recoveryTimer = null; }
-    this.status = 'ready';
-    this.lastError = null;
+    this.status = rejection ? 'restart-required' : 'ready';
+    this.lastError = rejection ? rejection.reason : null;
+    this.runtimeError = null;
+    this.errorBeforeRuntime = null;
+    this.wakeDeferral = null;
     this.lastSwapAt = new Date().toISOString();
-    if (previous) this.hotReloads++;
+    if (previous || swappedWhileIdle) this.hotReloads++;
+    this.recordBaseline(next);
 
     if (previous) {
       previous.role = 'standby';
@@ -1040,16 +1671,26 @@ class Supervisor {
 
     this.writeState();
     this.flushHostQueue();
-    if (previous && previous.manifestHash !== next.manifestHash) {
+    if (reference && reference.manifestHash !== next.manifestHash) {
       this.sendHost({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' });
     }
+    // F10 (2026-10-03 review): say what happened. A .prev resume after an idle
+    // rejection used to log "recovered … without reconnect" while the pair
+    // settled restart-required, and every worker-less swap said "on wake".
     if (previous) log(`hot-swapped worker v${previous.version} → v${next.version} without reconnect`);
-    else log(`recovered worker v${next.version} without reconnect`);
+    else if (rejection) log(`resumed v${next.version} from .prev; v${rejection.version || '?'} needs /mcp reconnect (${rejection.reason})`);
+    else if (swappedWhileIdle) log(`hot-swapped worker v${reference.version} → v${next.version} ${next.wake ? 'on wake' : 'on recovery'}, without reconnect`);
+    else log(`${next.wake ? 'woke' : 'recovered'} worker v${next.version} without reconnect`);
 
-    if (this.pendingTarget && this.pendingTarget.signature !== next.target.signature) {
+    // MV-1 (2026-10-03 review): a target parked while this candidate validated
+    // passes the same gate the poller applies, against the worker just
+    // committed. A --force rollback that landed while a wake's .prev candidate
+    // validated was parked (nothing was active to compare it with) and then
+    // hot-swapped in here — a live pair never downgrades in place.
+    if (this.pendingTarget) {
       const pending = this.pendingTarget;
       this.pendingTarget = null;
-      queueMicrotask(() => this.startCandidate(pending));
+      if (!this.skipsUpdate(pending)) queueMicrotask(() => this.startCandidate(pending));
     }
   }
 
@@ -1077,20 +1718,13 @@ class Supervisor {
     }, graceMs).unref?.();
   }
 
-  tryPreviousWorker(target) {
-    const previousPath = path.join(path.dirname(target.path), '.prev', path.basename(target.path));
-    if (!fs.existsSync(previousPath)) return;
-    const previousVersion = readBakedVersion(previousPath);
-    if (!previousVersion) return;
-    const previous = {
-      path: previousPath,
-      version: previousVersion,
-      signature: `previous:${previousPath}:${previousVersion}`,
-      source: 'rollback',
-      dev: false,
-    };
+  // A transient recovery failure may also resume .prev — but only the copy of
+  // the version this connection last ran (previousBaselineTarget).
+  tryPreviousWorker(target, { wake = false } = {}) {
+    const previous = this.previousBaselineTarget(target);
+    if (!previous) return;
     setTimeout(() => {
-      if (!this.closed && !this.active && !this.candidate) this.startCandidate(previous, { recovery: true });
+      if (!this.closed && !this.active && !this.candidate) this.startCandidate(previous, { recovery: true, wake });
     }, 150).unref?.();
   }
 
@@ -1099,22 +1733,76 @@ class Supervisor {
     if (this.recoveryTimer) return;   // a recovery backoff owns the next attempt — the poller must not preempt it
     this.checking = true;
     try {
-      const runtime = readRuntimeTarget(this.runtimeManifest, { allowExternal: this.allowExternal });
-      if (!runtime.ok) {
-        if (!runtime.absent) {
-          this.lastError = runtime.error;
-          this.writeState();
-        }
+      let runtime = this.runtimeWatch.read();
+      if (!runtime.ok) return this.noteRuntimeError(runtime);
+      this.clearRuntimeError();
+      // B1 (2026-10-03): a pair with no worker that is asleep — hibernated, or
+      // settled restart-required — never starts a candidate here. The guard
+      // below compared the manifest with `this.active?.version`, which is
+      // undefined while hibernated; compareSemver(v, undefined) is null, so it
+      // never returned, and every idle pair woke about a second after it fell
+      // asleep (since 1.57.0). Only a host request wakes a sleeping pair.
+      if (!this.active && !this.candidate && (this.status === 'hibernated' || this.status === 'restart-required')) {
+        if (this.status === 'hibernated' && !this.waking) this.notePendingWake(runtime.target);
         return;
       }
-      const target = runtime.target;
-      if (target.signature === this.active?.target.signature || target.signature === this.candidate?.target.signature || target.signature === this.rejectedSignature) return;
-      const cmp = compareSemver(target.version, this.active?.version || this.active?.target.version);
-      if (!target.dev && cmp !== null && cmp <= 0) return;
-      this.startCandidate(target);
+      if (this.skipsUpdate(runtime.target)) return;
+      // The stat gate only ever SKIPS work: a candidate starts from a full read.
+      if (runtime.cached) {
+        runtime = this.runtimeWatch.read({ force: true });
+        if (!runtime.ok) return this.noteRuntimeError(runtime);
+        if (this.skipsUpdate(runtime.target)) return;
+      }
+      this.startCandidate(runtime.target);
     } finally {
       this.checking = false;
     }
+  }
+
+  skipsUpdate(target) {
+    if (target.signature === this.active?.target.signature || target.signature === this.candidate?.target.signature || target.signature === this.rejectedSignature) return true;
+    // Never-downgrade compares with the last COMMITTED worker when none is
+    // active (MV-1, 2026-10-03 review): while a wake's or a recovery's
+    // candidate validates, `this.active` is null, compareSemver(v, undefined) is
+    // null — the hole B1 closed for hibernated pairs — and an older manifest was
+    // parked and then started. A dev target still goes through.
+    const reference = this.active ? (this.active.version || this.active.target.version) : this.baselineVersion();
+    const cmp = compareSemver(target.version, reference);
+    return !target.dev && cmp !== null && cmp <= 0;
+  }
+
+  // B8: while the runtime fails integrity (an install mid-rename), every 1 s
+  // poll used to rewrite the state file — ~15 renames a second machine-wide,
+  // against files 15 supervisors and the doctor read. Write on change only.
+  noteRuntimeError(runtime) {
+    if (runtime.absent) {
+      if (this.pendingWakeTarget) {
+        this.pendingWakeTarget = null;
+        this.writeState();
+      }
+      return;
+    }
+    if (this.lastError === runtime.error) return;
+    if (this.runtimeError === null) this.errorBeforeRuntime = this.lastError;
+    this.runtimeError = runtime.error;
+    this.lastError = runtime.error;
+    this.writeState();
+  }
+
+  // A runtime that verifies again must not keep reporting the integrity error
+  // it recovered from; whatever lastError it displaced comes back.
+  clearRuntimeError() {
+    if (this.runtimeError === null && !this.wakeDeferral) return;
+    const recorded = this.runtimeError;
+    const before = this.errorBeforeRuntime;
+    const deferred = Boolean(this.wakeDeferral);
+    this.runtimeError = null;
+    this.errorBeforeRuntime = null;
+    // A runtime that verifies again is bootable: the next wake will not defer.
+    this.wakeDeferral = null;
+    const restore = recorded !== null && this.lastError === recorded;
+    if (restore) this.lastError = before;
+    if (restore || deferred) this.writeState();
   }
 
   scheduleAutoUpdate() {
@@ -1123,6 +1811,11 @@ class Supervisor {
       brainDir: path.dirname(this.runtimeManifest),
       currentVersion: this.active?.version || this.fallbackTarget.version,
     });
+    // K3: receipted on every tick — one small write per poll (10 min). A due
+    // check this tick found has its helper launched by now, and that helper
+    // pre-stamps within seconds; a stamp still unmoved later is a real stall.
+    this.lastAutoUpdatePollAt = new Date().toISOString();
+    this.writeState();
   }
 
   flushHostQueue() {
@@ -1133,23 +1826,22 @@ class Supervisor {
   async run() {
     this.bootedAt = new Date().toISOString();
     fs.mkdirSync(this.stateDir, { recursive: true });
-    // Opportunistic cleanup of dead supervisor receipts.
-    try {
-      for (const name of fs.readdirSync(this.stateDir)) {
-        if (!name.endsWith('.json')) continue;
-        const file = path.join(this.stateDir, name);
-        const state = readJson(file);
-        if (!state?.pid || !isAlivePid(state.pid)) {
-          try { fs.unlinkSync(file); } catch { /* raced */ }
-        }
-      }
-    } catch { /* */ }
+    // Opportunistic cleanup of dead supervisor receipts and leftover tmp files
+    // (cleanSupervisorStateDir has the rules).
+    try { cleanSupervisorStateDir(this.stateDir); } catch { /* */ }
 
-    const initial = this.selectInitialTarget();
-    this.active = this.spawnWorker(initial, 'active');
-    this.status = 'awaiting-initialize';
-    this.writeState();
-    this.flushHostQueue();
+    // The host transport is wired BEFORE the first worker is chosen (K1): the
+    // choice may wait out an install mid-rename, and meanwhile the host's first
+    // requests queue (onHostMessage queues while no worker is active) and flush
+    // to the worker below. A host that goes away during the wait still closes
+    // this process, so its end/close handlers are registered first too.
+    const finished = new Promise(resolve => {
+      this.resolveRun = resolve;
+      process.stdin.once('end', () => this.close());
+      process.stdin.once('close', () => this.close());
+      process.once('SIGINT', () => this.close());
+      process.once('SIGTERM', () => this.close());
+    });
 
     process.stdout.on('error', (error) => {
       if (this.closed) return;
@@ -1176,6 +1868,24 @@ class Supervisor {
         this.sendHost({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } });
       },
     ));
+
+    let initial;
+    try { initial = await this.selectInitialTarget(); }
+    catch (error) {
+      // Return the actual startup failure to queued initialize requests before
+      // closing. A broken install must neither boot unchecked files nor leave
+      // the host waiting for a worker that cannot start.
+      for (const message of this.hostQueue.splice(0)) {
+        if (message.id !== undefined) this.sendHost({ jsonrpc: '2.0', id: message.id, error: { code: -32002, message: error.message, data: { retryable: true } } });
+      }
+      this.close();
+      throw error;
+    }
+    if (this.closed) return finished;
+    this.active = this.spawnWorker(initial, 'active');
+    this.status = 'awaiting-initialize';
+    this.writeState();
+    this.flushHostQueue();
 
     this.poller = setInterval(() => this.checkForUpdate(), Math.max(50, this.pollMs));
     this.poller.unref?.();
@@ -1209,13 +1919,7 @@ class Supervisor {
       this.parentWatchdog.unref?.();
     }
 
-    await new Promise(resolve => {
-      this.resolveRun = resolve;
-      process.stdin.once('end', () => this.close());
-      process.stdin.once('close', () => this.close());
-      process.once('SIGINT', () => this.close());
-      process.once('SIGTERM', () => this.close());
-    });
+    await finished;
   }
 
   close() {
@@ -1261,4 +1965,13 @@ export const __test = {
   schemaAcceptsPrevious,
   toolCompatibility,
   compareSemver,
+  atomicJson,
+  createRuntimeWatch,
+  cleanSupervisorStateDir,
+  deadSupervisorReceipt,
+  pidState,
+  DEFAULT_AUTO_UPDATE_POLL_MS,
+  DEAD_RECEIPT_GRACE_MS,
+  PRESENCE_IDENTITY_METHOD,
+  RESTART_REQUIRED_IDLE,
 };

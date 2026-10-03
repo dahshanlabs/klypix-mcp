@@ -168,6 +168,32 @@ const run = (args, { cwd = REPO, home = HOME_ROOT, timeout = 60_000 } = {}) => {
     'E: doctor reports the same verdict and exit code from both shapes');
 }
 
+// ── E2 — a PARTIAL verdict closes as partial, not "✓ aligned." (2026-10-03) ──
+// The only finding here is a readiness warning: an engine module in the managed
+// directory that no install receipt covers. Exit code stays 0 (no drift).
+{
+  const home = tmp('e2-partial-home');
+  const project = tmp('e2-partial-project');
+  const brainDir = path.join(home, '.claude', 'project-brain');
+  fs.mkdirSync(brainDir, { recursive: true });
+  const version = JSON.parse(fs.readFileSync(path.join(REPO, 'package.json'), 'utf8')).version;
+  const server = `const PKG_VERSION = '${version}';\n`;
+  fs.writeFileSync(path.join(brainDir, 'klypix-mcp-server.mjs'), server);
+  fs.writeFileSync(path.join(brainDir, '.mcp-runtime.json'), JSON.stringify({
+    protocol: 1, version, worker: 'klypix-mcp-worker.mjs', channel: 'npm',
+    files: { 'klypix-mcp-server.mjs': crypto.createHash('sha256').update(server).digest('hex') },
+  }));
+  fs.writeFileSync(path.join(brainDir, '.brain-version.json'), JSON.stringify({ brainVersion: version, via: 'npm', dirty: false }));
+  fs.writeFileSync(path.join(brainDir, 'stray.mjs'), '// no install receipt covers this module\n');
+  for (const [shape, args] of [['bin', [DOCTOR]], ['dispatcher', [MCP, 'doctor']]]) {
+    const result = run([...args, '--no-color', '--project', project], { home });
+    ok(result.code === 0 && /PARTIAL/.test(result.out)
+      && /\n• partial — 1 readiness warning above \(no drift\)\s*$/.test(result.out)
+      && !/✓ aligned\./.test(result.out),
+    `E2: a PARTIAL verdict ends with "• partial — 1 readiness warning above (no drift)" and exits 0 (${shape})`);
+  }
+}
+
 // ── F — conformance honours --json from source and the installed bundle ──────
 // test/conformance.mjs covers the dispatcher shape. The installed-copy assertion
 // also pins the flatten + staged-file closure used by the published flat bundle.

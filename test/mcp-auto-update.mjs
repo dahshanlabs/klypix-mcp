@@ -1,14 +1,28 @@
 // Acceptance tests for the host-neutral MCP updater. All registry and installer
 // seams are injected; this test never contacts npm or changes the user's brain.
+// Fixtures are literal JSON written into temp dirs — never read from ~/.claude.
 
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { spawnSync } from 'child_process';
 import { EventEmitter } from 'events';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 import {
+  AUTO_UPDATE_HARNESS_REFRESH_MS,
+  AUTO_UPDATE_OVERDUE_GRACE_MS,
+  AUTO_UPDATE_POLL_EVIDENCE_MS,
+  AUTO_UPDATE_POLL_MS,
+  AUTO_UPDATE_POLL_SETTLE_MS,
+  AUTO_UPDATE_RECHECK_FLOOR_MS,
+  AUTO_UPDATE_RETRY_MS,
+  AUTO_UPDATE_SPAWN_RETRY_MS,
+  AUTO_UPDATE_TTL_MS,
+  __test,
+  autoUpdateDecision,
+  autoUpdateOverdue,
   autoUpdatePaths,
+  autoUpdateSchedule,
   installExactRuntime,
   inspectAutoUpdate,
   readRegisteredProjectBrains,
@@ -21,6 +35,10 @@ import { auditProject, compactAgentsBrief, linkProject } from '../src/agent-rule
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-auto-update-'));
 const HERE = path.dirname(fileURLToPath(import.meta.url));
+const MINUTE = 60 * 1000;
+const HOUR = 60 * MINUTE;
+const DAY = 24 * HOUR;
+const DEAD_PID = 2147483646;   // no such process: the owner of an abandoned lock
 let pass = 0, fail = 0;
 const ok = (condition, message) => {
   if (condition) { pass++; console.log(`✓ ${message}`); }
@@ -31,18 +49,36 @@ const scenario = (name) => {
   fs.mkdirSync(dir, { recursive: true });
   return dir;
 };
-const writeRuntime = (dir, version, { dev = false } = {}) => {
+const writeRuntime = (dir, version, { dev = false, channel, installedAt } = {}) => {
   fs.writeFileSync(path.join(dir, '.mcp-runtime.json'), JSON.stringify({
     protocol: 1,
     version,
     worker: 'worker.mjs',
     dev,
+    ...(channel ? { channel } : {}),
+    ...(installedAt ? { installedAt } : {}),
   }));
   fs.writeFileSync(path.join(dir, '.brain-version.json'), JSON.stringify({
     brainVersion: version,
     dev,
-    via: dev ? 'dev' : 'npm',
+    via: channel || (dev ? 'dev' : 'npm'),
+    ...(installedAt ? { installedAt } : {}),
   }));
+};
+const readStamp = (dir) => JSON.parse(fs.readFileSync(autoUpdatePaths(dir).stamp, 'utf8'));
+const readStatus = (dir) => JSON.parse(fs.readFileSync(autoUpdatePaths(dir).status, 'utf8'));
+const installAs = (options) => async (version, { brainDir }) => writeRuntime(brainDir, version, options);
+const noFetch = async () => { throw new Error('must not contact npm'); };
+const noInstall = async () => { throw new Error('must not install'); };
+// Policy checks name enabled/force explicitly: sandboxed suite runs set
+// KLYPIX_AUTO_UPDATE=0, which would otherwise turn every case into 'disabled'.
+const check = (options) => runAutoUpdateCheck({ enabled: true, force: false, currentVersion: null, ...options });
+// The view a spawner gets, with the opt-out env neutralised for the same reason.
+const view = (dir, now) => inspectAutoUpdate(dir, { now, env: {} });
+const fakeChild = () => {
+  const child = new EventEmitter();
+  child.unref = () => {};
+  return child;
 };
 
 try {
@@ -67,17 +103,17 @@ try {
       fetchLatest: async () => { fetches++; return '1.4.0'; },
       installVersion: async () => { installs++; },
     };
-    const first = await runAutoUpdateCheck(options);
-    const second = await runAutoUpdateCheck({ ...options, now: 100_001 });
+    const first = await check(options);
+    const second = await check({ ...options, now: 100_001 });
     ok(first.result === 'current' && fetches === 1 && installs === 0, 'current runtime checks npm once and does not install');
-    ok(second.result === 'throttled' && fetches === 1, 'machine-wide 24h stamp throttles later sessions');
+    ok(second.result === 'throttled' && fetches === 1, 'machine-wide 6h schedule throttles later sessions');
   }
 
   {
     const dir = scenario('compatible-update');
     writeRuntime(dir, '1.4.0');
     let exact = null;
-    const result = await runAutoUpdateCheck({
+    const result = await check({
       brainDir: dir,
       now: 200_000,
       fetchLatest: async () => '1.5.2',
@@ -95,7 +131,7 @@ try {
     const dir = scenario('current-reconciles-harness');
     writeRuntime(dir, '1.5.2');
     let reconciledVersion = null;
-    const result = await runAutoUpdateCheck({
+    const result = await check({
       brainDir: dir,
       now: 250_000,
       fetchLatest: async () => '1.5.2',
@@ -128,6 +164,9 @@ try {
     const receipt = await reconcileRegisteredProjects({
       brainDir: dir,
       version: '1.5.2',
+      // The registrations above are stamped 10-30 ms after the epoch; reconcile
+      // on the same clock so the 14-day stale-registration filter keeps them.
+      now: 40,
       rules: { auditProject, compactAgentsBrief, linkProject },
     });
     const humanAgents = fs.readFileSync(path.join(projectA, 'AGENTS.md'), 'utf8');
@@ -154,7 +193,7 @@ try {
   {
     const dir = scenario('bootstrap');
     let installed = false;
-    const result = await runAutoUpdateCheck({
+    const result = await check({
       brainDir: dir,
       currentVersion: '1.5.2',
       now: 300_000,
@@ -170,7 +209,7 @@ try {
   {
     const dir = scenario('unpublished-dev-package');
     let installed = false;
-    const result = await runAutoUpdateCheck({
+    const result = await check({
       brainDir: dir,
       currentVersion: '1.6.0',
       now: 350_000,
@@ -184,7 +223,7 @@ try {
     const dir = scenario('major-boundary');
     writeRuntime(dir, '1.9.0');
     let installed = false;
-    const result = await runAutoUpdateCheck({
+    const result = await check({
       brainDir: dir,
       now: 400_000,
       fetchLatest: async () => '2.0.0',
@@ -197,7 +236,7 @@ try {
     const dir = scenario('dev-owned');
     writeRuntime(dir, '1.9.0', { dev: true });
     let fetched = false;
-    const result = await runAutoUpdateCheck({
+    const result = await check({
       brainDir: dir,
       now: 500_000,
       fetchLatest: async () => { fetched = true; return '1.9.1'; },
@@ -208,7 +247,7 @@ try {
   {
     const dir = scenario('offline');
     writeRuntime(dir, '1.9.0');
-    const result = await runAutoUpdateCheck({
+    const result = await check({
       brainDir: dir,
       now: 600_000,
       fetchLatest: async () => { throw new Error('offline'); },
@@ -220,14 +259,15 @@ try {
   {
     const dir = scenario('lock');
     writeRuntime(dir, '1.9.0');
+    // A LIVE owner (this test process): since A8 a dead owner's lock is taken over.
     fs.writeFileSync(autoUpdatePaths(dir).lock, JSON.stringify({
       protocol: 1,
       token: 'other',
-      pid: 123,
+      pid: process.pid,
       acquiredAt: 700_000,
     }));
     let fetched = false;
-    const result = await runAutoUpdateCheck({
+    const result = await check({
       brainDir: dir,
       now: 700_001,
       fetchLatest: async () => { fetched = true; return '1.9.1'; },
@@ -240,9 +280,7 @@ try {
     let launch = null;
     const fakeSpawn = (command, args, options) => {
       launch = { command, args, options };
-      const child = new EventEmitter();
-      child.unref = () => {};
-      return child;
+      return fakeChild();
     };
     const child = spawnAutoUpdateHelper({
       brainDir: dir,
@@ -285,6 +323,939 @@ try {
       });
     } catch { rejected = true; }
     ok(rejected, 'non-semver package input is rejected before process creation');
+  }
+
+  // ── 2026-10-03: identity-aware schedule, cadence, backoff, hold, lock ──────
+
+  {
+    // A6 — cadence.
+    ok(AUTO_UPDATE_TTL_MS === 6 * HOUR, 'A6: one scheduled registry check per machine per 6 h');
+    ok(AUTO_UPDATE_POLL_MS === 10 * MINUTE && AUTO_UPDATE_POLL_MS <= 15 * MINUTE, 'A6: spawners poll the schedule every 10 min (local reads only)');
+    const dir = scenario('ttl-boundary');
+    writeRuntime(dir, '1.4.0');
+    const t = Date.UTC(2026, 9, 3, 6, 0, 0);
+    await check({ brainDir: dir, now: t, fetchLatest: async () => '1.4.0' });
+    // Literal 6 h, not the constant: the boundary itself is what is pinned.
+    ok(!view(dir, t + 6 * HOUR - 1).due, 'A6: not due 1 ms before lastCheck + 6 h');
+    const atTtl = view(dir, t + 6 * HOUR);
+    ok(atTtl.due && atTtl.dueReason === 'interval', 'A6: due exactly at lastCheck + 6 h');
+    const worker = fs.readFileSync(path.join(HERE, '..', 'bin', 'klypix-worker.mjs'), 'utf8').replace(/\r/g, '');
+    const namespace = worker.match(/import \* as (\w+) from '\.\.\/src\/mcp-auto-update\.mjs';/)?.[1];
+    ok(!!namespace && worker.includes(
+      `setInterval(checkForCoreUpdate, Math.max(60_000, Number(${namespace}.AUTO_UPDATE_POLL_MS) || 60 * 60 * 1000))`),
+    'A6: the worker polls at AUTO_UPDATE_POLL_MS through a namespace member with a 60-min fallback');
+  }
+
+  {
+    // This PC on 2026-10-02: a dev-owned check did nothing, then an npm install
+    // made the runtime npm-owned — and a 24 h stamp hid that for a day.
+    const dir = scenario('dev-then-npm');
+    writeRuntime(dir, '1.8.0', { dev: true });
+    const t0 = Date.parse('2026-10-02T05:19:23.580Z');
+    let fetched = false;
+    const devResult = await check({ brainDir: dir, now: t0, fetchLatest: async () => { fetched = true; return '1.9.1'; } });
+    ok(devResult.result === 'dev-owned' && !fetched, 'A5: a dev-owned runtime is recorded without fetching');
+    ok(readStatus(dir).identity?.dev === true && readStamp(dir).failures === 0
+      && readStamp(dir).nextCheckAt === t0 + AUTO_UPDATE_TTL_MS,
+    'A2/A7: the dev-owned result records the identity it evaluated and a terminal 6 h stamp');
+    writeRuntime(dir, '1.9.0', { channel: 'npm' });
+    const after = view(dir, t0 + HOUR);
+    ok(after.due && after.dueReason === 'install-changed' && after.stale && after.staleReason === 'left-dev-ownership',
+      'A3: leaving dev ownership makes the check due at once and marks the old result stale');
+    let installedVersion = null;
+    const updated = await check({
+      brainDir: dir,
+      now: t0 + HOUR,
+      fetchLatest: async () => '1.9.1',
+      installVersion: async (version, { brainDir }) => { installedVersion = version; writeRuntime(brainDir, version); },
+    });
+    ok(updated.result === 'updated' && installedVersion === '1.9.1', 'A3: the re-opened check installs the pending release');
+  }
+
+  {
+    // `npx -y klypix-mcp@latest install --force` over a dev deploy of the SAME
+    // version: no version moved, only ownership — the schedule must re-open.
+    const dir = scenario('dev-to-npm-same-version');
+    writeRuntime(dir, '1.9.0', { dev: true });
+    const t = Date.UTC(2026, 9, 3, 6, 30, 0);
+    await check({ brainDir: dir, now: t, fetchLatest: noFetch });
+    writeRuntime(dir, '1.9.0', { channel: 'npm' });
+    const after = view(dir, t + 10 * MINUTE);
+    ok(after.due && after.dueReason === 'install-changed' && after.staleReason === 'left-dev-ownership',
+      'A3: returning a dev-owned runtime to npm at the same version re-opens the schedule');
+  }
+
+  {
+    // Literal copies of this PC's files on 2026-10-02 (legacy, pre-identity).
+    const dir = scenario('legacy-live-state');
+    const files = autoUpdatePaths(dir);
+    fs.writeFileSync(files.stamp, '{"protocol":1,"lastCheck":1790918363580,"checkedAt":"2026-10-02T05:19:23.580Z"}\n');
+    fs.writeFileSync(files.status, '{"protocol":1,"result":"dev-owned","checkedAt":"2026-10-02T05:19:23.580Z","currentVersion":"1.86.0"}\n');
+    fs.writeFileSync(files.runtime, '{"protocol":1,"version":"1.88.0","worker":"klypix-mcp-worker.mjs","channel":"npm","installedAt":"2026-10-02T14:39:15.704Z","files":{}}\n');
+    fs.writeFileSync(files.version, '{"brainVersion":"1.88.0","via":"npm","dirty":false,"installedAt":"2026-10-02T14:39:15.704Z"}');
+    const live = view(dir, Date.parse('2026-10-02T14:45:00.000Z'));
+    ok(live.due && live.dueReason === 'install-changed' && live.stale && live.staleReason === 'left-dev-ownership',
+      'A2: a legacy dev-owned status next to npm receipts is stale and due minutes after the install');
+  }
+
+  {
+    // The pre-host-neutral hook wrote a bare {lastCheck} and no status: a
+    // stamp nothing can attribute counts as changed ONCE, after the floor.
+    const dir = scenario('unusable-status');
+    writeRuntime(dir, '1.4.0');
+    const t = Date.UTC(2026, 9, 3, 6, 45, 0);
+    fs.writeFileSync(autoUpdatePaths(dir).stamp, JSON.stringify({ lastCheck: t }));
+    const atFloor = view(dir, t + AUTO_UPDATE_RECHECK_FLOOR_MS);
+    ok(!view(dir, t + MINUTE).due && atFloor.due && atFloor.dueReason === 'install-changed',
+      'A3: a legacy stamp with no usable status counts as changed once, after the floor');
+    await check({ brainDir: dir, now: t + AUTO_UPDATE_RECHECK_FLOOR_MS, fetchLatest: async () => '1.4.0' });
+    ok(!view(dir, t + 2 * AUTO_UPDATE_RECHECK_FLOOR_MS).due, 'A3: … and only once: the recorded identity takes over');
+  }
+
+  {
+    const dir = scenario('recheck-floor');
+    writeRuntime(dir, '1.4.0');
+    const t = Date.UTC(2026, 9, 3, 7, 0, 0);
+    await check({ brainDir: dir, now: t, fetchLatest: async () => '1.4.0' });
+    writeRuntime(dir, '1.4.1');   // installed by something other than the helper
+    const early = view(dir, t + MINUTE);
+    const atFloor = view(dir, t + AUTO_UPDATE_RECHECK_FLOOR_MS);
+    ok(!early.due && early.dueReason === 'install-changed' && early.stale && early.staleReason === 'version-increased',
+      'A3: an install change 1 min after a check waits for the 5-min floor');
+    ok(atFloor.due && atFloor.dueReason === 'install-changed', 'A3: … and is due at lastCheck + 5 min');
+    let launches = 0;
+    const spawnProcess = () => { launches++; return fakeChild(); };
+    ok(spawnAutoUpdateHelper({ brainDir: dir, env: {}, spawnProcess, now: t + MINUTE }) === null && launches === 0,
+      'A3: spawners launch nothing before the floor');
+    ok(!!spawnAutoUpdateHelper({ brainDir: dir, env: {}, spawnProcess, now: t + AUTO_UPDATE_RECHECK_FLOOR_MS }) && launches === 1,
+      'A3: spawners launch the helper once the install change is due');
+  }
+
+  {
+    const dir = scenario('no-self-trigger');
+    writeRuntime(dir, '1.4.0');
+    const t = Date.UTC(2026, 9, 3, 8, 0, 0);
+    const result = await check({ brainDir: dir, now: t, fetchLatest: async () => '1.5.0', installVersion: installAs() });
+    const later = view(dir, t + 6 * MINUTE);
+    ok(result.result === 'updated' && readStatus(dir).identity?.version === '1.5.0' && readStamp(dir).identity?.version === '1.5.0',
+      'A2: an update records the VERIFIED identity in the status and the stamp');
+    ok(!later.due && !later.stale && later.dueReason === 'interval', "A3: the helper's own install never reads as a change (no self-trigger)");
+  }
+
+  {
+    const dir = scenario('desktop-reinstall');
+    writeRuntime(dir, '1.4.0', { channel: 'npm', installedAt: '2026-10-03T07:00:00.000Z' });
+    const t = Date.UTC(2026, 9, 3, 9, 0, 0);
+    await check({ brainDir: dir, now: t, fetchLatest: async () => '1.4.0' });
+    // The desktop installer self-heals at an EQUAL version on every launch.
+    writeRuntime(dir, '1.4.0', { channel: 'app', installedAt: '2026-10-03T09:02:00.000Z' });
+    const later = view(dir, t + 6 * MINUTE);
+    ok(!later.due && !later.stale && later.installedIdentity?.channel === 'app',
+      'A1: channel and installedAt are display-only — an equal-version desktop re-install triggers nothing');
+  }
+
+  {
+    const dir = scenario('unreadable-receipt');
+    writeRuntime(dir, '1.4.0');
+    const t = Date.UTC(2026, 9, 3, 10, 0, 0);
+    await check({ brainDir: dir, now: t, fetchLatest: async () => '1.4.0' });
+    fs.writeFileSync(autoUpdatePaths(dir).runtime, '{"protocol":1,"version":"1.4');   // a non-atomic writer, mid-write
+    const torn = view(dir, t + 6 * MINUTE);
+    ok(torn.installedIdentity?.unknown === true && !torn.stale && !torn.due,
+      'A1: a receipt that exists but cannot be read is unknown, never a change');
+    let fetched = false, installed = false;
+    const forced = await check({
+      brainDir: dir,
+      now: t + 7 * MINUTE,
+      force: true,
+      fetchLatest: async () => { fetched = true; return '1.5.0'; },
+      installVersion: async () => { installed = true; },
+    });
+    ok(forced.result === 'failed' && /unreadable/.test(forced.error) && !fetched && !installed,
+      'A1: the helper never fetches or installs over receipts it cannot read');
+  }
+
+  {
+    const dir = scenario('unmanaged-ahead-schedule');
+    const t = Date.UTC(2026, 9, 3, 11, 0, 0);
+    const result = await check({ brainDir: dir, currentVersion: '1.6.0', now: t, fetchLatest: async () => '1.5.2', installVersion: noInstall });
+    ok(result.result === 'ahead' && readStatus(dir).identity?.version === null,
+      "A1: the recorded identity comes from the receipts only, never the caller's version");
+    const plus6 = view(dir, t + 6 * MINUTE);
+    const plus60 = view(dir, t + 60 * MINUTE);
+    ok(!plus6.due && !plus60.due && !plus6.stale && !plus60.stale,
+      "A1: an unmanaged 'ahead' run is not due at +6 min or +60 min (no npm query per poll)");
+    writeRuntime(dir, '1.5.2');   // then the released runtime is installed by hand
+    const managedNow = view(dir, t + 61 * MINUTE);
+    ok(managedNow.due && managedNow.dueReason === 'install-changed' && managedNow.staleReason === 'became-managed',
+      'A3: unmanaged → managed re-opens the schedule');
+  }
+
+  {
+    // 2026-10-03 integration review: with no receipt naming a version, the
+    // helper decides with its spawner's version. The view, given that version,
+    // must decide the same — the doctor and the receipts read it.
+    const dir = scenario('receiptless-major');
+    const t = Date.UTC(2026, 9, 3, 14, 0, 0);
+    const helper = await check({ brainDir: dir, currentVersion: '1.6.0', now: t, fetchLatest: async () => '2.0.0', installVersion: noInstall });
+    const informed = inspectAutoUpdate(dir, { now: t + MINUTE, env: {}, currentVersion: '1.6.0' });
+    ok(helper.result === 'major-blocked' && informed.decision === 'major-blocked' && informed.installedIdentity?.version === null,
+      "A5: a receipt-less runtime's view, given the spawner's version, decides what the helper decided (major-blocked); its identity stays receipts-only");
+  }
+
+  {
+    const dir = scenario('downgrade-hold');
+    writeRuntime(dir, '1.9.0');
+    const t = Date.UTC(2026, 9, 3, 12, 0, 0);
+    const installs = [];
+    const install = async (version, { brainDir }) => { installs.push(version); writeRuntime(brainDir, version); };
+    await check({ brainDir: dir, now: t, fetchLatest: async () => '1.9.1', installVersion: install });
+    writeRuntime(dir, '1.9.0');   // npx -y klypix-mcp@1.9.0 install --runtime-only --force
+    const soon = view(dir, t + 6 * MINUTE);
+    ok(!soon.due && soon.stale && soon.staleReason === 'manual-downgrade',
+      'A3: a deliberate --force downgrade is not due at +6 min (reported as manual-downgrade)');
+    ok(soon.hold === null && soon.nextHold?.version === '1.9.1' && soon.decision === 'held',
+      'A5: before the next check runs, the view already decides with the hold that check applies — never "install" for the rolled-back-from version');
+    const held = await check({ brainDir: dir, now: t + AUTO_UPDATE_TTL_MS, fetchLatest: async () => '1.9.1', installVersion: install });
+    ok(held.result === 'held' && readStatus(dir).hold?.version === '1.9.1' && installs.length === 1,
+      'A4: the next scheduled check holds the rolled-back-from version instead of re-installing it');
+    ok(view(dir, t + AUTO_UPDATE_TTL_MS + MINUTE).decision === 'held', 'A5: the doctor/hook view states the same hold');
+    const again = await check({ brainDir: dir, now: t + 2 * AUTO_UPDATE_TTL_MS, fetchLatest: async () => '1.9.1', installVersion: install });
+    ok(again.result === 'held' && installs.length === 1, 'A4: the hold survives later checks');
+    const newer = await check({ brainDir: dir, now: t + 3 * AUTO_UPDATE_TTL_MS, fetchLatest: async () => '1.9.2', installVersion: install });
+    ok(newer.result === 'updated' && installs.at(-1) === '1.9.2' && !readStatus(dir).hold,
+      'A4: a newer publish installs normally and clears the hold');
+  }
+
+  {
+    const dir = scenario('hold-force');
+    writeRuntime(dir, '1.9.0');
+    const t = Date.UTC(2026, 9, 3, 13, 0, 0);
+    const installs = [];
+    const install = async (version, { brainDir }) => { installs.push(version); writeRuntime(brainDir, version); };
+    await check({ brainDir: dir, now: t, fetchLatest: async () => '1.9.1', installVersion: install });
+    writeRuntime(dir, '1.9.0');
+    await check({ brainDir: dir, now: t + AUTO_UPDATE_TTL_MS, fetchLatest: async () => '1.9.1', installVersion: install });
+    const forced = await check({ brainDir: dir, now: t + AUTO_UPDATE_TTL_MS + MINUTE, force: true, fetchLatest: async () => '1.9.1', installVersion: install });
+    ok(forced.result === 'updated' && installs.at(-1) === '1.9.1' && installs.length === 2 && !readStatus(dir).hold,
+      'A4: KLYPIX_AUTO_UPDATE_FORCE=1 bypasses the hold');
+  }
+
+  {
+    const table = [
+      [{ version: '1.9.0', managed: true, dev: true }, '2.0.0', null, 'dev-owned'],
+      [{ version: '1.9.0', managed: true, dev: false }, '2.0.0', null, 'major-blocked'],
+      [{ version: '1.9.0', managed: false, dev: false }, '2.0.0', null, 'major-blocked'],
+      [{ version: '1.4.0', managed: true, dev: false }, '1.5.0', null, 'install'],
+      [{ version: '1.5.0', managed: true, dev: false }, '1.5.0', null, 'current'],
+      [{ version: '1.5.0', managed: false, dev: false }, '1.5.0', null, 'install'],
+      [{ version: null, managed: false, dev: false }, '1.5.0', null, 'install'],
+      [{ version: '1.6.0', managed: false, dev: false }, '1.5.2', null, 'ahead'],
+      [{ version: '2.0.0', managed: true, dev: false }, '1.9.0', null, 'ahead'],
+      [{ version: '1.8.0', managed: true, dev: false }, '1.9.0', { version: '1.9.0' }, 'held'],
+      [{ version: '1.8.0', managed: true, dev: false }, '1.9.1', { version: '1.9.0' }, 'install'],
+      [{ version: '1.8.0', managed: true, dev: false }, 'not-semver', null, 'unknown'],
+      [{ unknown: true }, '1.9.0', null, 'unknown'],
+    ];
+    const wrong = table.filter(([installed, latestVersion, hold, expected]) =>
+      autoUpdateDecision({ installed, latestVersion, hold }) !== expected);
+    ok(wrong.length === 0, `A5: autoUpdateDecision table — dev, major (managed or not), install, current, bootstrap, ahead, held, unknown${wrong.length ? ` (wrong: ${JSON.stringify(wrong)})` : ''}`);
+    const dir = scenario('unmanaged-major');
+    let installed = false;
+    const result = await check({
+      brainDir: dir,
+      currentVersion: '1.9.0',
+      now: Date.UTC(2026, 9, 3, 14, 0, 0),
+      fetchLatest: async () => '2.0.0',
+      installVersion: async () => { installed = true; },
+    });
+    ok(result.result === 'major-blocked' && !installed, 'A5: the major gate applies to an unmanaged (direct-package) runtime too');
+  }
+
+  {
+    const dir = scenario('change-respects-backoff');
+    writeRuntime(dir, '1.4.0');
+    const t = Date.UTC(2026, 9, 3, 15, 0, 0);
+    await check({ brainDir: dir, now: t, fetchLatest: async () => { throw new Error('offline'); } });
+    writeRuntime(dir, '1.4.1');
+    const during = view(dir, t + 6 * MINUTE);
+    const atRetry = view(dir, t + AUTO_UPDATE_RETRY_MS[0]);
+    ok(!during.due && during.failures === 1 && during.dueReason === 'retry' && during.stale,
+      'A3: an install change never bypasses a pending failure backoff');
+    ok(atRetry.due, 'A3: … the retry still runs at its backoff time');
+  }
+
+  {
+    const dir = scenario('total-scheduler');
+    writeRuntime(dir, '1.4.0');
+    const t = Date.UTC(2026, 9, 3, 16, 0, 0);
+    const files = autoUpdatePaths(dir);
+    const matching = { result: 'current', currentVersion: '1.4.0', identity: { version: '1.4.0', managed: true, dev: false } };
+    const cases = [
+      ['lastCheck 1e20', { lastCheck: 1e20 }, matching, 'invalid-stamp'],
+      ['lastCheck two days ahead', { lastCheck: t + 2 * DAY }, matching, 'invalid-stamp'],
+      ["nextCheckAt 'x'", { lastCheck: t - MINUTE, nextCheckAt: 'x' }, matching, 'invalid-stamp'],
+      ['nextCheckAt two days ahead', { lastCheck: t - MINUTE, nextCheckAt: t + 2 * DAY }, matching, 'invalid-stamp'],
+      ['failures -1', { lastCheck: t - 7 * HOUR, failures: -1 }, matching, 'interval'],
+      ['status identity null', { lastCheck: t - 7 * HOUR }, { result: 'current', currentVersion: '1.4.0', identity: null }, 'interval'],
+      ["stamp '[]'", [], matching, 'invalid-stamp'],
+    ];
+    for (const [label, stamp, status, reason] of cases) {
+      fs.writeFileSync(files.stamp, JSON.stringify(stamp));
+      fs.writeFileSync(files.status, JSON.stringify(status));
+      let seen = null, spawned = null, threw = null;
+      try {
+        seen = view(dir, t);
+        spawned = spawnAutoUpdateHelper({ brainDir: dir, env: {}, now: t, spawnProcess: fakeChild });
+      } catch (error) { threw = error; }
+      ok(!threw && seen?.due && seen.dueReason === reason && !!spawned && !seen.scheduleError,
+        `A3: ${label} never throws from inspect/spawn and is due (${reason})`);
+    }
+    fs.writeFileSync(files.stamp, JSON.stringify({ lastCheck: t - MINUTE, failures: 0, nextCheckAt: t + 6 * HOUR }));
+    fs.writeFileSync(files.status, JSON.stringify(matching));
+    fs.writeFileSync(files.lock, JSON.stringify({ protocol: 1, token: 'future', pid: process.pid, acquiredAt: t + 2 * DAY }));
+    const futureLock = view(dir, t);
+    ok(futureLock.due && futureLock.dueReason === 'invalid-stamp' && futureLock.inProgress === null,
+      'A3: a lock dated more than a day ahead is invalid, not an owner');
+    fs.rmSync(files.lock, { force: true });
+    let threw = null;
+    try {
+      autoUpdateSchedule();
+      for (const input of [null, false, 42, [], "invalid", { get stamp() { throw new Error("unreadable input"); } }]) autoUpdateSchedule(input);
+      autoUpdateSchedule({ stamp: { lastCheck: 'soon', failures: 'many' }, status: 42, installed: 'x', lock: { acquiredAt: -5 }, now: NaN, ttlMs: -1 });
+      autoUpdateSchedule({ stamp: { lastCheck: t, nextCheckAt: t }, status: { identity: { version: 7 } }, installed: { version: 'x' }, now: t });
+    } catch (error) { threw = error; }
+    ok(!threw, 'A3: autoUpdateSchedule is total over arbitrary input');
+  }
+
+  {
+    const dir = scenario('in-progress');
+    writeRuntime(dir, '1.4.0');
+    const t = Date.UTC(2026, 9, 3, 17, 0, 0);
+    const files = autoUpdatePaths(dir);
+    const writeLock = (pid, acquiredAt) => fs.writeFileSync(files.lock, JSON.stringify({ protocol: 1, token: `${pid}-holder`, pid, acquiredAt }));
+    writeLock(process.pid, t - MINUTE);
+    const live = view(dir, t);
+    let launches = 0;
+    const spawned = spawnAutoUpdateHelper({ brainDir: dir, env: {}, now: t, spawnProcess: () => { launches++; return fakeChild(); } });
+    ok(!live.due && live.inProgress?.pid === process.pid && spawned === null && launches === 0,
+      'A3: not due while a live helper holds the lock — spawners stop launching helpers that would only be busy');
+    writeLock(DEAD_PID, t - MINUTE);
+    ok(view(dir, t).due && view(dir, t).inProgress === null, 'A3: a lock left by a dead helper does not hold the schedule');
+    writeLock(process.pid, t - 3 * HOUR);
+    ok(view(dir, t).due, 'A3: a live-looking owner older than 2 h no longer holds it (pid reuse / hung backstop)');
+  }
+
+  {
+    const dir = scenario('pre-stamp');
+    writeRuntime(dir, '1.4.0');
+    const t = Date.UTC(2026, 9, 3, 18, 0, 0);
+    let seen = null;
+    const result = await check({
+      brainDir: dir,
+      now: t,
+      fetchLatest: async () => { seen = readStamp(dir); return '1.5.0'; },
+      installVersion: async () => { throw new Error('EPERM: rename .mcp-runtime.json'); },
+    });
+    ok(seen?.failures === 1 && seen.nextCheckAt === t + AUTO_UPDATE_RETRY_MS[0] && seen.inProgress?.pid === process.pid,
+      'A7: before any network call the attempt is stamped as FAILED (+15 min, inProgress)');
+    const status = readStatus(dir);
+    ok(result.result === 'failed' && status.latestVersion === '1.5.0' && status.attempt === 1
+      && status.nextRetryAt === new Date(t + AUTO_UPDATE_RETRY_MS[0]).toISOString(),
+    'A7: a failed install keeps the fetched latestVersion, the attempt number and the retry time');
+    ok(readStamp(dir).failures === 1 && readStamp(dir).inProgress === null, 'A7: the failed outcome keeps the incremented count');
+    const recovered = await check({ brainDir: dir, now: t + AUTO_UPDATE_RETRY_MS[0], fetchLatest: async () => '1.5.0', installVersion: installAs() });
+    ok(recovered.result === 'updated' && readStamp(dir).failures === 0
+      && readStamp(dir).nextCheckAt === t + AUTO_UPDATE_RETRY_MS[0] + AUTO_UPDATE_TTL_MS,
+    'A7: a terminal outcome resets failures to 0 and schedules now + 6 h');
+  }
+
+  {
+    // A helper that DIES after the pre-stamp (sleep, shutdown, AV, the npx
+    // timeout) must escalate, never retry every 15 min forever. Real child
+    // processes: each one exits inside fetchLatest, leaving its lock behind.
+    const dir = scenario('dying-helper');
+    writeRuntime(dir, '1.4.0');
+    const driver = path.join(root, 'dying-helper-driver.mjs');
+    const moduleUrl = pathToFileURL(path.join(HERE, '..', 'src', 'mcp-auto-update.mjs')).href;
+    // The child records what it saw with a synchronous file write: stdout to a
+    // pipe is not guaranteed to flush before process.exit().
+    fs.writeFileSync(driver, [
+      "import fs from 'fs';",
+      `import { autoUpdatePaths, runAutoUpdateCheck } from ${JSON.stringify(moduleUrl)};`,
+      'const [dir, now, observed] = [process.argv[2], Number(process.argv[3]), process.argv[4]];',
+      'await runAutoUpdateCheck({',
+      '  brainDir: dir, now, enabled: true, force: false, currentVersion: null,',
+      '  fetchLatest: async () => { fs.copyFileSync(autoUpdatePaths(dir).stamp, observed); process.exit(9); },',
+      '});',
+    ].join('\n'));
+    let t = Date.UTC(2026, 9, 3, 19, 0, 0);
+    const intervals = [];
+    const earlyDue = [];
+    const onTimeDue = [];
+    for (let round = 1; round <= 5; round++) {
+      const observed = path.join(root, `dying-helper-round-${round}.json`);
+      const run = spawnSync(process.execPath, [driver, dir, String(t), observed], { encoding: 'utf8', timeout: 60_000 });
+      let stamp = null;
+      try { stamp = JSON.parse(fs.readFileSync(observed, 'utf8')); } catch { /* reported below */ }
+      if (run.status !== 9 || stamp?.failures !== round) {
+        ok(false, `A7: helper round ${round} died after its pre-stamp (exit ${run.status}, ${String(run.stderr || '').slice(0, 160)})`);
+        break;
+      }
+      intervals.push(stamp.nextCheckAt - stamp.lastCheck);
+      earlyDue.push(view(dir, stamp.nextCheckAt - 1).due);
+      onTimeDue.push(view(dir, stamp.nextCheckAt).due);
+      t = stamp.nextCheckAt;
+    }
+    ok(JSON.stringify(intervals) === JSON.stringify([15 * MINUTE, HOUR, 4 * HOUR, 6 * HOUR, 6 * HOUR]),
+      `A7: a helper that dies after the pre-stamp escalates 15m → 1h → 4h → 6h (${intervals.map((ms) => `${ms / MINUTE}m`).join(' → ')})`);
+    ok(intervals.length === 5 && intervals.every((ms, i) => i === 0 || ms >= intervals[i - 1]), 'A7: the backoff never shrinks');
+    ok(earlyDue.length === 5 && earlyDue.every((due) => !due) && onTimeDue.every(Boolean),
+      "A7: each retry is due on time and not a moment early — the dead helper's lock never blocks it");
+  }
+
+  {
+    const dir = scenario('lock-semantics');
+    writeRuntime(dir, '1.9.0');
+    const t = Date.UTC(2026, 9, 3, 20, 0, 0);
+    const files = autoUpdatePaths(dir);
+    const writeLock = (pid, acquiredAt) => fs.writeFileSync(files.lock, JSON.stringify({ protocol: 1, token: `${pid}-holder`, pid, acquiredAt }));
+    writeLock(DEAD_PID, t - 1000);
+    const taken = await check({ brainDir: dir, now: t, fetchLatest: async () => '1.9.0' });
+    ok(taken.result === 'current' && !fs.existsSync(files.lock), 'A8: a lock whose owner pid is dead is taken over at once');
+    writeLock(process.pid, t - 1000);
+    const live = await check({ brainDir: dir, now: t, force: true, fetchLatest: noFetch });
+    ok(live.result === 'busy', 'A8: a live owner keeps its lock');
+    const EPERM_PID = 4242424;
+    const realKill = process.kill;
+    process.kill = (pid, signal) => {
+      if (pid === EPERM_PID) { const error = new Error('EPERM: operation not permitted'); error.code = 'EPERM'; throw error; }
+      return realKill.call(process, pid, signal);
+    };
+    try {
+      writeLock(EPERM_PID, t - 1000);
+      const eperm = await check({ brainDir: dir, now: t, force: true, fetchLatest: noFetch });
+      ok(eperm.result === 'busy', 'A8: EPERM from kill(pid, 0) counts as alive');
+    } finally { process.kill = realKill; }
+    writeLock(process.pid, t - 3 * HOUR);
+    const hung = await check({ brainDir: dir, now: t, force: true, fetchLatest: async () => '1.9.0' });
+    ok(hung.result === 'current', 'A8: a live-looking owner older than 2 h is taken over (pid reuse / hung backstop)');
+  }
+
+  {
+    const dir = scenario('awaited-finalize');
+    writeRuntime(dir, '1.4.0');
+    const t = Date.UTC(2026, 9, 3, 21, 0, 0);
+    const files = autoUpdatePaths(dir);
+    let lockDuringReconcile = null;
+    await check({
+      brainDir: dir,
+      now: t,
+      fetchLatest: async () => '1.5.0',
+      installVersion: installAs(),
+      reconcileProjects: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        lockDuringReconcile = fs.existsSync(files.lock);
+        return { checked: 0, updated: 0, unchanged: 0, failed: 0, skipped: 0, projects: [] };
+      },
+    });
+    ok(lockDuringReconcile === true && !fs.existsSync(files.lock),
+      'A9: the machine lock is held through the harness pass and the status write, then released');
+    const broken = scenario('status-write-fails');
+    writeRuntime(broken, '1.4.0');
+    fs.mkdirSync(autoUpdatePaths(broken).status);   // every rename onto the status path now fails
+    let outcome = null, rejected = null;
+    try {
+      outcome = await check({ brainDir: broken, now: t, fetchLatest: async () => '1.5.0', installVersion: installAs() });
+    } catch (error) { rejected = error; }
+    ok(!rejected && outcome?.result === 'updated' && !!outcome.recordError,
+      'A9: a failed status write after a good install is reported, never thrown');
+    ok(readStamp(broken).failures === 1 && readStamp(broken).inProgress === null,
+      'A9: an unrecorded outcome keeps the attempt counted, so the next check redoes it');
+  }
+
+  {
+    const dir = scenario('atomic-json');
+    const target = path.join(dir, 'status.json');
+    const realRename = fs.renameSync;
+    let attempts = 0;
+    fs.renameSync = (from, to) => {
+      attempts++;
+      if (attempts <= 2) { const error = new Error('EPERM: simulated reader hold'); error.code = 'EPERM'; throw error; }
+      return realRename.call(fs, from, to);
+    };
+    let threw = null;
+    try { __test.atomicJson(target, { committed: true }); }
+    catch (error) { threw = error; }
+    finally { fs.renameSync = realRename; }
+    ok(!threw && attempts === 3 && JSON.parse(fs.readFileSync(target, 'utf8')).committed === true,
+      'A10: a transient EPERM on the rename is outlasted and the file is committed');
+    attempts = 0;
+    fs.renameSync = () => { attempts++; const error = new Error('ENOENT: gone'); error.code = 'ENOENT'; throw error; };
+    threw = null;
+    try { __test.atomicJson(target, { committed: false }); }
+    catch (error) { threw = error; }
+    finally { fs.renameSync = realRename; }
+    ok(threw?.code === 'ENOENT' && attempts === 1 && fs.readdirSync(dir).every((name) => !name.endsWith('.tmp')),
+      'A10: a non-retryable error is rethrown at once and the staged tmp is removed');
+  }
+
+  {
+    const dir = scenario('dev-deploy-race');
+    writeRuntime(dir, '1.9.0');
+    const result = await check({
+      brainDir: dir,
+      now: Date.UTC(2026, 9, 3, 22, 0, 0),
+      fetchLatest: async () => '1.9.1',
+      // brain:deploy (dev:true, no install lock) lands during the fetch window.
+      installVersion: installAs({ dev: true }),
+    });
+    ok(result.result === 'dev-owned' && readStatus(dir).identity?.dev === true
+      && readStamp(dir).identity?.dev === true && readStamp(dir).failures === 0,
+    'A11: a dev deploy that wins the race is recorded as dev-owned, never updated');
+  }
+
+  {
+    const dir = scenario('harness-gating');
+    writeRuntime(dir, '1.5.2');
+    const t = Date.UTC(2026, 9, 4, 0, 0, 0);
+    const passes = [];
+    let hash = 'aaaa1111';
+    let latest = '1.5.2';
+    const run = (now, extra = {}) => check({
+      brainDir: dir,
+      now,
+      fetchLatest: async () => latest,
+      installVersion: installAs(),
+      loadRules: async () => ({ INSTRUCTIONS_HASH: hash }),
+      reconcileProjects: async ({ version }) => {
+        passes.push({ now, version });
+        return { checked: 1, updated: 0, unchanged: 1, failed: 0, skipped: 0, projects: [] };
+      },
+      ...extra,
+    });
+    await run(t);
+    await run(t + AUTO_UPDATE_TTL_MS);
+    ok(passes.length === 1 && readStatus(dir).harness?.checkedAt === new Date(t).toISOString()
+      && readStatus(dir).harness?.instructionsHash === 'aaaa1111',
+    'A12: an unchanged runtime does not re-run the harness pass at every 6 h check (the last receipt is kept)');
+    hash = 'bbbb2222';
+    await run(t + 2 * AUTO_UPDATE_TTL_MS);
+    ok(passes.length === 2, 'A12: changed managed instructions re-run the pass');
+    await run(t + 3 * AUTO_UPDATE_TTL_MS);
+    await run(t + 2 * AUTO_UPDATE_TTL_MS + AUTO_UPDATE_HARNESS_REFRESH_MS);
+    ok(passes.length === 3, 'A12: an otherwise unchanged runtime is re-checked once a day');
+    writeRuntime(dir, '1.5.3');   // installed by hand: identity changed
+    latest = '1.5.3';
+    const changedAt = t + 2 * AUTO_UPDATE_TTL_MS + AUTO_UPDATE_HARNESS_REFRESH_MS + AUTO_UPDATE_RECHECK_FLOOR_MS;
+    await run(changedAt);
+    ok(passes.length === 4 && passes.at(-1).version === '1.5.3', 'A12: a changed installed identity re-runs the pass');
+    latest = '1.5.4';
+    await run(changedAt + AUTO_UPDATE_TTL_MS);
+    ok(passes.length === 5 && passes.at(-1).version === '1.5.4', 'A12: an install by the helper always runs the pass');
+  }
+
+  {
+    const dir = scenario('stale-registrations');
+    const now = Date.UTC(2026, 9, 3, 12, 0, 0);
+    const fresh = path.join(dir, 'fresh');
+    const stale = path.join(dir, 'stale');
+    for (const project of [fresh, stale]) {
+      fs.mkdirSync(project, { recursive: true });
+      fs.writeFileSync(path.join(project, 'brain.klypix'), 'placeholder brain');
+    }
+    registerProjectBrain({ brainPath: path.join(fresh, 'brain.klypix'), brainDir: dir, now: now - DAY });
+    registerProjectBrain({ brainPath: path.join(stale, 'brain.klypix'), brainDir: dir, now: now - 15 * DAY });
+    const rules = { auditProject, compactAgentsBrief, linkProject };
+    const bulk = await reconcileRegisteredProjects({ brainDir: dir, version: '1.5.2', now, rules });
+    ok(bulk.checked === 2 && bulk.updated === 1 && bulk.skipped === 1
+      && bulk.projects.find((item) => item.project === 'stale')?.reason === 'stale-registration'
+      && bulk.skippedReasons?.['stale-registration'] === 1
+      && !fs.existsSync(path.join(stale, 'AGENTS.md')),
+    'A12: the bulk pass skips registrations unseen for 14 days and reports them as stale-registration');
+    const named = await reconcileRegisteredProjects({ brainDir: dir, version: '1.5.2', now, rules, brainPaths: [path.join(stale, 'brain.klypix')] });
+    ok(named.updated === 1 && fs.existsSync(path.join(stale, 'AGENTS.md')),
+      "A12: a project named explicitly (brain_sync's own) is reconciled however old its registration");
+  }
+
+  // ── 2026-10-03 review round ─────────────────────────────────────────────────
+  const iso = (ms) => new Date(ms).toISOString();
+
+  {
+    // TQ-3: the transitions that must NOT re-open the schedule. Each could be
+    // flipped to "fires" with the suite green; a regression would re-query npm
+    // 5 min after a brain:deploy (npm → dev at the same version) or after the
+    // receipts lose the runtime manifest, and bootstrap a runtime 5 min after
+    // they vanish instead of at the next 6 h check.
+    const t = Date.UTC(2026, 9, 4, 4, 0, 0);
+    const files = (dir) => autoUpdatePaths(dir);
+    const transitions = [
+      ['became-dev-owned', (dir) => writeRuntime(dir, '1.4.0', { dev: true })],
+      ['became-unmanaged', (dir) => fs.rmSync(files(dir).runtime)],   // .brain-version.json kept
+      ['receipts-missing', (dir) => { fs.rmSync(files(dir).runtime); fs.rmSync(files(dir).version); }],
+    ];
+    for (const [reason, transition] of transitions) {
+      const dir = scenario(`tq3-${reason}`);
+      writeRuntime(dir, '1.4.0');
+      await check({ brainDir: dir, now: t, fetchLatest: async () => '1.4.0' });
+      transition(dir);
+      const plus6 = view(dir, t + 6 * MINUTE);
+      const plus60 = view(dir, t + 60 * MINUTE);
+      ok(plus6.stale && plus6.staleReason === reason && !plus6.due && !plus60.due
+        && plus60.dueReason === 'interval' && plus60.dueAt === iso(t + AUTO_UPDATE_TTL_MS),
+      `TQ-3: ${reason} is reported stale but never re-opens the schedule (not due at +6 min or +60 min; next check at lastCheck + 6 h)`);
+    }
+  }
+
+  {
+    // TQ-4: the first state of every npm machine after this release lands is
+    // written by the 1.89.0 helper that installed it — result 'updated', no
+    // identity, currentVersion = the old version, installedVersion = the new.
+    // The result describes the INSTALLED version (A2's installedVersion-first).
+    const dir = scenario('legacy-updated');
+    writeRuntime(dir, '1.5.0');
+    const t = Date.UTC(2026, 9, 4, 5, 0, 0);
+    fs.writeFileSync(autoUpdatePaths(dir).stamp, JSON.stringify({ protocol: 1, lastCheck: t, checkedAt: iso(t) }));
+    fs.writeFileSync(autoUpdatePaths(dir).status, JSON.stringify({
+      protocol: 1, result: 'updated', checkedAt: iso(t), currentVersion: '1.4.0', latestVersion: '1.5.0',
+      installedVersion: '1.5.0', lastUpdatedAt: iso(t), harness: { checked: 0, updated: 0, unchanged: 0, failed: 0, skipped: 0, projects: [] },
+    }));
+    const soon = view(dir, t + 10 * MINUTE);
+    const before = view(dir, t + AUTO_UPDATE_TTL_MS - 1);
+    const atTtl = view(dir, t + AUTO_UPDATE_TTL_MS);
+    ok(!soon.stale && !soon.due && !before.due && atTtl.due && atTtl.dueReason === 'interval'
+      && soon.identity?.version === '1.5.0' && soon.identity?.legacy === true && soon.hold === null && soon.nextHold === null,
+    'TQ-4: a legacy "updated" status from the 1.89.0 helper describes the installed v1.5.0 — not stale, next check at lastCheck + 6 h, no hold');
+  }
+
+  {
+    // CF-4: a power cut can leave either file full of NULs (NTFS journals
+    // metadata, not data). The hold used to live only in the status: losing it
+    // re-installed the version the owner had rolled back from.
+    const dir = scenario('status-loss-keeps-hold');
+    writeRuntime(dir, '1.9.0');
+    const t = Date.UTC(2026, 9, 4, 6, 0, 0);
+    const installs = [];
+    const install = async (version, { brainDir }) => { installs.push(version); writeRuntime(brainDir, version); };
+    await check({ brainDir: dir, now: t, fetchLatest: async () => '1.9.1', installVersion: install });
+    writeRuntime(dir, '1.9.0');   // --force rollback
+    await check({ brainDir: dir, now: t + AUTO_UPDATE_TTL_MS, fetchLatest: async () => '1.9.1', installVersion: install });
+    ok(readStatus(dir).result === 'held' && readStamp(dir).hold?.version === '1.9.1',
+      'CF-4: the stamp mirrors the hold the status records');
+    fs.writeFileSync(autoUpdatePaths(dir).status, Buffer.alloc(64));
+    const lost = view(dir, t + 2 * AUTO_UPDATE_TTL_MS);
+    ok(lost.hold?.version === '1.9.1' && lost.nextHold?.version === '1.9.1',
+      'CF-4: with the status unreadable, the view still reports the hold (from the stamp)');
+    const after = await check({ brainDir: dir, now: t + 2 * AUTO_UPDATE_TTL_MS, fetchLatest: async () => '1.9.1', installVersion: install });
+    ok(after.result === 'held' && installs.length === 1 && readStatus(dir).hold?.version === '1.9.1',
+      'CF-4: … and the next check still holds it — the rolled-back-from version is never re-installed');
+  }
+
+  {
+    // CF-4, the stamp half: two failures (next retry in 1 h), then the stamp is
+    // lost. It read as "never checked" (due at once, failures 0) and the next
+    // failure was attempt 1 (15 min) instead of attempt 3 (4 h).
+    const dir = scenario('stamp-loss-keeps-backoff');
+    writeRuntime(dir, '1.4.0');
+    const t = Date.UTC(2026, 9, 4, 7, 0, 0);
+    const offline = async () => { throw new Error('offline'); };
+    await check({ brainDir: dir, now: t, fetchLatest: offline });
+    const second = t + AUTO_UPDATE_RETRY_MS[0];
+    await check({ brainDir: dir, now: second, fetchLatest: offline });
+    const retryAt = second + AUTO_UPDATE_RETRY_MS[1];
+    ok(readStamp(dir).failures === 2 && readStamp(dir).nextCheckAt === retryAt, 'CF-4 setup: two failures, the next retry 1 h out');
+    fs.writeFileSync(autoUpdatePaths(dir).stamp, Buffer.alloc(64));
+    const early = view(dir, second + 10 * MINUTE);
+    const onTime = view(dir, retryAt);
+    ok(!early.due && early.dueReason === 'invalid-stamp' && early.failures === 2 && onTime.due,
+      'CF-4: an unreadable stamp is rebuilt from the status — the 1 h retry is not shortened to "now"');
+    await check({ brainDir: dir, now: retryAt, fetchLatest: offline });
+    ok(readStamp(dir).failures === 3 && readStamp(dir).nextCheckAt === retryAt + AUTO_UPDATE_RETRY_MS[2] && readStatus(dir).attempt === 3,
+      'CF-4: the next failure is attempt 3 (4 h), never attempt 1 — the backoff never shrinks');
+    // Both files lost: the unknown counts as one failed attempt, not zero.
+    fs.writeFileSync(autoUpdatePaths(dir).stamp, Buffer.alloc(64));
+    fs.writeFileSync(autoUpdatePaths(dir).status, Buffer.alloc(64));
+    await check({ brainDir: dir, now: retryAt + AUTO_UPDATE_RETRY_MS[2], fetchLatest: offline });
+    ok(readStamp(dir).failures === 2, 'CF-4: with both files unreadable a failure is attempt 2, never a fresh attempt 1');
+  }
+
+  {
+    // CF-3: helper A slept > 2 h mid-install; B took its lock (A8). Both reach
+    // their terminal writes. Whatever the order, the record is A's real install
+    // — never B's failure (B's installer could not take A's .install.lock).
+    const files = (dir) => autoUpdatePaths(dir);
+    const t = Date.UTC(2026, 9, 4, 8, 0, 0);
+    const thiefAt = t + 2 * HOUR + MINUTE;
+    const npm = (version) => ({ version, managed: true, dev: false });
+    const robbed = (dir) => {   // B's footprint while A sleeps: the lock it took, its pre-stamp
+      fs.writeFileSync(files(dir).lock, JSON.stringify({ protocol: 1, token: 'thief-token', pid: process.pid, acquiredAt: thiefAt }));
+      fs.writeFileSync(files(dir).stamp, JSON.stringify({
+        protocol: 1, lastCheck: thiefAt, checkedAt: iso(thiefAt), failures: 2, nextCheckAt: thiefAt + HOUR,
+        identity: npm('1.9.0'), hold: null, inProgress: { pid: 4242, startedAt: iso(thiefAt) },
+      }));
+    };
+    const thiefFailed = (dir) => {
+      fs.writeFileSync(files(dir).status, JSON.stringify({
+        protocol: 1, result: 'failed', checkedAt: iso(thiefAt), currentVersion: '1.9.0', latestVersion: '1.9.1',
+        identity: npm('1.9.0'), attempt: 2, nextRetryAt: iso(thiefAt + HOUR), error: 'npm installer exited 1',
+      }));
+      fs.writeFileSync(files(dir).stamp, JSON.stringify({
+        protocol: 1, lastCheck: thiefAt, checkedAt: iso(thiefAt), failures: 2, nextCheckAt: thiefAt + HOUR,
+        identity: npm('1.9.0'), hold: null, inProgress: null,
+      }));
+    };
+    {
+      // B's failure lands first; then A — robbed — finishes its install.
+      const dir = scenario('lock-theft-install-last');
+      writeRuntime(dir, '1.9.0');
+      const result = await check({
+        brainDir: dir, now: t, fetchLatest: async () => '1.9.1',
+        installVersion: async (version, { brainDir }) => { robbed(brainDir); thiefFailed(brainDir); writeRuntime(brainDir, version); },
+      });
+      ok(result.result === 'updated' && readStatus(dir).result === 'updated' && readStamp(dir).failures === 0
+        && JSON.parse(fs.readFileSync(files(dir).lock, 'utf8')).token === 'thief-token',
+      'CF-3: a robbed helper still records the install it made — and leaves the lock it no longer owns alone');
+    }
+    {
+      // A finishes first (robbed); B, the owner, fails afterwards.
+      const dir = scenario('lock-theft-failure-last');
+      writeRuntime(dir, '1.9.0');
+      const result = await check({
+        brainDir: dir, now: thiefAt, fetchLatest: async () => '1.9.1',
+        installVersion: async (version, { brainDir }) => {
+          writeRuntime(brainDir, '1.9.1');   // A's install, then A's records
+          fs.writeFileSync(files(brainDir).status, JSON.stringify({
+            protocol: 1, result: 'updated', checkedAt: iso(t), currentVersion: '1.9.0', latestVersion: '1.9.1',
+            installedVersion: '1.9.1', identity: npm('1.9.1'),
+          }));
+          fs.writeFileSync(files(brainDir).stamp, JSON.stringify({
+            protocol: 1, lastCheck: t, checkedAt: iso(t), failures: 0, nextCheckAt: t + AUTO_UPDATE_TTL_MS,
+            identity: npm('1.9.1'), hold: null, inProgress: null,
+          }));
+          throw new Error('npm installer exited 1');
+        },
+      });
+      ok(result.result === 'failed' && result.superseded === true
+        && readStatus(dir).result === 'updated' && readStamp(dir).failures === 0 && readStamp(dir).lastCheck === t,
+      'CF-3: a failure never overwrites an outcome another helper recorded after this attempt began');
+    }
+    {
+      // A robbed helper that installed nothing records nothing — not even a
+      // truthful-looking 'current' over whatever the thief is doing.
+      const dir = scenario('lock-theft-robbed-current');
+      writeRuntime(dir, '1.9.0');
+      const result = await check({
+        brainDir: dir, now: t, fetchLatest: async () => { robbed(dir); return '1.9.0'; }, installVersion: noInstall,
+      });
+      ok(result.result === 'current' && result.superseded === true && !fs.existsSync(files(dir).status)
+        && readStamp(dir).lastCheck === thiefAt,
+      'CF-3: a robbed helper\'s non-install outcome writes nothing — the thief\'s pre-stamp stands');
+    }
+    {
+      // The lock was taken, but the thief has not pre-stamped yet: this helper's
+      // pre-stamp is still on disk, and its failure still is not its to record.
+      const dir = scenario('lock-theft-before-prestamp');
+      writeRuntime(dir, '1.9.0');
+      const result = await check({
+        brainDir: dir, now: t, fetchLatest: async () => '1.9.1',
+        installVersion: async () => {
+          fs.writeFileSync(files(dir).lock, JSON.stringify({ protocol: 1, token: 'thief-token', pid: process.pid, acquiredAt: thiefAt }));
+          throw new Error('npm install timed out');
+        },
+      });
+      ok(result.superseded === true && !fs.existsSync(files(dir).status)
+        && readStamp(dir).lastCheck === t && readStamp(dir).inProgress?.pid === process.pid,
+      'CF-3: a helper whose lock was taken records no failure, even before the thief has stamped');
+    }
+    {
+      // A robbed helper's own failure writes nothing: the thief owns the record.
+      const dir = scenario('lock-theft-robbed-fails');
+      writeRuntime(dir, '1.9.0');
+      const result = await check({
+        brainDir: dir, now: t, fetchLatest: async () => '1.9.1',
+        installVersion: async (version, { brainDir }) => { robbed(brainDir); throw new Error('npm install timed out'); },
+      });
+      ok(result.superseded === true && !fs.existsSync(files(dir).status) && readStamp(dir).lastCheck === thiefAt,
+        'CF-3: a robbed helper\'s failure writes nothing — the thief\'s pre-stamp stands');
+    }
+    {
+      // Release by rename-then-verify: a lock another helper took over between
+      // our read and our release is never deleted.
+      const dir = scenario('release-lock');
+      const lock = path.join(dir, '.autoupdate.lock');
+      fs.writeFileSync(lock, JSON.stringify({ protocol: 1, token: 'ours', pid: process.pid, acquiredAt: 1 }));
+      const realRead = fs.readFileSync;
+      let replaced = false;
+      fs.readFileSync = function (file, ...rest) {
+        const out = realRead.call(fs, file, ...rest);
+        if (!replaced && path.resolve(String(file)) === path.resolve(lock)) {
+          replaced = true;
+          fs.writeFileSync(lock, JSON.stringify({ protocol: 1, token: 'theirs', pid: process.pid, acquiredAt: 2 }));
+        }
+        return out;
+      };
+      let released = null;
+      try { released = __test.releaseLock(lock, 'ours'); }
+      finally { fs.readFileSync = realRead; }
+      ok(released === false && JSON.parse(fs.readFileSync(lock, 'utf8')).token === 'theirs' && fs.readdirSync(dir).length === 1,
+        'CF-3: the lock is released by rename-then-verify — a lock replaced after our read survives');
+    }
+  }
+
+  {
+    // MV-2: a rollback onto a release from before the hold replaces this
+    // module's FILE; long-lived processes keep the new code in memory but launch
+    // the file. Modelled with a copy imported first, then overwritten.
+    const dir = scenario('pre-hold-helper');
+    const copy = path.join(dir, 'module', 'mcp-auto-update.mjs');
+    fs.mkdirSync(path.dirname(copy), { recursive: true });
+    const source = path.join(HERE, '..', 'src', 'mcp-auto-update.mjs');
+    fs.copyFileSync(source, copy);
+    const loaded = await import(`${pathToFileURL(copy).href}?pre-hold`);
+    const brainDir = path.join(dir, 'brain');
+    fs.mkdirSync(brainDir, { recursive: true });
+    writeRuntime(brainDir, '1.9.0');
+    const t = Date.UTC(2026, 9, 4, 9, 0, 0);
+    await loaded.runAutoUpdateCheck({
+      brainDir, now: t, enabled: true, force: false, currentVersion: null,
+      fetchLatest: async () => '1.9.1', installVersion: installAs(),
+    });
+    writeRuntime(brainDir, '1.9.0');   // npx klypix-mcp@<pre-hold> install --force ...
+    fs.writeFileSync(copy, '// a 1.89.0-era updater: 24 h stamp, no hold\nexport async function runAutoUpdateCheck() {}\n');   // ... replaced the helper too
+    const due = t + AUTO_UPDATE_TTL_MS;
+    let launches = 0;
+    const spawnProcess = () => { launches++; return fakeChild(); };
+    const seen = loaded.inspectAutoUpdate(brainDir, { now: due, env: {} });
+    ok(seen.due && seen.helperApi === 1 && seen.nextHold?.version === '1.9.1' && seen.decision === 'install',
+      'MV-2: the view knows the helper on disk predates the hold, and decides as that helper will (install), never "held" on its behalf');
+    ok(loaded.spawnAutoUpdateHelper({ brainDir, env: {}, now: due, spawnProcess }) === null && launches === 0,
+      'MV-2: a spawner never launches a pre-hold helper while a hold applies');
+    fs.copyFileSync(source, copy);   // a hold-aware helper again
+    ok(!!loaded.spawnAutoUpdateHelper({ brainDir, env: {}, now: due, spawnProcess }) && launches === 1,
+      'MV-2: … a hold-aware helper is launched as usual');
+  }
+
+  {
+    // MV-3: the spawn gate runs in long-lived code, the throttle in the helper
+    // on disk. A helper that changes nothing (an older one still throttling, or
+    // one that cannot start) is not relaunched at every 10-min poll.
+    const dir = scenario('spawn-memory');
+    writeRuntime(dir, '1.4.0');
+    const t = Date.UTC(2026, 9, 4, 10, 0, 0);
+    let launches = 0;
+    const spawnProcess = () => { launches++; return fakeChild(); };   // writes nothing
+    const spawn = (now) => spawnAutoUpdateHelper({ brainDir: dir, env: {}, now, spawnProcess });
+    ok(!!spawn(t) && launches === 1, 'MV-3: a due check launches the helper');
+    ok(spawn(t + AUTO_UPDATE_POLL_MS) === null && spawn(t + 2 * AUTO_UPDATE_POLL_MS) === null
+      && launches === 1 && view(dir, t + 2 * AUTO_UPDATE_POLL_MS).due,
+    'MV-3: still due, but a helper that left the stamp and status untouched is not relaunched every poll');
+    ok(!!spawn(t + AUTO_UPDATE_SPAWN_RETRY_MS) && launches === 2, 'MV-3: … it is relaunched after AUTO_UPDATE_SPAWN_RETRY_MS');
+    fs.writeFileSync(autoUpdatePaths(dir).stamp, JSON.stringify({ protocol: 1, lastCheck: t - 7 * HOUR, failures: 0 }));
+    ok(!!spawn(t + AUTO_UPDATE_SPAWN_RETRY_MS + AUTO_UPDATE_POLL_MS) && launches === 3,
+      'MV-3: … or as soon as the stamp or the status changes');
+  }
+
+  {
+    // K2 (2026-10-03): ONE overdue rule, pure and total. The doctor and the
+    // SessionStart notice used to judge "overdue" with their own conditions.
+    const t = Date.UTC(2026, 9, 5, 12, 0, 0);
+    const iso = (ms) => new Date(ms).toISOString();
+    const plan = (over = {}) => ({
+      dueAt: iso(t - 2 * HOUR), dueReason: 'interval', inProgress: null, scheduleError: null, helperApi: 2,
+      installedIdentity: { version: '1.4.0', managed: true, dev: false, installedAt: null, unknown: false },
+      stampWrittenAt: iso(t - 8 * HOUR), runtimeCommittedAt: null, ...over,
+    });
+    // A live session that polled the schedule 5 min ago (K3's evidence).
+    const session = (over = {}) => ({ bootedAt: iso(t - 10 * HOUR), autoUpdate: { enabled: true, lastPollAt: iso(t - 5 * MINUTE) }, ...over });
+    const judge = (p, supervisors = [session()], extra = {}) => autoUpdateOverdue({ plan: p, supervisors, now: t, ...extra });
+
+    const late = judge(plan());
+    ok(late.overdue && late.overdueByMs === 2 * HOUR && late.dueForMs === 2 * HOUR && late.evidence?.sessions === 1 && late.suppressed === null,
+      'K2: due 2 h, polled by a live session since → overdue by 2 h');
+    ok(judge(plan({ dueAt: iso(t - AUTO_UPDATE_OVERDUE_GRACE_MS) })).overdue
+      && !judge(plan({ dueAt: iso(t - AUTO_UPDATE_OVERDUE_GRACE_MS + 1000) })).overdue,
+    'K2: overdue from exactly 30 min past due (now ≥ due + 30 min), not a second sooner');
+    ok(judge(plan(), []).suppressed === 'no-live-session'
+      && judge(plan(), [session({ autoUpdate: { enabled: false } })]).suppressed === 'no-live-session'
+      && !judge(plan(), [session({ autoUpdate: { enabled: false } })]).overdue,
+    'K2: no live session with updates on → never overdue');
+    ok(!judge(plan({ dueAt: iso(t - 20 * MINUTE) })).overdue && judge(plan({ dueAt: iso(t - 20 * MINUTE) })).suppressed === null
+      && !judge(plan({ inProgress: { pid: 7, startedAt: iso(t - MINUTE) } })).overdue
+      && !judge(plan({ scheduleError: 'boom' })).overdue && !judge(plan({ dueAt: null })).overdue,
+    'K2: a check due < 30 min, running, or with an unknown schedule is not judged');
+    ok(judge(plan({ helperApi: 1 })).suppressed === 'pre-hold-updater' && !judge(plan({ helperApi: 1 })).overdue
+      && judge(plan(), [session()], { helperApi: 1 }).suppressed === 'pre-hold-updater' && judge(plan({ helperApi: 1 }), [session()], { helperApi: 2 }).overdue,
+    'K2: a pre-hold updater (helperApi 1) is never judged; the caller can name the helper spawners launch');
+    const changed = (installedAt, runtimeCommittedAt = null) => judge(plan({
+      dueAt: iso(t - 5 * HOUR), dueReason: 'install-changed', runtimeCommittedAt,
+      installedIdentity: { version: '1.4.0', managed: true, dev: false, installedAt, unknown: false },
+    }));
+    ok(changed(iso(t - HOUR)).overdueByMs === HOUR && !changed(iso(t - 10 * MINUTE)).overdue
+      && changed(null, iso(t - HOUR)).overdueByMs === HOUR,
+    'K2: an install-changed check is late from the install (receipt installedAt, else the runtime manifest mtime), not from its lastCheck floor');
+    const never = (stampWrittenAt) => judge(plan({ dueAt: iso(t), dueReason: 'never-checked', stampWrittenAt }));
+    ok(never(null).overdue && never(null).dueForMs === null && never(null).overdueByMs === 10 * HOUR
+      && never(iso(t - 3 * HOUR)).dueForMs === 3 * HOUR && never(iso(t - 3 * HOUR)).overdueByMs === 3 * HOUR,
+    'K2: a check due "now" by construction is due since its stamp was written, or since before any record (measured from the session start)');
+    let threw = null;
+    try {
+      for (const input of [undefined, null, {}, { plan: 'x' }, { plan: { dueAt: 5 } }, { plan: plan(), supervisors: 'x', now: NaN },
+        { plan: plan({ dueReason: 'never-checked', dueAt: iso(t) }), supervisors: [null, 7, { bootedAt: 1e20 }, { autoUpdate: 'x' }], now: t }]) {
+        const result = autoUpdateOverdue(input);
+        if (typeof result?.overdue !== 'boolean') throw new Error(`no verdict for ${JSON.stringify(input)}`);
+      }
+    } catch (error) { threw = error; }
+    ok(!threw, `K2: autoUpdateOverdue is total over arbitrary input${threw ? ` (${threw.message})` : ''}`);
+
+    // The schedule view carries the two file times the rule needs, so callers do no I/O for it.
+    const dir = scenario('overdue-file-times');
+    writeRuntime(dir, '1.4.0');
+    const before = view(dir, t);
+    fs.writeFileSync(autoUpdatePaths(dir).stamp, JSON.stringify({ protocol: 1, lastCheck: t - HOUR, failures: 0 }));
+    const after = view(dir, t);
+    ok(before.stampWrittenAt === null && Number.isFinite(Date.parse(before.runtimeCommittedAt))
+      && Number.isFinite(Date.parse(after.stampWrittenAt)),
+    'K2: inspectAutoUpdate reports when the stamp (null: never written) and the runtime receipt were written');
+  }
+
+  {
+    // K3 (2026-10-03): overdue needs EVIDENCE that a poller ran after the check
+    // fell due — a live supervisor's autoUpdate.lastPollAt at least 2 min after
+    // it — not a session merely open since before. That closes the post-sleep
+    // false positive: on waking, every session reads "open for hours".
+    const due = Date.UTC(2026, 9, 6, 2, 0, 0);
+    const iso = (ms) => new Date(ms).toISOString();
+    const plan = {
+      dueAt: iso(due), dueReason: 'interval', inProgress: null, scheduleError: null, helperApi: 2,
+      installedIdentity: { version: '1.4.0', managed: true, dev: false, installedAt: null, unknown: false },
+      stampWrittenAt: iso(due - 6 * HOUR), runtimeCommittedAt: null,
+    };
+    const polled = (pollAt, over = {}) => ({ bootedAt: iso(due - 12 * HOUR), autoUpdate: { enabled: true, lastPollAt: iso(pollAt) }, ...over });
+    const judge = (now, supervisors) => autoUpdateOverdue({ plan, supervisors, now });
+
+    const slept = judge(due + 7 * HOUR, [polled(due - 20 * MINUTE)]);
+    ok(!slept.overdue && slept.suppressed === 'no-poll-evidence',
+      'K3: a machine asleep across dueAt (its last poll was before it) is not overdue on waking, though its sessions were open for hours');
+    const tick = [polled(due + 5 * MINUTE)];
+    ok(!judge(due + 29 * MINUTE, tick).overdue && judge(due + 30 * MINUTE, tick).overdue
+      && judge(due + 30 * MINUTE, tick).evidence?.lastPollAt === iso(due + 5 * MINUTE),
+    'K3: a tick 5 min after due that left the stamp unmoved → overdue once 30 min past due, naming that poll');
+    const preFix = judge(due + 3 * HOUR, [{ bootedAt: iso(due - 12 * HOUR), autoUpdate: { enabled: true } }, { bootedAt: iso(due - 12 * HOUR) }]);
+    ok(!preFix.overdue && preFix.suppressed === 'no-poll-evidence',
+      'K3: receipts without lastPollAt (supervisor code from before this rule) are never evidence — not judged');
+    ok(!judge(due + HOUR, [polled(due + AUTO_UPDATE_POLL_EVIDENCE_MS - 1000)]).overdue
+      && judge(due + HOUR, [polled(due + AUTO_UPDATE_POLL_EVIDENCE_MS)]).overdue,
+    'K3: only a poll at least 2 min after the check fell due counts');
+    const now = due + HOUR;
+    ok(!judge(now, [polled(now - AUTO_UPDATE_POLL_SETTLE_MS + 1000)]).overdue
+      && judge(now, [polled(now - AUTO_UPDATE_POLL_SETTLE_MS)]).overdue,
+    'K3: a poll younger than the settle time is not evidence yet — the helper it launched may still be taking the lock');
+    ok(!judge(now, [polled(now + 5 * MINUTE)]).overdue
+      && !judge(now, [polled(due + 5 * MINUTE, { autoUpdate: { enabled: false, lastPollAt: iso(due + 5 * MINUTE) } })]).overdue,
+    'K3: a poll stamped in the future, or by a supervisor with updates off, is not evidence');
+    const mixed = judge(now, [polled(due - 10 * MINUTE), polled(due + 20 * MINUTE, { bootedAt: iso(due + 18 * MINUTE) })]);
+    ok(mixed.overdue && mixed.evidence?.sessions === 1 && mixed.overdueByMs === HOUR,
+      'K3: one session that polled after due is enough; overdue is measured from when the check fell due');
   }
 
   {

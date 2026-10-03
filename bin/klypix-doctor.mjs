@@ -2,8 +2,8 @@
 // klypix-doctor — `npx klypix-mcp doctor`. The brain's self-check: is THIS machine's
 // brain current, are the Claude capture and Codex presence adapters wired, what verbs
 // does it expose, which lifecycle sessions are live, and is the harness projection in
-// sync? ONE fact, ONE reconcile block. Read-only (never writes). Exits 0 = ALIGNED,
-// 1 = DRIFTED — so it
+// sync? ONE fact, ONE reconcile block. Read-only (never writes). Exits 0 = ALIGNED
+// or PARTIAL (readiness warnings, no drift), 1 = DRIFTED — so it
 // doubles as a pre-commit / CI readiness gate.
 //
 //   npx klypix-mcp doctor              # this project + this machine's brain
@@ -63,9 +63,14 @@ try {
   }
 
   const drifted = report.verdict === 'DRIFTED' || extraDrift > 0;
+  // PARTIAL used to end with "✓ aligned." under a head that said PARTIAL
+  // (2026-10-03) — the closing line is what people read. Exit code unchanged.
+  const warnings = Array.isArray(report.readinessWarnings) ? report.readinessWarnings.length : 0;
   console.log(drifted ? (color ? '\x1b[33m' : '') + `\n✗ drift found — see reconcile above.` + (color ? '\x1b[0m' : '')
     : report.verdict === 'NOT-INSTALLED' ? '\n• brain not installed on this machine.'
-      : (color ? '\x1b[32m' : '') + '\n✓ aligned.' + (color ? '\x1b[0m' : ''));
+      : report.verdict === 'PARTIAL'
+        ? (color ? '\x1b[33m' : '') + `\n• partial — ${warnings} readiness warning${warnings === 1 ? '' : 's'} above (no drift)` + (color ? '\x1b[0m' : '')
+        : (color ? '\x1b[32m' : '') + '\n✓ aligned.' + (color ? '\x1b[0m' : ''));
   process.exit(drifted ? 1 : 0);
 } catch (e) {
   console.error(`✗ doctor failed: ${e?.message || e}`);

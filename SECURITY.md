@@ -19,9 +19,9 @@ worth sending; do not sit on something because it is not fully characterised.
 ## Supported versions
 
 Fixes ship on the latest published version only. There are no maintained release
-branches — `npm i klypix-mcp@latest` is the upgrade path, and the supervisor's
-once-per-24h version check (disable with `KLYPIX_AUTO_UPDATE=0`) is how most
-installations learn a new one exists.
+branches — `npm i klypix-mcp@latest` is the upgrade path, and the automatic update
+check (every 6 hours; disable with `KLYPIX_AUTO_UPDATE=0`) is how most installations
+learn a new one exists.
 
 ## What this package touches
 
@@ -37,9 +37,13 @@ report might concern:
 - **The brain is a file in your repository** and the presence lane is a file under your
   home directory. Both are readable by anything running as your user; neither is
   encrypted at rest, and neither is intended to hold secrets.
-- **The engine makes no network calls**, with two documented exceptions: the
-  once-per-24h npm version check, and — only after explicit, per-brain, default-off
-  consent given in the KLYPIX desktop app — the cross-PC presence relay.
+- **The engine makes no network calls**, with documented exceptions: the two anonymous
+  npm version probes (the updater's check every 6 hours — plus a re-check after another
+  install upgrades the runtime, and retries 15 minutes, 1 hour and 4 hours after a failed
+  check — which also installs a newer same-major release, and the Claude Code Stop hook's
+  at-most-daily probe in brain projects; `KLYPIX_AUTO_UPDATE=0` turns both off), and —
+  only after explicit, per-brain, default-off consent given in the KLYPIX desktop app —
+  the cross-PC presence relay.
 - **Coordination between sessions is advisory.** Overlap warnings are a coordination
   aid, not an access control. Nothing here is a security boundary between agents
   running as the same user, and it should not be relied on as one.

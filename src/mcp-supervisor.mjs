@@ -547,8 +547,18 @@ class Supervisor {
         lastSwapAt: this.lastSwapAt,
         lastError: this.lastError,
         autoUpdate: {
+          // currentVersion: what scheduleAutoUpdate hands the helper, so the
+          // receipt's `decision` is the helper's decision.
+          ...inspectAutoUpdate(path.dirname(this.runtimeManifest), {
+            currentVersion: this.active?.version || this.fallbackTarget?.version || null,
+          }),
+          // This supervisor's OWN setting, spread last (2026-10-03 integration
+          // review). The doctor ("enabled in N of M connections") and the
+          // SessionStart notice ("overdue") read it to know which connections
+          // run checks; the environment's `enabled` from inspectAutoUpdate used
+          // to overwrite it, so a supervisor embedded with autoUpdate:false
+          // (the klypix-mcp/supervisor API) claimed to run them.
           enabled: this.autoUpdate,
-          ...inspectAutoUpdate(path.dirname(this.runtimeManifest)),
         },
         runtimeManifest: this.runtimeManifest.replace(/\\/g, '/'),
         active: this.active ? {

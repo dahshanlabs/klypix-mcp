@@ -886,7 +886,35 @@ try {
       'B8: once the same manifest verifies again its integrity error is cleared, and nothing swaps');
   });
 
+  // 2026-10-03 integration review: the receipt's autoUpdate.enabled is the
+  // supervisor's OWN setting. The doctor ("enabled in N of M connections") and
+  // the SessionStart notice ("overdue") read it to know which connections run
+  // checks, but the environment's view from inspectAutoUpdate() overwrote it,
+  // so a supervisor embedded with autoUpdate:false (the public
+  // klypix-mcp/supervisor API) claimed to run them.
+  const embeddedReceiptOwnSetting = () => scenario('embedded', async (track) => {
+    const dir = runtimeDir('embedded');
+    install(dir, '90.0.0', { identity: true });
+    const entry = path.join(dir, 'embedded-supervisor.mjs');
+    fs.writeFileSync(entry, [
+      `import { runMcpSupervisor } from ${JSON.stringify(pathToFileURL(path.join(HERE, '..', 'src', 'mcp-supervisor.mjs')).href)};`,
+      `await runMcpSupervisor({ fallbackWorker: ${JSON.stringify(path.join(dir, 'worker.mjs'))}, fallbackVersion: '90.0.0', autoUpdate: false });`,
+      '',
+    ].join('\n'));
+    // Updates ON in the environment. KLYPIX_MCP_AUTO_UPDATE_CHILD=1 still keeps
+    // any helper from starting: nothing in this suite may contact npm.
+    const pair = track(await openPair(dir, 'embedded', {
+      entry,
+      env: { KLYPIX_AUTO_UPDATE: '', KLYPIX_MCP_AUTO_UPDATE_CHILD: '1', KLYPIX_WORKER_HIBERNATE_MS: '0' },
+    }));
+    ok(await pair.call() === '90.0.0', 'an embedded supervisor (runMcpSupervisor, autoUpdate:false) serves its worker');
+    const state = await waitFor(async () => (pair.state()?.status === 'ready' ? pair.state() : null), 10000);
+    ok(state.autoUpdate?.enabled === false && 'dueReason' in (state.autoUpdate || {}),
+      "the receipt records the supervisor's own auto-update setting (off), not its environment's (on), next to the schedule");
+  });
+
   await Promise.all([
+    embeddedReceiptOwnSetting(),
     asleepThenWakeIntoNewer(),
     breakingWakeWithoutPrev(),
     majorWakeResumesPrev(),

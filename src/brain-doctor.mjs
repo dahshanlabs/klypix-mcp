@@ -650,7 +650,9 @@ function autoUpdateView({ au, brainDir, supervisors, version, hooks, npmLatest, 
   const pollers = live.filter((state) => state.autoUpdateEnabled !== false);
   const pollTimes = pollers.map((state) => timeOf(state.lastPollAt)).filter((ms) => Number.isFinite(ms) && ms <= now + 1000);
   const latestPollAt = pollTimes.length ? new Date(Math.max(...pollTimes)).toISOString() : null;
-  const unpolledSessions = pollers.filter((state) => !Number.isFinite(timeOf(state.lastPollAt))).length;
+  // Pre-fix supervisor code (no supervisorVersion, B9) never records a poll; a
+  // fixed one records its first 2 s after it starts, so it is not counted here.
+  const unpolledSessions = pollers.filter((state) => state.preFix && !Number.isFinite(timeOf(state.lastPollAt))).length;
 
   const knownLatest = knownNpmLatest(brainDir, au, npmLatest, now);
   // MV-2: a pre-hold updater re-installs whatever the owner rolled back from;

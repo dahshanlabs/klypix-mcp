@@ -816,6 +816,13 @@ const supervisorReceipt = (brainDir, name, state) => writeJson(path.join(brainDi
     && auLine(textOf(r)).includes(`check due since ${dueSince} (2h) — overdue is not judged: no open session has recorded a poll since then — 1 connection on pre-fix supervisor code records none (/mcp reconnect)`)
     && !/check due now|runs within/.test(auLine(textOf(r))),
   `TR-1: with only pre-fix receipts the line says the check has been due 2h and why it is not judged — never "due now — runs within 10 min" (${auLine(textOf(r))})`);
+  // A FIXED supervisor that has not polled yet (it polls 2 s after it starts)
+  // is not called pre-fix code.
+  liveSupervisor({ bootedAt: iso(NOW - 1_000), autoUpdate: { enabled: true } });
+  r = run();
+  ok(r.autoUpdate.unpolledSessions === 0 && !/pre-fix/.test(auLine(textOf(r)))
+    && auLine(textOf(r)).includes(`check due since ${dueSince} (2h) — no open session has polled since then; it runs within 10 min while one is open`),
+  `TR-1: a fixed supervisor that has not polled yet is not counted as pre-fix code (${auLine(textOf(r))})`);
   // F9 (2026-10-03 review): a session that opened seconds ago — the first
   // SessionStart after an idle night — has polled, but the helper its poll
   // launched has not taken the lock yet. That poll is no evidence yet.

@@ -15,7 +15,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { laneFileFor, listActiveSessions } from '../src/agent-presence.mjs';
 import { AUTO_UPDATE_POLL_MS } from '../src/mcp-auto-update.mjs';
-import { __test as supervisorTest } from '../src/mcp-supervisor.mjs';
+import { __test as supervisorTest, readRuntimeTarget } from '../src/mcp-supervisor.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BIN = path.join(HERE, '..', 'bin', 'klypix-mcp.mjs');
@@ -33,7 +33,10 @@ const isAlive = (pid) => {
   catch { return false; }
 };
 
-function workerSource(version, { extraTool = false, removeVersion = false, presence = null, identity = false, bootAudit = null } = {}) {
+function workerSource(version, {
+  extraTool = false, removeVersion = false, presence = null, identity = false, bootAudit = null,
+  crashOnce = null, hangOnce = null, initDelayMs = 0,
+} = {}) {
   const toolNames = [
     ...(removeVersion ? [] : ['version']),
     'slow',
@@ -54,7 +57,16 @@ const PRESENCE = ${JSON.stringify(presence)};
 // every SDK server it answers unknown requests with "Method not found".
 const IDENTITY = ${JSON.stringify(identity)};
 const BOOT_AUDIT = ${JSON.stringify(bootAudit)};
-if (BOOT_AUDIT) fs.appendFileSync(BOOT_AUDIT, JSON.stringify({ pid: process.pid, version: VERSION, file: process.argv[1] }) + '\\n');
+if (BOOT_AUDIT) fs.appendFileSync(BOOT_AUDIT, JSON.stringify({ pid: process.pid, version: VERSION, file: process.argv[1], autoUpdate: process.env.KLYPIX_AUTO_UPDATE ?? null }) + '\\n');
+// Transient failures, once per marker file: crash at start, or ignore the first
+// initialize (the supervisor's initialize timeout then fires).
+const CRASH_ONCE = ${JSON.stringify(crashOnce)};
+if (CRASH_ONCE && fs.existsSync(CRASH_ONCE)) { fs.unlinkSync(CRASH_ONCE); process.exit(1); }
+const HANG_ONCE = ${JSON.stringify(hangOnce)};
+let hangInitialize = false;
+if (HANG_ONCE && fs.existsSync(HANG_ONCE)) { fs.unlinkSync(HANG_ONCE); hangInitialize = true; }
+// A real worker answers initialize in ~0.5 s, sometimes longer than one 1 s poll.
+const INIT_DELAY_MS = ${JSON.stringify(initDelayMs)};
 // A presence-owning fixture must behave like the REAL worker: it registers its
 // lane row and REMOVES it on shutdown. Without the removal, a supervisor that
 // fails to hold the row still looks correct — exactly how the first takeover
@@ -88,6 +100,8 @@ const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity 
 rl.on('line', async line => {
   let msg; try { msg = JSON.parse(line); } catch { return; }
   if (msg.method === 'initialize') {
+    if (hangInitialize) { hangInitialize = false; return; }
+    if (INIT_DELAY_MS) await new Promise(resolve => setTimeout(resolve, INIT_DELAY_MS));
     send({ jsonrpc: '2.0', id: msg.id, result: {
       protocolVersion: msg.params?.protocolVersion || '2025-06-18',
       capabilities: { tools: { listChanged: true } },
@@ -590,7 +604,7 @@ try {
     throw new Error('could not obtain a dead pid');
   })();
 
-  async function openPair(dir, name, { env = {}, args = [], entry = BIN } = {}) {
+  async function openPair(dir, name, { env = {}, args = [], entry = BIN, pollMs = null } = {}) {
     const stateDir = path.join(dir, 'states');
     fs.mkdirSync(stateDir, { recursive: true });
     let listChanged = 0;
@@ -616,6 +630,7 @@ try {
       ...env,
     };
     delete childEnv.KLYPIX_MCP_SUPERVISOR_POLL_MS;   // the production 1000 ms poll
+    if (pollMs) childEnv.KLYPIX_MCP_SUPERVISOR_POLL_MS = String(pollMs);
     const transport = new StdioClientTransport({
       command: process.execPath,
       args: [entry, ...args],
@@ -748,17 +763,24 @@ try {
     await sleep(3000);
     ok(boots(audit).length === bootCount && boots(audit).filter(entry => entry.version === '91.0.0').length === 1,
       'B4: the new major was tried once and never respawned');
+    ok(/resumed v90\.0\.0 from \.prev; v91\.0\.0 needs \/mcp reconnect \(major upgrade/.test(pair.logs())
+      && !/recovered worker v90\.0\.0 without reconnect/.test(pair.logs()),
+    'F10: the log says the .prev resume still needs a reconnect, never "recovered … without reconnect"');
   });
 
-  // B8 swap at 1 s + B1/B3: a --force rollback while asleep.
+  // B8 swap at 1 s + B1/B3: a --force rollback while asleep. MV-1 (2026-10-03
+  // review): v90.1.0 takes 2.5 s to initialize — longer than one 1 s poll, as a
+  // real worker sometimes does — and adds a tool, so a rollback slipped in
+  // while the wake's .prev candidate validates would either hot-swap to v90.0.0
+  // or strand the pair restart-required. Boots are counted seconds later.
   const swapThenRollbackWhileAsleep = () => scenario('rollback', async (track) => {
     const dir = runtimeDir('rollback');
     const audit = path.join(dir, 'boots.jsonl');
     install(dir, '90.0.0', { identity: true, bootAudit: audit });
     const pair = track(await openPair(dir, 'b3-rollback'));
     await pair.call();
-    install(dir, '90.1.0', { identity: true, bootAudit: audit });
-    await waitFor(async () => (await pair.call()) === '90.1.0', 15000);
+    install(dir, '90.1.0', { identity: true, bootAudit: audit, extraTool: true, initDelayMs: 2500 });
+    await waitFor(async () => (await pair.call()) === '90.1.0', 20000);
     ok(pair.state()?.hotReloads === 1, 'B8: the stat-gated 1 s poll still hot-swaps a live pair when an install commits');
     await waitFor(async () => pair.state()?.status === 'hibernated', 20000);
     const count = pair.state().hibernation.count;
@@ -770,9 +792,15 @@ try {
       && asleep.hibernation.pendingWakeTarget === null && boots(audit).length === bootCount,
     'B1: a rollback installed while hibernated is not a wake target and does not wake the pair');
     ok(await pair.call() === '90.1.0', 'B3: the wake does not adopt the rollback — it resumes v90.1.0, the version the pair last ran');
+    await sleep(4000);   // several 1 s polls after the .prev candidate committed
     const woke = boots(audit).slice(bootCount);
     ok(woke.length === 1 && woke[0].version === '90.1.0' && fromPrev(woke[0]),
-      'B3: that wake booted only .prev — the rolled-back v90.0.0 never started');
+      `B3/MV-1: that wake booted only .prev — the rolled-back v90.0.0 never started, even while .prev validated across polls (boots: ${woke.map(entry => `${entry.version}${fromPrev(entry) ? '(.prev)' : ''}`).join(' ') || 'none'})`);
+    // Ready, or asleep again (1 s idle): a restart-required pair never hibernates.
+    const settled = pair.state();
+    const ran = settled?.active?.version || settled?.hibernation?.target?.version;
+    ok(['ready', 'hibernated'].includes(settled?.status) && ran === '90.1.0' && !settled.lastError && await pair.call() === '90.1.0',
+      `MV-1: the woken pair stays on v90.1.0 — no in-place downgrade, no "breaking tool manifest" for a deliberate rollback (${settled?.status}${settled?.lastError ? `: ${settled.lastError}` : ''})`);
   });
 
   // B3: an install that stopped half-way.
@@ -822,7 +850,8 @@ try {
       `await runMcpSupervisor({ fallbackWorker: ${JSON.stringify(path.join(dir, 'worker.mjs'))}, fallbackVersion: '90.0.0', workerArgs: [] });`,
       '',
     ].join('\n'));
-    const pair = track(await openPair(dir, 'b3-flat', { entry }));
+    // F6: the reinstall hint needs 3 refusals over 10 min in production; 0 here.
+    const pair = track(await openPair(dir, 'b3-flat', { entry, env: { KLYPIX_MCP_WAKE_REINSTALL_HINT_MS: '0' } }));
     await pair.call();
     await waitFor(async () => pair.state()?.status === 'hibernated', 20000);
     install(dir, '90.1.0', { identity: true, bootAudit: audit, commit: false });
@@ -834,7 +863,20 @@ try {
     const deferred = pair.state();
     ok(deferred?.status === 'hibernated' && /integrity mismatch: worker\.mjs/.test(deferred.lastError || ''),
       'B3: the pair stays hibernated (presence held) and reports the integrity error');
+    ok(deferred?.hibernation?.wakeDeferred?.count === 1 && /integrity mismatch: worker\.mjs/.test(deferred.hibernation.wakeDeferred.reason || ''),
+      'F6: the receipt records the refused wake, so the doctor stops promising a wake on the next request');
+    const second = await pair.callError();
+    const third = await pair.callError();
+    ok(/retry shortly/.test(String(second?.message || ''))
+      && /still do not verify .* after 3 attempts since .* — reinstall with npx -y klypix-mcp@latest install --force, then retry/.test(String(third?.message || ''))
+      && pair.state()?.hibernation?.wakeDeferred?.count === 3 && boots(audit).length === bootCount,
+    `F6: a refusal that persists names the reinstall instead of "retry shortly" (${String(third?.message || '').slice(0, 160)})`);
     commitManifest(dir, '90.1.0');   // the interrupted install is re-run to completion
+    const healed = await waitFor(async () => {
+      const s = pair.state();
+      return s?.status === 'hibernated' && s.lastError === null && s.hibernation?.wakeDeferred === null ? s : null;
+    }, 10000).then(() => true, () => false);
+    ok(healed, 'F6: once the runtime verifies again, the poller clears the refusal while the pair still sleeps');
     ok(await pair.call() === '90.1.0' && pair.state()?.lastError === null,
       'B3: the next request wakes into the completed install, with no reconnect');
   });
@@ -894,7 +936,8 @@ try {
   // klypix-mcp/supervisor API) claimed to run them.
   const embeddedReceiptOwnSetting = () => scenario('embedded', async (track) => {
     const dir = runtimeDir('embedded');
-    install(dir, '90.0.0', { identity: true });
+    const audit = path.join(dir, 'boots.jsonl');
+    install(dir, '90.0.0', { identity: true, bootAudit: audit });
     const entry = path.join(dir, 'embedded-supervisor.mjs');
     fs.writeFileSync(entry, [
       `import { runMcpSupervisor } from ${JSON.stringify(pathToFileURL(path.join(HERE, '..', 'src', 'mcp-supervisor.mjs')).href)};`,
@@ -911,6 +954,11 @@ try {
     const state = await waitFor(async () => (pair.state()?.status === 'ready' ? pair.state() : null), 10000);
     ok(state.autoUpdate?.enabled === false && 'dueReason' in (state.autoUpdate || {}),
       "the receipt records the supervisor's own auto-update setting (off), not its environment's (on), next to the schedule");
+    // CF-5 (2026-10-03 review): the worker runs its own update poll from its
+    // own environment, so "off" in the receipt was true of the supervisor only.
+    const workerBoots = boots(audit);
+    ok(workerBoots.length >= 1 && workerBoots.every(entry => entry.autoUpdate === '0'),
+      `CF-5: the worker of a supervisor embedded with autoUpdate:false runs with KLYPIX_AUTO_UPDATE=0 (${JSON.stringify(workerBoots.map(entry => entry.autoUpdate))})`);
   });
 
   await Promise.all([
@@ -925,6 +973,302 @@ try {
     realWorkerProbeStampsNoActivity(),
     integrityErrorWrittenOnce(),
   ]);
+
+  // ── 2026-10-03 review round: wakes of a direct-package pair, transient wake
+  // failures, the stat gate's forced read, an unreadable manifest ────────────
+  // A direct-package launch in miniature: the supervisor's own worker lives
+  // OUTSIDE the managed runtime directory, like <npx cache>/klypix-mcp/bin.
+  const packageEntry = (name, version, options = {}) => {
+    const pkgDir = path.join(root, 'b', `${name}-pkg`);
+    fs.mkdirSync(pkgDir, { recursive: true });
+    const worker = path.join(pkgDir, 'worker.mjs');
+    fs.writeFileSync(worker, workerSource(version, options));
+    const entry = path.join(pkgDir, 'entry.mjs');
+    fs.writeFileSync(entry, [
+      `import { runMcpSupervisor } from ${JSON.stringify(pathToFileURL(path.join(HERE, '..', 'src', 'mcp-supervisor.mjs')).href)};`,
+      `await runMcpSupervisor({ fallbackWorker: ${JSON.stringify(worker)}, fallbackVersion: ${JSON.stringify(version)}, workerArgs: [] });`,
+      '',
+    ].join('\n'));
+    return { entry, worker };
+  };
+  // The flat bundle in miniature: the supervisor's own worker IS the runtime's.
+  const flatEntry = (dir, version) => {
+    const entry = path.join(dir, 'server.mjs');
+    fs.writeFileSync(entry, [
+      `import { runMcpSupervisor } from ${JSON.stringify(pathToFileURL(path.join(HERE, '..', 'src', 'mcp-supervisor.mjs')).href)};`,
+      `await runMcpSupervisor({ fallbackWorker: ${JSON.stringify(path.join(dir, 'worker.mjs'))}, fallbackVersion: ${JSON.stringify(version)}, workerArgs: [] });`,
+      '',
+    ].join('\n'));
+    return entry;
+  };
+  const answer = (pair) => pair.call().catch(error => `ERROR ${error?.message || error}`);
+  const bootList = (entries) => entries.map(entry => `${entry.version}${fromPrev(entry) ? '(.prev)' : ''}`).join(' ') || 'none';
+
+  // CF-1: the README's `npx -y klypix-mcp` (Claude Desktop) runs the package's
+  // own worker while the managed runtime is OLDER. Its first wake after a
+  // hibernation settled restart-required ("a rollback applies at the next
+  // reconnect") — after every publish, until the managed runtime caught up.
+  const packagePairWakesOwnWorker = () => scenario('pkg-older-runtime', async (track) => {
+    const dir = runtimeDir('pkg-older-runtime');
+    const audit = path.join(dir, 'boots.jsonl');
+    install(dir, '90.0.0', { identity: true, bootAudit: audit });
+    const { entry, worker } = packageEntry('pkg-older-runtime', '90.1.0', { identity: true, bootAudit: audit });
+    const pair = track(await openPair(dir, 'cf1-pkg-older', { entry }));
+    ok(await pair.call() === '90.1.0', 'CF-1: a direct-package pair whose managed runtime is older serves the package\'s own worker');
+    await waitFor(async () => pair.state()?.status === 'hibernated', 20000);
+    const bootCount = boots(audit).length;
+    const first = await answer(pair);
+    const second = await answer(pair);
+    const woke = boots(audit).slice(bootCount);
+    const s = pair.state();
+    ok(first === '90.1.0' && second === '90.1.0', `CF-1: after a hibernation it wakes into the worker it ran — no reconnect error (${first} / ${second})`);
+    ok(['ready', 'hibernated'].includes(s?.status) && !s.lastError && woke.length >= 1 && woke.every(item => samePath(item.file, worker)),
+      `CF-1: the wake booted only the package worker; the older managed runtime never started (${s?.status}; ${bootList(woke)})`);
+  });
+
+  // CF-1: the same pair while the managed runtime fails integrity. The worker
+  // it slept on is the package's own, outside the managed directory: every
+  // request waited ~5 s and failed "core files do not verify … retry shortly".
+  const packagePairWakesThroughIntegrity = () => scenario('pkg-integrity', async (track) => {
+    const dir = runtimeDir('pkg-integrity');
+    const audit = path.join(dir, 'boots.jsonl');
+    install(dir, '90.0.0', { identity: true, bootAudit: audit });
+    writeAtomic(manifestOf(dir), fs.readFileSync(manifestOf(dir), 'utf8').replace(/("worker\.mjs": ")[0-9a-f]{64}/, `$1${'0'.repeat(64)}`));
+    const { entry, worker } = packageEntry('pkg-integrity', '90.1.0', { identity: true, bootAudit: audit });
+    const pair = track(await openPair(dir, 'cf1-pkg-integrity', { entry }));
+    ok(await pair.call() === '90.1.0', 'CF-1: a direct-package pair beside a runtime failing integrity serves the package\'s own worker');
+    await waitFor(async () => pair.state()?.status === 'hibernated', 20000);
+    const bootCount = boots(audit).length;
+    const woken = await answer(pair);
+    const woke = boots(audit).slice(bootCount);
+    ok(woken === '90.1.0' && woke.length >= 1 && woke.every(item => samePath(item.file, worker)) && !pair.state()?.hibernation?.wakeDeferred,
+      `CF-1: it wakes into the package worker it slept on — never "core files do not verify" for a worker outside the managed directory (${woken.slice(0, 120)})`);
+  });
+
+  // TQ-6: a pair that slept on the MANAGED runtime meets an install that
+  // stopped half-way, with no .prev to resume. The package's own worker lives
+  // outside the managed directory, so the wake boots that — a consistent graph
+  // — and never the half-installed runtime's worker.mjs.
+  const runtimePairWakesPackageOnIntegrity = () => scenario('pkg-fallback-integrity', async (track) => {
+    const dir = runtimeDir('pkg-fallback-integrity');
+    const audit = path.join(dir, 'boots.jsonl');
+    install(dir, '90.0.0', { identity: true, bootAudit: audit });
+    const { entry, worker } = packageEntry('pkg-fallback-integrity', '90.0.0', { identity: true, bootAudit: audit });
+    const pair = track(await openPair(dir, 'tq6-pkg-fallback', { entry }));
+    ok(await pair.call() === '90.0.0' && samePath(boots(audit)[0]?.file, path.join(dir, 'worker.mjs')),
+      'TQ-6: an equal-version direct-package pair starts on the managed runtime');
+    await waitFor(async () => pair.state()?.status === 'hibernated', 20000);
+    install(dir, '90.1.0', { identity: true, bootAudit: audit, commit: false });
+    fs.rmSync(path.join(dir, '.prev'), { recursive: true, force: true });
+    const bootCount = boots(audit).length;
+    const woken = await answer(pair);
+    const woke = boots(audit).slice(bootCount);
+    ok(woken === '90.0.0' && woke.length >= 1 && woke.every(item => samePath(item.file, worker)),
+      `TQ-6: with no .prev, the wake boots the package's own worker, never the half-installed runtime (${woken.slice(0, 120)}; ${woke.map(item => path.basename(path.dirname(item.file))).join(' ')})`);
+  });
+
+  // TQ-1: .prev holds a version OTHER than the one this connection last ran
+  // (v90.0.0 after a swap to v90.1.0, which added a tool). A crash on wake
+  // retries the installed core. Resuming any .prev turned it into a permanent
+  // restart-required: gated against v90.1.0, v90.0.0 "removed tools".
+  const crashOnWakeRetriesInstalled = () => scenario('crash-once', async (track) => {
+    const dir = runtimeDir('crash-once');
+    const audit = path.join(dir, 'boots.jsonl');
+    const marker = path.join(dir, 'crash-once.marker');
+    install(dir, '90.0.0', { identity: true, bootAudit: audit });
+    const pair = track(await openPair(dir, 'tq1-crash-once'));
+    await pair.call();
+    install(dir, '90.1.0', { identity: true, bootAudit: audit, extraTool: true, crashOnce: marker });
+    await waitFor(async () => (await pair.call()) === '90.1.0', 15000);
+    await waitFor(async () => pair.state()?.status === 'hibernated', 20000);
+    fs.writeFileSync(marker, 'x');   // the next v90.1.0 boot exits once
+    const bootCount = boots(audit).length;
+    const woken = await answer(pair);
+    await sleep(1500);
+    const woke = boots(audit).slice(bootCount);
+    const s = pair.state();
+    ok(woken === '90.1.0' && ['ready', 'hibernated'].includes(s?.status) && !s.lastError && !fs.existsSync(marker) && !woke.some(fromPrev),
+      `TQ-1: a crash on wake retries the installed v90.1.0 after the backoff; the older .prev never starts (${woken.slice(0, 120)}; ${s?.status}; ${bootList(woke)})`);
+  });
+
+  // TQ-2: a transient failure that is not an exit — the woken candidate
+  // ignores its first initialize — keeps the recovery backoff. Classed as
+  // deterministic, it settled restart-required with no retry.
+  const timeoutOnWakeRetriesInstalled = () => scenario('hang-once', async (track) => {
+    const dir = runtimeDir('hang-once');
+    const audit = path.join(dir, 'boots.jsonl');
+    const marker = path.join(dir, 'hang-once.marker');
+    install(dir, '90.0.0', { identity: true, bootAudit: audit });
+    const pair = track(await openPair(dir, 'tq2-hang-once', { env: { KLYPIX_MCP_SUPERVISOR_TIMEOUT_MS: '2000' } }));
+    await pair.call();
+    install(dir, '90.1.0', { identity: true, bootAudit: audit, extraTool: true, hangOnce: marker });
+    await waitFor(async () => (await pair.call()) === '90.1.0', 15000);
+    await waitFor(async () => pair.state()?.status === 'hibernated', 20000);
+    fs.writeFileSync(marker, 'x');   // the next v90.1.0 boot never answers its initialize
+    const bootCount = boots(audit).length;
+    const woken = await answer(pair);
+    await sleep(1500);
+    const woke = boots(audit).slice(bootCount);
+    const s = pair.state();
+    ok(woken === '90.1.0' && ['ready', 'hibernated'].includes(s?.status) && !s.lastError
+      && woke.filter(item => item.version === '90.1.0' && !fromPrev(item)).length >= 2 && !woke.some(fromPrev),
+    `TQ-2: an initialize timeout on wake is transient — the backoff retry serves v90.1.0, status clean (${woken.slice(0, 120)}; ${s?.status}; ${bootList(woke)})`);
+  });
+
+  // TQ-6: the stat gate only ever SKIPS work. A breaking B is rejected while A
+  // serves; B's worker is then edited with no new manifest (the stat gate still
+  // says "verified"), and A's crash recovery clears the rejection. The next poll
+  // must re-verify B in full before starting it, never boot its new bytes.
+  const forcedReadBeforeCandidate = () => scenario('forced-read', async (track) => {
+    const dir = runtimeDir('forced-read');
+    const writeWorkerFile = (name, version, options) => writeAtomic(path.join(dir, name), workerSource(version, options));
+    const commitWorker = (name, version) => writeAtomic(manifestOf(dir), `${JSON.stringify({
+      protocol: 1, version, worker: name, channel: 'npm', installedAt: new Date().toISOString(),
+      files: { [name]: hash(path.join(dir, name)) },
+    }, null, 2)}\n`);
+    writeWorkerFile('worker-a.mjs', '90.0.0', { identity: true });
+    writeWorkerFile('worker-b.mjs', '90.1.0', { identity: true, removeVersion: true });   // breaking: drops `version`
+    commitWorker('worker-a.mjs', '90.0.0');
+    const pair = track(await openPair(dir, 'tq6-forced-read', { env: { KLYPIX_WORKER_HIBERNATE_MS: '0', KLYPIX_MCP_ROLLBACK_GRACE_MS: '300' } }));
+    ok(await pair.call() === '90.0.0', 'TQ-6: A serves v90.0.0');
+    commitWorker('worker-b.mjs', '90.1.0');
+    await waitFor(async () => /removed tools: version/.test(pair.state()?.lastError || ''), 15000);
+    writeWorkerFile('worker-b.mjs', '90.1.0', { identity: true, extraTool: true });   // new bytes, same manifest
+    const crashed = await pair.callError('crash');
+    await waitFor(async () => pair.state()?.status === 'ready' && pair.state()?.active?.version === '90.0.0', 15000);
+    await sleep(3000);   // several 1 s polls after the recovery commit
+    const served = await answer(pair);
+    const s = pair.state();
+    ok(Boolean(crashed) && served === '90.0.0' && s?.active?.version === '90.0.0'
+      && /integrity mismatch: worker-b\.mjs/.test(s?.lastError || ''),
+    `TQ-6: a cached target is re-verified in full before a candidate starts — the edited B is reported, never booted (${served}; ${s?.lastError})`);
+  });
+
+  // CF-2: a manifest that exists but cannot be read is not "absent". Here it is
+  // briefly a directory (EISDIR); in the field, EBUSY while an installer renames
+  // the new one over it. The wake waits it out like an integrity failure; taken
+  // for "no runtime", it skipped the wait and booted the flat bundle's worker.
+  const unreadableManifestWaitsOnWake = () => scenario('unreadable', async (track) => {
+    const dir = runtimeDir('unreadable');
+    install(dir, '90.0.0', { identity: true });
+    const pair = track(await openPair(dir, 'cf2-unreadable', { entry: flatEntry(dir, '90.0.0') }));
+    await pair.call();
+    await waitFor(async () => pair.state()?.status === 'hibernated', 20000);
+    install(dir, '90.1.0', { identity: true });
+    await waitFor(async () => pair.state()?.hibernation?.pendingWakeTarget?.version === '90.1.0', 10000);
+    const committed = fs.readFileSync(manifestOf(dir), 'utf8');
+    fs.rmSync(manifestOf(dir), { force: true, maxRetries: 20, retryDelay: 25 });
+    fs.mkdirSync(manifestOf(dir));
+    const restore = sleep(1500).then(() => {
+      fs.rmSync(manifestOf(dir), { recursive: true, force: true, maxRetries: 20, retryDelay: 25 });
+      writeAtomic(manifestOf(dir), committed);
+    });
+    const woken = await answer(pair);
+    await restore;
+    ok(woken === '90.1.0', `CF-2: a wake that meets an unreadable (not absent) manifest waits for it and wakes into the install (${woken.slice(0, 160)})`);
+  });
+
+  // CF-2: with NO manifest at all, the flat bundle's own worker is the managed
+  // runtime itself, which nothing verifies — a wake never boots it.
+  const flatAbsentManifestDefers = () => scenario('flat-absent', async (track) => {
+    const dir = runtimeDir('flat-absent');
+    const audit = path.join(dir, 'boots.jsonl');
+    install(dir, '90.0.0', { identity: true, bootAudit: audit });
+    const pair = track(await openPair(dir, 'cf2-flat-absent', { entry: flatEntry(dir, '90.0.0') }));
+    await pair.call();
+    await waitFor(async () => pair.state()?.status === 'hibernated', 20000);
+    const committed = fs.readFileSync(manifestOf(dir), 'utf8');
+    fs.rmSync(manifestOf(dir), { force: true, maxRetries: 20, retryDelay: 25 });
+    const bootCount = boots(audit).length;
+    const refused = await answer(pair);
+    ok(/KLYPIX core files do not verify \(runtime manifest is absent\)/.test(refused) && boots(audit).length === bootCount,
+      `CF-2: a flat-bundle wake with no manifest boots nothing unverified and answers with a retryable error (${refused.slice(0, 140)})`);
+    writeAtomic(manifestOf(dir), committed);
+    await waitFor(async () => pair.state()?.hibernation?.wakeDeferred === null, 10000);
+    ok(await answer(pair) === '90.0.0', 'CF-2: once the manifest is back, the next request wakes the pair');
+  });
+
+  // CF-2: the package's own worker can change on disk under a running
+  // supervisor (an npx cache refresh). A wake uses the version the file carries
+  // NOW — under the old tag every attempt failed "candidate advertised vY,
+  // manifest says vX" and the pair reached recovery-failed.
+  const packageRefreshedWakesNewVersion = () => scenario('pkg-refreshed', async (track) => {
+    const dir = runtimeDir('pkg-refreshed');
+    const audit = path.join(dir, 'boots.jsonl');
+    install(dir, '90.0.0', { identity: true, bootAudit: audit });
+    const { entry, worker } = packageEntry('pkg-refreshed', '90.1.0', { identity: true, bootAudit: audit });
+    const pair = track(await openPair(dir, 'cf2-pkg-refreshed', { entry }));
+    ok(await pair.call() === '90.1.0', 'CF-2: a direct-package pair serves its package worker v90.1.0');
+    await waitFor(async () => pair.state()?.status === 'hibernated', 20000);
+    writeAtomic(worker, workerSource('90.2.0', { identity: true, bootAudit: audit }));   // npx refreshed the package
+    const woken = await answer(pair);
+    const s = pair.state();
+    ok(woken === '90.2.0' && ['ready', 'hibernated'].includes(s?.status) && !s.lastError,
+      `CF-2: the wake starts the package worker under the version its file carries now (${woken.slice(0, 140)})`);
+  });
+
+  await Promise.all([
+    packagePairWakesOwnWorker(),
+    packagePairWakesThroughIntegrity(),
+    runtimePairWakesPackageOnIntegrity(),
+    crashOnWakeRetriesInstalled(),
+    timeoutOnWakeRetriesInstalled(),
+    forcedReadBeforeCandidate(),
+    unreadableManifestWaitsOnWake(),
+    flatAbsentManifestDefers(),
+    packageRefreshedWakesNewVersion(),
+  ]);
+
+  // CF-2 — only a missing manifest is absent, unit level.
+  {
+    const dir = runtimeDir('absent-unit');
+    const manifest = manifestOf(dir);
+    const missing = readRuntimeTarget(manifest);
+    fs.mkdirSync(manifest);
+    const directory = readRuntimeTarget(manifest);
+    fs.rmSync(manifest, { recursive: true, force: true });
+    fs.writeFileSync(manifest, '{}');
+    const realRead = fs.readFileSync;
+    fs.readFileSync = (file, ...rest) => {
+      if (path.resolve(String(file)) === path.resolve(manifest)) {
+        const error = new Error('EBUSY: resource busy or locked, open'); error.code = 'EBUSY'; throw error;
+      }
+      return realRead.call(fs, file, ...rest);
+    };
+    let busy = null;
+    try { busy = readRuntimeTarget(manifest); } finally { fs.readFileSync = realRead; }
+    ok(missing.absent === true && !directory.absent && !directory.ok && !busy?.absent && /unreadable: EBUSY/.test(busy?.error || ''),
+      'CF-2: readRuntimeTarget reports absent only for a missing file; EBUSY or a directory is an unreadable manifest');
+  }
+
+  // TQ-5 — the receipt rename retries EPERM/EBUSY/EACCES. The directory case
+  // below fails every attempt and cannot tell a retry from none; on Linux CI
+  // nothing holds a file open, so this is pinned with an injected rename.
+  {
+    const dir = runtimeDir('atomic-retry');
+    const target = path.join(dir, 'receipt.json');
+    const realRename = fs.renameSync;
+    let attempts = 0;
+    fs.renameSync = (from, to) => {
+      attempts++;
+      if (attempts <= 2) { const error = new Error('EPERM: simulated reader hold'); error.code = 'EPERM'; throw error; }
+      return realRename.call(fs, from, to);
+    };
+    let threw = null;
+    try { supervisorTest.atomicJson(target, { committed: true }); }
+    catch (error) { threw = error; }
+    finally { fs.renameSync = realRename; }
+    ok(!threw && attempts === 3 && JSON.parse(fs.readFileSync(target, 'utf8')).committed === true,
+      'TQ-5: a supervisor state write outlasts a transient EPERM on its rename and commits');
+    attempts = 0;
+    fs.renameSync = () => { attempts++; const error = new Error('ENOENT: gone'); error.code = 'ENOENT'; throw error; };
+    threw = null;
+    try { supervisorTest.atomicJson(target, { committed: false }); }
+    catch (error) { threw = error; }
+    finally { fs.renameSync = realRename; }
+    ok(threw?.code === 'ENOENT' && attempts === 1 && !fs.readdirSync(dir).some(name => name.endsWith('.tmp')),
+      'TQ-5: a non-retryable rename error is rethrown at once and the tmp is removed');
+  }
 
   // B7 — exactly which receipts a starting supervisor removes.
   {

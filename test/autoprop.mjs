@@ -21,6 +21,7 @@ import { fileURLToPath } from 'url';
 import { linkProject, mcpServerEntry } from '../src/agent-rules.mjs';
 import { inspect, render } from '../src/brain-doctor.mjs';
 import { AUTO_UPDATE_TTL_MS, installIdentity } from '../src/mcp-auto-update.mjs';
+import { readRuntimeTarget } from '../src/mcp-supervisor.mjs';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const INSTALL = path.join(REPO, 'bin', 'klypix-install.mjs');
@@ -364,8 +365,27 @@ function runInstall(home, projectCwd, args = []) {
   'D: the real installer preserves the highest Core receipt and ignores appVersion ordering');
 
   // forced re-install → .prev backup of the prior scripts is created
+  const liveManifestBefore = fs.readFileSync(path.join(bd, '.mcp-runtime.json'), 'utf8');
   runInstall(home, proj, ['--force']);
   ok(fs.existsSync(path.join(bd, '.prev', 'global-brain-hook.mjs')), 'D: re-install snapshots the prior scripts to .prev/ (rollback)');
+  // K1-PREV-UNVERIFIED (2026-10-03 review): a supervisor boots .prev while an
+  // install is half-applied, so the snapshot carries the previous install's own
+  // manifest — and every file it lists verifies inside .prev.
+  const prevDir = path.join(bd, '.prev');
+  const prevManifest = path.join(prevDir, '.mcp-runtime.json');
+  const prevRuntime = readRuntimeTarget(prevManifest);
+  ok(prevRuntime.ok && fs.readFileSync(prevManifest, 'utf8') === liveManifestBefore,
+    `D: .prev carries the previous install's own manifest, and it verifies there (${prevRuntime.error || 'verified'})`);
+  // An install that stopped half-way leaves the live files two versions. A
+  // retry must not copy that mix over the last complete snapshot.
+  const prevBytes = () => fs.readdirSync(prevDir).sort()
+    .map((name) => `${name}:${crypto.createHash('sha256').update(fs.readFileSync(path.join(prevDir, name))).digest('hex')}`).join('\n');
+  const prevBefore = prevBytes();
+  fs.appendFileSync(path.join(bd, 'klypix-format.mjs'), '\n// a newer copy renamed in before the install stopped\n');
+  const retried = runInstall(home, proj, ['--force']);
+  ok(prevBytes() === prevBefore && readRuntimeTarget(prevManifest).ok && /\.prev kept: the live core files do not match their manifest \(klypix-format\.mjs differs from its hash\)/.test(retried),
+    'D: a re-install over core files that fail their manifest keeps the last complete .prev, untouched');
+  ok(readRuntimeTarget(path.join(bd, '.mcp-runtime.json')).ok, 'D: and that re-install still repairs the live core files');
   ok(JSON.parse(fs.readFileSync(path.join(proj, '.mcp.json'), 'utf8')).mcpServers['klypix-canvas'].args[0] === 'scripts/klypix-mcp-server.mjs',
     'D: reinstall preserves a portable project-owned node server');
   ok((fs.readFileSync(path.join(proj, '.codex', 'config.toml'), 'utf8').match(/\[mcp_servers\.klypix-canvas\]/g) || []).length === 1, 'D: Codex project MCP registration stays idempotent on re-install');

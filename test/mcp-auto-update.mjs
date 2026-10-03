@@ -1243,6 +1243,18 @@ try {
     const preFix = judge(due + 3 * HOUR, [{ bootedAt: iso(due - 12 * HOUR), autoUpdate: { enabled: true } }, { bootedAt: iso(due - 12 * HOUR) }]);
     ok(!preFix.overdue && preFix.suppressed === 'no-poll-evidence',
       'K3: receipts without lastPollAt (supervisor code from before this rule) are never evidence — not judged');
+    // TQ-2 (2026-10-03 review): the same on the never-checked, no-stamp branch.
+    // There the check is due since before any record (since = -Infinity), so no
+    // time bound rejects a missing poll: only the "no lastPollAt" rule does —
+    // without it null coerces to epoch 0 and reads as a poll in 1970.
+    const neverNoStamp = { ...plan, dueAt: iso(due), dueReason: 'never-checked', stampWrittenAt: null };
+    const neverPreFix = autoUpdateOverdue({
+      plan: neverNoStamp,
+      supervisors: [{ bootedAt: iso(due - 10 * HOUR), autoUpdate: { enabled: true } }, { bootedAt: iso(due - 10 * HOUR), autoUpdate: { enabled: true, lastPollAt: null } }],
+      now: due,
+    });
+    ok(neverPreFix.overdue === false && neverPreFix.suppressed === 'no-poll-evidence' && neverPreFix.evidence === null,
+      `K3: a never-checked install with no stamp and only pre-fix receipts is not judged either (${JSON.stringify(neverPreFix)})`);
     ok(!judge(due + HOUR, [polled(due + AUTO_UPDATE_POLL_EVIDENCE_MS - 1000)]).overdue
       && judge(due + HOUR, [polled(due + AUTO_UPDATE_POLL_EVIDENCE_MS)]).overdue,
     'K3: only a poll at least 2 min after the check fell due counts');

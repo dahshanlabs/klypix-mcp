@@ -138,11 +138,14 @@ ok(formatRuntimeReport(report).includes('no process was changed or terminated'),
   ok(text.includes('Hibernated 2 connection(s) — about 800 MB not resident (mean resident worker 400 MB); each wakes on its next request.'),
     'K4: "each wakes on its next request" counts only the pairs that can');
   ok(/3 asleep connection\(s\) will not wake into the installed core on their next request — /.test(text)
-    && /pid 21: its last wake found no consistent core to boot \(runtime integrity mismatch: klypix-mcp-worker\.mjs, 2 attempts\) — requests fail until the core files verify; npx -y klypix-mcp@latest doctor shows the fix/.test(text)
-    && /pid 22: sleeps on v1\.90\.0; the installed v2\.0\.0 is a new major, which its wake refuses — \/mcp reconnect to adopt it/.test(text)
-    && /pid 23: restart-required \(major upgrade v1\.90\.0 → v2\.0\.0 requires reconnect\) — every request is answered with a reconnect error; \/mcp reconnect/.test(text),
-  'K4: those pairs are stated separately, each with its reason and what to do');
-  ok(!/install --force|klypix-mcp@\S+ install|--runtime-only/.test(text),
+    // Each detail ends where the next pair (or the line) begins: nothing may
+    // follow the remedy, not even another remedy (TQ-1, 2026-10-03 review).
+    && /pid 21: its last wake found no consistent core to boot \(runtime integrity mismatch: klypix-mcp-worker\.mjs, 2 attempts\) — requests fail until the core files verify; npx -y klypix-mcp@latest doctor shows the fix(?=; pid \d+: |\.$)/m.test(text)
+    && /pid 22: sleeps on v1\.90\.0; the installed v2\.0\.0 is a new major, which its wake refuses — \/mcp reconnect to adopt it(?=; pid \d+: |\.$)/m.test(text)
+    && /pid 23: restart-required \(major upgrade v1\.90\.0 → v2\.0\.0 requires reconnect\) — every request is answered with a reconnect error; \/mcp reconnect(?=; pid \d+: |\.$)/m.test(text),
+  'K4: those pairs are stated separately, each with its reason and what to do — and nothing after it');
+  // Any installer form, the bare `npx klypix-mcp install` included (TQ-1).
+  ok(!/klypix-mcp(@\S+)? install|install --force|--runtime-only/.test(text),
     'K4: the report never names an installer command (agents read it too)');
 }
 

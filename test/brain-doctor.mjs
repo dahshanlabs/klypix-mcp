@@ -25,6 +25,7 @@ import {
 } from '../src/agent-rules.mjs';
 import { driftLine, inspect, render, structuredReport } from '../src/brain-doctor.mjs';
 import { laneFileFor } from '../src/agent-presence.mjs';
+import { wakeBlock } from '../src/runtime-inspector.mjs';
 import { AUTO_UPDATE_TTL_MS } from '../src/mcp-auto-update.mjs';
 import { makeVault, seedBrain } from './_harness.mjs';
 
@@ -595,19 +596,35 @@ const supervisorReceipt = (brainDir, name, state) => writeJson(path.join(brainDi
     && r.actions.some((a) => a.startsWith('npx -y klypix-mcp@latest install --force') && /cannot wake/.test(a))
     && /cannot wake — the core files do not verify/.test(driftLine(r)),
   'F6: a refused wake is IMPAIRED with the reinstall named — never "wakes on the next request"');
-  const noted = { ...deferredPair, hibernation: { ...deferredPair.hibernation, wakeDeferred: null } };
-  supervisorReceipt(brainDir, 'deferred', { ...noted, updatedAt: at(2 * 60_000) });
-  ok(run().supervisors.live[0]?.wakeBlocked === true,
-    'F6: an integrity failure its poller has reported for longer than an install takes also blocks the wake');
-  supervisorReceipt(brainDir, 'deferred', noted);
+  ok(wakeBlock(deferredPair)?.reason === 'wake-deferred',
+    'F6/K4: `klypix-mcp runtime` reads the same refused wake as unable to wake');
+  // K1-DOCTOR-WAKEBLOCKED-FALSE (2026-10-03 review): an integrity error the
+  // receipt merely carries is no refused wake. K1 boots .prev when a fresh
+  // connection meets a failing install and records the error in its very first
+  // receipt; hibernated, the pair wakes from that same .prev (B3). The doctor
+  // printed it IMPAIRED ("requests fail until they verify") while the runtime
+  // report (K4) said it wakes — and it does.
+  const fromPrev = {
+    ...deferredPair,
+    updatedAt: at(2 * 60_000),
+    hibernation: {
+      hibernated: true, wakeDeferred: null,
+      target: { version: PKG_VERSION, source: 'rollback', path: path.join(brainDir, '.prev', 'klypix-mcp-worker.mjs') },
+    },
+  };
+  supervisorReceipt(brainDir, 'deferred', fromPrev);
   r = run();
-  ok(r.supervisors.live[0]?.wakeBlocked === false && r.supervisors.impaired.length === 0,
-    'F6: a fresh integrity error (an install mid-flight) is not yet a blocked wake');
-  const previousPair = { ...noted, updatedAt: at(2 * 60_000), hibernation: { ...noted.hibernation, target: { version: PKG_VERSION, source: 'rollback' } } };
-  supervisorReceipt(brainDir, 'deferred', previousPair);
+  text = render(r, { color: false });
+  ok(r.supervisors.live[0]?.wakeBlocked === false && r.supervisors.impaired.length === 0
+    && !/IMPAIRED|requests fail until they verify|cannot wake/.test(text)
+    && !/cannot wake/.test(driftLine(r))
+    && /pid \d+ hibernated: runtime integrity mismatch: worker\.mjs/.test(text)
+    && wakeBlock(fromPrev) === null,
+  `K1: a pair booted from .prev that carries the integrity error but has refused no wake is not IMPAIRED — it wakes from .prev, as \`klypix-mcp runtime\` says; the error is still shown (${text.split('\n').filter((line) => /SUPERVISOR|pid \d+/.test(line)).join(' | ')})`);
+  supervisorReceipt(brainDir, 'deferred', { ...fromPrev, updatedAt: at(10_000) });
   ok(run().supervisors.live[0]?.wakeBlocked === false,
-    'K1: a sleeping pair that served from the previous snapshot is not called unable to wake solely because the live files fail integrity');
-  supervisorReceipt(brainDir, 'deferred', { ...previousPair, hibernation: { ...previousPair.hibernation, wakeDeferred: deferredPair.hibernation.wakeDeferred } });
+    'F6: a fresh integrity error (an install mid-flight) is not a blocked wake either');
+  supervisorReceipt(brainDir, 'deferred', { ...fromPrev, hibernation: { ...fromPrev.hibernation, wakeDeferred: deferredPair.hibernation.wakeDeferred } });
   ok(run().supervisors.live[0]?.wakeBlocked === true,
     'K1: an actual refused wake overrides a previously working snapshot');
 
@@ -779,9 +796,14 @@ const supervisorReceipt = (brainDir, name, state) => writeJson(path.join(brainDi
   // session merely open since before it.
   liveSupervisor({ autoUpdate: { enabled: true, lastPollAt: iso(NOW - 2 * HOUR - 20 * 60_000) } });
   r = run();
+  // TR-1 (2026-10-03 review): not judged, but not "due now — runs within
+  // 10 min" either: the line says how long the check has been due and why it is
+  // not called overdue.
+  const dueSince = `${iso(NOW - 2 * HOUR).slice(0, 16)}Z`;   // the doctor's minute-precision UTC
   ok(r.autoUpdate.overdue === false && r.autoUpdate.overdueSuppressed === 'no-poll-evidence'
-    && r.verdict === 'ALIGNED' && /check due now/.test(auLine(textOf(r))),
-  'K3: a machine that slept across the due time (last poll before it) reads "due now" on waking, not overdue — though its session has been open 10 h');
+    && r.verdict === 'ALIGNED'
+    && auLine(textOf(r)).includes(`check due since ${dueSince} (2h) — no open session has polled since then; it runs within 10 min while one is open`),
+  `K3/TR-1: a machine that slept across the due time (last poll before it) is not overdue on waking — though its session has been open 10 h — and the line says how long it has been due (${auLine(textOf(r))})`);
   supervisorReceipt(brainDir, 'live', {
     bootedAt: iso(NOW - 10 * HOUR), updatedAt: iso(NOW - 30_000), active: { pid: process.pid, version: PKG_VERSION },
     autoUpdate: { enabled: true },
@@ -790,14 +812,26 @@ const supervisorReceipt = (brainDir, name, state) => writeJson(path.join(brainDi
   ok(r.supervisors.preFix.length === 1 && r.autoUpdate.overdue === false && r.autoUpdate.overdueSuppressed === 'no-poll-evidence'
     && r.verdict === 'ALIGNED',
   'K3: only pre-fix receipts (no lastPollAt) → overdue is not judged');
+  ok(r.autoUpdate.dueForMs === 2 * HOUR && r.autoUpdate.unpolledSessions === 1
+    && auLine(textOf(r)).includes(`check due since ${dueSince} (2h) — overdue is not judged: no open session has recorded a poll since then — 1 connection on pre-fix supervisor code records none (/mcp reconnect)`)
+    && !/check due now|runs within/.test(auLine(textOf(r))),
+  `TR-1: with only pre-fix receipts the line says the check has been due 2h and why it is not judged — never "due now — runs within 10 min" (${auLine(textOf(r))})`);
+  // A FIXED supervisor that has not polled yet (it polls 2 s after it starts)
+  // is not called pre-fix code.
+  liveSupervisor({ bootedAt: iso(NOW - 1_000), autoUpdate: { enabled: true } });
+  r = run();
+  ok(r.autoUpdate.unpolledSessions === 0 && !/pre-fix/.test(auLine(textOf(r)))
+    && auLine(textOf(r)).includes(`check due since ${dueSince} (2h) — no open session has polled since then; it runs within 10 min while one is open`),
+  `TR-1: a fixed supervisor that has not polled yet is not counted as pre-fix code (${auLine(textOf(r))})`);
   // F9 (2026-10-03 review): a session that opened seconds ago — the first
   // SessionStart after an idle night — has polled, but the helper its poll
   // launched has not taken the lock yet. That poll is no evidence yet.
   liveSupervisor({ bootedAt: iso(NOW - 4_000), autoUpdate: { enabled: true, lastPollAt: iso(NOW - 2_000) } });
   r = run();
   ok(r.autoUpdate.overdue === false && r.autoUpdate.overdueSuppressed === 'no-poll-evidence'
-    && r.verdict === 'ALIGNED' && /check due now/.test(auLine(textOf(r))),
-  'K3/F9: a check due 2 h ago with only a session that polled seconds ago is due now, not overdue');
+    && r.verdict === 'ALIGNED'
+    && /check due since \S+ \(2h\) — the latest poll on record \(\S+, <1m ago\) is too recent, or too close to the due time, to judge it overdue yet/.test(auLine(textOf(r))),
+  `K3/F9: a check due 2 h ago with only a session that polled seconds ago is not overdue yet, and says why (${auLine(textOf(r))})`);
   writeJson(files.stamp, { protocol: 1, lastCheck: NOW - 6 * HOUR - 30 * 60_000, failures: 0, nextCheckAt: NOW - 30 * 60_000, identity: npmIdentity });
   liveSupervisor({ autoUpdate: { enabled: true, lastPollAt: iso(NOW - 25 * 60_000) } });
   r = run();
@@ -913,6 +947,17 @@ const supervisorReceipt = (brainDir, name, state) => writeJson(path.join(brainDi
   ok(r.autoUpdate.overdue === true && /no check recorded yet · check overdue by 10h — no running session performed the check/.test(auLine(textOf(r)))
     && r.verdict === 'PARTIAL',
   'F9/K3: never checked, though a session open 10 h polled 5 min ago, is overdue by 10h (measured from that session\'s start)');
+  // TQ-2 (2026-10-03 review): the same never-checked install, no stamp at all,
+  // with only a pre-fix receipt (no lastPollAt): nothing is evidence, and no
+  // poll "in 1970" is invented from the missing one.
+  supervisorReceipt(brainDir, 'live', {
+    bootedAt: iso(NOW - 10 * HOUR), updatedAt: iso(NOW - 30_000), active: { pid: process.pid, version: PKG_VERSION },
+    autoUpdate: { enabled: true },
+  });
+  r = run();
+  ok(r.autoUpdate.overdue === false && r.autoUpdate.overdueSuppressed === 'no-poll-evidence' && r.verdict === 'ALIGNED'
+    && !/overdue|1970/.test(auLine(textOf(r))),
+  `TQ-2: never checked, no stamp, only a pre-fix receipt → overdue is not judged (${auLine(textOf(r))})`);
   reset();
   writeJson(files.stamp, { protocol: 1, lastCheck: NOW - 30 * 60_000, failures: 1, nextCheckAt: NOW - 15 * 60_000, identity: npmIdentity });
   writeJson(files.status, current(7 * HOUR));

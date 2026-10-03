@@ -297,9 +297,6 @@ function inspectRunning(brainDir, baked, now, self) {
 const SUPERVISOR_DEAD_RECEIPT_MS = 120 * 1000;
 const SUPERVISOR_TRANSITION_MS = 45 * 1000;
 const WAKING_STATUSES = new Set(['validating-update', 'update-ready', 'recovering', 'recovery-ready']);
-// readRuntimeTarget's failures (mcp-supervisor.mjs): the core files on disk do
-// not verify, so a sleeping pair has nothing consistent to wake into.
-const RUNTIME_INTEGRITY_ERROR = /^(runtime (manifest|worker|file|integrity)\b|unsupported runtime protocol)/;
 const majorOf = (version) => {
   const match = String(version || '').match(/^v?(\d+)\.\d+\.\d+/);
   return match ? Number(match[1]) : null;
@@ -357,18 +354,26 @@ function inspectSupervisors(brainDir, baked, now = Date.now()) {
     // queue. A broken or backpressured host pipe stays what it is.
     const deliveryStatus = transition === 'waking' && !['impaired', 'backpressured'].includes(state.transport?.host)
       ? 'queued' : recordedDelivery;
-    // F6 (2026-10-03 review): a sleeping pair whose last wake found the core
-    // files failing verification (wakeDeferred), or whose poller has reported
-    // them failing for longer than an install takes, answers every request with
-    // an error until they verify. It used to read "wakes on the next request".
+    // F6 (2026-10-03 review): a sleeping pair whose last wake found no
+    // consistent core to boot (wakeDeferred, which the supervisor writes on the
+    // first refused wake) answers every request with an error until the core
+    // files verify. It used to read "wakes on the next request".
+    // Only that refusal counts (K1-DOCTOR-WAKEBLOCKED-FALSE, 2026-10-03 review),
+    // the rule `klypix-mcp runtime` follows (runtime-inspector wakeBlock). An
+    // integrity error the receipt merely carries is not one: the wake resumes
+    // .prev when it holds this pair's version — every pair K1 booted from .prev
+    // records the error in its first receipt and wakes from .prev — or the
+    // package's own worker outside the managed directory. Read as "cannot
+    // wake", every connection that started during a failing install was
+    // printed IMPAIRED while it woke without trouble. The error itself is still
+    // shown on the pair's line.
     const wakeDeferred = intentionallyHibernated && state.hibernation?.wakeDeferred
       && typeof state.hibernation.wakeDeferred === 'object' ? state.hibernation.wakeDeferred : null;
-    // A pair that already served from .prev can resume that same snapshot;
-    // the live directory's integrity error alone does not prove its wake fails.
-    // An actual refused wake still wins over this last-known fallback.
-    const hasPreviousWorker = sleepingTarget?.source === 'rollback';
-    const wakeBlocked = intentionallyHibernated
-      && (Boolean(wakeDeferred) || (!hasPreviousWorker && RUNTIME_INTEGRITY_ERROR.test(String(state.lastError || '')) && !fresh));
+    // Only a wake the supervisor actually refused proves a sleeping pair cannot
+    // wake — the same rule as `klypix-mcp runtime` (wakeBlock). An integrity error
+    // alone does not: the wake waits for the install to settle, and a pair that
+    // served from .prev resumes that snapshot while it still verifies.
+    const wakeBlocked = intentionallyHibernated && Boolean(wakeDeferred);
     const workerImpaired = (!state.active && !intentionallyHibernated && transition !== 'waking'
       && status !== 'starting' && status !== 'awaiting-initialize') || wakeBlocked;
     const deliveryImpaired = deliveryStatus === 'impaired' || state.transport?.host === 'impaired';
@@ -634,6 +639,20 @@ function autoUpdateView({ au, brainDir, supervisors, version, hooks, npmLatest, 
   const overdueSuppressed = rule.suppressed === 'no-live-session' ? 'no-live-session'
     : (skew && (rule.overdue || rule.suppressed) ? 'version-skew' : (rule.suppressed || null));
   const overdue = rule.overdue === true && !skew;
+  // TR-1 (2026-10-03 review): a long-due check the rule did NOT judge for want
+  // of a poll (K3) used to print the generic "check due now — runs within
+  // 10 min", hiding how long it had been due and repeating a promise an open
+  // session had visibly not kept. That is the normal state right after this
+  // release: every live connection runs pre-fix supervisor code, which records
+  // no poll, until it reconnects. Keep not judging, but carry what is known:
+  // how long it has been due, the latest poll on record, and how many sessions
+  // record none.
+  const pollers = live.filter((state) => state.autoUpdateEnabled !== false);
+  const pollTimes = pollers.map((state) => timeOf(state.lastPollAt)).filter((ms) => Number.isFinite(ms) && ms <= now + 1000);
+  const latestPollAt = pollTimes.length ? new Date(Math.max(...pollTimes)).toISOString() : null;
+  // Pre-fix supervisor code (no supervisorVersion, B9) never records a poll; a
+  // fixed one records its first 2 s after it starts, so it is not counted here.
+  const unpolledSessions = pollers.filter((state) => state.preFix && !Number.isFinite(timeOf(state.lastPollAt))).length;
 
   const knownLatest = knownNpmLatest(brainDir, au, npmLatest, now);
   // MV-2: a pre-hold updater re-installs whatever the owner rolled back from;
@@ -679,6 +698,11 @@ function autoUpdateView({ au, brainDir, supervisors, version, hooks, npmLatest, 
     overdue,
     overdueByMs: overdue ? rule.overdueByMs : null,
     overdueSuppressed,
+    // How long the check has been due by the rule's own reckoning (null when
+    // it was due since before any record), and the polls behind a suppression.
+    dueForMs: Number.isFinite(rule.dueForMs) ? rule.dueForMs : null,
+    latestPollAt,
+    unpolledSessions,
     // What the overdue rule saw: the live sessions that polled after the check
     // fell due, and the latest such poll (K3).
     overdueEvidence: overdue ? rule.evidence || null : null,
@@ -1633,6 +1657,18 @@ export function render(r, opts = {}) {
         parts.push(`next check unknown${au.scheduleError ? ` (${au.scheduleError})` : ''}`);
       } else if (au.overdue) {
         parts.push(`${c.yel}check overdue by ${durationText(au.overdueByMs)} — no running session performed the check${c.rst}`);
+      } else if (au.overdueSuppressed === 'no-poll-evidence' && Number.isFinite(au.dueForMs)) {
+        // TR-1: not judged (K3), but not "due now" either — the rule reports
+        // this only once the check is past its 30 min grace. Say how long, and
+        // why it is not called overdue.
+        const sinceMs = nowMs - au.dueForMs;
+        const polledMs = timeOf(au.latestPollAt);
+        const why = Number.isFinite(polledMs) && polledMs >= sinceMs
+          ? `the latest poll on record (${isoMinute(polledMs)}, ${durationText(nowMs - polledMs)} ago) is too recent, or too close to the due time, to judge it overdue yet`
+          : (au.unpolledSessions
+            ? `overdue is not judged: no open session has recorded a poll since then — ${au.unpolledSessions} connection${au.unpolledSessions === 1 ? '' : 's'} on pre-fix supervisor code record${au.unpolledSessions === 1 ? 's' : ''} none (/mcp reconnect)`
+            : `no open session has polled since then; it runs within ${pollText} while one is open`);
+        parts.push(`check due since ${isoMinute(sinceMs)} (${durationText(au.dueForMs)}) — ${why}`);
       } else if (dueMs <= nowMs) {
         parts.push(`check due now — runs within ${pollText} while any KLYPIX session is open, or 2 s after the next one starts`);
       } else {

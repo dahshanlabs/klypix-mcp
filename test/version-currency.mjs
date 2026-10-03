@@ -218,6 +218,10 @@ const startedLine = await judged(overduePlan, { spawned: true });
 ok(/The automatic update check was overdue \(due for 3h; .*\) and was started just now; if this notice repeats, run `brain_doctor`/.test(startedLine)
     && !/Automatic check overdue —/.test(startedLine),
    'F3: when this SessionStart has just started the overdue check, the notice says so instead of "run the doctor"');
+// TQ-1 (2026-10-03 review): the overdue texts reach the agent too, and name the
+// doctor — never an installer, in any form.
+ok([overdueLine, startedLine].every((line) => !/klypix-mcp(@\S+)? install|install --force|install --runtime-only/.test(line)),
+   'K3: the overdue notices never name an installer command (the agent reads them)');
 // An install-changed check is due from the moment the receipts changed, not from
 // its lastCheck + 5 min floor (the doctor measures it the same way): an install
 // 10 min ago after a check 1 h ago is not 55 min late.
@@ -236,17 +240,25 @@ ok(/Automatic check overdue \(no check recorded on this machine; a running KLYPI
    'K2: a check never recorded, polled by a live session 20 min ago, is overdue in the notice too — the doctor\'s rule');
 // K3: a session open for hours is no evidence by itself. A machine asleep across
 // the due time wakes with every session "open since" — and none had polled.
+// TR-1 (2026-10-03 review): not judged is not "due now" — these checks fell due
+// 3 h ago, and the notice says so (it printed "(due now)" before).
 writeSupervisor(`${process.pid}.json`, liveReceipt({ autoUpdate: { enabled: true, lastPollAt: iso(NOW - 3 * HOUR - 20 * 60_000) } }));
-ok(/\(due now\); no action required/.test(await judged(overduePlan)),
-   'K3: a machine that slept across the due time (its last poll before it) is "due now" on waking, not "overdue"');
+const sleptLine = await judged(overduePlan);
+ok(/at the next update check \(due for 3h\); no action required/.test(sleptLine) && !/overdue|due now/i.test(sleptLine),
+   'K3/TR-1: a machine that slept across the due time (its last poll before it) is not "overdue" on waking — and it has been due for 3h, not "now"');
 writeSupervisor(`${process.pid}.json`, liveReceipt({ autoUpdate: { enabled: true } }));
-ok(/\(due now\); no action required/.test(await judged(overduePlan)),
-   'K3: a receipt without lastPollAt (supervisor code from before the rule) is never evidence');
+const preFixLine = await judged(overduePlan);
+ok(/at the next update check \(due for 3h\); no action required/.test(preFixLine) && !/overdue|due now/i.test(preFixLine),
+   'K3/TR-1: a receipt without lastPollAt (supervisor code from before the rule) is never evidence — the notice says how long the check has been due, not "due now"');
 // F9/K3: the first SessionStart after an idle night reads its own supervisor's
 // first poll (2 s after it starts) before the helper that poll launched has run.
 writeSupervisor(`${process.pid}.json`, liveReceipt({ bootedAt: iso(NOW - 4_000), autoUpdate: { enabled: true, lastPollAt: iso(NOW - 2_000) } }));
-ok(/\(due now\); no action required/.test(await judged(overduePlan)),
+ok(/\(due for 3h\); no action required/.test(await judged(overduePlan)),
    'K3: a session that polled seconds ago (this session\'s own) does not make a check "overdue" yet');
+// The failed-retry notice takes the same span.
+writeSupervisor(`${process.pid}.json`, liveReceipt({ autoUpdate: { enabled: true } }));
+ok(/next retry due for 3h\./.test(await judged({ ...overduePlan, failures: 1, result: 'failed', error: 'npm view timed out' })),
+   'TR-1: a failed check past due with no poll evidence says "next retry due for 3h", not "due now"');
 writeSupervisor(`${process.pid}.json`, liveReceipt({ autoUpdate: { enabled: false, lastPollAt: iso(NOW - 20 * 60_000) } }));
 ok(/\(due now\)/.test(await judged(overduePlan)),
    'a session whose own auto-update is off never runs the check → it does not make one "overdue"');

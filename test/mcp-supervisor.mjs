@@ -579,13 +579,17 @@ try {
     installedAt: new Date().toISOString(),
     files: { 'worker.mjs': hash(path.join(dir, 'worker.mjs')) },
   }, null, 2)}\n`);
-  // bin/klypix-install.mjs in miniature: snapshot the live file to .prev, rename
-  // the new one in, commit the manifest last (commit:false = it stopped there).
+  // bin/klypix-install.mjs in miniature: snapshot the live install to .prev —
+  // only when it verifies against its own manifest, which goes in last — rename
+  // the new worker in, commit the manifest last (commit:false = it stopped there).
   const install = (dir, version, { commit = true, ...options } = {}) => {
     const worker = path.join(dir, 'worker.mjs');
-    if (fs.existsSync(worker)) {
-      fs.mkdirSync(path.join(dir, '.prev'), { recursive: true });
-      fs.copyFileSync(worker, path.join(dir, '.prev', 'worker.mjs'));
+    if (readRuntimeTarget(manifestOf(dir)).ok) {
+      const prev = path.join(dir, '.prev');
+      fs.mkdirSync(prev, { recursive: true });
+      fs.rmSync(manifestOf(prev), { force: true });
+      fs.copyFileSync(worker, path.join(prev, 'worker.mjs'));
+      writeAtomic(manifestOf(prev), fs.readFileSync(manifestOf(dir), 'utf8'));
     }
     writeAtomic(worker, workerSource(version, options));
     if (commit) commitManifest(dir, version);
@@ -1123,6 +1127,41 @@ try {
     `TQ-2: an initialize timeout on wake is transient — the backoff retry serves v90.1.0, status clean (${woken.slice(0, 120)}; ${s?.status}; ${bootList(woke)})`);
   });
 
+  // SWAP-RETRY (2026-10-03, field): a HOT-SWAP candidate that times out while the
+  // old worker keeps serving used to be rejected for good — restart-required,
+  // its signature blacklisted — so one initialize timeout under load pinned the
+  // connection to its old version until a reconnect. It now retries on the swap
+  // backoff (base 1 s here) and lands the new version without a reconnect.
+  const timeoutOnSwapRetries = () => scenario('swap-hang-once', async (track) => {
+    const dir = runtimeDir('swap-hang-once');
+    const audit = path.join(dir, 'boots.jsonl');
+    const marker = path.join(dir, 'swap-hang-once.marker');
+    install(dir, '90.0.0', { identity: true, bootAudit: audit });
+    const pair = track(await openPair(dir, 'swap-hang-once', {
+      env: { KLYPIX_MCP_SUPERVISOR_TIMEOUT_MS: '2000', KLYPIX_MCP_SWAP_RETRY_BASE_MS: '4000', KLYPIX_WORKER_HIBERNATE_MS: '0' },
+    }));
+    ok(await pair.call() === '90.0.0', 'SWAP-RETRY: the pair serves v90.0.0 before the update');
+    fs.writeFileSync(marker, 'x');   // the first v90.1.0 candidate never answers its initialize
+    install(dir, '90.1.0', { identity: true, bootAudit: audit, extraTool: true, hangOnce: marker });
+    // The 4 s retry window opens once the hung first attempt times out (2 s).
+    let sawRetry = null;
+    try {
+      await waitFor(async () => {
+        const s = pair.state();
+        if (s?.swapRetry) sawRetry = { status: s.status, swapRetry: s.swapRetry, served: await pair.call() };
+        return Boolean(sawRetry);
+      }, 15000);
+    } catch { /* reported below */ }
+    let landed = false;
+    try { await waitFor(async () => (await pair.call()) === '90.1.0', 20000); landed = true; } catch { /* reported below */ }
+    const s = pair.state();
+    ok(landed && s?.status === 'ready' && !s.lastError && s.hotReloads >= 1
+      && boots(audit).filter(item => item.version === '90.1.0').length >= 2,
+    `SWAP-RETRY: after a transient initialize timeout the swap is retried and lands v90.1.0 with no reconnect (${s?.status}; hot ${s?.hotReloads}; ${s?.lastError || 'no error'}; ${bootList(boots(audit))})`);
+    ok(Boolean(sawRetry) && sawRetry.status === 'ready' && sawRetry.served === '90.0.0' && sawRetry.swapRetry.attempt === 1,
+      `SWAP-RETRY: while the retry waits, the old worker keeps serving and the pair reads ready, not restart-required (${JSON.stringify(sawRetry)})`);
+  });
+
   // TQ-6: the stat gate only ever SKIPS work. A breaking B is rejected while A
   // serves; B's worker is then edited with no new manifest (the stat gate still
   // says "verified"), and A's crash recovery clears the rejection. The next poll
@@ -1221,6 +1260,7 @@ try {
     runtimePairWakesPackageOnIntegrity(),
     crashOnWakeRetriesInstalled(),
     timeoutOnWakeRetriesInstalled(),
+    timeoutOnSwapRetries(),
     forcedReadBeforeCandidate(),
     unreadableManifestWaitsOnWake(),
     flatAbsentManifestDefers(),
@@ -1336,6 +1376,78 @@ try {
     `K1: a direct-package launch boots its own worker at once — it lives outside the directory being installed (${connected} ms; ${bootList(booted)})`);
   });
 
+  // K1-PREV-UNVERIFIED (2026-10-03 review): .prev is booted only while its own
+  // manifest verifies. An installer that refreshed .prev from a half-applied
+  // live directory (any installer before this fix, retrying 15 min after the
+  // failed attempt) left a worker that still carries a baked version beside a
+  // sibling module of the other version; the desktop installer keeps no manifest
+  // in .prev at all. A .prev shaped like the real one: the worker beside a
+  // sibling module, both hashed by the manifest.
+  const writePrevSnapshot = (prev, version, { audit }) => {
+    fs.mkdirSync(prev, { recursive: true });
+    fs.writeFileSync(path.join(prev, 'worker.mjs'), workerSource(version, { identity: true, bootAudit: audit }));
+    fs.writeFileSync(path.join(prev, 'engine.mjs'), `export const ENGINE = ${JSON.stringify(version)};\n`);
+    writeAtomic(manifestOf(prev), `${JSON.stringify({
+      protocol: 1, version, worker: 'worker.mjs', channel: 'npm', installedAt: new Date().toISOString(),
+      files: { 'worker.mjs': hash(path.join(prev, 'worker.mjs')), 'engine.mjs': hash(path.join(prev, 'engine.mjs')) },
+    }, null, 2)}\n`);
+  };
+  const mixPrev = (prev) => fs.writeFileSync(path.join(prev, 'engine.mjs'), 'export const ENGINE = "90.1.0";\n');
+  const bootRefusesUnverifiedPrev = (name, label, spoil) => scenario(name, async (track) => {
+    const dir = runtimeDir(name);
+    const audit = path.join(dir, 'boots.jsonl');
+    install(dir, '90.0.0', { identity: true, bootAudit: audit });
+    install(dir, '90.1.0', { identity: true, bootAudit: audit, commit: false });
+    const prev = path.join(dir, '.prev');
+    writePrevSnapshot(prev, '90.0.0', { audit });
+    spoil(prev);
+    // Same outcome as no .prev at all (boot-noprev): nothing boots, and the
+    // host's initialize gets the retryable refusal instead of unchecked files.
+    const child = spawn(process.execPath, [flatEntry(dir, '90.1.0')], {
+      cwd: dir, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, KLYPIX_MCP_RUNTIME_MANIFEST: manifestOf(dir), KLYPIX_MCP_STATE_DIR: path.join(dir, 'states'), KLYPIX_AUTO_UPDATE: '0' },
+    });
+    let stdout = '';
+    child.stdout.on('data', chunk => { stdout += chunk; });
+    const exited = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { child.kill(); reject(new Error(`${name}: startup did not close within 30 s`)); }, 30000);
+      child.once('error', error => { clearTimeout(timer); reject(error); });
+      child.once('exit', (code, signal) => { clearTimeout(timer); resolve({ code, signal }); });
+    });
+    child.stdin.on('error', () => {});
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: `k1-${name}`, version: '1.0.0' } } }) + '\n');
+    const result = await exited;
+    const replies = stdout.trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+    const error = replies.find(message => message.id === 1)?.error;
+    ok(result.code !== 0 && boots(audit).length === 0 && error?.code === -32002 && error.data?.retryable === true
+      && /no previous worker whose own manifest verifies/.test(error.message),
+    `K1-PREV: ${label} is never booted — the boot refuses the connection, as with no .prev (${JSON.stringify(result)}; ${bootList(boots(audit))}; ${error?.message || stdout.slice(-160)})`);
+  });
+  const bootRefusesMixedPrev = () => bootRefusesUnverifiedPrev('boot-prev-mixed',
+    'a .prev whose worker carries a baked v90.0.0 beside a sibling module from v90.1.0', mixPrev);
+  const bootRefusesUnvouchedPrev = () => bootRefusesUnverifiedPrev('boot-prev-nomanifest',
+    'a .prev with a baked worker but no manifest of its own', (prev) => fs.rmSync(manifestOf(prev), { force: true }));
+
+  // The same for a pair that already runs from .prev (K1 booted it there): its
+  // wake resumed that copy on a baked version alone. Mixed since, it is not
+  // resumed; in the flat bundle nothing consistent is left, so the wake defers.
+  const wakeRefusesMixedPrev = () => scenario('wake-prev-mixed', async (track) => {
+    const dir = runtimeDir('wake-prev-mixed');
+    const audit = path.join(dir, 'boots.jsonl');
+    install(dir, '90.0.0', { identity: true, bootAudit: audit });
+    install(dir, '90.1.0', { identity: true, bootAudit: audit, commit: false });
+    writePrevSnapshot(path.join(dir, '.prev'), '90.0.0', { audit });
+    const pair = track(await openPair(dir, 'k1-wake-prev-mixed', { entry: flatEntry(dir, '90.1.0'), pollMs: 60_000 }));
+    ok(await answer(pair) === '90.0.0' && pair.state()?.active?.source === 'rollback',
+      'K1-PREV: a .prev whose manifest verifies — worker and sibling module — is booted');
+    await waitFor(async () => pair.state()?.status === 'hibernated', 20000);
+    mixPrev(path.join(dir, '.prev'));
+    const bootCount = boots(audit).length;
+    const woken = await answer(pair);
+    ok(/KLYPIX core files do not verify/.test(woken) && boots(audit).length === bootCount,
+      `K1-PREV: a pair running from .prev does not wake from it once it stops verifying (${woken.slice(0, 140)})`);
+  });
+
   // The FIRST receipt such a boot writes already names the integrity error. A
   // raw host sends `initialize` and nothing else, and the receipt is read the
   // moment that is answered: without notifications/initialized the
@@ -1438,7 +1550,32 @@ try {
     bootDirectPackageAtOnce(),
     bootReceiptsNameTheError(),
     pollIsReceipted(),
+    bootRefusesMixedPrev(),
+    bootRefusesUnvouchedPrev(),
+    wakeRefusesMixedPrev(),
   ]);
+
+  // K1-PREV-UNVERIFIED — what makes .prev bootable, unit level.
+  {
+    const dir = runtimeDir('prev-unit');
+    const prev = path.join(dir, '.prev');
+    const target = () => supervisorTest.prevSnapshotTarget(path.join(dir, 'worker.mjs'));
+    writePrevSnapshot(prev, '90.0.0', { audit: null });
+    const whole = target();
+    mixPrev(prev);
+    const mixed = target();
+    writePrevSnapshot(prev, '90.0.0', { audit: null });
+    const manifest = JSON.parse(fs.readFileSync(manifestOf(prev), 'utf8'));
+    writeAtomic(manifestOf(prev), JSON.stringify({ ...manifest, files: { 'engine.mjs': manifest.files['engine.mjs'] } }));
+    const workerUnhashed = target();
+    writeAtomic(manifestOf(prev), JSON.stringify({ ...manifest, version: '90.0.1' }));
+    const versionDiffers = target();
+    fs.rmSync(manifestOf(prev), { force: true });
+    const unvouched = target();
+    ok(whole?.source === 'rollback' && whole.version === '90.0.0' && samePath(whole.path, path.join(prev, 'worker.mjs'))
+      && mixed === null && workerUnhashed === null && versionDiffers === null && unvouched === null,
+    `K1-PREV: .prev is a target only while its manifest verifies, hashes its worker and names the worker's version (${[whole?.version, mixed, workerUnhashed, versionDiffers, unvouched].map(String).join(' / ')})`);
+  }
 
   // CF-2 — only a missing manifest is absent, unit level.
   {
@@ -1551,6 +1688,38 @@ try {
     ok(committed.ok && !committed.cached && committed.target.signature !== first.target.signature,
       'B8: a newly committed manifest is read in full on the next poll');
     ok(watch.read().cached && !watch.read({ force: true }).cached, 'B8: a full read can be forced before any candidate starts');
+  }
+
+  // K1-WAIT-FULL-REHASH — a boot or wake waiting for an install hashes the
+  // runtime again only when the manifest's stat moves (installs commit it last),
+  // plus once at the deadline. It used to re-hash every file every 250 ms.
+  {
+    let key = 'manifest-0';
+    let lastRead = null;
+    let reads = 0;
+    let verifiesAt = null;
+    const watch = {
+      statKey: () => key,
+      lastReadKey: () => lastRead,
+      read: () => {
+        reads++;
+        lastRead = key;
+        return key === verifiesAt
+          ? { ok: true, target: { version: '90.1.0' } }
+          : { ok: false, error: 'runtime integrity mismatch: worker.mjs' };
+      },
+    };
+    const stuck = await supervisorTest.settleRuntime(watch, { waitMs: 600, pollMs: 20 });
+    ok(!stuck.ok && reads === 2,
+      `K1-WAIT: a manifest that never moves is hashed once at the start and once at the deadline, not on every poll (${reads} full reads in 600 ms at a 20 ms poll)`);
+    reads = 0;
+    verifiesAt = 'manifest-1';
+    setTimeout(() => { key = 'manifest-1'; }, 150);   // the installer commits its manifest
+    const started = Date.now();
+    const settled = await supervisorTest.settleRuntime(watch, { waitMs: 5000, pollMs: 20 });
+    const waited = Date.now() - started;
+    ok(settled.ok && reads === 2 && waited < 1500,
+      `K1-WAIT: a manifest commit inside the wait is read at once and ends it (${reads} full reads, ${waited} ms)`);
   }
 
   // B8 — a state write that fails leaves nothing behind.

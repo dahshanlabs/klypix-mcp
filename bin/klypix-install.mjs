@@ -212,6 +212,33 @@ function renameSyncWithBackoff(from, to) {
     }
 }
 
+// The live install as its own `.mcp-runtime.json` describes it, every listed
+// file read and hashed now: { raw, entries: [[name, bytes]] }; { absent: true }
+// with no manifest (an install from before the supervisor); { error } when a
+// listed file is missing or differs — a half-applied install, two versions'
+// files side by side. Only the flat layout (bare file names) is accepted.
+function readVerifiedLiveRuntime(dir) {
+    const manifestPath = path.join(dir, '.mcp-runtime.json');
+    let raw;
+    try { raw = fs.readFileSync(manifestPath, 'utf8'); }
+    catch (e) { return e?.code === 'ENOENT' ? { absent: true } : { error: `manifest unreadable (${e?.code || e?.message})` }; }
+    let manifest;
+    try { manifest = JSON.parse(raw); } catch { return { error: 'manifest is not valid JSON' }; }
+    const files = manifest && typeof manifest.files === 'object' && !Array.isArray(manifest.files) ? manifest.files : null;
+    if (manifest?.protocol !== 1 || !files || !Object.prototype.hasOwnProperty.call(files, String(manifest.worker || ''))) {
+        return { error: 'manifest does not hash its worker' };
+    }
+    const entries = [];
+    for (const [name, expected] of Object.entries(files)) {
+        if (path.basename(name) !== name) return { error: `unexpected path ${name}` };
+        let bytes;
+        try { bytes = fs.readFileSync(path.join(dir, name)); } catch { return { error: `${name} is missing` }; }
+        if (crypto.createHash('sha256').update(bytes).digest('hex') !== expected) return { error: `${name} differs from its hash` };
+        entries.push([name, bytes]);
+    }
+    return { raw, entries };
+}
+
 function migrateProjectMcpConfig() {
     try {
         const file = path.join(process.cwd(), '.mcp.json');
@@ -416,10 +443,37 @@ try {
         const s = path.join(BIN, src); if (exists(s)) staged.push({ dst, content: flatten(fs.readFileSync(s, 'utf8')) });
     }
     for (const st of staged) fs.writeFileSync(path.join(BRAIN_DIR, st.dst + '.klypix-new'), st.content);
+    // .prev is what a supervisor boots while an install is half-applied (a
+    // fresh connection, a wake, a crash recovery), so it must be ONE version,
+    // whole (K1-PREV-UNVERIFIED, 2026-10-03 review). It used to be refreshed from
+    // whatever the live directory held: a retry after an install that stopped
+    // mid-rename (the updater's own, 15 min later) copied the MIXED set over the
+    // last complete snapshot. Now the live files are snapshotted only when they
+    // verify against their own manifest — the very bytes that were hashed are
+    // written — and that manifest is copied in LAST: it is what the supervisor
+    // verifies before it boots .prev (prevSnapshotAt). A live directory that
+    // fails its manifest leaves the last complete snapshot where it is.
     try {
-        const prevDir = path.join(BRAIN_DIR, '.prev'); fs.mkdirSync(prevDir, { recursive: true });
-        for (const st of staged) { const live = path.join(BRAIN_DIR, st.dst); if (exists(live)) fs.copyFileSync(live, path.join(prevDir, st.dst)); }
-    } catch { /* .prev rollback snapshot is best-effort */ }
+        const prevDir = path.join(BRAIN_DIR, '.prev');
+        const prevManifest = path.join(prevDir, '.mcp-runtime.json');
+        const live = readVerifiedLiveRuntime(BRAIN_DIR);
+        if (live.entries) {
+            fs.mkdirSync(prevDir, { recursive: true });
+            fs.rmSync(prevManifest, { force: true });   // nothing vouches for .prev while it changes
+            for (const [name, bytes] of live.entries) fs.writeFileSync(path.join(prevDir, name), bytes);
+            fs.writeFileSync(prevManifest + '.klypix-new', live.raw);
+            renameSyncWithBackoff(prevManifest + '.klypix-new', prevManifest);
+        } else if (live.absent) {
+            // No manifest to verify against (an install from before the
+            // supervisor): a plain copy for a manual rollback, which no
+            // supervisor boots — nothing vouches for it.
+            fs.mkdirSync(prevDir, { recursive: true });
+            fs.rmSync(prevManifest, { force: true });
+            for (const st of staged) { const file = path.join(BRAIN_DIR, st.dst); if (exists(file)) fs.copyFileSync(file, path.join(prevDir, st.dst)); }
+        } else {
+            console.log(`• .prev kept: the live core files do not match their manifest (${live.error}) — the last complete snapshot stays the rollback copy`);
+        }
+    } catch { /* .prev rollback snapshot is best-effort; an unfinished one has no manifest */ }
     const renameOrder = staged.slice().sort((a, b) => (a.dst === 'global-brain-hook.mjs' ? 1 : 0) - (b.dst === 'global-brain-hook.mjs' ? 1 : 0));
     let n = 0;
     for (const st of renameOrder) { renameSyncWithBackoff(path.join(BRAIN_DIR, st.dst + '.klypix-new'), path.join(BRAIN_DIR, st.dst)); n++; }

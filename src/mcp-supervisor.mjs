@@ -61,6 +61,11 @@ const DEFAULT_AUTO_UPDATE_START_DELAY_MS = 2000;
 const RECOVERY_MAX_ATTEMPTS = 5;
 const RECOVERY_BACKOFF_BASE_MS = 1000;
 const RECOVERY_BACKOFF_MAX_MS = 60_000;
+// Hot-swap retry policy (2026-10-03): a candidate that fails TRANSIENTLY while
+// the old worker keeps serving is retried after base × 1, 4, 20 (30 s, 2 min,
+// 10 min by default); only then is it kept rejected until a reconnect.
+const DEFAULT_SWAP_RETRY_BASE_MS = 30_000;
+const SWAP_RETRY_FACTORS = [1, 4, 20];
 // Unbounded queue growth is its own failure mode while a recovery is running.
 const HOST_QUEUE_MAX = 200;
 // A wake that finds the manifest failing integrity is usually racing an install:
@@ -166,17 +171,32 @@ const workerFileVersion = (file) => {
     return pkg?.name === 'klypix-mcp' && typeof pkg.version === 'string' ? pkg.version : null;
   } catch { return null; }
 };
-// The installer's snapshot of a worker file: `.prev/<name>` beside it. Every
-// live file is copied there before the first new one is renamed in, so it is a
-// complete copy of the previous install. Null when there is none, or when its
-// version is not baked in (only the flat bundle bakes it).
-const prevSnapshotTarget = (workerPath) => {
-  const previousPath = path.join(path.dirname(workerPath), '.prev', path.basename(workerPath));
-  if (!fs.existsSync(previousPath)) return null;
-  const version = readBakedVersion(previousPath);
-  if (!version) return null;
-  return { path: previousPath, version, signature: `previous:${previousPath}:${version}`, source: 'rollback', dev: false };
+// The installer's snapshot of the previous install, `.prev/` beside the worker,
+// as a boot target — or null. It is one only while `.prev/.mcp-runtime.json`
+// verifies here and now, byte for byte: the installer snapshots the live
+// directory only when it verifies against its own manifest, and copies that
+// manifest in LAST (bin/klypix-install.mjs). A baked version string used to be
+// the whole check (K1-PREV-UNVERIFIED, 2026-10-03 review), and both installers
+// refreshed .prev from whatever the live directory held — so a retry after a
+// half-applied install filled .prev with two versions' files, and a boot or a
+// wake from it loaded a mixed module graph. A .prev that no manifest vouches for
+// (the desktop installer's, or any installer's before this) is never booted.
+const prevSnapshotAt = (prevDir) => {
+  const manifestPath = path.join(prevDir, '.mcp-runtime.json');
+  const runtime = readRuntimeTarget(manifestPath);
+  if (!runtime.ok) return null;
+  const { path: file, version } = runtime.target;
+  // The worker itself must be among the files the manifest hashes, and carry
+  // the version the manifest names.
+  let hashed = false;
+  try {
+    const files = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))?.files;
+    hashed = isRecord(files) && Object.keys(files).some((relative) => path.resolve(prevDir, relative) === file);
+  } catch { /* unreadable since the verified read: not vouched for */ }
+  if (!hashed || readBakedVersion(file) !== version) return null;
+  return { path: file, version, signature: `previous:${file}:${version}`, source: 'rollback', dev: false };
 };
+const prevSnapshotTarget = (workerPath) => prevSnapshotAt(path.join(path.dirname(workerPath), '.prev'));
 
 function createLineReader(onMessage, onError) {
   let buffered = Buffer.alloc(0);
@@ -334,6 +354,7 @@ function createRuntimeWatch(manifestPath, {
   now = () => Date.now(),
 } = {}) {
   let verified = null;
+  let lastKey = null;
   const statKey = () => {
     try {
       // bigint: NTFS file ids exceed 2^53 and must compare exactly.
@@ -344,6 +365,7 @@ function createRuntimeWatch(manifestPath, {
   return {
     read({ force = false } = {}) {
       const key = statKey();
+      lastKey = key;
       const at = now();
       if (!force && key !== null && verified?.key === key && at >= verified.at && at - verified.at < reverifyMs) {
         return { ok: true, target: verified.target, cached: true };
@@ -352,7 +374,40 @@ function createRuntimeWatch(manifestPath, {
       verified = runtime.ok && key !== null ? { key, at, target: runtime.target } : null;
       return runtime;
     },
+    // The manifest's stat now, and as it was just before the last read: a
+    // commit since that read moves it (settleRuntime).
+    statKey,
+    lastReadKey: () => lastKey,
   };
+}
+
+// Wait for an install to settle (B3 wakes, K1 boots): repeat the read while it
+// fails integrity (or cannot be read) for up to waitMs. Installs commit the
+// manifest LAST, by rename-over, so until its stat moves nothing can have made
+// a failing read verify: the wait polls the stat and re-hashes the runtime
+// only when it moves, plus once at the deadline, before .prev or the fallback
+// is chosen (K1-WAIT-FULL-REHASH, 2026-10-03 review). It used to re-hash every
+// file every 250 ms — ~20 full reads (~8 MiB/s) per waiting connection, the
+// load B8 removed from the poller because it contends with the installer's
+// renames, whose EPERM is what leaves an install half-applied in the first place.
+async function settleRuntime(watch, {
+  initial = watch.read({ force: true }),
+  waitMs = WAKE_INTEGRITY_WAIT_MS,
+  pollMs = WAKE_INTEGRITY_POLL_MS,
+  stopped = () => false,
+} = {}) {
+  let runtime = initial;
+  const deadline = Date.now() + waitMs;
+  // The key taken just before that read: a commit landing during it still moves.
+  let seen = watch.lastReadKey();
+  while (!runtime.ok && !runtime.absent && !stopped() && Date.now() < deadline) {
+    await sleep(pollMs);
+    const key = watch.statKey();
+    if (key === seen && Date.now() < deadline) continue;
+    seen = key;
+    runtime = watch.read({ force: true });
+  }
+  return runtime;
 }
 
 // Is this supervisor receipt provably dead? The boot cleanup deletes on a yes,
@@ -440,6 +495,10 @@ class Supervisor {
     this.pollMs = Number(options.pollMs || process.env.KLYPIX_MCP_SUPERVISOR_POLL_MS || DEFAULT_POLL_MS);
     this.timeoutMs = Number(options.timeoutMs || process.env.KLYPIX_MCP_SUPERVISOR_TIMEOUT_MS || DEFAULT_TIMEOUT_MS);
     this.rollbackGraceMs = Number(options.rollbackGraceMs || process.env.KLYPIX_MCP_ROLLBACK_GRACE_MS || DEFAULT_ROLLBACK_GRACE_MS);
+    this.swapRetryBaseMs = Math.max(1000, Number(options.swapRetryBaseMs || process.env.KLYPIX_MCP_SWAP_RETRY_BASE_MS || DEFAULT_SWAP_RETRY_BASE_MS) || DEFAULT_SWAP_RETRY_BASE_MS);
+    this.swapRetryAttempts = 0;
+    this.swapRetrySignature = null;
+    this.swapRetryTimer = null;
     this.autoUpdate = options.autoUpdate !== false && autoUpdateEnabled();
     this.autoUpdatePollMs = Number(
       options.autoUpdatePollMs
@@ -756,18 +815,27 @@ class Supervisor {
     return target.dev || cmp === null || cmp >= 0;
   }
 
-  // The installer copies every live file to .prev before it renames new ones
-  // in, so .prev is a complete, consistent copy of the PREVIOUS install. It is a
-  // safe place to resume only when that copy is the version this connection
-  // last ran — the version the host's tool list still describes. Any other
-  // version would be a swap no gate has seen; crash recovery used to boot
-  // whatever .prev held.
+  // A .prev whose manifest verifies (prevSnapshotAt) is a complete, consistent
+  // copy of ONE previous install. It is a safe place to resume only when that
+  // copy is the version this connection last ran — the version the host's tool
+  // list still describes. Any other version would be a swap no gate has seen;
+  // crash recovery used to boot whatever .prev held.
   previousBaselineTarget(anchor) {
     if (!anchor?.path || anchor.source === 'rollback') return null;
     const previous = prevSnapshotTarget(anchor.path);
     const baseVersion = this.baselineVersion();
     if (!previous || !baseVersion || previous.version !== String(baseVersion)) return null;
     return previous;
+  }
+
+  // A pair that already runs from .prev resumes that same snapshot — while it
+  // still verifies and still holds this connection's version. An install
+  // rewrites .prev, and a pre-fix installer could rewrite it with a mixed set.
+  resumableRollback(anchor) {
+    const snapshot = anchor?.path ? prevSnapshotAt(path.dirname(anchor.path)) : null;
+    const baseVersion = this.baselineVersion();
+    if (!snapshot || !baseVersion || snapshot.version !== String(baseVersion)) return null;
+    return path.resolve(snapshot.path) === path.resolve(anchor.path) ? snapshot : null;
   }
 
   // The package's own worker as it is on disk NOW. fallbackTarget carries the
@@ -888,14 +956,10 @@ class Supervisor {
 
   // A full read of the manifest, repeated while it fails integrity (or cannot be
   // read) for up to WAKE_INTEGRITY_WAIT_MS: an install renames its files one at
-  // a time and commits the manifest last. Wakes (B3) and boots (K1) wait alike.
+  // a time and commits the manifest last. Wakes (B3) and boots (K1) wait alike;
+  // settleRuntime re-hashes only when the manifest moves.
   async settledRuntime(runtime = this.runtimeWatch.read({ force: true })) {
-    const deadline = Date.now() + WAKE_INTEGRITY_WAIT_MS;
-    while (!runtime.ok && !runtime.absent && !this.closed && Date.now() < deadline) {
-      await sleep(WAKE_INTEGRITY_POLL_MS);
-      runtime = this.runtimeWatch.read({ force: true });
-    }
-    return runtime;
+    return settleRuntime(this.runtimeWatch, { initial: runtime, stopped: () => this.closed });
   }
 
   // B3 (2026-10-03): the wake re-reads the manifest instead of trusting the
@@ -951,9 +1015,9 @@ class Supervisor {
     // sleeping target's path inside the managed directory — resume .prev when it
     // holds this connection's version...
     // A pair that already resumed from .prev resumes that same copy — while it
-    // still holds this connection's version (a new install overwrites .prev).
+    // still verifies and holds this connection's version (resumableRollback).
     const previous = anchor?.source === 'rollback'
-      ? (fs.existsSync(anchor.path) && readBakedVersion(anchor.path) === String(this.baselineVersion()) ? anchor : null)
+      ? this.resumableRollback(anchor)
       : this.previousBaselineTarget(anchor);
     if (previous) {
       log(`runtime still fails integrity after ${WAKE_INTEGRITY_WAIT_MS} ms (${runtime.error}) — waking v${previous.version} from .prev`);
@@ -1043,9 +1107,10 @@ class Supervisor {
   // is <brainDir>/klypix-mcp-worker.mjs — inside the directory being renamed —
   // and booting it at once could load a mixed module graph (a new worker beside
   // an old engine, or the reverse). So the boot waits for the install to settle,
-  // as a wake does (B3), and then tries the previous worker snapshot. Without
-  // one it refuses the connection instead of loading the known-unverified live
-  // files. A direct-package launch
+  // as a wake does (B3), and then boots .prev's complete pre-install copy — one
+  // whose own manifest verifies (prevSnapshotAt). Without one it refuses the
+  // connection instead of loading the known-unverified live files; the
+  // integrity error is recorded either way. A direct-package launch
   // keeps its worker outside the managed directory, which no install touches: it
   // boots at once. The host's first requests queue meanwhile (run()).
   async selectInitialTarget() {
@@ -1064,7 +1129,7 @@ class Supervisor {
           log(`runtime still fails integrity after ${WAKE_INTEGRITY_WAIT_MS} ms (${runtime.error}) — starting v${previous.version} from .prev, the complete copy of the previous install`);
           return previous;
         }
-        throw new Error(`KLYPIX core files do not verify (${runtime.error}) and no previous worker is available — no worker was started; retry after the install finishes, then /mcp reconnect`);
+        throw new Error(`KLYPIX core files do not verify (${runtime.error}) and no previous worker whose own manifest verifies is available — no worker was started; retry after the install finishes, then /mcp reconnect`);
       }
     }
     if (!runtime.ok) return this.fallbackTarget;
@@ -1532,6 +1597,37 @@ class Supervisor {
     }
   }
 
+  // A hot-swap that failed while the old worker still serves. A deterministic
+  // rejection (new major, breaking tools) stays rejected until a new install or a
+  // reconnect. A TRANSIENT one — an initialize timeout under load, a spawn error,
+  // an exit before activation — used to pin the connection to its old version
+  // just the same (field, 2026-10-03: one 15 s initialize timeout during a
+  // test-heavy hour left a Codex pair on v1.88.0 beside a v1.89.0 install until it
+  // reconnected). It now retries the same target on the swap backoff while the
+  // old worker keeps serving; the signature stays rejected meanwhile so the 1 s
+  // poller cannot restart it early, and the timer lifts it.
+  scheduleSwapRetry(candidate, reason) {
+    const signature = candidate.target.signature;
+    if (this.swapRetrySignature !== signature) {
+      this.swapRetrySignature = signature;
+      this.swapRetryAttempts = 0;
+    }
+    if (this.swapRetryAttempts >= SWAP_RETRY_FACTORS.length) return false;
+    const delay = this.swapRetryBaseMs * SWAP_RETRY_FACTORS[this.swapRetryAttempts++];
+    const rejectedVersion = candidate.version || candidate.target.version;
+    this.rejectedSignature = signature;
+    this.status = 'ready';
+    if (this.swapRetryTimer) clearTimeout(this.swapRetryTimer);
+    this.swapRetryTimer = setTimeout(() => {
+      this.swapRetryTimer = null;
+      if (!this.closed && this.rejectedSignature === signature) this.rejectedSignature = null;
+    }, delay);
+    this.swapRetryTimer.unref?.();
+    this.writeState({ rejectedVersion, swapRetry: { attempt: this.swapRetryAttempts, of: SWAP_RETRY_FACTORS.length, inMs: delay } });
+    log(`kept v${this.active?.version || 'none'}; v${rejectedVersion} failed transiently (${reason}) — retrying in ${Math.round(delay / 1000)} s (${this.swapRetryAttempts}/${SWAP_RETRY_FACTORS.length})`);
+    return true;
+  }
+
   rejectCandidate(reason, terminate = true, { deterministic = false } = {}) {
     const candidate = this.candidate;
     if (!candidate) return;
@@ -1542,6 +1638,7 @@ class Supervisor {
       this.rejectWhileIdle(candidate, reason);
       return;
     }
+    if (this.active && !deterministic && this.scheduleSwapRetry(candidate, reason)) return;
     this.status = this.active ? 'restart-required' : 'recovery-failed';
     if (!this.active) {
       // RECOVERY rejection: transient spawn failures (0xC0000142-class) must
@@ -1646,6 +1743,9 @@ class Supervisor {
     this.rejectedSignature = rejection ? rejection.signature : null;
     this.recoveryAttempts = 0;   // a committed worker resets the retry budget
     if (this.recoveryTimer) { clearTimeout(this.recoveryTimer); this.recoveryTimer = null; }
+    this.swapRetryAttempts = 0;   // and the hot-swap retry budget
+    this.swapRetrySignature = null;
+    if (this.swapRetryTimer) { clearTimeout(this.swapRetryTimer); this.swapRetryTimer = null; }
     this.status = rejection ? 'restart-required' : 'ready';
     this.lastError = rejection ? rejection.reason : null;
     this.runtimeError = null;
@@ -1941,6 +2041,7 @@ class Supervisor {
     clearTimeout(this.autoUpdateStarter);
     clearInterval(this.autoUpdatePoller);
     if (this.recoveryTimer) { clearTimeout(this.recoveryTimer); this.recoveryTimer = null; }
+    if (this.swapRetryTimer) { clearTimeout(this.swapRetryTimer); this.swapRetryTimer = null; }
     // Real shutdown grace: stdin EOF lets the worker run its own presence
     // cleanup (stopRuntimePresence/removeSession). An instant SIGTERM is
     // TerminateProcess on Windows — the cleanup never runs and every normally
@@ -1967,6 +2068,8 @@ export const __test = {
   compareSemver,
   atomicJson,
   createRuntimeWatch,
+  settleRuntime,
+  prevSnapshotTarget,
   cleanSupervisorStateDir,
   deadSupervisorReceipt,
   pidState,

@@ -699,18 +699,31 @@ function recordLaneFailure(reason, mode = 'presence-lane') {
     return { ok: false, reason: value };
 }
 // tmp+rename: lock-free readers must never parse a torn lane as an empty one.
-// Windows rename-over-open-destination throws EPERM (AV / a concurrent reader):
-// one immediate retry wins the race; on final failure the tmp is removed before
-// rethrowing so failures can't litter the sessions dir (field: dozens of
-// orphaned tmp files, 2026-08-07). A throttled janitor sweeps pre-fix orphans.
+// Windows rename-over-open-destination throws EPERM/EACCES/EBUSY (AV / a
+// concurrent reader). One immediate retry stopped being enough once many
+// sessions shared a lane (16 lost races in six hours at 15–23 live sessions,
+// 2026-10-02): the rename now backs off, ~185 ms worst case, inside the lane
+// lock. On final failure the tmp is removed before rethrowing so failures
+// can't litter the sessions dir (field: dozens of orphaned tmp files,
+// 2026-08-07). A throttled janitor sweeps pre-fix orphans.
+// PARITY: agent-presence.mjs renameWithRetry — same codes, same backoff
+// (duplicated because this hook stays free of sibling static imports).
+const RENAME_RETRY_CODES = new Set(['EPERM', 'EACCES', 'EBUSY']);
+const LANE_RENAME_BACKOFF_MS = [10, 25, 50, 100];
+function renameRetry(from, to, rename = fs.renameSync, sleep = sleepSync, backoffMs = LANE_RENAME_BACKOFF_MS) {
+    for (let attempt = 0; ; attempt++) {
+        try { rename(from, to); return attempt + 1; }
+        catch (error) {
+            if (!RENAME_RETRY_CODES.has(error?.code) || attempt >= backoffMs.length) throw error;
+            sleep(backoffMs[attempt]);
+        }
+    }
+}
 function writeLaneAtomic(payload) {
     const tmp = SESSIONS_FILE + '.tmp-' + process.pid + '-' + Math.random().toString(36).slice(2, 8);
     fs.writeFileSync(tmp, payload);
-    try { fs.renameSync(tmp, SESSIONS_FILE); }
-    catch (err) {
-        try { fs.renameSync(tmp, SESSIONS_FILE); }
-        catch { try { fs.unlinkSync(tmp); } catch { /* best-effort */ } throw err; }
-    }
+    try { renameRetry(tmp, SESSIONS_FILE); }
+    catch (err) { try { fs.unlinkSync(tmp); } catch { /* best-effort */ } throw err; }
     sweepStaleTmp(SESSIONS_DIR);
 }
 // PARITY: same throttle/age/pattern contract as agent-presence.mjs
@@ -915,16 +928,13 @@ function readHostmapChecked() {
 function writeHostmapAtomic(payload, renameSync = fs.renameSync) {
     const tmp = HOSTMAP_FILE + '.' + process.pid + '-' + Math.random().toString(36).slice(2, 8) + '.tmp';
     fs.writeFileSync(tmp, payload);
-    try { renameSync(tmp, HOSTMAP_FILE); }
-    catch (firstError) {
-        // Windows can transiently reject rename-over-open with EPERM while an
-        // AV scanner or reader releases the destination. Match the lane
-        // writer's bounded retry; never leave a temp file on final failure.
-        try { renameSync(tmp, HOSTMAP_FILE); }
-        catch (finalError) {
-            try { fs.unlinkSync(tmp); } catch { /* best-effort */ }
-            throw finalError || firstError;
-        }
+    // Windows can transiently reject rename-over-open with EPERM while an AV
+    // scanner or reader releases the destination. Same bounded backoff as the
+    // lane writer; never leave a temp file on final failure.
+    try { renameRetry(tmp, HOSTMAP_FILE, renameSync); }
+    catch (error) {
+        try { fs.unlinkSync(tmp); } catch { /* best-effort */ }
+        throw error;
     }
 }
 function commitPresenceIdentityFiles({ lanePayload, hostmapPayload = null, writeHostmap = writeHostmapAtomic, writeLane = writeLaneAtomic }) {
@@ -1716,7 +1726,7 @@ function readMsgOutboxChecked() {
 function writeMsgOutboxAtomic(payload) {
     const tmp = MSG_OUTBOX_FILE + '.' + process.pid + '-' + Math.random().toString(36).slice(2, 8) + '.tmp';
     fs.writeFileSync(tmp, payload);
-    try { fs.renameSync(tmp, MSG_OUTBOX_FILE); }
+    try { renameRetry(tmp, MSG_OUTBOX_FILE); }
     catch (error) { try { fs.unlinkSync(tmp); } catch { /* best-effort */ } throw error; }
 }
 function updateMsgOutbox(mutate) {
@@ -5974,5 +5984,5 @@ if (!process.env.KLYPIX_BRAIN_NO_MAIN) {
 
 // Exported for hermetic unit tests only (gated by KLYPIX_BRAIN_NO_MAIN above so the
 // import doesn't run main()/exit the test). Not part of the runtime hook contract.
-export { refreshNpmCurrency, versionCurrencyFooter, autoUpdateFooterInputs, knownNpmLatest, bakedBrainVersion, httpsFetchLatest, cmpSemver, decayStampForMessage, messageActionId, messageFooter, postMessages, touchSession, writeHostmapAtomic, commitPresenceIdentityFiles, MSG_OUTBOX_FILE, HOSTMAP_FILE, SESSIONS_FILE, splitMarkerSuffixes, parseMarkerSuffixText, evidenceGitPath, gitBlobOid, computeFreshness, selfHealFooter };
+export { refreshNpmCurrency, versionCurrencyFooter, autoUpdateFooterInputs, knownNpmLatest, bakedBrainVersion, httpsFetchLatest, cmpSemver, decayStampForMessage, messageActionId, messageFooter, postMessages, touchSession, writeHostmapAtomic, renameRetry, commitPresenceIdentityFiles, MSG_OUTBOX_FILE, HOSTMAP_FILE, SESSIONS_FILE, splitMarkerSuffixes, parseMarkerSuffixText, evidenceGitPath, gitBlobOid, computeFreshness, selfHealFooter };
 // (shouldSelfUpdate is exported at its declaration above — the auto-propagation decision seam for tests)

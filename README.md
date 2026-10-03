@@ -460,8 +460,8 @@ receiving model calls `brain_message_receipt` with the exact message id and per-
 token; only that token-bound action records `consumed`. Pending, offered, and acknowledged notes
 survive reconnects. Expiry or bounded-capacity eviction records a failed per-recipient receipt
 instead of silently looking delivered. The send-time audience is fixed, unresolved targeted sends
-fail closed, the core lane is machine-local, notes expire after 24 hours, and they are never written
-into the brain.
+fail closed, the core lane is machine-local, a note to every session expires after 24 hours and a
+directed note after 7 days, and notes are never written into the brain.
 
 Durable handoffs go in the brain itself — decisions, findings, open questions and skills captured
 as cards, each stamped with the agent that wrote it.

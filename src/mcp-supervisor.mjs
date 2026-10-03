@@ -983,7 +983,10 @@ class Supervisor {
     const persistent = this.wakeDeferral.count >= WAKE_DEFERRAL_REINSTALL_COUNT
       && Date.now() - Date.parse(this.wakeDeferral.since) >= this.wakeReinstallHintMs;
     const detail = persistent
-      ? `KLYPIX core files still do not verify (${this.lastError || 'runtime integrity'}) after ${this.wakeDeferral.count} attempts since ${this.wakeDeferral.since} — reinstall with npx -y klypix-mcp@latest install --force, then retry`
+      // This text reaches the AGENT as a tool error, so it names the repair's owner
+      // and the read-only diagnosis, not an installer: reinstalling a shared live
+      // install is the user's call (the doctor prints the exact command).
+      ? `KLYPIX core files still do not verify (${this.lastError || 'runtime integrity'}) after ${this.wakeDeferral.count} attempts since ${this.wakeDeferral.since} — the install on this machine needs a repair: ask the user to run npx -y klypix-mcp@latest doctor, which shows the fix (do not run an installer yourself), then retry`
       : `KLYPIX core files do not verify (${this.lastError || 'runtime integrity'}) — an update may be mid-install; retry shortly`;
     for (const queued of this.hostQueue.splice(0)) this.failHostRequest(queued, detail);
     log(`wake deferred (${this.wakeDeferral.count}×): ${this.lastError || 'runtime integrity'} — no consistent worker to boot; staying hibernated, the next request retries`);

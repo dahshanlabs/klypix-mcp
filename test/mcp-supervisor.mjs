@@ -871,9 +871,10 @@ try {
     const second = await pair.callError();
     const third = await pair.callError();
     ok(/retry shortly/.test(String(second?.message || ''))
-      && /still do not verify .* after 3 attempts since .* — reinstall with npx -y klypix-mcp@latest install --force, then retry/.test(String(third?.message || ''))
+      && /still do not verify .* after 3 attempts since .* — the install on this machine needs a repair: ask the user to run npx -y klypix-mcp@latest doctor, which shows the fix \(do not run an installer yourself\), then retry/.test(String(third?.message || ''))
+      && !/klypix-mcp@\S+ install|install --force/.test(String(third?.message || ''))
       && pair.state()?.hibernation?.wakeDeferred?.count === 3 && boots(audit).length === bootCount,
-    `F6: a refusal that persists names the reinstall instead of "retry shortly" (${String(third?.message || '').slice(0, 160)})`);
+    `F6: a refusal that persists names the repair and its owner (the user, via the doctor) instead of "retry shortly", never an installer command (${String(third?.message || '').slice(0, 160)})`);
     commitManifest(dir, '90.1.0');   // the interrupted install is re-run to completion
     const healed = await waitFor(async () => {
       const s = pair.state();

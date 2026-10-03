@@ -5424,11 +5424,16 @@ function installedDoctorHint(baked) {
 function updateRemedy({ plan, decision, latest, baked, brainDir, now, spawned = false }) {
     const neutral = { mark: '⬆️', text: `${installedDoctorHint(baked)} shows whether it installs automatically.` };
     if (!plan || typeof plan !== 'object' || plan.scheduleError) return neutral;
+    // Every SessionStart puts this text in an AGENT's context, and agents on shared
+    // machines have run installers on their own before (a dev-owned install flipped
+    // to npm, a live install overwritten mid-session). So these two branches name the
+    // decision and who owns it, never an installer command; the doctor, which a
+    // person runs, carries the exact remedy.
     if (decision === 'dev-owned') {
-        return { mark: '⚠️', text: 'Automatic updates are paused: developer-owned install — re-deploy from your checkout, or `npx -y klypix-mcp@latest install --force` to return to npm releases.' };
+        return { mark: '⚠️', text: `Automatic updates are paused: developer-owned install — it follows its checkout, not npm releases. Returning it to npm releases is the owner's decision (tell the user; do not run an installer yourself) — ${installedDoctorHint(baked)} shows how.` };
     }
     if (decision === 'major-blocked') {
-        return { mark: '⚠️', text: `Automatic updates will NOT install it: \`v${latest}\` is a new major version, which needs a manual install — the owner's decision: \`npx -y klypix-mcp@latest install\`.` };
+        return { mark: '⚠️', text: `Automatic updates will NOT install it: \`v${latest}\` is a new major version, which needs a manual install — the owner's decision (tell the user; do not run an installer yourself) — ${installedDoctorHint(baked)} shows how.` };
     }
     if (decision === 'held') {
         const from = plan.hold && plan.hold.version;

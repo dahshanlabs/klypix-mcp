@@ -296,7 +296,9 @@ npm view klypix-mcp@<version> --json | grep -A3 attestations
 
 1. `npm view klypix-mcp version` shows the new version.
 2. Install it clean somewhere neutral and run `klypix-mcp --help`.
-3. `npx klypix-mcp doctor` in a linked project — it should report aligned.
+3. `npx -y klypix-mcp@<version> doctor` in a linked project — it should report aligned. PARTIAL
+   (exit 0) is also clean: it means readiness warnings only — read them (sessions without a
+   declared scope, a retired leftover module). DRIFTED (exit 1) is not.
 4. Machines pick the new build up through the auto-propagation path; a fresh
    `npx klypix-mcp install` forces it.
 5. **Re-sync the DESKTOP bundle and prove it boots.** The KLYPIX repo carries its own

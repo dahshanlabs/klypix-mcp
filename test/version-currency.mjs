@@ -156,16 +156,20 @@ const running = at({ plan: planFor({ dueAt: iso(NOW + 15 * 60_000), inProgress: 
 ok(/at the next update check \(running now\)/.test(running), 'a live helper holds the lock → "(running now)", not a stale ETA');
 
 const devLine = at({ plan: planFor({ installedIdentity: { version: '1.13.0', managed: true, dev: true, unknown: false } }), decision: 'dev-owned' });
-ok(/Automatic updates are paused: developer-owned install — re-deploy from your checkout, or `npx -y klypix-mcp@latest install --force` to return to npm releases\./.test(devLine),
-   'dev-owned → says automatic updates are paused and how to return to npm releases');
+ok(/Automatic updates are paused: developer-owned install — it follows its checkout, not npm releases\. Returning it to npm releases is the owner's decision \(tell the user; do not run an installer yourself\) — `brain_doctor` \(or `npx -y klypix-mcp@[^`]+ doctor`\) shows how\./.test(devLine),
+   'dev-owned → says automatic updates are paused, whose decision it is, and where the remedy lives');
+ok(!/klypix-mcp(@\S+)? install|install --force|install --runtime-only/.test(devLine),
+   'dev-owned → the agent-visible notice never names an installer command (agents have run installers on their own)');
 ok(!/no action required/.test(devLine) && !/automatically in the background/.test(devLine),
    'dev-owned → never "no action required", never an install promise');
 
 const majorLine = at({ plan: planFor(), decision: 'major-blocked', known: { latest: '2.0.0', at: NOW - HOUR } });
 ok(/will NOT install it: `v2\.0\.0` is a new major version, which needs a manual install/.test(majorLine) && !/no action required/.test(majorLine),
    'major-blocked → names the manual install, promises nothing');
-ok(/the owner's decision: `npx -y klypix-mcp@latest install`\./.test(majorLine),
-   'F2: major-blocked names the command that installs it');
+ok(/the owner's decision \(tell the user; do not run an installer yourself\) — `brain_doctor` \(or `npx -y klypix-mcp@[^`]+ doctor`\) shows how\./.test(majorLine),
+   'F2: major-blocked names whose decision it is and points at the installed doctor');
+ok(!/klypix-mcp(@\S+)? install|install --force|install --runtime-only/.test(majorLine),
+   'major-blocked → the agent-visible notice never names an installer command');
 
 const heldLine = at({ plan: planFor({ hold: { version: '1.14.0', since: iso(NOW - HOUR) } }), decision: 'held' });
 ok(/held after a manual downgrade to `v1\.13\.0` — only a release newer than `v1\.14\.0` installs automatically/.test(heldLine) && !/no action required/.test(heldLine),

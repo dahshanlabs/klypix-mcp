@@ -748,6 +748,18 @@ const supervisorReceipt = (brainDir, name, state) => writeJson(path.join(brainDi
   ok(r.autoUpdate.staleReason === 'manual-downgrade' && r.autoUpdate.knownDecision === 'held'
     && !/installs at the next check/.test(textOf(r)),
   'A7: a deliberate downgrade is predicted as held — the doctor never promises to re-install the version the owner left');
+  // A7b (2026-10-03 integration review) — a runtime no receipt names. The
+  // helper decides with the version its spawner passes (the baked one), and so
+  // does the SessionStart notice; the doctor promised an install the helper
+  // refuses.
+  reset();
+  fs.rmSync(path.join(brainDir, '.mcp-runtime.json'), { force: true });
+  fs.rmSync(path.join(brainDir, '.brain-version.json'), { force: true });
+  writeJson(files.cache, { pkg: 'klypix-mcp', latest: NEXT_MAJOR, checkedAt: NOW - 30 * 60_000, latestAt: NOW - 30 * 60_000 });
+  r = run();
+  ok(r.autoUpdate.installedIdentity?.version === null && r.autoUpdate.knownDecision === 'major-blocked'
+    && /will NOT install automatically: new major/.test(textOf(r)) && !/installs at the next check/.test(textOf(r)),
+  'A7b: a receipt-less runtime with a new major known locally → "will NOT install automatically: new major", as the helper decides');
   reset();
   writeJson(files.cache, { pkg: 'klypix-mcp', latest: NEXT, checkedAt: NOW - HOUR, latestAt: NOW - HOUR });
   r = run({ env: OFF });

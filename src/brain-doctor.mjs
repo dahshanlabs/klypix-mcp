@@ -558,11 +558,20 @@ function autoUpdateView({ au, brainDir, supervisors, version, npmLatest, doctorV
   const knownLatest = knownNpmLatest(brainDir, au, npmLatest, now);
   const hold = au.hold || predictedHold(au);
   const decide = typeof autoUpdateLib.autoUpdateDecision === 'function' ? autoUpdateLib.autoUpdateDecision : null;
+  // When no receipt names a version, the helper decides with the version its
+  // spawner passed (KLYPIX_MCP_AUTO_UPDATE_CURRENT: the running or baked one),
+  // and so does the SessionStart notice. Deciding with the bare receipts said
+  // "installs at the next check" for a new major the helper refuses
+  // (2026-10-03 integration review).
+  const id = au.installedIdentity;
+  const decidingAs = id && typeof id === 'object' && !id.unknown && !id.version && version.baked
+    ? { ...id, version: version.baked }
+    : (id || null);
   const decisionFor = (latest) => {
     if (!latest) return null;
     if (!effectiveEnabled) return 'disabled';
     if (!decide) return 'unknown';
-    try { return decide({ installed: au.installedIdentity || null, latestVersion: latest, hold }); }
+    try { return decide({ installed: decidingAs, latestVersion: latest, hold }); }
     catch { return 'unknown'; }
   };
   const installedVersion = au.installedIdentity?.version || version.baked || null;
@@ -897,7 +906,9 @@ export function inspect(opts = {}) {
   let auBase = null;
   try {
     if (typeof autoUpdateLib.inspectAutoUpdate === 'function') {
-      auBase = autoUpdateLib.inspectAutoUpdate(brainDir, { now, env: opts.env || process.env });
+      // currentVersion: the version a spawner hands the helper, so the updater's
+      // own `decision` field decides a receipt-less runtime as the helper will.
+      auBase = autoUpdateLib.inspectAutoUpdate(brainDir, { now, env: opts.env || process.env, currentVersion: version.baked });
     }
   } catch { auBase = null; }
   if (!auBase || typeof auBase !== 'object') {

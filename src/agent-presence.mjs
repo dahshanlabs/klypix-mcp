@@ -373,20 +373,50 @@ export function looksMachineTurn(text) {
 // lines) can never parse a torn lane as an authoritative "0 peers / no
 // messages", and a crash mid-write can never destroy undelivered messages.
 // On Windows, renaming over a destination a reader/AV momentarily holds open
-// throws EPERM — one immediate retry wins that race, and on final failure the
-// tmp is REMOVED before rethrowing (the field found dozens of orphaned
-// `.tmp-<pid>-<rand>` files littering the sessions dir, 2026-08-07).
+// throws EPERM/EACCES/EBUSY. ONE immediate retry used to be the whole answer,
+// and it stopped being enough once many sessions shared a lane: 16 lost races
+// in six hours at 15–23 live sessions (2026-10-02), and a lost race is not
+// cosmetic — the throw left an MCP tool call failed outright (a brain_note)
+// and a hook heartbeat or delivery dropped. The rename now backs off like the
+// brain's own atomic write does; worst case ~185 ms, inside the caller's lane
+// lock (peers' lock budget is 500–600 ms, so one slow writer delays them, it
+// does not starve them). On final failure the tmp is REMOVED before
+// rethrowing (the field found dozens of orphaned `.tmp-<pid>-<rand>` files
+// littering the sessions dir, 2026-08-07).
+// PARITY: global-brain-hook.mjs renameRetry — same codes, same backoff.
+const RENAME_RETRY_CODES = new Set(['EPERM', 'EACCES', 'EBUSY']);
+export const LANE_RENAME_BACKOFF_MS = Object.freeze([10, 25, 50, 100]);
+// Returns the number of attempts it took. `rename` and `sleep` are injectable
+// for tests; the defaults are read at CALL time so a patched fs is honoured.
+export function renameWithRetry(from, to, { rename = fs.renameSync, sleep = sleepSync, backoffMs = LANE_RENAME_BACKOFF_MS } = {}) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      rename(from, to);
+      return attempt + 1;
+    } catch (error) {
+      if (!RENAME_RETRY_CODES.has(error?.code) || attempt >= backoffMs.length) throw error;
+      sleep(backoffMs[attempt]);
+    }
+  }
+}
+
 function writeLaneFileAtomic(laneFile, payload) {
   const tmp = `${laneFile}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
   fs.writeFileSync(tmp, payload);
   try {
-    fs.renameSync(tmp, laneFile);
+    renameWithRetry(tmp, laneFile);
   } catch (err) {
-    try { fs.renameSync(tmp, laneFile); }
-    catch { try { fs.unlinkSync(tmp); } catch { /* best-effort */ } throw err; }
+    try { fs.unlinkSync(tmp); } catch { /* best-effort */ }
+    throw err;
   }
   sweepStaleTmpFiles(path.dirname(laneFile));
 }
+
+// A lane write that still fails after the backoff is reported, never thrown
+// out of a heartbeat or a send: the caller gets a verdict it can show ("the
+// note was not posted, retry") instead of an exception that fails a whole tool
+// call for a reason unrelated to what the tool was asked to do.
+const writeFailureReason = (error) => `write-failed:${String(error?.code || error?.message || 'unknown').slice(0, 80)}`;
 
 // Opportunistic janitor for tmp orphans left by crashes or the pre-fix rename
 // path. Throttled to once per process per 10 minutes; only files matching our
@@ -1097,14 +1127,20 @@ export function upsertSession({
     };
     const kept = sessions.filter((session) => session.id !== id);
     kept.push(next);
-    fs.mkdirSync(path.dirname(laneFile), { recursive: true });
-    writeLaneFileAtomic(laneFile, JSON.stringify({
-      ...data,
-      sessions: kept.slice(-40),
-      messages: maintainMessages(data.messages, now),
-      endedSessions,
-      directory: rememberSession(data.directory, next, now),
-    }));
+    try {
+      fs.mkdirSync(path.dirname(laneFile), { recursive: true });
+      writeLaneFileAtomic(laneFile, JSON.stringify({
+        ...data,
+        sessions: kept.slice(-40),
+        messages: maintainMessages(data.messages, now),
+        endedSessions,
+        directory: rememberSession(data.directory, next, now),
+      }));
+    } catch (error) {
+      // The heartbeat did not land: return the lane as it IS (without this
+      // touch) and say so, exactly like the lock-timeout path above.
+      return withWriteVerdict(sessions.sort((a, b) => Number(b.lastSeen || 0) - Number(a.lastSeen || 0)), false, writeFailureReason(error));
+    }
     return withWriteVerdict(kept.sort((a, b) => Number(b.lastSeen || 0) - Number(a.lastSeen || 0)), true);
   } finally {
     if (gotLock) releaseLock(lockFile);
@@ -2694,12 +2730,19 @@ export function postPresenceMessage({
       ...(offline ? { offline } : {}),
     };
     messages.push(message);
-    fs.mkdirSync(path.dirname(laneFile), { recursive: true });
-    writeLaneFileAtomic(laneFile, JSON.stringify({
-      ...data,
-      sessions,
-      messages: capMessages(messages, MESSAGE_LANE_CAP, now),
-    }));
+    try {
+      fs.mkdirSync(path.dirname(laneFile), { recursive: true });
+      writeLaneFileAtomic(laneFile, JSON.stringify({
+        ...data,
+        sessions,
+        messages: capMessages(messages, MESSAGE_LANE_CAP, now),
+      }));
+    } catch (error) {
+      // Nothing was written, so nothing was posted: tell the sender to retry
+      // rather than throwing — a thrown lane error reads to a model as "the
+      // tool is broken" and sends it back to asking the human to relay.
+      return { posted: false, message: null, reason: writeFailureReason(error) };
+    }
     // Who will actually see this, and in what state — the sender's reply to the
     // human is built from this, so it must say "idle 14m" or "not running",
     // never just "queued".

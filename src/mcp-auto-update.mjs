@@ -675,17 +675,12 @@ function outcomeRecord({ stampRead, statusRead }) {
  *   installed  installIdentity(brainDir)
  *   lock       {pid, acquiredAt, alive} of .autoupdate.lock, or null
  */
-export function autoUpdateSchedule({
-  stamp = null,
-  stampState = null,
-  status = null,
-  installed = null,
-  lock = null,
-  now = Date.now(),
-  enabled = true,
-  ttlMs = AUTO_UPDATE_TTL_MS,
-} = {}) {
+export function autoUpdateSchedule(input = {}) {
   try {
+    const {
+      stamp = null, stampState = null, status = null, installed = null,
+      lock = null, now = Date.now(), enabled = true, ttlMs = AUTO_UPDATE_TTL_MS,
+    } = isRecord(input) ? input : {};
     const t = validNow(now);
     const ttl = validTtl(ttlMs);
     const record = isRecord(stamp) ? stamp : null;

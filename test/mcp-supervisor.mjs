@@ -1288,18 +1288,37 @@ try {
     `K1: an install that commits inside the wait is booted as the verified runtime (${bootList(booted)}; ${s?.active?.source}; ${s?.lastError})`);
   });
 
-  const bootWithoutPrevStartsOwnWorker = () => scenario('boot-noprev', async (track) => {
+  const bootWithoutPrevRejectsUncheckedFiles = () => scenario('boot-noprev', async (track) => {
     const dir = runtimeDir('boot-noprev');
-    install(dir, '90.0.0', { identity: true });
-    install(dir, '90.1.0', { identity: true, commit: false });
+    const audit = path.join(dir, 'boots.jsonl');
+    install(dir, '90.0.0', { identity: true, bootAudit: audit });
+    install(dir, '90.1.0', { identity: true, bootAudit: audit, commit: false });
     fs.rmSync(path.join(dir, '.prev'), { recursive: true, force: true });
     const started = Date.now();
-    const pair = track(await openPair(dir, 'k1-boot-noprev', { entry: flatEntry(dir, '90.1.0'), ...quiet }));
-    const waited = Date.now() - started;
-    const s = pair.state();
-    ok(await answer(pair) === '90.1.0' && waited >= 4000 && s?.active?.source === 'package'
-      && /integrity mismatch: worker\.mjs/.test(s?.lastError || ''),
-    `K1: with no .prev, the boot still waits, then starts the package's own worker as before and records why (${waited} ms; ${s?.active?.source}; ${s?.lastError})`);
+    const child = spawn(process.execPath, [flatEntry(dir, '90.1.0')], {
+      cwd: dir, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, KLYPIX_MCP_RUNTIME_MANIFEST: manifestOf(dir), KLYPIX_MCP_STATE_DIR: path.join(dir, 'states'), KLYPIX_AUTO_UPDATE: '0' },
+    });
+    let stdout = '', stderr = '';
+    child.stdout.on('data', chunk => { stdout += chunk; });
+    child.stderr.on('data', chunk => { stderr += chunk; });
+    const exited = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { child.kill(); reject(new Error('unchecked startup did not close within 30 s')); }, 30000);
+      child.once('error', error => { clearTimeout(timer); reject(error); });
+      child.once('exit', (code, signal) => { clearTimeout(timer); resolve({ code, signal }); });
+    });
+    child.stdin.on('error', () => {});
+    child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'k1-boot-noprev', version: '1.0.0' } } }) + '\n');
+    const result = await exited;
+    const replies = stdout.trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+    const error = replies.find(message => message.id === 1)?.error;
+    ok(result.code !== 0 && Date.now() - started >= 4000 && boots(audit).length === 0
+      && error?.code === -32002 && error.data?.retryable === true && /no worker was started/.test(error.message),
+      `K1: an incomplete install without .prev boots nothing and answers initialize with a retryable error (${JSON.stringify(result)}; ${stdout}; ${stderr.slice(-160)})`);
+    commitManifest(dir, '90.1.0');
+    const pair = track(await openPair(dir, 'k1-boot-repaired', { entry: flatEntry(dir, '90.1.0'), ...quiet }));
+    ok(await answer(pair) === '90.1.0' && boots(audit).length === 1,
+      'K1: reconnect after the install finishes starts the verified worker');
   });
 
   const bootDirectPackageAtOnce = () => scenario('boot-pkg', async (track) => {
@@ -1370,16 +1389,11 @@ try {
   };
   const bootReceiptsNameTheError = async () => {
     try {
-      const [withPrev, withoutPrev] = await Promise.all([
-        firstReceiptAfterBoot('boot-receipt-prev', { prev: true }),
-        firstReceiptAfterBoot('boot-receipt-noprev', { prev: false }),
-      ]);
+      const withPrev = await firstReceiptAfterBoot('boot-receipt-prev', { prev: true });
       const view = (s) => `${s?.status}/${s?.active?.source}/${s?.lastError}`;
       ok(withPrev?.status === 'awaiting-initialize' && withPrev.active?.source === 'rollback'
-        && /integrity mismatch: worker\.mjs/.test(withPrev.lastError || '')
-        && withoutPrev?.status === 'awaiting-initialize' && withoutPrev.active?.source === 'package'
-        && /integrity mismatch: worker\.mjs/.test(withoutPrev.lastError || ''),
-      `K1: the first receipt after the boot already names the integrity error, whether it started .prev or its own worker (${view(withPrev)}; ${view(withoutPrev)})`);
+        && /integrity mismatch: worker\.mjs/.test(withPrev.lastError || ''),
+      `K1: the first receipt after booting .prev already names the integrity error (${view(withPrev)})`);
     } catch (error) {
       ok(false, `K1: the first receipt after the boot — ${error?.message || error}`);
     }
@@ -1420,7 +1434,7 @@ try {
   await Promise.all([
     bootDuringInstallStartsPrev(),
     bootWaitsForInstallToFinish(),
-    bootWithoutPrevStartsOwnWorker(),
+    bootWithoutPrevRejectsUncheckedFiles(),
     bootDirectPackageAtOnce(),
     bootReceiptsNameTheError(),
     pollIsReceipted(),

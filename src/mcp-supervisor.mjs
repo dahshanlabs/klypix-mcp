@@ -1043,9 +1043,9 @@ class Supervisor {
   // is <brainDir>/klypix-mcp-worker.mjs — inside the directory being renamed —
   // and booting it at once could load a mixed module graph (a new worker beside
   // an old engine, or the reverse). So the boot waits for the install to settle,
-  // as a wake does (B3), and then boots .prev's complete pre-install copy; only
-  // without one does it boot the package's own worker, as before. Either way the
-  // integrity error is recorded from the first receipt. A direct-package launch
+  // as a wake does (B3), and then tries the previous worker snapshot. Without
+  // one it refuses the connection instead of loading the known-unverified live
+  // files. A direct-package launch
   // keeps its worker outside the managed directory, which no install touches: it
   // boots at once. The host's first requests queue meanwhile (run()).
   async selectInitialTarget() {
@@ -1053,7 +1053,7 @@ class Supervisor {
     if (!runtime.ok && !runtime.absent && within(path.dirname(this.runtimeManifest), this.fallbackTarget.path)) {
       log(`runtime fails integrity at start (${runtime.error}) — waiting up to ${WAKE_INTEGRITY_WAIT_MS} ms for an install to settle`);
       runtime = await this.settledRuntime(runtime);
-      if (!runtime.ok && !runtime.absent && !this.closed) {
+      if (!runtime.ok && !this.closed) {
         // Recorded the way the poller records it (noteRuntimeError), so a
         // manifest that verifies later clears it (clearRuntimeError).
         this.errorBeforeRuntime = this.lastError;
@@ -1064,8 +1064,7 @@ class Supervisor {
           log(`runtime still fails integrity after ${WAKE_INTEGRITY_WAIT_MS} ms (${runtime.error}) — starting v${previous.version} from .prev, the complete copy of the previous install`);
           return previous;
         }
-        log(`runtime still fails integrity after ${WAKE_INTEGRITY_WAIT_MS} ms (${runtime.error}) and .prev holds no worker — starting the package's own worker v${this.fallbackTarget.version}`);
-        return this.fallbackTarget;
+        throw new Error(`KLYPIX core files do not verify (${runtime.error}) and no previous worker is available — no worker was started; retry after the install finishes, then /mcp reconnect`);
       }
     }
     if (!runtime.ok) return this.fallbackTarget;
@@ -1870,7 +1869,18 @@ class Supervisor {
       },
     ));
 
-    const initial = await this.selectInitialTarget();
+    let initial;
+    try { initial = await this.selectInitialTarget(); }
+    catch (error) {
+      // Return the actual startup failure to queued initialize requests before
+      // closing. A broken install must neither boot unchecked files nor leave
+      // the host waiting for a worker that cannot start.
+      for (const message of this.hostQueue.splice(0)) {
+        if (message.id !== undefined) this.sendHost({ jsonrpc: '2.0', id: message.id, error: { code: -32002, message: error.message, data: { retryable: true } } });
+      }
+      this.close();
+      throw error;
+    }
     if (this.closed) return finished;
     this.active = this.spawnWorker(initial, 'active');
     this.status = 'awaiting-initialize';

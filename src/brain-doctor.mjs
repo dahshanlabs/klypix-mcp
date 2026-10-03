@@ -363,8 +363,12 @@ function inspectSupervisors(brainDir, baked, now = Date.now()) {
     // an error until they verify. It used to read "wakes on the next request".
     const wakeDeferred = intentionallyHibernated && state.hibernation?.wakeDeferred
       && typeof state.hibernation.wakeDeferred === 'object' ? state.hibernation.wakeDeferred : null;
+    // A pair that already served from .prev can resume that same snapshot;
+    // the live directory's integrity error alone does not prove its wake fails.
+    // An actual refused wake still wins over this last-known fallback.
+    const hasPreviousWorker = sleepingTarget?.source === 'rollback';
     const wakeBlocked = intentionallyHibernated
-      && (Boolean(wakeDeferred) || (RUNTIME_INTEGRITY_ERROR.test(String(state.lastError || '')) && !fresh));
+      && (Boolean(wakeDeferred) || (!hasPreviousWorker && RUNTIME_INTEGRITY_ERROR.test(String(state.lastError || '')) && !fresh));
     const workerImpaired = (!state.active && !intentionallyHibernated && transition !== 'waking'
       && status !== 'starting' && status !== 'awaiting-initialize') || wakeBlocked;
     const deliveryImpaired = deliveryStatus === 'impaired' || state.transport?.host === 'impaired';

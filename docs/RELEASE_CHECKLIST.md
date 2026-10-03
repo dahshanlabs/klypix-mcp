@@ -329,10 +329,10 @@ only when the immutable tarball integrity exactly matches the gate-cleared check
 
 State these plainly rather than assuming them away:
 
-- **It does not run on pull requests.** There is no PR-time CI for this repo, so a
-  contributor's first signal is the release gate. Adding a separate `ci.yml` that runs
-  `npm ci && npm test` on `push`/`pull_request` is the obvious next step; it was left out
-  here to keep the publish path's behaviour a single, reviewable change.
+- **Publication does not run on pull requests.** The separate `ci.yml` runs
+  `npm ci` and the full test chain on pull requests and pushes to `master`, with
+  read-only permissions. It does not publish packages or replace the tagged
+  release evidence and publication gates.
 - **It does not test on Windows.** The gate runs on `ubuntu-latest` only, while a large
   share of users — and the known `EPERM`/rename flakes — are on Windows. A matrix run is
   a follow-up.

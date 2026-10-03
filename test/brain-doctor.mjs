@@ -603,6 +603,13 @@ const supervisorReceipt = (brainDir, name, state) => writeJson(path.join(brainDi
   r = run();
   ok(r.supervisors.live[0]?.wakeBlocked === false && r.supervisors.impaired.length === 0,
     'F6: a fresh integrity error (an install mid-flight) is not yet a blocked wake');
+  const previousPair = { ...noted, updatedAt: at(2 * 60_000), hibernation: { ...noted.hibernation, target: { version: PKG_VERSION, source: 'rollback' } } };
+  supervisorReceipt(brainDir, 'deferred', previousPair);
+  ok(run().supervisors.live[0]?.wakeBlocked === false,
+    'K1: a sleeping pair that served from the previous snapshot is not called unable to wake solely because the live files fail integrity');
+  supervisorReceipt(brainDir, 'deferred', { ...previousPair, hibernation: { ...previousPair.hibernation, wakeDeferred: deferredPair.hibernation.wakeDeferred } });
+  ok(run().supervisors.live[0]?.wakeBlocked === true,
+    'K1: an actual refused wake overrides a previously working snapshot');
 
   clear();
   supervisorReceipt(brainDir, 'pending', {

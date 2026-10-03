@@ -621,6 +621,7 @@ try {
     let threw = null;
     try {
       autoUpdateSchedule();
+      for (const input of [null, false, 42, [], "invalid", { get stamp() { throw new Error("unreadable input"); } }]) autoUpdateSchedule(input);
       autoUpdateSchedule({ stamp: { lastCheck: 'soon', failures: 'many' }, status: 42, installed: 'x', lock: { acquiredAt: -5 }, now: NaN, ttlMs: -1 });
       autoUpdateSchedule({ stamp: { lastCheck: t, nextCheckAt: t }, status: { identity: { version: 7 } }, installed: { version: 'x' }, now: t });
     } catch (error) { threw = error; }

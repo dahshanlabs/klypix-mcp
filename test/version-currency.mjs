@@ -218,6 +218,10 @@ const startedLine = await judged(overduePlan, { spawned: true });
 ok(/The automatic update check was overdue \(due for 3h; .*\) and was started just now; if this notice repeats, run `brain_doctor`/.test(startedLine)
     && !/Automatic check overdue —/.test(startedLine),
    'F3: when this SessionStart has just started the overdue check, the notice says so instead of "run the doctor"');
+// TQ-1 (2026-10-03 review): the overdue texts reach the agent too, and name the
+// doctor — never an installer, in any form.
+ok([overdueLine, startedLine].every((line) => !/klypix-mcp(@\S+)? install|install --force|install --runtime-only/.test(line)),
+   'K3: the overdue notices never name an installer command (the agent reads them)');
 // An install-changed check is due from the moment the receipts changed, not from
 // its lastCheck + 5 min floor (the doctor measures it the same way): an install
 // 10 min ago after a check 1 h ago is not 55 min late.

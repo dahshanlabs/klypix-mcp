@@ -349,6 +349,7 @@ function createRuntimeWatch(manifestPath, {
   now = () => Date.now(),
 } = {}) {
   let verified = null;
+  let lastKey = null;
   const statKey = () => {
     try {
       // bigint: NTFS file ids exceed 2^53 and must compare exactly.
@@ -359,6 +360,7 @@ function createRuntimeWatch(manifestPath, {
   return {
     read({ force = false } = {}) {
       const key = statKey();
+      lastKey = key;
       const at = now();
       if (!force && key !== null && verified?.key === key && at >= verified.at && at - verified.at < reverifyMs) {
         return { ok: true, target: verified.target, cached: true };
@@ -367,7 +369,40 @@ function createRuntimeWatch(manifestPath, {
       verified = runtime.ok && key !== null ? { key, at, target: runtime.target } : null;
       return runtime;
     },
+    // The manifest's stat now, and as it was just before the last read: a
+    // commit since that read moves it (settleRuntime).
+    statKey,
+    lastReadKey: () => lastKey,
   };
+}
+
+// Wait for an install to settle (B3 wakes, K1 boots): repeat the read while it
+// fails integrity (or cannot be read) for up to waitMs. Installs commit the
+// manifest LAST, by rename-over, so until its stat moves nothing can have made
+// a failing read verify: the wait polls the stat and re-hashes the runtime
+// only when it moves, plus once at the deadline, before .prev or the fallback
+// is chosen (K1-WAIT-FULL-REHASH, 2026-10-03 review). It used to re-hash every
+// file every 250 ms — ~20 full reads (~8 MiB/s) per waiting connection, the
+// load B8 removed from the poller because it contends with the installer's
+// renames, whose EPERM is what leaves an install half-applied in the first place.
+async function settleRuntime(watch, {
+  initial = watch.read({ force: true }),
+  waitMs = WAKE_INTEGRITY_WAIT_MS,
+  pollMs = WAKE_INTEGRITY_POLL_MS,
+  stopped = () => false,
+} = {}) {
+  let runtime = initial;
+  const deadline = Date.now() + waitMs;
+  // The key taken just before that read: a commit landing during it still moves.
+  let seen = watch.lastReadKey();
+  while (!runtime.ok && !runtime.absent && !stopped() && Date.now() < deadline) {
+    await sleep(pollMs);
+    const key = watch.statKey();
+    if (key === seen && Date.now() < deadline) continue;
+    seen = key;
+    runtime = watch.read({ force: true });
+  }
+  return runtime;
 }
 
 // Is this supervisor receipt provably dead? The boot cleanup deletes on a yes,
@@ -912,14 +947,10 @@ class Supervisor {
 
   // A full read of the manifest, repeated while it fails integrity (or cannot be
   // read) for up to WAKE_INTEGRITY_WAIT_MS: an install renames its files one at
-  // a time and commits the manifest last. Wakes (B3) and boots (K1) wait alike.
+  // a time and commits the manifest last. Wakes (B3) and boots (K1) wait alike;
+  // settleRuntime re-hashes only when the manifest moves.
   async settledRuntime(runtime = this.runtimeWatch.read({ force: true })) {
-    const deadline = Date.now() + WAKE_INTEGRITY_WAIT_MS;
-    while (!runtime.ok && !runtime.absent && !this.closed && Date.now() < deadline) {
-      await sleep(WAKE_INTEGRITY_POLL_MS);
-      runtime = this.runtimeWatch.read({ force: true });
-    }
-    return runtime;
+    return settleRuntime(this.runtimeWatch, { initial: runtime, stopped: () => this.closed });
   }
 
   // B3 (2026-10-03): the wake re-reads the manifest instead of trusting the
@@ -1992,6 +2023,7 @@ export const __test = {
   compareSemver,
   atomicJson,
   createRuntimeWatch,
+  settleRuntime,
   prevSnapshotTarget,
   cleanSupervisorStateDir,
   deadSupervisorReceipt,

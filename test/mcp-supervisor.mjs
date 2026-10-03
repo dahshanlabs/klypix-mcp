@@ -1654,6 +1654,38 @@ try {
     ok(watch.read().cached && !watch.read({ force: true }).cached, 'B8: a full read can be forced before any candidate starts');
   }
 
+  // K1-WAIT-FULL-REHASH — a boot or wake waiting for an install hashes the
+  // runtime again only when the manifest's stat moves (installs commit it last),
+  // plus once at the deadline. It used to re-hash every file every 250 ms.
+  {
+    let key = 'manifest-0';
+    let lastRead = null;
+    let reads = 0;
+    let verifiesAt = null;
+    const watch = {
+      statKey: () => key,
+      lastReadKey: () => lastRead,
+      read: () => {
+        reads++;
+        lastRead = key;
+        return key === verifiesAt
+          ? { ok: true, target: { version: '90.1.0' } }
+          : { ok: false, error: 'runtime integrity mismatch: worker.mjs' };
+      },
+    };
+    const stuck = await supervisorTest.settleRuntime(watch, { waitMs: 600, pollMs: 20 });
+    ok(!stuck.ok && reads === 2,
+      `K1-WAIT: a manifest that never moves is hashed once at the start and once at the deadline, not on every poll (${reads} full reads in 600 ms at a 20 ms poll)`);
+    reads = 0;
+    verifiesAt = 'manifest-1';
+    setTimeout(() => { key = 'manifest-1'; }, 150);   // the installer commits its manifest
+    const started = Date.now();
+    const settled = await supervisorTest.settleRuntime(watch, { waitMs: 5000, pollMs: 20 });
+    const waited = Date.now() - started;
+    ok(settled.ok && reads === 2 && waited < 1500,
+      `K1-WAIT: a manifest commit inside the wait is read at once and ends it (${reads} full reads, ${waited} ms)`);
+  }
+
   // B8 — a state write that fails leaves nothing behind.
   {
     const dir = runtimeDir('atomic');

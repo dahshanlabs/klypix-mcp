@@ -20,6 +20,7 @@ import { execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { linkProject, mcpServerEntry } from '../src/agent-rules.mjs';
 import { inspect, render } from '../src/brain-doctor.mjs';
+import { AUTO_UPDATE_TTL_MS, installIdentity } from '../src/mcp-auto-update.mjs';
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const INSTALL = path.join(REPO, 'bin', 'klypix-install.mjs');
@@ -207,7 +208,10 @@ function runInstall(home, projectCwd, args = []) {
   // commits — so acknowledge the released-tag deploy guard explicitly. The
   // guard's own refusal/ack/receipt behavior is locked by
   // test/released-tag-guard.mjs against dedicated git fixtures.
-  const env = { ...process.env, HOME: home, USERPROFILE: home, KLYPIX_BRAIN_NUDGE: 'off', KLYPIX_MCP_ALLOW_UNTAGGED: '1' };
+  // KLYPIX_MCP_INSTALL_DIR is pinned to this case's own temp home: an inherited
+  // value (sandboxed suite runs set one) would otherwise send the real installer
+  // somewhere else and every assertion below would read an empty bundle.
+  const env = { ...process.env, HOME: home, USERPROFILE: home, KLYPIX_MCP_INSTALL_DIR: path.join(home, '.claude', 'project-brain'), KLYPIX_BRAIN_NUDGE: 'off', KLYPIX_MCP_ALLOW_UNTAGGED: '1' };
   delete env.KLYPIX_BRAIN_NO_MAIN;
   return execFileSync(process.execPath, [INSTALL, ...args], { cwd: projectCwd, env, encoding: 'utf8' });
 }
@@ -247,19 +251,45 @@ function runInstall(home, projectCwd, args = []) {
   const installedAudit = inspect({ home, projectDir: proj });
   ok(installedAudit.tools.count === new Set(installedAudit.tools.names).size,
     'D: doctor reports the exact unique tool count when App and fallback registrations share a name');
-  fs.writeFileSync(path.join(bd, '.autoupdate-check.json'), JSON.stringify({ lastCheck: Date.now() }));
-  fs.writeFileSync(path.join(bd, '.autoupdate-status.json'), JSON.stringify({
+  // The receipts of THIS install are recorded as the evaluated identity. On an
+  // untagged checkout the real install above is dev-owned (KLYPIX_MCP_ALLOW_UNTAGGED),
+  // so a status without identity would — correctly — read as stale.
+  const checkedNow = Date.now();
+  fs.writeFileSync(path.join(bd, '.autoupdate-check.json'), JSON.stringify({
+    protocol: 1, lastCheck: checkedNow, failures: 0, nextCheckAt: checkedNow + AUTO_UPDATE_TTL_MS,
+  }));
+  const installedNow = installIdentity(bd);
+  const updateStatus = {
     protocol: 1,
     result: 'current',
+    checkedAt: new Date(checkedNow).toISOString(),
     currentVersion: PKG_VERSION,
     latestVersion: PKG_VERSION,
+    identity: { version: installedNow.version, managed: installedNow.managed, dev: installedNow.dev },
     harness: { checked: 2, updated: 1, unchanged: 1, failed: 0, skipped: 0, projects: [] },
-  }));
-  const updateAudit = inspect({ home, projectDir: proj });
+  };
+  fs.writeFileSync(path.join(bd, '.autoupdate-status.json'), JSON.stringify(updateStatus));
+  // Sandboxed suite runs set KLYPIX_AUTO_UPDATE=0; this audit is about the receipts.
+  const updateEnv = { ...process.env, KLYPIX_AUTO_UPDATE: '' };
+  const updateAudit = inspect({ home, projectDir: proj, env: updateEnv });
   ok(updateAudit.autoUpdate.enabled && updateAudit.autoUpdate.result === 'current'
     && /AUTO-UPDATE.*machine-wide 24h check.*current/.test(render(updateAudit, { color: false }))
     && /AUTO-HARNESS.*2 registered project\(s\) checked.*1 refreshed.*1 current.*0 partial/.test(render(updateAudit, { color: false })),
   'D: doctor exposes the host-neutral update and automatic harness receipts');
+  ok(updateAudit.autoUpdate.stale === false && updateAudit.autoUpdate.due === false
+    && updateAudit.autoUpdate.installedIdentity?.version === PKG_VERSION,
+  'D: a result recorded for this exact install reads as current, not stale');
+  fs.writeFileSync(path.join(bd, '.autoupdate-status.json'), JSON.stringify({
+    ...updateStatus,
+    currentVersion: '1.0.0',
+    latestVersion: '1.0.0',
+    identity: { version: '1.0.0', managed: true, dev: false },
+  }));
+  const staleAudit = inspect({ home, projectDir: proj, env: updateEnv });
+  ok(staleAudit.autoUpdate.stale === true && staleAudit.autoUpdate.staleReason === 'version-increased'
+    && staleAudit.autoUpdate.dueReason === 'install-changed',
+  'D: a result recorded for a previous install reads as stale and re-opens the schedule');
+  fs.writeFileSync(path.join(bd, '.autoupdate-status.json'), JSON.stringify(updateStatus));
   const baked = fs.readFileSync(path.join(bd, 'klypix-mcp-server.mjs'), 'utf8');
   ok(new RegExp(`const PKG_VERSION = '${PKG_VERSION.replace(/\./g, '\\.')}'`).test(baked), 'D: server has the baked version (flat layout has no package.json)');
   // migration: the project .mcp.json flipped npx → local node, with a backup.
@@ -342,7 +372,7 @@ function runInstall(home, projectCwd, args = []) {
   ok(!fs.existsSync(path.join(bd, '.install.lock')), 'D: the install lock is released after completion');
 
   // concurrency: two installs at once are idempotent (lock serializes; no torn state)
-  const env = { ...process.env, HOME: home, USERPROFILE: home, KLYPIX_BRAIN_NUDGE: 'off', KLYPIX_MCP_ALLOW_UNTAGGED: '1' }; delete env.KLYPIX_BRAIN_NO_MAIN;
+  const env = { ...process.env, HOME: home, USERPROFILE: home, KLYPIX_MCP_INSTALL_DIR: bd, KLYPIX_BRAIN_NUDGE: 'off', KLYPIX_MCP_ALLOW_UNTAGGED: '1' }; delete env.KLYPIX_BRAIN_NO_MAIN;
   const { execFile } = await import('child_process');
   const run = () => new Promise(res => execFile(process.execPath, [INSTALL], { cwd: proj, env }, (e) => res(e ? 1 : 0)));
   const [a, b] = await Promise.all([run(), run()]);

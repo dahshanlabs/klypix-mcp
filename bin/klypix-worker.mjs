@@ -40,6 +40,10 @@ import {
   registerProjectBrain,
   spawnAutoUpdateHelper,
 } from '../src/mcp-auto-update.mjs';
+// Namespace import for constants added after 1.89.0 (AUTO_UPDATE_POLL_MS): a
+// worker that meets an older mcp-auto-update.mjs mid-install must degrade to a
+// fallback, not fail to link over a missing named export.
+import * as autoUpdateModule from '../src/mcp-auto-update.mjs';
 // Namespace import (already in-process via the klypix-core chain, so zero added
 // load cost) so a bundle whose klypix-format predates classifyDecay degrades
 // gracefully — a named import of a missing export would kill the whole server.
@@ -1318,7 +1322,7 @@ server.server.oninitialized = () => {
   });
   autoUpdateStarter = setTimeout(checkForCoreUpdate, 2000);
   autoUpdateStarter.unref?.();
-  autoUpdatePoller = setInterval(checkForCoreUpdate, 60 * 60 * 1000);
+  autoUpdatePoller = setInterval(checkForCoreUpdate, Math.max(60_000, Number(autoUpdateModule.AUTO_UPDATE_POLL_MS) || 60 * 60 * 1000));
   autoUpdatePoller.unref?.();
   log(`ready · vault=${VAULT} · presence=mcp`);
 };

@@ -297,9 +297,6 @@ function inspectRunning(brainDir, baked, now, self) {
 const SUPERVISOR_DEAD_RECEIPT_MS = 120 * 1000;
 const SUPERVISOR_TRANSITION_MS = 45 * 1000;
 const WAKING_STATUSES = new Set(['validating-update', 'update-ready', 'recovering', 'recovery-ready']);
-// readRuntimeTarget's failures (mcp-supervisor.mjs): the core files on disk do
-// not verify, so a sleeping pair has nothing consistent to wake into.
-const RUNTIME_INTEGRITY_ERROR = /^(runtime (manifest|worker|file|integrity)\b|unsupported runtime protocol)/;
 const majorOf = (version) => {
   const match = String(version || '').match(/^v?(\d+)\.\d+\.\d+/);
   return match ? Number(match[1]) : null;
@@ -357,18 +354,26 @@ function inspectSupervisors(brainDir, baked, now = Date.now()) {
     // queue. A broken or backpressured host pipe stays what it is.
     const deliveryStatus = transition === 'waking' && !['impaired', 'backpressured'].includes(state.transport?.host)
       ? 'queued' : recordedDelivery;
-    // F6 (2026-10-03 review): a sleeping pair whose last wake found the core
-    // files failing verification (wakeDeferred), or whose poller has reported
-    // them failing for longer than an install takes, answers every request with
-    // an error until they verify. It used to read "wakes on the next request".
+    // F6 (2026-10-03 review): a sleeping pair whose last wake found no
+    // consistent core to boot (wakeDeferred, which the supervisor writes on the
+    // first refused wake) answers every request with an error until the core
+    // files verify. It used to read "wakes on the next request".
+    // Only that refusal counts (K1-DOCTOR-WAKEBLOCKED-FALSE, 2026-10-03 review),
+    // the rule `klypix-mcp runtime` follows (runtime-inspector wakeBlock). An
+    // integrity error the receipt merely carries is not one: the wake resumes
+    // .prev when it holds this pair's version — every pair K1 booted from .prev
+    // records the error in its first receipt and wakes from .prev — or the
+    // package's own worker outside the managed directory. Read as "cannot
+    // wake", every connection that started during a failing install was
+    // printed IMPAIRED while it woke without trouble. The error itself is still
+    // shown on the pair's line.
     const wakeDeferred = intentionallyHibernated && state.hibernation?.wakeDeferred
       && typeof state.hibernation.wakeDeferred === 'object' ? state.hibernation.wakeDeferred : null;
-    // A pair that already served from .prev can resume that same snapshot;
-    // the live directory's integrity error alone does not prove its wake fails.
-    // An actual refused wake still wins over this last-known fallback.
-    const hasPreviousWorker = sleepingTarget?.source === 'rollback';
-    const wakeBlocked = intentionallyHibernated
-      && (Boolean(wakeDeferred) || (!hasPreviousWorker && RUNTIME_INTEGRITY_ERROR.test(String(state.lastError || '')) && !fresh));
+    // Only a wake the supervisor actually refused proves a sleeping pair cannot
+    // wake — the same rule as `klypix-mcp runtime` (wakeBlock). An integrity error
+    // alone does not: the wake waits for the install to settle, and a pair that
+    // served from .prev resumes that snapshot while it still verifies.
+    const wakeBlocked = intentionallyHibernated && Boolean(wakeDeferred);
     const workerImpaired = (!state.active && !intentionallyHibernated && transition !== 'waking'
       && status !== 'starting' && status !== 'awaiting-initialize') || wakeBlocked;
     const deliveryImpaired = deliveryStatus === 'impaired' || state.transport?.host === 'impaired';

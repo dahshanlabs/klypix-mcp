@@ -25,6 +25,7 @@ import {
 } from '../src/agent-rules.mjs';
 import { driftLine, inspect, render, structuredReport } from '../src/brain-doctor.mjs';
 import { laneFileFor } from '../src/agent-presence.mjs';
+import { wakeBlock } from '../src/runtime-inspector.mjs';
 import { AUTO_UPDATE_TTL_MS } from '../src/mcp-auto-update.mjs';
 import { makeVault, seedBrain } from './_harness.mjs';
 
@@ -595,19 +596,35 @@ const supervisorReceipt = (brainDir, name, state) => writeJson(path.join(brainDi
     && r.actions.some((a) => a.startsWith('npx -y klypix-mcp@latest install --force') && /cannot wake/.test(a))
     && /cannot wake — the core files do not verify/.test(driftLine(r)),
   'F6: a refused wake is IMPAIRED with the reinstall named — never "wakes on the next request"');
-  const noted = { ...deferredPair, hibernation: { ...deferredPair.hibernation, wakeDeferred: null } };
-  supervisorReceipt(brainDir, 'deferred', { ...noted, updatedAt: at(2 * 60_000) });
-  ok(run().supervisors.live[0]?.wakeBlocked === true,
-    'F6: an integrity failure its poller has reported for longer than an install takes also blocks the wake');
-  supervisorReceipt(brainDir, 'deferred', noted);
+  ok(wakeBlock(deferredPair)?.reason === 'wake-deferred',
+    'F6/K4: `klypix-mcp runtime` reads the same refused wake as unable to wake');
+  // K1-DOCTOR-WAKEBLOCKED-FALSE (2026-10-03 review): an integrity error the
+  // receipt merely carries is no refused wake. K1 boots .prev when a fresh
+  // connection meets a failing install and records the error in its very first
+  // receipt; hibernated, the pair wakes from that same .prev (B3). The doctor
+  // printed it IMPAIRED ("requests fail until they verify") while the runtime
+  // report (K4) said it wakes — and it does.
+  const fromPrev = {
+    ...deferredPair,
+    updatedAt: at(2 * 60_000),
+    hibernation: {
+      hibernated: true, wakeDeferred: null,
+      target: { version: PKG_VERSION, source: 'rollback', path: path.join(brainDir, '.prev', 'klypix-mcp-worker.mjs') },
+    },
+  };
+  supervisorReceipt(brainDir, 'deferred', fromPrev);
   r = run();
-  ok(r.supervisors.live[0]?.wakeBlocked === false && r.supervisors.impaired.length === 0,
-    'F6: a fresh integrity error (an install mid-flight) is not yet a blocked wake');
-  const previousPair = { ...noted, updatedAt: at(2 * 60_000), hibernation: { ...noted.hibernation, target: { version: PKG_VERSION, source: 'rollback' } } };
-  supervisorReceipt(brainDir, 'deferred', previousPair);
+  text = render(r, { color: false });
+  ok(r.supervisors.live[0]?.wakeBlocked === false && r.supervisors.impaired.length === 0
+    && !/IMPAIRED|requests fail until they verify|cannot wake/.test(text)
+    && !/cannot wake/.test(driftLine(r))
+    && /pid \d+ hibernated: runtime integrity mismatch: worker\.mjs/.test(text)
+    && wakeBlock(fromPrev) === null,
+  `K1: a pair booted from .prev that carries the integrity error but has refused no wake is not IMPAIRED — it wakes from .prev, as \`klypix-mcp runtime\` says; the error is still shown (${text.split('\n').filter((line) => /SUPERVISOR|pid \d+/.test(line)).join(' | ')})`);
+  supervisorReceipt(brainDir, 'deferred', { ...fromPrev, updatedAt: at(10_000) });
   ok(run().supervisors.live[0]?.wakeBlocked === false,
-    'K1: a sleeping pair that served from the previous snapshot is not called unable to wake solely because the live files fail integrity');
-  supervisorReceipt(brainDir, 'deferred', { ...previousPair, hibernation: { ...previousPair.hibernation, wakeDeferred: deferredPair.hibernation.wakeDeferred } });
+    'F6: a fresh integrity error (an install mid-flight) is not a blocked wake either');
+  supervisorReceipt(brainDir, 'deferred', { ...fromPrev, hibernation: { ...fromPrev.hibernation, wakeDeferred: deferredPair.hibernation.wakeDeferred } });
   ok(run().supervisors.live[0]?.wakeBlocked === true,
     'K1: an actual refused wake overrides a previously working snapshot');
 

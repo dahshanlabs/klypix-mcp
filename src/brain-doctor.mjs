@@ -639,6 +639,18 @@ function autoUpdateView({ au, brainDir, supervisors, version, hooks, npmLatest, 
   const overdueSuppressed = rule.suppressed === 'no-live-session' ? 'no-live-session'
     : (skew && (rule.overdue || rule.suppressed) ? 'version-skew' : (rule.suppressed || null));
   const overdue = rule.overdue === true && !skew;
+  // TR-1 (2026-10-03 review): a long-due check the rule did NOT judge for want
+  // of a poll (K3) used to print the generic "check due now — runs within
+  // 10 min", hiding how long it had been due and repeating a promise an open
+  // session had visibly not kept. That is the normal state right after this
+  // release: every live connection runs pre-fix supervisor code, which records
+  // no poll, until it reconnects. Keep not judging, but carry what is known:
+  // how long it has been due, the latest poll on record, and how many sessions
+  // record none.
+  const pollers = live.filter((state) => state.autoUpdateEnabled !== false);
+  const pollTimes = pollers.map((state) => timeOf(state.lastPollAt)).filter((ms) => Number.isFinite(ms) && ms <= now + 1000);
+  const latestPollAt = pollTimes.length ? new Date(Math.max(...pollTimes)).toISOString() : null;
+  const unpolledSessions = pollers.filter((state) => !Number.isFinite(timeOf(state.lastPollAt))).length;
 
   const knownLatest = knownNpmLatest(brainDir, au, npmLatest, now);
   // MV-2: a pre-hold updater re-installs whatever the owner rolled back from;
@@ -684,6 +696,11 @@ function autoUpdateView({ au, brainDir, supervisors, version, hooks, npmLatest, 
     overdue,
     overdueByMs: overdue ? rule.overdueByMs : null,
     overdueSuppressed,
+    // How long the check has been due by the rule's own reckoning (null when
+    // it was due since before any record), and the polls behind a suppression.
+    dueForMs: Number.isFinite(rule.dueForMs) ? rule.dueForMs : null,
+    latestPollAt,
+    unpolledSessions,
     // What the overdue rule saw: the live sessions that polled after the check
     // fell due, and the latest such poll (K3).
     overdueEvidence: overdue ? rule.evidence || null : null,
@@ -1638,6 +1655,18 @@ export function render(r, opts = {}) {
         parts.push(`next check unknown${au.scheduleError ? ` (${au.scheduleError})` : ''}`);
       } else if (au.overdue) {
         parts.push(`${c.yel}check overdue by ${durationText(au.overdueByMs)} — no running session performed the check${c.rst}`);
+      } else if (au.overdueSuppressed === 'no-poll-evidence' && Number.isFinite(au.dueForMs)) {
+        // TR-1: not judged (K3), but not "due now" either — the rule reports
+        // this only once the check is past its 30 min grace. Say how long, and
+        // why it is not called overdue.
+        const sinceMs = nowMs - au.dueForMs;
+        const polledMs = timeOf(au.latestPollAt);
+        const why = Number.isFinite(polledMs) && polledMs >= sinceMs
+          ? `the latest poll on record (${isoMinute(polledMs)}, ${durationText(nowMs - polledMs)} ago) is too recent, or too close to the due time, to judge it overdue yet`
+          : (au.unpolledSessions
+            ? `overdue is not judged: no open session has recorded a poll since then — ${au.unpolledSessions} connection${au.unpolledSessions === 1 ? '' : 's'} on pre-fix supervisor code record${au.unpolledSessions === 1 ? 's' : ''} none (/mcp reconnect)`
+            : `no open session has polled since then; it runs within ${pollText} while one is open`);
+        parts.push(`check due since ${isoMinute(sinceMs)} (${durationText(au.dueForMs)}) — ${why}`);
       } else if (dueMs <= nowMs) {
         parts.push(`check due now — runs within ${pollText} while any KLYPIX session is open, or 2 s after the next one starts`);
       } else {

@@ -796,9 +796,14 @@ const supervisorReceipt = (brainDir, name, state) => writeJson(path.join(brainDi
   // session merely open since before it.
   liveSupervisor({ autoUpdate: { enabled: true, lastPollAt: iso(NOW - 2 * HOUR - 20 * 60_000) } });
   r = run();
+  // TR-1 (2026-10-03 review): not judged, but not "due now — runs within
+  // 10 min" either: the line says how long the check has been due and why it is
+  // not called overdue.
+  const dueSince = `${iso(NOW - 2 * HOUR).slice(0, 16)}Z`;   // the doctor's minute-precision UTC
   ok(r.autoUpdate.overdue === false && r.autoUpdate.overdueSuppressed === 'no-poll-evidence'
-    && r.verdict === 'ALIGNED' && /check due now/.test(auLine(textOf(r))),
-  'K3: a machine that slept across the due time (last poll before it) reads "due now" on waking, not overdue — though its session has been open 10 h');
+    && r.verdict === 'ALIGNED'
+    && auLine(textOf(r)).includes(`check due since ${dueSince} (2h) — no open session has polled since then; it runs within 10 min while one is open`),
+  `K3/TR-1: a machine that slept across the due time (last poll before it) is not overdue on waking — though its session has been open 10 h — and the line says how long it has been due (${auLine(textOf(r))})`);
   supervisorReceipt(brainDir, 'live', {
     bootedAt: iso(NOW - 10 * HOUR), updatedAt: iso(NOW - 30_000), active: { pid: process.pid, version: PKG_VERSION },
     autoUpdate: { enabled: true },
@@ -807,14 +812,19 @@ const supervisorReceipt = (brainDir, name, state) => writeJson(path.join(brainDi
   ok(r.supervisors.preFix.length === 1 && r.autoUpdate.overdue === false && r.autoUpdate.overdueSuppressed === 'no-poll-evidence'
     && r.verdict === 'ALIGNED',
   'K3: only pre-fix receipts (no lastPollAt) → overdue is not judged');
+  ok(r.autoUpdate.dueForMs === 2 * HOUR && r.autoUpdate.unpolledSessions === 1
+    && auLine(textOf(r)).includes(`check due since ${dueSince} (2h) — overdue is not judged: no open session has recorded a poll since then — 1 connection on pre-fix supervisor code records none (/mcp reconnect)`)
+    && !/check due now|runs within/.test(auLine(textOf(r))),
+  `TR-1: with only pre-fix receipts the line says the check has been due 2h and why it is not judged — never "due now — runs within 10 min" (${auLine(textOf(r))})`);
   // F9 (2026-10-03 review): a session that opened seconds ago — the first
   // SessionStart after an idle night — has polled, but the helper its poll
   // launched has not taken the lock yet. That poll is no evidence yet.
   liveSupervisor({ bootedAt: iso(NOW - 4_000), autoUpdate: { enabled: true, lastPollAt: iso(NOW - 2_000) } });
   r = run();
   ok(r.autoUpdate.overdue === false && r.autoUpdate.overdueSuppressed === 'no-poll-evidence'
-    && r.verdict === 'ALIGNED' && /check due now/.test(auLine(textOf(r))),
-  'K3/F9: a check due 2 h ago with only a session that polled seconds ago is due now, not overdue');
+    && r.verdict === 'ALIGNED'
+    && /check due since \S+ \(2h\) — the latest poll on record \(\S+, <1m ago\) is too recent, or too close to the due time, to judge it overdue yet/.test(auLine(textOf(r))),
+  `K3/F9: a check due 2 h ago with only a session that polled seconds ago is not overdue yet, and says why (${auLine(textOf(r))})`);
   writeJson(files.stamp, { protocol: 1, lastCheck: NOW - 6 * HOUR - 30 * 60_000, failures: 0, nextCheckAt: NOW - 30 * 60_000, identity: npmIdentity });
   liveSupervisor({ autoUpdate: { enabled: true, lastPollAt: iso(NOW - 25 * 60_000) } });
   r = run();

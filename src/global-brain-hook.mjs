@@ -5474,6 +5474,13 @@ function updateRemedy({ plan, decision, overdue = null, latest, baked, now, spaw
         }
         return { mark: '⚠️', text: `Automatic check overdue (${late}) — run ${installedDoctorHint(baked)}.` };
     }
+    // TR-1 (2026-10-03 review): a check past its grace that the rule did not
+    // judge for want of a poll (K3: every session on pre-fix supervisor code,
+    // or none polled since it fell due) has been due for a while — "(due now)"
+    // hid that. Not judged overdue, so still no alarm.
+    const when = dueAt <= now && overdue && overdue.suppressed === 'no-poll-evidence' && Number.isFinite(overdue.dueForMs)
+        ? `due for ${spanLabel(overdue.dueForMs)}`
+        : etaLabel(dueAt, now);
     // A failed result written by a pre-2026-10-03 updater has no count in its
     // stamp; it is still one failed attempt, never a clean slate.
     const failures = Math.max(
@@ -5486,9 +5493,9 @@ function updateRemedy({ plan, decision, overdue = null, latest, baked, now, spaw
         const why = plan.result === 'failed' && plan.error
             ? String(plan.error).replace(/[`\r\n]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120)
             : 'it stopped before recording a result';
-        return { mark: '⚠️', text: `KLYPIX will retry automatically — last automatic attempt failed (${why}, attempt ${failures}); next retry ${etaLabel(dueAt, now)}.` };
+        return { mark: '⚠️', text: `KLYPIX will retry automatically — last automatic attempt failed (${why}, attempt ${failures}); next retry ${when}.` };
     }
-    return promise(etaLabel(dueAt, now));
+    return promise(when);
 }
 
 // SessionStart footer — ambient version drift. Reads ONLY local files (zero

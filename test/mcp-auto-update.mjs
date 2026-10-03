@@ -13,6 +13,7 @@ import {
   AUTO_UPDATE_POLL_MS,
   AUTO_UPDATE_RECHECK_FLOOR_MS,
   AUTO_UPDATE_RETRY_MS,
+  AUTO_UPDATE_SPAWN_RETRY_MS,
   AUTO_UPDATE_TTL_MS,
   __test,
   autoUpdateDecision,
@@ -870,6 +871,283 @@ try {
     const named = await reconcileRegisteredProjects({ brainDir: dir, version: '1.5.2', now, rules, brainPaths: [path.join(stale, 'brain.klypix')] });
     ok(named.updated === 1 && fs.existsSync(path.join(stale, 'AGENTS.md')),
       "A12: a project named explicitly (brain_sync's own) is reconciled however old its registration");
+  }
+
+  // ── 2026-10-03 review round ─────────────────────────────────────────────────
+  const iso = (ms) => new Date(ms).toISOString();
+
+  {
+    // TQ-3: the transitions that must NOT re-open the schedule. Each could be
+    // flipped to "fires" with the suite green; a regression would re-query npm
+    // 5 min after a brain:deploy (npm → dev at the same version) or after the
+    // receipts lose the runtime manifest, and bootstrap a runtime 5 min after
+    // they vanish instead of at the next 6 h check.
+    const t = Date.UTC(2026, 9, 4, 4, 0, 0);
+    const files = (dir) => autoUpdatePaths(dir);
+    const transitions = [
+      ['became-dev-owned', (dir) => writeRuntime(dir, '1.4.0', { dev: true })],
+      ['became-unmanaged', (dir) => fs.rmSync(files(dir).runtime)],   // .brain-version.json kept
+      ['receipts-missing', (dir) => { fs.rmSync(files(dir).runtime); fs.rmSync(files(dir).version); }],
+    ];
+    for (const [reason, transition] of transitions) {
+      const dir = scenario(`tq3-${reason}`);
+      writeRuntime(dir, '1.4.0');
+      await check({ brainDir: dir, now: t, fetchLatest: async () => '1.4.0' });
+      transition(dir);
+      const plus6 = view(dir, t + 6 * MINUTE);
+      const plus60 = view(dir, t + 60 * MINUTE);
+      ok(plus6.stale && plus6.staleReason === reason && !plus6.due && !plus60.due
+        && plus60.dueReason === 'interval' && plus60.dueAt === iso(t + AUTO_UPDATE_TTL_MS),
+      `TQ-3: ${reason} is reported stale but never re-opens the schedule (not due at +6 min or +60 min; next check at lastCheck + 6 h)`);
+    }
+  }
+
+  {
+    // TQ-4: the first state of every npm machine after this release lands is
+    // written by the 1.89.0 helper that installed it — result 'updated', no
+    // identity, currentVersion = the old version, installedVersion = the new.
+    // The result describes the INSTALLED version (A2's installedVersion-first).
+    const dir = scenario('legacy-updated');
+    writeRuntime(dir, '1.5.0');
+    const t = Date.UTC(2026, 9, 4, 5, 0, 0);
+    fs.writeFileSync(autoUpdatePaths(dir).stamp, JSON.stringify({ protocol: 1, lastCheck: t, checkedAt: iso(t) }));
+    fs.writeFileSync(autoUpdatePaths(dir).status, JSON.stringify({
+      protocol: 1, result: 'updated', checkedAt: iso(t), currentVersion: '1.4.0', latestVersion: '1.5.0',
+      installedVersion: '1.5.0', lastUpdatedAt: iso(t), harness: { checked: 0, updated: 0, unchanged: 0, failed: 0, skipped: 0, projects: [] },
+    }));
+    const soon = view(dir, t + 10 * MINUTE);
+    const before = view(dir, t + AUTO_UPDATE_TTL_MS - 1);
+    const atTtl = view(dir, t + AUTO_UPDATE_TTL_MS);
+    ok(!soon.stale && !soon.due && !before.due && atTtl.due && atTtl.dueReason === 'interval'
+      && soon.identity?.version === '1.5.0' && soon.identity?.legacy === true && soon.hold === null && soon.nextHold === null,
+    'TQ-4: a legacy "updated" status from the 1.89.0 helper describes the installed v1.5.0 — not stale, next check at lastCheck + 6 h, no hold');
+  }
+
+  {
+    // CF-4: a power cut can leave either file full of NULs (NTFS journals
+    // metadata, not data). The hold used to live only in the status: losing it
+    // re-installed the version the owner had rolled back from.
+    const dir = scenario('status-loss-keeps-hold');
+    writeRuntime(dir, '1.9.0');
+    const t = Date.UTC(2026, 9, 4, 6, 0, 0);
+    const installs = [];
+    const install = async (version, { brainDir }) => { installs.push(version); writeRuntime(brainDir, version); };
+    await check({ brainDir: dir, now: t, fetchLatest: async () => '1.9.1', installVersion: install });
+    writeRuntime(dir, '1.9.0');   // --force rollback
+    await check({ brainDir: dir, now: t + AUTO_UPDATE_TTL_MS, fetchLatest: async () => '1.9.1', installVersion: install });
+    ok(readStatus(dir).result === 'held' && readStamp(dir).hold?.version === '1.9.1',
+      'CF-4: the stamp mirrors the hold the status records');
+    fs.writeFileSync(autoUpdatePaths(dir).status, Buffer.alloc(64));
+    const lost = view(dir, t + 2 * AUTO_UPDATE_TTL_MS);
+    ok(lost.hold?.version === '1.9.1' && lost.nextHold?.version === '1.9.1',
+      'CF-4: with the status unreadable, the view still reports the hold (from the stamp)');
+    const after = await check({ brainDir: dir, now: t + 2 * AUTO_UPDATE_TTL_MS, fetchLatest: async () => '1.9.1', installVersion: install });
+    ok(after.result === 'held' && installs.length === 1 && readStatus(dir).hold?.version === '1.9.1',
+      'CF-4: … and the next check still holds it — the rolled-back-from version is never re-installed');
+  }
+
+  {
+    // CF-4, the stamp half: two failures (next retry in 1 h), then the stamp is
+    // lost. It read as "never checked" (due at once, failures 0) and the next
+    // failure was attempt 1 (15 min) instead of attempt 3 (4 h).
+    const dir = scenario('stamp-loss-keeps-backoff');
+    writeRuntime(dir, '1.4.0');
+    const t = Date.UTC(2026, 9, 4, 7, 0, 0);
+    const offline = async () => { throw new Error('offline'); };
+    await check({ brainDir: dir, now: t, fetchLatest: offline });
+    const second = t + AUTO_UPDATE_RETRY_MS[0];
+    await check({ brainDir: dir, now: second, fetchLatest: offline });
+    const retryAt = second + AUTO_UPDATE_RETRY_MS[1];
+    ok(readStamp(dir).failures === 2 && readStamp(dir).nextCheckAt === retryAt, 'CF-4 setup: two failures, the next retry 1 h out');
+    fs.writeFileSync(autoUpdatePaths(dir).stamp, Buffer.alloc(64));
+    const early = view(dir, second + 10 * MINUTE);
+    const onTime = view(dir, retryAt);
+    ok(!early.due && early.dueReason === 'invalid-stamp' && early.failures === 2 && onTime.due,
+      'CF-4: an unreadable stamp is rebuilt from the status — the 1 h retry is not shortened to "now"');
+    await check({ brainDir: dir, now: retryAt, fetchLatest: offline });
+    ok(readStamp(dir).failures === 3 && readStamp(dir).nextCheckAt === retryAt + AUTO_UPDATE_RETRY_MS[2] && readStatus(dir).attempt === 3,
+      'CF-4: the next failure is attempt 3 (4 h), never attempt 1 — the backoff never shrinks');
+    // Both files lost: the unknown counts as one failed attempt, not zero.
+    fs.writeFileSync(autoUpdatePaths(dir).stamp, Buffer.alloc(64));
+    fs.writeFileSync(autoUpdatePaths(dir).status, Buffer.alloc(64));
+    await check({ brainDir: dir, now: retryAt + AUTO_UPDATE_RETRY_MS[2], fetchLatest: offline });
+    ok(readStamp(dir).failures === 2, 'CF-4: with both files unreadable a failure is attempt 2, never a fresh attempt 1');
+  }
+
+  {
+    // CF-3: helper A slept > 2 h mid-install; B took its lock (A8). Both reach
+    // their terminal writes. Whatever the order, the record is A's real install
+    // — never B's failure (B's installer could not take A's .install.lock).
+    const files = (dir) => autoUpdatePaths(dir);
+    const t = Date.UTC(2026, 9, 4, 8, 0, 0);
+    const thiefAt = t + 2 * HOUR + MINUTE;
+    const npm = (version) => ({ version, managed: true, dev: false });
+    const robbed = (dir) => {   // B's footprint while A sleeps: the lock it took, its pre-stamp
+      fs.writeFileSync(files(dir).lock, JSON.stringify({ protocol: 1, token: 'thief-token', pid: process.pid, acquiredAt: thiefAt }));
+      fs.writeFileSync(files(dir).stamp, JSON.stringify({
+        protocol: 1, lastCheck: thiefAt, checkedAt: iso(thiefAt), failures: 2, nextCheckAt: thiefAt + HOUR,
+        identity: npm('1.9.0'), hold: null, inProgress: { pid: 4242, startedAt: iso(thiefAt) },
+      }));
+    };
+    const thiefFailed = (dir) => {
+      fs.writeFileSync(files(dir).status, JSON.stringify({
+        protocol: 1, result: 'failed', checkedAt: iso(thiefAt), currentVersion: '1.9.0', latestVersion: '1.9.1',
+        identity: npm('1.9.0'), attempt: 2, nextRetryAt: iso(thiefAt + HOUR), error: 'npm installer exited 1',
+      }));
+      fs.writeFileSync(files(dir).stamp, JSON.stringify({
+        protocol: 1, lastCheck: thiefAt, checkedAt: iso(thiefAt), failures: 2, nextCheckAt: thiefAt + HOUR,
+        identity: npm('1.9.0'), hold: null, inProgress: null,
+      }));
+    };
+    {
+      // B's failure lands first; then A — robbed — finishes its install.
+      const dir = scenario('lock-theft-install-last');
+      writeRuntime(dir, '1.9.0');
+      const result = await check({
+        brainDir: dir, now: t, fetchLatest: async () => '1.9.1',
+        installVersion: async (version, { brainDir }) => { robbed(brainDir); thiefFailed(brainDir); writeRuntime(brainDir, version); },
+      });
+      ok(result.result === 'updated' && readStatus(dir).result === 'updated' && readStamp(dir).failures === 0
+        && JSON.parse(fs.readFileSync(files(dir).lock, 'utf8')).token === 'thief-token',
+      'CF-3: a robbed helper still records the install it made — and leaves the lock it no longer owns alone');
+    }
+    {
+      // A finishes first (robbed); B, the owner, fails afterwards.
+      const dir = scenario('lock-theft-failure-last');
+      writeRuntime(dir, '1.9.0');
+      const result = await check({
+        brainDir: dir, now: thiefAt, fetchLatest: async () => '1.9.1',
+        installVersion: async (version, { brainDir }) => {
+          writeRuntime(brainDir, '1.9.1');   // A's install, then A's records
+          fs.writeFileSync(files(brainDir).status, JSON.stringify({
+            protocol: 1, result: 'updated', checkedAt: iso(t), currentVersion: '1.9.0', latestVersion: '1.9.1',
+            installedVersion: '1.9.1', identity: npm('1.9.1'),
+          }));
+          fs.writeFileSync(files(brainDir).stamp, JSON.stringify({
+            protocol: 1, lastCheck: t, checkedAt: iso(t), failures: 0, nextCheckAt: t + AUTO_UPDATE_TTL_MS,
+            identity: npm('1.9.1'), hold: null, inProgress: null,
+          }));
+          throw new Error('npm installer exited 1');
+        },
+      });
+      ok(result.result === 'failed' && result.superseded === true
+        && readStatus(dir).result === 'updated' && readStamp(dir).failures === 0 && readStamp(dir).lastCheck === t,
+      'CF-3: a failure never overwrites an outcome another helper recorded after this attempt began');
+    }
+    {
+      // A robbed helper that installed nothing records nothing — not even a
+      // truthful-looking 'current' over whatever the thief is doing.
+      const dir = scenario('lock-theft-robbed-current');
+      writeRuntime(dir, '1.9.0');
+      const result = await check({
+        brainDir: dir, now: t, fetchLatest: async () => { robbed(dir); return '1.9.0'; }, installVersion: noInstall,
+      });
+      ok(result.result === 'current' && result.superseded === true && !fs.existsSync(files(dir).status)
+        && readStamp(dir).lastCheck === thiefAt,
+      'CF-3: a robbed helper\'s non-install outcome writes nothing — the thief\'s pre-stamp stands');
+    }
+    {
+      // The lock was taken, but the thief has not pre-stamped yet: this helper's
+      // pre-stamp is still on disk, and its failure still is not its to record.
+      const dir = scenario('lock-theft-before-prestamp');
+      writeRuntime(dir, '1.9.0');
+      const result = await check({
+        brainDir: dir, now: t, fetchLatest: async () => '1.9.1',
+        installVersion: async () => {
+          fs.writeFileSync(files(dir).lock, JSON.stringify({ protocol: 1, token: 'thief-token', pid: process.pid, acquiredAt: thiefAt }));
+          throw new Error('npm install timed out');
+        },
+      });
+      ok(result.superseded === true && !fs.existsSync(files(dir).status)
+        && readStamp(dir).lastCheck === t && readStamp(dir).inProgress?.pid === process.pid,
+      'CF-3: a helper whose lock was taken records no failure, even before the thief has stamped');
+    }
+    {
+      // A robbed helper's own failure writes nothing: the thief owns the record.
+      const dir = scenario('lock-theft-robbed-fails');
+      writeRuntime(dir, '1.9.0');
+      const result = await check({
+        brainDir: dir, now: t, fetchLatest: async () => '1.9.1',
+        installVersion: async (version, { brainDir }) => { robbed(brainDir); throw new Error('npm install timed out'); },
+      });
+      ok(result.superseded === true && !fs.existsSync(files(dir).status) && readStamp(dir).lastCheck === thiefAt,
+        'CF-3: a robbed helper\'s failure writes nothing — the thief\'s pre-stamp stands');
+    }
+    {
+      // Release by rename-then-verify: a lock another helper took over between
+      // our read and our release is never deleted.
+      const dir = scenario('release-lock');
+      const lock = path.join(dir, '.autoupdate.lock');
+      fs.writeFileSync(lock, JSON.stringify({ protocol: 1, token: 'ours', pid: process.pid, acquiredAt: 1 }));
+      const realRead = fs.readFileSync;
+      let replaced = false;
+      fs.readFileSync = function (file, ...rest) {
+        const out = realRead.call(fs, file, ...rest);
+        if (!replaced && path.resolve(String(file)) === path.resolve(lock)) {
+          replaced = true;
+          fs.writeFileSync(lock, JSON.stringify({ protocol: 1, token: 'theirs', pid: process.pid, acquiredAt: 2 }));
+        }
+        return out;
+      };
+      let released = null;
+      try { released = __test.releaseLock(lock, 'ours'); }
+      finally { fs.readFileSync = realRead; }
+      ok(released === false && JSON.parse(fs.readFileSync(lock, 'utf8')).token === 'theirs' && fs.readdirSync(dir).length === 1,
+        'CF-3: the lock is released by rename-then-verify — a lock replaced after our read survives');
+    }
+  }
+
+  {
+    // MV-2: a rollback onto a release from before the hold replaces this
+    // module's FILE; long-lived processes keep the new code in memory but launch
+    // the file. Modelled with a copy imported first, then overwritten.
+    const dir = scenario('pre-hold-helper');
+    const copy = path.join(dir, 'module', 'mcp-auto-update.mjs');
+    fs.mkdirSync(path.dirname(copy), { recursive: true });
+    const source = path.join(HERE, '..', 'src', 'mcp-auto-update.mjs');
+    fs.copyFileSync(source, copy);
+    const loaded = await import(`${pathToFileURL(copy).href}?pre-hold`);
+    const brainDir = path.join(dir, 'brain');
+    fs.mkdirSync(brainDir, { recursive: true });
+    writeRuntime(brainDir, '1.9.0');
+    const t = Date.UTC(2026, 9, 4, 9, 0, 0);
+    await loaded.runAutoUpdateCheck({
+      brainDir, now: t, enabled: true, force: false, currentVersion: null,
+      fetchLatest: async () => '1.9.1', installVersion: installAs(),
+    });
+    writeRuntime(brainDir, '1.9.0');   // npx klypix-mcp@<pre-hold> install --force ...
+    fs.writeFileSync(copy, '// a 1.89.0-era updater: 24 h stamp, no hold\nexport async function runAutoUpdateCheck() {}\n');   // ... replaced the helper too
+    const due = t + AUTO_UPDATE_TTL_MS;
+    let launches = 0;
+    const spawnProcess = () => { launches++; return fakeChild(); };
+    const seen = loaded.inspectAutoUpdate(brainDir, { now: due, env: {} });
+    ok(seen.due && seen.helperApi === 1 && seen.nextHold?.version === '1.9.1' && seen.decision === 'install',
+      'MV-2: the view knows the helper on disk predates the hold, and decides as that helper will (install), never "held" on its behalf');
+    ok(loaded.spawnAutoUpdateHelper({ brainDir, env: {}, now: due, spawnProcess }) === null && launches === 0,
+      'MV-2: a spawner never launches a pre-hold helper while a hold applies');
+    fs.copyFileSync(source, copy);   // a hold-aware helper again
+    ok(!!loaded.spawnAutoUpdateHelper({ brainDir, env: {}, now: due, spawnProcess }) && launches === 1,
+      'MV-2: … a hold-aware helper is launched as usual');
+  }
+
+  {
+    // MV-3: the spawn gate runs in long-lived code, the throttle in the helper
+    // on disk. A helper that changes nothing (an older one still throttling, or
+    // one that cannot start) is not relaunched at every 10-min poll.
+    const dir = scenario('spawn-memory');
+    writeRuntime(dir, '1.4.0');
+    const t = Date.UTC(2026, 9, 4, 10, 0, 0);
+    let launches = 0;
+    const spawnProcess = () => { launches++; return fakeChild(); };   // writes nothing
+    const spawn = (now) => spawnAutoUpdateHelper({ brainDir: dir, env: {}, now, spawnProcess });
+    ok(!!spawn(t) && launches === 1, 'MV-3: a due check launches the helper');
+    ok(spawn(t + AUTO_UPDATE_POLL_MS) === null && spawn(t + 2 * AUTO_UPDATE_POLL_MS) === null
+      && launches === 1 && view(dir, t + 2 * AUTO_UPDATE_POLL_MS).due,
+    'MV-3: still due, but a helper that left the stamp and status untouched is not relaunched every poll');
+    ok(!!spawn(t + AUTO_UPDATE_SPAWN_RETRY_MS) && launches === 2, 'MV-3: … it is relaunched after AUTO_UPDATE_SPAWN_RETRY_MS');
+    fs.writeFileSync(autoUpdatePaths(dir).stamp, JSON.stringify({ protocol: 1, lastCheck: t - 7 * HOUR, failures: 0 }));
+    ok(!!spawn(t + AUTO_UPDATE_SPAWN_RETRY_MS + AUTO_UPDATE_POLL_MS) && launches === 3,
+      'MV-3: … or as soon as the stamp or the status changes');
   }
 
   {

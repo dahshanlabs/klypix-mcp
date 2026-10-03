@@ -18,7 +18,14 @@
 //     a helper that dies mid-check backs off instead of retrying in a storm;
 //   - a deliberate older install (a --force rollback) is held: the updater never
 //     re-installs the version it was rolled back from, only a newer release
-//     (KLYPIX_AUTO_UPDATE_FORCE=1 overrides the hold);
+//     (KLYPIX_AUTO_UPDATE_FORCE=1 overrides the hold). The hold lives in the
+//     status and is mirrored in the stamp, so losing either file keeps it. A
+//     rollback onto a release from before the hold (AUTO_UPDATE_API 1, ≤ 1.89.0)
+//     also rolls this helper back, and that helper re-installs: spawners never
+//     launch it while a hold applies, and the README tells owners how to stay;
+//   - a helper whose lock was taken from it (a live owner past 2 h) records only
+//     an install it made itself, and a failure never overwrites an outcome
+//     another helper recorded after this attempt began;
 //   - stable, same-major releases only (a new major requires a manual install),
 //     whether or not the runtime is managed yet;
 //   - a developer-owned (dev:true) runtime is never fetched for, installed over,
@@ -51,6 +58,13 @@ import https from 'https';
 import { spawn } from 'child_process';
 import { fileURLToPath, pathToFileURL } from 'url';
 
+// The rules this file implements, as a literal other code can read without
+// importing it (MV-2, 2026-10-03 review): 2 = the identity-aware 6 h schedule,
+// failure backoff and downgrade hold. A file without the line is api 1 — every
+// release through 1.89.0: a time-only 24 h stamp and no hold. Bump it whenever
+// the schedule, the hold or a decision changes meaning; the doctor and the
+// spawners read it from the file a spawner will actually launch.
+export const AUTO_UPDATE_API = 2;
 export const AUTO_UPDATE_TTL_MS = 6 * 60 * 60 * 1000;
 // How often supervisors and workers ask "is a check due?". Each poll is a few
 // small JSON reads and never touches the network; npm is contacted only when
@@ -79,6 +93,10 @@ export const AUTO_UPDATE_HARNESS_REFRESH_MS = 24 * 60 * 60 * 1000;
 // reconciles its own project at registration, so a revived project still heals
 // on its first use.
 export const AUTO_UPDATE_STALE_REGISTRATION_MS = 14 * 24 * 60 * 60 * 1000;
+// A spawner whose last helper left the stamp and the status untouched (it
+// exited 'throttled' or 'busy', or could not start) waits this long before
+// launching another (MV-3, 2026-10-03 review).
+export const AUTO_UPDATE_SPAWN_RETRY_MS = AUTO_UPDATE_TTL_MS / 2;
 export const AUTO_UPDATE_WORKER_ARG = '--klypix-auto-update-worker';
 
 const MAX_DATE_MS = 8.64e15;
@@ -602,19 +620,52 @@ export function autoUpdateDecision({ installed = null, latestVersion = null, hol
   } catch { return 'unknown'; }
 }
 
+// The schedule a status implies, for a stamp that cannot be used (CF-4): a
+// failed result's attempt and nextRetryAt, else the cadence after checkedAt.
+// null when the status carries no usable time.
+function scheduleFromStatus(status, now, ttlMs) {
+  if (!isRecord(status) || typeof status.result !== 'string') return null;
+  const at = (value) => readTime(typeof value === 'string' ? Date.parse(value) : NaN, now).ms;
+  const checkedMs = at(status.checkedAt);
+  if (status.result === 'failed') {
+    const failures = sanitizeFailures(status.attempt) || 1;
+    const retryMs = at(status.nextRetryAt);
+    if (retryMs !== null) return { failures, dueAt: retryMs };
+    return checkedMs !== null ? { failures, dueAt: checkedMs + retryDelay(failures, ttlMs) } : null;
+  }
+  return checkedMs !== null ? { failures: 0, dueAt: checkedMs + ttlMs } : null;
+}
+
+// The stamp and the status, each ABSENT, readable or UNREADABLE (readReceipt).
+function readCheckState(files) {
+  return { stampRead: readReceipt(files.stamp), statusRead: readReceipt(files.status) };
+}
+
+// The record a hold and the evaluated identity are read from (CF-4): the
+// status — or, when the status cannot be read, the stamp, which mirrors both.
+// Losing the status used to drop a recorded downgrade hold, and the next check
+// re-installed the version the owner had rolled back from.
+function outcomeRecord({ stampRead, statusRead }) {
+  if (statusRead.state === 'ok') return statusRead.value;
+  if (stampRead.state === 'ok') return { identity: stampRead.value.identity, hold: stampRead.value.hold };
+  return null;
+}
+
 /**
  * When is the next check due, and why? Pure and TOTAL: it validates every
  * number before using it and answers {due:false, error} on any surprise, so a
  * corrupt stamp can never crash the worker/supervisor timers that poll it
  * (neither installs an uncaughtException handler).
  *
- *   stamp     .autoupdate-check.json  {lastCheck, failures, nextCheckAt, ...}
- *   status    .autoupdate-status.json {result, identity, ...}
- *   installed installIdentity(brainDir)
- *   lock      {pid, acquiredAt, alive} of .autoupdate.lock, or null
+ *   stamp      .autoupdate-check.json  {lastCheck, failures, nextCheckAt, ...}
+ *   stampState 'unreadable' when that file exists but could not be read
+ *   status     .autoupdate-status.json {result, identity, ...}
+ *   installed  installIdentity(brainDir)
+ *   lock       {pid, acquiredAt, alive} of .autoupdate.lock, or null
  */
 export function autoUpdateSchedule({
   stamp = null,
+  stampState = null,
   status = null,
   installed = null,
   lock = null,
@@ -626,8 +677,8 @@ export function autoUpdateSchedule({
     const t = validNow(now);
     const ttl = validTtl(ttlMs);
     const record = isRecord(stamp) ? stamp : null;
-    const corrupt = stamp !== null && stamp !== undefined && !record;
-    const failures = sanitizeFailures(record?.failures);
+    const corrupt = stampState === 'unreadable' || (stamp !== null && stamp !== undefined && !record);
+    let failures = sanitizeFailures(record?.failures);
     const last = readTime(record?.lastCheck, t);
     const next = readTime(record?.nextCheckAt, t);
     const lockAt = isRecord(lock) ? readTime(lock.acquiredAt, t) : { absent: true, ms: null };
@@ -641,6 +692,19 @@ export function autoUpdateSchedule({
     if (corrupt || last.invalid || next.invalid || lockAt.invalid) {
       dueAt = t;
       dueReason = 'invalid-stamp';
+      // CF-4 (2026-10-03 review): a stamp that cannot be used (a power cut
+      // leaves NULs; NTFS journals metadata, not data) used to read as "never
+      // checked": due at once with the failure count back at zero, so a 4 h
+      // backoff shrank to now + 15 min. The status mirrors the backoff — a
+      // failed result carries its attempt and nextRetryAt — so the schedule is
+      // rebuilt from it. Only when neither file says anything is it due now.
+      if (!lockAt.invalid) {
+        const rebuilt = scheduleFromStatus(status, t, ttl);
+        if (rebuilt) {
+          failures = rebuilt.failures;
+          if (rebuilt.dueAt > t) { dueAt = rebuilt.dueAt; nextCheckAt = rebuilt.dueAt; }
+        }
+      }
     } else if (last.absent) {
       dueAt = t;
       dueReason = 'never-checked';
@@ -710,12 +774,15 @@ export function inspectAutoUpdate(brainDir, { now = Date.now(), env = process.en
   try {
     const t = validNow(now);
     const files = autoUpdatePaths(brainDir);
-    const stamp = readJson(files.stamp);
-    const rawStatus = readJson(files.status);
+    const state = readCheckState(files);
+    const stamp = state.stampRead.value;
+    const rawStatus = state.statusRead.value;
     const status = isRecord(rawStatus) ? rawStatus : {};
+    const record = outcomeRecord(state);
     const installed = installIdentity(files.brainDir);
     const plan = autoUpdateSchedule({
       stamp,
+      stampState: state.stampRead.state,
       status: rawStatus,
       installed,
       lock: readLockState(files.lock),
@@ -724,17 +791,23 @@ export function inspectAutoUpdate(brainDir, { now = Date.now(), env = process.en
       ttlMs: AUTO_UPDATE_TTL_MS,
     });
     const lastCheck = isRecord(stamp) ? readTime(stamp.lastCheck, t).ms : null;
-    const hold = sanitizeHold(status.hold);
+    const hold = sanitizeHold(record?.hold);
     const evaluated = evaluatedIdentity(rawStatus);
     // `decision` is what the NEXT check does with latestVersion (2026-10-03
     // integration review): with the hold that check applies, and with the
     // version the helper falls back to when no receipt names one. It used to
     // read 'install' for a --force downgrade the helper would hold, and for a
     // new major the helper would block on a receipt-less runtime.
-    const upcomingHold = nextHold(rawStatus, installed);
+    const upcomingHold = nextHold(record, installed);
     const decidingAs = isRecord(installed) && !installed.unknown && !installed.version && strictSemver(currentVersion)
       ? { ...installed, version: String(currentVersion).trim() }
       : installed;
+    // The helper this process launches is this module's FILE, which a rollback
+    // replaces (the flat bundle). A helper from before the hold (api 1, ≤ 1.89.0)
+    // re-installs the version the owner left: decide as that helper will
+    // (MV-2, 2026-10-03 review), never "held" on its behalf.
+    const helperApi = updaterApiOf(fileURLToPath(import.meta.url));
+    const helperHolds = helperApi === null || helperApi >= 2;
     return {
       enabled,
       lastCheck,
@@ -765,11 +838,13 @@ export function inspectAutoUpdate(brainDir, { now = Date.now(), env = process.en
       // The hold the next check applies: `hold`, or the version a deliberate
       // downgrade left that the helper has not recorded yet.
       nextHold: upcomingHold,
+      // The rules of the helper file spawners launch (null: unreadable).
+      helperApi,
       // What the updater would do with the last fetched npm version.
       decision: autoUpdateDecision({
         installed: decidingAs,
         latestVersion: strictSemver(status.latestVersion) ? status.latestVersion : null,
-        hold: upcomingHold,
+        hold: helperHolds ? upcomingHold : null,
       }),
       scheduleError: plan.error || null,
     };
@@ -800,10 +875,30 @@ export function inspectAutoUpdate(brainDir, { now = Date.now(), env = process.en
       installedIdentity: null,
       hold: null,
       nextHold: null,
+      helperApi: null,
       decision: 'unknown',
       scheduleError: cleanError(error),
     };
   }
+}
+
+// The AUTO_UPDATE_API a file declares: a number, 1 for an updater from before
+// the marker, null when it cannot be read. Text only — importing another copy
+// of this module into a long-lived process would pin it in memory for good.
+// Cached by size + mtime: spawners ask on every poll and receipt write.
+const updaterApiCache = new Map();
+export function updaterApiOf(file) {
+  try {
+    const stat = fs.statSync(file);
+    const key = `${stat.size}:${stat.mtimeMs}`;
+    const cached = updaterApiCache.get(file);
+    if (cached?.key === key) return cached.api;
+    const text = fs.readFileSync(file, 'utf8');
+    const marker = text.match(/^export const AUTO_UPDATE_API = (\d+);/m);
+    const api = marker ? Number(marker[1]) : (/\brunAutoUpdateCheck\b/.test(text) ? 1 : null);
+    updaterApiCache.set(file, { key, api });
+    return api;
+  } catch { return null; }
 }
 
 /**
@@ -823,8 +918,25 @@ export function spawnAutoUpdateHelper({
 } = {}) {
   try {
     if (!autoUpdateEnabled(env) || env.KLYPIX_MCP_AUTO_UPDATE_CHILD === '1') return null;
-    if (!inspectAutoUpdate(brainDir, { env, now }).due) return null;
+    const view = inspectAutoUpdate(brainDir, { env, now });
+    if (!view.due) return null;
     const helper = fileURLToPath(import.meta.url);
+    // MV-2 (2026-10-03 review): a rollback onto a release from before the hold
+    // also rolled this FILE back. Never launch that helper while a hold applies:
+    // it would re-install the version the owner left. (The rolled-back
+    // release's own spawners still do — the README says how to stay.)
+    if (view.nextHold && view.helperApi !== null && view.helperApi < 2) return null;
+    // MV-3: the schedule runs here, in long-lived code; the throttle runs in the
+    // helper on disk. When they disagree (that older helper waits 24 h), every
+    // poll launched a node process that exited 'throttled' having written
+    // nothing — about 30 every 10 min on a machine with 15 connections. A
+    // helper that changed nothing is not relaunched by this process until the
+    // stamp or the status changes, or AUTO_UPDATE_SPAWN_RETRY_MS has passed.
+    const files = autoUpdatePaths(brainDir);
+    const signature = checkStateSignature(files);
+    const at = validNow(now);
+    const last = lastSpawnByDir.get(files.brainDir);
+    if (last && last.signature === signature && at >= last.at && at - last.at < AUTO_UPDATE_SPAWN_RETRY_MS) return null;
     const child = spawnProcess(process.execPath, [helper, AUTO_UPDATE_WORKER_ARG], {
       // Do not hold the managed directory as this detached process's cwd.
       // This matters for ephemeral/test homes on Windows and is cleaner for
@@ -842,8 +954,22 @@ export function spawnAutoUpdateHelper({
     });
     child.on('error', () => { /* fail-open: the MCP transport remains healthy */ });
     child.unref();
+    lastSpawnByDir.set(files.brainDir, { at, signature });
     return child;
   } catch { return null; }
+}
+
+// What this process's last helper launch saw (spawnAutoUpdateHelper, MV-3).
+const lastSpawnByDir = new Map();
+// The stamp's and the status's bytes, hashed: a helper that ran wrote at least
+// its pre-stamp, so an unchanged signature means it did nothing.
+function checkStateSignature(files) {
+  const hash = crypto.createHash('sha1');
+  for (const file of [files.stamp, files.status]) {
+    try { hash.update(fs.readFileSync(file)); } catch { hash.update('-'); }
+    hash.update('\0');
+  }
+  return hash.digest('hex');
 }
 
 // ── Locks (install-lock.mjs semantics) ───────────────────────────────────────
@@ -942,12 +1068,25 @@ function acquireLock(lockFile, now, staleMs = AUTO_UPDATE_LOCK_STALE_MS) {
   return null;
 }
 
+// Release by rename-then-verify (install-lock.mjs releaseInstallLockSync): a
+// read-then-unlink could delete a lock another helper took over between the
+// read and the unlink (CF-3, 2026-10-03 review).
 function releaseLock(lockFile, token) {
+  if (!token) return false;
+  const released = `${lockFile}.released-${process.pid}-${crypto.randomBytes(6).toString('hex')}`;
   try {
-    const lock = readJson(lockFile);
-    if (lock?.token === token) fs.unlinkSync(lockFile);
-  } catch { /* a stale-lock recovery may already have removed it */ }
+    if (readJson(lockFile)?.token !== token) return false;
+    fs.renameSync(lockFile, released);
+    if (readJson(released)?.token === token) {
+      fs.unlinkSync(released);
+      return true;
+    }
+    // Not ours after all: put it back unless its owner already replaced it.
+    if (!fs.existsSync(lockFile)) fs.renameSync(released, lockFile);
+    return false;
+  } catch { return false; }   // a stale-lock recovery may already have removed it
 }
+const lockOwnedBy = (lockFile, token) => Boolean(token) && readJson(lockFile)?.token === token;
 
 export function fetchLatestStableVersion({
   timeoutMs = 8000,
@@ -1079,10 +1218,12 @@ export async function runAutoUpdateCheck({
   // The helper consults the schedule WITHOUT the lock: acquiring the lock is
   // what answers "another helper is already checking" ('busy').
   const throttled = () => {
-    const stamp = readJson(files.stamp);
+    const state = readCheckState(files);
+    const stamp = state.stampRead.value;
     const plan = autoUpdateSchedule({
       stamp,
-      status: readJson(files.status),
+      stampState: state.stampRead.state,
+      status: state.statusRead.value,
       installed: installIdentity(files.brainDir),
       lock: null,
       now: clock,
@@ -1116,7 +1257,7 @@ export async function runAutoUpdateCheck({
     // the finally release the lock before the harness pass and the status
     // write, and turned a failed status write into an unhandled rejection.
     return await checkWhileLocked({
-      files, currentVersion, force, now: clock, ttlMs: ttl,
+      files, token, currentVersion, force, now: clock, ttlMs: ttl,
       fetchLatest, installVersion, reconcileProjects, loadRules,
     });
   } finally {
@@ -1125,11 +1266,14 @@ export async function runAutoUpdateCheck({
 }
 
 async function checkWhileLocked({
-  files, currentVersion, force, now, ttlMs, fetchLatest, installVersion, reconcileProjects, loadRules,
+  files, token, currentVersion, force, now, ttlMs, fetchLatest, installVersion, reconcileProjects, loadRules,
 }) {
-  const priorStamp = readJson(files.stamp);
-  const priorStatus = readJson(files.status);
+  const state = readCheckState(files);
+  const priorStamp = state.stampRead.value;
+  const priorStatus = state.statusRead.value;
   const prior = isRecord(priorStatus) ? priorStatus : {};
+  // The status, or the stamp's mirror of its identity and hold (CF-4).
+  const record = outcomeRecord(state);
   const checkedAt = isoAt(now);
   const receipts = readInstallReceiptsSettled(files.brainDir);
   const identity = identityFromReceipts(receipts);
@@ -1137,14 +1281,24 @@ async function checkWhileLocked({
   // no receipts yet); the identity that is RECORDED never does.
   const installed = runtimeFromReceipts(receipts.runtime.value, receipts.stamp.value, currentVersion);
   const evaluated = recordedIdentity(identity);
-  const attempt = sanitizeFailures(isRecord(priorStamp) ? priorStamp.failures : 0) + 1;
+  // An unreadable stamp lost its count (CF-4). The status mirrors it for a
+  // failed outcome; otherwise the unknown counts as one failed attempt — never
+  // zero, which shrank a 4 h backoff to 15 min.
+  const priorFailures = state.stampRead.state === 'unreadable'
+    ? Math.max(1, prior.result === 'failed' ? sanitizeFailures(prior.attempt) : 0)
+    : sanitizeFailures(priorStamp?.failures);
+  const attempt = priorFailures + 1;
   const retryAt = now + retryDelay(attempt, ttlMs);
   const priorHarness = isRecord(prior.harness) ? prior.harness : null;
-  let hold = sanitizeHold(prior.hold);
+  // A4: a managed npm install that is now older than the install the last
+  // result described was rolled back on purpose; hold the version it left.
+  // Receipts that cannot be read keep whatever hold was recorded.
+  let hold = identity.unknown ? sanitizeHold(record?.hold) : nextHold(record, identity, checkedAt);
 
   // Pessimistic pre-stamp: until a terminal outcome is recorded this attempt
   // COUNTS as failed. A helper killed after this point (sleep, shutdown, AV, the
   // 10-min npx timeout) therefore escalates 15 min → 1 h → 4 h, never a storm.
+  // Every stamp also mirrors the hold, so losing the status keeps it (CF-4).
   const failedStamp = {
     protocol: 1,
     lastCheck: now,
@@ -1152,6 +1306,7 @@ async function checkWhileLocked({
     failures: attempt,
     nextCheckAt: retryAt,
     identity: evaluated,
+    hold: hold || null,
     inProgress: { pid: process.pid, startedAt: checkedAt },
   };
   const stampError = tryWrite(files.stamp, failedStamp);
@@ -1173,6 +1328,23 @@ async function checkWhileLocked({
     return { checked: true, ...status, ...(recordError ? { recordError } : {}) };
   }
 
+  // CF-3 (2026-10-03 review): a live owner older than AUTO_UPDATE_LOCK_STALE_MS
+  // is robbed by design (A8: a laptop that slept 2 h mid-check). Both helpers
+  // then reach their terminal writes, in either order, and a false 'failed' —
+  // the robber's installer could not take .install.lock from the live original
+  // — landed on top of a good 'updated'. So before every terminal write:
+  //   - a helper whose lock was taken records only an install it made itself
+  //     (that install happened, whoever holds the lock now);
+  //   - a failure never overwrites an outcome another helper recorded after
+  //     this attempt's pre-stamp.
+  const holdsLock = () => lockOwnedBy(files.lock, token);
+  const preStampIntact = () => {
+    const current = readReceipt(files.stamp);
+    return current.state !== 'ok'
+      || (current.value.lastCheck === now && current.value.inProgress?.pid === process.pid);
+  };
+  const superseded = (status) => ({ checked: true, ...status, superseded: true });
+
   const fail = (error, extra = {}) => {
     const status = {
       protocol: 1,
@@ -1187,6 +1359,7 @@ async function checkWhileLocked({
       ...(hold ? { hold } : {}),
       ...(priorHarness ? { harness: priorHarness } : {}),
     };
+    if (!holdsLock() || !preStampIntact()) return superseded(status);
     const recordError = tryWrite(files.status, status);
     tryWrite(files.stamp, { ...failedStamp, inProgress: null });
     return { checked: true, ...status, ...(recordError ? { recordError } : {}) };
@@ -1228,6 +1401,8 @@ async function checkWhileLocked({
   };
 
   const finish = async (status, pass = null) => {
+    // Robbed (CF-3): only an install this helper made is still its to record.
+    if (!holdsLock() && !['updated', 'bootstrapped'].includes(status.result)) return superseded(status);
     const harness = pass ? await harnessPass(pass) : priorHarness;
     const complete = { ...status, ...(harness ? { harness } : {}) };
     const recordError = tryWrite(files.status, complete);
@@ -1244,6 +1419,7 @@ async function checkWhileLocked({
       failures: 0,
       nextCheckAt: now + ttlMs,
       identity: complete.identity,
+      hold: complete.hold || null,
       inProgress: null,
     });
     return { checked: true, ...complete };
@@ -1255,10 +1431,6 @@ async function checkWhileLocked({
     // dev-owned contract. A short retry is the safe default.
     return fail(new Error(`install receipts unreadable — ${identity.error}`));
   }
-
-  // A4: a managed npm install that is now older than the install the last
-  // result described was rolled back on purpose; hold the version it left.
-  hold = nextHold(priorStatus, identity, checkedAt);
 
   if (installed.dev) {
     // Never fetched for: the developer's deploy owns these files.

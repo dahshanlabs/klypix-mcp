@@ -653,7 +653,12 @@ function offlinePhrase(receipt) {
   }
   if (untouched) {
     const left = receipt.expiresAt ? ` (kept ${Math.max(1, Math.round((receipt.expiresAt - now) / 86_400_000))}d more)` : '';
-    return `waiting — that session was ${state} when you sent it (${seen}); it is delivered the moment that session next acts${left}`;
+    // Reopen on the human's OK (1.91.0): name the button only where it exists —
+    // a Claude Code or Codex session with an identifier-safe id.
+    const host = String(target.client || '').toLowerCase();
+    const reopenable = ['claude-code', 'claude', 'codex'].includes(host) && /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(String(target.id || ''));
+    const offer = reopenable ? ' — if the human wants it sooner, brain_reopen asks them whether to reopen that session now' : '';
+    return `waiting — that session was ${state} when you sent it (${seen}); it is delivered the moment that session next acts${left}${offer}`;
   }
   return null;
 }

@@ -3766,7 +3766,8 @@ async function capture(lib) {
                     // Ten minutes of silence means closed OR idle with no KLYPIX
                     // heartbeat; only a SessionEnd proves "closed".
                     const state = r.endedAt ? 'closed' : (quiet ? `not seen for ${quiet} (closed, or idle with no KLYPIX heartbeat)` : 'not running');
-                    const reopen = r.resumeCommand ? ` If it was closed, the human can reopen it with \`${r.resumeCommand}\`.` : '';
+                    // Reopen on the human's OK (1.91.0) — the MCP verb asks the human first.
+                    const reopen = r.resumeCommand ? ` If the human wants it handled sooner, offer to reopen it: call brain_reopen with session "${r.id}" (KLYPIX asks them with a Reopen / Not now prompt first), or they can run \`${r.resumeCommand}\` in that session's folder.` : '';
                     items.push({ key: `message:${o.id}`, kind: 'message', line: neutralMarkers(`📬 Your note to ${to} is QUEUED — ${clientWordOf(r.client)} ${String(r.id).slice(0, 8)}${r.intent ? ` ("${String(r.intent).slice(0, 60)}")` : ''} is ${state}; it is delivered the moment that session next acts (kept 7d). Say "queued", not "delivered".${reopen}`) });
                 } else if (o.status === 'sent') {
                     const who = (o.recipients || []).map(r => `${clientWordOf(r.client)} ${String(r.id).slice(0, 8)}${r.statusLabel ? ` (${r.statusLabel})` : ''}`).join(', ') || to;

@@ -119,7 +119,7 @@ npx klypix-mcp conformance
 
 It runs in a temporary fixture and touches nothing else. It checks tool discovery, task memory,
 truthful peer reporting, overlap surfacing, proactive logging, and in-band delivery of a peer note.
-It verifies 15 required coordination behaviours — not the 22 tools, and not the retrieval engine.
+It verifies 15 required coordination behaviours — not the 23 tools, and not the retrieval engine.
 
 ---
 
@@ -142,7 +142,7 @@ git repo, and then **proves the result** before it exits:
   editors   Claude Code · Cursor · Codex · Gemini CLI · Antigravity · VS Code
   wired     9 file(s) · 9 updated   (skipped 5 for tools you don't have)
   git       .klypix merge driver registered
-  verified  ✓ 22 tools reachable via .mcp.json (892ms)
+  verified  ✓ 23 tools reachable via .mcp.json (892ms)
 ```
 
 That last line is the point. MCP config fails **silently** — a wrong entry means the server never
@@ -451,8 +451,9 @@ KLYPIX has identified before that is **not on the lane now** (closed, or quiet) 
 directed note the moment it next acts — a directed note is kept 7 days, and the sender is told it
 is *queued*, not delivered. That is what stops the human from being the courier between two
 agents: the standing rule every host receives is that a message it would otherwise ask the person
-to relay or paste is sent this way instead. Nothing here starts or wakes a session — the note
-waits until a person opens it. A supported
+to relay or paste is sent this way instead. Nothing here starts or wakes a session on its own — the
+note waits until a person opens it, and the person decides when that is (see *Reopen on your OK*
+below). A supported
 KLYPIX action offers the note in model-visible context; the next independent supported action
 replays it and records an acknowledgement. That acknowledgement proves only that a later action followed the
 offer — never that a person read it or that an agent acted on it. The note keeps replaying until the
@@ -462,6 +463,30 @@ survive reconnects. Expiry or bounded-capacity eviction records a failed per-rec
 instead of silently looking delivered. The send-time audience is fixed, unresolved targeted sends
 fail closed, the core lane is machine-local, a note to every session expires after 24 hours and a
 directed note after 7 days, and notes are never written into the brain.
+
+### Reopen on your OK
+
+A note to a session that has closed would otherwise wait until someone happens to open that
+session again. When the person wants it handled sooner, the sending agent calls `brain_reopen`, and
+**KLYPIX asks the person** — an in-chat *Reopen / Not now* prompt in apps that support MCP
+elicitation (Claude Code, Codex), otherwise a small native dialog. Only on *Reopen* does KLYPIX
+open that Claude Code or Codex session in a **new, visible terminal**, in the folder it worked in,
+with the host's own resume command (`claude --resume <id>`, `codex resume <id>`); the session
+receives the waiting note at its first action and the sender sees the receipt as usual.
+
+- The person decides, never a model: the answer comes from the app's prompt or KLYPIX's own
+  dialog, which no agent can click. With neither available, nothing opens and the person is given
+  the command to run.
+- Only a session with a note **addressed to it** is reopened — KLYPIX reopens a conversation so a
+  note can reach it; it does not start, route or supervise agents.
+- The first prompt the reopened session gets is fixed text that tells it to collect the note; the
+  note itself arrives through the labelled message channel as information from another session,
+  never typed in as if the person had said it. The sender's session identity never leaks into it.
+- *Not now* is remembered: the same session is not offered again for a while, and a double click
+  cannot open two windows.
+- From a terminal: `npx klypix-mcp sessions` lists this project's closed sessions and the notes
+  waiting for them; `npx klypix-mcp sessions reopen <id>` reopens one (`--quiet` lets it wait for
+  you instead of starting on the note).
 
 Durable handoffs go in the brain itself — decisions, findings, open questions and skills captured
 as cards, each stamped with the agent that wrote it.
@@ -637,7 +662,7 @@ The MCP verbs below are what agents call. These are what **you** call:
 
 ---
 
-## The 22 verbs
+## The 23 verbs
 
 | Tool | What it does |
 |---|---|
@@ -651,6 +676,7 @@ The MCP verbs below are what agents call. These are what **you** call:
 | `brain_doctor` | Self-diagnosis: version, core/enhanced host adapters, active sessions, tool count, projection drift |
 | `brain_message` | Session-to-session coordination notes — to a live session, or queued for one that is not running until it next starts — with a fixed send-time audience and per-recipient pending / offer / acknowledgement / consumption / failure receipts (a directed note is kept 7 days, a broadcast 24h; never written into the brain) |
 | `brain_message_receipt` | Explicitly record model-side consumption using the exact message id and per-recipient offer token; acknowledgement alone never consumes a note |
+| `brain_reopen` | Reopen a closed Claude Code or Codex session so a note waiting for it gets there now — only after the person answers *Reopen* in an in-chat prompt or KLYPIX's own dialog; opens a new, visible terminal in that session's folder with the host's resume command |
 | `brain_sync` | Context Gateway: task capsule, active-task peers, exact-file overlap, one-time alerts, timing, and optional result-manifest reconciliation |
 | `brain_connect` | Find and draw related-but-unlinked cards |
 | `project_map_context` | Read-only, bounded code-graph evidence beside correction-aware brain context, with exact-path review proposals; external artifacts (e.g. Graphify) are supported but never installed or run locally |

@@ -19,7 +19,7 @@ const PKG_VERSION = (() => {
   }
 })();
 
-const DIRECT = new Set(['install', 'link', 'doctor', 'runtime', 'conformance', 'garden-code', 'init', 'git-driver', 'git-hook', 'brain-history', 'brain-deleted', 'orphans', 'diff', 'pr-brief', 'uninstall', 'bench']);
+const DIRECT = new Set(['install', 'link', 'doctor', 'runtime', 'conformance', 'garden-code', 'init', 'git-driver', 'git-hook', 'brain-history', 'brain-deleted', 'orphans', 'diff', 'pr-brief', 'uninstall', 'bench', 'sessions']);
 
 const USAGE = [
   `klypix-mcp ${PKG_VERSION} — shared project brain + MCP coordination server.`,
@@ -29,6 +29,8 @@ const USAGE = [
   '          [--no-project] [--json]     brain, config for the editors you actually have, merge driver, verified',
   '  link [dir] [--check]                project this project\'s 14 managed agent config files (--check audits, writes nothing, exits 1 on drift)',
   '  doctor [--npm] [--all] [--json]     read-only self-check; exits 1 on drift',
+  '  sessions [--json]                   closed agent sessions of this project and the notes waiting for them',
+  '  sessions reopen <id> [--quiet]      reopen one (Claude Code / Codex) in a new terminal so its waiting notes reach it',
   '  runtime [--json] [--watch seconds]  passive MCP process/RAM attribution; never terminates a process',
   '  conformance [--json]                launch two real MCP clients against this build',
   '  bench [--quick] [--json] [--out F]  reproducible benchmark: concurrent-write safety, latency, soak, crash',

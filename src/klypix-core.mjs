@@ -1834,7 +1834,12 @@ export async function opBrainMessage({ vault, canvas, text: msgText, to, via, fr
     const state = r.endedAt
       ? `closed (last seen ${ageWord(now - (r.lastSeen || r.endedAt))})`
       : (quiet ? `not on the lane — not seen for ${quiet} (closed, or idle with no KLYPIX heartbeat)` : 'not running');
-    const resume = r.resumeCommand ? ` If it was closed and they want it handled sooner, they can reopen it (${r.resumeCommand}).` : '';
+    // Reopen on the human's OK (1.91.0): only a host with a verified resume-by-id
+    // gets the offer (resumeCommand is '' otherwise), and it is the HUMAN who
+    // decides — brain_reopen asks them with a button before anything opens.
+    const resume = r.resumeCommand
+      ? ` If the human wants it handled sooner, offer to reopen it: call brain_reopen with session "${r.id}" — KLYPIX asks the human with a Reopen / Not now prompt and opens nothing unless they say yes; the reopened session gets the note at its first action. Skip the offer for a note that can simply wait. (A human can also run \`${r.resumeCommand}\` in that session's folder.)`
+      : '';
     return {
       blocks: [text(`📬 Queued for ${labelOf(r)} — that session is ${state}. KLYPIX delivers the note the moment that session next acts, and drops it after 7 days if it never does. Tell the human it is QUEUED, not delivered, and that they do not need to relay anything.${resume} (id: ${message.id}) ${RECEIPT}`)],
       message,

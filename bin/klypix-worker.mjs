@@ -33,7 +33,18 @@ import {
 import { compareProjectGraphResults, projectGraphContextMarkdown, queryProjectGraph, suggestProjectGraphBrainLinks, scanNativeProjectMap, checkBrainDrift, brainDriftMarkdown } from '../src/project-graph.mjs';
 import { auditProject, compactAgentsBrief, linkProject, mcpServerEntry } from '../src/agent-rules.mjs';
 import { createMcpPresence, KLYPIX_MCP_INSTRUCTIONS, normalizeMcpClient } from '../src/mcp-presence.mjs';
-import { consumeMessageReceipt, findProjectBrain, listActiveSessions } from '../src/agent-presence.mjs';
+import {
+  buildReopenLaunch,
+  consumeMessageReceipt,
+  findProjectBrain,
+  launchReopen,
+  listActiveSessions,
+  nativeReopenDialog,
+  recordSessionReopen,
+  reopenCandidate,
+  reopenQuestion,
+  REOPEN_NUDGE,
+} from '../src/agent-presence.mjs';
 import { collectRepoState, commitsInRange, makeContainmentProbe } from '../src/repo-state.mjs';
 import {
   reconcileRegisteredProjects,
@@ -113,6 +124,11 @@ await runVerb('link', './klypix-link.mjs');
 // current, are the 5 hooks wired, what verbs does it expose, who's live, is the harness
 // projection in sync? One verdict, one reconcile block. Exits 1 on drift (CI gate).
 await runVerb('doctor', './klypix-doctor.mjs');
+
+// `npx klypix-mcp sessions` — this project's closed agent sessions and the notes
+// waiting for them; `sessions reopen <id>` reopens one in a new terminal so its
+// notes reach it (typing the verb is the human's yes). Runs before server setup.
+await runVerb('sessions', './klypix-sessions.mjs');
 
 // `npx klypix-mcp conformance` — launch two real, isolated MCP clients against
 // this exact installed server and verify task memory, truthful peers, blocking
@@ -751,7 +767,7 @@ server.registerTool('brain_note', {
 
 server.registerTool('brain_message', {
   title: 'Message another agent session on this project — live, idle, or recently closed (one-time note, not a brain card)',
-  description: 'Leave a DELIBERATE, targeted note for another agent session working on this project ("merged the hook refactor — rebase before you commit", "don\'t touch canvasStore, mid-refactor"). Address it to a session id from the brain_sync peer list or brain_doctor. A LIVE session gets it on its next lifecycle event or KLYPIX tool call, even if it is idle right now. A session KLYPIX has identified before that is NOT on the lane now (closed, or quiet) still receives a directed note the moment it next acts — the note is kept for up to 7 days — so if you would otherwise ask the human to relay or paste something to another agent session, send it here instead and tell them it was sent or queued. Broadcasts ("all") reach only sessions live right now. Any MCP client can send and receive through the shared machine-local presence lane. Delivery contract: a supported action offers the note into model-visible context, a later independent action acknowledges it, and it retires either by an explicit brain_message_receipt ("acted on it") or by auto-consumption on a further independent action; your receipt line names which, and neither is proof a human read it. Expiry or capacity loss leaves a failed per-recipient receipt instead of silently disappearing. OS-user-local and machine-local. Ephemeral and NOT persisted to the brain — for a durable decision use brain_note instead.',
+  description: 'Leave a DELIBERATE, targeted note for another agent session working on this project ("merged the hook refactor — rebase before you commit", "don\'t touch canvasStore, mid-refactor"). Address it to a session id from the brain_sync peer list or brain_doctor. A LIVE session gets it on its next lifecycle event or KLYPIX tool call, even if it is idle right now. A session KLYPIX has identified before that is NOT on the lane now (closed, or quiet) still receives a directed note the moment it next acts — the note is kept for up to 7 days — so if you would otherwise ask the human to relay or paste something to another agent session, send it here instead and tell them it was sent or queued. If the human wants a queued note handled sooner, brain_reopen asks them whether to reopen that session now. Broadcasts ("all") reach only sessions live right now. Any MCP client can send and receive through the shared machine-local presence lane. Delivery contract: a supported action offers the note into model-visible context, a later independent action acknowledges it, and it retires either by an explicit brain_message_receipt ("acted on it") or by auto-consumption on a further independent action; your receipt line names which, and neither is proof a human read it. Expiry or capacity loss leaves a failed per-recipient receipt instead of silently disappearing. OS-user-local and machine-local. Ephemeral and NOT persisted to the brain — for a durable decision use brain_note instead.',
   inputSchema: {
     text: z.string().describe('The note to deliver (kept to 400 chars).'),
     to: z.string().optional().describe('Target — a session id (or unique prefix of at least 8 characters) from the peer list, or an exact unique branch; omit or "all" for every session live right now. A directed id may name a session that is not running: the note then waits and is delivered when that session next starts.'),
@@ -825,6 +841,142 @@ server.registerTool('brain_message_receipt', {
     structuredContent: { schemaVersion: 1, ...verdict },
     ...(!verdict.ok ? { isError: true } : {}),
   };
+});
+
+// ── brain_reopen (1.91.0): reopen a closed session so a waiting note reaches it
+// The agent proposes; the HUMAN decides. Consent is collected by KLYPIX itself,
+// never by the model: an in-chat prompt when the client supports MCP
+// elicitation, otherwise a native "Reopen / Not now" dialog raised by this
+// process, otherwise nothing opens and the human is given the command. The
+// session opens in a new, visible terminal with its host's own resume command.
+const REOPEN_ELICIT_TIMEOUT_MS = 110_000;
+const REOPEN_CHOICE_ACT = 'Reopen it and let it act on the note';
+const REOPEN_CHOICE_QUIET = 'Reopen it — I will prompt it myself';
+const REOPEN_CHOICE_WAIT = 'Not now — let the note wait';
+
+async function askHumanToReopen({ question, start, extra }) {
+  let caps = {};
+  try { caps = server.server.getClientCapabilities?.() || {}; } catch { /* older SDK */ }
+  if (caps.elicitation) {
+    const choices = start === false ? [REOPEN_CHOICE_QUIET, REOPEN_CHOICE_WAIT] : [REOPEN_CHOICE_ACT, REOPEN_CHOICE_QUIET, REOPEN_CHOICE_WAIT];
+    try {
+      const answer = await server.server.elicitInput({
+        mode: 'form',
+        message: question,
+        requestedSchema: {
+          type: 'object',
+          properties: { choice: { type: 'string', title: 'Reopen this session now?', enum: choices, default: choices[0] } },
+          required: ['choice'],
+        },
+      }, { timeout: REOPEN_ELICIT_TIMEOUT_MS, ...(extra?.requestId !== undefined ? { relatedRequestId: extra.requestId } : {}) });
+      if (answer?.action === 'accept') {
+        const choice = String(answer.content?.choice || choices[0]);
+        if (choice === REOPEN_CHOICE_WAIT) return { via: 'in-chat', answer: 'wait' };
+        return { via: 'in-chat', answer: 'reopen', start: choice === REOPEN_CHOICE_ACT };
+      }
+      if (answer?.action === 'decline') return { via: 'in-chat', answer: 'wait' };
+      return { via: 'in-chat', answer: 'no-answer' };
+    } catch (error) {
+      // An unanswered in-chat prompt is an answer ("not now, not here"): never
+      // follow it with a second prompt in another window.
+      if (/time(d)? ?out/i.test(String(error?.message || ''))) return { via: 'in-chat', answer: 'no-answer' };
+      log(`brain_reopen: in-chat prompt unavailable (${String(error?.message || error).slice(0, 120)}); using the native dialog`);
+    }
+  }
+  const native = await nativeReopenDialog({
+    message: `${question}\n\nYes = reopen it${start === false ? '' : ' and let it act on the note'}. No = not now.`,
+    timeoutS: 50,
+  });
+  if (native === 'reopen') return { via: 'dialog', answer: 'reopen', start: start !== false };
+  if (native === 'wait') return { via: 'dialog', answer: 'wait' };
+  if (native === 'timeout') return { via: 'dialog', answer: 'no-answer' };
+  return { via: null, answer: 'unavailable' };
+}
+
+const reopenClientWord = (client) => {
+  const key = String(client || '').toLowerCase();
+  if (key === 'claude-code' || key === 'claude') return 'Claude Code';
+  if (key === 'codex') return 'Codex';
+  return key ? key.replace(/(^|[-_ ])([a-z])/g, (_m, p, c) => `${p}${c.toUpperCase()}`) : 'Another';
+};
+
+server.registerTool('brain_reopen', {
+  title: 'Reopen a closed agent session so a waiting note reaches it — only after the human says yes',
+  description: 'A note to a session that has CLOSED waits up to 7 days and is delivered only when that session is next used. When the human wants it handled sooner, call this: KLYPIX asks the HUMAN (an in-chat Reopen / Not now prompt where the app supports it, otherwise a native dialog) and, only on yes, reopens that Claude Code or Codex session in a new, visible terminal in its own folder with the host\'s resume command; the reopened session receives the waiting note(s) at its first action. Nothing opens without the human\'s answer, nothing runs headless, and only a session with a note waiting can be reopened. Do not call it again for the same session after the human chose "Not now" unless they bring it up. Machine-local.',
+  annotations: {
+    destructiveHint: false,
+    idempotentHint: false,
+    openWorldHint: true,
+  },
+  inputSchema: {
+    session: z.string().min(1).max(160).describe('The session to reopen: its id, or a unique prefix of at least 8 characters, as shown in the queued-note reply, brain_sync peers, or brain_doctor. It must be a Claude Code or Codex session that is not running and has a note waiting.'),
+    start: z.boolean().optional().describe('true (default): the reopened session starts on the note right away. false: it opens and waits for the human to prompt it.'),
+    project: z.string().optional().describe('Absolute project root containing brain.klypix. Defaults to this connection\'s project.'),
+  },
+}, async ({ session, start, project }, extra) => {
+  const brainPath = project ? findProjectBrain(path.resolve(project)) : (mcpPresence.brainPath || findProjectBrain(mcpPresence.vault));
+  const identity = extra?.klypixRequestIdentity || {};
+  const me = String(identity.sessionId || mcpPresence.id || '');
+  const senderLabel = `${reopenClientWord(identity.clientInfo?.client)} session ${me.slice(0, 8)}`.trim();
+  const now = Date.now();
+  const candidate = reopenCandidate({ brainPath, target: session, now, selfIds: [me, mcpPresence.id].filter(Boolean), explicit: true });
+  const reply = (status, text, structured = {}) => ({
+    content: [{ type: 'text', text }],
+    structuredContent: { schemaVersion: 1, status, session: candidate?.entry?.id || String(session || ''), ...structured },
+    ...(status === 'failed' ? { isError: true } : {}),
+  });
+  if (!candidate.ok) {
+    const e = candidate.entry || {};
+    const who = e.id ? `${reopenClientWord(e.client)} ${String(e.id).slice(0, 8)}` : `"${String(session).slice(0, 40)}"`;
+    const ago = (at) => `${Math.max(1, Math.round((now - Number(at || now)) / 60_000))} minute(s) ago`;
+    const why = {
+      'no-brain': 'there is no project brain for this connection — call brain_sync with the project root first.',
+      'unknown-session': `no session KLYPIX remembers matches ${who}. Use the id from the queued-note reply, brain_sync peers, or brain_doctor.`,
+      'ambiguous-session': `${who} matches more than one session — use more characters of its id.`,
+      self: `${who} is this session.`,
+      live: `${who} is running${candidate.statusLabel ? ` (${candidate.statusLabel})` : ''} — it gets the note at its next action, so there is nothing to reopen.`,
+      'unsupported-client': `${who} cannot be reopened by KLYPIX — only Claude Code and Codex have a verified resume-by-id. The note stays queued until that session is next used.`,
+      'unsafe-id': `${who} has an id that cannot be passed to a terminal safely, so KLYPIX will not reopen it.`,
+      'no-waiting-note': `no note is waiting for ${who}. KLYPIX reopens a session only so a note can reach it — send it with brain_message first.`,
+      'just-reopened': `KLYPIX opened ${who} ${ago(candidate.reopenedAt)} — the terminal window should already be up.`,
+      'recently-declined': `the human chose "Not now" for ${who} ${ago(candidate.declinedAt)}. Ask them in chat before offering it again.`,
+    }[candidate.reason] || `KLYPIX could not reopen ${who} (${candidate.reason}).`;
+    return reply('refused', `Not reopened: ${why}`, { reason: candidate.reason });
+  }
+  const wantStart = start !== false;
+  const question = reopenQuestion(candidate, { senderLabel, start: wantStart, now });
+  const consent = await askHumanToReopen({ question, start: wantStart, extra });
+  const label = `${candidate.hostLabel} ${candidate.entry.id.slice(0, 8)}`;
+  const kept = candidate.expiresAt ? `kept ${Math.max(1, Math.round((candidate.expiresAt - Date.now()) / 86_400_000))} more day(s)` : 'kept up to 7 days';
+  const manualLine = `${candidate.cwdSource === 'session' ? 'In' : 'From the project folder'} ${candidate.cwd}, run: ${candidate.command}`;
+  if (consent.answer === 'unavailable') {
+    recordSessionReopen({ brainPath, sessionId: candidate.entry.id, outcome: 'manual', by: me });
+    return reply('manual', `Not reopened: KLYPIX cannot show the human a Reopen button in this app or on this machine, so nothing was opened. Give them this to run themselves if they want it now — ${manualLine}. Otherwise the note stays queued (${kept}).`, { cwd: candidate.cwd, command: candidate.command });
+  }
+  if (consent.answer === 'wait') {
+    recordSessionReopen({ brainPath, sessionId: candidate.entry.id, outcome: 'declined', via: consent.via, by: me });
+    return reply('declined', `Not reopened — the human chose "Not now". The note stays queued (${kept}) and is delivered when ${label} is next used. Do not offer this again unless the human brings it up.`, { via: consent.via });
+  }
+  if (consent.answer !== 'reopen') {
+    recordSessionReopen({ brainPath, sessionId: candidate.entry.id, outcome: 'no-answer', via: consent.via, by: me });
+    return reply('no-answer', `Not reopened — the human did not answer the prompt, so nothing was opened. The note stays queued (${kept}). If they want it now: ${manualLine}.`, { via: consent.via, cwd: candidate.cwd, command: candidate.command });
+  }
+  const plan = buildReopenLaunch({ hostKey: candidate.hostKey, sessionId: candidate.entry.id, cwd: candidate.cwd, prompt: consent.start ? REOPEN_NUDGE : '' });
+  const launch = launchReopen(plan);
+  if (launch.dryRun) {
+    recordSessionReopen({ brainPath, sessionId: candidate.entry.id, outcome: 'dry-run', via: consent.via, method: plan.method, by: me });
+    return reply('dry-run', `Dry run (KLYPIX_REOPEN_LAUNCH=dry-run): the human said yes, and ${label} would open via ${plan.method} in ${candidate.cwd} with ${candidate.command}. Nothing was started.`, { via: consent.via, method: plan.method, cwd: candidate.cwd, command: candidate.command, launch });
+  }
+  if (!launch.launched) {
+    recordSessionReopen({ brainPath, sessionId: candidate.entry.id, outcome: plan.method === 'manual' ? 'manual' : 'failed', via: consent.via, method: plan.method || null, by: me });
+    const reason = plan.method === 'manual'
+      ? (plan.reason === 'no-display' ? 'there is no display to open a terminal on' : 'no terminal app was found')
+      : String(launch.reason || plan.reason || 'the terminal did not start');
+    return reply(plan.method === 'manual' ? 'manual' : 'failed', `The human said yes, but KLYPIX could not open a terminal here (${reason}). Give them this to run — ${manualLine}. The note stays queued until then.`, { via: consent.via, cwd: candidate.cwd, command: candidate.command, reason });
+  }
+  recordSessionReopen({ brainPath, sessionId: candidate.entry.id, outcome: 'reopened', via: consent.via, method: plan.method, by: me });
+  const notes = candidate.waitingNotes.length;
+  return reply('reopened', `🔓 Reopened ${label} — the human said yes${consent.via === 'dialog' ? ' in the KLYPIX dialog' : ''}. It opened in a new ${plan.method === 'windows-terminal' ? 'Windows Terminal window' : plan.method === 'macos-terminal' ? 'Terminal window' : 'terminal window'} in ${candidate.cwd} with ${candidate.command}${consent.start ? ', and starts on the note right away' : ', waiting for the human to prompt it'}. ${notes === 1 ? 'The waiting note is' : `The ${notes} waiting notes are`} delivered at its first action; your next prompt shows the receipt. If the window shows an error (for example the command is not found), the note stays queued — ${manualLine}.`, { via: consent.via, method: plan.method, cwd: candidate.cwd, command: candidate.command, start: Boolean(consent.start), notes });
 });
 
 server.registerTool('brain_sync', {

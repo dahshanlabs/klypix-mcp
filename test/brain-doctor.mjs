@@ -1279,7 +1279,8 @@ const supervisorReceipt = (brainDir, name, state) => writeJson(path.join(brainDi
   ok(names.includes('brain_lens'), 'brain_lens is a registered MCP tool');
   ok(names.includes('project_map_scan'), 'project_map_scan is a registered MCP tool');
   ok(names.includes('project_map_drift'), 'project_map_drift is a registered MCP tool');
-  ok(names.length === 22, `tool manifest is 22 verbs (got ${names.length})`);
+  ok(names.includes('brain_reopen'), 'brain_reopen is a registered MCP tool');
+  ok(names.length === 23, `tool manifest is 23 verbs (got ${names.length})`);
   // KLYPIX Remote was dropped from the product; its four verbs went with it.
   // Assert their ABSENCE so the removal cannot silently regress — a brain that
   // still advertises them promises a relay that can only fail.

@@ -171,6 +171,12 @@ const note = ({ home, from, to, now, text = 'payment step is done, in Payment.ts
     'A16 the question names the host, the session, its last intent and who left the note');
   ok(/Reopen it now in a new terminal/.test(q) && q.includes(project) && /starts on the note right away/.test(q) && /stays queued/.test(q),
     'A16 the question says where it opens, that it starts on the note, and what happens if it waits');
+  // each state carries its own verb: "was closed 2m ago" (1.91.0 read "is closed 2m ago"), "is not running (last seen …)"
+  const base = { hostLabel: 'Codex', entry: { id: codex, intent: '' }, waitingNotes: [{}], cwd: '' };
+  const closedQ = reopenQuestion({ ...base, endedAt: t0 }, { now: t0 + 2 * MIN });
+  const quietQ = reopenQuestion({ ...base, lastSeen: t0 }, { now: t0 + 2 * MIN });
+  ok(/ was closed 2m ago, and a note /.test(closedQ) && !/is closed/.test(closedQ), 'A17 a closed session reads "was closed 2m ago"');
+  ok(/ is not running \(last seen 2m ago\), and a note /.test(quietQ), 'A17 a quiet session reads "is not running (last seen 2m ago)"');
 }
 
 // ── B. buildReopenLaunch ──────────────────────────────────────────────────────

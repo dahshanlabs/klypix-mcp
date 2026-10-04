@@ -3153,10 +3153,13 @@ export function launchReopen(plan, {
     fs.writeFileSync(file, content, mode ? { mode } : undefined);
   },
 } = {}) {
-  if (!plan?.ok || plan.method === 'manual') return { launched: false, reason: plan?.reason || 'manual', manual: plan?.manual || null };
+  if (!plan?.ok) return { launched: false, reason: plan?.reason || 'no-plan', manual: plan?.manual || null };
+  // Dry run reports whatever WOULD happen — including "manual" on a machine
+  // with no display — so the same check passes on a desktop and in headless CI.
   if (String(env.KLYPIX_REOPEN_LAUNCH || '').toLowerCase() === 'dry-run') {
-    return { launched: false, dryRun: true, method: plan.method, file: plan.file, args: plan.args, script: plan.script ? plan.script.path : null };
+    return { launched: false, dryRun: true, method: plan.method, file: plan.file || null, args: plan.args || null, script: plan.script ? plan.script.path : null };
   }
+  if (plan.method === 'manual') return { launched: false, reason: plan.reason || 'manual', manual: plan.manual || null };
   try {
     if (plan.script) writeFile(plan.script.path, plan.script.content, plan.script.mode);
     const pid = spawnImpl(plan.file, plan.args, { env: plan.env, detached: plan.detached !== false });

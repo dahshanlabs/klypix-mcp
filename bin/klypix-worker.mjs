@@ -965,7 +965,8 @@ server.registerTool('brain_reopen', {
   const launch = launchReopen(plan);
   if (launch.dryRun) {
     recordSessionReopen({ brainPath, sessionId: candidate.entry.id, outcome: 'dry-run', via: consent.via, method: plan.method, by: me });
-    return reply('dry-run', `Dry run (KLYPIX_REOPEN_LAUNCH=dry-run): the human said yes, and ${label} would open via ${plan.method} in ${candidate.cwd} with ${candidate.command}. Nothing was started.`, { via: consent.via, method: plan.method, cwd: candidate.cwd, command: candidate.command, launch });
+    const would = plan.method === 'manual' ? 'would be handed to the human as a command (no terminal can be opened here)' : `would open via ${plan.method}`;
+    return reply('dry-run', `Dry run (KLYPIX_REOPEN_LAUNCH=dry-run): the human said yes, and ${label} ${would} in ${candidate.cwd} with ${candidate.command}. Nothing was started.`, { via: consent.via, method: plan.method, cwd: candidate.cwd, command: candidate.command, launch });
   }
   if (!launch.launched) {
     recordSessionReopen({ brainPath, sessionId: candidate.entry.id, outcome: plan.method === 'manual' ? 'manual' : 'failed', via: consent.via, method: plan.method || null, by: me });

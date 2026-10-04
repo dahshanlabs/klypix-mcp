@@ -368,7 +368,7 @@ const note = ({ home, from, to, now, text = 'payment step is done, in Payment.ts
   });
   await client.connect(transport);
   const result = await client.callTool({ name: 'brain_reopen', arguments: { session: codex, project } });
-  ok(asked.length === 1 && result.structuredContent?.status === 'dry-run' && /would open/.test(result.content[0].text),
+  ok(asked.length === 1 && result.structuredContent?.status === 'dry-run' && /would (open|be handed)/.test(result.content[0].text),
     'E8 through the supervisor: the worker\'s prompt reaches the host and the human\'s answer comes back');
   await client.close();
 }

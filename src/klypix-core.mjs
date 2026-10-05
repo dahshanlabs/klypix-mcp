@@ -47,6 +47,10 @@ import { findProjectBrain, neutralizeMarkers, postPresenceMessage, readReleaseLe
 import { collectRepoState, commitsInRange, makeContainmentProbe } from './repo-state.mjs';
 
 import { brainCaptureLockPath, vaultCreateLockPath, withAdvisoryWriteLock } from './brain-write-lock.mjs';
+// Plugin mode helpers (KLYPIX_PLUGIN=1). A namespace import: every bundle that
+// ships this engine ships mcp-auto-update.mjs beside it, and a missing export
+// (older copy mid-install) degrades to normal mode instead of failing to link.
+import * as autoUpdateLib from './mcp-auto-update.mjs';
 import {
   dot, embedTexts, getEmbedder, getEmbedderForUse, withRerankerForUse,
   rerankHits, semanticFallbackNotice, semanticMemorySnapshot,
@@ -456,9 +460,26 @@ export async function opSearchCanvases({ vault, query }) {
 export async function opSearchAllBrains({ vault, query, as_of, log = () => {} }) {
   const q = String(query || '').trim().toLowerCase();
   if (!q) return err('Provide a non-empty query.');
-  const reg = path.join(PB_DIR, 'registry.json');
+  // Plugin mode registers projects in its own machine-state folder
+  // (KLYPIX_PLUGIN_DATA); it reads that list AND the shared one other KLYPIX
+  // sessions on this machine maintain. Reads only.
+  const registries = [path.join(PB_DIR, 'registry.json')];
+  if (typeof autoUpdateLib.pluginDataDir === 'function' && autoUpdateLib.pluginDataDir()) {
+    registries.unshift(path.join(autoUpdateLib.pluginDataDir(), 'registry.json'));
+  }
   let brains = [];
-  try { brains = (JSON.parse(fs.readFileSync(reg, 'utf8')).brains || []).filter(b => b && b.path); } catch { /* no registry yet */ }
+  const seenBrains = new Set();
+  for (const reg of registries) {
+    let listed = [];
+    try { listed = (JSON.parse(fs.readFileSync(reg, 'utf8')).brains || []).filter(b => b && b.path); } catch { /* no registry yet */ }
+    for (const b of listed) {
+      const resolved = path.resolve(String(b.path));
+      const key = process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+      if (seenBrains.has(key)) continue;
+      seenBrains.add(key);
+      brains.push(b);
+    }
+  }
   if (!brains.length) return { blocks: [text('No brains registered yet — the brain hook registers each project as you work in it.')] };
   const terms = q.split(/[^\p{L}\p{N}#]+/u).filter(t => t.length >= 3);
   if (!terms.length) return err('Query too short — use words of 3+ characters.');
@@ -1889,13 +1910,18 @@ export async function opBrainNote({ vault, canvas, text: noteText, area, marker 
   // review, CONFIRMED). Cards ride the same capture batch, so they also pass
   // through the fulfillment cross-check. Queue is cleared only after the write.
   const projectDir = path.dirname(file);
+  // Plugin mode keeps that queue outside the project (pluginShipObsPaths).
+  const shipQueue = typeof autoUpdateLib.isPluginMode === 'function' && autoUpdateLib.isPluginMode()
+    && typeof autoUpdateLib.pluginShipObsPaths === 'function'
+    ? { paths: autoUpdateLib.pluginShipObsPaths(projectDir) }
+    : {};
   // The pending-ships drain reads a queue, folds it into THIS batch and clears it
   // only after the write — so it has to sit inside the lock too, or two concurrent
   // notes both drain the same queue and one batch of ship cards is lost with the
   // write that carried it.
   return withCanvasWriteLock(file, async () => {
   let pendingShips = [];
-  try { pendingShips = readPendingShips(projectDir); } catch { pendingShips = []; }
+  try { pendingShips = readPendingShips(projectDir, shipQueue); } catch { pendingShips = []; }
   if (pendingShips.length) {
     for (const c of pendingShipCards(pendingShips, {})) {
       input.cards.push({ text: `${c.area}: 🏁 ${c.summary}\n#${String(c.area).toLowerCase()} #auto`, area: c.area, createdVia: 'ship-observed', borderColor: 'rgba(59,130,246,0.8)' });
@@ -1905,7 +1931,7 @@ export async function opBrainNote({ vault, canvas, text: noteText, area, marker 
     const res = await captureIntoBrain(fs.readFileSync(file), input);
     let out = res.buffer; try { out = (await tidyBrain(res.buffer)).buffer; } catch { /* keep append result if tidy fails */ }
     await atomicWrite(file, out);
-    if (pendingShips.length) clearPendingShips(projectDir);   // durable now — safe to consume
+    if (pendingShips.length) clearPendingShips(projectDir, shipQueue);   // durable now — safe to consume
     // Question enrichment (1.77): the caller session's declared intent is the
     // natural-language question that produced this card — recorded to the
     // retrieval sidecar so brain_ask finds the card in the asker's vocabulary.

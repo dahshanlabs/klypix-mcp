@@ -44,6 +44,23 @@ import {
 import * as autoUpdateModule from './mcp-auto-update.mjs';
 import { formatReceivedMessages, peekMessages, removeSession, upsertSession } from './agent-presence.mjs';
 
+// Plugin mode (KLYPIX_PLUGIN=1; see mcp-auto-update.mjs). Read through the
+// namespace with a local fallback, for the same mid-install reason as above.
+const pluginModeOn = () => (typeof autoUpdateModule.isPluginMode === 'function'
+  ? autoUpdateModule.isPluginMode()
+  : String(process.env.KLYPIX_PLUGIN ?? '').trim() === '1');
+const pluginStateDir = () => (typeof autoUpdateModule.machineStateDir === 'function'
+  ? autoUpdateModule.machineStateDir()
+  : path.join(os.homedir(), '.claude', 'project-brain'));
+// In plugin mode the managed runtime is never read: every read is "absent", so
+// boot, wake and recovery all resolve to the package's own worker, and nothing
+// outside the package is ever adopted or hot-swapped to.
+const PLUGIN_RUNTIME_WATCH = Object.freeze({
+  read: () => ({ ok: false, absent: true, error: 'plugin mode: the managed runtime is not used' }),
+  statKey: () => null,
+  lastReadKey: () => null,
+});
+
 const INTERNAL_PREFIX = '__klypix_supervisor__';
 const DEFAULT_POLL_MS = 1000;
 const DEFAULT_TIMEOUT_MS = 15000;
@@ -488,11 +505,16 @@ class Supervisor {
       source: 'package',
       dev: false,
     };
-    this.runtimeManifest = path.resolve(
-      options.runtimeManifest
-      || process.env.KLYPIX_MCP_RUNTIME_MANIFEST
-      || path.join(os.homedir(), '.claude', 'project-brain', '.mcp-runtime.json'),
-    );
+    // Plugin mode: the package's own worker only. The manifest path is kept
+    // (receipts and the stateDir default derive from its folder) but it is
+    // never read — runtimeWatch below is PLUGIN_RUNTIME_WATCH — and it points
+    // into the plugin's data folder when KLYPIX_PLUGIN_DATA is set.
+    this.pluginMode = pluginModeOn();
+    this.runtimeManifest = path.resolve(this.pluginMode
+      ? path.join(pluginStateDir(), '.mcp-runtime.json')
+      : (options.runtimeManifest
+        || process.env.KLYPIX_MCP_RUNTIME_MANIFEST
+        || path.join(os.homedir(), '.claude', 'project-brain', '.mcp-runtime.json')));
     this.allowExternal = options.allowExternal === true || process.env.KLYPIX_MCP_ALLOW_EXTERNAL_WORKER === '1';
     this.pollMs = Number(options.pollMs || process.env.KLYPIX_MCP_SUPERVISOR_POLL_MS || DEFAULT_POLL_MS);
     this.timeoutMs = Number(options.timeoutMs || process.env.KLYPIX_MCP_SUPERVISOR_TIMEOUT_MS || DEFAULT_TIMEOUT_MS);
@@ -597,7 +619,9 @@ class Supervisor {
     this.wakeDeferral = null;
     const hintEnv = Number(process.env.KLYPIX_MCP_WAKE_REINSTALL_HINT_MS);
     this.wakeReinstallHintMs = Number.isFinite(hintEnv) && hintEnv >= 0 ? hintEnv : DEFAULT_WAKE_REINSTALL_HINT_MS;
-    this.runtimeWatch = createRuntimeWatch(this.runtimeManifest, { allowExternal: this.allowExternal });
+    this.runtimeWatch = this.pluginMode
+      ? PLUGIN_RUNTIME_WATCH
+      : createRuntimeWatch(this.runtimeManifest, { allowExternal: this.allowExternal });
     // K3 (2026-10-03): when this supervisor last polled the update schedule.
     // The overdue rule (autoUpdateOverdue) needs proof that a session was there
     // to run a due check; being open since before it fell due is not that proof
@@ -656,6 +680,8 @@ class Supervisor {
           backpressuredAt: this.hostBackpressuredAt,
         },
         clientInfo: this.clientInfo,
+        // Additive: a plugin-mode pair runs only its package's worker, never updates.
+        pluginMode: this.pluginMode,
         status: this.status,
         hotReloads: this.hotReloads,
         lastSwapAt: this.lastSwapAt,
@@ -823,6 +849,7 @@ class Supervisor {
   // list still describes. Any other version would be a swap no gate has seen;
   // crash recovery used to boot whatever .prev held.
   previousBaselineTarget(anchor) {
+    if (this.pluginMode) return null;   // plugin mode: the package's own worker only
     if (!anchor?.path || anchor.source === 'rollback') return null;
     const previous = prevSnapshotTarget(anchor.path);
     const baseVersion = this.baselineVersion();
@@ -834,6 +861,7 @@ class Supervisor {
   // still verifies and still holds this connection's version. An install
   // rewrites .prev, and a pre-fix installer could rewrite it with a mixed set.
   resumableRollback(anchor) {
+    if (this.pluginMode) return null;
     const snapshot = anchor?.path ? prevSnapshotAt(path.dirname(anchor.path)) : null;
     const baseVersion = this.baselineVersion();
     if (!snapshot || !baseVersion || snapshot.version !== String(baseVersion)) return null;
@@ -861,6 +889,9 @@ class Supervisor {
   // itself — and nothing vouches for that file without a verifying manifest.
   packageWorker() {
     const file = this.fallbackTarget.path;
+    // Plugin mode has no managed runtime to defer to: the package's worker is
+    // the only worker, wherever the package lives.
+    if (this.pluginMode) return fs.existsSync(file) ? this.currentFallbackTarget() : null;
     if (within(path.dirname(this.runtimeManifest), file) || !fs.existsSync(file)) return null;
     return this.currentFallbackTarget();
   }
@@ -1116,6 +1147,7 @@ class Supervisor {
   // keeps its worker outside the managed directory, which no install touches: it
   // boots at once. The host's first requests queue meanwhile (run()).
   async selectInitialTarget() {
+    if (this.pluginMode) return this.fallbackTarget;   // never ~/.claude/project-brain code
     let runtime = this.runtimeWatch.read({ force: true });
     if (!runtime.ok && !runtime.absent && within(path.dirname(this.runtimeManifest), this.fallbackTarget.path)) {
       log(`runtime fails integrity at start (${runtime.error}) — waiting up to ${WAKE_INTEGRITY_WAIT_MS} ms for an install to settle`);
@@ -1831,6 +1863,7 @@ class Supervisor {
   }
 
   async checkForUpdate() {
+    if (this.pluginMode) return;   // plugin mode never hot-swaps
     if (this.closed || this.checking) return;
     if (this.recoveryTimer) return;   // a recovery backoff owns the next attempt — the poller must not preempt it
     this.checking = true;
@@ -1989,18 +2022,24 @@ class Supervisor {
     this.writeState();
     this.flushHostQueue();
 
-    this.poller = setInterval(() => this.checkForUpdate(), Math.max(50, this.pollMs));
-    this.poller.unref?.();
-    this.autoUpdateStarter = setTimeout(
-      () => this.scheduleAutoUpdate(),
-      Math.max(0, this.autoUpdateStartDelayMs),
-    );
-    this.autoUpdateStarter.unref?.();
-    this.autoUpdatePoller = setInterval(
-      () => this.scheduleAutoUpdate(),
-      Math.max(60000, this.autoUpdatePollMs),
-    );
-    this.autoUpdatePoller.unref?.();
+    // Plugin mode: no manifest poller (nothing outside the package is adopted)
+    // and no update scheduler (autoUpdate is false there, whatever the env says).
+    if (!this.pluginMode) {
+      this.poller = setInterval(() => this.checkForUpdate(), Math.max(50, this.pollMs));
+      this.poller.unref?.();
+    }
+    if (this.autoUpdate) {
+      this.autoUpdateStarter = setTimeout(
+        () => this.scheduleAutoUpdate(),
+        Math.max(0, this.autoUpdateStartDelayMs),
+      );
+      this.autoUpdateStarter.unref?.();
+      this.autoUpdatePoller = setInterval(
+        () => this.scheduleAutoUpdate(),
+        Math.max(60000, this.autoUpdatePollMs),
+      );
+      this.autoUpdatePoller.unref?.();
+    }
 
     if (this.hibernateIdleMs) {
       this.hibernationTimer = setInterval(() => { this.maybeHibernate().catch(() => {}); }, Math.max(1_000, Math.min(60_000, this.hibernateIdleMs)));
@@ -2060,6 +2099,12 @@ class Supervisor {
 }
 
 export async function runMcpSupervisor(options) {
+  // A launcher that did not substitute ${...} (an older Claude Code) passes the
+  // literal through; such a value is never a path. Dropped here, before the
+  // worker inherits this environment.
+  if (typeof autoUpdateModule.scrubUnexpandedEnv === 'function') {
+    for (const key of autoUpdateModule.scrubUnexpandedEnv(process.env)) log(`ignoring ${key}: it still holds an unsubstituted \${...} placeholder`);
+  }
   const supervisor = new Supervisor(options);
   await supervisor.run();
 }

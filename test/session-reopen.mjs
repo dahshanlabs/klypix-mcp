@@ -270,6 +270,14 @@ const note = ({ home, from, to, now, text = 'payment step is done, in Payment.ts
     'D5 no display, no dialog');
   ok(await nativeReopenDialog({ message: 'x', platform: 'win32', env: {}, find: () => null, spawnImpl: () => { throw new Error('spawn failed'); } }) === 'unavailable',
     'D6 a dialog that cannot start is "unavailable", never a throw');
+  // D7: the Windows dialog runs an inline -Command, which no execution policy
+  // governs, so it never asks PowerShell to bypass one.
+  let winArgv = null;
+  await nativeReopenDialog({ message: 'x', platform: 'win32', env: {}, find: () => null,
+    spawnImpl: (file, args) => { winArgv = args; return fakeSpawn('7', 0)(); } });
+  ok(Array.isArray(winArgv) && !winArgv.some((a) => /executionpolicy|bypass/i.test(String(a)))
+    && winArgv[0] === '-NoProfile' && winArgv[1] === '-NonInteractive' && winArgv[2] === '-Command',
+  `D7 Windows dialog argv: -NoProfile -NonInteractive -Command, no -ExecutionPolicy Bypass (got ${JSON.stringify((winArgv || []).slice(0, 3))})`);
 }
 
 // ── E. Over a real MCP connection ─────────────────────────────────────────────

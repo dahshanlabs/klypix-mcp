@@ -63,10 +63,29 @@ import * as brainFormat from '../src/klypix-format.mjs';
 // Real package version for the MCP handshake (was hardcoded '1.0.0', which
 // misled every client/version diagnosis — it could never reflect the true release).
 const PKG_VERSION = (() => { try { return createRequire(import.meta.url)('../package.json').version; } catch { return '0.0.0'; } })();
-const RUNTIME_BRAIN_DIR = path.dirname(
-  process.env.KLYPIX_MCP_RUNTIME_MANIFEST
-  || path.join(os.homedir(), '.claude', 'project-brain', '.mcp-runtime.json'),
-);
+// Plugin mode (KLYPIX_PLUGIN=1 — the Claude plugin's launch; see the README
+// section "Running as a Claude plugin" and mcp-auto-update.mjs). Read through
+// the namespace with a local fallback, so a worker meeting an older
+// mcp-auto-update.mjs mid-install still links.
+const PLUGIN_MODE = typeof autoUpdateModule.isPluginMode === 'function'
+  ? autoUpdateModule.isPluginMode()
+  : String(process.env.KLYPIX_PLUGIN ?? '').trim() === '1';
+// An unsubstituted ${...} (older Claude Code) is never a path: treat it as unset.
+const UNEXPANDED_ENV = typeof autoUpdateModule.scrubUnexpandedEnv === 'function'
+  ? autoUpdateModule.scrubUnexpandedEnv(process.env)
+  : [];
+// Process-private machine state (project registry, running-server heartbeat):
+// the plugin's data folder in plugin mode when KLYPIX_PLUGIN_DATA is set,
+// otherwise ~/.claude/project-brain as always. Nothing in it is read as code.
+const MACHINE_STATE_DIR = PLUGIN_MODE && typeof autoUpdateModule.machineStateDir === 'function'
+  ? autoUpdateModule.machineStateDir()
+  : path.join(os.homedir(), '.claude', 'project-brain');
+const RUNTIME_BRAIN_DIR = PLUGIN_MODE
+  ? MACHINE_STATE_DIR
+  : path.dirname(
+    process.env.KLYPIX_MCP_RUNTIME_MANIFEST
+    || path.join(os.homedir(), '.claude', 'project-brain', '.mcp-runtime.json'),
+  );
 
 // IMPORTANT: stdout is the JSON-RPC channel. Never console.log — only stderr.
 const log = (...a) => console.error('[klypix-mcp]', ...a);
@@ -208,6 +227,12 @@ if (process.argv[2] === 'init') {
     ],
   });
   fs.writeFileSync(target, buf);
+  if (PLUGIN_MODE) {
+    // The Claude plugin already connects this server: an extra .mcp.json entry
+    // would start a second, unpinned copy beside it.
+    console.error(`✓ Created ${target}\n\nKLYPIX is connected through the Claude plugin — no MCP config entry is needed.\nAsk your agent to read the canvas "brain" — it now has a project memory.`);
+    process.exit(0);
+  }
   const cfg = JSON.stringify({ mcpServers: { 'klypix-canvas': mcpServerEntry({ vault: process.cwd().replace(/\\/g, '/') }) } }, null, 2);
   console.error(`✓ Created ${target}\n\nAdd this to your MCP client config (.mcp.json / claude_desktop_config.json):\n\n${cfg}\n\nThen ask your agent to read the canvas "brain" — it now has a project memory.`);
   process.exit(0);
@@ -215,6 +240,8 @@ if (process.argv[2] === 'init') {
 
 const vaultArgIdx = process.argv.indexOf('--vault');
 const VAULT = resolveVault(vaultArgIdx >= 0 ? process.argv[vaultArgIdx + 1] : undefined);
+for (const key of UNEXPANDED_ENV) log(`ignoring ${key}: it still holds an unsubstituted \${...} placeholder`);
+if (PLUGIN_MODE) log(`plugin mode · package worker only · auto-update off · no project config writes · state=${MACHINE_STATE_DIR}`);
 // A silent ~/Documents fallback is how idle default-root pairs hide inside the
 // machine's RAM total. Say it loudly; brain_sync {project} re-routes per call.
 if (vaultArgIdx < 0 && !process.env.KLYPIX_VAULT) {
@@ -1063,6 +1090,9 @@ server.registerTool('brain_sync', {
         text: 'KLYPIX project routing changed after coordination. Harness, ship observation, and context retrieval were stopped; retry brain_sync.',
       }, { phase, totalStartedAt });
     }
+    // Plugin mode keeps the registration (search_all_brains reads it to find
+    // this project's brain later) but in its machine-state folder: a local list
+    // of brain paths, never a project file.
     registration = registerProjectBrain({
       brainPath: report.structured.brain,
       brainDir: RUNTIME_BRAIN_DIR,
@@ -1075,7 +1105,10 @@ server.registerTool('brain_sync', {
         text: 'KLYPIX project routing changed during project registration. Later sync side effects were stopped; retry brain_sync.',
       }, { phase, totalStartedAt });
     }
-    harness = await reconcileRegisteredProjects({
+    // Plugin mode NEVER creates or rewrites project files: no rules files, no
+    // editor MCP configs, no AGENTS.md brief block. The harness pass is the
+    // only brain_sync path that writes them, so in plugin mode it does not run.
+    harness = PLUGIN_MODE ? null : await reconcileRegisteredProjects({
       brainDir: RUNTIME_BRAIN_DIR,
       version: PKG_VERSION,
       brainPaths: [report.structured.brain],
@@ -1100,10 +1133,16 @@ server.registerTool('brain_sync', {
       const dir = report.structured?.project || mcpPresence.vault;
       if (typeof brainFormat.observeShipDrift === 'function' && dir) {
         const { execFileSync } = await import('child_process');
+        // Plugin mode keeps the observation baseline out of the project
+        // (normal mode: <project>/.claude/brain-ship-obs.json + its queue).
+        const paths = PLUGIN_MODE && typeof autoUpdateModule.pluginShipObsPaths === 'function'
+          ? autoUpdateModule.pluginShipObsPaths(dir)
+          : undefined;
         shipNotice = brainFormat.observeShipDrift(dir, {
           gitRun: (args) => execFileSync('git', String(args).split(/\s+/).filter(Boolean), {
             cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 4000,
           }),
+          ...(paths ? { paths } : {}),
         }).notice || '';
       }
     } catch { /* observation is best-effort — never fail a sync */ }
@@ -1332,11 +1371,30 @@ server.registerTool('brain_doctor', {
     // layers, the auto-update schedule and each connection's state, without
     // parsing rendered lines. A brain-doctor.mjs that predates the projection
     // (an install that stopped half-way) leaves it out; the text still answers.
+    // Plugin mode: the doctor still inspects this machine, but the machine
+    // install, hooks and editor configs it audits are optional extras of the
+    // npm CLI, not part of the plugin. Install/link remediations would write
+    // Claude settings and project files, so they are withheld here and the
+    // reader is told why — the user can still run them by hand.
+    let pluginNote = '';
+    if (PLUGIN_MODE) {
+      const installAction = /klypix-mcp(@\S+)?\s+(install|link|git-hook\s+install|git-driver\s+install)\b/;
+      const withheld = (report.actions || []).filter((a) => installAction.test(String(a)));
+      report.actions = (report.actions || []).filter((a) => !installAction.test(String(a)));
+      pluginNote = 'PLUGIN MODE — this server runs from the Claude plugin\'s pinned klypix-mcp package: automatic updates are off, '
+        + 'it never adopts code from ~/.claude/project-brain, and it writes no rules files, editor MCP configs or AGENTS.md. '
+        + 'The machine install, hooks and editor configs reported below are optional extras of the npm CLI, not needed by the plugin'
+        + (withheld.length ? `; ${withheld.length} install/link action(s) were left out — installing them is the user's choice, do not run them on the user's behalf.` : '.')
+        + '\n\n';
+    }
     let structuredContent = null;
     try { if (typeof structuredReport === 'function') structuredContent = structuredReport(report); }
     catch { structuredContent = null; }
+    if (PLUGIN_MODE && structuredContent && typeof structuredContent === 'object') {
+      structuredContent.pluginMode = { enabled: true, autoUpdate: false, projectConfigWrites: false, stateDir: MACHINE_STATE_DIR };
+    }
     return {
-      content: [{ type: 'text', text: render(report, { color: false }) }],
+      content: [{ type: 'text', text: pluginNote + render(report, { color: false }) }],
       ...(structuredContent ? { structuredContent } : {}),
     };
   } catch (e) {
@@ -1358,7 +1416,8 @@ server.registerTool('brain_doctor', {
 const RUNNING_HEARTBEAT_FRESH_MS = 2 * 60 * 1000;
 const RUNNING_LEGACY_GRACE_MS = 5 * 60 * 1000;
 function recordRunningServer({ remove = false } = {}) {
-  const brainDir = path.join(os.homedir(), '.claude', 'project-brain');
+  // Plugin mode with KLYPIX_PLUGIN_DATA: the plugin's own folder.
+  const brainDir = MACHINE_STATE_DIR;
   const REG = path.join(brainDir, '.running-servers.json');
   const LOCK = REG + '.lock';
   const LOCK_STALE_MS = 5000;   // a heartbeat critical section is ms; steal a lock older than this
@@ -1535,14 +1594,18 @@ server.server.oninitialized = () => {
   // older stable supervisor acquire the updater immediately after hot-swapping
   // to a compatible new worker; no extra host reconnect is needed for the
   // scheduler itself. Stamp + lock make the duplicate trigger effectively free.
-  const checkForCoreUpdate = () => spawnAutoUpdateHelper({
-    brainDir: RUNTIME_BRAIN_DIR,
-    currentVersion: PKG_VERSION,
-  });
-  autoUpdateStarter = setTimeout(checkForCoreUpdate, 2000);
-  autoUpdateStarter.unref?.();
-  autoUpdatePoller = setInterval(checkForCoreUpdate, Math.max(60_000, Number(autoUpdateModule.AUTO_UPDATE_POLL_MS) || 60 * 60 * 1000));
-  autoUpdatePoller.unref?.();
+  // Plugin mode: no update scheduler at all (spawnAutoUpdateHelper would refuse
+  // anyway — autoUpdateEnabled() is false there — but no timer is armed).
+  if (!PLUGIN_MODE) {
+    const checkForCoreUpdate = () => spawnAutoUpdateHelper({
+      brainDir: RUNTIME_BRAIN_DIR,
+      currentVersion: PKG_VERSION,
+    });
+    autoUpdateStarter = setTimeout(checkForCoreUpdate, 2000);
+    autoUpdateStarter.unref?.();
+    autoUpdatePoller = setInterval(checkForCoreUpdate, Math.max(60_000, Number(autoUpdateModule.AUTO_UPDATE_POLL_MS) || 60 * 60 * 1000));
+    autoUpdatePoller.unref?.();
+  }
   log(`ready · vault=${VAULT} · presence=mcp`);
 };
 server.server.onclose = stopRuntimePresence;

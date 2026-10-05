@@ -10,6 +10,16 @@ import path from 'path';
 import crypto from 'crypto';
 import { enrichmentTextFor, readEnrichment } from './enrichment.mjs';
 import { createRequire } from 'module';
+import * as autoUpdateLib from './mcp-auto-update.mjs';
+
+// Plugin mode (KLYPIX_PLUGIN=1) never loads the on-device semantic runtime:
+// not the package's own optional copy, and not ~/.claude/project-brain/semantic
+// (code from outside the pinned package), so no model is ever downloaded.
+// Retrieval is keyword-only there. Evaluated per call, not at import.
+const semanticDisabledByPlugin = () => (typeof autoUpdateLib.isPluginMode === 'function'
+  ? autoUpdateLib.isPluginMode()
+  : String(process.env.KLYPIX_PLUGIN ?? '').trim() === '1');
+const PLUGIN_SEMANTIC_ERROR = 'semantic retrieval is off in plugin mode (keyword retrieval only)';
 
 const PB_DIR = path.join(os.homedir(), '.claude', 'project-brain');
 const EMB_DIR = path.join(PB_DIR, 'embeddings');
@@ -106,7 +116,7 @@ export function semanticMemorySnapshot() {
 }
 
 export const semanticMemoryMode = () => MODE;
-export const shouldPrewarmSemantic = () => MODE === 'legacy' || process.env.KLYPIX_SEMANTIC_PREWARM === '1';
+export const shouldPrewarmSemantic = () => !semanticDisabledByPlugin() && (MODE === 'legacy' || process.env.KLYPIX_SEMANTIC_PREWARM === '1');
 
 const clearSemanticIdleTimer = () => {
   if (!semanticIdleTimer) return;
@@ -282,6 +292,7 @@ function ambientTransformersEntryIfSafe() {
 }
 
 async function loadTransformers() {
+  if (semanticDisabledByPlugin()) throw new Error(PLUGIN_SEMANTIC_ERROR);
   if (ambientTransformersEntryIfSafe()) {
     try { return await import('@huggingface/transformers'); } catch { /* try owned runtime */ }
   }
@@ -313,6 +324,7 @@ async function loadTransformers() {
 // in step.
 let runtimeInstalledCache = null;
 export function semanticRuntimeInstalled() {
+  if (semanticDisabledByPlugin()) return false;
   if (runtimeInstalledCache !== null) return runtimeInstalledCache;
   let found = false;
   try {
@@ -335,6 +347,7 @@ export function semanticRuntimeInstalled() {
 // unconditionally.
 export function semanticFallbackNotice(hadSemantic) {
   if (hadSemantic) return null;
+  if (semanticDisabledByPlugin()) return `lexical only — ${PLUGIN_SEMANTIC_ERROR}: the Claude plugin runs only its pinned package and downloads no models`;
   if (semanticRuntimeInstalled()) {
     return 'lexical only — the on-device semantic model is still warming or the queue is saturated; retry shortly for semantic ranking';
   }
@@ -348,6 +361,7 @@ export function semanticFallbackNotice(hadSemantic) {
 }
 
 export function getEmbedder(log = () => {}) {
+  if (semanticDisabledByPlugin()) return Promise.resolve(null);
   if (!embedderPromise) {
     embedderPromise = (async () => {
       const t = await loadTransformers();
@@ -365,6 +379,7 @@ export function getEmbedder(log = () => {}) {
 }
 
 export function getReranker(log = () => {}) {
+  if (semanticDisabledByPlugin()) return Promise.resolve(null);
   if (!rerankerPromise) {
     rerankerPromise = (async () => {
       const t = await loadTransformers();

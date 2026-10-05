@@ -15,7 +15,7 @@
 
 import fs from 'fs';
 import path from 'path';
-import { parseKlypix, structToMarkdown } from '../src/klypix-format.mjs';
+import { parseKlypix, structToMarkdown, scopeLockedView } from '../src/klypix-format.mjs';
 
 const args = process.argv.slice(2);
 const file = args.find(a => !a.startsWith('--'));
@@ -31,20 +31,29 @@ try {
     console.error(e.message);
     process.exit(1);
 }
-const { struct, zip, assetPaths } = parsed;
+const { zip, assetPaths } = parsed;
+// This is the read path agents without MCP use (Aider), so it shows them what
+// read_canvas shows: cards inside a box a person locked from AI tools in KLYPIX
+// are left out (and counted), and each card's id, saved reading and state ride
+// along.
+const view = scopeLockedView(parsed);
+const struct = view.struct;
 // Fall back to the filename for the title when the file didn't store one.
 if (!struct.title || struct.title === 'Untitled') {
     struct.title = path.basename(file).replace(/\.(klypix|any)$/i, '');
 }
 
-// Optionally extract binary assets so the agent can open images with vision.
+// Optionally extract binary assets so the agent can open images with vision —
+// never an asset only a hidden (scope-locked) card uses.
 if (assetsDir && assetPaths.length) {
     fs.mkdirSync(assetsDir, { recursive: true });
+    const visibleAssets = new Set(struct.assets);
     for (const p of assetPaths) {
+        if (!visibleAssets.has(path.basename(p))) continue;
         const bytes = await zip.file(p).async('nodebuffer');
         fs.writeFileSync(path.join(assetsDir, path.basename(p)), bytes);
     }
 }
 
 if (asJson) { console.log(JSON.stringify(struct, null, 2)); process.exit(0); }
-console.log(structToMarkdown(struct, { assetsDir }));
+console.log(structToMarkdown(struct, { assetsDir, parsed, lockedBoxes: view.boxes }));

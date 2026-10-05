@@ -265,7 +265,9 @@ function schemaAcceptsPrevious(oldSchema = {}, nextSchema = {}) {
   return sameJson(omitShape(oldClean), omitShape(nextClean));
 }
 
-function toolCompatibility(oldTools = [], nextTools = []) {
+// Exported for test/tool-schema-freeze.mjs: the release gate that no existing
+// tool's input schema changes in a way this check would refuse at hot-swap.
+export function toolCompatibility(oldTools = [], nextTools = []) {
   const oldMap = new Map(oldTools.map(tool => [tool.name, tool]));
   const nextMap = new Map(nextTools.map(tool => [tool.name, tool]));
   const removed = [];

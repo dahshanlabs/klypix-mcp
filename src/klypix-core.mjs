@@ -43,6 +43,7 @@ import {
 import {
   leaseVerdict, readEndpoint, pathHash, canvasWriteLockPath, tellUser, LEASE_SINCE_APP_VERSION,
 } from './app-lease.mjs';
+import { LIMITS, assetBytes, dataUrlImage, fitImage, imageSkipReason, locateAsset, mb } from './card-files.mjs';
 import { findProjectBrain, neutralizeMarkers, postPresenceMessage, readReleaseLease } from './agent-presence.mjs';
 import { collectRepoState, commitsInRange, makeContainmentProbe } from './repo-state.mjs';
 
@@ -93,7 +94,6 @@ export const IS_CANVAS = /\.(klypix|any)$/i;
 const SKIP_DIRS = new Set(['node_modules', '.git', '.cache', 'AppData', '$Recycle.Bin', 'Windows']);
 const MAX_FILES = 400;
 const IMG_RE = /\.(png|jpe?g|gif|webp|bmp)$/i;
-const IMG_MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp' };
 
 // Resolve the vault folder the same way every face does: explicit > env > ~/Documents.
 export function resolveVault(explicit) {
@@ -285,69 +285,59 @@ function notFoundResult(ref, vault, ambiguous = null) {
 
 const ymdOf = (ms) => (Number(ms) > 0 ? new Date(Number(ms)).toISOString().slice(0, 10) : null);
 
-// Sniff an image's type from its first bytes (an asset id need not carry an
-// extension). null = not a type a vision model reads.
-function imageMime(assetPath, b64) {
-  const ext = String(assetPath || '').split('.').pop().toLowerCase();
-  if (IMG_MIME[ext]) return IMG_MIME[ext];
-  const head = String(b64 || '').slice(0, 8);
-  if (head.startsWith('iVBOR')) return 'image/png';
-  if (head.startsWith('/9j/')) return 'image/jpeg';
-  if (head.startsWith('R0lG')) return 'image/gif';
-  if (head.startsWith('UklGR')) return 'image/webp';
-  if (head.startsWith('Qk')) return 'image/bmp';
-  return null;
-}
-
 /**
- * The images of a canvas's photo cards, IN CARD ORDER, each tied to its card.
- * The original is preferred; its thumbnail stands in only when the original is
- * missing or too large to attach (~5 MB). Scope-locked cards never appear
- * (callers pass the visible cards). Capped by count.
+ * The images of a canvas's photo cards, IN CARD ORDER, each tied to its card,
+ * sized for what AI apps accept in ONE tool result (src/card-files.mjs):
+ *   • the original when it fits its share of `budget` (base64 characters);
+ *   • otherwise a smaller copy of a JPEG (the app never saves a smaller copy of
+ *     a photo in the file — its thumbnail is rebuilt on open);
+ *   • otherwise not attached, with the plain reason, so the caller can point the
+ *     AI at read_card_contents (which also hands over the original's path).
+ * Scope-locked cards never appear (callers pass the visible cards).
+ * → { attached: [{ cardId, name, data, mime, path, bytes, downscaled, width?, height? }],
+ *     notAttached: [{ cardId, name, reason, bytes? }] }
  */
-export async function cardImages(parsed, visibleCards, { max = 8, onlyIds = null } = {}) {
-  const out = [];
+export async function canvasImages(parsed, visibleCards, { max = 4, budget = LIMITS.imageResultBudget, onlyIds = null } = {}) {
   const items = parsed?.items || {};
+  const wanted = [];
   for (const c of visibleCards || []) {
-    if (out.length >= max) break;
     if (onlyIds && !onlyIds.has(c.id)) continue;
     const it = items[c.id];
     if (!it) continue;
-    const imageFile = it.type === 'file' && IMG_RE.test(`.${String(it.extension || '').toLowerCase()}`);
+    const imageFile = it.type === 'file' && !it.isFolder && IMG_RE.test(`.${String(it.extension || '').toLowerCase()}`);
     if (it.type !== 'image' && !imageFile) continue;
-    // assets/<assetId> is where every current KLYPIX build stores a card's bytes;
-    // a nested layout (assets/images/<shard>/<id>.<ext>) is matched by name too.
-    const located = (id) => {
-      if (!id) return null;
-      const direct = `assets/${id}`;
-      if (parsed.zip.file(direct)) return direct;
-      return (parsed.assetPaths || []).find(p => p.endsWith(`/${id}`) || path.basename(p).split('.')[0] === String(id).split('.')[0]) || null;
-    };
-    const candidates = [
-      located(it.assetId) ? { p: located(it.assetId), thumbnail: false } : null,
-      located(it.thumbnailAssetId) ? { p: located(it.thumbnailAssetId), thumbnail: true } : null,
-    ].filter(Boolean);
-    let done = false;
-    for (const cand of candidates) {
-      try {
-        const entry = parsed.zip.file(cand.p);
-        if (!entry) continue;
-        const b64 = await entry.async('base64');
-        if (!b64 || b64.length > 7_000_000) continue; // skip > ~5MB
-        const mime = imageMime(cand.p, b64);
-        if (!mime) continue;
-        out.push({ cardId: c.id, name: c.title || it.fileName || 'image', data: b64, mime, path: cand.p, thumbnail: cand.thumbnail });
-        done = true;
-        break;
-      } catch { /* unreadable asset: try the next candidate */ }
-    }
-    // Legacy image cards carried a data URL instead of an asset.
-    if (!done && typeof it.src === 'string' && it.src.startsWith('data:image/')) {
-      const m = /^data:(image\/[a-z+.-]+);base64,(.+)$/i.exec(it.src);
-      if (m && m[2].length <= 7_000_000) out.push({ cardId: c.id, name: c.title || it.fileName || 'image', data: m[2], mime: m[1], path: `${c.id}.inline`, thumbnail: false });
-    }
+    wanted.push({ c, it });
   }
-  return out;
+  const attached = [];
+  const notAttached = [];
+  let remaining = Math.max(0, budget);
+  for (let i = 0; i < wanted.length; i++) {
+    const { c, it } = wanted[i];
+    const name = c.title || it.fileName || 'image';
+    if (attached.length >= max) { notAttached.push({ cardId: c.id, name, reason: 'count' }); continue; }
+    let buf = null;
+    let where = null;
+    const got = it.assetId ? await assetBytes(parsed, it.assetId) : { missing: true };
+    if (got.buf) { buf = got.buf; where = locateAsset(parsed, it.assetId); }
+    else if (typeof it.src === 'string' && it.src.startsWith('data:image/')) { buf = dataUrlImage(it.src); where = `${c.id}.inline`; }
+    if (!buf) {
+      notAttached.push({ cardId: c.id, name, reason: got.tooLarge ? 'too-large' : it.phoneAsset ? 'phone' : 'missing', ...(got.size ? { bytes: got.size } : {}) });
+      continue;
+    }
+    const share = Math.floor(remaining / Math.max(1, Math.min(wanted.length - i, max - attached.length)));
+    if (share < LIMITS.minImageB64) { notAttached.push({ cardId: c.id, name, reason: 'budget', bytes: buf.length }); continue; }
+    const fit = await fitImage(buf, share);
+    if (!fit.ok) { notAttached.push({ cardId: c.id, name, reason: fit.reason, mime: fit.mime, bytes: buf.length }); continue; }
+    remaining -= fit.data.length;
+    attached.push({ cardId: c.id, name, data: fit.data, mime: fit.mime, path: where, bytes: buf.length, downscaled: fit.downscaled, ...(fit.downscaled ? { width: fit.width, height: fit.height } : {}) });
+  }
+  return { attached, notAttached };
+}
+
+/** Back-compatible shape: just the attached images (thumbnail is always false now). */
+export async function cardImages(parsed, visibleCards, { max = 8, onlyIds = null, budget } = {}) {
+  const { attached } = await canvasImages(parsed, visibleCards, { max, onlyIds, ...(budget != null ? { budget } : {}) });
+  return attached.map(a => ({ ...a, thumbnail: false }));
 }
 
 export async function opListCanvases({ vault }) {
@@ -386,15 +376,25 @@ export async function opReadCanvas({ vault, canvas }) {
     // printed, not searched, and their images are not attached.
     const view = scopeLockedView(parsed);
     const blocks = [text(structToMarkdown(view.struct, { parsed, lockedBoxes: view.boxes, mcp: true }))];
-    // Return image assets as actual image blocks so a vision-capable model SEES
-    // them — the whole point of a multimodal canvas. Capped (count + size), in
-    // card order, each preceded by the card it belongs to.
-    const images = await cardImages(parsed, view.struct.cards, { max: 8 });
-    for (const img of images) {
-      blocks.push(text(`Image for card ${img.cardId} '${img.name}'${img.thumbnail ? ' (its thumbnail — the original is too large to attach)' : ''}`));
+    // Return photo cards as actual image blocks so a vision-capable model SEES
+    // them — the whole point of a multimodal canvas. In card order, each after
+    // the card it belongs to, and sized for what AI apps accept in ONE result
+    // (Claude Desktop refuses a tool result over 1 MB): originals when they fit,
+    // a smaller copy of a large JPEG otherwise, never a silent failure.
+    const markdownChars = blocks[0].text.length;
+    const { attached, notAttached } = await canvasImages(parsed, view.struct.cards, {
+      max: 4, budget: Math.min(LIMITS.imageResultBudget, Math.max(0, 900_000 - markdownChars)),
+    });
+    for (const img of attached) {
+      blocks.push(text(`Image for card ${img.cardId} '${img.name}'${img.downscaled ? ` (a smaller copy, ${img.width}×${img.height} px, of the ${mb(img.bytes)} original — read_card_contents gives the original's file path)` : ''}`));
       blocks.push({ kind: 'image', data: img.data, mime: img.mime, name: img.path });
     }
-    if (images.length > 0) blocks.push(text(`\n(${images.length} image${images.length > 1 ? 's' : ''} from this canvas ${images.length > 1 ? 'are' : 'is'} attached above, each after the card it belongs to — read ${images.length > 1 ? 'them' : 'it'} directly.)`));
+    if (attached.length > 0) blocks.push(text(`\n(${attached.length} image${attached.length > 1 ? 's' : ''} from this canvas ${attached.length > 1 ? 'are' : 'is'} attached above, each after the card it belongs to — read ${attached.length > 1 ? 'them' : 'it'} directly.)`));
+    if (notAttached.length > 0) {
+      const why = (n) => (n.reason === 'phone' ? 'an iPhone photo whose bytes are not stored in this canvas file'
+        : n.reason === 'missing' ? 'its bytes are not in this canvas file' : imageSkipReason(n.reason, n.mime));
+      blocks.push(text(`Not attached here: ${notAttached.map(n => `card ${n.cardId} '${n.name}' (${why(n)})`).join('; ')}. Call read_card_contents with those card ids to get each photo (and its original's file path).`));
+    }
     return { blocks, struct: view.struct };
   } catch (e) {
     return err(`Failed to read ${file}: ${e.message}`);

@@ -3198,7 +3198,7 @@ export function nativeReopenDialog({
       file = find('powershell.exe') || 'powershell.exe';
       // WScript.Shell Popup: 4 = Yes/No, 32 = question icon, 4096 = system modal
       // (on top). Returns 6 Yes, 7 No, -1 when it gives up.
-      args = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command',
+      args = ['-NoProfile', '-NonInteractive', '-Command',
         '$s = New-Object -ComObject WScript.Shell; $r = $s.Popup($env:KLYPIX_REOPEN_MSG, [int]$env:KLYPIX_REOPEN_TIMEOUT, $env:KLYPIX_REOPEN_TITLE, 4 + 32 + 4096); [Console]::Out.Write($r)'];
       parse = (out) => (/^\s*6\b/.test(out) ? 'reopen' : /^\s*7\b/.test(out) ? 'wait' : /-1/.test(out) ? 'timeout' : 'unavailable');
     } else if (platform === 'darwin') {

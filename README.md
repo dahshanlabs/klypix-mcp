@@ -344,6 +344,71 @@ it lists the tools:
 
 ---
 
+## Running as a Claude plugin
+
+The KLYPIX Claude plugin starts this server as `npx -y klypix-mcp@1.93.0`: one exact version, never
+a range or `latest`. It sets three variables: `KLYPIX_PLUGIN=1`,
+`KLYPIX_PLUGIN_DATA=${CLAUDE_PLUGIN_DATA}` and `KLYPIX_VAULT=${CLAUDE_PROJECT_DIR}`.
+`KLYPIX_PLUGIN=1` turns on **plugin mode**, which changes how the MCP server behaves and nothing
+else. Every `npx klypix-mcp` command (`install`, `link`, `doctor`, `sessions` and the rest) works
+exactly as described elsewhere in this README. Only `KLYPIX_PLUGIN=1` turns plugin mode on;
+`CLAUDE_PLUGIN_ROOT` on its own does not.
+
+**What plugin mode never does**
+
+- **Update itself.** It never asks npm for a newer release and never installs one, whatever
+  `KLYPIX_AUTO_UPDATE` is set to. You run the version the plugin pins, and a newer version reaches
+  you only in a new plugin release.
+- **Run code from outside the package.** It runs only the worker inside the pinned package. It
+  never starts or switches to the copy that `npx klypix-mcp install` puts in
+  `~/.claude/project-brain`, and it never loads the optional on-device semantic model from that
+  folder. Search is keyword-only, so it never downloads model weights.
+- **Write project config files.** It never creates or rewrites rules files, editor MCP configs
+  (`.mcp.json`, `.cursor/`, `.codex/config.toml` and the rest) or the `AGENTS.md` brief block, in
+  this project or any other. Outside plugin mode, `brain_sync` and the updater do write these files;
+  *Security and permissions* explains when.
+- **Change Claude's settings.** It never writes `~/.claude/settings.json`, hooks, permissions or any
+  other host configuration.
+- **Collect data or read credentials.** It sends no telemetry or usage data, reads no API keys or
+  tokens, and opens no network port.
+
+**Network.** Plugin mode makes two kinds of request, and both go to the public npm registry. The
+first is npx downloading the pinned package when the plugin starts the server. The second is one
+`npm view klypix-mcp version`, and it runs only when an agent calls `brain_doctor` with
+`check_npm: true`. There are no other requests.
+
+**Programs it runs on your computer.** Read-only `git` commands in your project (current branch,
+tags, log) for coordination and release checks. Also `brain_reopen`, described at the end of this
+section.
+
+**What it reads.** In your project: `brain.klypix`, the `.klypix` canvases, the `version` field of
+`package.json` and your git tags. On your computer: the coordination files in the table below. If
+the KLYPIX desktop app is installed, it also reads the app's data folder (`%APPDATA%\klypix`),
+read-only, to see whether the app is running, which canvases it has open, and the readings it saved
+on cards. It never reads chat history, transcripts or Claude's memory.
+
+**What it writes, and where**
+
+| Where | What | Why |
+|---|---|---|
+| Your project | Only what a tool call asks for: `brain.klypix` (`brain_note` and the other brain tools), canvases (`create_canvas`, `add_to_canvas`), `klypix-map/graph.json` when `project_map_scan` is called, and `.klypix/claims/<owner>.json` when `brain_sync` is asked to publish a release claim. During a brain write it holds `.claude/brain-capture.lock`, creating the `.claude/` folder if the project has none. The lock file is deleted after the write; the folder stays. Creating a canvas briefly holds `.klypix-create.lock` in the folder. | The KLYPIX app and every other session that writes the brain use the same locks, so two writers never overwrite each other. |
+| The plugin's data folder (`KLYPIX_PLUGIN_DATA`) | Connection receipts (`.supervisors/`), the running-server heartbeat (`.running-servers.json`), the list of projects whose brains you used (`registry.json`, which `search_all_brains` reads), and the last version and git tag seen in each project (`ship-observations/`). | Only this server uses these files. If `KLYPIX_PLUGIN_DATA` is not set, or still contains a `${...}` that was never filled in, it uses `CLAUDE_PLUGIN_DATA`. If neither is usable, the files go in `~/.claude/project-brain`. |
+| `~/.claude/project-brain` (shared) | Presence lanes (`sessions/`), write locks (`locks/`), restore points (`history/`), and small records built from your brain: `.capture-gap.json`, and `enrichment/`, `provenance/`, `.brief-cache-*` and `.guards-*` when the tools that use them run. | Your other KLYPIX sessions on this computer (Claude Code, Codex, Cursor, the app) use the same files on purpose. Through them, a plugin session and a terminal session on the same project see each other, get warnings when they plan to edit the same files, and pass notes. Restore points are kept here so that `npx klypix-mcp brain-history` can still undo a brain write after you remove the plugin. |
+
+**`brain_reopen`.** Sometimes a session leaves a note for another session that has already closed.
+An agent can then call `brain_reopen`, and KLYPIX asks you first: in chat with *Reopen* and *Not
+now* buttons, or in a small dialog (PowerShell on Windows, osascript on macOS, zenity or kdialog on
+Linux). Only if you choose *Reopen* does it open a new, visible terminal that runs the app's own
+resume command, `claude --resume <id>` or `codex resume <id>`. *Reopen on your OK* has the details.
+
+**After you uninstall the plugin.** Claude Code removes the plugin and deletes its data folder.
+These stay: your brain and canvases, which belong to you; any `.claude/` folder a brain write
+created in a project; and the presence lanes, write locks and restore points in
+`~/.claude/project-brain`. Other KLYPIX tools on this computer share that folder. If you use none,
+you can delete it.
+
+---
+
 ## Task briefing
 
 Every Claude Code session starts already knowing the project: a bounded brief of at most 2KB in
@@ -892,6 +957,18 @@ keep lazy first-use indexing instead.
   writes `<cwd>/.codex/config.toml` **inside the project** you run it in, and removes any KLYPIX
   entry from the global `~/.codex/config.toml`. **`link` writes 14 files inside the project** you
   run it in; `link --check` audits them without writing.
+- **The MCP server writes those project files too, outside plugin mode.** `link` and `install` are
+  not the only writers of the 14 files. Each time `brain_sync` starts a task (`phase: "start"`) in
+  a project that has a `brain.klypix`, the server does two things. It adds that project to the
+  machine's registry, `~/.claude/project-brain/registry.json` (the Claude Code hook adds projects
+  there as well). Then it checks the project's KLYPIX-managed files and creates or rewrites any that
+  are missing or out of date. That check covers all 14 files, whichever editors you have. It
+  includes `.mcp.json`, whose entry starts the installed bundle or, when there is none,
+  `npx -y klypix-mcp` with no version pinned, and `.codex/config.toml`. The automatic updater does
+  the same for every registered project seen in the last 14 days, right after it installs an update
+  and otherwise at most once a day. `KLYPIX_AUTO_UPDATE=0` stops the updater's pass. Plugin mode
+  (`KLYPIX_PLUGIN=1`) stops both passes and the registry write to `~/.claude/project-brain`; see
+  *Running as a Claude plugin*.
 - **Codex hooks require Codex's own trust approval** and are opt-in via `--codex-hooks`.
 
 ## Current limitations
@@ -918,9 +995,11 @@ Read this section before you build on any of it.
 - **Drift detection is single-host and opt-in per card.** It needs an `ev:` anchor written by the
   card's author, and it runs only in the Claude Code hook path — the MCP tools do not compute
   freshness.
-- **`search_all_brains` finds nothing for a Cursor-only or Codex-only setup.** The cross-project
-  registry is written by the Claude Code hook and only by it. This is a silent empty result, not an
-  error.
+- **`search_all_brains` only finds registered projects.** The cross-project registry is written by
+  the Claude Code hook and by `brain_sync` when it starts a task, from any MCP host. A project where
+  neither has happened is missing from the results, and nothing reports it: the search just comes
+  back empty. In plugin mode the server keeps its own list in the plugin's data folder and searches
+  that list together with the shared one.
 - **`npx klypix-mcp link` does not manage `CLAUDE.md`.** It manages `AGENTS.md` and seven other
   rules files. Only the desktop app writes `CLAUDE.md`.
 - **A fresh `npx klypix-mcp install` gets lexical retrieval.** The optional on-device model is

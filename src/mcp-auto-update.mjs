@@ -195,7 +195,87 @@ const validTtl = (value) => (typeof value === 'number' && Number.isFinite(value)
   ? value
   : AUTO_UPDATE_TTL_MS);
 
+// ── Plugin mode (KLYPIX_PLUGIN=1) ─────────────────────────────────────────────
+// The server-runtime switch a Claude plugin turns on when it launches the pinned
+// package (`npx -y klypix-mcp@<exact version>` with KLYPIX_PLUGIN=1). Only the
+// explicit variable counts: CLAUDE_PLUGIN_ROOT is deliberately NOT a trigger,
+// because it is set for every process a plugin context spawns, and a switch that
+// changes what the server writes must be one the launcher chose on purpose.
+// In plugin mode:
+//   - automatic updates are off everywhere (supervisor, worker, helper, harness
+//     pass), whatever KLYPIX_AUTO_UPDATE says — autoUpdateEnabled() below;
+//   - the supervisor runs only the package's own worker (no ~/.claude/project-brain
+//     runtime is adopted or hot-swapped to) — mcp-supervisor.mjs;
+//   - no server path creates or rewrites project files (rules files, editor MCP
+//     configs, the AGENTS.md brief block) and the cross-project harness pass
+//     never runs — bin/klypix-worker.mjs;
+//   - the on-device semantic runtime is never loaded (no code from outside the
+//     package, no model downloads): retrieval is keyword-only — semantic-memory.mjs;
+//   - process-private machine state goes under KLYPIX_PLUGIN_DATA when set —
+//     machineStateDir() below. CLI verbs (install, link, setup, doctor…) are
+//     unaffected: this is a server-runtime switch only.
+// These helpers live here, not in a new module, because every runtime that
+// imports the supervisor or the worker already ships this file (the flat
+// ~/.claude/project-brain bundle and the desktop app's generated copies).
+export function isPluginMode(env = process.env) {
+  return String(env?.KLYPIX_PLUGIN ?? '').trim() === '1';
+}
+
+// An older Claude Code passes `${CLAUDE_PLUGIN_DATA}` through literally when it
+// does not substitute it. Such a value is never a path: treat it as unset, so no
+// folder named "${CLAUDE_PLUGIN_DATA}" is ever created.
+export const UNEXPANDED_ENV_KEYS = Object.freeze(['KLYPIX_VAULT', 'KLYPIX_PLUGIN_DATA']);
+export const isUnexpandedEnvValue = (value) => typeof value === 'string' && value.includes('${');
+export function scrubUnexpandedEnv(env = process.env, keys = UNEXPANDED_ENV_KEYS) {
+  const dropped = [];
+  for (const key of keys) {
+    if (isUnexpandedEnvValue(env?.[key])) {
+      delete env[key];
+      dropped.push(key);
+    }
+  }
+  return dropped;
+}
+
+/** The plugin's data folder: KLYPIX_PLUGIN_DATA, resolved — only in plugin mode, and only a real path. */
+// Fallback: CLAUDE_PLUGIN_DATA itself, which Claude Code also exports to a
+// plugin's stdio MCP server. Claude Code deletes that folder when the plugin is
+// uninstalled from the last place it was installed.
+export function pluginDataDir(env = process.env) {
+  if (!isPluginMode(env)) return null;
+  for (const key of ['KLYPIX_PLUGIN_DATA', 'CLAUDE_PLUGIN_DATA']) {
+    const value = String(env?.[key] ?? '').trim();
+    if (value && !isUnexpandedEnvValue(value)) return path.resolve(value);
+  }
+  return null;
+}
+
+/**
+ * Where this server keeps its PROCESS-PRIVATE machine state: supervisor
+ * receipts, the running-server heartbeat, the project registry and (in plugin
+ * mode) ship-observation baselines. KLYPIX_PLUGIN_DATA in plugin mode when set;
+ * otherwise ~/.claude/project-brain exactly as before. State that is shared
+ * with the user's other KLYPIX sessions on purpose (presence lanes, write locks,
+ * restore points) does not move — see README "Running as a Claude plugin".
+ */
+export function machineStateDir({ env = process.env, home = os.homedir() } = {}) {
+  return pluginDataDir(env) || path.join(home, '.claude', 'project-brain');
+}
+
+/**
+ * Plugin mode keeps ship-observation baselines out of the project (normal mode
+ * writes <project>/.claude/brain-ship-obs.json + brain-pending-ships.jsonl):
+ * one pair per project under machineStateDir()/ship-observations, keyed by the
+ * project path. Same shape as klypix-format's shipObsPaths().
+ */
+export function pluginShipObsPaths(projectDir, { env = process.env, home = os.homedir() } = {}) {
+  const key = crypto.createHash('sha1').update(normalizeBrainPath(projectDir || '.')).digest('hex').slice(0, 20);
+  const dir = path.join(machineStateDir({ env, home }), 'ship-observations');
+  return { state: path.join(dir, `${key}.json`), queue: path.join(dir, `${key}.pending.jsonl`) };
+}
+
 export function autoUpdateEnabled(env = process.env) {
+  if (isPluginMode(env)) return false;
   const value = String(env.KLYPIX_AUTO_UPDATE ?? '').trim().toLowerCase();
   return !['0', 'off', 'false', 'no'].includes(value);
 }
@@ -325,7 +405,13 @@ export async function reconcileRegisteredProjects({
   rules = null,
   now = Date.now(),
   staleAfterMs = AUTO_UPDATE_STALE_REGISTRATION_MS,
+  env = process.env,
 } = {}) {
+  // Plugin mode never writes project files. The worker does not call this in
+  // plugin mode; refusing here as well means no future caller can.
+  if (isPluginMode(env)) {
+    return { checked: 0, updated: 0, unchanged: 0, failed: 0, skipped: 0, projects: [], pluginMode: true };
+  }
   const bulk = !Array.isArray(brainPaths);
   const requested = bulk
     ? readRegisteredProjectBrains(brainDir)

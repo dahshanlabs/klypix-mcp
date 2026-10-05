@@ -4460,6 +4460,10 @@ export const shipObsPaths = (projectDir) => ({
     state: path.join(projectDir || '.', '.claude', 'brain-ship-obs.json'),
     queue: path.join(projectDir || '.', '.claude', 'brain-pending-ships.jsonl'),
 });
+// Every reader/writer below accepts an explicit `paths` ({state, queue}) so a
+// caller can keep the observation outside the project. The MCP server's plugin
+// mode does (mcp-auto-update.mjs pluginShipObsPaths); hooks keep the default.
+const shipPaths = (projectDir, paths) => (paths && paths.state && paths.queue ? paths : shipObsPaths(projectDir));
 // Tag names may carry '@' (changesets / lerna: "klypix-mcp@1.43.0"); shell
 // metacharacters stay out because the tag is interpolated into a git command.
 const SAFE_TAG_RE = /^[\w.@/-]+$/;
@@ -4475,8 +4479,8 @@ export function readShipSignals(projectDir, gitRun) {
     try { version = String(JSON.parse(fs.readFileSync(path.join(projectDir, 'package.json'), 'utf8')).version || ''); } catch { /* not an npm project */ }
     return { tag, version };
 }
-export const writeShipObsState = (projectDir, sig) => {
-    const { state } = shipObsPaths(projectDir);
+export const writeShipObsState = (projectDir, sig, paths = null) => {
+    const { state } = shipPaths(projectDir, paths);
     try { fs.mkdirSync(path.dirname(state), { recursive: true }); fs.writeFileSync(state, JSON.stringify(sig)); return true; } catch { return false; }
 };
 /**
@@ -4486,14 +4490,14 @@ export const writeShipObsState = (projectDir, sig) => {
  * advances only after they are durably queued. First call BASELINES silently.
  * Never throws; a non-git / non-npm project simply yields nothing.
  */
-export function observeShipDrift(projectDir, { gitRun, now = () => new Date().toISOString() } = {}) {
+export function observeShipDrift(projectDir, { gitRun, now = () => new Date().toISOString(), paths = null } = {}) {
     const empty = { events: [], notice: '' };
     if (!projectDir || typeof gitRun !== 'function') return empty;
     try {
-        const { state, queue } = shipObsPaths(projectDir);
+        const { state, queue } = shipPaths(projectDir, paths);
         let prev = null; try { prev = JSON.parse(fs.readFileSync(state, 'utf8')); } catch { /* first run */ }
         const sig = readShipSignals(projectDir, gitRun);
-        if (!prev || typeof prev !== 'object') { writeShipObsState(projectDir, sig); return empty; }
+        if (!prev || typeof prev !== 'object') { writeShipObsState(projectDir, sig, paths); return empty; }
         const events = [];
         if (sig.tag && prev.tag && sig.tag !== prev.tag && SAFE_TAG_RE.test(sig.tag)) {
             let subj = ''; try { subj = String(gitRun(`log -1 --format=%s ${sig.tag}`) || '').trim(); } catch { /* optional */ }
@@ -4508,27 +4512,27 @@ export function observeShipDrift(projectDir, { gitRun, now = () => new Date().to
             const dir = cmpSemver3(sig.version, prev.version) < 0 ? 'reverted to' : '→';
             events.push({ area: 'Release', key: `version-observed ${sig.version}`, version: sig.version, summary: `version ${dir} ${sig.version} observed at task start (was ${prev.version})` });
         }
-        if (!events.length) { writeShipObsState(projectDir, sig); return empty; }
+        if (!events.length) { writeShipObsState(projectDir, sig, paths); return empty; }
         try {
             fs.mkdirSync(path.dirname(queue), { recursive: true });
             for (const e of events) fs.appendFileSync(queue, JSON.stringify({ ts: now(), ...e }) + '\n');
         } catch { return empty; }                 // couldn't queue → don't advance the baseline
-        writeShipObsState(projectDir, sig);
+        writeShipObsState(projectDir, sig, paths);
         return {
             events,
             notice: `⏱️ Ship signal observed since this project's last observation: ${events.map(e => e.key).join(' · ')} — queued for capture + claim reconciliation at the next brain write. Open ❓ cards about this release may already be fulfilled; verify live before reporting them as blockers.`,
         };
     } catch { return empty; }
 }
-export function readPendingShips(projectDir) {
+export function readPendingShips(projectDir, { paths = null } = {}) {
     try {
-        const { queue } = shipObsPaths(projectDir);
+        const { queue } = shipPaths(projectDir, paths);
         if (!fs.existsSync(queue)) return [];
         return fs.readFileSync(queue, 'utf8').split('\n').filter(Boolean)
             .map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
     } catch { return []; }
 }
-export const clearPendingShips = (projectDir) => { try { fs.unlinkSync(shipObsPaths(projectDir).queue); } catch { /* already gone */ } };
+export const clearPendingShips = (projectDir, { paths = null } = {}) => { try { fs.unlinkSync(shipPaths(projectDir, paths).queue); } catch { /* already gone */ } };
 /**
  * Turn queued observations into capture-ready ship cards. `isSeen(key)` consults
  * the caller's persistent dedup state; `narrated` are ship summaries captured in

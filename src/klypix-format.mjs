@@ -9362,6 +9362,34 @@ export function lensToMarkdown(d, view = 'all') {
     return L.join('\n');
 }
 
+// What read_card_contents hands an MCP caller for a card that carries a file
+// (src/card-files.mjs), in a few words — so a reader of read_canvas never
+// concludes the contents of photos, PDFs, documents or folders are out of reach.
+// Self-contained on purpose: this module is bundled alone into the app.
+const TEXT_FILE_EXT_RE = /^(txt|text|md|markdown|csv|tsv|json|jsonl|xml|html?|ya?ml|toml|ini|cfg|conf|log|srt|vtt|sql|sh|bash|ps1|bat|cmd|py|js|mjs|cjs|jsx|ts|tsx|java|kt|go|rs|rb|php|c|h|cc|cpp|hpp|cs|swift|css|scss|less|vue|svelte|tex|rtf)$/i;
+const OFFICE_FILE_EXT_RE = /^(docx?|dotx|xlsx?|xlsm|pptx?|odt|ods|odp|pages|numbers|key)$/i;
+const IMAGE_FILE_EXT_RE = /^(png|jpe?g|gif|webp|bmp|heic|heif|tiff?|avif)$/i;
+export function cardContentsHint(it, hasReading = false) {
+    if (!it || typeof it !== 'object') return null;
+    const hasBytes = !!(it.assetId || (typeof it.src === 'string' && it.src.startsWith('data:')) || it.originalPath || it.refPath);
+    const ext = String(it.extension || String(it.fileName || '').split('.').pop() || '').toLowerCase();
+    if (it.type === 'file' && it.isFolder) return 'its file list; add entry_paths with file paths from it (up to 8) to get those files themselves';
+    if (it.type === 'link') return hasReading ? "KLYPIX's whole saved reading" : null;
+    if (!hasBytes) return null;
+    if (it.type === 'image' || (it.type === 'file' && IMAGE_FILE_EXT_RE.test(ext))) return "the photo itself (a smaller copy when it is large) and the original's file path";
+    if (it.type === 'video' || it.type === 'audio') {
+        return hasReading ? "KLYPIX's whole saved reading" : `a local path to the ${it.type} file (no reading is saved yet, and ${it.type} cannot be attached)`;
+    }
+    if (it.type !== 'file') return null;
+    if (ext === 'pdf') return `a local path to the PDF to open with your file-reading tool${it.previewDataUrl ? ", and KLYPIX's saved image of page 1" : ''}`;
+    if (TEXT_FILE_EXT_RE.test(ext)) return "the file's text";
+    if (OFFICE_FILE_EXT_RE.test(ext)) {
+        const preview = it.previewSheet ? "KLYPIX's saved first rows of the sheet" : it.previewHtml ? "KLYPIX's saved opening text" : null;
+        return `a local path to the file to open with your file-reading tool${preview ? `, and ${preview}` : ''}`;
+    }
+    return 'a local path to the file to open with your file-reading tool';
+}
+
 /**
  * Render a parsed struct to the markdown brief (shared by read-klypix + MCP).
  *
@@ -9435,9 +9463,17 @@ export function structToMarkdown(struct, { assetsDir, parsed = null, lockedBoxes
                 extra.push(`KLYPIX's saved reading (${meta}):\n${fenceContent({ cardId: c.id, source: `KLYPIX reading, ${derived.ranOn === 'cloud_ai' ? 'cloud AI' : 'this PC'}`, author: recordedAuthor(it), text: excerpt })}`);
             }
             const readable = ['link', 'video', 'audio', 'image'].includes(c.type) || (c.type === 'file' && !it.isFolder);
-            if (readable && !slot.link && !slot.ocr && !derived) {
+            // An MCP caller gets the photo or file itself from read_card_contents,
+            // so "not read" is only worth saying where nothing else stands in for
+            // a reading (links, audio, video).
+            const fileStandsIn = mcp && (c.type === 'image' || c.type === 'file');
+            if (readable && !slot.link && !slot.ocr && !derived && !fileStandsIn) {
                 const step = notReadStep(it);
                 extra.push(`Not read by KLYPIX yet${step ? ` — ${step}` : ''}.`);
+            }
+            if (mcp) {
+                const hint = cardContentsHint(it, !!derived || !!slot.link);
+                if (hint) extra.push(`Inside: read_card_contents with card_ids ["${c.id}"] returns ${hint}.`);
             }
             if (extra.length) L.push(extra.join('\n'));
         }
@@ -9487,12 +9523,12 @@ export function structToMarkdown(struct, { assetsDir, parsed = null, lockedBoxes
         L.push(assetsDir
             ? `Extracted to \`${assetsDir}\` — open them to read images with vision:`
             : mcp
-                ? 'Call read_card_contents for what is inside a card.'
+                ? "Call read_card_contents with a card's id for what is inside it: the photo itself, a PDF, Office, audio or video file as a local file path, a text file's words, the files inside a folder, and KLYPIX's saved readings and previews."
                 : `Re-run with \`--assets <dir>\` to extract these for reading:`);
         for (const a of struct.assets) L.push(`- ${a}`);
         L.push('');
     } else if (mcp) {
-        L.push('_Call read_card_contents for what is inside a link, video, photo or document card._');
+        L.push('_Call read_card_contents for what is inside a link, video, photo, PDF, document or folder card._');
     }
     return L.join('\n');
 }

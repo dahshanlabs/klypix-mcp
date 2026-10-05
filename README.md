@@ -620,6 +620,38 @@ your PC. **Your AI tool reads what KLYPIX has already read:**
   again.
 - Text that comes back from cards, pages, reels and files is fenced as data, never instructions.
 
+### Reading what is inside cards
+
+A canvas saved by KLYPIX keeps a copy of every file dropped on it. `read_card_contents` hands those
+files to your AI tool as they are, so it reads them with its own model and its own file tools —
+KLYPIX itself extracts nothing here (no OCR, transcription or document-text extraction; those run in
+the KLYPIX app). Pass the ids `read_canvas` prints; every card with something inside has an
+`Inside:` line saying what comes back.
+
+| Card | What your AI tool gets |
+|---|---|
+| Text file (`.txt`, `.md`, `.csv`, `.json`, source code, …) | Its words, fenced as data (up to `max_chars` per card, 48,000 characters per answer). A longer file is cut, marked `truncated`, and the whole file is given as a local path. |
+| Photo | The photo itself. A photo too large for one answer comes as a smaller JPEG copy (long edge 1,568 px or less, turned upright from its EXIF orientation), and the full-size original as a local path. Formats vision models do not take (BMP, HEIC, TIFF) come as a path, with the reason. |
+| PDF | A local path to the PDF — Claude Code's Read tool opens it — and KLYPIX's saved image of page 1. |
+| Word, Excel, PowerPoint and other files | A local path to the file, plus the preview KLYPIX saved: a document's opening text, a sheet's first rows. |
+| Folder | Its file list. Add `entry_paths` (up to 8 file paths from the list) to get those files the same way. Paths that would leave the folder are refused; an entry over 64 MB, or one that inflates more than 200 times its stored size, is refused with its size. A folder kept on disk (not embedded) is read from where it is, never outside it. |
+| Audio, video | The reading KLYPIX saved, when there is one. Otherwise a local path and a plain statement that nothing in the answer says what it contains; a video's saved poster frame is attached and labelled as one frame. |
+
+Limits, and why:
+
+- **One answer stays under 1 MB.** Claude Desktop refuses a whole tool result over 1 MB, so the images
+  in one answer share a budget of 800,000 base64 characters (up to 4 images in `read_card_contents`
+  and in `read_canvas`). A photo that does not fit even as a smaller copy is named with the reason.
+- **Files go by path, not as embedded blobs.** An MCP embedded resource carrying a PDF is rejected by
+  claude.ai's connector layer today, so PDFs and Office files are copied once to a cache folder and
+  given as a path: `extracted/` in the plugin's data folder when running as a Claude plugin, otherwise
+  `<system temp>/klypix-mcp/extracted`, named `<sha-256 prefix>-<original name>`. A file over 150 MB
+  is not copied out. An AI tool without a file-reading tool (Claude Desktop without a filesystem
+  connector) gets the previews and the path, not the whole PDF.
+- **An iPhone photo or file** added to a shared space is not stored in the canvas file (KLYPIX fetches
+  it while it runs), so it cannot be handed over from the saved canvas; the answer says so.
+- Cards inside a box locked from AI tools are never read, copied or attached.
+
 ## Measure it yourself
 
 Claims about a shared brain — "nothing is lost", "it stays fast" — are unfalsifiable until a

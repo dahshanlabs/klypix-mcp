@@ -44,12 +44,14 @@ for (const [label, bin] of [['supervisor', 'klypix-mcp.mjs'], ['worker', 'klypix
     const byName = new Map(tools.map(t => [t.name, t]));
     const drifted = snapshot.filter(t => JSON.stringify(byName.get(t.name)?.inputSchema) !== JSON.stringify(t.inputSchema)).map(t => t.name);
     ok(drifted.length === 0, `[${label}] the 23 old input schemas equal the 1.91.0 snapshot (drifted: ${drifted.join(', ') || 'none'})`);
-    ok(client.getInstructions()?.includes('what is inside a link, video, photo or document card comes from read_card_contents'), `[${label}] the server instructions point to read_card_contents and klypix_status`);
+    ok(client.getInstructions()?.includes('comes from read_card_contents with the card ids read_canvas prints')
+      && client.getInstructions()?.includes('a file name in read_canvas is never the end of what you can read')
+      && client.getInstructions()?.includes('call klypix_status'), `[${label}] the server instructions point to read_card_contents (files, PDFs, photos, folders) and klypix_status`);
 
     const status = await client.callTool({ name: 'klypix_status', arguments: {} });
     const sc = status.structuredContent || {};
     ok(!status.isError && sc.ok === true && sc.mode === 'file' && sc.app?.running === false, `[${label}] klypix_status: ok, file mode, app not running`);
-    ok(sc.server?.vault === vault.replace(/\\/g, '/') && Array.isArray(sc.features) && sc.features.some(f => f.tool === 'read_card_contents' && f.available === 'saved_readings_only'),
+    ok(sc.server?.vault === vault.replace(/\\/g, '/') && Array.isArray(sc.features) && sc.features.some(f => f.tool === 'read_card_contents' && f.available === 'saved_readings_and_files'),
       `[${label}] klypix_status names the folder it reads and what each feature still needs`);
 
     // A running KLYPIX with the fixture open (this process's pid is alive).

@@ -403,8 +403,10 @@ try {
     // @modelcontextprotocol/ext-apps powers the canvas_view MCP App; the server
     // treats it as OPTIONAL (lazy import, degrades to a text-only tool), so a
     // resolve failure here must NOT abort — it's queued but tolerated if missing.
-    const OPTIONAL_DEPS = new Set(['@modelcontextprotocol/ext-apps']);
-    const queue = ['jszip', 'fractional-indexing', '@modelcontextprotocol/sdk', 'zod', '@modelcontextprotocol/ext-apps'].map(name => ({ name, fromDir: PKG_ROOT }));
+    // jpeg-js (card-files.mjs) is lazy too: without it a large photo is handed over
+    // by path instead of as a smaller copy.
+    const OPTIONAL_DEPS = new Set(['@modelcontextprotocol/ext-apps', 'jpeg-js']);
+    const queue = ['jszip', 'fractional-indexing', '@modelcontextprotocol/sdk', 'zod', '@modelcontextprotocol/ext-apps', 'jpeg-js'].map(name => ({ name, fromDir: PKG_ROOT }));
     let deps = 0; const missing = [];
     while (queue.length) {
         const { name, fromDir } = queue.shift();
@@ -434,7 +436,7 @@ try {
     // a newer klypix-format cannot. merge-brains and the driver ship here so
     // brain-history's restore merge, the KLYPIX core and the git driver all
     // find one engine in this directory.
-    for (const f of ['global-brain-hook.mjs', 'klypix-format.mjs', 'brain-graveyard.mjs', 'merge-brains.mjs', 'klypix-merge-driver.mjs', 'capture-gap.mjs', 'brain-semantic.mjs', 'semantic-memory.mjs', 'enrichment.mjs', 'provenance.mjs', 'brain-note.mjs', 'brain-evidence.mjs', 'brain-git-hook.mjs', 'git-capture-install.mjs', 'brain-history.mjs', 'app-lease.mjs', 'klypix-core.mjs', 'app-tools.mjs', 'brain-write-lock.mjs', 'agent-rules.mjs', 'brain-doctor.mjs', 'editor-detect.mjs', 'agent-presence.mjs', 'mcp-presence.mjs', 'repo-state.mjs', 'result-reconcile.mjs', 'finding-routing.mjs', 'presence-relay.mjs', 'mcp-supervisor.mjs', 'mcp-auto-update.mjs', 'runtime-inspector.mjs', 'project-graph.mjs', 'bench.mjs', 'codex-brain-hook.mjs', 'codex-hooks.mjs', 'canvas-view-app.html']) {
+    for (const f of ['global-brain-hook.mjs', 'klypix-format.mjs', 'brain-graveyard.mjs', 'merge-brains.mjs', 'klypix-merge-driver.mjs', 'capture-gap.mjs', 'brain-semantic.mjs', 'semantic-memory.mjs', 'enrichment.mjs', 'provenance.mjs', 'brain-note.mjs', 'brain-evidence.mjs', 'brain-git-hook.mjs', 'git-capture-install.mjs', 'brain-history.mjs', 'app-lease.mjs', 'klypix-core.mjs', 'app-tools.mjs', 'card-files.mjs', 'brain-write-lock.mjs', 'agent-rules.mjs', 'brain-doctor.mjs', 'editor-detect.mjs', 'agent-presence.mjs', 'mcp-presence.mjs', 'repo-state.mjs', 'result-reconcile.mjs', 'finding-routing.mjs', 'presence-relay.mjs', 'mcp-supervisor.mjs', 'mcp-auto-update.mjs', 'runtime-inspector.mjs', 'project-graph.mjs', 'bench.mjs', 'codex-brain-hook.mjs', 'codex-hooks.mjs', 'canvas-view-app.html']) {
         const s = path.join(SRC, f); if (exists(s)) staged.push({ dst: f, content: fs.readFileSync(s, 'utf8') });
     }
     for (const [src, dst] of [

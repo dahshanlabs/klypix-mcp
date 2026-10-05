@@ -1,0 +1,1123 @@
+[
+  {
+    "name": "list_canvases",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    }
+  },
+  {
+    "name": "read_canvas",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "canvas": {
+          "type": "string",
+          "description": "Canvas title or filename (e.g. \"SS2\"), vault-relative path, or absolute path."
+        }
+      },
+      "required": [
+        "canvas"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    }
+  },
+  {
+    "name": "search_canvases",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "Text or #tag to find inside canvases."
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    }
+  },
+  {
+    "name": "search_all_brains",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "What to find across all project brains."
+        },
+        "as_of": {
+          "description": "Optional YYYY-MM-DD: rank what was TRUE at that date (time-travel query).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    }
+  },
+  {
+    "name": "brain_ask",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "question": {
+          "type": "string",
+          "description": "The natural-language question to answer from the brain."
+        },
+        "canvas": {
+          "description": "Brain canvas filename/path. Defaults to the project brain (\"brain\").",
+          "type": "string"
+        },
+        "as_of": {
+          "description": "Optional YYYY-MM-DD: answer as of that date (superseded cards count as live if they were current then).",
+          "type": "string"
+        },
+        "k": {
+          "description": "Max cards to surface for synthesis (default 10, capped 20).",
+          "type": "number"
+        }
+      },
+      "required": [
+        "question"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    }
+  },
+  {
+    "name": "project_map_context",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "question": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Question or code concept to ground in both current structure and project memory."
+        },
+        "project": {
+          "description": "Absolute project root. Defaults to this MCP connection's configured project/vault.",
+          "type": "string"
+        },
+        "graph_path": {
+          "description": "Optional project-relative graph JSON path. Defaults to graphify-out/graph.json and may not escape the project root.",
+          "type": "string"
+        },
+        "compare_to": {
+          "description": "Optional project-relative prior graph JSON path. Adds exact total deltas plus bounded query-neighborhood changes; it may not escape the project root.",
+          "type": "string"
+        },
+        "depth": {
+          "description": "Relationship hops around the best code matches (0-3, default 1).",
+          "type": "number"
+        },
+        "max_nodes": {
+          "description": "Maximum code nodes returned (default 60, capped 200).",
+          "type": "number"
+        },
+        "k": {
+          "description": "Maximum brain cards returned (default 8; fast mode caps 8, deep history caps 20).",
+          "type": "number"
+        },
+        "deep_history": {
+          "description": "false (default) uses the sub-second lexical-fast correction-aware path; true opts into whole-brain semantic/history retrieval, which may cold-load the local model.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "question"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    }
+  },
+  {
+    "name": "project_map_scan",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "description": "Absolute project root. Defaults to this MCP connection's configured project/vault.",
+          "type": "string"
+        }
+      },
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    }
+  },
+  {
+    "name": "project_map_drift",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "description": "Absolute project root. Defaults to this MCP connection's configured project/vault.",
+          "type": "string"
+        },
+        "brain": {
+          "description": "Optional brain filename/path inside the project. Defaults to brain.klypix / brain.any.",
+          "type": "string"
+        }
+      },
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    }
+  },
+  {
+    "name": "brain_challenge",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "claim": {
+          "type": "string",
+          "description": "The proposed decision/claim to argue against — one concise statement."
+        },
+        "canvas": {
+          "description": "Brain canvas filename/path. Defaults to the project brain (\"brain\").",
+          "type": "string"
+        },
+        "k": {
+          "description": "Max contradiction candidates to surface (default 8, capped 20).",
+          "type": "number"
+        }
+      },
+      "required": [
+        "claim"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    }
+  },
+  {
+    "name": "brain_insights",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "canvas": {
+          "description": "Canvas filename/path. Defaults to the project brain (\"brain\").",
+          "type": "string"
+        },
+        "staleDays": {
+          "description": "Open questions older than this many days count as stale (default 21).",
+          "type": "number"
+        },
+        "view": {
+          "description": "\"areas\" = a cheap category map (what sections exist + live counts) to orient BEFORE retrieving. \"status\" = where each active area stands (newest milestone + open count). \"full\" (default) = hubs, orphans, stale questions and areas.",
+          "type": "string",
+          "enum": [
+            "full",
+            "areas",
+            "status"
+          ]
+        }
+      },
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    }
+  },
+  {
+    "name": "brain_lens",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "canvas": {
+          "description": "Canvas filename/path. Defaults to the project brain (\"brain\").",
+          "type": "string"
+        },
+        "view": {
+          "description": "Which lens to compute (default \"all\" — every section, timeline events omitted from structured output unless view is \"timeline\").",
+          "type": "string",
+          "enum": [
+            "all",
+            "freshness",
+            "provenance",
+            "activity",
+            "timeline",
+            "orrery",
+            "unresolved"
+          ]
+        },
+        "root": {
+          "description": "Orrery center: a card title prefix or id. Default: the most-connected hub card.",
+          "type": "string"
+        },
+        "staleDays": {
+          "description": "Open questions older than this count as stale (default 21).",
+          "type": "number"
+        },
+        "limit": {
+          "description": "Cap for recent-activity entries (default 30).",
+          "type": "number"
+        },
+        "structured": {
+          "description": "Also return the full machine-readable lens object (large — tens of KB). Default false: the markdown answers the question, and the object was previously attached to every call whether or not anything read it.",
+          "type": "boolean"
+        }
+      },
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    }
+  },
+  {
+    "name": "brain_connect",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "canvas": {
+          "description": "Canvas filename/path. Defaults to the project brain (\"brain\").",
+          "type": "string"
+        },
+        "apply": {
+          "description": "false (default) = suggest only; true = draw the connections.",
+          "type": "boolean"
+        },
+        "max": {
+          "description": "Max connections to propose/draw (default 24).",
+          "type": "number"
+        },
+        "threshold": {
+          "description": "Min semantic similarity 0–1. Default 0.55 for orphan repair; 0.45 for scope:\"all\". Higher = fewer, tighter links.",
+          "type": "number"
+        },
+        "scope": {
+          "description": "\"orphans\" (default) repairs isolated decision/milestone cards; \"all\" proposes across every live card.",
+          "type": "string",
+          "enum": [
+            "orphans",
+            "all"
+          ]
+        },
+        "pairs": {
+          "description": "Explicit card-id pairs to connect (bypasses auto-proposal). Use to dismiss a reconcile false-positive: pass the two card ids with relationship:\"not_contradiction\".",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "fromId": {
+                "type": "string"
+              },
+              "toId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "fromId",
+              "toId"
+            ]
+          }
+        },
+        "relationship": {
+          "description": "Relationship for explicit `pairs` (e.g. \"not_contradiction\" to permanently dismiss a contradiction candidate, or \"relates_to\", \"depends_on\", \"supports\").",
+          "type": "string"
+        }
+      },
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    }
+  },
+  {
+    "name": "brain_reconcile",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "canvas": {
+          "description": "Brain canvas filename/path. Defaults to the project brain (\"brain\").",
+          "type": "string"
+        },
+        "root": {
+          "description": "Project root holding the migrations dir / git repo (default: the brain file's folder).",
+          "type": "string"
+        },
+        "mode": {
+          "description": "Which pass to run (default \"all\"): contradictions · migrations · legacy (pre-v1.15 raw-bash ship cards to tidy) · claims (open \"remaining:/next:\" clauses a later milestone likely fulfilled — receipts + ✓ markers; confirm with {id, milestoneId}) · plans (plan / proposal / \"design decided\" cards a LATER 🏁 appears to have built — embedding-first because the ship is usually renamed) · release (open cards the commits in `ref` look to have fulfilled; confirm with {id, sha}).",
+          "type": "string",
+          "enum": [
+            "all",
+            "contradictions",
+            "migrations",
+            "legacy",
+            "claims",
+            "plans",
+            "release"
+          ]
+        },
+        "ref": {
+          "description": "mode \"release\": the git ref being cut. Defaults to this session's active release lease, else HEAD.",
+          "type": "string",
+          "maxLength": 200
+        },
+        "sinceRef": {
+          "description": "mode \"release\": the baseline the range starts from. Defaults to the highest release-shaped tag in the repo.",
+          "type": "string",
+          "maxLength": 200
+        },
+        "confirm": {
+          "description": "Pairs YOU verified. Honoured on mode \"claims\" and mode \"release\" only. Each confirmed card is stamped ✅, archived, and arrowed \"closed by\" to its evidence.",
+          "maxItems": 64,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "maxLength": 64,
+                "description": "The OPEN card id to close."
+              },
+              "milestoneId": {
+                "description": "mode \"claims\": the live milestone card that fulfilled it. Requires an existing \"likely closed by\" link or a current coverage gap on this exact pair.",
+                "type": "string",
+                "maxLength": 64
+              },
+              "sha": {
+                "description": "mode \"release\": a commit the listing named as covering this card (cov ≥ 0.6, confirmable). Omit to use the card's own #commit- receipt.",
+                "type": "string",
+                "maxLength": 40
+              },
+              "whole": {
+                "description": "Assert the WHOLE card is done. Without it, covering one item of a multi-item clause writes \"✔ partial\" and the card stays open.",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "id"
+            ]
+          }
+        },
+        "dismiss": {
+          "description": "Wrong hints to retire permanently as \"not_fulfilled\" edges between two CARDS — never re-suggested by claims, release, or the self-heal. A card-to-card pair is what makes the dismissal durable; a coverage hint built straight from a commit has no card to point at and will be re-listed at the next release cut until the open card is resolved or the pair is named with a cardId.",
+          "maxItems": 64,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "openId": {
+                "type": "string",
+                "maxLength": 64,
+                "description": "The open card the hint was wrong about."
+              },
+              "cardId": {
+                "description": "The milestone/evidence card to dismiss it against (required unless the listing already named one).",
+                "type": "string",
+                "maxLength": 64
+              },
+              "sha": {
+                "description": "Informational only — the commit that produced the wrong hint. A dismissal is recorded against a CARD, so a hint whose only evidence is a raw commit (no milestone card) cannot be dismissed: pass a cardId, or retire the open card itself.",
+                "type": "string",
+                "maxLength": 40
+              }
+            },
+            "required": [
+              "openId"
+            ]
+          }
+        },
+        "note": {
+          "description": "One line of why, echoed in the receipt.",
+          "type": "string",
+          "maxLength": 400
+        }
+      },
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    }
+  },
+  {
+    "name": "brain_garden",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "canvas": {
+          "description": "Brain canvas filename/path. Defaults to the project brain (\"brain\").",
+          "type": "string"
+        },
+        "apply": {
+          "description": "false (default) = list over-grown areas + cards to synthesize; true = consolidate using the supplied syntheses.",
+          "type": "boolean"
+        },
+        "syntheses": {
+          "description": "Required when apply:true — one entry per area you want consolidated.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "title": {
+                "type": "string",
+                "description": "Area title EXACTLY as returned by the dry run."
+              },
+              "synthesis": {
+                "type": "string",
+                "description": "3-6 sentence prose synthesis preserving every still-relevant fact/decision/number."
+              }
+            },
+            "required": [
+              "title",
+              "synthesis"
+            ]
+          }
+        },
+        "approve": {
+          "description": "Required when apply:true — the 8-char human-approval code. You are never shown it: the human runs `npx klypix-mcp garden-code` and pastes the code into chat after reviewing your plan. Never guess or fabricate it.",
+          "type": "string"
+        },
+        "repair": {
+          "description": "Run a targeted repair instead of the consolidation pass. \"duplicate-partials\" collapses repeated ✔ partial notes on a card to the earliest one — lossless, idempotent, no syntheses and no approval code. Dry-run by default; apply:true writes.",
+          "type": "string",
+          "enum": [
+            "duplicate-partials"
+          ]
+        }
+      },
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    }
+  },
+  {
+    "name": "create_canvas",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "title": {
+          "type": "string",
+          "description": "Canvas title (also the filename)."
+        },
+        "cards": {
+          "minItems": 1,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "text": {
+                "type": "string",
+                "description": "Card text. First line is the card title."
+              },
+              "heading": {
+                "description": "Bold title card for the main goal/topic.",
+                "type": "boolean"
+              },
+              "color": {
+                "description": "Hex color, e.g. #ef4444 for a risk/blocker.",
+                "type": "string"
+              },
+              "group": {
+                "description": "Put this card inside the titled box of that name (created if missing), in card order. Alternative to listing it in `groups`.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "text"
+            ]
+          },
+          "description": "The cards. 5-12 atomic cards is ideal for a mind-map; a checklist can be longer when grouped."
+        },
+        "connections": {
+          "description": "Arrows between cards.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "from": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "string"
+                  }
+                ],
+                "description": "Source card: index (0-based), title, or id."
+              },
+              "to": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "string"
+                  }
+                ],
+                "description": "Target card: index, title, or id."
+              },
+              "relationship": {
+                "description": "leads_to|depends_on|relates_to|conflicts_with|supports|questions|costs|blocks",
+                "type": "string"
+              },
+              "label": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "from",
+              "to"
+            ]
+          }
+        },
+        "groups": {
+          "description": "Titled boxes, each listing its member cards in reading order (index, title, or id). Ungrouped cards form a band above the boxes — good for the title card, a link, a legend.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "title": {
+                "type": "string",
+                "description": "Box header, e.g. \"Part 1 · Get ready\". Also the card's area."
+              },
+              "cards": {
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "anyOf": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "string"
+                    }
+                  ]
+                },
+                "description": "Member cards IN READING ORDER — index (0-based), title, or id. They stack top-to-bottom inside the box."
+              },
+              "color": {
+                "description": "Hex border color for the box (default emerald).",
+                "type": "string"
+              },
+              "columns": {
+                "description": "Split a long list into N columns, filled top-to-bottom then next column. Default 1 (2 when more than 12 cards).",
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 4
+              },
+              "width": {
+                "description": "Card width inside the box in px (default 340). Use ~520 for long prose cards so they do not become skyscrapers.",
+                "type": "integer",
+                "minimum": 200,
+                "maximum": 640
+              }
+            },
+            "required": [
+              "title",
+              "cards"
+            ]
+          }
+        },
+        "filename": {
+          "description": "Override the output filename (without extension).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "title",
+        "cards"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    }
+  },
+  {
+    "name": "add_to_canvas",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "canvas": {
+          "type": "string",
+          "description": "Canvas filename, vault-relative path, or absolute path."
+        },
+        "cards": {
+          "minItems": 1,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "text": {
+                "type": "string",
+                "description": "Card text. First line is the card title."
+              },
+              "heading": {
+                "description": "Bold title card for the main goal/topic.",
+                "type": "boolean"
+              },
+              "color": {
+                "description": "Hex color, e.g. #ef4444 for a risk/blocker.",
+                "type": "string"
+              },
+              "group": {
+                "description": "Put this card inside the titled box of that name (created if missing), in card order. Alternative to listing it in `groups`.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "text"
+            ]
+          },
+          "description": "Cards to add."
+        },
+        "connections": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "from": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "string"
+                  }
+                ],
+                "description": "Source card: index (0-based), title, or id."
+              },
+              "to": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "string"
+                  }
+                ],
+                "description": "Target card: index, title, or id."
+              },
+              "relationship": {
+                "description": "leads_to|depends_on|relates_to|conflicts_with|supports|questions|costs|blocks",
+                "type": "string"
+              },
+              "label": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "from",
+              "to"
+            ]
+          }
+        }
+      },
+      "required": [
+        "canvas",
+        "cards"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    }
+  },
+  {
+    "name": "klypix_status",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    }
+  },
+  {
+    "name": "read_card_contents",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "canvas": {
+          "type": "string",
+          "description": "Canvas title as KLYPIX shows it, file name, vault-relative path, or absolute path."
+        },
+        "card_ids": {
+          "minItems": 1,
+          "maxItems": 5,
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Up to 5 card ids, as read_canvas prints them (\"· id …\")."
+        },
+        "read_new": {
+          "description": "Default true: for a card with no saved reading, return the step that makes one. false: saved readings only.",
+          "type": "boolean"
+        },
+        "refresh": {
+          "description": "Ask for a fresh reading even though one is saved. In this version the saved reading comes back with the step the user takes in KLYPIX for a fresh one.",
+          "type": "boolean"
+        },
+        "pin_result": {
+          "description": "Reserved for KLYPIX app mode: pin a new reading beside the card. Ignored when reading saved files.",
+          "type": "boolean"
+        },
+        "entry_paths": {
+          "description": "Folder cards: list only these paths (or folders) inside it.",
+          "maxItems": 8,
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "max_chars": {
+          "description": "Characters of text per card (1,000-48,000, default 12,000). The whole answer carries at most 48,000.",
+          "type": "integer",
+          "minimum": 1000,
+          "maximum": 48000
+        },
+        "wait_seconds": {
+          "description": "Reserved for KLYPIX app mode: how long to wait for a new reading (5-45, default 40). Ignored when reading saved files.",
+          "type": "integer",
+          "minimum": 5,
+          "maximum": 45
+        }
+      },
+      "required": [
+        "canvas",
+        "card_ids"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    }
+  },
+  {
+    "name": "brain_note",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string",
+          "description": "The note — one concise idea; the first line becomes the card title."
+        },
+        "marker": {
+          "description": "(none)=decision · ?=open question · !=milestone · +=🛠️ skill (reusable how-to/gotcha; always resurfaces, never ages out) · ✓=resolve+archive the best-matching card · ~=update the matching card in place. Default: decision.",
+          "type": "string",
+          "enum": [
+            "",
+            "?",
+            "!",
+            "+",
+            "✓",
+            "~"
+          ]
+        },
+        "area": {
+          "description": "Area/topic — routes the card into that titled container and becomes a #tag (e.g. \"Auth\", \"Release\").",
+          "type": "string"
+        },
+        "closes": {
+          "description": "Title or [[wikilink]] of a strategy/question card this note fulfils — resolves+archives it and draws a \"closed by\" arrow.",
+          "type": "string"
+        },
+        "question": {
+          "description": "The question this note ANSWERS, phrased as someone would ask it (\"how do we keep a draft separate from what runs?\"). Recorded as retrieval enrichment beside the vector cache — never on the canvas — so the card is found by paraphrase, not only by its own words. The session's declared intent is recorded as well.",
+          "type": "string",
+          "maxLength": 240
+        },
+        "evidence": {
+          "description": "Supporting references. File bytes are fingerprinted as captured working-tree sources; hashes only detect source changes. On ~, [] clears evidence. Not accepted on resolve; use a milestone with closes to attach new evidence.",
+          "maxItems": 16,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "file",
+                  "pr",
+                  "url",
+                  "commit",
+                  "run"
+                ]
+              },
+              "ref": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1000,
+                "description": "A project-relative file path (optional :line or #Lline), or an external reference. External references are stored without fetching them."
+              },
+              "oid": {
+                "description": "Optional full file blob hash from Git; a caller-supplied anchor, not proof of the claim.",
+                "type": "string"
+              },
+              "verifiedAt": {
+                "description": "Optional caller-reported ISO verification date/time; not independently verified.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "ref"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "verify": {
+          "description": "Verification instructions or command text to retain and display. Never executed by KLYPIX. On ~, an empty string clears it.",
+          "type": "string",
+          "maxLength": 2000
+        },
+        "guard": {
+          "description": "GUARD CARDS: make this '+' skill fire BEFORE a matching tool call runs (Claude Code PreToolUse denies on severity block; other hosts warn), not just resurface in briefs. The card stays a normal 🛠️ rule — ✓-resolving it retires the guard, ~ with {remove:true} disarms it.",
+          "type": "object",
+          "properties": {
+            "when": {
+              "description": "When to interrupt — triggers are AND-ed; at least one required.",
+              "type": "object",
+              "properties": {
+                "tool": {
+                  "description": "Regex matched against the tool name (e.g. \"Bash\", \"Edit|Write\").",
+                  "type": "string",
+                  "maxLength": 200
+                },
+                "command": {
+                  "description": "Regex matched against the command string, for shell tools (e.g. \"\\\\bgit\\\\s+stash\\\\b\"). Anchor deliberately — an unanchored pattern also matches the words inside echo/commit-message text.",
+                  "type": "string",
+                  "maxLength": 200
+                },
+                "paths": {
+                  "description": "Path PREFIXES (forward-slash, project-relative) — the guard fires when the session's touched files match one. Prefixes, not regexes.",
+                  "maxItems": 20,
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "maxLength": 200
+                  }
+                },
+                "multiWorktree": {
+                  "description": "Fire only when the repo has more than one git worktree (probed live when the guard is in play).",
+                  "type": "boolean",
+                  "const": true
+                }
+              }
+            },
+            "severity": {
+              "description": "warn (default) injects the message as context and the call proceeds; block DENIES the tool call with the message. 'block' is for irreversible actions and HUMAN-DIRECTED authoring only — never author block without explicit user instruction.",
+              "type": "string",
+              "enum": [
+                "warn",
+                "block"
+              ]
+            },
+            "message": {
+              "description": "What the interrupted session reads — say the trap and the safe alternative. Required unless remove:true.",
+              "type": "string",
+              "maxLength": 500
+            },
+            "remove": {
+              "description": "Disarm: pass exactly { remove: true } with marker '~' matching the card to delete its machine trigger while keeping the prose rule.",
+              "type": "boolean",
+              "const": true
+            }
+          }
+        },
+        "canvas": {
+          "description": "Brain canvas filename/path. Defaults to the project brain (\"brain\").",
+          "type": "string"
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    }
+  },
+  {
+    "name": "brain_message",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string",
+          "description": "The note to deliver (kept to 400 chars)."
+        },
+        "to": {
+          "description": "Target — a session id (or unique prefix of at least 8 characters) from the peer list, or an exact unique branch; omit or \"all\" for every session live right now. A directed id may name a session that is not running: the note then waits and is delivered when that session next starts.",
+          "type": "string"
+        },
+        "canvas": {
+          "description": "Brain canvas filename/path. Defaults to the project brain (\"brain\").",
+          "type": "string"
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    }
+  },
+  {
+    "name": "brain_message_receipt",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "description": "Absolute project root containing brain.klypix. Defaults to this MCP connection's current project.",
+          "type": "string"
+        },
+        "message_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160,
+          "description": "Exact coordination message id returned with the offered note."
+        },
+        "offer_token": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160,
+          "description": "Exact offer token returned with the offered note."
+        }
+      },
+      "required": [
+        "message_id",
+        "offer_token"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    }
+  },
+  {
+    "name": "brain_reopen",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "session": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160,
+          "description": "The session to reopen: its id, or a unique prefix of at least 8 characters, as shown in the queued-note reply, brain_sync peers, or brain_doctor. It must be a Claude Code or Codex session that is not running and has a note waiting."
+        },
+        "start": {
+          "description": "true (default): the reopened session starts on the note right away. false: it opens and waits for the human to prompt it.",
+          "type": "boolean"
+        },
+        "project": {
+          "description": "Absolute project root containing brain.klypix. Defaults to this connection's project.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session"
+      ],
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    }
+  },
+  {
+    "name": "brain_sync",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "description": "Nonempty absolute current project root that directly contains brain.klypix or brain.any. Supply it on phase \"start\" so routing stays correct even when the MCP host launches from its own install directory.",
+          "type": "string"
+        },
+        "intent": {
+          "description": "One sentence describing the current task. Supply for start/checkpoint; completion clears it.",
+          "type": "string",
+          "maxLength": 160
+        },
+        "files": {
+          "description": "Project-relative files you expect to touch or have touched. Exact overlaps with peers are flagged.",
+          "maxItems": 20,
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "phase": {
+          "description": "start replaces prior task scope; checkpoint merges changed scope; complete clears task intent/files. Default: checkpoint.",
+          "type": "string",
+          "enum": [
+            "start",
+            "checkpoint",
+            "complete"
+          ]
+        },
+        "include_context": {
+          "description": "Include fast task-relevant brain cards and offer queued coordination notes in the same response. Defaults true; false also defers note delivery so internal supervisor probes cannot consume model-visible messages.",
+          "type": "boolean"
+        },
+        "results": {
+          "description": "On phase complete, 1-8 result manifests for stable claim keys. The in-handler versioned validator rejects malformed, empty, unknown-field, or incomparable evidence and retains task scope."
+        },
+        "releaseIntent": {
+          "description": "Declare EXCLUSIVE intent to prepare a release of this project. The first declarer takes a ~2h lease (refreshed by checkpoints, freed by phase \"complete\", by expiry, or when the holder session ends); a second declarer gets a structured hard conflict naming the holder, version, and ref. While any lease is active every peer's sync gains a \"release in preparation\" footer line. A NEW declaration is also checked against what the release would LEAVE BEHIND: if the ref is missing commits that are on trunk or on a branch a live peer session is working on, OR commits any session STAKED a releaseClaim on (even one that has since ended), the lease is REFUSED (nothing is changed) and the response lists them — report those commits to the user, then re-declare with acknowledge:[...] naming each sha if the release should go ahead without them. Acknowledging away a claimed or live-owned commit queues its owner a notification automatically.",
+          "type": "object",
+          "properties": {
+            "version": {
+              "type": "string",
+              "maxLength": 64,
+              "description": "The version this session intends to release (e.g. \"1.70.0\")."
+            },
+            "ref": {
+              "type": "string",
+              "maxLength": 200,
+              "description": "The git ref (branch or tag) the release will be cut from."
+            },
+            "acknowledge": {
+              "description": "Commit shas this release DELIBERATELY leaves behind. Only needed after a refusal: if the ref would drop finished work, the lease is refused and the response names every sha. Re-declare with those shas here to proceed — and tell the user what they are first.",
+              "maxItems": 1024,
+              "type": "array",
+              "items": {
+                "type": "string",
+                "maxLength": 40
+              }
+            }
+          },
+          "required": [
+            "version",
+            "ref"
+          ]
+        },
+        "releaseClaim": {
+          "description": "Stake a durable claim that specific commits ride the NEXT release — the promise \"you'll see it in the next build\" made machine-readable. Unlike presence rows (which age out ~10min after a session ends), a claim persists until fulfilled (the release ref contains the shas — auto-retired with a courtesy note), withdrawn, or expired (14d). A release that would drop claimed shas is REFUSED until they are acknowledged BY NAME, and acknowledging them away notifies the owner. Use exactly one of shas (stake/extend) or withdraw.",
+          "type": "object",
+          "properties": {
+            "shas": {
+              "description": "Commit shas that MUST ride the next release. Stake after committing work a user was promised — the claim OUTLIVES this session (14d), and every future releaseIntent must contain these commits or acknowledge them by name.",
+              "maxItems": 20,
+              "type": "array",
+              "items": {
+                "type": "string",
+                "maxLength": 40
+              }
+            },
+            "note": {
+              "description": "One line of why — shown verbatim in any refusal that names this claim (\"founder was told the Arrow tool ships in the next build\").",
+              "type": "string",
+              "maxLength": 160
+            },
+            "withdraw": {
+              "description": "Shas to withdraw from this session's claim; [] or true withdraws the whole claim. Only the staking session (or its logical continuation) can withdraw.",
+              "anyOf": [
+                {
+                  "maxItems": 20,
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "maxLength": 40
+                  }
+                },
+                {
+                  "type": "boolean"
+                }
+              ]
+            },
+            "publish": {
+              "description": "Also write the claim as .klypix/claims/<owner>.json in the project (or delete that file when withdrawing). Commit it and the promise TRAVELS WITH THE REPO: every clone's release gate reads it, it is reviewable in PRs, and its history is auditable — team-wide claims over plain git, zero infrastructure.",
+              "type": "boolean"
+            }
+          }
+        }
+      },
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    }
+  },
+  {
+    "name": "brain_doctor",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "project": {
+          "description": "Project dir to audit harness + peers for. Defaults to the server's working directory.",
+          "type": "string"
+        },
+        "check_npm": {
+          "description": "Also fetch npm latest to flag a stale brain (default false — this one does a network `npm view`).",
+          "type": "boolean"
+        }
+      },
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    }
+  },
+  {
+    "name": "canvas_view",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "canvas": {
+          "description": "Canvas filename/path. Defaults to the project brain (\"brain\").",
+          "type": "string"
+        }
+      },
+      "$schema": "http://json-schema.org/draft-07/schema#"
+    }
+  }
+]

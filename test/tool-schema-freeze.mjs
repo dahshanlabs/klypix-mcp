@@ -60,6 +60,20 @@ ok(reader?.annotations?.readOnlyHint === false && reader?.annotations?.destructi
   && JSON.stringify(reader?.inputSchema?.required) === '["canvas","card_ids"]' && reader?.inputSchema?.properties?.card_ids?.maxItems === 5,
 'read_card_contents: honest annotations; canvas + card_ids (1-5) required, the rest optional');
 
+// 1.92.0 published klypix_status and read_card_contents, so from then on THEIR
+// schemas are frozen too. test/fixtures/tool-schemas-1.92.0.json was generated
+// from the untouched v1.92.0 worker (origin/master 4fe728f) over the same stdio
+// handshake, before any later edit; it is added beside the 1.91.0 snapshot,
+// never regenerated to make this pass. Later releases add tools or NEW optional
+// top-level fields only.
+const snapshot192 = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'tool-schemas-1.92.0.json'), 'utf8'));
+ok(Array.isArray(snapshot192) && snapshot192.length === 25, `the 1.92.0 snapshot holds 25 tools (got ${snapshot192.length})`);
+const verdict192 = toolCompatibility(snapshot192, current);
+ok(verdict192.ok === true && verdict192.removed.length === 0 && verdict192.changed.length === 0,
+  `the supervisor accepts this worker over 1.92.0 (removed: ${verdict192.removed.join(', ') || 'none'}; changed: ${verdict192.changed.join(', ') || 'none'})`);
+const drifted192 = snapshot192.filter(t => JSON.stringify(byName.get(t.name)?.inputSchema) !== JSON.stringify(t.inputSchema)).map(t => t.name);
+ok(drifted192.length === 0, `every 1.92.0 input schema — klypix_status and read_card_contents included — is byte-identical (drifted: ${drifted192.join(', ') || 'none'})`);
+
 fs.rmSync(tmp, { recursive: true, force: true });
 console.log(failures ? `\n✗ ${failures} failure(s)` : '\n✓ tool-schema-freeze: all assertions passed');
 process.exit(failures ? 1 : 0);

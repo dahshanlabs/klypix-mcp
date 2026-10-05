@@ -392,7 +392,7 @@ on cards. It never reads chat history, transcripts or Claude's memory.
 | Where | What | Why |
 |---|---|---|
 | Your project | Only what a tool call asks for: `brain.klypix` (`brain_note` and the other brain tools), canvases (`create_canvas`, `add_to_canvas`), `klypix-map/graph.json` when `project_map_scan` is called, and `.klypix/claims/<owner>.json` when `brain_sync` is asked to publish a release claim. During a brain write it holds `.claude/brain-capture.lock`, creating the `.claude/` folder if the project has none. The lock file is deleted after the write; the folder stays. Creating a canvas briefly holds `.klypix-create.lock` in the folder. | The KLYPIX app and every other session that writes the brain use the same locks, so two writers never overwrite each other. |
-| The plugin's data folder (`KLYPIX_PLUGIN_DATA`) | Connection receipts (`.supervisors/`), the running-server heartbeat (`.running-servers.json`), the list of projects whose brains you used (`registry.json`, which `search_all_brains` reads), and the last version and git tag seen in each project (`ship-observations/`). | Only this server uses these files. If `KLYPIX_PLUGIN_DATA` is not set, or still contains a `${...}` that was never filled in, it uses `CLAUDE_PLUGIN_DATA`. If neither is usable, the files go in `~/.claude/project-brain`. |
+| The plugin's data folder (`KLYPIX_PLUGIN_DATA`) | Connection receipts (`.supervisors/`), the running-server heartbeat (`.running-servers.json`), the list of projects whose brains you used (`registry.json`, which `search_all_brains` reads), and the last version and git tag seen in each project (`ship-observations/`). Also `extracted/`: copies of the PDFs, Office and other files `read_card_contents` hands to your AI tool as a local path, taken from the canvas you asked about. | Only this server uses these files. If `KLYPIX_PLUGIN_DATA` is not set, or still contains a `${...}` that was never filled in, it uses `CLAUDE_PLUGIN_DATA`. If neither is usable, the files go in `~/.claude/project-brain`, except `extracted/`, which then goes in `<system temp>/klypix-mcp/extracted` (where it always goes outside plugin mode). |
 | `~/.claude/project-brain` (shared) | Presence lanes (`sessions/`), write locks (`locks/`), restore points (`history/`), and small records built from your brain: `.capture-gap.json`, and `enrichment/`, `provenance/`, `.brief-cache-*` and `.guards-*` when the tools that use them run. | Your other KLYPIX sessions on this computer (Claude Code, Codex, Cursor, the app) use the same files on purpose. Through them, a plugin session and a terminal session on the same project see each other, get warnings when they plan to edit the same files, and pass notes. Restore points are kept here so that `npx klypix-mcp brain-history` can still undo a brain write after you remove the plugin. |
 
 **`brain_reopen`.** Sometimes a session leaves a note for another session that has already closed.
@@ -602,13 +602,17 @@ Apache-2.0 and work with no app installed. The app's interface is available in E
 ### KLYPIX canvases and your AI tool
 
 Beyond project brains, the same connection reads and writes the KLYPIX canvases (spaces) saved on
-your PC. **Your AI tool reads what KLYPIX has already read:**
+your PC. **Your AI tool reads what KLYPIX has already read, and the files a saved canvas holds:**
 
-- `read_canvas` prints every card with its id; `read_card_contents` returns what is inside a card
-  from what KLYPIX saved — the transcript on a video card, the text card **Read contents** made for a
-  reel or web page, an OCR card for a photo, a folder's file list. For a reel or a video, choose Read
-  contents in KLYPIX first (select the card, press Enter), let the canvas save, then ask your AI tool.
-  This version does not start new readings itself.
+- `read_canvas` prints every card with its id; `read_card_contents` returns what is inside a card.
+  From what KLYPIX saved: the transcript on a video card, the text card **Read contents** made for a
+  reel or web page, an OCR card for a photo, a folder's file list. From the files embedded in the
+  saved canvas, with KLYPIX closed: a text file's words, a photo (a smaller copy when it is large),
+  and PDFs, Office and other files as a local path with the previews KLYPIX saved — see *Reading
+  what is inside cards* below. Audio and video come back as a path only; what they say comes from a
+  reading KLYPIX saved. For a reel, a web page or a video, choose Read contents in KLYPIX first
+  (select the card, press Enter), let the canvas save, then ask your AI tool. This version does not
+  start new readings itself.
 - What a person set up in KLYPIX is respected: cards inside a box **locked from AI tools** are left
   out of every read; frozen cards are marked read-only; collapsed boxes, comments and tags are shown.
 - `klypix_status` tells your AI tool what KLYPIX can do on this PC right now, and which step the person
@@ -807,8 +811,8 @@ The MCP verbs below are what agents call. These are what **you** call:
 | `project_map_scan` | KLYPIX's own zero-install scanner: gitignore-aware file inventory + file-level import edges (relative, tsconfig-alias, and monorepo-workspace imports resolved) written to `klypix-map/graph.json` — which then serves `project_map_context` automatically |
 | `project_map_drift` | Read-only drift report: brain cards whose referenced files are gone or moved (with rename candidates), plus a headline when the checkout itself is behind its origin default branch |
 | `canvas_view` | Returns the board as a structured render spec plus a text summary, and declares an MCP Apps (SEP-1865) UI resource |
-| `read_canvas` | A canvas as markdown: every card with its id, the connection graph, `[[links]]`, `#tags` and tag pills, status, comments, reactions, frozen and collapsed boxes, and the readings KLYPIX already saved on link, video and photo cards; photo cards' images attached, each labelled with its card. Cards inside a box a person locked from AI tools are left out, and counted. Titles as KLYPIX shows them work as names |
-| `read_card_contents` | What is inside up to 5 cards — a reel, YouTube video, web page, video or audio file, photo, document or folder — from what KLYPIX has already read: transcripts it saved on the card, its Read contents and OCR result cards, folder listings. Fenced as data, marked full or partial, with where it was made (this PC or cloud AI). A card KLYPIX has not read yet comes back with the one step the person takes in KLYPIX; this version starts no new readings |
+| `read_canvas` | A canvas as markdown: every card with its id, the connection graph, `[[links]]`, `#tags` and tag pills, status, comments, reactions, frozen and collapsed boxes, and the readings KLYPIX already saved on link, video and photo cards; photo cards' images attached (a smaller copy when large), each labelled with its card; every card with something inside names the `read_card_contents` call that returns it. Cards inside a box a person locked from AI tools are left out, and counted. Titles as KLYPIX shows them work as names |
+| `read_card_contents` | What is inside up to 5 cards — a reel, YouTube video, web page, video or audio file, photo, PDF, Office or text file, or folder. Readings KLYPIX already saved: transcripts on the card, its Read contents and OCR result cards, folder listings — fenced as data, marked full or partial, with where they were made (this PC or cloud AI). The files embedded in the saved canvas, with KLYPIX closed: a text file's words; a photo (a smaller copy when it is large, plus the original's local path); PDFs, Office and other files as a cached local path with KLYPIX's saved previews (a PDF's first page, a document's opening text, a sheet's first rows); folder entries named in `entry_paths`, by the same rules. Audio and video come back as a path, and what they say only from a reading KLYPIX saved. One answer stays under Claude Desktop's 1 MB limit. A link, video or audio card KLYPIX has not read yet comes back with the one step the person takes in KLYPIX; this version starts no new readings and extracts no text itself |
 | `klypix_status` | What KLYPIX can do on this PC right now: whether the app is running and which canvases it has open (from the lease file the app writes), where canvases are read from, and what each feature still needs from the person |
 | `search_canvases` | Search across canvases by name, content, tags and tag pills, and the readings KLYPIX saved on cards; returns card ids and dates. Never searches inside a box a person locked from AI tools |
 | `search_all_brains` | Cross-project memory search across every registered brain on this machine |
@@ -816,7 +820,7 @@ The MCP verbs below are what agents call. These are what **you** call:
 | `add_to_canvas` | Append cards/connections (positions preserved), bordered and readable on KLYPIX's dark and Paper themes; a card's `group` puts it in that titled box. Refuses a canvas open in KLYPIX (`OPEN_IN_APP`), a box locked from AI tools (`SCOPE_LOCKED`) or a frozen box (`FROZEN`), and writes nothing; project brains are the exception to the first. Returns the new card ids |
 | `list_canvases` | List every `.klypix` in the vault |
 
-Exactly 25 as of klypix-mcp 1.92.0, machine-verifiable with `npx klypix-mcp doctor`.
+Exactly 25 as of klypix-mcp 1.93.0, machine-verifiable with `npx klypix-mcp doctor`.
 
 > **`canvas_view`:** no MCP Apps host has been observed rendering the UI resource yet — there is no
 > screenshot and no host-level test. Hosts without the extension get clean text, which is the path

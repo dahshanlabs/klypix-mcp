@@ -38,7 +38,11 @@ import {
   isFastDecayCard, isUnresolvedOpenCard, isSkillCard, validateGuard, guardSidecarPathFor, ensureGuardSidecar, DECAY_STALE_MS, formatDecayAge,
   isPlanCard, planFulfillmentFor, PLAN_PAIR_SIM_BRAIN, isAgconfTwinId,
   readPendingShips, clearPendingShips, pendingShipCards, formatCaptureReceipts, parseVerifySuffix, amendmentFirst,
+  scopeLockedView, scopeLockLine, derivedReading, readManifestCheap, escapeInstructionLines,
 } from './klypix-format.mjs';
+import {
+  leaseVerdict, readEndpoint, pathHash, canvasWriteLockPath, tellUser, LEASE_SINCE_APP_VERSION,
+} from './app-lease.mjs';
 import { findProjectBrain, neutralizeMarkers, postPresenceMessage, readReleaseLease } from './agent-presence.mjs';
 import { collectRepoState, commitsInRange, makeContainmentProbe } from './repo-state.mjs';
 
@@ -110,18 +114,53 @@ export function walkVault(vault) {
   return out;
 }
 
+// The title KLYPIX shows for a canvas file (manifest.title), read cheaply from
+// the ZIP's central directory and cached by path + size + mtime, so resolving a
+// name never inflates a whole canvas. Legacy .any files (no manifest) → null.
+const titleCache = new Map();
+export function canvasTitleOf(file) {
+  let st;
+  try { st = fs.statSync(file); } catch { return null; }
+  const key = path.resolve(file);
+  const hit = titleCache.get(key);
+  if (hit && hit.size === st.size && hit.mtimeMs === st.mtimeMs) return hit.title;
+  const manifest = readManifestCheap(file);
+  const title = manifest && typeof manifest.title === 'string' && manifest.title.trim() ? manifest.title.trim() : null;
+  if (titleCache.size > 2000) titleCache.clear();
+  titleCache.set(key, { size: st.size, mtimeMs: st.mtimeMs, title });
+  return title;
+}
+
 // Resolve a user-supplied canvas reference: absolute path, vault-relative path,
-// or a bare filename (matched against the walked list, case-insensitively).
-export function resolveCanvas(vault, ref) {
-  if (!ref) return null;
-  if (path.isAbsolute(ref) && fs.existsSync(ref)) return ref;
+// a bare filename (matched against the walked list, case-insensitively), and —
+// when no file name matches — the title KLYPIX shows (manifest.title), first
+// exactly, then ignoring case. Two canvases with that title are ambiguous: the
+// caller gets both paths instead of a guess.
+//   → { file } · { ambiguous: [paths] } · { file: null }
+export function resolveCanvasDetailed(vault, ref) {
+  if (!ref || typeof ref !== 'string') return { file: null };
+  if (path.isAbsolute(ref) && fs.existsSync(ref)) return { file: ref };
   const rel = path.join(vault, ref);
-  if (fs.existsSync(rel)) return rel;
+  if (fs.existsSync(rel)) return { file: rel };
+  const all = walkVault(vault);
   const want = path.basename(ref).toLowerCase();
-  const matches = walkVault(vault).filter(f => path.basename(f).toLowerCase() === want
+  const byName = all.filter(f => path.basename(f).toLowerCase() === want
     || path.basename(f).toLowerCase() === want + '.klypix'
     || path.basename(f).toLowerCase() === want + '.any');
-  return matches[0] || null;
+  if (byName.length) return { file: byName[0] };
+  const wanted = ref.trim();
+  if (!wanted) return { file: null };
+  const titled = all.map(f => ({ f, title: canvasTitleOf(f) })).filter(x => x.title);
+  for (const same of [(t) => t === wanted, (t) => t.toLowerCase() === wanted.toLowerCase()]) {
+    const matches = titled.filter(x => same(x.title)).map(x => x.f);
+    if (matches.length === 1) return { file: matches[0] };
+    if (matches.length > 1) return { ambiguous: matches };
+  }
+  return { file: null };
+}
+
+export function resolveCanvas(vault, ref) {
+  return resolveCanvasDetailed(vault, ref).file || null;
 }
 
 // Resolve the DEFAULT project brain for the brain-* ops, INDEPENDENT of the
@@ -225,46 +264,134 @@ function cardDetailBlock(struct, onlyIds) {
 
 // ── Operations ───────────────────────────────────────────────────────────────
 
+// The result envelope's error half (P0 agent parity): the first line states the
+// outcome, the LAST line is KLYPIX's one sentence for the person, and the
+// structured half carries the code. Only KLYPIX speaks in tell_user.
+function notFoundResult(ref, vault, ambiguous = null) {
+  const sentence = tellUser('NOT_FOUND');
+  const first = ambiguous
+    ? `More than one canvas is titled "${ref}" — pass one of these paths:\n${ambiguous.map(p => `  - ${p}`).join('\n')}`
+    : `Canvas not found: ${ref} (vault: ${vault}). Names match a file name or the title KLYPIX shows.`;
+  return {
+    blocks: [text(first), text(`Tell the user: ${sentence}`)],
+    isError: true,
+    structured: { ok: false, mode: 'file', code: 'NOT_FOUND', tell_user: sentence, ...(ambiguous ? { candidates: ambiguous } : {}) },
+  };
+}
+
+const ymdOf = (ms) => (Number(ms) > 0 ? new Date(Number(ms)).toISOString().slice(0, 10) : null);
+
+// Sniff an image's type from its first bytes (an asset id need not carry an
+// extension). null = not a type a vision model reads.
+function imageMime(assetPath, b64) {
+  const ext = String(assetPath || '').split('.').pop().toLowerCase();
+  if (IMG_MIME[ext]) return IMG_MIME[ext];
+  const head = String(b64 || '').slice(0, 8);
+  if (head.startsWith('iVBOR')) return 'image/png';
+  if (head.startsWith('/9j/')) return 'image/jpeg';
+  if (head.startsWith('R0lG')) return 'image/gif';
+  if (head.startsWith('UklGR')) return 'image/webp';
+  if (head.startsWith('Qk')) return 'image/bmp';
+  return null;
+}
+
+/**
+ * The images of a canvas's photo cards, IN CARD ORDER, each tied to its card.
+ * The original is preferred; its thumbnail stands in only when the original is
+ * missing or too large to attach (~5 MB). Scope-locked cards never appear
+ * (callers pass the visible cards). Capped by count.
+ */
+export async function cardImages(parsed, visibleCards, { max = 8, onlyIds = null } = {}) {
+  const out = [];
+  const items = parsed?.items || {};
+  for (const c of visibleCards || []) {
+    if (out.length >= max) break;
+    if (onlyIds && !onlyIds.has(c.id)) continue;
+    const it = items[c.id];
+    if (!it) continue;
+    const imageFile = it.type === 'file' && IMG_RE.test(`.${String(it.extension || '').toLowerCase()}`);
+    if (it.type !== 'image' && !imageFile) continue;
+    // assets/<assetId> is where every current KLYPIX build stores a card's bytes;
+    // a nested layout (assets/images/<shard>/<id>.<ext>) is matched by name too.
+    const located = (id) => {
+      if (!id) return null;
+      const direct = `assets/${id}`;
+      if (parsed.zip.file(direct)) return direct;
+      return (parsed.assetPaths || []).find(p => p.endsWith(`/${id}`) || path.basename(p).split('.')[0] === String(id).split('.')[0]) || null;
+    };
+    const candidates = [
+      located(it.assetId) ? { p: located(it.assetId), thumbnail: false } : null,
+      located(it.thumbnailAssetId) ? { p: located(it.thumbnailAssetId), thumbnail: true } : null,
+    ].filter(Boolean);
+    let done = false;
+    for (const cand of candidates) {
+      try {
+        const entry = parsed.zip.file(cand.p);
+        if (!entry) continue;
+        const b64 = await entry.async('base64');
+        if (!b64 || b64.length > 7_000_000) continue; // skip > ~5MB
+        const mime = imageMime(cand.p, b64);
+        if (!mime) continue;
+        out.push({ cardId: c.id, name: c.title || it.fileName || 'image', data: b64, mime, path: cand.p, thumbnail: cand.thumbnail });
+        done = true;
+        break;
+      } catch { /* unreadable asset: try the next candidate */ }
+    }
+    // Legacy image cards carried a data URL instead of an asset.
+    if (!done && typeof it.src === 'string' && it.src.startsWith('data:image/')) {
+      const m = /^data:(image\/[a-z+.-]+);base64,(.+)$/i.exec(it.src);
+      if (m && m[2].length <= 7_000_000) out.push({ cardId: c.id, name: c.title || it.fileName || 'image', data: m[2], mime: m[1], path: `${c.id}.inline`, thumbnail: false });
+    }
+  }
+  return out;
+}
+
 export async function opListCanvases({ vault }) {
   const files = walkVault(vault);
   if (files.length === 0) {
     return { blocks: [text(`No .klypix/.any files found under vault: ${vault}\nSet --vault or KLYPIX_VAULT to your canvas folder.`)] };
   }
+  // "open in KLYPIX" comes from the lease a running KLYPIX writes (app-lease.mjs).
+  // No lease → nothing is marked; it never guesses.
+  const lease = readEndpoint();
+  const openHashes = lease.status === 'live' && lease.endpoint ? new Set(lease.endpoint.openFiles) : new Set();
   const rows = [];
+  let openCount = 0;
   for (const f of files) {
     try {
       const { struct } = await parseKlypix(fs.readFileSync(f));
       const st = fs.statSync(f);
-      rows.push(`- ${path.relative(vault, f)} — "${struct.title}" · ${struct.counts.cards} cards, ${struct.counts.connections} connections · ${new Date(st.mtimeMs).toISOString().slice(0, 10)}`);
+      const open = openHashes.size && openHashes.has(pathHash(f));
+      if (open) openCount++;
+      rows.push(`- ${path.relative(vault, f)} — "${struct.title}" · ${struct.counts.cards} cards, ${struct.counts.connections} connections · ${new Date(st.mtimeMs).toISOString().slice(0, 10)}${open ? ' · open in KLYPIX' : ''}`);
     } catch {
       rows.push(`- ${path.relative(vault, f)} — (unreadable)`);
     }
   }
-  return { blocks: [text(`# Canvases in ${vault}\n\n${rows.join('\n')}`)] };
+  const note = openCount ? `\n\n${openCount} of these ${openCount === 1 ? 'is' : 'are'} open in KLYPIX right now: add_to_canvas refuses ${openCount === 1 ? 'it' : 'them'} until the tab is closed.` : '';
+  return { blocks: [text(`# Canvases in ${vault}\n\nRead one by its title or file name.\n\n${rows.join('\n')}${note}`)] };
 }
 
 export async function opReadCanvas({ vault, canvas }) {
-  const file = resolveCanvas(vault, canvas);
-  if (!file) return err(`Canvas not found: ${canvas} (vault: ${vault})`);
+  const resolved = resolveCanvasDetailed(vault, canvas);
+  if (!resolved.file) return notFoundResult(canvas, vault, resolved.ambiguous);
+  const file = resolved.file;
   try {
-    const { struct, zip, assetPaths } = await parseKlypix(fs.readFileSync(file));
-    const blocks = [text(structToMarkdown(struct))];
+    const parsed = await parseKlypix(fs.readFileSync(file));
+    // Scope lock: cards inside a box a person locked from AI tools are not
+    // printed, not searched, and their images are not attached.
+    const view = scopeLockedView(parsed);
+    const blocks = [text(structToMarkdown(view.struct, { parsed, lockedBoxes: view.boxes, mcp: true }))];
     // Return image assets as actual image blocks so a vision-capable model SEES
-    // them — the whole point of a multimodal canvas. Capped (count + size).
-    let included = 0;
-    for (const p of assetPaths) {
-      if (included >= 8) break;
-      if (!IMG_RE.test(p)) continue;
-      try {
-        const b64 = await zip.file(p).async('base64');
-        if (!b64 || b64.length > 7_000_000) continue; // skip > ~5MB
-        const ext = p.split('.').pop().toLowerCase();
-        blocks.push({ kind: 'image', data: b64, mime: IMG_MIME[ext] || 'image/png', name: p });
-        included++;
-      } catch { /* skip unreadable asset */ }
+    // them — the whole point of a multimodal canvas. Capped (count + size), in
+    // card order, each preceded by the card it belongs to.
+    const images = await cardImages(parsed, view.struct.cards, { max: 8 });
+    for (const img of images) {
+      blocks.push(text(`Image for card ${img.cardId} '${img.name}'${img.thumbnail ? ' (its thumbnail — the original is too large to attach)' : ''}`));
+      blocks.push({ kind: 'image', data: img.data, mime: img.mime, name: img.path });
     }
-    if (included > 0) blocks.push(text(`\n(${included} image${included > 1 ? 's' : ''} from this canvas are attached above — read them directly.)`));
-    return { blocks, struct };
+    if (images.length > 0) blocks.push(text(`\n(${images.length} image${images.length > 1 ? 's' : ''} from this canvas ${images.length > 1 ? 'are' : 'is'} attached above, each after the card it belongs to — read ${images.length > 1 ? 'them' : 'it'} directly.)`));
+    return { blocks, struct: view.struct };
   } catch (e) {
     return err(`Failed to read ${file}: ${e.message}`);
   }
@@ -279,26 +406,46 @@ export async function opSearchCanvases({ vault, query }) {
   const hit = (s) => { const v = String(s || '').toLowerCase(); return terms.some(t => v.includes(t)); };
   const hits = [];
   for (const f of walkVault(vault)) {
-    let struct;
-    try { ({ struct } = await parseKlypix(fs.readFileSync(f))); } catch { continue; }
+    let parsed;
+    try { parsed = await parseKlypix(fs.readFileSync(f)); } catch { continue; }
+    // Scope lock: a locked box's cards never match, and never show.
+    const { struct } = scopeLockedView(parsed);
+    const items = parsed.items || {};
     const rel = path.relative(vault, f);
+    let saved = null;
+    try { saved = ymdOf(fs.statSync(f).mtimeMs); } catch { /* */ }
     const nameMatch = hit(struct.title) || hit(rel);
+    const readingOf = (c) => derivedReading(items[c.id]);
+    const itemTags = (c) => (Array.isArray(items[c.id]?.tags) ? items[c.id].tags.map(String) : []);
+    const inReading = (c) => { const r = readingOf(c); return !!r && hit(r.text); };
     const matched = struct.cards.filter(c =>
       hit(c.title) ||
       hit(c.text) ||
-      (c.tags || []).some(t => hit('#' + t)));
+      (c.tags || []).some(t => hit('#' + t)) ||
+      itemTags(c).some(t => hit('#' + t) || hit(t)) ||
+      inReading(c));
     if (nameMatch || matched.length) {
       // Matching stays recall-first (an archived card CAN be the right answer to
       // "what did we try?"), but an archived hit is now labelled. Unlabelled, a
       // superseded or retired decision read exactly like a current one.
       const isArchived = (c) => /^archive$/i.test(c.area || '');
       const n = struct.counts;
-      const head = `## ${rel} — "${struct.title}" · ${n.live ?? n.cards} live cards${n.archived ? `, ${n.archived} archived` : ''}, ${n.connections} connections${nameMatch && !matched.length ? '  (name/title match)' : ''}`;
+      const head = `## ${rel} — "${struct.title}" · ${n.live ?? n.cards} live cards${n.archived ? `, ${n.archived} archived` : ''}, ${n.connections} connections${saved ? ` · saved ${saved}` : ''}${nameMatch && !matched.length ? '  (name/title match)' : ''}`;
       const body = matched.slice(0, 8).map(c => {
         const pos = (c.pos && c.pos.x != null) ? ` @(${Math.round(c.pos.x)},${Math.round(c.pos.y)})` : '';
-        const tags = (c.tags && c.tags.length) ? ' ' + c.tags.map(t => '#' + t).join(' ') : '';
+        const allTags = [...new Set([...(c.tags || []), ...itemTags(c)])];
+        const tags = allTags.length ? ' ' + allTags.map(t => '#' + t).join(' ') : '';
         const arch = isArchived(c) ? ' ⛔ archived' : '';
-        return `- [${c.type}] "${c.title || '(card)'}" (${c.id})${pos}${tags}${arch}\n    ${String(c.text || '').replace(/\s+/g, ' ').slice(0, 240)}`;
+        const it = items[c.id] || {};
+        const date = ymdOf(it.editedAt) || ymdOf(it.createdAt);
+        const ownText = String(c.text || '').replace(/\s+/g, ' ').slice(0, 240);
+        const reading = readingOf(c);
+        // A match found only in KLYPIX's saved reading says so, and shows the
+        // reading (escaped — it is reel/page/file text, not instructions).
+        const fromReading = reading && !hit(c.title) && !hit(c.text) && hit(reading.text)
+          ? `\n    in KLYPIX's saved reading: ${escapeInstructionLines(reading.text.replace(/\s+/g, ' ').slice(0, 240))}`
+          : '';
+        return `- [${c.type}] "${c.title || '(card)'}" (${c.id})${pos}${date ? ` · ${date}` : ''}${tags}${arch}\n    ${escapeInstructionLines(ownText)}${fromReading}`;
       }).join('\n');
       hits.push(matched.length ? `${head}\n${body}` : head);
     }
@@ -723,12 +870,16 @@ export async function opCanvasView({ vault, canvas }) {
   if (!t.file) return err(`No canvas found — looked for ./brain.klypix in the project, then ${vault}. Pass canvas: "<name>".`);
   let parsed;
   try { parsed = await parseKlypix(fs.readFileSync(t.file)); } catch (e) { return err(`Read failed: ${e.message}`); }
-  const { struct, canvas: canvasJson, zip } = parsed;
-  const renderSpec = await buildRenderSpec({ struct, canvas: canvasJson, zip });
+  const { canvas: canvasJson, zip } = parsed;
+  // Scope lock in BOTH places this tool reads: the render spec walks the raw
+  // order + item files, and the summary walks the struct.
+  const { struct, hiddenIds, boxes } = scopeLockedView(parsed);
+  const renderSpec = await buildRenderSpec({ struct, canvas: canvasJson, zip }, { hiddenIds });
   const stamp = brainStamp(t.file, struct, t.how);
   const summary = `${stamp}Rendered “${struct.title}” — ${renderSpec.items.length} items · ${renderSpec.connections.length} connections`
     + `${renderSpec.counts.truncated ? ` · ${renderSpec.counts.truncated} truncated for budget` : ''}`
     + `${renderSpec.counts.strokes ? ` · ${renderSpec.counts.strokes} ink strokes not shown` : ''}\n\n`
+    + boxes.map(box => `> 🔒 ${scopeLockLine(box)}\n\n`).join('')
     + structToBrief(struct, { maxRecent: 10, maxMilestones: 4, maxConnections: 0, maxSkills: 6 });
   return { blocks: [text(summary)], structured: { renderSpec } };
 }
@@ -1364,9 +1515,15 @@ const lockBusy = (kind) => err(
   'Nothing was overwritten; retry the same operation.'
 );
 
+// Every canvas write takes a cross-process lock, not only brains. Brains keep
+// the folder lock the hooks and the desktop app share
+// (<folder>/.claude/brain-capture.lock). An ordinary canvas locks in the
+// profile (~/.claude/project-brain/locks/<sha256 of its canonical path>.lock)
+// through the same protocol: acquiring the folder lock creates a `.claude`
+// folder, which would appear beside a canvas on the Desktop or in Documents.
 const withCanvasWriteLock = (file, fn, { brain = false } = {}) =>
   withWriteLock(path.resolve(file), () => {
-    if (!brain) return fn();
+    if (!brain) return withAdvisoryWriteLock(canvasWriteLockPath(file), (locked) => locked ? fn() : lockBusy('Canvas'));
     return withAdvisoryWriteLock(brainCaptureLockPath(file), (locked) => locked ? fn() : lockBusy('Brain'));
   });
 
@@ -1410,7 +1567,7 @@ export async function opBrainGarden({ vault, canvas, apply = false, syntheses, a
         const { buffer, stats } = await collapseDuplicatePartialNotes(fs.readFileSync(file));
         if (!stats.cards) return { blocks: [text('✓ Nothing to repair — no card carries a repeated ✔ partial note.')] };
         await atomicWrite(file, buffer);
-        return { blocks: [text(`🧹 Repaired ${stats.cards} card(s): ${stats.notes} duplicate ✔ partial note(s) removed, the earliest of each kept. Nothing was archived or deleted. Reopen the brain in the KLYPIX app to see it.`)] };
+        return { blocks: [text(`🧹 Repaired ${stats.cards} card(s): ${stats.notes} duplicate ✔ partial note(s) removed, the earliest of each kept. Nothing was archived or deleted. It appears in the brain if it is open in KLYPIX (inside OneDrive or Dropbox, when you next open it).`)] };
       } catch (e) {
         return err(`Repair failed (brain unchanged): ${e.message}`);
       }
@@ -1439,7 +1596,7 @@ export async function opBrainGarden({ vault, canvas, apply = false, syntheses, a
       if (!stats.synthCards) return { blocks: [text(`No areas consolidated — each synthesis \`title\` must match a dry-run area title exactly.${skippedNote}`)] };
       let out = buffer; try { out = (await tidyBrain(buffer)).buffer; } catch { /* keep apply result if tidy fails */ }
       await atomicWrite(file, out);
-      return { blocks: [text(`🌿 Gardened ${stats.areas} area(s): ${stats.archived} old card(s) → ${stats.synthCards} synthesis card(s); originals archived with "consolidated into" arrows (any prose-dropped figures appended verbatim). Reopen the brain in the KLYPIX app to see it.${skippedNote}`)] };
+      return { blocks: [text(`🌿 Gardened ${stats.areas} area(s): ${stats.archived} old card(s) → ${stats.synthCards} synthesis card(s); originals archived with "consolidated into" arrows (any prose-dropped figures appended verbatim). It appears in the brain if it is open in KLYPIX (inside OneDrive or Dropbox, when you next open it).${skippedNote}`)] };
     } catch (e) {
       return err(`Garden apply failed (brain unchanged): ${e.message}`);
     }
@@ -1580,14 +1737,17 @@ export async function opBrainConnect({ vault, canvas, apply = false, max = 24, t
   }, { brain: true });
 }
 
-export async function opCreateCanvas({ vault, title, cards, connections, groups, filename }) {
+export async function opCreateCanvas({ vault, title, cards, connections, groups, filename, via }) {
   if (!fs.existsSync(vault)) { try { fs.mkdirSync(vault, { recursive: true }); } catch { /* ignore */ } }
   // Locked on the VAULT: safeName picks a free name by probing the directory, so
   // two concurrent creates of the same title would both see it free and the second
   // atomicWrite would silently replace the first canvas.
   return withVaultCreateLock(vault, async () => {
     try {
-      const buf = await buildKlypix({ title, cards, connections, groups });
+      // Provenance: WHICH AI tool made these cards (the MCP client's name), the
+      // same stamp add_to_canvas writes — KLYPIX shows it as the card's chip.
+      const stamped = via ? (cards || []).map(c => ({ ...c, createdVia: via })) : cards;
+      const buf = await buildKlypix({ title, cards: stamped, connections, groups });
       const name = filename ? safeName(vault, filename.replace(IS_CANVAS, '')) : safeName(vault, title);
       const out = path.join(vault, name);
       await atomicWrite(out, buf);
@@ -1605,8 +1765,10 @@ export async function opCreateCanvas({ vault, title, cards, connections, groups,
 }
 
 export async function opAddToCanvas({ vault, canvas, cards, connections, via }) {
-  const file = resolveCanvas(vault, canvas);
-  if (!file) return err(`Canvas not found: ${canvas}`);
+  const resolved = resolveCanvasDetailed(vault, canvas);
+  if (!resolved.file) return notFoundResult(canvas, vault, resolved.ambiguous);
+  const file = resolved.file;
+  const failed = (message, extra = {}) => ({ blocks: [text(message)], isError: true, structured: { ok: false, mode: 'file', ...extra } });
   // add_to_canvas is generic, so infer the document kind before choosing the
   // cross-process layer. Filename is the legacy signal; manifest.kind keeps a
   // renamed brain protected. The actual read-modify-write still happens only
@@ -1619,25 +1781,75 @@ export async function opAddToCanvas({ vault, canvas, cards, connections, via }) 
   // The read MUST be inside the lock: reading first and appending later is exactly
   // the interleaving that loses the other writer's cards.
   return withCanvasWriteLock(file, async () => {
+    // The lease (app-lease.mjs): a canvas KLYPIX has OPEN is never rewritten —
+    // the app's next save would replace the file, and KLYPIX builds before the
+    // lease drop cards they did not hold. Brains are exempt: KLYPIX merges them
+    // and shows an agent's brain cards live. Checked inside the lock, right
+    // before the read, so the window in which KLYPIX could open the file
+    // between check and write is as small as this process can make it.
+    const verdict = isBrain ? { action: 'write', code: null } : leaseVerdict(file);
+    const shownTitle = canvasTitleOf(file) || path.basename(file).replace(IS_CANVAS, '');
+    if (verdict.action === 'refuse') {
+      const sentence = tellUser('OPEN_IN_APP', { canvas: shownTitle });
+      return {
+        blocks: [
+          text(`Nothing was written: '${shownTitle}' is open in KLYPIX right now, and KLYPIX's next save would replace the file.`),
+          text(`Tell the user: ${sentence}`),
+        ],
+        isError: true,
+        structured: { ok: false, mode: 'file', code: 'OPEN_IN_APP', tell_user: sentence, canvas: file },
+      };
+    }
     try {
       const original = fs.readFileSync(file);
       let beforeIds = new Set();
       try { const b = await parseKlypix(original); beforeIds = new Set(b.struct.cards.map(c => c.id)); } catch { /* new/legacy → treat all as new */ }
       // Provenance: stamp WHICH agent wrote these cards (cursor / claude / cline / a2a).
       const stamped = via ? cards.map(c => ({ ...c, createdVia: via })) : cards;
-      const buf = await appendToKlypix(original, { cards: stamped, connections });
-      await atomicWrite(file, buf);
-      let detail = '', struct;
+      let buf;
+      try {
+        buf = await appendToKlypix(original, { cards: stamped, connections });
+      } catch (e) {
+        // A group naming a box the person locked from AI tools, or froze:
+        // refused before anything was written.
+        if (e?.code === 'SCOPE_LOCKED' || e?.code === 'FROZEN') {
+          const sentence = tellUser(e.code);
+          return {
+            blocks: [text(`Nothing was written: ${e.message}`), text(`Tell the user: ${sentence}`)],
+            isError: true,
+            structured: { ok: false, mode: 'file', code: e.code, tell_user: sentence, canvas: file },
+          };
+        }
+        throw e;
+      }
+      // Restore point before the bytes are replaced: brains always, an ordinary
+      // canvas too (machine-local, size-capped; `npx klypix-mcp brain-history`).
+      await atomicWrite(file, buf, { isBrain, restorePoint: !isBrain, reason: 'add_to_canvas' });
+      let detail = '', struct, cardIds = [], boxIds = [];
       try {
         ({ struct } = await parseKlypix(buf));
-        detail = cardDetailBlock(struct, new Set(struct.cards.map(c => c.id).filter(id => !beforeIds.has(id))));
+        const fresh = struct.cards.filter(c => !beforeIds.has(c.id));
+        cardIds = fresh.filter(c => c.type !== 'container').map(c => c.id);
+        boxIds = fresh.filter(c => c.type === 'container').map(c => c.id);
+        detail = cardDetailBlock(struct, new Set(fresh.map(c => c.id)));
       } catch { /* detail is optional */ }
-      return {
-        blocks: [text(`Added ${cards.length} card(s) to ${path.relative(vault, file)}. Reopen the canvas in the KLYPIX app to see them.${detail}`)],
-        file: { name: path.basename(file), buffer: buf }, struct,
-      };
+      const title = struct?.title || shownTitle;
+      const seen = isBrain
+        ? 'It appears in the brain if it is open in KLYPIX (inside OneDrive or Dropbox, when you next open it).'
+        : 'They appear when the canvas is next opened in KLYPIX.';
+      const blocks = [text(`Added ${cards.length} card${cards.length === 1 ? '' : 's'} to '${title}'. ${seen}${detail}`)];
+      const structured = { ok: true, mode: 'file', canvas: file, card_ids: cardIds, ...(boxIds.length ? { box_ids: boxIds } : {}) };
+      // KLYPIX on this PC cannot say whether it has the canvas open (no lease:
+      // closed, or a build from before the lease) — written, with the one step
+      // that keeps the cards if it IS open.
+      if (verdict.action === 'warn') {
+        const sentence = tellUser('MAY_BE_OPEN', { canvas: title, version: LEASE_SINCE_APP_VERSION });
+        blocks.push(text(`Tell the user: ${sentence}`));
+        Object.assign(structured, { code: 'MAY_BE_OPEN', tell_user: sentence });
+      }
+      return { blocks, structured, file: { name: path.basename(file), buffer: buf }, struct };
     } catch (e) {
-      return err(`Add failed: ${e.message}`);
+      return failed(`Add failed: ${e.message}`);
     }
   }, { brain: isBrain });
 }
@@ -1761,7 +1973,7 @@ export async function opBrainNote({ vault, canvas, text: noteText, area, marker 
     try {
       if (guardField || fs.existsSync(guardSidecarPathFor(file))) await ensureGuardSidecar(file);
     } catch { /* best-effort — the hook's currency check is the backstop */ }
-    return { blocks: [text(`✓ brain_note → ${path.basename(file)} (via ${t.how}) · ${bits.join(' · ')}. Reopen the brain in the KLYPIX app to see it.${corr}${rc}`)] };
+    return { blocks: [text(`✓ brain_note → ${path.basename(file)} (via ${t.how}) · ${bits.join(' · ')}. It appears in the brain if it is open in KLYPIX (inside OneDrive or Dropbox, when you next open it).${corr}${rc}`)] };
   } catch (e) {
     return err(`brain_note failed (brain unchanged): ${e.message}`);
   }

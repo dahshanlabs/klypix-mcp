@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "comment": "Shared by klypix-mcp (src/app-lease.mjs) and the KLYPIX desktop app (electron/agentBridge). The app mirrors this file byte-for-byte through scripts/sync-bundled-mcp.mjs; change it only in klypix-mcp.",
+  "protocol": "klypix-app-bridge/1",
+  "canonicalPath": {
+    "rule": "path.resolve; fs.realpathSync.native when the file exists; \"/\" -> \"\\\"; lowercase. sha256 of the UTF-8 result, lowercase hex.",
+    "vectors": [
+      {
+        "input": "C:/Users/Test/Documents/KLYPIX/Launch ideas.klypix",
+        "canonical": "c:\\users\\test\\documents\\klypix\\launch ideas.klypix",
+        "sha256": "a1228c43f60b602d8daa30eaaab7e1b0230a92901d1a7d3dbb8f96a8806c033e"
+      }
+    ]
+  }
+}

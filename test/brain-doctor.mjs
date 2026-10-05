@@ -1280,7 +1280,21 @@ const supervisorReceipt = (brainDir, name, state) => writeJson(path.join(brainDi
   ok(names.includes('project_map_scan'), 'project_map_scan is a registered MCP tool');
   ok(names.includes('project_map_drift'), 'project_map_drift is a registered MCP tool');
   ok(names.includes('brain_reopen'), 'brain_reopen is a registered MCP tool');
-  ok(names.length === 23, `tool manifest is 23 verbs (got ${names.length})`);
+  ok(names.includes('klypix_status'), 'klypix_status is a registered MCP tool');
+  ok(names.includes('read_card_contents'), 'read_card_contents is a registered MCP tool');
+  ok(names.length === 25, `tool manifest is 25 verbs (got ${names.length})`);
+  // Doctor's TOOLS line counts by a static scan; the two app tools register
+  // from app-tools.mjs beside the worker, so the scan must read that file too.
+  {
+    const emptyHome = path.join(vault, '.doctor-tools-home');
+    fs.mkdirSync(emptyHome, { recursive: true });
+    const scanned = inspect({ home: emptyHome, projectDir: vault, fmtLib: null });
+    const toolsLine = render(scanned, { color: false }).split('\n').find(l => /TOOLS/.test(l)) || '';
+    ok(scanned.tools.source === 'package' && scanned.tools.count === 25
+      && scanned.tools.names.includes('klypix_status') && scanned.tools.names.includes('read_card_contents'),
+    `doctor's static tool scan counts 25 and includes both app tools (got ${scanned.tools.count} from ${scanned.tools.source})`);
+    ok(toolsLine.includes('klypix_status') && toolsLine.includes('read_card_contents'), 'doctor\'s TOOLS line lists klypix_status and read_card_contents');
+  }
   // KLYPIX Remote was dropped from the product; its four verbs went with it.
   // Assert their ABSENCE so the removal cannot silently regress — a brain that
   // still advertises them promises a relay that can only fail.

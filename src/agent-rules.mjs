@@ -309,10 +309,33 @@ export function connectCodexMcpServer({ configPath, name = 'klypix-canvas', entr
   };
 }
 
-export function disconnectCodexMcpServer({ configPath } = {}) {
+// The --vault a KLYPIX Codex table passes, or null when it passes none.
+function codexTableVault(block) {
+  const argsLine = String(block || '').match(/^[ \t]*args[ \t]*=[ \t]*\[(.*)\][ \t]*$/m);
+  if (!argsLine) return null;
+  const values = [...argsLine[1].matchAll(/"((?:[^"\\]|\\.)*)"|'([^']*)'/g)].map(m => {
+    if (m[1] === undefined) return m[2];
+    try { return JSON.parse(`"${m[1]}"`); } catch { return m[1]; }
+  });
+  const at = values.indexOf('--vault');
+  return at >= 0 && at + 1 < values.length ? values[at + 1] : null;
+}
+const isAbsoluteAnywhere = (p) => path.win32.isAbsolute(p) || path.posix.isAbsolute(p);
+
+// onlyRelativeVault: remove only the KLYPIX tables whose --vault is RELATIVE
+// (the pre-1.35 global `--vault "."` entry, which a global Codex process
+// resolves from its own install folder). `install` uses it: the table KLYPIX's
+// Settings → Codex button writes carries an absolute vault, and removing it
+// greyed that button. Uninstall still removes every KLYPIX table.
+export function disconnectCodexMcpServer({ configPath, onlyRelativeVault = false } = {}) {
   const parsed = safeReadCodexConfig(configPath);
   if (!parsed.ok) return { ok: false, error: parsed.error };
-  const owned = (parsed.tables || []).filter(t => t.parts[0] === 'mcp_servers' && t.parts.length >= 2 && /klypix/i.test(String(t.parts[1])));
+  const owned = (parsed.tables || []).filter(t => t.parts[0] === 'mcp_servers' && t.parts.length >= 2 && /klypix/i.test(String(t.parts[1])))
+    .filter(t => {
+      if (!onlyRelativeVault) return true;
+      const vault = codexTableVault(parsed.servers[String(t.parts[1])]?.raw ?? parsed.raw.slice(t.start, t.end));
+      return vault != null && !isAbsoluteAnywhere(vault);
+    });
   if (!owned.length) return { ok: true, action: 'unchanged', path: configPath };
   let next = parsed.raw;
   for (const table of [...owned].sort((a, b) => b.start - a.start)) {

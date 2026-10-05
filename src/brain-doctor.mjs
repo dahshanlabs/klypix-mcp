@@ -200,6 +200,12 @@ function inspectTools(brainDir, pkgRoot) {
     // MCP App registers through it; the manifest must count it or doctor drifts.
     const re = /(?:server\.registerTool|registerAppTool)\(\s*(?:server\s*,\s*)?['"]([^'"]+)['"]/g;
     let mm; while ((mm = re.exec(src))) names.push(mm[1]);
+    // klypix_status and read_card_contents register from app-tools.mjs, beside
+    // the worker: the deployed flat copy sits next to the deployed worker, the
+    // package copy in src/. Without this the TOOLS line misses two verbs.
+    const deployed = f.startsWith(brainDir);
+    const appTools = readText(deployed ? path.join(brainDir, 'app-tools.mjs') : path.join(pkgRoot, 'src', 'app-tools.mjs'));
+    if (appTools && names.length) { re.lastIndex = 0; while ((mm = re.exec(appTools))) names.push(mm[1]); }
     const uniqueNames = [...new Set(names)];
     if (uniqueNames.length) return { names: uniqueNames, count: uniqueNames.length, source: f.startsWith(brainDir) ? 'deployed' : 'package', hash: sha(uniqueNames.slice().sort().join(',')).slice(0, 8) };
   }

@@ -967,7 +967,7 @@ keep lazy first-use indexing instead.
   `npx -y klypix-mcp` with no version pinned, and `.codex/config.toml`. The automatic updater does
   the same for every registered project seen in the last 14 days, right after it installs an update
   and otherwise at most once a day. `KLYPIX_AUTO_UPDATE=0` stops the updater's pass. Plugin mode
-  (`KLYPIX_PLUGIN=1`) stops both passes and the registry write to `~/.claude/project-brain`; see
+  (`KLYPIX_PLUGIN=1`) stops both passes and keeps its registry in the plugin's data folder; see
   *Running as a Claude plugin*.
 - **Codex hooks require Codex's own trust approval** and are opt-in via `--codex-hooks`.
 

@@ -56,6 +56,12 @@ try { historyLib = await import('./brain-history.mjs'); } catch { historyLib = n
 // must degrade to omitting the line, never kill the doctor.
 let repoStateLib = null;
 try { repoStateLib = await import('./repo-state.mjs'); } catch { repoStateLib = null; }
+// app-lease reads the file a running KLYPIX app writes (endpoint.json) for the
+// APP BRIDGE line (agent tool parity P1). Same failure-tolerant idiom: a flat
+// bundle that predates it omits the line. Only the endpoint file is read —
+// never the token, and the pipe name is never reported.
+let appLeaseLib = null;
+try { appLeaseLib = await import('./app-lease.mjs'); } catch { appLeaseLib = null; }
 // agent-presence is the CANONICAL owner of the session-liveness rule (freshness
 // windows + dead-host sweep). The doctor deliberately keeps reading lane files
 // directly so it can diagnose a broken bundle, so this import is failure-
@@ -182,6 +188,11 @@ function inspectHooks(home) {
 }
 
 // ── TOOLS (discoverable manifest) layer ──────────────────────────────────────
+// show_in_klypix is app-only: the worker registers it where a KLYPIX app can
+// run (Windows, or KLYPIX_APP_TOOLS=on). The static scan sees the literal
+// registration everywhere, so the count applies the worker's own rule.
+const APP_ONLY_TOOLS = new Set(['show_in_klypix']);
+const appToolsHere = (env = process.env) => process.platform === 'win32' || env.KLYPIX_APP_TOOLS === 'on';
 function inspectTools(brainDir, pkgRoot) {
   // Prefer the DEPLOYED server (what this machine's brain actually exposes); fall back
   // to the running package's server file. Regex the registration list — no import, no
@@ -206,10 +217,36 @@ function inspectTools(brainDir, pkgRoot) {
     const deployed = f.startsWith(brainDir);
     const appTools = readText(deployed ? path.join(brainDir, 'app-tools.mjs') : path.join(pkgRoot, 'src', 'app-tools.mjs'));
     if (appTools && names.length) { re.lastIndex = 0; while ((mm = re.exec(appTools))) names.push(mm[1]); }
-    const uniqueNames = [...new Set(names)];
+    const uniqueNames = [...new Set(names)].filter(n => appToolsHere() || !APP_ONLY_TOOLS.has(n));
     if (uniqueNames.length) return { names: uniqueNames, count: uniqueNames.length, source: f.startsWith(brainDir) ? 'deployed' : 'package', hash: sha(uniqueNames.slice().sort().join(',')).slice(0, 8) };
   }
   return { names: [], count: 0, source: null, hash: null };
+}
+
+// ── APP BRIDGE (advisory) ─────────────────────────────────────────────────────
+// Whether the KLYPIX desktop app is running on this PC and lets AI tools use it
+// (agent tool parity P1), from its endpoint.json alone: running, app version,
+// access on/off, protocol and whether this klypix-mcp speaks it. No connection
+// is made, and the token and the pipe name are never read into this report.
+// Never a verdict layer: KLYPIX closed is a normal state.
+export function inspectAppBridge(env = process.env) {
+  const here = appToolsHere(env);
+  if (!appLeaseLib || typeof appLeaseLib.readEndpoint !== 'function') return { known: false, platform: here };
+  let lease;
+  try { lease = appLeaseLib.readEndpoint(); } catch { return { known: false, platform: here }; }
+  const e = lease?.status === 'live' ? lease.endpoint : null;
+  if (!e) return { known: true, platform: here, running: false, state: here ? (lease?.status === 'stale' ? 'not-running' : 'not-detected') : 'not-on-this-system' };
+  const supported = appLeaseLib.APP_BRIDGE_PROTOCOL || 'klypix-app-bridge/1';
+  return {
+    known: true,
+    platform: here,
+    running: true,
+    state: 'running',
+    appVersion: e.appVersion || null,
+    access: e.access,
+    protocol: e.protocol || null,
+    protocolSupported: e.protocol === supported,
+  };
 }
 
 // ── RUNNING layer (behavioral truth, not a baked stamp) ──────────────────────
@@ -1084,6 +1121,7 @@ export function inspect(opts = {}) {
     catch { provenance = null; }
   }
   const tools = inspectTools(brainDir, PKG_ROOT);
+  const appBridge = inspectAppBridge();
   // ── CHECKOUT (release-state visibility, 2026-08-14 incident) ──────────────
   // Advisory, never a verdict layer: when the PROJECT itself is a versioned
   // source checkout, report mechanically whether HEAD carries its own release
@@ -1348,7 +1386,7 @@ export function inspect(opts = {}) {
   // `checkout` is additive (schema-stable): downstream renderers keep parsing
   // every existing field; it never feeds layers/verdict/actions by design.
   // `doctor`, `engineCode` and `inspectedAt` are additive too (2026-10-03).
-  return { verdict, layers, drifted, readinessWarnings, version, running, supervisors, autoUpdate, hooks, codexSmart, codexHooks, gitCapture, history, provenance, tools, peers, sessions: peers, receipts: peers.receipts, receiptSessionId, harness, npm, decayGuard, mergeEngine, checkout, project: { dir: projectDir, brainPath, hasBrain }, brainDir, actions, doctor, engineCode, inspectedAt: now };
+  return { verdict, layers, drifted, readinessWarnings, version, running, supervisors, autoUpdate, hooks, codexSmart, codexHooks, gitCapture, history, provenance, tools, appBridge, peers, sessions: peers, receipts: peers.receipts, receiptSessionId, harness, npm, decayGuard, mergeEngine, checkout, project: { dir: projectDir, brainPath, hasBrain }, brainDir, actions, doctor, engineCode, inspectedAt: now };
 }
 
 // ── Structured result (E1, 2026-10-03) ──────────────────────────────────────
@@ -1769,6 +1807,17 @@ export function render(r, opts = {}) {
 
   // TOOLS
   L.push(`${ok} ${c.bold}TOOLS${c.rst}    ${r.tools.count} MCP verb(s)${r.tools.hash ? ` ${c.dim}[#${r.tools.hash}, ${r.tools.source}]${c.rst}` : ''}${r.tools.count ? `: ${c.dim}${r.tools.names.join(', ')}${c.rst}` : ''}`);
+
+  // APP BRIDGE (advisory; never the token or the pipe name)
+  if (r.appBridge?.known) {
+    const a = r.appBridge;
+    if (a.running) {
+      const amark = a.protocolSupported === false ? warn : ok;
+      L.push(`${amark} ${c.bold}App bridge${c.rst} KLYPIX ${a.appVersion ? `v${a.appVersion} ` : ''}running · access for AI tools ${a.access} · protocol ${a.protocol || '?'}${a.protocolSupported === false ? ` ${c.yel}(this klypix-mcp speaks a different one — update KLYPIX or klypix-mcp)${c.rst}` : ''}`);
+    } else {
+      L.push(`${ok} ${c.bold}App bridge${c.rst} ${c.dim}${a.state === 'not-on-this-system' ? 'no KLYPIX app on this system (Windows only) — file mode' : a.state === 'not-running' ? 'KLYPIX not running — file mode' : 'KLYPIX not running (or older than the bridge) — file mode'}${c.rst}`);
+    }
+  }
 
   // DECAY-GUARD (fast-decay status claims must stamp as LAST KNOWN, not current)
   if (r.decayGuard) {

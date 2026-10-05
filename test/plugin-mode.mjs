@@ -13,7 +13,8 @@
 //      files, .claude/ ship-observation files). Control: normal mode writes them.
 //   4. Process-private state lands under KLYPIX_PLUGIN_DATA; shared state
 //      (presence lanes) stays in ~/.claude/project-brain as documented.
-//   5. A real stdio handshake against bin/klypix-mcp.mjs: 25 tools, the 23 old
+//   5. A real stdio handshake against bin/klypix-mcp.mjs: 25 tools (26 with
+//      show_in_klypix on Windows), the 23 old
 //      input schemas byte-identical to the 1.91.0 snapshot.
 //   6. Unsubstituted ${...} values are ignored (no folder of that name).
 //   7. No semantic runtime is loaded; `init` and brain_doctor do not advise
@@ -259,8 +260,10 @@ try {
       const { tools } = await client.listTools();
       const byName = new Map(tools.map((t) => [t.name, t]));
       const drifted = snapshot.filter((t) => JSON.stringify(byName.get(t.name)?.inputSchema) !== JSON.stringify(t.inputSchema)).map((t) => t.name);
-      ok(tools.length === 25 && drifted.length === 0 && !byName.has('stub_only'),
-        `stdio handshake on bin/klypix-mcp.mjs: 25 tools, the 23 old schemas equal the 1.91.0 snapshot (drifted: ${drifted.join(', ') || 'none'})`);
+      // show_in_klypix (P1) is app-only: Windows here (KLYPIX_APP_TOOLS is cleared by baseEnv).
+      const expectedTools = process.platform === 'win32' ? 26 : 25;
+      ok(tools.length === expectedTools && drifted.length === 0 && !byName.has('stub_only'),
+        `stdio handshake on bin/klypix-mcp.mjs: ${expectedTools} tools, the 23 old schemas equal the 1.91.0 snapshot (drifted: ${drifted.join(', ') || 'none'})`);
       // A newer install lands while the session is open.
       stubRuntime(box.brainDir, '100.0.0', audit);
       await sleep(1200);

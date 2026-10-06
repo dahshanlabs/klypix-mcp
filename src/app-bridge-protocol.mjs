@@ -120,9 +120,17 @@ export const CODE_SENTENCES = Object.freeze({
   APP_NO_ANSWER: 'KLYPIX stopped answering before it confirmed. Check the canvas in KLYPIX before you ask me again.',
 });
 
-/** KLYPIX's sentence for a code, with {tool} / {canvas} filled in. */
+/** Variants the app distinguishes by a field on the refusal: DAILY_CAP carries
+ *  `cap: "tool" | "total"` (one tool's 20, or the 40 all AI tools share). The
+ *  app's own tell_user always wins; these are the fallbacks. */
+export const VARIANT_SENTENCES = Object.freeze({
+  DAILY_CAP_TOTAL: "AI tools used today's 40 video readings in KLYPIX. Ask again tomorrow, or read the card in KLYPIX yourself.",
+});
+
+/** KLYPIX's sentence for a code, with {tool} / {canvas} filled in.
+ *  vars.cap === 'total' picks the shared-cap wording for DAILY_CAP. */
 export function sentenceFor(code, vars = {}) {
-  const template = CODE_SENTENCES[code];
+  const template = code === 'DAILY_CAP' && vars.cap === 'total' ? VARIANT_SENTENCES.DAILY_CAP_TOTAL : CODE_SENTENCES[code];
   if (!template) return '';
   return template
     .replace(/\{tool\}/g, () => vars.tool || 'this AI tool')

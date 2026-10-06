@@ -47,6 +47,17 @@ for (const [label, bin] of [['supervisor', 'klypix-mcp.mjs'], ['worker', 'klypix
       status: async (_p, ctx) => fakeStatus(ctx),
       read_card_contents: async (p) => {
         seen.reads.push(p);
+        // The canvas is still restoring in KLYPIX (security-review NOT_READY).
+        if (p.card_ids[0] === 'img_1' && p.refresh === true) return { ok: false, code: 'NOT_READY', tell_user: 'KLYPIX is still opening that canvas. Ask me again in a moment.', retry_after_seconds: 3 };
+        // The shared daily cap (cap kind "total", no sentence sent) and a photo KLYPIX did not send.
+        if (p.card_ids[0] === 'vid_1' && p.refresh === true) {
+          return {
+            ok: true, canvas: 'Parity Fixture', truncated: false,
+            results: [{ card_id: 'vid_1', card_type: 'video', status: 'failed', paid_by: 'none', code: 'DAILY_CAP', cap: 'total' },
+              { card_id: 'img_1', card_type: 'image', status: 'full', method: 'image', ran_on: 'this_pc', paid_by: 'ai_tool' }],
+            images_skipped: [{ card_id: 'img_1', reason: 'too_large' }],
+          };
+        }
         return {
           ok: true, canvas: 'Parity Fixture', truncated: false, pinned: 1, undo: 'One Ctrl+Z in KLYPIX removes the readings pinned for this request.',
           results: [{
@@ -67,7 +78,8 @@ for (const [label, bin] of [['supervisor', 'klypix-mcp.mjs'], ['worker', 'klypix
             { id: 'txt_one', type: 'text', title: 'First idea', text: fence('txt_one', 'card text', 'First idea, edited live'), visibility: 'shown', parent_id: null, x: 0, y: 0, w: 200, h: 60, frozen: false, layer: 'default', created_by: 'user' },
             { id: 'txt_in_ideas', type: 'text', title: 'An idea in the box', visibility: 'inside_collapsed_box', parent_id: 'ctn_ideas', x: 0, y: 0, w: 200, h: 60, frozen: false, layer: 'default', created_by: 'user' },
           ],
-          connections: [], view: fakeStatus({ client: { label: 'x' } }).view, total_cards: 2, scope_locked_hidden: 1, next_offset: null, truncated: false,
+          connections: [{ id: 'c1', from: 'txt_one', to: 'txt_in_ideas' }], connections_truncated: true,
+          view: fakeStatus({ client: { label: 'x' } }).view, total_cards: 2, scope_locked_hidden: 1, next_offset: null, truncated: false,
         };
       },
       lens: async (p) => { seen.lenses.push(p); return { ok: true, canvas: 'Parity Fixture', lens: 'freshness', legend: [{ label: 'this week' }, { label: 'older' }], cards: [{ id: 'txt_tags', label: 'this week', color: '#10b981', emphasis: 'glow' }], glowing: ['txt_tags'], headlines: fence('lens', 'card headlines', 'txt_tags: Plan for launch') }; },
@@ -112,6 +124,18 @@ for (const [label, bin] of [['supervisor', 'klypix-mcp.mjs'], ['worker', 'klypix
       `[${label}] the reading is fenced as data and says who paid`);
     ok(!rd.content.some(c => c.type === 'text' && c.text.startsWith('Tell the user:')) && !/^Tell the user:/m.test(rdText), `[${label}] content cannot speak as KLYPIX: no "Tell the user" line`);
     ok(seen.reads.at(-1)?.canvas === fixture && JSON.stringify(seen.reads.at(-1)?.card_ids) === '["lnk_unread"]', `[${label}] KLYPIX was asked for that canvas by its path and those cards`);
+    // Review-fix protocol additions: NOT_READY is "ask again shortly"; DAILY_CAP
+    // names which cap; images_skipped is reported per card.
+    const notReady = await call('read_card_contents', { canvas: 'Parity Fixture', card_ids: ['img_1'], refresh: true });
+    ok(notReady.isError === true && notReady.structuredContent?.code === 'NOT_READY' && notReady.structuredContent?.status === 'not_ready'
+      && notReady.structuredContent?.retry_after_seconds === 3 && /call again with the same arguments in about 3 seconds/.test(textOf(notReady))
+      && textOf(notReady).includes('Tell the user: KLYPIX is still opening that canvas.'),
+    `[${label}] NOT_READY (canvas still restoring): retry_after_seconds and KLYPIX's sentence, nothing done`);
+    const capped = await call('read_card_contents', { canvas: 'Parity Fixture', card_ids: ['vid_1', 'img_1'], refresh: true });
+    const cr = capped.structuredContent?.results || [];
+    ok(!capped.isError && cr[0]?.code === 'DAILY_CAP' && cr[0]?.tell_user?.startsWith("AI tools used today's 40 video readings")
+      && JSON.stringify(capped.structuredContent?.images_skipped) === '["img_1"]' && /KLYPIX did not send this photo/.test(textOf(capped)),
+    `[${label}] the shared daily cap gets its own sentence, and a photo KLYPIX did not send is named`);
 
     // ── read_canvas: live ───────────────────────────────────────────────────
     const rc = await call('read_canvas', { canvas: 'Plain board' });
@@ -119,6 +143,7 @@ for (const [label, bin] of [['supervisor', 'klypix-mcp.mjs'], ['worker', 'klypix
     ok(!rc.isError && rc.structuredContent?.mode === 'app' && /Read live from KLYPIX/.test(rcText) && rcText.includes('First idea, edited live')
       && /inside a collapsed box/.test(rcText) && rc.structuredContent?.cards?.length === 2 && !('text' in rc.structuredContent.cards[0]),
     `[${label}] read_canvas on an open canvas is live: unsaved text, each card's visibility`);
+    ok(rc.structuredContent?.connections_truncated === true && /more than KLYPIX sends in one answer/.test(rcText), `[${label}] connections_truncated is passed on and said`);
     const rcClosed = await call('read_canvas', { canvas: 'Closed board' });
     ok(!rcClosed.isError && !rcClosed.structuredContent && /First idea/.test(textOf(rcClosed)) && seen.readCanvas.length === 1, `[${label}] a canvas KLYPIX does not hold is read from its saved file`);
 

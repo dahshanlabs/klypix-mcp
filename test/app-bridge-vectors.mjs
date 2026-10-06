@@ -14,7 +14,7 @@ import { fileURLToPath } from 'node:url';
 import {
   BRIDGE_PROTOCOL, CALL_DEADLINE_MS, CAPS, CLIENT_KEY, CLIENT_LABELS, CODE_SENTENCES, FrameDecoder, FrameError, HANDSHAKE_TIMEOUT_MS,
   IDLE_TIMEOUT_MS, MAX_CONNECTIONS, MAX_CONNECTIONS_PER_CLIENT, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, METHODS, PAID_BY, VISIBILITY,
-  clientKeyFromName, clientLabelFor, encodeFrame, isAllowedPipePath, proofC, proofS, proofsMatch,
+  clientKeyFromName, clientLabelFor, encodeFrame, isAllowedPipePath, proofC, proofS, proofsMatch, sentenceFor,
 } from '../src/app-bridge-protocol.mjs';
 import { APP_BRIDGE_PROTOCOL, pathHash } from '../src/app-lease.mjs';
 import { ENDPOINT_FILE, TOKEN_FILE } from '../src/app-bridge-client.mjs';
@@ -98,6 +98,9 @@ ok(Array.isArray(v.canonicalPath?.vectors) && v.canonicalPath.vectors.every(x =>
 ok(CODE_SENTENCES.ACCESS_OFF === 'AI tools are turned off in KLYPIX (Settings → Project). Turn them on there, then ask me again.'
   && CODE_SENTENCES.BLOCKED === 'You blocked {tool} in KLYPIX. Unblock it in Settings → Project if you want me to continue.',
 'ACCESS_OFF and BLOCKED say what the founder decided (D1, 2026-10-05)');
+ok(sentenceFor('DAILY_CAP', { tool: 'Codex' }) === "Codex used today's 20 video readings in KLYPIX. Ask again tomorrow, or read the card in KLYPIX yourself."
+  && sentenceFor('DAILY_CAP', { tool: 'Codex', cap: 'total' }).startsWith("AI tools used today's 40 video readings"),
+'DAILY_CAP has distinct sentences for this tool\'s cap and the cap all AI tools share');
 ok(!('NOT_ALLOWED' in CODE_SENTENCES) && !('WAITING_FOR_USER' in CODE_SENTENCES) && !('DENIED' in CODE_SENTENCES), 'no pairing codes survive in P1');
 ok(Object.values(CODE_SENTENCES).every(s => !/never forgets|every agent|all coding agents|end-to-end/i.test(s)), 'no sentence makes a banned claim');
 

@@ -771,6 +771,20 @@ export async function readCardContents({ vault, canvas, card_ids, read_new, refr
     }
   }
 
+  // A host or model that reads only structuredContent (or only a result's
+  // `text`) must still learn a file exists. So a result with no words of its
+  // own — a PDF or Office file handed over by path, an unread audio or video —
+  // carries its card's plain notes as its text: where the file is and how to
+  // open it, and the honest "not read yet, do not describe it" line for audio
+  // and video. A result WITH words (a saved preview, a cut text file) keeps
+  // exactly those words, cut to max_chars, and its path in `file.path`.
+  // results[i] and sections[i] are the same card (pushed together above).
+  results.forEach((r, i) => {
+    if (r.text) return;
+    const notes = (sections[i]?.lines || []).filter(l => typeof l === 'string' && l && !l.includes('[content from card'));
+    if (notes.length) r.text = notes.join('\n');
+  });
+
   // `file` was attached by reference so the image phase could fill it in; drop
   // the ones that stayed empty (cards with no file).
   for (const r of results) if (r.file && !Object.keys(r.file).length) delete r.file;
@@ -794,20 +808,29 @@ const NOT_READY_RETRY_SECONDS = 5;
 const oneLine = (s, max = 600) => (typeof s === 'string' ? s.replace(/\s+/g, ' ').trim().slice(0, max) : '');
 
 // A refusal from KLYPIX (or from the bridge client on its behalf), as a tool result.
+// NOT_READY (KLYPIX is starting, or still restoring that canvas) is a "try
+// again shortly", like still_reading: nothing was done, and the answer says
+// when to ask again (retry_after_seconds), so a tool does not give up on it.
 function appRefusal(outcome, { first, tool = 'this AI tool', structured = {} } = {}) {
   const code = typeof outcome?.code === 'string' && outcome.code ? outcome.code : 'FAILED';
-  const tell = oneLine(outcome?.tell_user) || sayNow(code, { tool }) || null;
-  const retry = code === 'NOT_READY' ? NOT_READY_RETRY_SECONDS : Number(outcome?.retry_after_seconds) || null;
+  const cap = outcome?.cap === 'total' || outcome?.cap === 'tool' ? outcome.cap : undefined;
+  const tell = oneLine(outcome?.tell_user) || sayNow(code, { tool, cap }) || null;
+  const notReady = code === 'NOT_READY';
+  const retry = notReady
+    ? Math.max(1, Math.min(60, Number(outcome?.retry_after_seconds) || NOT_READY_RETRY_SECONDS))
+    : Number(outcome?.retry_after_seconds) || null;
+  const lead = first || `KLYPIX did not do that (${code}).`;
   return envelope({
     ok: false,
     mode: 'app',
     code,
     tell_user: tell,
-    text: first || `KLYPIX did not do that (${code}).`,
+    text: notReady ? `${lead} KLYPIX is not ready yet (it is starting, or still opening that canvas): call again with the same arguments in about ${retry} seconds.` : lead,
     structured: {
+      ...(notReady ? { status: 'not_ready' } : {}),
       ...(typeof outcome?.request_id === 'string' ? { request_id: outcome.request_id } : {}),
       ...(retry ? { retry_after_seconds: retry } : {}),
-      ...(typeof outcome?.cap === 'string' ? { cap: outcome.cap } : {}),
+      ...(cap ? { cap } : {}),
       ...structured,
     },
   });
@@ -932,9 +955,13 @@ async function appReadEnvelope(outcome, { tool }) {
       } catch { /* the note above stands */ }
     }
   }
-  for (const id of Array.isArray(outcome.images_skipped) ? outcome.images_skipped : []) {
-    const lines = notes.get(String(id));
-    if (lines) lines.push('KLYPIX did not send this photo: it is larger than the 5 MB an AI tool is handed in one answer.');
+  // images_skipped: photos KLYPIX read but did not send (over its 5 MB / 8-image
+  // bounds). Card ids, or { card_id, reason } — either is accepted.
+  const skippedImages = (Array.isArray(outcome.images_skipped) ? outcome.images_skipped : [])
+    .map(x => (x && typeof x === 'object' ? String(x.card_id ?? '') : String(x))).filter(Boolean);
+  for (const id of skippedImages) {
+    const lines = notes.get(id);
+    if (lines) lines.push('KLYPIX did not send this photo: it is over what KLYPIX hands an AI tool in one answer (5 MB a photo, 8 photos). Ask for this card on its own, or open it in KLYPIX.');
   }
 
   const sections = [];
@@ -958,7 +985,13 @@ async function appReadEnvelope(outcome, { tool }) {
     if (typeof r.text === 'string' && r.text) lines.push(escapeInstructionLines(r.text));
     lines.push(...(notes.get(id) || []));
     sections.push(lines.join('\n'));
-    const t = oneLine(r.tell_user);
+    // As in file mode: a result without words of its own still says, in its
+    // `text`, whether its photo is attached or where the full-size file is.
+    const own = notes.get(id) || [];
+    if (!r.text && own.length) r.text = own.join('\n');
+    // KLYPIX's own per-card sentence; when one is missing, the sentence for its
+    // code (DAILY_CAP names which cap: this tool's 20 or the 40 all tools share).
+    const t = oneLine(r.tell_user) || (typeof r.code === 'string' ? sayNow(r.code, { tool, cap: r.cap === 'total' ? 'total' : undefined }) : '');
     if (t) { r.tell_user = t; sentences.push(t); }
   }
   const outer = oneLine(outcome.tell_user);
@@ -982,7 +1015,7 @@ async function appReadEnvelope(outcome, { tool }) {
       results,
       truncated: !!outcome.truncated,
       ...(pinned ? { pinned, ...(undo ? { undo } : {}) } : {}),
-      ...(Array.isArray(outcome.images_skipped) && outcome.images_skipped.length ? { images_skipped: outcome.images_skipped.map(String) } : {}),
+      ...(skippedImages.length ? { images_skipped: skippedImages } : {}),
     },
   });
 }

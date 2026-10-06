@@ -3237,10 +3237,11 @@ export function reopenQuestion(candidate, { senderLabel = 'another session', sta
   const entry = candidate?.entry || {};
   const who = `${candidate?.hostLabel || 'The'} session ${String(entry.id || '').slice(0, 8)}${entry.intent ? ` ("${neutralizeMarkers(String(entry.intent).slice(0, 70))}")` : ''}`;
   const notes = candidate?.waitingNotes?.length || 0;
-  const state = candidate?.endedAt ? `closed ${agoLabel(now - candidate.endedAt)}` : `not running (last seen ${agoLabel(now - Number(candidate?.lastSeen || now))})`;
+  // "was closed 2m ago" / "is not running (last seen 2m ago)": the verb belongs to each state (1.91.0 read "is closed 2m ago")
+  const state = candidate?.endedAt ? `was closed ${agoLabel(now - candidate.endedAt)}` : `is not running (last seen ${agoLabel(now - Number(candidate?.lastSeen || now))})`;
   const days = candidate?.expiresAt ? Math.max(1, Math.round((candidate.expiresAt - now) / 86_400_000)) : 7;
   return [
-    `${who} is ${state}, and ${notes === 1 ? 'a note' : `${notes} notes`} from ${senderLabel} ${notes === 1 ? 'is' : 'are'} waiting for it.`,
+    `${who} ${state}, and ${notes === 1 ? 'a note' : `${notes} notes`} from ${senderLabel} ${notes === 1 ? 'is' : 'are'} waiting for it.`,
     `Reopen it now in a new terminal${candidate?.cwd ? ` (in ${candidate.cwd})` : ''} so it gets ${notes === 1 ? 'the note' : 'them'}?${start ? ' It starts on the note right away.' : ''}`,
     `If it waits, the note stays queued for ${days} more day${days === 1 ? '' : 's'} and is delivered when that session is next used.`,
   ].join('\n');

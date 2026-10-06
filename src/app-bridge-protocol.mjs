@@ -42,6 +42,14 @@ export const CALL_DEADLINE_MS = 45_000;
 /** Connections one AI tool (clientKey) may hold at once, and in all. */
 export const MAX_CONNECTIONS_PER_CLIENT = 8;
 export const MAX_CONNECTIONS = 32;
+/** Calls one connection may have in flight (TOO_MANY_CALLS past it). This
+ *  client runs one call per connection, so it never reaches it. */
+export const MAX_CALLS_PER_CONNECTION = 4;
+/** While this many answer bytes wait to be written, the app stops reading. */
+export const MAX_QUEUED_WRITE_BYTES = 32 * 1024 * 1024;
+/** endpoint.json's `features`: a KLYPIX that writes the lease but has no pipe
+ *  lacks "bridge", and gets APP_UPDATE_REQUIRED, not ACCESS_OFF. */
+export const ENDPOINT_FEATURES = Object.freeze(['bridge']);
 /** How long a still-running read tells the AI tool to wait before asking again. */
 export const RETRY_AFTER_SECONDS = 15;
 
@@ -58,6 +66,21 @@ export const CAPS = Object.freeze({
   maxImages: 8,
   maxImageBytes: 5 * 1024 * 1024,
   maxAnswerChars: 48_000,
+  maxImageTotalBytes: 11 * 1024 * 1024,
+});
+
+/** DAILY_CAP's cap kinds, and why a returned reading was not pinned. */
+export const CAP_KINDS = Object.freeze(['tool', 'total']);
+export const PIN_SKIPPED = Object.freeze(['FROZEN', 'OFF', 'CANCELLED', 'CHANGED']);
+
+/** The parameters main forwards for each method (anything else is dropped). */
+export const METHOD_PARAMS = Object.freeze({
+  status: [],
+  read_canvas: ['canvas', 'offset', 'limit', 'max_chars_per_card', 'shown_only'],
+  lens: ['canvas', 'lens', 'root'],
+  read_card_contents: ['canvas', 'card_ids', 'read_new', 'refresh', 'pin_result', 'entry_paths', 'max_chars', 'wait_seconds'],
+  add_to_canvas: ['canvas', 'cards', 'connections'],
+  show_in_klypix: ['canvas', 'card_ids', 'banner', 'bring_to_front'],
 });
 
 /** The methods a client may call after the handshake. */
@@ -80,6 +103,7 @@ export const RPC_ERRORS = Object.freeze({
   AUTH_FAILED: -32001,
   PROTOCOL_MISMATCH: -32002,
   TOO_MANY_CONNECTIONS: -32003,
+  TOO_MANY_CALLS: -32004,
 });
 
 // ── What KLYPIX says to the person ───────────────────────────────────────────
@@ -115,6 +139,8 @@ export const CODE_SENTENCES = Object.freeze({
   NOT_EMBEDDED: 'That card points to a file on this PC instead of carrying it, so KLYPIX does not open it for AI tools. Drop the file onto the canvas to embed it, then ask me again.',
   CONSENT_NEEDED: 'KLYPIX could read only the caption and cover picture. To let it watch reels, read one reel yourself in KLYPIX (Read contents) once and allow the video helper.',
   UNSUPPORTED: 'KLYPIX has no reader for this kind of card.',
+  CANCELLED: 'The request was stopped in KLYPIX, so nothing was added.',
+  BAD_PATH: 'KLYPIX opens only a canvas file on this PC (.klypix), not one on a network drive or path.',
   // Only this client says these: the app never received the request.
   APP_UNVERIFIED: 'Something other than KLYPIX answered on KLYPIX\'s connection, so I sent it nothing. Quit and reopen KLYPIX, then ask me again.',
   APP_NO_ANSWER: 'KLYPIX stopped answering before it confirmed. Check the canvas in KLYPIX before you ask me again.',

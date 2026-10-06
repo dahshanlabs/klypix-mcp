@@ -136,6 +136,51 @@ seen.push(...secretsOf(app));
   app.writeEndpoint();
 }
 
+// ── A KLYPIX without the bridge (a lease-only build) ─────────────────────────
+{
+  const ep = JSON.parse(fs.readFileSync(path.join(dir, 'endpoint.json'), 'utf8'));
+  const { features: _f, ...noFeatures } = ep;
+  fs.writeFileSync(path.join(dir, 'endpoint.json'), JSON.stringify({ ...noFeatures, access: 'off' }));
+  const before = app.log.connections;
+  const r = await call('status');
+  ok(r.reached === false && r.outcome.code === 'APP_UPDATE_REQUIRED' && app.log.connections === before,
+    'endpoint.json without features ["bridge"] (a lease-only KLYPIX) → APP_UPDATE_REQUIRED, not ACCESS_OFF, and no connection');
+  app.writeEndpoint();
+}
+
+// ── cancel { request_id } stops a read that already answered still_reading ───
+{
+  const origRead = handlers.read_card_contents;
+  let stopped = false;
+  handlers.read_card_contents = async (p, { client, jobs }) => {
+    if (p.card_ids?.[0] === 'bg') {
+      jobs.set('req_bg1', { key: client.key, abort: () => { stopped = true; } });
+      return { ok: true, status: 'still_reading', retry_after_seconds: 15, request_id: 'req_bg1', results: [] };
+    }
+    if (p.card_ids?.[0] === 'bg-wait') { await sleep(5000); return { ok: true, results: [] }; }
+    return { ok: true, results: [] };
+  };
+  const first = await call('read_card_contents', { canvas: 'C:/Board.klypix', card_ids: ['bg'] });
+  ok(first.outcome.status === 'still_reading' && first.outcome.request_id === 'req_bg1', 'a read answers still_reading with its request_id');
+  // The repeat attaches (here: a call that waits); the host cancels it.
+  handlers.read_card_contents = async (_p, { signal }) => { await new Promise(r => { signal.addEventListener('abort', r, { once: true }); setTimeout(r, 5000); }); return { ok: true, results: [] }; };
+  const ctl = new AbortController();
+  setTimeout(() => ctl.abort(), 300);
+  const again = await call('read_card_contents', { canvas: 'c:/board.klypix', card_ids: ['bg'] }, { signal: ctl.signal });
+  await sleep(100);
+  const jobCancel = app.log.cancels.find(c => c.request_id === 'req_bg1');
+  ok(again.outcome.code === 'CANCELLED' && jobCancel?.found === true && stopped === true,
+    'a host cancel of the repeat also sends cancel { request_id }, which stops the read itself (same canvas, spelled differently)');
+  // Another tool cannot stop it.
+  app.state.jobs.set('req_other', { key: 'someone-else', abort: () => { throw new Error('must not run'); } });
+  const ctl2 = new AbortController();
+  const p2 = call('read_card_contents', { canvas: 'C:/Other.klypix', card_ids: ['x'] }, { signal: ctl2.signal });
+  setTimeout(() => ctl2.abort(), 200);
+  await p2;
+  ok(!app.log.cancels.some(c => c.request_id === 'req_other'), 'a read this client never started is never named in a cancel');
+  handlers.read_card_contents = origRead;
+}
+
 // ── Deadline → still_reading; repeat attaches ────────────────────────────────
 {
   const t0 = Date.now();

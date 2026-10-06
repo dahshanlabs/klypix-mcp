@@ -1310,7 +1310,7 @@ const supervisorReceipt = (brainDir, name, state) => writeJson(path.join(brainDi
     process.env.KLYPIX_APP_BRIDGE_DIR = bridgeDir;
     const pipeName = 'klypix-agent-SECRETPIPE0123456789';
     const tokenValue = 'ab'.repeat(32);
-    fs.writeFileSync(path.join(bridgeDir, 'endpoint.json'), JSON.stringify({ v: 1, protocol: 'klypix-app-bridge/1', pid: process.pid, appVersion: '1.3.200', startedAt: new Date().toISOString(), access: 'on', pipe: pipeName, openFiles: [] }));
+    fs.writeFileSync(path.join(bridgeDir, 'endpoint.json'), JSON.stringify({ v: 1, protocol: 'klypix-app-bridge/1', pid: process.pid, appVersion: '1.3.200', startedAt: new Date().toISOString(), access: 'on', pipe: pipeName, openFiles: [], features: ['bridge'] }));
     fs.writeFileSync(path.join(bridgeDir, 'token'), tokenValue);
     const live = inspect({ home: emptyHome, projectDir: vault, fmtLib: null });
     const liveText = render(live, { color: false });

@@ -17,7 +17,11 @@
     "defaultDir": "%APPDATA%\\klypix\\agent-bridge",
     "endpointFile": "endpoint.json",
     "tokenFile": "token",
-    "tokenDefaultDir": "%LOCALAPPDATA%\\klypix\\agent-bridge"
+    "tokenDefaultDir": "%LOCALAPPDATA%\\klypix\\agent-bridge",
+    "tokenDirRule": "KLYPIX_APP_BRIDGE_DIR when set (development builds and tests), else %LOCALAPPDATA%\\klypix\\agent-bridge; a packaged app ignores the variable for the token",
+    "endpointFeatures": [
+      "bridge"
+    ]
   },
   "framing": {
     "lengthPrefix": "uint32le",
@@ -28,7 +32,9 @@
     "handshakeTimeoutMs": 5000,
     "callDeadlineMs": 45000,
     "maxConnectionsPerClient": 8,
-    "maxConnections": 32
+    "maxConnections": 32,
+    "maxCallsPerConnection": 4,
+    "maxQueuedWriteBytes": 33554432
   },
   "frames": [
     {
@@ -211,7 +217,8 @@
     "maxAddCards": 50,
     "maxImages": 8,
     "maxImageBytes": 5242880,
-    "maxAnswerChars": 48000
+    "maxAnswerChars": 48000,
+    "maxImageTotalBytes": 11534336
   },
   "paidBy": [
     "none",
@@ -224,5 +231,63 @@
     "hidden_by_filter",
     "inside_collapsed_box",
     "off_screen"
-  ]
+  ],
+  "rpcErrors": {
+    "parse": -32700,
+    "invalidRequest": -32600,
+    "methodNotFound": -32601,
+    "invalidParams": -32602,
+    "internal": -32603,
+    "authFailed": -32001,
+    "protocolMismatch": -32002,
+    "tooManyConnections": -32003,
+    "tooManyCalls": -32004
+  },
+  "params": {
+    "status": [],
+    "read_canvas": [
+      "canvas",
+      "offset",
+      "limit",
+      "max_chars_per_card",
+      "shown_only"
+    ],
+    "lens": [
+      "canvas",
+      "lens",
+      "root"
+    ],
+    "read_card_contents": [
+      "canvas",
+      "card_ids",
+      "read_new",
+      "refresh",
+      "pin_result",
+      "entry_paths",
+      "max_chars",
+      "wait_seconds"
+    ],
+    "add_to_canvas": [
+      "canvas",
+      "cards",
+      "connections"
+    ],
+    "show_in_klypix": [
+      "canvas",
+      "card_ids",
+      "banner",
+      "bring_to_front"
+    ]
+  },
+  "capKinds": [
+    "tool",
+    "total"
+  ],
+  "pinSkipped": [
+    "FROZEN",
+    "OFF",
+    "CANCELLED",
+    "CHANGED"
+  ],
+  "readKeyCanvas": "path: sha256 of the canonical path (the lease hash); title: lowercased title; active: none given"
 }

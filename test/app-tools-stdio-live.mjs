@@ -22,6 +22,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { buildParityFixture, buildPlainCanvas } from './_parity-fixture.mjs';
 import { startFakeApp, fakeStatus, fence } from './_fake-app-bridge.mjs';
+import { pathHash } from '../src/app-lease.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, '..');
@@ -44,7 +45,7 @@ for (const [label, bin] of [['supervisor', 'klypix-mcp.mjs'], ['worker', 'klypix
     dir: bridge,
     openFiles: [fixture, plain],
     handlers: {
-      status: async (_p, ctx) => fakeStatus(ctx),
+      status: async (_p, ctx) => fakeStatus(ctx, { activeFile: plain }),
       read_card_contents: async (p) => {
         seen.reads.push(p);
         // The canvas is still restoring in KLYPIX (security-review NOT_READY).
@@ -73,10 +74,10 @@ for (const [label, bin] of [['supervisor', 'klypix-mcp.mjs'], ['worker', 'klypix
       read_canvas: async (p) => {
         seen.readCanvas.push(p);
         return {
-          ok: true, canvas: { title: 'Plain board', path: plain, unsaved: true },
+          ok: true, canvas: { title: 'Plain board', path_hash: pathHash(plain), unsaved: true }, note: 'Read live from KLYPIX, unsaved changes included.', locked_layers: ['agent'],
           cards: [
-            { id: 'txt_one', type: 'text', title: 'First idea', text: fence('txt_one', 'card text', 'First idea, edited live'), visibility: 'shown', parent_id: null, x: 0, y: 0, w: 200, h: 60, frozen: false, layer: 'default', created_by: 'user' },
-            { id: 'txt_in_ideas', type: 'text', title: 'An idea in the box', visibility: 'inside_collapsed_box', parent_id: 'ctn_ideas', x: 0, y: 0, w: 200, h: 60, frozen: false, layer: 'default', created_by: 'user' },
+            { id: 'txt_one', type: 'text', text: fence('txt_one', 'card text', 'First idea, edited live'), visibility: 'shown', parent_id: null, x: 0, y: 0, w: 200, h: 60, frozen: false, layer: 'default', created_by: 'user' },
+            { id: 'txt_in_ideas', type: 'text', visibility: 'inside_collapsed_box', parent_id: 'ctn_ideas', x: 0, y: 0, w: 200, h: 60, frozen: false, layer: 'default', created_by: 'user' },
           ],
           connections: [{ id: 'c1', from: 'txt_one', to: 'txt_in_ideas' }], connections_truncated: true,
           view: fakeStatus({ client: { label: 'x' } }).view, total_cards: 2, scope_locked_hidden: 1, next_offset: null, truncated: false,
@@ -107,8 +108,12 @@ for (const [label, bin] of [['supervisor', 'klypix-mcp.mjs'], ['worker', 'klypix
     ok(sc.active_canvas?.title === 'Plain board' && sc.active_canvas.unsaved === true && JSON.stringify(sc.selection) === '["txt_one"]'
       && sc.view?.lens?.name === 'freshness' && sc.readiness?.ai_credential === 'own_gemini_key',
     `[${label}] it reports the canvas in front of the person, the selection, the view and readiness`);
-    ok(sc.this_tool?.cloud_readings_today === 3 && sc.this_tool?.cloud_readings_left_today === 17 && sc.caps?.cloud_per_tool_per_day === 20,
-      `[${label}] and the Gemini readings this tool has left today (17 of 20)`);
+    ok(sc.this_tool?.cloud_readings_today === 3 && sc.this_tool?.readings_left === 17 && sc.this_tool?.readings_left_total === 12
+      && sc.this_tool?.cloud_readings_left_today === 12 && sc.caps?.readings_left_total === 12
+      && textOf(st).includes("17 of this tool's 20 left, 12 of the 40 all AI tools share left (so 12 for this tool)"),
+    `[${label}] and both readings left today: 17 of this tool's 20, 12 of the shared 40 (so 12 usable)`);
+    ok(sc.active_canvas?.path === plain.split(path.sep).join('/') && sc.active_canvas?.path_hash === pathHash(plain) && sc.open_canvases?.[0]?.path === sc.active_canvas.path,
+      `[${label}] KLYPIX names canvases by path_hash; the client maps it to the file it reads`);
     ok(/lens: freshness/.test(textOf(st)) && /status filter hides: done/.test(textOf(st)) && /1 collapsed box/.test(textOf(st)), `[${label}] the text summarises the person's view`);
     const hello = app.log.hellos.at(-1);
     ok(hello.clientName === clientName && hello.clientKey === clientName && hello.clientVersion === '9.9.9', `[${label}] the bridge got the raw clientInfo name and version, and the strict key`);
@@ -141,7 +146,9 @@ for (const [label, bin] of [['supervisor', 'klypix-mcp.mjs'], ['worker', 'klypix
     const rc = await call('read_canvas', { canvas: 'Plain board' });
     const rcText = textOf(rc);
     ok(!rc.isError && rc.structuredContent?.mode === 'app' && /Read live from KLYPIX/.test(rcText) && rcText.includes('First idea, edited live')
-      && /inside a collapsed box/.test(rcText) && rc.structuredContent?.cards?.length === 2 && !('text' in rc.structuredContent.cards[0]),
+      && /inside a collapsed box/.test(rcText) && rc.structuredContent?.cards?.length === 2 && !('text' in rc.structuredContent.cards[0])
+      && rc.structuredContent?.canvas?.path === plain.split(path.sep).join('/') && JSON.stringify(rc.structuredContent?.locked_layers) === '["agent"]'
+      && !/^### First idea/m.test(rcText),
     `[${label}] read_canvas on an open canvas is live: unsaved text, each card's visibility`);
     ok(rc.structuredContent?.connections_truncated === true && /more than KLYPIX sends in one answer/.test(rcText), `[${label}] connections_truncated is passed on and said`);
     const rcClosed = await call('read_canvas', { canvas: 'Closed board' });

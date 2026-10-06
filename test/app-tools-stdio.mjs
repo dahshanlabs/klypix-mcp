@@ -68,10 +68,9 @@ for (const [label, bin] of [['supervisor', 'klypix-mcp.mjs'], ['worker', 'klypix
     const before = fs.readFileSync(file);
     const refused = await client.callTool({ name: 'add_to_canvas', arguments: { canvas: 'Parity Fixture', cards: [{ text: 'must not land' }] } });
     const last = refused.content[refused.content.length - 1];
-    // The lease says access 'off'. Where a KLYPIX app can run (P1), the refusal
-    // names that switch (KLYPIX could take the cards live if AI tools were on);
-    // elsewhere it is P0's OPEN_IN_APP. Either way nothing is written.
-    const refusedCode = process.platform === 'win32' ? 'ACCESS_OFF' : 'OPEN_IN_APP';
+    // This lease is a P0 KLYPIX's: no "bridge" feature, so it cannot take cards
+    // live; P0's OPEN_IN_APP (close the tab) is the step that works. Nothing is written.
+    const refusedCode = 'OPEN_IN_APP';
     ok(refused.isError === true && refused.structuredContent?.code === refusedCode && refused.structuredContent?.ok === false, `[${label}] add_to_canvas on the open canvas: isError, code ${refusedCode} (got ${refused.structuredContent?.code})`);
     ok(last?.type === 'text' && last.text.startsWith('Tell the user:'), `[${label}] its last line starts "Tell the user:"`);
     ok(fs.readFileSync(file).equals(before), `[${label}] and the file is byte-identical`);

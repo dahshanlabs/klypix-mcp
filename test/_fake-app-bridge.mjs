@@ -39,10 +39,12 @@ const refusal = (code, tell) => ({ ok: false, mode: 'app', code, tell_user: tell
  */
 export async function startFakeApp({
   dir, handlers = {}, openFiles = [], access = 'on', protocol = BRIDGE_PROTOCOL, appVersion = '1.3.200',
-  pid = process.pid, squatter = false, serverToken = null, writeTokenFile = true,
+  pid = process.pid, squatter = false, serverToken = null, writeTokenFile = true, features = ['bridge'],
 } = {}) {
   fs.mkdirSync(dir, { recursive: true });
   const state = {
+    features,                  // endpoint.json `features` (null = a lease-only KLYPIX)
+    jobs: new Map(),           // request_id → { key, abort } for reads that answered still_reading
     token: newToken(),
     serverToken,               // when set, the server proves/accepts THIS token instead of the file's
     access,
@@ -71,6 +73,7 @@ export async function startFakeApp({
       v: 1, protocol: state.protocol, pid, appVersion, startedAt: new Date().toISOString(),
       access: state.access, ...(state.access === 'on' && pipe ? { pipe } : {}),
       openFiles: openFiles.map(p => pathHash(p)).sort(),
+      ...(state.features ? { features: state.features } : {}),
     };
     fs.writeFileSync(path.join(dir, 'endpoint.json'), JSON.stringify(body, null, 2));
   };
@@ -126,6 +129,16 @@ export async function startFakeApp({
         } else if (stage === 'ready') {
           log.calls.push({ method: m.method, params: m.params, key: client.key, name: client.name });
           if (m.method === 'cancel') {
+            // Revision 2b: { request_id } stops a read that already answered
+            // still_reading, and only the tool that started it may.
+            if (typeof m.params?.request_id === 'string') {
+              const job = state.jobs.get(m.params.request_id);
+              const found = !!job && job.key === client.key;
+              log.cancels.push({ request_id: m.params.request_id, found });
+              if (found) { job.abort(); state.jobs.delete(m.params.request_id); }
+              send({ jsonrpc: '2.0', id: m.id, result: { ok: true, mode: 'app', cancelled: found } });
+              continue;
+            }
             const target = m.params?.id;
             const ctl = inflight.get(target);
             log.cancels.push({ target, found: !!ctl });
@@ -142,7 +155,7 @@ export async function startFakeApp({
           const ctl = new AbortController();
           inflight.set(m.id, ctl);
           Promise.resolve()
-            .then(() => handler(m.params || {}, { client, signal: ctl.signal, id: m.id }))
+            .then(() => handler(m.params || {}, { client, signal: ctl.signal, id: m.id, jobs: state.jobs }))
             .then((result) => send({ jsonrpc: '2.0', id: m.id, result: { mode: 'app', ...result } }),
               () => send({ jsonrpc: '2.0', id: m.id, error: { code: RPC_ERRORS.INTERNAL, message: 'internal error' } }))
             .finally(() => inflight.delete(m.id));
@@ -203,12 +216,14 @@ export async function startFakeApp({
 }
 
 // ── Realistic answers (shapes from the app's src/agentBridge/*.ts) ───────────
-export const fakeStatus = ({ client }) => ({
+// Revision 2 shape: canvases by path_hash (never a path); readings left of the
+// tool's 20 and of the 40 all tools share.
+export const fakeStatus = ({ client }, { activeFile = 'C:/fake/Plain board.klypix' } = {}) => ({
   ok: true,
   app: { running: true, version: '1.3.200', platform: 'win32', reel_helper_ready: true, access: 'on' },
-  this_tool: { label: client.label, blocked: false, cloud_readings_today: 3 },
-  active_canvas: { title: 'Plain board', path: 'C:/fake/Plain board.klypix', unsaved: true },
-  open_canvases: [{ title: 'Plain board', path: 'C:/fake/Plain board.klypix', unsaved: true, active: true }],
+  this_tool: { label: client.label, blocked: false, cloud_readings_today: 3, readings_left: 17, readings_left_total: 12 },
+  active_canvas: { title: 'Plain board', path_hash: pathHash(activeFile), unsaved: true },
+  open_canvases: [{ title: 'Plain board', path_hash: pathHash(activeFile), unsaved: true, active: true }],
   selection: ['txt_one'],
   view: {
     viewport: { pan_x: 0, pan_y: 0, zoom: 0.8, visible_world: { x: 0, y: 0, w: 1000, h: 800 } },

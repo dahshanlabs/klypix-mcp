@@ -13,6 +13,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   BRIDGE_PROTOCOL, CALL_DEADLINE_MS, CAPS, CLIENT_KEY, CLIENT_LABELS, CODE_SENTENCES, FrameDecoder, FrameError, HANDSHAKE_TIMEOUT_MS,
+  CAP_KINDS, ENDPOINT_FEATURES, MAX_CALLS_PER_CONNECTION, MAX_QUEUED_WRITE_BYTES, METHOD_PARAMS, PIN_SKIPPED, RPC_ERRORS,
   IDLE_TIMEOUT_MS, MAX_CONNECTIONS, MAX_CONNECTIONS_PER_CLIENT, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, METHODS, PAID_BY, VISIBILITY,
   clientKeyFromName, clientLabelFor, encodeFrame, isAllowedPipePath, proofC, proofS, proofsMatch, sentenceFor,
 } from '../src/app-bridge-protocol.mjs';
@@ -40,6 +41,14 @@ ok(v.framing.lengthPrefix === 'uint32le' && v.framing.encoding === 'utf8-json'
 ok(JSON.stringify(v.methods) === JSON.stringify([...METHODS]), `the methods match (${METHODS.join(', ')})`);
 ok(Object.entries(v.caps).every(([k, n]) => CAPS[k] === n) && Object.keys(CAPS).length === Object.keys(v.caps).length, 'the caps match (20 per tool, 40 in all, 5 cards a call, 3 running)');
 ok(JSON.stringify(v.paidBy) === JSON.stringify([...PAID_BY]) && JSON.stringify(v.visibility) === JSON.stringify([...VISIBILITY]), 'paid_by and visibility vocabularies match');
+
+// Revision 2 / 2b sections.
+ok(JSON.stringify(v.discovery.endpointFeatures) === JSON.stringify([...ENDPOINT_FEATURES]), 'endpoint.json carries features ["bridge"]');
+ok(v.framing.maxCallsPerConnection === MAX_CALLS_PER_CONNECTION && v.framing.maxQueuedWriteBytes === MAX_QUEUED_WRITE_BYTES, 'at most 4 calls in flight per connection; backpressure at 32 MiB');
+ok(v.rpcErrors.tooManyCalls === RPC_ERRORS.TOO_MANY_CALLS && v.rpcErrors.authFailed === RPC_ERRORS.AUTH_FAILED && v.rpcErrors.protocolMismatch === RPC_ERRORS.PROTOCOL_MISMATCH
+  && v.rpcErrors.tooManyConnections === RPC_ERRORS.TOO_MANY_CONNECTIONS, 'the JSON-RPC error codes match (TOO_MANY_CALLS -32004 included)');
+ok(JSON.stringify(v.params) === JSON.stringify(METHOD_PARAMS), 'the parameters main forwards per method match');
+ok(JSON.stringify(v.capKinds) === JSON.stringify([...CAP_KINDS]) && JSON.stringify(v.pinSkipped) === JSON.stringify([...PIN_SKIPPED]), 'cap kinds (tool, total) and pin_skipped reasons match');
 
 // ── Frames ──────────────────────────────────────────────────────────────────
 for (const f of v.frames) {

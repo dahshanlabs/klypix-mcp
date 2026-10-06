@@ -90,6 +90,9 @@ export function readEndpoint() {
     startedAt: parsed.startedAt ?? null,
     access: parsed.access === 'on' ? 'on' : parsed.access === 'off' ? 'off' : 'unknown',
     openFiles: parsed.openFiles.filter((h) => typeof h === 'string' && /^[0-9a-f]{64}$/i.test(h)).map((h) => h.toLowerCase()),
+    // P1: "bridge" marks a KLYPIX that has the app bridge (a lease-only build
+    // writes no features). The pipe name is deliberately not read here.
+    features: Array.isArray(parsed.features) ? parsed.features.filter((f) => typeof f === 'string').slice(0, 32).map((f) => f.slice(0, 64)) : [],
   };
   return { status: pidAlive(endpoint.pid) ? 'live' : 'stale', endpoint };
 }

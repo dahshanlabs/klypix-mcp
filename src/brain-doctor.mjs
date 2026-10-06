@@ -245,7 +245,9 @@ export function inspectAppBridge(env = process.env) {
     appVersion: e.appVersion || null,
     access: e.access,
     protocol: e.protocol || null,
-    protocolSupported: e.protocol === supported,
+    // A KLYPIX that writes the lease but has no bridge lists no "bridge" feature.
+    bridge: Array.isArray(e.features) && e.features.includes('bridge'),
+    protocolSupported: e.protocol === supported && Array.isArray(e.features) && e.features.includes('bridge'),
   };
 }
 
@@ -1813,7 +1815,7 @@ export function render(r, opts = {}) {
     const a = r.appBridge;
     if (a.running) {
       const amark = a.protocolSupported === false ? warn : ok;
-      L.push(`${amark} ${c.bold}App bridge${c.rst} KLYPIX ${a.appVersion ? `v${a.appVersion} ` : ''}running · access for AI tools ${a.access} · protocol ${a.protocol || '?'}${a.protocolSupported === false ? ` ${c.yel}(this klypix-mcp speaks a different one — update KLYPIX or klypix-mcp)${c.rst}` : ''}`);
+      L.push(`${amark} ${c.bold}App bridge${c.rst} KLYPIX ${a.appVersion ? `v${a.appVersion} ` : ''}running · access for AI tools ${a.access} · protocol ${a.protocol || '?'}${a.protocolSupported === false ? ` ${c.yel}(${a.bridge === false ? 'this KLYPIX has no app bridge yet — update KLYPIX' : 'this klypix-mcp speaks a different one — update KLYPIX or klypix-mcp'})${c.rst}` : ''}`);
     } else {
       L.push(`${ok} ${c.bold}App bridge${c.rst} ${c.dim}${a.state === 'not-on-this-system' ? 'no KLYPIX app on this system (Windows only) — file mode' : a.state === 'not-running' ? 'KLYPIX not running — file mode' : 'KLYPIX not running (or older than the bridge) — file mode'}${c.rst}`);
     }

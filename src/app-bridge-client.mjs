@@ -104,6 +104,9 @@ export function discoverApp({ platform = process.platform } = {}) {
   const appVersion = typeof raw.appVersion === 'string' ? raw.appVersion.slice(0, 40) : null;
   const protocol = typeof raw.protocol === 'string' ? raw.protocol.slice(0, 64) : null;
   if (protocol !== BRIDGE_PROTOCOL) return base('update_required', { appVersion, protocol });
+  // A KLYPIX that writes the lease but has no bridge (no "bridge" feature)
+  // needs an update; telling its user to turn on a switch it lacks would mislead.
+  if (!Array.isArray(raw.features) || !raw.features.includes('bridge')) return base('update_required', { appVersion, protocol });
   const access = raw.access === 'on' ? 'on' : 'off';
   if (access !== 'on' || typeof raw.pipe !== 'string' || !raw.pipe) return base('access_off', { appVersion, protocol, access: 'off' });
   if (!isAllowedPipePath(raw.pipe, platform)) return base('unverified', { appVersion, protocol, access });
@@ -115,10 +118,12 @@ export function discoverApp({ platform = process.platform } = {}) {
 const DISCOVERY_CODES = { not_running: 'APP_NOT_RUNNING', update_required: 'APP_UPDATE_REQUIRED', access_off: 'ACCESS_OFF', unverified: 'APP_UNVERIFIED' };
 
 // One connection, one call. Resolves to { kind, … }; never rejects.
-function attempt({ pipe, token, key, label, name, version, method, params, deadline, signal }) {
+function attempt({ pipe, token, key, label, name, version, method, params, deadline, signal, cancelRequestId = null }) {
   return new Promise((resolve) => {
     const CALL_ID = 10;
     const CANCEL_ID = 11;
+    const CANCEL_JOB_ID = 12;
+    const cancelAnswers = new Set();
     let settled = false;
     let stage = 'connect';
     let sent = false;
@@ -134,6 +139,12 @@ function attempt({ pipe, token, key, label, name, version, method, params, deadl
       if (stage === 'call' && sent) {
         stage = 'cancelling';
         try { socket.write(encodeFrame(rpcRequest(CANCEL_ID, 'cancel', { id: CALL_ID }))); } catch { /* closing anyway */ }
+        // A repeat of a read that already answered still_reading is attached to
+        // that read: stop the read itself too, by its request_id (Revision 2b;
+        // only the tool that started it may).
+        if (cancelRequestId) {
+          try { socket.write(encodeFrame(rpcRequest(CANCEL_JOB_ID, 'cancel', { request_id: cancelRequestId }))); } catch { /* closing anyway */ }
+        }
         arm(Math.min(CANCEL_GRACE_MS, Math.max(0, remaining())), () => finish({ kind: 'cancelled', sent }));
       } else {
         finish({ kind: 'cancelled', sent });
@@ -204,16 +215,35 @@ function attempt({ pipe, token, key, label, name, version, method, params, deadl
         } else if (stage === 'call' || stage === 'cancelling') {
           if (m.id === CALL_ID) {
             if (stage === 'cancelling') { finish({ kind: 'cancelled', sent: true }); return; }
-            finish(m.error ? { kind: 'call_error', sent: true } : { kind: 'result', sent: true, result: m.result });
+            if (m.error) { finish({ kind: m.error.code === RPC_ERRORS.TOO_MANY_CALLS ? 'too_many' : 'call_error', sent: true }); return; }
+            finish({ kind: 'result', sent: true, result: m.result });
             return;
           }
-          if (m.id === CANCEL_ID && stage === 'cancelling') { finish({ kind: 'cancelled', sent: true }); return; }
+          if (stage === 'cancelling' && (m.id === CANCEL_ID || m.id === CANCEL_JOB_ID)) {
+            cancelAnswers.add(m.id);
+            // Wait for both cancels when both were sent (the job cancel is the
+            // one that stops an attached read).
+            if (!cancelRequestId || cancelAnswers.size >= 2) { finish({ kind: 'cancelled', sent: true }); return; }
+          }
         }
       }
     });
     socket.on('error', () => finish({ kind: stage === 'connect' ? 'connect_failed' : sent ? 'closed_after_send' : 'closed_before_send', sent }));
     socket.on('close', () => finish({ kind: stage === 'connect' ? 'connect_failed' : sent ? 'closed_after_send' : 'closed_before_send', sent }));
   });
+}
+
+// Reads KLYPIX is still running for this process, by the same key the app
+// attaches on: tool, canvas, sorted card ids, refresh. The canvas is the
+// resolved path this client always sends, compared case-insensitively.
+const READ_JOB_TTL_MS = 30 * 60_000;
+const readJobs = new Map();
+function readJobKey(clientKey, params) {
+  const ids = [...new Set(Array.isArray(params.card_ids) ? params.card_ids.map(String) : [])].sort();
+  return JSON.stringify([clientKey, String(params.canvas ?? '').replace(/\//g, '\\').toLowerCase(), ids, params.refresh === true]);
+}
+function sweepReadJobs(now = Date.now()) {
+  for (const [k, v] of readJobs) if (now - v.at > READ_JOB_TTL_MS) readJobs.delete(k);
 }
 
 /** The app's answer as an outcome object (it always is one; guard anyway). */
@@ -251,6 +281,13 @@ export async function callApp(method, params = {}, options = {}) {
     sendParams = { ...sendParams, wait_seconds: Math.max(5, Math.min(asked, 45, room)) };
   }
 
+  // A read that answered still_reading keeps running in KLYPIX under its
+  // request_id; a repeat call attaches to it. Remember that id per read, so a
+  // host cancel of the repeat stops the read itself (cancel { request_id }).
+  const jobKey = method === 'read_card_contents' ? readJobKey(key, sendParams) : null;
+  sweepReadJobs();
+  const runningRequestId = jobKey ? readJobs.get(jobKey)?.requestId || null : null;
+
   let last = null;
   for (let round = 0; round < 2; round++) {
     const target = discoverApp({ platform: options.platform });
@@ -258,11 +295,17 @@ export async function callApp(method, params = {}, options = {}) {
     const token = readBridgeToken();
     if (!token) return refuse('ACCESS_OFF');
     if (Date.now() >= deadline) break;
-    const r = await attempt({ pipe: target.pipe, token, key, label, name, version, method, params: sendParams, deadline, signal: options.signal });
+    const r = await attempt({ pipe: target.pipe, token, key, label, name, version, method, params: sendParams, deadline, signal: options.signal, cancelRequestId: runningRequestId });
     last = r.kind;
     switch (r.kind) {
-      case 'result':
-        return { reached: true, outcome: normalizeOutcome(r.result, tool) };
+      case 'result': {
+        const outcome = normalizeOutcome(r.result, tool);
+        if (jobKey) {
+          if (outcome.status === 'still_reading' && typeof outcome.request_id === 'string') readJobs.set(jobKey, { requestId: outcome.request_id, at: Date.now() });
+          else readJobs.delete(jobKey);
+        }
+        return { reached: true, outcome };
+      }
       case 'call_error':
         onEvent('call-error');
         return { reached: true, outcome: { ok: false, mode: 'app', code: 'FAILED', tell_user: sentenceFor('FAILED', { tool }) } };
@@ -273,6 +316,7 @@ export async function callApp(method, params = {}, options = {}) {
         }
         return { reached: true, outcome: { ok: false, mode: 'app', code: 'APP_NO_ANSWER', tell_user: sentenceFor('APP_NO_ANSWER', { tool }) } };
       case 'cancelled':
+        if (jobKey && r.sent) readJobs.delete(jobKey);
         return { reached: r.sent, outcome: { ok: false, mode: 'app', code: 'CANCELLED' } };
       case 'protocol_mismatch':
         return refuse('APP_UPDATE_REQUIRED');

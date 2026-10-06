@@ -2,7 +2,8 @@
 // the stable supervisor (bin/klypix-mcp.mjs, what every host launches) and on
 // the worker it proxies (bin/klypix-worker.mjs).
 //
-// Through the wire, not by importing the engine: the tool list (25, the 23 old
+// Through the wire, not by importing the engine: the tool list (25, or 26 with
+// show_in_klypix on Windows; the 23 old
 // schemas byte-identical to the 1.91.0 snapshot), klypix_status in file mode,
 // the OPEN_IN_APP refusal with a fake lease (file untouched, last line "Tell the
 // user:"), and read_card_contents returning a reading KLYPIX saved.
@@ -40,7 +41,10 @@ for (const [label, bin] of [['supervisor', 'klypix-mcp.mjs'], ['worker', 'klypix
   try {
     const { tools } = await client.listTools();
     const names = tools.map(t => t.name);
-    ok(names.length === 25 && names.includes('klypix_status') && names.includes('read_card_contents'), `[${label}] listTools shows 25 tools, the two new ones included (got ${names.length})`);
+    // show_in_klypix (P1) is app-only: Windows here (KLYPIX_APP_TOOLS is cleared above).
+    const expected = process.platform === 'win32' ? 26 : 25;
+    ok(names.length === expected && names.includes('klypix_status') && names.includes('read_card_contents') && names.includes('show_in_klypix') === (expected === 26),
+      `[${label}] listTools shows ${expected} tools, the app tools included where they apply (got ${names.length})`);
     const byName = new Map(tools.map(t => [t.name, t]));
     const drifted = snapshot.filter(t => JSON.stringify(byName.get(t.name)?.inputSchema) !== JSON.stringify(t.inputSchema)).map(t => t.name);
     ok(drifted.length === 0, `[${label}] the 23 old input schemas equal the 1.91.0 snapshot (drifted: ${drifted.join(', ') || 'none'})`);
@@ -64,7 +68,10 @@ for (const [label, bin] of [['supervisor', 'klypix-mcp.mjs'], ['worker', 'klypix
     const before = fs.readFileSync(file);
     const refused = await client.callTool({ name: 'add_to_canvas', arguments: { canvas: 'Parity Fixture', cards: [{ text: 'must not land' }] } });
     const last = refused.content[refused.content.length - 1];
-    ok(refused.isError === true && refused.structuredContent?.code === 'OPEN_IN_APP' && refused.structuredContent?.ok === false, `[${label}] add_to_canvas on the open canvas: isError, code OPEN_IN_APP`);
+    // This lease is a P0 KLYPIX's: no "bridge" feature, so it cannot take cards
+    // live; P0's OPEN_IN_APP (close the tab) is the step that works. Nothing is written.
+    const refusedCode = 'OPEN_IN_APP';
+    ok(refused.isError === true && refused.structuredContent?.code === refusedCode && refused.structuredContent?.ok === false, `[${label}] add_to_canvas on the open canvas: isError, code ${refusedCode} (got ${refused.structuredContent?.code})`);
     ok(last?.type === 'text' && last.text.startsWith('Tell the user:'), `[${label}] its last line starts "Tell the user:"`);
     ok(fs.readFileSync(file).equals(before), `[${label}] and the file is byte-identical`);
 

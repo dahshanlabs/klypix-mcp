@@ -289,8 +289,10 @@ const flatten = (code) => code
     // nothing in bin/ had imported it directly before.
     // app-lease / app-tools (P0 agent parity): the worker lazily imports the
     // app tools (klypix_status, read_card_contents); klypix-core and the app
-    // tools import the lease reader.
-    .replace(/\.\.\/src\/(bench|brain-doctor|agent-presence|agent-rules|capture-gap|enrichment|finding-routing|mcp-presence|mcp-supervisor|mcp-auto-update|presence-relay|repo-state|semantic-memory|runtime-inspector|project-graph|git-capture-install|app-lease|app-tools)\.mjs/g, './$1.mjs')
+    // tools import the lease reader. app-bridge-protocol / app-bridge-client
+    // (P1 agent parity): the app tools lazily import the client of the KLYPIX
+    // app bridge, which imports the protocol.
+    .replace(/\.\.\/src\/(bench|brain-doctor|agent-presence|agent-rules|capture-gap|enrichment|finding-routing|mcp-presence|mcp-supervisor|mcp-auto-update|presence-relay|repo-state|semantic-memory|runtime-inspector|project-graph|git-capture-install|app-lease|app-tools|app-bridge-protocol|app-bridge-client)\.mjs/g, './$1.mjs')
     .replace(/klypix-worker\.mjs/g, 'klypix-mcp-worker.mjs')
     .replace(/const PKG_VERSION = \(\(\) => \{[\s\S]*?\}\)\(\);/, `const PKG_VERSION = '${VERSION}'; // baked at install (flat layout has no package.json)`);
 
@@ -436,7 +438,7 @@ try {
     // a newer klypix-format cannot. merge-brains and the driver ship here so
     // brain-history's restore merge, the KLYPIX core and the git driver all
     // find one engine in this directory.
-    for (const f of ['global-brain-hook.mjs', 'klypix-format.mjs', 'brain-graveyard.mjs', 'merge-brains.mjs', 'klypix-merge-driver.mjs', 'capture-gap.mjs', 'brain-semantic.mjs', 'semantic-memory.mjs', 'enrichment.mjs', 'provenance.mjs', 'brain-note.mjs', 'brain-evidence.mjs', 'brain-git-hook.mjs', 'git-capture-install.mjs', 'brain-history.mjs', 'app-lease.mjs', 'klypix-core.mjs', 'app-tools.mjs', 'card-files.mjs', 'brain-write-lock.mjs', 'agent-rules.mjs', 'brain-doctor.mjs', 'editor-detect.mjs', 'agent-presence.mjs', 'mcp-presence.mjs', 'repo-state.mjs', 'result-reconcile.mjs', 'finding-routing.mjs', 'presence-relay.mjs', 'mcp-supervisor.mjs', 'mcp-auto-update.mjs', 'runtime-inspector.mjs', 'project-graph.mjs', 'bench.mjs', 'codex-brain-hook.mjs', 'codex-hooks.mjs', 'canvas-view-app.html']) {
+    for (const f of ['global-brain-hook.mjs', 'klypix-format.mjs', 'brain-graveyard.mjs', 'merge-brains.mjs', 'klypix-merge-driver.mjs', 'capture-gap.mjs', 'brain-semantic.mjs', 'semantic-memory.mjs', 'enrichment.mjs', 'provenance.mjs', 'brain-note.mjs', 'brain-evidence.mjs', 'brain-git-hook.mjs', 'git-capture-install.mjs', 'brain-history.mjs', 'app-lease.mjs', 'klypix-core.mjs', 'app-bridge-protocol.mjs', 'app-bridge-client.mjs', 'app-tools.mjs', 'card-files.mjs', 'brain-write-lock.mjs', 'agent-rules.mjs', 'brain-doctor.mjs', 'editor-detect.mjs', 'agent-presence.mjs', 'mcp-presence.mjs', 'repo-state.mjs', 'result-reconcile.mjs', 'finding-routing.mjs', 'presence-relay.mjs', 'mcp-supervisor.mjs', 'mcp-auto-update.mjs', 'runtime-inspector.mjs', 'project-graph.mjs', 'bench.mjs', 'codex-brain-hook.mjs', 'codex-hooks.mjs', 'canvas-view-app.html']) {
         const s = path.join(SRC, f); if (exists(s)) staged.push({ dst: f, content: fs.readFileSync(s, 'utf8') });
     }
     for (const [src, dst] of [

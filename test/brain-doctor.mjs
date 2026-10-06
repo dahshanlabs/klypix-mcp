@@ -1282,18 +1282,47 @@ const supervisorReceipt = (brainDir, name, state) => writeJson(path.join(brainDi
   ok(names.includes('brain_reopen'), 'brain_reopen is a registered MCP tool');
   ok(names.includes('klypix_status'), 'klypix_status is a registered MCP tool');
   ok(names.includes('read_card_contents'), 'read_card_contents is a registered MCP tool');
-  ok(names.length === 25, `tool manifest is 25 verbs (got ${names.length})`);
-  // Doctor's TOOLS line counts by a static scan; the two app tools register
-  // from app-tools.mjs beside the worker, so the scan must read that file too.
+  // show_in_klypix (agent parity P1) is app-only: registered where a KLYPIX app
+  // can run — Windows, or KLYPIX_APP_TOOLS=on. 25 on the Ubuntu CI, 26 on Windows.
+  const appToolsHere = process.platform === 'win32' || process.env.KLYPIX_APP_TOOLS === 'on';
+  const expectedTools = 25 + (appToolsHere ? 1 : 0);
+  ok(names.includes('show_in_klypix') === appToolsHere, `show_in_klypix is registered exactly where a KLYPIX app can run (${appToolsHere ? 'here' : 'not here'})`);
+  ok(names.length === expectedTools, `tool manifest is ${expectedTools} verbs on ${process.platform} (got ${names.length})`);
+  // Doctor's TOOLS line counts by a static scan; the app tools register from
+  // app-tools.mjs beside the worker, so the scan must read that file too, and
+  // apply the same platform rule to show_in_klypix.
   {
     const emptyHome = path.join(vault, '.doctor-tools-home');
     fs.mkdirSync(emptyHome, { recursive: true });
     const scanned = inspect({ home: emptyHome, projectDir: vault, fmtLib: null });
-    const toolsLine = render(scanned, { color: false }).split('\n').find(l => /TOOLS/.test(l)) || '';
-    ok(scanned.tools.source === 'package' && scanned.tools.count === 25
-      && scanned.tools.names.includes('klypix_status') && scanned.tools.names.includes('read_card_contents'),
-    `doctor's static tool scan counts 25 and includes both app tools (got ${scanned.tools.count} from ${scanned.tools.source})`);
+    const rendered = render(scanned, { color: false }).split('\n');
+    const toolsLine = rendered.find(l => /TOOLS/.test(l)) || '';
+    ok(scanned.tools.source === 'package' && scanned.tools.count === expectedTools
+      && scanned.tools.names.includes('klypix_status') && scanned.tools.names.includes('read_card_contents')
+      && scanned.tools.names.includes('show_in_klypix') === appToolsHere,
+    `doctor's static tool scan counts ${expectedTools} and includes the app tools this platform registers (got ${scanned.tools.count} from ${scanned.tools.source})`);
     ok(toolsLine.includes('klypix_status') && toolsLine.includes('read_card_contents'), 'doctor\'s TOOLS line lists klypix_status and read_card_contents');
+    // The App bridge line: running, access, protocol — from endpoint.json only,
+    // never the token or the pipe name.
+    const prevBridge = process.env.KLYPIX_APP_BRIDGE_DIR;
+    const bridgeDir = path.join(vault, '.doctor-bridge');
+    fs.mkdirSync(bridgeDir, { recursive: true });
+    process.env.KLYPIX_APP_BRIDGE_DIR = bridgeDir;
+    const pipeName = 'klypix-agent-SECRETPIPE0123456789';
+    const tokenValue = 'ab'.repeat(32);
+    fs.writeFileSync(path.join(bridgeDir, 'endpoint.json'), JSON.stringify({ v: 1, protocol: 'klypix-app-bridge/1', pid: process.pid, appVersion: '1.3.200', startedAt: new Date().toISOString(), access: 'on', pipe: pipeName, openFiles: [], features: ['bridge'] }));
+    fs.writeFileSync(path.join(bridgeDir, 'token'), tokenValue);
+    const live = inspect({ home: emptyHome, projectDir: vault, fmtLib: null });
+    const liveText = render(live, { color: false });
+    const bridgeLine = liveText.split('\n').find(l => /App bridge/.test(l)) || '';
+    const structured = JSON.stringify(structuredReport(live));
+    ok(/KLYPIX v1\.3\.200 running · access for AI tools on · protocol klypix-app-bridge\/1/.test(bridgeLine), `doctor prints an App bridge line: running, access, protocol (${bridgeLine.trim()})`);
+    ok(live.appBridge?.running === true && live.appBridge.access === 'on' && live.appBridge.protocolSupported === true, 'the report carries appBridge (the E1 structured projection is unchanged)');
+    ok(![liveText, structured, JSON.stringify(live.appBridge)].some(s => s.includes(pipeName) || s.includes(tokenValue)), 'the token and the pipe name appear nowhere in doctor\'s output');
+    fs.rmSync(path.join(bridgeDir, 'endpoint.json'));
+    const closed = render(inspect({ home: emptyHome, projectDir: vault, fmtLib: null }), { color: false }).split('\n').find(l => /App bridge/.test(l)) || '';
+    ok(/file mode/.test(closed), `with KLYPIX closed the App bridge line says file mode (${closed.trim()})`);
+    if (prevBridge === undefined) delete process.env.KLYPIX_APP_BRIDGE_DIR; else process.env.KLYPIX_APP_BRIDGE_DIR = prevBridge;
   }
   // KLYPIX Remote was dropped from the product; its four verbs went with it.
   // Assert their ABSENCE so the removal cannot silently regress — a brain that

@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "comment": "Shared by klypix-mcp (src/app-lease.mjs) and the KLYPIX desktop app (electron/agentBridge). The app mirrors this file byte-for-byte through scripts/sync-bundled-mcp.mjs; change it only in klypix-mcp.",
+  "comment": "Shared by klypix-mcp (src/app-lease.mjs, src/app-bridge-protocol.mjs, src/app-bridge-client.mjs) and the KLYPIX desktop app (electron/agentBridge). The app mirrors this file byte-for-byte through scripts/sync-bundled-mcp.mjs; change it only in klypix-mcp, together with the app. Spec: docs/architecture/agent-tool-parity-2026-09-30/BRIDGE-PROTOCOL.md in the KLYPIX repository.",
   "protocol": "klypix-app-bridge/1",
   "canonicalPath": {
     "rule": "path.resolve; fs.realpathSync.native when the file exists; \"/\" -> \"\\\"; lowercase. sha256 of the UTF-8 result, lowercase hex.",
@@ -11,5 +11,283 @@
         "sha256": "a1228c43f60b602d8daa30eaaab7e1b0230a92901d1a7d3dbb8f96a8806c033e"
       }
     ]
-  }
+  },
+  "discovery": {
+    "dirEnv": "KLYPIX_APP_BRIDGE_DIR",
+    "defaultDir": "%APPDATA%\\klypix\\agent-bridge",
+    "endpointFile": "endpoint.json",
+    "tokenFile": "token",
+    "tokenDefaultDir": "%LOCALAPPDATA%\\klypix\\agent-bridge",
+    "tokenDirRule": "KLYPIX_APP_BRIDGE_DIR when set (development builds and tests), else %LOCALAPPDATA%\\klypix\\agent-bridge; a packaged app ignores the variable for the token",
+    "endpointFeatures": [
+      "bridge"
+    ]
+  },
+  "framing": {
+    "lengthPrefix": "uint32le",
+    "encoding": "utf8-json",
+    "maxRequestBytes": 1048576,
+    "maxResponseBytes": 16777216,
+    "idleTimeoutMs": 30000,
+    "handshakeTimeoutMs": 5000,
+    "callDeadlineMs": 45000,
+    "maxConnectionsPerClient": 8,
+    "maxConnections": 32,
+    "maxCallsPerConnection": 4,
+    "maxQueuedWriteBytes": 33554432
+  },
+  "frames": [
+    {
+      "message": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "ping"
+      },
+      "hex": "280000007b226a736f6e727063223a22322e30222c226964223a312c226d6574686f64223a2270696e67227d"
+    },
+    {
+      "message": {
+        "jsonrpc": "2.0",
+        "id": "r-7",
+        "method": "status",
+        "params": {}
+      },
+      "hex": "3a0000007b226a736f6e727063223a22322e30222c226964223a22722d37222c226d6574686f64223a22737461747573222c22706172616d73223a7b7d7d"
+    }
+  ],
+  "handshake": {
+    "tokenHex": "0707070707070707070707070707070707070707070707070707070707070707",
+    "nonceS": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "nonceC": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "clientKey": "codex",
+    "proofC": "f6c618fb7228a2c755023c975c2b7209212df4dab6d22e223f9b325f943f2cda",
+    "proofS": "b31c00f53349512a11e2d878e920b7dea51396c137ccff2472f1f19cd0705afc"
+  },
+  "clientKeys": [
+    {
+      "name": "codex-mcp-client",
+      "key": "codex-mcp-client"
+    },
+    {
+      "name": "../../x",
+      "key": "-..-x"
+    },
+    {
+      "name": "Claude Desktop",
+      "key": "claude-desktop"
+    },
+    {
+      "name": "claude-ai",
+      "key": "claude-ai"
+    },
+    {
+      "name": "claude-code",
+      "key": "claude-code"
+    },
+    {
+      "name": "",
+      "key": "mcp"
+    },
+    {
+      "name": "...Hidden",
+      "key": "hidden"
+    },
+    {
+      "name": "A very long name that goes past thirty-two characters",
+      "key": "a-very-long-name-that-goes-past-"
+    },
+    {
+      "name": "Cursor (VS Code) 1.2",
+      "key": "cursor-vs-code-1.2"
+    },
+    {
+      "name": "C:\\Users\\x",
+      "key": "c-users-x"
+    }
+  ],
+  "labelPatterns": [
+    [
+      "codex",
+      "i",
+      "Codex"
+    ],
+    [
+      "claude[\\s_-]*code",
+      "i",
+      "Claude Code"
+    ],
+    [
+      "^claude[\\s_-]*ai$|claude[\\s_-]*desktop",
+      "i",
+      "Claude Desktop"
+    ],
+    [
+      "cursor",
+      "i",
+      "Cursor"
+    ],
+    [
+      "cline",
+      "i",
+      "Cline"
+    ],
+    [
+      "windsurf",
+      "i",
+      "Windsurf"
+    ],
+    [
+      "antigravity",
+      "i",
+      "Antigravity"
+    ],
+    [
+      "^iphone$",
+      "i",
+      "iPhone"
+    ]
+  ],
+  "clientLabels": [
+    {
+      "name": "codex-mcp-client",
+      "label": "Codex"
+    },
+    {
+      "name": "Codex",
+      "label": "Codex"
+    },
+    {
+      "name": "claude-code",
+      "label": "Claude Code"
+    },
+    {
+      "name": "Claude Code",
+      "label": "Claude Code"
+    },
+    {
+      "name": "claude-ai",
+      "label": "Claude Desktop"
+    },
+    {
+      "name": "Claude Desktop",
+      "label": "Claude Desktop"
+    },
+    {
+      "name": "cursor-vscode",
+      "label": "Cursor"
+    },
+    {
+      "name": "Cline",
+      "label": "Cline"
+    },
+    {
+      "name": "windsurf",
+      "label": "Windsurf"
+    },
+    {
+      "name": "Antigravity",
+      "label": "Antigravity"
+    },
+    {
+      "name": "my-own-tool",
+      "label": "my-own-tool"
+    },
+    {
+      "name": "",
+      "label": "AI tool"
+    }
+  ],
+  "methods": [
+    "status",
+    "read_canvas",
+    "read_card_contents",
+    "add_to_canvas",
+    "show_in_klypix",
+    "lens",
+    "cancel",
+    "ping"
+  ],
+  "caps": {
+    "cloudPerToolPerDay": 20,
+    "cloudTotalPerDay": 40,
+    "maxCardsPerCall": 5,
+    "maxRunningPerTool": 3,
+    "showMinIntervalMs": 3000,
+    "maxShowCards": 50,
+    "maxAddCards": 50,
+    "maxImages": 8,
+    "maxImageBytes": 5242880,
+    "maxAnswerChars": 48000,
+    "maxImageTotalBytes": 11534336
+  },
+  "paidBy": [
+    "none",
+    "ai_tool",
+    "own_gemini_key",
+    "included_ai"
+  ],
+  "visibility": [
+    "shown",
+    "hidden_by_filter",
+    "inside_collapsed_box",
+    "off_screen"
+  ],
+  "rpcErrors": {
+    "parse": -32700,
+    "invalidRequest": -32600,
+    "methodNotFound": -32601,
+    "invalidParams": -32602,
+    "internal": -32603,
+    "authFailed": -32001,
+    "protocolMismatch": -32002,
+    "tooManyConnections": -32003,
+    "tooManyCalls": -32004
+  },
+  "params": {
+    "status": [],
+    "read_canvas": [
+      "canvas",
+      "offset",
+      "limit",
+      "max_chars_per_card",
+      "shown_only"
+    ],
+    "lens": [
+      "canvas",
+      "lens",
+      "root"
+    ],
+    "read_card_contents": [
+      "canvas",
+      "card_ids",
+      "read_new",
+      "refresh",
+      "pin_result",
+      "entry_paths",
+      "max_chars",
+      "wait_seconds"
+    ],
+    "add_to_canvas": [
+      "canvas",
+      "cards",
+      "connections"
+    ],
+    "show_in_klypix": [
+      "canvas",
+      "card_ids",
+      "banner",
+      "bring_to_front"
+    ]
+  },
+  "capKinds": [
+    "tool",
+    "total"
+  ],
+  "pinSkipped": [
+    "FROZEN",
+    "OFF",
+    "CANCELLED",
+    "CHANGED"
+  ],
+  "readKeyCanvas": "path: sha256 of the canonical path (the lease hash); title: lowercased title; active: none given"
 }

@@ -96,7 +96,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/ext-apps": "^1.7.5",
-    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@modelcontextprotocol/sdk": "^1.31.0",
     "fractional-indexing": "^3.2.0",
     "jpeg-js": "^0.4.4",
     "jszip": "^3.10.1",

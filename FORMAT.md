@@ -177,8 +177,12 @@ card's file on the card: `derivedText`, with `derivedTextKind` (`document-text`,
 `derivedTextVisuals` and `derivedTextSha`. A reading is made again from the bytes whenever
 it is missing, so `sameMeaning` strips these fields too: two copies that differ only in
 their reading are one card (no conflict twin), and a reading made on one side never brings
-back a card the other side deleted. Of two such copies a merge writes the one whose reading
-is current.
+back a card the other side deleted. A merge still keeps readings. Of two such copies it
+writes the one with the better reading: a current one first, then one with visuals, then one
+made by cloud AI, then the longer text. When one side's edit wins, the other side's reading
+is carried onto it as long as it is still a reading of the card's bytes. Identities do not
+change: `itemSignature`, and with it bin-entry ids (`rid`), conflict-twin ids and revived ids,
+hashes the card with its reading, exactly as before.
 
 A document's reading (`derivedTextKind: "document-text"`, on a `file` card) carries
 `derivedTextSha`: the card's `assetSha`, else its `assetId`, when it was read. It is current

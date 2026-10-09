@@ -3810,8 +3810,8 @@ console.log('\n— S2-X mutation checks (one rule off at a time) —');
     },
     {
       rule: 'a twin is the purged card only if EVERY copy of it holds the restored bytes',
-      find: '      .find((c) => copies.every((v) => fullEntryRid(c.from, v) === c.rid));',
-      replace: '      .find((c) => copies.some((v) => fullEntryRid(c.from, v) === c.rid));',
+      find: '      .find((c) => copies.every((v) => holdsEntryBytes(c.from, v, c.rid)));',
+      replace: '      .find((c) => copies.some((v) => holdsEntryBytes(c.from, v, c.rid)));',
       canon: 'purgeNeedsEveryCopy', check: 'K15g',
     },
     {

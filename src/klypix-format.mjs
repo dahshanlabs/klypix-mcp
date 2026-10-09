@@ -163,13 +163,21 @@ export const VOLATILE_ITEM_FIELDS = ['updatedAt', 'zIndex', 'editedAt'];
 // the card's file — a document's text, a video's or a voice note's transcript
 // or analysis (the app's READING_FIELD_KEYS, items/documentReadingFields.ts).
 // Derived data, made again from the card's bytes whenever it is missing, so it
-// is no part of what a card MEANS either:
+// is no part of what a card MEANS (meaningSignature, sameMeaning):
 //   • two copies whose only difference is their reading are one card — no
 //     conflict twin, no content conflict;
 //   • a reading made on one side is not an edit, so it never brings back a
 //     card the other side deleted: the delete wins.
-// A merge still keeps a reading whenever it keeps the card: of two copies that
-// mean the same it writes the one whose reading is current (pickReadingCopy).
+// It IS part of a card's identity, exactly as in every engine up to 1.94:
+// itemSignature — and with it bin identities (fullEntryRid, receiptIdentity),
+// conflict-twin ids and revived ids — hashes the card with its reading, so a
+// receipt or a twin an older engine minted names the same bytes here. A check
+// of a copy against a stored identity also accepts the copy with a reading
+// KLYPIX made since (holdsEntryBytes).
+// A merge keeps a reading whenever it keeps the card: of two copies that mean
+// the same it writes the one with the better reading (pickReadingCopy), and
+// where one side's edit wins it carries the other side's reading onto it while
+// that reading is still of the bytes the card holds (carryReading).
 export const READING_ITEM_FIELDS = ['derivedText', 'derivedTextKind', 'derivedTextSource', 'derivedTextSha', 'derivedTextAt', 'derivedTextVisuals'];
 
 // Key-sorted JSON, so two writers' key orders can never fake a difference.
@@ -197,28 +205,31 @@ export function pickThreeWay(o, t, b) {
  *  or any strings): true when the first wins. */
 export const canonicalFirst = (a, b) => a > b;
 
-/** Of two copies of one card that mean the same (sameMeaning), the one a merge
- *  writes: 'ours' or 'theirs'. They differ at most in volatile and reading
- *  fields, and the reading is what AI tools are served, so the reading
- *  decides — the same way on every machine, whichever side is ours: git and
- *  Brain Sync compare readings, so an ours-first pick would hand two readings
- *  back and forth between the repo and the cloud.
- *    1. A current reading beats none and beats a stale one (readingIsCurrent:
- *       a document's text counts only while derivedTextSha names the bytes the
- *       card holds).
- *    2. Otherwise the reading is decided 3-way from the base `b`: one made or
- *       dropped on one side wins, and two different new ones are picked from
- *       the two values alone (pickThreeWay).
- *  Copies with the same reading keep ours, as before: they differ in volatile
- *  fields only. */
-export function pickReadingCopy(o, t, b = null) {
-    if (o === t) return 'ours';
-    const ro = readingFieldsOf(o), rt = readingFieldsOf(t);
-    if (stableJson(ro.fields) === stableJson(rt.fields)) return 'ours';
-    if (ro.current !== rt.current) return ro.current ? 'ours' : 'theirs';
-    const rb = b == null ? undefined : readingFieldsOf(b).fields;
-    return pickThreeWay(ro.fields, rt.fields, rb) === ro.fields ? 'ours' : 'theirs';
+// ── Readings in a merge ──────────────────────────────────────────────────────
+// Which of two readings is the better one, best first: a reading with visuals
+// (a video analysis, or a transcript made with the frames), then one made by
+// cloud AI (it cost money; a local transcript can be made again for free), then
+// the longer text; two that tie on all three go by their key-sorted JSON. From
+// the two readings alone — never the base, never the side — so every machine
+// and both transports pick the same one, and a merge never trades a paid or a
+// richer reading for a poorer one.
+const readingRank = (f) => [
+    f.derivedTextKind === 'video-analysis' || f.derivedTextVisuals === true ? 1 : 0,
+    f.derivedTextSource === 'cloud' ? 1 : 0,
+    typeof f.derivedText === 'string' ? f.derivedText.length : 0,
+];
+/** True when reading fields `a` rank above the different reading fields `b`. */
+function readingBeats(a, b) {
+    const ra = readingRank(a), rb = readingRank(b);
+    for (let i = 0; i < ra.length; i++) if (ra[i] !== rb[i]) return ra[i] > rb[i];
+    return canonicalFirst(stableJson(a), stableJson(b));
 }
+const isPlainObject = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
+const readingFieldsIn = (item) => {
+    const fields = {};
+    for (const f of READING_ITEM_FIELDS) if (item[f] !== undefined) fields[f] = item[f];
+    return fields;
+};
 // A card's reading fields, and whether that reading is current. Most cards have
 // none, so a JSON string that never names the field is not parsed.
 function readingFieldsOf(json) {
@@ -226,25 +237,85 @@ function readingFieldsOf(json) {
     if (typeof json !== 'string' || !json.includes('derivedText')) return none;
     let item;
     try { item = JSON.parse(json); } catch { return none; }
-    if (!item || typeof item !== 'object' || Array.isArray(item)) return none;
-    const fields = {};
-    for (const f of READING_ITEM_FIELDS) if (item[f] !== undefined) fields[f] = item[f];
-    return { fields, current: readingIsCurrent(item) };
+    if (!isPlainObject(item)) return none;
+    return { fields: readingFieldsIn(item), current: readingIsCurrent(item) };
 }
 
-/** A card's MEANING as a canonical string: parsed, volatile and reading fields
- *  stripped, key-sorted. Unparseable JSON falls back to byte identity — a
- *  malformed item must never crash a merge. */
-export function itemSignature(json) {
+/** Of two copies of one card that mean the same (sameMeaning), the one a merge
+ *  writes: 'ours' or 'theirs'. They differ at most in volatile and reading
+ *  fields, and the reading is what AI tools are served, so the reading
+ *  decides — from the two copies alone, the same way on every machine
+ *  whichever side is ours (git and Brain Sync compare readings, so an
+ *  ours-first pick would hand two readings back and forth between the repo
+ *  and the cloud): a current reading (readingIsCurrent: a document's text only
+ *  while derivedTextSha names the bytes the card holds) beats none and beats
+ *  a stale one; then the better reading (readingBeats). Copies with the same
+ *  reading keep ours, as before: they differ in volatile fields only. */
+export function pickReadingCopy(o, t) {
+    if (o === t) return 'ours';
+    const ro = readingFieldsOf(o), rt = readingFieldsOf(t);
+    if (stableJson(ro.fields) === stableJson(rt.fields)) return 'ours';
+    if (ro.current !== rt.current) return ro.current ? 'ours' : 'theirs';
+    return readingBeats(ro.fields, rt.fields) ? 'ours' : 'theirs';
+}
+
+/** The copy a merge writes when `winner` — one side's copy of a card, kept
+ *  whole because that side changed the card — meets `donor`, the other side's
+ *  copy of it: the winner, with the donor's reading in place of its own when
+ *  the donor's is still a reading of the winner's bytes and is the better one.
+ *  A document's text goes over only while its derivedTextSha names the
+ *  winner's bytes (an edit that replaced the file leaves it behind as stale);
+ *  any other reading only between copies of one type holding the same asset
+ *  (assetId and assetSha). The edit is a person's and the reading is derived
+ *  from the bytes, so this keeps both: a paid reading (a cloud video analysis)
+ *  is not thrown away because the card was renamed on the other machine. The
+ *  result depends on the two copies alone, whichever side either is. */
+export function carryReading(winner, donor) {
+    if (typeof winner !== 'string' || typeof donor !== 'string' || winner === donor || !donor.includes('derivedText')) return winner;
+    let w, d;
+    try { w = JSON.parse(winner); d = JSON.parse(donor); } catch { return winner; }
+    if (!isPlainObject(w) || !isPlainObject(d) || w.type !== d.type) return winner;
+    const rw = readingFieldsIn(w), rd = readingFieldsIn(d);
+    if (stableJson(rw) === stableJson(rd)) return winner;
+    const carried = { ...w };
+    for (const f of READING_ITEM_FIELDS) delete carried[f];
+    Object.assign(carried, rd);
+    // Current on the WINNER's bytes: a document's text by its derivedTextSha
+    // (readingIsCurrent → savedDocumentText), any other reading by the asset.
+    const ofTheseBytes = readingIsCurrent(carried) && (carried.derivedTextKind === DOCUMENT_TEXT_KIND
+        || ((w.assetId ?? null) === (d.assetId ?? null) && (w.assetSha ?? null) === (d.assetSha ?? null)));
+    if (!ofTheseBytes) return winner;
+    if (readingIsCurrent(w) && readingBeats(rw, rd)) return winner;
+    return JSON.stringify(carried);
+}
+
+// A card as a canonical string: parsed, the given fields stripped, key-sorted.
+// Unparseable JSON falls back to byte identity — a malformed item must never
+// crash a merge.
+function signatureWithout(json, fieldLists) {
     if (json == null) return null;
     try {
         const obj = JSON.parse(json);
-        for (const f of VOLATILE_ITEM_FIELDS) delete obj[f];
-        for (const f of READING_ITEM_FIELDS) delete obj[f];
+        for (const list of fieldLists) for (const f of list) delete obj[f];
         return stableJson(obj);
     } catch {
         return json;
     }
+}
+
+/** A card's IDENTITY as a canonical string: volatile fields stripped,
+ *  key-sorted — byte for byte what every engine since 1.86 hashes into bin
+ *  identities (fullEntryRid), conflict-twin ids and revived ids. Reading fields
+ *  stay in: an identity names exact bytes, and hashing anything else would
+ *  make every receipt and twin an older engine minted name different bytes. */
+export function itemSignature(json) {
+    return signatureWithout(json, [VOLATILE_ITEM_FIELDS]);
+}
+
+/** A card's MEANING as a canonical string: volatile AND reading fields
+ *  stripped, key-sorted. What sameMeaning compares. */
+export function meaningSignature(json) {
+    return signatureWithout(json, [VOLATILE_ITEM_FIELDS, READING_ITEM_FIELDS]);
 }
 
 /** True when two item JSON strings mean the same thing (volatile and reading
@@ -255,7 +326,7 @@ export function itemSignature(json) {
 export const sameMeaning = (a, b) => {
     if (a === b) return true;           // fast path: byte-identical
     if (a == null || b == null) return false;
-    return itemSignature(a) === itemSignature(b);
+    return meaningSignature(a) === meaningSignature(b);
 };
 
 const compactText = (value, max = 140) => String(value || '').replace(/\s+/g, ' ').trim().slice(0, max);
@@ -335,6 +406,20 @@ const sha256Hex = (s) => crypto.createHash('sha256').update(String(s)).digest('h
 // hash of what it purged, because a short secret could be brute-forced from it.
 // An R receipt keeps its F's identity: those bytes are live again, nothing leaks.
 export const fullEntryRid = (id, json) => 'r_' + sha256Hex(`${id}\n${itemSignature(json) ?? ''}`).slice(0, 16);
+
+/** True when `json` holds the bytes a full entry's identity `rid` was minted
+ *  from (`id` is the card the entry was minted for): byte for byte, reading
+ *  fields included, as fullEntryRid mints it in every engine — or those bytes
+ *  with a reading KLYPIX made on the card since (the entry's bytes had none).
+ *  Every check of a copy against a stored rid ("is this the deleted card", "is
+ *  this what the restore put back") goes through here, so a copy is never
+ *  called edited only because KLYPIX read it. */
+export function holdsEntryBytes(id, json, rid) {
+    if (typeof rid !== 'string' || !rid || json == null) return false;
+    if (fullEntryRid(id, json) === rid) return true;
+    const meaning = meaningSignature(json);
+    return meaning !== itemSignature(json) && 'r_' + sha256Hex(`${id}\n${meaning ?? ''}`).slice(0, 16) === rid;
+}
 
 /** The identity of one bin entry: its stored rid, else the one it would have
  *  been minted with. A pre-rid F shares its identity with a new F of the same

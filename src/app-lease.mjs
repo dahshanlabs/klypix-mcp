@@ -181,7 +181,7 @@ export const TELL_USER = {
   // only, so a photo, a video or a file card needs a different human step.
   NOT_READ_IMAGE: 'Right-click the photo in KLYPIX and choose Extract text (OCR). After the canvas saves, ask me again.',
   NOT_READ_MEDIA: "Open the canvas in KLYPIX and ask KLYPIX's AI about that card; KLYPIX saves what it reads on the card. After the canvas saves, ask me again.",
-  NOT_READ_DOCUMENT: "KLYPIX does not save the text of a document card yet, so I can't read it from the saved canvas. Open it in KLYPIX if you need its text.",
+  NOT_READ_DOCUMENT: "Open the canvas in KLYPIX and ask KLYPIX's AI about that card; KLYPIX saves the text it reads from a document on the card. After the canvas saves, ask me again.",
 };
 
 export function tellUser(code, vars = {}) {

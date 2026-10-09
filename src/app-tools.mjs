@@ -30,8 +30,10 @@
 // runtime missing it degrades to file mode instead of losing these tools.
 //
 // P0 FILE MODE: both tools read what the KLYPIX app has already saved
-// into a canvas — transcripts on media cards (derivedText), Read contents result
-// cards, OCR cards, folder listings — and the lease file a running KLYPIX
+// into a canvas — transcripts on media cards (derivedText), a document's text
+// on its file card (derivedText, served only while its derivedTextSha names the
+// bytes the card holds), Read contents result cards, OCR cards, folder
+// listings — and the lease file a running KLYPIX
 // writes. Nothing here reads a page, a reel or a document itself: that is the
 // app's own value (its readers, keys, consents and credits), and from P1 an AI
 // tool reaches it through the app, never around it.
@@ -66,7 +68,7 @@ import {
 } from './app-lease.mjs';
 import { brainTarget, canvasTitleOf, resolveCanvasDetailed, walkVault } from './klypix-core.mjs';
 import {
-  classifyLinkTier, derivedReading, escapeInstructionLines, fenceContent, parseKlypix, readManifestCheap, recordedAuthor, savedReadingIndex, scopeLockedView,
+  classifyLinkTier, derivedReading, DOCUMENT_TEXT_KIND, escapeInstructionLines, fenceContent, parseKlypix, readManifestCheap, recordedAuthor, savedReadingIndex, scopeLockedView,
 } from './klypix-format.mjs';
 import {
   LIMITS, assetBytes, cacheBytes, dataUrlImage, decodeText, diskBytes, extOf, findZipEntry, fitImage, htmlPreviewToText,
@@ -407,6 +409,9 @@ function linkMethod(url, partial) {
   return { method: 'page_fetch', ranOn: 'this_pc' };
 }
 function derivedMethod(item, reading) {
+  // A document's text: derivedReading served it only because it is of the
+  // bytes the card holds now (savedDocumentText).
+  if (reading.kind === DOCUMENT_TEXT_KIND) return 'document_text';
   if (reading.kind === 'image-understanding') return 'image_understanding';
   if (reading.kind === 'video-transcript' || (item.type === 'video' && reading.visuals === false)) return 'audio_only_transcript';
   return 'media_transcript';
@@ -729,8 +734,11 @@ export async function readCardContents({ vault, canvas, card_ids, read_new, refr
     if (truncated) anyTruncated = true;
     const entry = { card_id: id, card_type: type, ...result, text: shown, truncated, file: fileInfo, ...(entries ? { entries } : {}), ...(frozenIds.has(id) ? { frozen: true } : {}) };
     if (cardSentence) { entry.code = notReadCode; entry.tell_user = cardSentence; sentences.push(cardSentence); }
-    // refresh: in file mode a fresh reading is the person's step in KLYPIX.
-    if (refresh === true && !['card_text', 'folder_listing', 'file_text', 'image', 'file_path', 'saved_preview'].includes(result.method)) {
+    // refresh: in file mode a fresh reading is the person's step in KLYPIX —
+    // but not for a document's text: it is served only while it is of the
+    // bytes the card holds, and a new read of those bytes gives the same
+    // words (the file itself goes by path beside it), so no step is sent.
+    if (refresh === true && !['card_text', 'folder_listing', 'file_text', 'image', 'file_path', 'saved_preview', 'document_text'].includes(result.method)) {
       const sentence = stepFor(item);
       if (sentence) { entry.tell_user = sentence; sentences.push(sentence); }
     }

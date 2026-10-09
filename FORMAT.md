@@ -170,6 +170,22 @@ writing, so two copies of an identical card differ in it. Any comparison that de
 learned this the hard way: a byte-compare spawned conflict twins for cards nobody
 touched. `mergeBrains` exports `sameMeaning(a, b)` as the single correct comparison.
 
+**A saved reading is DERIVED — not content either.** KLYPIX keeps what it read from a
+card's file on the card: `derivedText`, with `derivedTextKind` (`document-text`,
+`audio-transcript`, `video-transcript`, `video-analysis`, `image-understanding`),
+`derivedTextSource` (`local` | `cloud`) and, depending on the kind, `derivedTextAt`,
+`derivedTextVisuals` and `derivedTextSha`. A reading is made again from the bytes whenever
+it is missing, so `sameMeaning` strips these fields too: two copies that differ only in
+their reading are one card (no conflict twin), and a reading made on one side never brings
+back a card the other side deleted. Of two such copies a merge writes the one whose reading
+is current.
+
+A document's reading (`derivedTextKind: "document-text"`, on a `file` card) carries
+`derivedTextSha`: the card's `assetSha`, else its `assetId`, when it was read. It is current
+only while that still names the card's bytes; a reader must not serve a reading of earlier
+bytes as what the file says. A credential file's reading (`.env`, `.pem`, `.key`, `.npmrc` …)
+is never served — KLYPIX does not keep one.
+
 ## Bytes: when they are embedded vs referenced
 
 **Embedded** — the bytes live inside the ZIP under `assets/`, and the item JSON

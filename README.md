@@ -707,6 +707,12 @@ the KLYPIX app). Pass the ids `read_canvas` prints; every card with something in
 | Folder | Its file list. Add `entry_paths` (up to 8 file paths from the list) to get those files the same way. Paths that would leave the folder are refused; an entry over 64 MB, or one that inflates more than 200 times its stored size, is refused with its size. A folder kept on disk (not embedded) is read from where it is, never outside it. |
 | Audio, video | The reading KLYPIX saved, when there is one. Otherwise a local path and a plain statement that nothing in the answer says what it contains; a video's saved poster frame is attached and labelled as one frame. |
 
+A PDF, Office or text file that KLYPIX has already read also comes back with the text KLYPIX
+saved from it, first (`method: document_text`), and the file by path beside it. That text is
+used only while the card still holds the file it was read from: a reading of an earlier version
+of the file is never served, shown by `read_canvas` or matched by `search_canvases`, and the
+file itself is handed over as above.
+
 Limits, and why:
 
 - **One answer stays under 1 MB.** Claude Desktop refuses a whole tool result over 1 MB, so the images

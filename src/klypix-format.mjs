@@ -159,6 +159,19 @@ export const shard = (id) => id.replace(/^[a-z]+[_:]/i, '').toLowerCase().slice(
 // bearing: a real edit to any of them is still a real conflict.
 export const VOLATILE_ITEM_FIELDS = ['updatedAt', 'zIndex', 'editedAt'];
 
+// READING = a card's saved reading: the words KLYPIX's own readers took out of
+// the card's file — a document's text, a video's or a voice note's transcript
+// or analysis (the app's READING_FIELD_KEYS, items/documentReadingFields.ts).
+// Derived data, made again from the card's bytes whenever it is missing, so it
+// is no part of what a card MEANS either:
+//   • two copies whose only difference is their reading are one card — no
+//     conflict twin, no content conflict;
+//   • a reading made on one side is not an edit, so it never brings back a
+//     card the other side deleted: the delete wins.
+// A merge still keeps a reading whenever it keeps the card: of two copies that
+// mean the same it writes the one whose reading is current (pickReadingCopy).
+export const READING_ITEM_FIELDS = ['derivedText', 'derivedTextKind', 'derivedTextSource', 'derivedTextSha', 'derivedTextAt', 'derivedTextVisuals'];
+
 // Key-sorted JSON, so two writers' key orders can never fake a difference.
 const stableJson = (v) => JSON.stringify(v, (_k, val) =>
     (val && typeof val === 'object' && !Array.isArray(val))
@@ -184,21 +197,58 @@ export function pickThreeWay(o, t, b) {
  *  or any strings): true when the first wins. */
 export const canonicalFirst = (a, b) => a > b;
 
-/** A card's MEANING as a canonical string: parsed, volatile fields stripped,
- *  key-sorted. Unparseable JSON falls back to byte identity — a malformed item
- *  must never crash a merge. */
+/** Of two copies of one card that mean the same (sameMeaning), the one a merge
+ *  writes: 'ours' or 'theirs'. They differ at most in volatile and reading
+ *  fields, and the reading is what AI tools are served, so the reading
+ *  decides — the same way on every machine, whichever side is ours: git and
+ *  Brain Sync compare readings, so an ours-first pick would hand two readings
+ *  back and forth between the repo and the cloud.
+ *    1. A current reading beats none and beats a stale one (readingIsCurrent:
+ *       a document's text counts only while derivedTextSha names the bytes the
+ *       card holds).
+ *    2. Otherwise the reading is decided 3-way from the base `b`: one made or
+ *       dropped on one side wins, and two different new ones are picked from
+ *       the two values alone (pickThreeWay).
+ *  Copies with the same reading keep ours, as before: they differ in volatile
+ *  fields only. */
+export function pickReadingCopy(o, t, b = null) {
+    if (o === t) return 'ours';
+    const ro = readingFieldsOf(o), rt = readingFieldsOf(t);
+    if (stableJson(ro.fields) === stableJson(rt.fields)) return 'ours';
+    if (ro.current !== rt.current) return ro.current ? 'ours' : 'theirs';
+    const rb = b == null ? undefined : readingFieldsOf(b).fields;
+    return pickThreeWay(ro.fields, rt.fields, rb) === ro.fields ? 'ours' : 'theirs';
+}
+// A card's reading fields, and whether that reading is current. Most cards have
+// none, so a JSON string that never names the field is not parsed.
+function readingFieldsOf(json) {
+    const none = { fields: {}, current: false };
+    if (typeof json !== 'string' || !json.includes('derivedText')) return none;
+    let item;
+    try { item = JSON.parse(json); } catch { return none; }
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return none;
+    const fields = {};
+    for (const f of READING_ITEM_FIELDS) if (item[f] !== undefined) fields[f] = item[f];
+    return { fields, current: readingIsCurrent(item) };
+}
+
+/** A card's MEANING as a canonical string: parsed, volatile and reading fields
+ *  stripped, key-sorted. Unparseable JSON falls back to byte identity — a
+ *  malformed item must never crash a merge. */
 export function itemSignature(json) {
     if (json == null) return null;
     try {
         const obj = JSON.parse(json);
         for (const f of VOLATILE_ITEM_FIELDS) delete obj[f];
+        for (const f of READING_ITEM_FIELDS) delete obj[f];
         return stableJson(obj);
     } catch {
         return json;
     }
 }
 
-/** True when two item JSON strings mean the same thing (volatile fields aside).
+/** True when two item JSON strings mean the same thing (volatile and reading
+ *  fields aside).
  *  The single definition of "did this card actually change": the git merge
  *  driver, the merge engine and the Brain Sync core all decide with it, so all
  *  three transports agree on what an edit is. */
@@ -1091,6 +1141,8 @@ export function fenceContent({ cardId, source, author, text }) {
 // ── Saved readings (P0 agent parity) ─────────────────────────────────────────
 // What KLYPIX has already read, from the saved file alone:
 //   • derivedText on a media card (transcript / analysis / image understanding);
+//   • derivedText on a document's file card (its text, kind 'document-text'),
+//     only while its derivedTextSha names the bytes the card holds;
 //   • a Read contents result: a text card tagged `link` (+ `partial`), with an
 //     arrow FROM the link card TO it (KlypixCanvas readLinkContents);
 //   • an OCR result: a text card tagged `ocr`, arrowed from the image.
@@ -1147,16 +1199,78 @@ export function savedReadingIndex(parsed, hiddenIds = new Set()) {
     return { bySource, byResult };
 }
 
+// A DOCUMENT's reading (the KLYPIX app's agent/documentReading.ts): the text
+// KLYPIX extracted from a file card — PDF, Word, Excel, text, code — saved on
+// the card as derivedText with derivedTextKind 'document-text',
+// derivedTextSource 'local' and derivedTextSha: the bytes it was read from,
+// named by the card's assetSha, else its assetId (an asset id's bytes change
+// only through a repack, and a repack stamps assetSha). It carries no
+// derivedTextAt, so two machines reading the same bytes write the same fields.
+// The reading is CURRENT only while the card still holds those bytes. KLYPIX
+// drops it when the bytes change, but a file written by an older KLYPIX or by
+// another program can still carry one of earlier bytes, and no reader here
+// serves that as what the file says. These are the app's own rules
+// (items/documentReadingFields.ts), restated so this module stays standalone.
+export const DOCUMENT_TEXT_KIND = 'document-text';
+
+/** Which bytes a card holds, as two copies of the card name them: its
+ *  assetSha, else its assetId; null for a card with no bytes of its own. */
+export function documentBytesIdentity(item) {
+    if (!item) return null;
+    if (typeof item.assetSha === 'string' && item.assetSha) return item.assetSha;
+    if (typeof item.assetId === 'string' && item.assetId) return item.assetId;
+    return null;
+}
+
+const SECRET_FILE_EXTENSIONS = new Set(['env', 'pem', 'key', 'p12', 'pfx', 'keystore', 'npmrc', 'netrc', 'htpasswd']);
+/** A file whose words are credentials (.env, keys, .npmrc …). KLYPIX never
+ *  keeps its text on the card, and a reading one carries is never served. */
+export function isSecretBearingFile(item) {
+    if (!item) return false;
+    if (SECRET_FILE_EXTENSIONS.has(String(item.extension || '').toLowerCase().replace(/^\./, ''))) return true;
+    const base = (String(item.fileName || '').split(/[\\/]/).pop() || '').toLowerCase();
+    if (/^\.env(?:\..*)?$/.test(base)) return true;
+    if (/^\.?(?:npmrc|netrc|htpasswd)$/.test(base)) return true;
+    const dot = base.lastIndexOf('.');
+    return dot >= 0 && SECRET_FILE_EXTENSIONS.has(base.slice(dot + 1));
+}
+
+/** A document card's saved text when it was read from the bytes the card
+ *  holds now; null when there is none, when it is another kind of reading,
+ *  when the file changed after it was read (a stale reading), or when the
+ *  file is one whose text is never kept. */
+export function savedDocumentText(item) {
+    if (!item || item.type !== 'file' || item.isFolder) return null;
+    if (item.derivedTextKind !== DOCUMENT_TEXT_KIND) return null;
+    const text = item.derivedText;
+    if (typeof text !== 'string' || !text.trim()) return null;
+    if (isSecretBearingFile(item)) return null;
+    const identity = documentBytesIdentity(item);
+    return identity !== null && item.derivedTextSha === identity ? text : null;
+}
+
+/** True when a card carries a reading a reader may serve as current: a
+ *  document's text only while savedDocumentText says so; a transcript or any
+ *  other reading whenever it is there (those are not tied to the bytes). */
+export function readingIsCurrent(item) {
+    if (!item || typeof item.derivedText !== 'string' || !item.derivedText.trim()) return false;
+    if (item.derivedTextKind === DOCUMENT_TEXT_KIND) return savedDocumentText(item) !== null;
+    return true;
+}
+
 const DERIVED_KIND_LABEL = {
     'image-understanding': 'image understanding',
     'audio-transcript': 'audio transcript',
     'video-transcript': 'video transcript',
     'video-analysis': 'video analysis',
+    'document-text': 'document text',
 };
-/** A media card's saved reading (derivedText), normalised, or null. */
+/** A card's saved reading (derivedText), normalised, or null — null too for a
+ *  document's reading of bytes the card no longer holds (readingIsCurrent). */
 export function derivedReading(item) {
     const text = typeof item?.derivedText === 'string' ? item.derivedText : '';
     if (!text.trim()) return null;
+    if (!readingIsCurrent(item)) return null;
     const kind = typeof item.derivedTextKind === 'string' ? item.derivedTextKind : null;
     return {
         text,
@@ -1175,7 +1289,10 @@ export function notReadStep(item) {
     if (item.type === 'link') return 'select it in KLYPIX and press Enter (Read contents), then let the canvas save';
     if (item.type === 'image') return 'right-click it in KLYPIX and choose Extract text (OCR), then let the canvas save';
     if (item.type === 'video' || item.type === 'audio') return "ask KLYPIX's AI about it in KLYPIX (KLYPIX saves what it reads on the card), then let the canvas save";
-    if (item.type === 'file' && !item.isFolder) return 'KLYPIX does not save the text of document cards yet';
+    if (item.type === 'file' && !item.isFolder) {
+        // KLYPIX never keeps a credential file's text, so no step promises it.
+        return isSecretBearingFile(item) ? null : "ask KLYPIX's AI about it in KLYPIX (KLYPIX saves the text it reads from a document on the card), then let the canvas save";
+    }
     return null;
 }
 
@@ -9381,13 +9498,17 @@ export function cardContentsHint(it, hasReading = false) {
         return hasReading ? "KLYPIX's whole saved reading" : `a local path to the ${it.type} file (no reading is saved yet, and ${it.type} cannot be attached)`;
     }
     if (it.type !== 'file') return null;
-    if (ext === 'pdf') return `a local path to the PDF to open with your file-reading tool${it.previewDataUrl ? ", and KLYPIX's saved image of page 1" : ''}`;
-    if (TEXT_FILE_EXT_RE.test(ext)) return "the file's text";
+    // A document KLYPIX has read comes back with its saved text first — only
+    // while that text is of the bytes the card holds — and the file by path.
+    const read = savedDocumentText(it) !== null;
+    const saved = read ? "KLYPIX's saved text of the document, and " : '';
+    if (ext === 'pdf') return `${saved}a local path to the PDF to open with your file-reading tool${it.previewDataUrl ? ", and KLYPIX's saved image of page 1" : ''}`;
+    if (TEXT_FILE_EXT_RE.test(ext)) return read ? `${saved}a local path to the file to open with your file-reading tool` : "the file's text";
     if (OFFICE_FILE_EXT_RE.test(ext)) {
-        const preview = it.previewSheet ? "KLYPIX's saved first rows of the sheet" : it.previewHtml ? "KLYPIX's saved opening text" : null;
-        return `a local path to the file to open with your file-reading tool${preview ? `, and ${preview}` : ''}`;
+        const preview = read ? null : it.previewSheet ? "KLYPIX's saved first rows of the sheet" : it.previewHtml ? "KLYPIX's saved opening text" : null;
+        return `${saved}a local path to the file to open with your file-reading tool${preview ? `, and ${preview}` : ''}`;
     }
-    return 'a local path to the file to open with your file-reading tool';
+    return `${saved}a local path to the file to open with your file-reading tool`;
 }
 
 /**

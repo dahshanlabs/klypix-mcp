@@ -164,7 +164,7 @@ import { createHash } from 'node:crypto';
 import {
   parseKlypix, shard, sameMeaning, itemSignature, twinIdFor, binEntryFor,
   entryKind, receiptIdentity, revivedIdFor, pickBinEntry, contentFreeReceiptFor, PURGED_BODY, fullEntryRid,
-  pickThreeWay, canonicalFirst,
+  pickThreeWay, canonicalFirst, pickReadingCopy,
 } from './klypix-format.mjs';
 import { generateKeyBetween } from 'fractional-indexing';
 
@@ -217,9 +217,9 @@ const ARCHIVE = /^archive$/i;
 // against 1.86 — the git driver, the API-5 KLYPIX sync core — import them from
 // this module, and the KLYPIX core reads the whole engine off this namespace.
 export {
-  sameMeaning, itemSignature, VOLATILE_ITEM_FIELDS, twinIdFor, revivedIdFor, receiptIdentity, entryKind,
+  sameMeaning, itemSignature, VOLATILE_ITEM_FIELDS, READING_ITEM_FIELDS, twinIdFor, revivedIdFor, receiptIdentity, entryKind,
   isContentFreeReceipt, pickBinEntry, PURGED_BODY, binEntryFor, contentFreeReceiptFor, fullEntryRid,
-  pickThreeWay,
+  pickThreeWay, pickReadingCopy,
 } from './klypix-format.mjs';
 export { purgeGraveyard, restoreFromGraveyard, listGraveyard } from './brain-graveyard.mjs';
 
@@ -258,6 +258,7 @@ export const MERGE_ENGINE_FEATURES = Object.freeze({
   arrangeReceipts: true,             // arrangeBrain buries what it collapses, survivor from content and ids (E-8)
   revivalMap: true,                  // revivalMap, and brainDelta's lastKnown/collectLive, for the live watcher
   sideFreeTies: true,                // option modes: a tie between two sides is broken from the values alone (pickThreeWay)
+  derivedReadings: true,             // every caller: a card's saved reading (READING_ITEM_FIELDS) is no part of its meaning — no twin, no conflict, a delete wins — and of two copies that mean the same the one with the current reading is written (pickReadingCopy)
   options: OPTION_VALUES,
 });
 
@@ -318,6 +319,18 @@ const sha12 = (s) => createHash('sha256').update(String(s)).digest('hex').slice(
 // list (updatedAt, zIndex, editedAt) — lives in klypix-format.mjs since 1.89,
 // so the bin identity (receiptIdentity) and twin ids hash exactly the meaning
 // this merge compares.
+//
+// A card's saved READING (READING_ITEM_FIELDS: derivedText and its kind,
+// source, sha, time and visuals — a document's text, a transcript) is stripped
+// there too: it is derived from the card's bytes and made again when missing.
+// Two machines that read one card between syncs wrote those fields
+// independently, and counted as content they kept a conflict twin of the card
+// (a media reading's time stamp alone did it), or brought back a card the
+// other side had deleted (a reading counted as the edit the deleter never saw).
+// Now a reading-only difference is one card and a reading never beats a
+// delete. Which of two such copies is written is still decided — the reading is
+// what AI tools are served, and git and Brain Sync compare it — by
+// pickReadingCopy: the current reading, the same copy whichever side is ours.
 
 // Load one .klypix buffer into a flat, comparison-friendly shape. Item JSON is
 // kept VERBATIM (the merge must write back exactly what a side held); whether
@@ -631,7 +644,7 @@ function mergeUnion(B, O, T, del, deletedMeta) {
     if (inO && inT) {
       // Change + divergence are judged by MEANING, not bytes (see sameMeaning):
       // a restamped `updatedAt` is not an edit, and two copies of one card that
-      // differ only in volatile fields are not in conflict.
+      // differ only in volatile or reading fields are not in conflict.
       const oChg = !inB || !sameMeaning(O.items[id], baseItem(id));
       const tChg = !inB || !sameMeaning(T.items[id], baseItem(id));
       const diverged = !sameMeaning(O.items[id], T.items[id]);
@@ -661,6 +674,14 @@ function mergeUnion(B, O, T, del, deletedMeta) {
           // disk/agent bytes and never create the historical duplicate twin.
           json = T.items[id]; side = 'theirs';
         }
+      }
+      else if (!diverged) {
+        // One card: the copies differ in volatile and reading fields at most.
+        // The one with the current reading is written (pickReadingCopy) — the
+        // same copy whichever side is ours, so a reading theirs made is kept.
+        side = pickReadingCopy(O.items[id], T.items[id], baseItem(id));
+        json = side === 'ours' ? O.items[id] : T.items[id];
+        if (side === 'theirs') delta.updated.push(id);
       }
       else { json = O.items[id]; side = 'ours'; }
     } else if (inT) {
@@ -1473,6 +1494,15 @@ function mergeOptionMode(B, O, T, del, deletedMeta, opt) {
           json = O.items[id]; side = 'ours';
           twinOf(id, T.items[id], srcPos, 'content-new-both');
         } else { json = T.items[id]; side = 'theirs'; }
+      } else if (!diverged && !unverified) {
+        // One card: the copies differ in volatile and reading fields at most.
+        // The one with the current reading is written (pickReadingCopy),
+        // decided from the copies and the base alone — never "ours", or git
+        // and Brain Sync would hand two readings back and forth. Foreign bytes
+        // (unverified) never replace our card, so there ours stays.
+        side = pickReadingCopy(O.items[id], T.items[id], cb);
+        json = side === 'ours' ? O.items[id] : T.items[id];
+        if (side === 'theirs') delta.updated.push(id);
       } else { json = O.items[id]; side = 'ours'; }
     } else if (inT) {
       json = T.items[id]; side = 'theirs';

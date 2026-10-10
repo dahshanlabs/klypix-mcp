@@ -176,6 +176,76 @@ if (!bashAvailable || !jqAvailable) {
   }
 }
 
+// The read-back after publishing asks for this server's LATEST version by
+// name: the search endpoint lists every version oldest first, so its first
+// row (1.82.0) never matched and the step warned on every release. It can only
+// warn — "Validate then publish" has already succeeded, so an unreachable
+// registry (run 38004083677: curl timed out) must not end the run red. Same
+// offline harness as the wait block above.
+const registryVerify = registryWorkflow.match(/      - name: Verify a stranger can see it\n[\s\S]*?        run: \|\n([\s\S]*?)(?=\n      - name:|\n*$)/)?.[1]
+  ?.split('\n').map((line) => line.replace(/^          /, '')).join('\n');
+const latestUrl = 'https://registry.modelcontextprotocol.io/v0/servers/io.github.dahshanlabs%2Fklypix-mcp/versions/latest';
+ok(Boolean(registryVerify), 'the MCP Registry read-back block is available for execution');
+ok(Boolean(registryVerify) && !/\bexit 1\b/.test(registryVerify) && !registryVerify.includes('::error::'),
+  'the registry read-back can only warn: a publish that succeeded never ends red');
+ok(Boolean(registryVerify) && registryVerify.includes(latestUrl) && !registryVerify.includes('servers[0]'),
+  "the registry read-back asks for this server's latest version, not the first search row");
+if (bashAvailable && jqAvailable && registryVerify) {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-registry-verify-'));
+  const shQuote = (value) => "'" + String(value).replace(/'/g, "'\\''") + "'";
+  const latest = (version) => ({ body: JSON.stringify({ server: { name: 'io.github.dahshanlabs/klypix-mcp', version } }), code: 0 });
+  const scenarios = [
+    { name: 'the released version as latest passes at once', replies: [latest('1.84.0')], attempts: 1, served: true },
+    { name: 'an index lag passes once latest catches up', replies: [latest('1.83.0'), latest('1.84.0')], attempts: 2, served: true },
+    { name: 'transport and HTTP errors cannot pass with matching bodies', replies: [{ ...latest('1.84.0'), code: 28 }, { ...latest('1.84.0'), code: 22 }, latest('1.84.0')], attempts: 3, served: true },
+    { name: 'empty, malformed and search-shaped bodies retry', replies: ['', '<html>unavailable</html>', 'null', JSON.stringify({ servers: [{ server: { version: '1.84.0' } }] })].map((body) => ({ body, code: 0 })).concat(latest('1.84.0')), attempts: 5, served: true },
+    { name: 'an unreachable registry warns after bounded retries', replies: [{ body: '', code: 28 }], attempts: 6, served: false },
+    { name: 'a latest that never catches up warns after bounded retries', replies: [latest('1.83.0')], attempts: 6, served: false },
+  ];
+  try {
+    for (const [index, scenario] of scenarios.entries()) {
+      const countFile = path.join(fixtureRoot, index + '-attempts');
+      const sleepFile = path.join(fixtureRoot, index + '-sleeps');
+      const argsFile = path.join(fixtureRoot, index + '-args');
+      const branches = scenario.replies.map((reply, n) =>
+        '    ' + (n === scenario.replies.length - 1 ? '*' : n + 1) + ') printf %s ' + shQuote(reply.body) + '; return ' + reply.code + ';;'
+      ).join('\n');
+      const script = [
+        'curl() {',
+        '  local count=0',
+        '  if [ -f "$COUNT_FILE" ]; then read -r count < "$COUNT_FILE"; fi',
+        '  count=$((count + 1))',
+        '  printf "%s\\n" "$count" > "$COUNT_FILE"',
+        '  printf "%s\\n" "$*" >> "$ARGS_FILE"',
+        '  case "$count" in', branches, '  esac', '}',
+        'sleep() { printf "%s\\n" "$1" >> "$SLEEP_FILE"; }',
+        'jq() { command "$JQ_BIN" "$@"; }',
+        registryVerify,
+      ].join('\n');
+      const result = spawnSync(bashBin, ['--noprofile', '--norc', '-c', script], {
+        encoding: 'utf8', timeout: 20_000,
+        env: { ...process.env, VERSION: '1.84.0', JQ_BIN: jqBin.replace(/\\/g, '/'),
+          COUNT_FILE: countFile.replace(/\\/g, '/'), SLEEP_FILE: sleepFile.replace(/\\/g, '/'), ARGS_FILE: argsFile.replace(/\\/g, '/') },
+      });
+      const attempts = fs.existsSync(countFile) ? Number(fs.readFileSync(countFile, 'utf8').trim()) : 0;
+      const sleeps = fs.existsSync(sleepFile) ? fs.readFileSync(sleepFile, 'utf8').trim().split('\n').filter(Boolean) : [];
+      const args = fs.existsSync(argsFile) ? fs.readFileSync(argsFile, 'utf8').trim().split('\n') : [];
+      const served = result.stdout.includes('registry serves io.github.dahshanlabs/klypix-mcp@1.84.0 as latest');
+      ok(result.status === 0 && attempts === scenario.attempts && served === scenario.served
+        && result.stdout.includes('::warning::') === !scenario.served,
+        'registry read-back: ' + scenario.name);
+      ok(sleeps.length === scenario.attempts - (scenario.served ? 1 : 0) && sleeps.every((value) => value === '15'),
+        'registry read-back: ' + scenario.name + ' keeps its retry delays');
+      ok(args.length === scenario.attempts && args.every((value) =>
+        /(?:^| )--fail(?: |$)/.test(value) && value.includes('--max-time 20') && value.includes(latestUrl)),
+        'registry read-back: ' + scenario.name + ' bounds each request and rejects HTTP errors');
+      if (result.error) console.error(result.error.message);
+    }
+  } finally {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+}
+
 if (failures) {
   console.error(`\n[x] publish-workflow: ${failures} assertion(s) failed`);
   process.exitCode = 1;

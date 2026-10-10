@@ -121,11 +121,22 @@ jobs:
           VERSION: ${{ steps.v.outputs.version }}
         run: |
           set -euo pipefail
-          FOUND="$(curl -sSL --max-time 20 \
-            "https://registry.modelcontextprotocol.io/v0/servers?search=io.github.dahshanlabs/klypix-mcp" \
-            | jq -r '.servers[0].server.version // empty')"
-          if [ "$FOUND" = "$VERSION" ]; then
-            echo "registry serves io.github.dahshanlabs/klypix-mcp@${VERSION}"
-          else
-            echo "::warning::Registry search does not yet return ${VERSION} (got '${FOUND}') — indexing may lag; check manually."
-          fi
+          # Ask for this server's LATEST version by name. The search endpoint
+          # lists every published version oldest first, so its first row
+          # (1.82.0) never matched and this step warned on every release. A
+          # read that cannot reach the registry means the same as an index
+          # lag (not confirmed yet), so it warns rather than turning the run
+          # red after "Validate then publish" has already succeeded.
+          URL="https://registry.modelcontextprotocol.io/v0/servers/io.github.dahshanlabs%2Fklypix-mcp/versions/latest"
+          FOUND=""
+          for i in $(seq 1 6); do
+            # The whole read sits in the condition: a failed transfer, or a
+            # body that is not this server's latest, cannot pass, and set -e
+            # cannot abort the step before the next attempt.
+            if FOUND="$(curl --fail -sSL --max-time 20 "$URL" 2>/dev/null \
+                | jq -er '.server.version' 2>/dev/null)" && [ "$FOUND" = "$VERSION" ]; then
+              echo "registry serves io.github.dahshanlabs/klypix-mcp@${VERSION} as latest"; exit 0
+            fi
+            echo "registry answers '${FOUND}' (attempt $i) — waiting"; sleep 15
+          done
+          echo "::warning::Registry does not yet answer ${VERSION} as latest (got '${FOUND}') — indexing may lag or the registry was unreachable; check ${URL} by hand."

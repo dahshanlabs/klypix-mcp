@@ -28,7 +28,7 @@ import {
   resolveVault, getEmbedder, shouldPrewarmSemantic, buildKlypixMap, cardSchema, connSchema, groupSchema,
   opListCanvases, opReadCanvas, opSearchCanvases, opSearchAllBrains,
   opBrainInsights, opBrainConnect, opBrainReconcile, opBrainGarden, opCreateCanvas, opAddToCanvas, opBrainNote, opBrainMessage, opBrainAsk, opBrainChallenge, opCanvasView, opBrainLens,
-  opBrainTaskContext,
+  opBrainTaskContext, opBrainHandoff,
 } from '../src/klypix-core.mjs';
 import { compareProjectGraphResults, projectGraphContextMarkdown, queryProjectGraph, suggestProjectGraphBrainLinks, scanNativeProjectMap, checkBrainDrift, brainDriftMarkdown } from '../src/project-graph.mjs';
 import { auditProject, compactAgentsBrief, linkProject, mcpServerEntry } from '../src/agent-rules.mjs';
@@ -1064,6 +1064,61 @@ server.registerTool('brain_reopen', {
   return reply('reopened', `🔓 Reopened ${label} — the human said yes${consent.via === 'dialog' ? ' in the KLYPIX dialog' : ''}. It opened in a new ${plan.method === 'windows-terminal' ? 'Windows Terminal window' : plan.method === 'macos-terminal' ? 'Terminal window' : 'terminal window'} in ${candidate.cwd} with ${candidate.command}${consent.start ? ', and starts on the note right away' : ', waiting for the human to prompt it'}. ${notes === 1 ? 'The waiting note is' : `The ${notes} waiting notes are`} delivered at its first action; your next prompt shows the receipt. If the window shows an error (for example the command is not found), the note stays queued — ${manualLine}.`, { via: consent.via, method: plan.method, cwd: candidate.cwd, command: candidate.command, start: Boolean(consent.start), notes });
 });
 
+// ── brain_handoff (1.99.0): a session hands its unfinished work to the next ─
+// Two layers. AUTOMATIC: every Stop hook records the session's last state on
+// the lane (intent, files, own commits, the tail of its last reply); when the
+// session goes quiet or closes with its task uncompleted, every new session of
+// any agent sees "unfinished work" at its first brain_sync. DELIBERATE: this
+// verb's `write` puts a 🤝 HANDOFF card into the brain — what is done, what is
+// next, files, how to verify — which the next session takes over by id.
+server.registerTool('brain_handoff', {
+  title: 'Hand unfinished work to the next session — or take over what another session left',
+  description: 'The session handoff. Call {action:"write"} when you are stopping before the work is done — the human asked for a handoff, your context or usage limit is near, the day ends, you are blocked or switching tool — with the task, what is done, what is NEXT in order, the files and how to verify: it becomes a 🤝 card in the project brain that the human can see and correct, and the next session on this project (any agent — Codex, Claude Code, Cursor) sees it at its first brain_sync / session start. Call {action:"take", id} (a card) or {action:"take", session} (unfinished work a session left without a card — KLYPIX records every session\'s last reply, files and commits automatically) before continuing it, so peers see it is taken; {action:"done"} when it is finished (the card is archived); {action:"list"} shows every open handoff and every unfinished session. Never ask the human to paste a summary into the next session — write a handoff. Machine-local for the automatic layer; the card travels with the brain.',
+  annotations: {
+    destructiveHint: false,
+    idempotentHint: false,
+    openWorldHint: false,
+  },
+  inputSchema: {
+    action: z.enum(['write', 'take', 'done', 'list']).optional().describe('write (default): record a handoff card. take: claim a handoff card (id) or unfinished work (session) before continuing it. done: mark it finished. list: every open handoff card and every unfinished session on this project.'),
+    project: z.string().optional().describe('Absolute project root containing brain.klypix. Defaults to this connection\'s project.'),
+    canvas: z.string().optional().describe('Brain canvas filename/path. Defaults to the project brain ("brain").'),
+    title: z.string().max(120).optional().describe('write: the work, in a few words ("Drive upload: the Place-it-now chooser").'),
+    task: z.string().max(400).optional().describe('write: one or two sentences — what the work is and why.'),
+    done: z.array(z.string().max(240)).max(12).optional().describe('write: what is already finished (so it is not redone).'),
+    next: z.array(z.string().max(240)).max(12).optional().describe('write: the remaining steps IN ORDER, as the next session should do them. Required.'),
+    files: z.array(z.string().max(200)).max(20).optional().describe('write: project-relative files the work touches (recorded as evidence anchors).'),
+    verify: z.string().max(400).optional().describe('write: how to check the state — a command or a visible result.'),
+    open: z.array(z.string().max(240)).max(8).optional().describe('write: questions still open, or decisions the human has to make.'),
+    reason: z.enum(['context_limit', 'usage_limit', 'end_of_session', 'blocked', 'switching_tool', 'other']).optional().describe('write: why the work stops here.'),
+    area: z.string().max(40).optional().describe('write: the brain area (titled box) the card goes into. Defaults to "Handoff".'),
+    continues: z.string().max(64).optional().describe('write: the id of an earlier handoff card this one continues — it is closed as "continued by" this one.'),
+    id: z.string().max(64).optional().describe('take / done: the handoff card id (from brain_sync, the session-start brief, or list).'),
+    session: z.string().max(160).optional().describe('take / done: the session id (or a unique prefix of 8+ characters) from the unfinished-work list, when the work has no card.'),
+    summary: z.string().max(400).optional().describe('done: what was finished, in one or two sentences. take: an optional note.'),
+  },
+}, async ({ action, project, canvas, ...rest }, extra) => {
+  const identity = extra?.klypixRequestIdentity || {};
+  const result = await opBrainHandoff({
+    vault: project ? path.resolve(project) : mcpPresence.vault,
+    canvas: canvas || boundBrainCanvas(undefined),
+    action: action || 'write',
+    from: { sessionId: identity.sessionId || mcpPresence.id, client: identity.clientInfo?.client || extra?.klypixClientName || 'unknown' },
+    via: extra?.klypixClientName,
+    ...rest,
+  });
+  // Capture receipt, as for brain_note: a written handoff IS this session's
+  // reasoning recorded through MCP — the uncaptured-work nudge must not fire.
+  if ((action || 'write') === 'write' && !result.isError) {
+    try {
+      const { recordSessionCapture } = await import('../src/capture-gap.mjs');
+      recordSessionCapture(identity.sessionId || mcpPresence.id, undefined, Date.now(), { project: mcpPresence.vault });
+    } catch { /* receipt is best-effort */ }
+  }
+  const out = toContent(result);
+  return result.structured ? { ...out, structuredContent: result.structured } : out;
+});
+
 server.registerTool('brain_sync', {
   title: 'KLYPIX Context Gateway — synchronize task, peers, conflicts, and relevant memory',
   description: 'APPROVAL-FREE task gateway over the authorized MCP connection. Call FIRST with a concise intent and expected files, again when scope changes, and with phase:"complete" before the final response. One bounded response returns compact task-relevant brain context, active TASK peers (idle connections hidden), one-time messages, structured exact-file conflicts, and late-arrival overlap alerts. A completion that supplies machine-checkable result manifests is fail-closed: invalid, conflicting, or incomparable evidence returns needs-reconciliation and retains task scope. `results` is ONLY for such manifests, never a summary of the work: with nothing machine-checkable to claim, complete without it. Works on any MCP host — it needs only the authorized MCP connection, so native lifecycle hooks are optional. LIMITS: blocking overlap is EXACT-PATH over the declared files of each session plus the edits its host observed; sessions on different branches are also test-merged with git merge-tree (committed work only); a same-folder overlap is an advisory notice; coordination/result reconciliation is machine-local and OS-user-local (a teammate on another machine is invisible), and file overlap remains ADVISORY.',
@@ -1343,6 +1398,23 @@ server.registerTool('brain_sync', {
     .map((block) => block.text)
     .filter(Boolean)
     .join('\n\n') || '';
+  // ── Handoffs (1.99.0): on task START only — the one moment a session asked
+  // to "continue" needs them. Open 🤝 cards + unfinished work other sessions
+  // left on the lane, as one block; a second brain parse, bounded, never
+  // fails a sync. Checkpoints and completions print nothing here.
+  let handoffText = '';
+  let handoffData = null;
+  if (phase === 'start' && include_context !== false && report.structured?.brain) {
+    try {
+      const h = await opBrainHandoff({ vault: mcpPresence.vault, canvas: report.structured.brain, action: 'list', from: { sessionId: extra?.klypixRequestIdentity?.sessionId || mcpPresence.id } });
+      const cards = h?.structured?.handoffs || [];
+      const lane = h?.structured?.unfinished || [];
+      if (!h?.isError && (cards.length || lane.length)) {
+        handoffText = String(h.blocks?.[0]?.text || '').replace(/^_brain:[^\n]*_\n\n/, '');
+        handoffData = { cards: cards.length, unfinished: lane.length, handoffs: cards.map((c) => ({ id: c.id, title: c.title, from: c.from, at: c.at, reason: c.reason, state: c.state, next: c.next, files: c.files })), sessions: lane.map((r) => ({ id: r.id, client: r.client, intent: r.intent, status: r.status, lastSeen: r.lastSeen, files: r.files, commits: r.commits, handoffCardId: r.handoffCardId, takenBy: r.takenBy })) };
+      }
+    } catch { /* never fails a sync */ }
+  }
   const totalMs = Math.max(0, Date.now() - totalStartedAt);
   const structuredContent = {
     ...(report.structured || {
@@ -1363,6 +1435,7 @@ server.registerTool('brain_sync', {
     },
     ...(registration ? { registration } : {}),
     ...(harness ? { harness } : {}),
+    ...(handoffData ? { handoffs: handoffData } : {}),
   };
   const harnessText = harness?.failed
     ? `KLYPIX harness self-heal needs attention: ${harness.failed} project(s) remain partially aligned; brain_doctor has the exact files.`
@@ -1374,7 +1447,7 @@ server.registerTool('brain_sync', {
   return {
     content: [{
       type: 'text',
-      text: [report.text, harnessText, shipNotice, releaseReconcileText, captureGapText, contextText, timingText].filter(Boolean).join('\n\n'),
+      text: [report.text, harnessText, shipNotice, releaseReconcileText, captureGapText, handoffText, contextText, timingText].filter(Boolean).join('\n\n'),
     }],
     structuredContent,
     ...(report.isError ? { isError: true } : {}),

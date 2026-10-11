@@ -590,8 +590,36 @@ receives the waiting note at its first action and the sender sees the receipt as
   waiting for them; `npx klypix-mcp sessions reopen <id>` reopens one (`--quiet` lets it wait for
   you instead of starting on the note).
 
-Durable handoffs go in the brain itself — decisions, findings, open questions and skills captured
-as cards, each stamped with the agent that wrote it.
+### Session handoff — continue in the next session, with any agent
+
+The case this exists for: a Claude Code session stops at its usage limit in the middle of a task,
+and the person opens Codex (or a fresh Claude Code) and says *continue*. Until 1.99.0 the only
+handoff was whatever the person pasted. Now there are two layers, and the person does not have
+to ask for either.
+
+**Automatic.** At every turn end the hooks record the session's last state on the lane that already
+remembers sessions for two weeks: the last human prompt, the tail of the last reply (where "done /
+next" usually is), the files it touched, and its *own* commits (the shas its `git commit` printed —
+never a branch range, because twenty sessions can share one checkout). When that session goes quiet
+for ten minutes or closes with its task uncompleted, every new session on the project sees
+**⏸️ Unfinished work left by other sessions** at its first `brain_sync` and at session start — in
+Claude Code, Codex, and any MCP host — with a status (*closed*, *idle 83m*), the files, the commits,
+the last words, and the resume command should the person want the old transcript. The agent takes it
+over with `brain_handoff {action:"take", session:"<id>"}` so peers see it is taken, continues from
+the record, and marks it `done`. Machine-local, like the rest of the lane.
+
+**Deliberate.** When a session knows it is stopping — the person asks for a handoff, the context or
+usage limit is near, the day ends, it is blocked, it is switching tool — it calls
+`brain_handoff {action:"write"}` with the task, what is done, what is **next in order**, the files
+and how to verify. That becomes a 🤝 HANDOFF card in the project brain: an open card the person can
+see and correct on the canvas, with the files as evidence anchors, that travels with the repo and
+syncs like every other card. It leads the session-start brief and the `brain_sync` start response
+until a session takes it (`{action:"take", id}`) and finishes it (`{action:"done", id}`, which
+archives it). A later handoff can name the earlier one it `continues`. The per-prompt hook nudges
+the agent to write one when the person says *handoff* or names the limit.
+
+Durable decisions still go in the brain as cards — a handoff is the one card about *work in
+flight*, and it closes when the work lands.
 
 ## Evidence-gated completion
 
@@ -891,7 +919,7 @@ The MCP verbs below are what agents call. These are what **you** call:
 
 ---
 
-## The verbs: 25, and 26 on Windows
+## The verbs: 26, and 27 on Windows
 
 | Tool | What it does |
 |---|---|
@@ -905,6 +933,7 @@ The MCP verbs below are what agents call. These are what **you** call:
 | `brain_doctor` | Self-diagnosis: version, core/enhanced host adapters, active sessions, tool count, projection drift |
 | `brain_message` | Session-to-session coordination notes — to a live session, or queued for one that is not running until it next starts — with a fixed send-time audience and per-recipient pending / offer / acknowledgement / consumption / failure receipts (a directed note is kept 7 days, a broadcast 24h; never written into the brain) |
 | `brain_message_receipt` | Explicitly record model-side consumption using the exact message id and per-recipient offer token; acknowledgement alone never consumes a note |
+| `brain_handoff` | The session handoff. `write` puts a 🤝 card in the brain — task, done, next in order, files, verify — when a session stops before the work is done; the next session of any agent sees it at its first `brain_sync` and `take`s it, then marks it `done`. `list` also shows the **unfinished work** KLYPIX recorded automatically for every session (its last reply, files and own commits), which can be taken over by session id |
 | `brain_reopen` | Reopen a closed Claude Code or Codex session so a note waiting for it gets there now — only after the person answers *Reopen* in an in-chat prompt or KLYPIX's own dialog; opens a new, visible terminal in that session's folder with the host's resume command |
 | `brain_sync` | Context Gateway: task capsule, active-task peers, exact-file overlap, one-time alerts, timing, and optional result-manifest reconciliation |
 | `brain_connect` | Find and draw related-but-unlinked cards |
@@ -922,7 +951,7 @@ The MCP verbs below are what agents call. These are what **you** call:
 | `add_to_canvas` | Append cards/connections (positions preserved), bordered and readable on KLYPIX's dark and Paper themes; a card's `group` puts it in that titled box. On a canvas open in KLYPIX (Windows) the cards go to KLYPIX itself: live, attributed, one undo. When KLYPIX cannot take them it refuses (`OPEN_IN_APP`, `ACCESS_OFF`, `BLOCKED`), a box locked from AI tools (`SCOPE_LOCKED`) or a frozen box (`FROZEN`), and writes nothing; project brains are the exception to the first. Returns the new card ids |
 | `list_canvases` | List every `.klypix` in the vault |
 
-Exactly 25 on Linux and macOS and 26 on Windows, where `show_in_klypix` is registered; machine-verifiable with `npx klypix-mcp doctor`, whose TOOLS line applies the same rule and whose App bridge line says whether KLYPIX is running, with access on or off.
+Exactly 26 on Linux and macOS and 27 on Windows, where `show_in_klypix` is registered; machine-verifiable with `npx klypix-mcp doctor`, whose TOOLS line applies the same rule and whose App bridge line says whether KLYPIX is running, with access on or off.
 
 > **`canvas_view`:** no MCP Apps host has been observed rendering the UI resource yet — there is no
 > screenshot and no host-level test. Hosts without the extension get clean text, which is the path

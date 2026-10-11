@@ -20,6 +20,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
+import { execFileSync } from 'child_process';
 import { prepareBrainEvidence, inspectCardEvidence, formatCardEvidence } from './brain-evidence.mjs';
 import { looksLikeUnfilledDraft } from './capture-gap.mjs';
 import { z } from 'zod';
@@ -37,14 +38,15 @@ import {
   splitQueryTokens, scoreCardsAgainstQuery, correctionOverlaysFor, supersededByNote, currentGuidanceFor, currentGuidancePrefix,
   isFastDecayCard, isUnresolvedOpenCard, isSkillCard, validateGuard, guardSidecarPathFor, ensureGuardSidecar, DECAY_STALE_MS, formatDecayAge,
   isPlanCard, planFulfillmentFor, PLAN_PAIR_SIM_BRAIN, isAgconfTwinId,
-  readPendingShips, clearPendingShips, pendingShipCards, formatCaptureReceipts, parseVerifySuffix, amendmentFirst,
+  readPendingShips, clearPendingShips, pendingShipCards, formatCaptureReceipts, parseVerifySuffix, amendmentFirst, rewriteCardById, handoffTitle,
   scopeLockedView, scopeLockLine, derivedReading, readManifestCheap, escapeInstructionLines,
 } from './klypix-format.mjs';
 import {
   leaseVerdict, readEndpoint, pathHash, canvasWriteLockPath, tellUser, LEASE_SINCE_APP_VERSION,
 } from './app-lease.mjs';
 import { LIMITS, assetBytes, dataUrlImage, fitImage, imageSkipReason, locateAsset, mb } from './card-files.mjs';
-import { findProjectBrain, neutralizeMarkers, postPresenceMessage, readReleaseLease } from './agent-presence.mjs';
+import { findProjectBrain, neutralizeMarkers, postPresenceMessage, readReleaseLease, listActiveSessions, listKnownSessions, sessionStatusLabel, stampSessionWork, listUnfinishedWork, formatUnfinishedWork, resumeCommandFor } from './agent-presence.mjs';
+import { normalizeHandoffInput, renderHandoffCard, handoffMachineField, parseHandoffCard, listOpenHandoffCards, formatHandoffCards, isHandoffLine1, HANDOFF_REASONS, clientWord as handoffClientWord } from './session-handoff.mjs';
 import { collectRepoState, commitsInRange, makeContainmentProbe } from './repo-state.mjs';
 
 import { brainCaptureLockPath, vaultCreateLockPath, withAdvisoryWriteLock } from './brain-write-lock.mjs';
@@ -2152,3 +2154,198 @@ export async function opBrainMessage({ vault, canvas, text: msgText, to, via, fr
 
 // Re-export the format helpers the bins need for non-op work (init onboarding).
 export { buildKlypixMap, parseKlypix };
+
+// ── brain_handoff (1.99.0): a session hands its unfinished work to the next ──
+// Two layers (see session-handoff.mjs): the AUTOMATIC lane record every Stop
+// hook writes, and the DELIBERATE 🤝 card a session writes into the brain when
+// it knows it is stopping. One verb covers both: write (card), take / done (a
+// card by id, or a lane record by session), list (both). Card writes go
+// through the capture engine (dedup, evidence fingerprints, enrichment) and
+// the brain lock; stamps are exact-id rewrites. Nothing here starts, wakes or
+// routes a session.
+function gitHeadInfo(dir) {
+  const out = { branch: '', head: '' };
+  try {
+    const run = (args) => execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000 }).trim();
+    const branch = run(['rev-parse', '--abbrev-ref', 'HEAD']);
+    out.branch = branch && branch !== 'HEAD' ? branch : '';
+    out.head = run(['rev-parse', '--short=7', 'HEAD']);
+  } catch { /* not a repo, or no git — the card just carries no branch */ }
+  return out;
+}
+const handoffAgo = (ms) => { const m = Math.max(0, Math.round(Number(ms || 0) / 60000)); if (m < 1) return 'just now'; if (m < 60) return `${m}m ago`; const h = Math.round(m / 60); return h < 48 ? `${h}h ago` : `${Math.round(h / 24)}d ago`; };
+const handoffFlat = (value) => String(value ?? '').replace(/\s+/g, ' ').trim();
+const handoffStatusOf = (file) => {
+  const now = Date.now();
+  let live = [];
+  let known = [];
+  try { live = listActiveSessions({ brainPath: file, now }); } catch { live = []; }
+  try { known = listKnownSessions({ brainPath: file, now }); } catch { known = []; }
+  return (sessionId) => {
+    const key = String(sessionId || '').toLowerCase();
+    if (!key) return '';
+    const row = live.find((s) => [s.id, s.logicalSessionId, ...(s.aliases || [])].filter(Boolean).some((v) => String(v).toLowerCase() === key || String(v).toLowerCase().startsWith(key)));
+    if (row) return sessionStatusLabel(row, now) || 'live';
+    const entry = known.find((e) => String(e.id).toLowerCase() === key || String(e.id).toLowerCase().startsWith(key));
+    return entry ? entry.status : '';
+  };
+};
+
+export async function opBrainHandoff({ vault, canvas, action = 'write', from = {}, via, id, session, summary, note, continues, continuedBy, ...fields }) {
+  const t = brainTarget(vault, canvas);
+  if (t.ambiguous) return ambiguousBrainErr(t.ambiguous);
+  if (!t.file) return err(`No brain found — looked for ./brain.klypix in the project, then ${vault}. Pass canvas: "<name>".`);
+  const file = t.file;
+  const projectDir = path.dirname(file);
+  const me = { sessionId: String(from.sessionId || '').slice(0, 160), client: String(from.client || via || 'unknown').slice(0, 40) };
+  const stamp = (ms) => { try { return new Date(ms).toISOString().slice(0, 16).replace('T', ' ') + ' UTC'; } catch { return ''; } };
+  const reply = (textOut, extra = {}, isError = false) => ({ blocks: [text(textOut)], structured: { schemaVersion: 1, action, brain: file, ...extra }, ...(isError ? { isError: true } : {}) });
+
+  if (action === 'list') {
+    let struct = null;
+    try { ({ struct } = await parseKlypix(fs.readFileSync(file))); } catch (e) { return err(`brain_handoff list failed: ${e.message}`); }
+    const now = Date.now();
+    const cards = listOpenHandoffCards(struct, { now });
+    const lane = listUnfinishedWork({ brainPath: file, now, selfId: me.sessionId });
+    const titles = new Map(cards.map((h) => [h.id, h.title]));
+    const blocks = [formatHandoffCards(cards, { now, statusOf: handoffStatusOf(file), max: 8 }), formatUnfinishedWork(lane, { now, max: 8, cardTitles: titles })].filter(Boolean);
+    const out = blocks.length ? blocks.join('\n\n') : 'No handoff card is open in this brain and no other session left unfinished work on this project (sessions quiet for 10 minutes or closed, intent never completed, last 14 days).';
+    return reply(brainStamp(file, struct, t.how) + out, { handoffs: cards, unfinished: lane });
+  }
+
+  if (action === 'write') {
+    const v = normalizeHandoffInput(fields);
+    if (!v.ok) return err(`brain_handoff write refused: ${v.error}`);
+    const value = v.value;
+    const at = Date.now();
+    const repo = gitHeadInfo(projectDir);
+    const resume = resumeCommandFor(me.client, me.sessionId);
+    const body = renderHandoffCard(value, { from: me, at, repo, resume });
+    const evidence = value.files.map((ref) => ({ kind: 'file', ref }));
+    // A handoff that CONTINUES an earlier one closes it FIRST: an open ❓ with
+    // a near-identical title would otherwise be the capture engine's merge
+    // target (a rephrased open question updates its twin in place), and the
+    // new card would never exist. Closed → archived → no longer a live twin.
+    let continuedNote = '';
+    if (continues) {
+      try {
+        const r = await opBrainHandoff({ vault, canvas: file, action: 'done', id: continues, from: me, via, summary: 'continued by a new handoff' });
+        continuedNote = r.isError ? `\nThe earlier handoff ${continues} was NOT closed: ${r.blocks?.[0]?.text || 'unknown error'}` : `\nEarlier handoff ${continues} closed as continued by this one.`;
+      } catch (e) { continuedNote = `\nThe earlier handoff ${continues} was NOT closed: ${e.message}`; }
+    }
+    const noteResult = await opBrainNote({
+      vault, canvas: file, text: body, area: value.area, marker: '?', via: via || me.client,
+      evidence: evidence.length ? evidence : undefined,
+      verify: value.verify || undefined,
+      enrichmentQuestion: [`what was ${handoffClientWord(me.client)} session ${me.sessionId.slice(0, 8)} working on and where did it leave off?`, `how do I continue ${value.title}?`],
+    });
+    if (noteResult.isError) return noteResult;
+    // Find the card the engine just wrote (exact line 1) and stamp its machine twin.
+    let cardId = null;
+    try {
+      await withCanvasWriteLock(file, async () => {
+        const buf = fs.readFileSync(file);
+        const { struct } = await parseKlypix(buf);
+        const mine = struct.cards
+          .filter((c) => c.type !== 'container' && isHandoffLine1(c.text) && handoffTitle(c) === value.title && !(c.handoff && c.handoff.from))
+          .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+        if (!mine.length) return;
+        cardId = mine[0].id;
+        const res = await rewriteCardById(buf, cardId, (j) => { j.handoff = handoffMachineField(value, { from: me, at, repo, continues }); }, { now: at });
+        if (res.changed) await atomicWrite(file, res.buffer);
+      }, { brain: true });
+    } catch { /* the card landed; only the machine twin is missing — prose still parses */ }
+    // The lane: this session's automatic record now points at its card.
+    let laneStamp = null;
+    if (me.sessionId && cardId) { try { laneStamp = stampSessionWork({ brainPath: file, sessionId: me.sessionId, patch: { handoffCardId: cardId } }); } catch { laneStamp = null; } }
+    // Name the successor on the closed card (archived above), so its history
+    // says where the work went.
+    if (continues && cardId && !continuedNote.includes('NOT closed')) {
+      try {
+        await withCanvasWriteLock(file, async () => {
+          const res = await rewriteCardById(fs.readFileSync(file), continues, (j) => { if (!j.handoff || typeof j.handoff !== 'object') return false; j.handoff.continuedBy = cardId; }, { now: at });
+          if (res.changed) await atomicWrite(file, res.buffer);
+        }, { brain: true });
+      } catch { /* history only */ }
+    }
+    const next = `\nThe next session on this project — any agent — sees it at its first brain_sync / session start${cardId ? ` as [${cardId}]` : ''} and takes it with brain_handoff {action:"take", id:"${cardId || '<id>'}"}. Tell the human it is recorded in the brain; do not ask them to paste anything.`;
+    return reply(`✓ Handoff recorded in ${path.basename(file)}: “${value.title}” (${HANDOFF_REASONS[value.reason]}) — ${value.next.length} next step(s), ${value.done.length} done, ${value.files.length} file(s)${value.verify ? ', verify given' : ''}.${laneStamp?.ok ? '' : ' (lane record not linked)'}${next}${continuedNote}\n\n${body}`, { id: cardId, title: value.title, laneLinked: Boolean(laneStamp?.ok) });
+  }
+
+  if (action === 'take' || action === 'done') {
+    const now = Date.now();
+    const verb = action === 'take' ? 'Taken' : 'Finished';
+    const extraNote = handoffFlat(summary || note || '').slice(0, 400);
+    const stampLine = `${verb}: ${handoffClientWord(me.client)} ${me.sessionId.slice(0, 8)} · ${stamp(now)}${extraNote ? ` · ${extraNote}` : ''}`;
+    // ── a lane record (automatic layer) ──
+    if (!id && session) {
+      const patch = action === 'take'
+        ? { takenBy: { id: me.sessionId, client: me.client, at: now } }
+        : { doneAt: now, doneBy: me.sessionId };
+      const r = stampSessionWork({ brainPath: file, sessionId: String(session), patch, now });
+      if (!r.ok) {
+        const why = {
+          'target-unknown': `no session KLYPIX remembers matches "${String(session).slice(0, 40)}" — use the id from the unfinished-work list`,
+          'target-not-unique': `"${String(session).slice(0, 40)}" matches more than one session — use more characters of its id`,
+          'lane-locked': 'the coordination lane is busy — retry',
+        }[r.reason] || r.reason;
+        return err(`brain_handoff ${action} refused: ${why}.`);
+      }
+      const rec = listUnfinishedWork({ brainPath: file, now, includeWorking: true }).find((x) => x.id === r.id) || null;
+      if (action === 'take') {
+        return reply(`✓ Taken over: the work ${handoffClientWord(rec?.client)} ${String(r.id).slice(0, 8)} left (“${rec?.intent || ''}”) is now yours — every peer sees it as taken. Now call brain_sync with that intent and its files${rec?.files?.length ? ` (${rec.files.slice(-6).join(', ')})` : ''}; when it is finished, brain_handoff {action:"done", session:"${String(r.id).slice(0, 8)}"}.${rec?.lastWords ? `\nIts last words: “${handoffFlat(rec.lastWords).slice(0, 600)}”` : ''}`, { session: r.id, record: rec });
+      }
+      return reply(`✓ Marked done: the work ${String(r.id).slice(0, 8)} left no longer shows as unfinished.${extraNote ? ` Note kept: ${extraNote}` : ''}`, { session: r.id });
+    }
+    if (!id) return err(`brain_handoff ${action} needs \`id\` (a handoff card id) or \`session\` (a session id from the unfinished-work list).`);
+    // ── a handoff card (deliberate layer) ──
+    return withCanvasWriteLock(file, async () => {
+      let buf = fs.readFileSync(file);
+      const { struct } = await parseKlypix(buf);
+      const card = struct.cards.find((c) => c.id === id && c.type !== 'container');
+      if (!card) return err(`brain_handoff ${action} refused: no card ${id} in ${path.basename(file)}.`);
+      if (!isHandoffLine1(card.text)) return err(`brain_handoff ${action} refused: ${id} is not a handoff card (no 🤝 HANDOFF on its first line).`);
+      const h = parseHandoffCard(card, { now });
+      if (h.state === 'done' || /^archive$/i.test(card.area || '')) return err(`brain_handoff ${action} refused: handoff ${id} (“${h.title}”) is already finished${h.finished ? ` by ${h.finished.client} ${String(h.finished.sessionId).slice(0, 8)}` : ''}.`);
+      const statusOf = handoffStatusOf(file);
+      if (action === 'take' && h.taken && h.taken.sessionId && h.taken.sessionId !== me.sessionId) {
+        const st = statusOf(h.taken.sessionId);
+        if (st === 'working') return err(`brain_handoff take refused: handoff ${id} (“${h.title}”) was taken by ${h.taken.client} ${String(h.taken.sessionId).slice(0, 8)} ${h.taken.at ? handoffAgo(now - h.taken.at) : ''} and that session is working now — coordinate with brain_message instead of duplicating it.`);
+      }
+      const res = await rewriteCardById(buf, id, (j) => {
+        const lines = String(j.content || '').replace(/\r/g, '').split('\n');
+        const tagAt = lines.findIndex((l, i) => i > 0 && /^#[\w-]/.test(l.trim()));
+        const insertAt = tagAt > 0 ? tagAt : lines.length;
+        lines.splice(insertAt, 0, stampLine);
+        j.content = lines.join('\n');
+        const machine = j.handoff && typeof j.handoff === 'object' ? j.handoff : { v: 1, state: 'open', title: h.title, from: { client: h.from.client, sessionId: h.from.sessionId }, at: h.at || null, taken: null, done: null };
+        if (action === 'take') { machine.state = 'taken'; machine.taken = { client: handoffClientWord(me.client), sessionId: me.sessionId, at: now, ...(extraNote ? { note: extraNote } : {}) }; }
+        else { machine.state = 'done'; machine.done = { client: handoffClientWord(me.client), sessionId: me.sessionId, at: now, ...(extraNote ? { summary: extraNote } : {}) }; if (continuedBy) machine.continuedBy = String(continuedBy).slice(0, 64); }
+        j.handoff = machine;
+      }, { now });
+      if (!res.changed) return err(`brain_handoff ${action} failed: ${res.reason}.`);
+      buf = res.buffer;
+      let archived = false;
+      if (action === 'done') {
+        // The card is an open ❓: resolve it by exact id (the same archive
+        // path a ✓ takes), so the brief and every lister stop showing it.
+        try {
+          const cap = await captureIntoBrain(buf, { resolutions: [{ id, whole: true, text: `${h.title} — ${extraNote || 'finished'}` }] });
+          buf = cap.buffer;
+          archived = (cap.stats?.idResolutions || []).some((o) => o.id === id && o.outcome !== 'refused');
+        } catch { archived = false; }
+        try { buf = (await tidyBrain(buf)).buffer; } catch { /* keep */ }
+      }
+      await atomicWrite(file, buf);
+      // The lane: the writer's automatic record follows the card.
+      if (h.from.sessionId) {
+        try { stampSessionWork({ brainPath: file, sessionId: h.from.sessionId, patch: action === 'take' ? { takenBy: { id: me.sessionId, client: me.client, at: now } } : { doneAt: now, doneBy: me.sessionId }, now }); } catch { /* best-effort */ }
+      }
+      if (action === 'take') {
+        return reply(`✓ Taken over: handoff ${id} “${h.title}” (left by ${h.from.client} ${String(h.from.sessionId).slice(0, 8)}${h.at ? ` ${handoffAgo(now - h.at)}` : ''}) is yours — every peer sees it as taken. Now call brain_sync with intent “${h.title}”${h.files.length ? ` and files ${h.files.join(', ')}` : ''}; work the Next list in order; when it is finished, brain_handoff {action:"done", id:"${id}", summary:"…"}.\n\n${handoffFlat(card.text).slice(0, 1400)}`, { id, handoff: h });
+      }
+      return reply(`✓ Finished: handoff ${id} “${h.title}” is marked done${archived ? ' and archived' : ' (it stays visible until the next tidy archives it)'}.${extraNote ? ` Summary kept: ${extraNote}` : ''} Record what shipped with brain_note (a 🏁 milestone) if it is worth remembering.`, { id, archived });
+    }, { brain: true });
+  }
+  return err(`brain_handoff: unknown action "${action}" — use write, take, done or list.`);
+}

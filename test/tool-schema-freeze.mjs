@@ -46,11 +46,11 @@ const current = tools.map(({ name, inputSchema }) => ({ name, inputSchema }));
 
 const verdict = toolCompatibility(snapshot, current);
 ok(verdict.ok === true, `the supervisor's own compatibility check accepts this worker over 1.91.0 (removed: ${verdict.removed.join(', ') || 'none'}; changed: ${verdict.changed.join(', ') || 'none'})`);
-ok(verdict.added.includes('klypix_status') && verdict.added.includes('read_card_contents'), 'klypix_status and read_card_contents are the added tools');
+ok(verdict.added.includes('klypix_status') && verdict.added.includes('read_card_contents') && verdict.added.includes('brain_handoff'), 'klypix_status, read_card_contents and brain_handoff are the added tools');
 // show_in_klypix (P1) is app-only: registered where a KLYPIX app can run
 // (Windows, or KLYPIX_APP_TOOLS=on). 25 tools on the Ubuntu CI, 26 on Windows.
 const appToolsHere = process.platform === 'win32' || env.KLYPIX_APP_TOOLS === 'on';
-const expectedAdded = appToolsHere ? 3 : 2;
+const expectedAdded = appToolsHere ? 4 : 3;   // + brain_handoff (1.99.0)
 ok(verdict.added.includes('show_in_klypix') === appToolsHere, `show_in_klypix is added exactly where a KLYPIX app can run (${appToolsHere ? 'here' : 'not here'})`);
 ok(verdict.added.length === expectedAdded && current.length === 23 + expectedAdded, `exactly ${expectedAdded} tools were added — ${23 + expectedAdded} in all (got ${current.length}: +${verdict.added.join(', ')})`);
 // Stricter than the supervisor: not even a description inside an old schema moved.

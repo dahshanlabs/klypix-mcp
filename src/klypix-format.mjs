@@ -1061,6 +1061,10 @@ export async function parseKlypix(buffer) {
             // Guard trigger (guard cards, 2026-08-24) — additive machine field;
             // exposed so compileGuards can read it off the parsed struct.
             ...(it.guard && typeof it.guard === 'object' ? { guard: it.guard } : {}),
+            // Session handoff state (1.99.0) — additive machine field stamped by
+            // brain_handoff (from / taken / done); the 🤝 line-1 glyph is the
+            // prose twin every reader can see.
+            ...(it.handoff && typeof it.handoff === 'object' ? { handoff: it.handoff } : {}),
             // Machine death-date (epoch ms) written by the gardener at
             // consolidation — the prose "⤵ consolidated" stamp's reliable twin,
             // so as_of time-travel never depends on parsing prose.
@@ -1987,6 +1991,37 @@ async function finalizeBrainZip(zip, canvas, manifest, now) {
     return out;
 }
 
+// ── Rewrite ONE card by exact id (1.99.0) ────────────────────────────────────
+// The by-id twin of captureIntoBrain's internal rewriteCard, for a caller that
+// already KNOWS the card (brain_handoff take/done stamps its own 🤝 card): no
+// fuzzy match, no lifecycle pass. `mutate(json)` edits the item JSON in place;
+// returning false leaves the brain byte-identical. Text is re-wrapped and the
+// card's height re-measured exactly as the capture engine does, and the same
+// finalizer re-parses the result before it is handed back. Legacy (pre-v4)
+// files are refused, never patched blind.
+export async function rewriteCardById(buffer, id, mutate, { now = Date.now() } = {}) {
+    if (!id || typeof mutate !== 'function') return { buffer, changed: false, reason: 'invalid-call' };
+    const { zip, canvas, manifest, isV4 } = await parseKlypix(buffer);
+    if (!isV4 || !canvas.positions) return { buffer, changed: false, reason: 'legacy-format' };
+    const ip = `items/${shard(id)}/${id}.json`;
+    const f = zip.file(ip);
+    if (!f) return { buffer, changed: false, reason: 'unknown-id' };
+    const j = JSON.parse(await f.async('string'));
+    if (j.type === 'container') return { buffer, changed: false, reason: 'not-a-card' };
+    const before = JSON.stringify(j);
+    if (mutate(j) === false) return { buffer, changed: false, reason: 'unchanged' };
+    if (j.type === 'text' || j.type == null) {
+        j.content = wrapText(String(j.content || ''));
+        const pos = canvas.positions[id];
+        if (pos) canvas.positions[id] = { ...pos, h: measureCardH(j.content) };
+    }
+    if (JSON.stringify(j) === before) return { buffer, changed: false, reason: 'unchanged' };
+    zip.file(ip, JSON.stringify(j));
+    stampBrainKind(manifest);
+    const out = await finalizeBrainZip(zip, canvas, manifest, now);
+    return { buffer: out, changed: true, reason: null };
+}
+
 // Append cards routed INTO their [Area] container (find-or-create), so captures
 // self-organize. addition.cards = [{ text, color?, area? }]. Non-destructive to
 // existing items. Falls back to the flat appender for legacy/no-positions files.
@@ -2869,6 +2904,59 @@ export const isMilestoneCard = (c) => lifecycleEligible(c) && !isSkillCard(c) &&
 // extra guard so a ✅/↩/⤵-stamped card is never reported as plainly still-open.
 export const isUnresolvedOpenCard = (c) => isOpenCard(c) && !RESOLVED_GLYPH.test(String(c?.text || ''));
 
+// ── Session handoff cards (1.99.0) ───────────────────────────────────────────
+// A deliberate handoff is an OPEN card ("Area: ❓ 🤝 HANDOFF — title …") that a
+// session writes when it stops before the work is done; brain_handoff owns its
+// lifecycle (take / done → ✅ archived). The 🤝 glyph on LINE 1 is the whole
+// contract: line-1 precedence keeps a milestone that QUOTES a handoff from
+// counting as one. `card.handoff` is the machine twin (state, from, taken,
+// done) — stamped by brain_handoff, carried through parseKlypix like `guard`.
+export const HANDOFF_RE = /🤝\s*HANDOFF\b/u;
+export const isHandoffCard = (c) => lifecycleEligible(c) && HANDOFF_RE.test(String(c?.text || '').split('\n', 1)[0]);
+export const isOpenHandoffCard = (c) => isHandoffCard(c) && isUnresolvedOpenCard(c) && !/^archive$/i.test(String(c?.area || ''))
+    && !(c?.handoff && typeof c.handoff === 'object' && c.handoff.state === 'done');
+// The title a handoff card was given (line 1 minus area prefix, glyphs and
+// the HANDOFF word) — what every list prints beside its id.
+// The capture engine hard-wraps a card at ~36 columns, so the title may span
+// several lines: take line 1 and every following line up to the first section
+// keyword (From:/Task:/…) or tag line.
+const HANDOFF_SECTION_LINE_RE = /^(?:From|Task|Done|Next|Files|Verify|Open|Taken|Finished|Continued by|Resume the session)\b[^\n]*:/u;
+export function handoffHeadLines(text) {
+    const lines = String(text ?? '').replace(/\r/g, '').split('\n');
+    const head = [lines[0] || ''];
+    for (const line of lines.slice(1)) {
+        const t = line.trim();
+        if (!t || HANDOFF_SECTION_LINE_RE.test(t) || /^#[\w-]/.test(t)) break;
+        head.push(t);
+    }
+    return head.join(' ');
+}
+export function handoffTitle(card) {
+    const line1 = handoffHeadLines(card?.text ?? card ?? '');
+    return line1
+        .replace(/^[^:\n]{1,40}:\s*/, '')
+        .replace(/[❓🎯🏁🛠✅✔↩⤵️]/gu, '')
+        .replace(/🤝\s*HANDOFF\b\s*[—:–-]?\s*/u, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+// One preview line for a brief (ultra and full): who left it, how long ago,
+// why, whether someone took it, and the first "next" step when the body has one.
+export function handoffBriefLine(card, now = Date.now()) {
+    const h = card?.handoff && typeof card.handoff === 'object' ? card.handoff : {};
+    const text = String(card?.text || '');
+    const ago = (ms) => { const m = Math.max(0, Math.round(ms / 60000)); if (m < 1) return 'just now'; if (m < 60) return `${m}m ago`; const hr = Math.round(m / 60); return hr < 48 ? `${hr}h ago` : `${Math.round(hr / 24)}d ago`; };
+    const who = h.from && h.from.client ? `${h.from.client} ${String(h.from.sessionId || '').slice(0, 8)}`.trim()
+        : (text.match(/^From:\s*([^·\n]+?)\s*(?:·|$)/mu)?.[1] || 'a session').trim();
+    const at = Number(h.at) || Number(card?.createdAt) || 0;
+    const reason = h.reason || text.match(/\breason:\s*([^·\n]+)/u)?.[1]?.trim() || '';
+    const next = text.match(/^Next:\s*\n?\s*(?:1[.)]\s*|[-•]\s*)?(.+)$/mu)?.[1]?.trim() || '';
+    const taken = h.taken && h.taken.client ? ` · taken by ${h.taken.client} ${String(h.taken.sessionId || '').slice(0, 8)}`.trimEnd() : '';
+    const bits = [`[${card?.id || '?'}] “${handoffTitle(card).slice(0, 90)}”`, `left by ${who}${at ? ` ${ago(now - at)}` : ''}${reason ? ` (${reason})` : ''}${taken}`];
+    if (next) bits.push(`next: ${next.slice(0, 110)}`);
+    return bits.join(' — ');
+}
+
 // ── DECLARED vs QUOTED lifecycle (1.85.0 field incident) ────────────────────
 // The classifiers above answer "does this card CARRY a lifecycle glyph", which
 // is the right question for a read-side tier: over-including a card costs a
@@ -3172,6 +3260,16 @@ export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMile
         for (const c of focus.slice(0, 20)) { push(`- ${fr(c)}${currentGuidancePrefix(guidance.get(c.id))}${flat(c.text)}${odBadge(c)}`); shown++; }
         if (shown < focus.length) push(`- ⚠️ …and ${focus.length - shown} MORE focus card(s) — read them (MCP search) before acting; this list is NOT complete.`);
     }
+    // 🤝 Open handoffs (session handoff, 1.99.0) — full text, newest first:
+    // the brief file is where the next session reads what was done and what
+    // is next without a tool call.
+    const handoffCards = live.filter(isOpenHandoffCard).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+    if (handoffCards.length) {
+        push('', `## 🤝 Open handoffs (${handoffCards.length}) — work a session left for the next one (newest first)`);
+        for (const c of handoffCards.slice(0, 6)) push(`- [${c.id}] ${flat(c.text).slice(0, 900)}`);
+        if (handoffCards.length > 6) push(`- …and ${handoffCards.length - 6} more — brain_handoff {action:"list"}.`);
+        push('Take one over: brain_handoff {action:"take", id:"<card id>"}, then brain_sync with its intent and files; when it is finished, brain_handoff {action:"done", id:"<card id>"}.');
+    }
     if (open.length) {
         push('', openStatusHeader(openSummary, 'brief'));
         // Overdue first, then OLDEST first. This tier used to render every open
@@ -3355,6 +3453,18 @@ export function structToUltraBrief(struct, { freshness = null, briefPath = '.cla
         let shown = 0;
         for (const c of conflicts.slice(0, 4)) { if (!pushIf(`- ${clip(c.from, 70)} ⚔️ ${clip(c.to, 70)}`)) break; shown++; }
         if (shown < conflicts.length) pushIf(`- …and ${conflicts.length - shown} more conflict(s) — in the full brief.`);
+    }
+    // 🤝 Open handoffs (session handoff, 1.99.0): work a session deliberately
+    // left for the next one. Ahead of the rules and opens tiers — a handoff is
+    // the one card a fresh session must not miss, and the opens list is greedy
+    // to the budget floor. (The lane's automatic "unfinished work" list is the
+    // hook's own footer — it is presence, not a card.)
+    const handoffs = live.filter(isOpenHandoffCard).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+    if (handoffs.length && pushIf('') && pushIf(`## 🤝 Open handoff${handoffs.length > 1 ? 's' : ''} (${handoffs.length}) — work a session left for the next one`)) {
+        let shown = 0;
+        for (const c of handoffs.slice(0, 3)) { if (!pushIf(`- ${handoffBriefLine(c)}`)) break; shown++; }
+        if (shown < handoffs.length) pushIf(`- …and ${handoffs.length - shown} more — brain_handoff {action:"list"}.`);
+        pushIf('Take one over: brain_handoff {action:"take", id:"<card id>"} → brain_sync with its intent; finished: {action:"done", id}.');
     }
     // Overdue opens lead (and get a ⏰ prefix) so a passed deadline is never the
     // line that falls off the bottom of the preview-sized budget.

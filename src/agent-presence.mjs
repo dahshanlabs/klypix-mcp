@@ -493,6 +493,55 @@ const endedMatches = (row, id) => {
 // ── Session directory upkeep (mailbox) ───────────────────────────────────────
 // PARITY: global-brain-hook.mjs keeps a verbatim twin (dirPrune/dirRemember)
 // because that hook stays free of sibling imports — change both.
+//
+// ── Unfinished work (session handoff, 1.99.0) ────────────────────────────────
+// A session's last known STATE rides its directory entry as `work`, so the
+// work a session stopped in the middle of — at a usage or context limit, a
+// closed window, a crash — is visible to the next session of ANY agent, with
+// no one having to write or paste a summary:
+//   lastPrompt   the last human prompt the session answered
+//   lastWords    the tail of its last reply (where "done / next" usually is)
+//   commits      commits made since the session started (sha + subject)
+//   baseHead     the HEAD the session started from (what `commits` counts from)
+//   handoffCardId a deliberate 🤝 handoff card it wrote into the brain
+//   takenBy      the session that took the work over (brain_handoff take)
+//   doneAt/doneBy marked finished (brain_handoff done)
+// `intentAt` and `completedAt` are copied from the lane row for the same
+// reason: a session whose intent was never completed is the one to show.
+// Every field is capped here, and an empty object is dropped, so an old entry
+// without `work` is byte-stable through a touch that changes nothing.
+export const WORK_LAST_WORDS_MAX = 700;
+export const WORK_COMMITS_MAX = 6;
+export function normalizeWork(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const out = {};
+  const str = (value, max) => String(value || '').replace(/\s+/g, ' ').trim().slice(0, max);
+  const ms = (value) => (Number.isFinite(Number(value)) && Number(value) > 0 ? Number(value) : null);
+  // Both texts are rendered into OTHER sessions' prompts: a capture marker
+  // inside them must never be harvestable there (see neutralizeMarkers).
+  if (raw.lastPrompt) out.lastPrompt = neutralizeMarkers(str(raw.lastPrompt, 240));
+  if (raw.lastWords) out.lastWords = neutralizeMarkers(String(raw.lastWords).replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim().slice(0, WORK_LAST_WORDS_MAX));
+  if (ms(raw.lastWordsAt)) out.lastWordsAt = ms(raw.lastWordsAt);
+  if (raw.baseHead) out.baseHead = String(raw.baseHead).trim().slice(0, 40);
+  if (Array.isArray(raw.commits)) {
+    const commits = raw.commits
+      .map((c) => (c && typeof c === 'object' ? { sha: str(c.sha, 12), subject: str(c.subject, 120) } : null))
+      .filter((c) => c && c.sha)
+      .slice(0, WORK_COMMITS_MAX);
+    if (commits.length) out.commits = commits;
+  }
+  if (raw.handoffCardId) out.handoffCardId = str(raw.handoffCardId, 64);
+  if (raw.takenBy && typeof raw.takenBy === 'object' && raw.takenBy.id) {
+    out.takenBy = { id: str(raw.takenBy.id, 160), client: str(raw.takenBy.client, 40) || 'unknown', at: ms(raw.takenBy.at) };
+  }
+  if (ms(raw.doneAt)) { out.doneAt = ms(raw.doneAt); if (raw.doneBy) out.doneBy = str(raw.doneBy, 160); }
+  return Object.keys(out).length ? out : null;
+}
+export function mergeWork(previous, patch) {
+  if (patch === undefined) return normalizeWork(previous);
+  if (patch === null) return null;
+  return normalizeWork({ ...(normalizeWork(previous) || {}), ...(patch && typeof patch === 'object' ? patch : {}) });
+}
 const pruneDirectory = (rows, now) => (Array.isArray(rows) ? rows : [])
   .filter((row) => row && recipientKey(row.id) && now - Number(row.lastSeen || 0) < DIRECTORY_FRESH_MS)
   .map((row) => ({
@@ -508,6 +557,9 @@ const pruneDirectory = (rows, now) => (Array.isArray(rows) ? rows : [])
     lastSeen: Number(row.lastSeen) || now,
     endedAt: Number(row.endedAt) || null,
     hostStatus: row.hostStatus ? String(row.hostStatus).slice(0, 16) : null,
+    ...(Number(row.intentAt) > 0 ? { intentAt: Number(row.intentAt) } : {}),
+    ...(Number(row.completedAt) > 0 ? { completedAt: Number(row.completedAt) } : {}),
+    ...(normalizeWork(row.work) ? { work: normalizeWork(row.work) } : {}),
   }))
   .sort((left, right) => Number(left.lastSeen) - Number(right.lastSeen))
   .slice(-DIRECTORY_CAP);
@@ -524,6 +576,12 @@ function rememberSession(directory, row, now, { ended = false } = {}) {
   const prev = index >= 0 ? rows[index] : null;
   const scope = [...new Set([...normalizeFiles(row.files), ...normalizeFiles(row.observedFiles)])].slice(-8);
   const intent = String(row.intent || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+  // The lane row's own timestamps decide "unfinished": an intent newer than
+  // its completion is work nobody finished. A row that carries neither keeps
+  // what the directory already knew (a hook twin predating 1.99.0).
+  const intentAt = Number(row.intentAt) > 0 ? Number(row.intentAt) : (Number(prev?.intentAt) > 0 ? Number(prev.intentAt) : null);
+  const completedAt = Number(row.completedAt) > 0 ? Number(row.completedAt) : (row.completedAt === null && intent ? null : (Number(prev?.completedAt) > 0 ? Number(prev.completedAt) : null));
+  const work = mergeWork(prev?.work, row.work);
   const entry = {
     id,
     client: String(row.client || prev?.client || 'unknown').slice(0, 40),
@@ -537,6 +595,9 @@ function rememberSession(directory, row, now, { ended = false } = {}) {
     lastSeen: now,
     endedAt: ended ? now : null,
     hostStatus: row.hostStatus ? String(row.hostStatus).slice(0, 16) : (prev?.hostStatus || null),
+    ...(intentAt ? { intentAt } : {}),
+    ...(completedAt ? { completedAt } : {}),
+    ...(work ? { work } : {}),
   };
   if (index >= 0) rows[index] = entry; else rows.push(entry);
   return rows
@@ -957,6 +1018,10 @@ export function upsertSession({
   // Host activity status (mailbox, 1.88.0): 'busy' | 'idle'. Derived from
   // `event` when a writer does not pass it; heartbeats keep the previous value.
   hostStatus = null,
+  // Unfinished-work state (session handoff, 1.99.0): a PATCH merged over the
+  // row's `work` (see normalizeWork) — last reply tail, commits, base head,
+  // handoff card, taken/done stamps. Absent = keep what the row has.
+  work,
   now = Date.now(),
 }) {
   if (!brainPath || !id) return withWriteVerdict([], false, 'no-brain-or-id');
@@ -1119,6 +1184,9 @@ export function upsertSession({
           ...(taskCompleted ? { completedAt: now } : (previous.completedAt ? { completedAt: previous.completedAt } : {})),
         }),
       ...(statusDigestHash !== undefined ? { statusDigestHash: String(statusDigestHash || '').slice(0, 16) } : {}),
+      // ADDITIVE unfinished-work state: merged only when this touch carries a
+      // patch; the `...previous` spread keeps it verbatim otherwise.
+      ...(work !== undefined ? (mergeWork(previous.work, work) ? { work: mergeWork(previous.work, work) } : {}) : {}),
       // ADDITIVE host status: stamped only when this touch carries one, kept
       // verbatim otherwise, so a heartbeat never turns "working" into unknown.
       ...(nextHostStatus
@@ -2822,6 +2890,144 @@ export function listKnownSessions({ brainPath, home, now = Date.now() } = {}) {
       resumeCommand: row ? '' : resumeCommandFor(entry.client, entry.id),
     };
   }).sort((left, right) => Number(right.lastSeen) - Number(left.lastSeen));
+}
+
+// ── Unfinished work — the automatic session handoff (1.99.0) ────────────────
+// The field case (2026-10-11): the founder's Claude Code session stops at a
+// usage limit mid-task, and Codex is asked to "continue" — with nothing to
+// continue from but whatever the human pastes. The lane already remembers
+// every exactly-identified session for two weeks; `work` (see normalizeWork)
+// adds the state a Stop hook can record without anyone writing a summary.
+// This is the READ side: every session whose intent was never completed and
+// that nobody is working on right now — closed, or live but quiet — newest
+// first, with its last words, commits and files, and whether another session
+// already took it over. Nothing here starts, wakes or routes a session.
+export const UNFINISHED_QUIET_MS = 10 * 60 * 1000;
+export function clientWord(client) {
+  const key = String(client || '').toLowerCase();
+  if (key === 'claude-code' || key === 'claude') return 'Claude Code';
+  if (key === 'codex') return 'Codex';
+  return key ? key.replace(/(^|[-_ ])([a-z])/g, (_m, p, c) => `${p}${c.toUpperCase()}`) : 'Unknown';
+}
+// How long since the row's host last did WORK: a heartbeat refreshes lastSeen
+// without touching it, so a connected-but-idle MCP session reads as quiet, not
+// as busy. A row with no host status falls back to its last activity/intent.
+const quietFor = (row, now) => {
+  if (!row) return Infinity;
+  const status = String(row.hostStatus || '');
+  if (status === 'busy' && now - Number(row.hostStatusAt || row.lastSeen || now) < HOST_STATUS_BUSY_FRESH_MS) return 0;
+  const at = Number(row.hostStatusAt || row.activityAt || row.intentAt || row.startedAt || row.lastSeen || now);
+  return Math.max(0, now - at);
+};
+export function listUnfinishedWork({ brainPath, home, now = Date.now(), selfId = '', includeWorking = false } = {}) {
+  if (!brainPath) return [];
+  const lane = readLane(laneFileFor(brainPath, home));
+  const live = pruneSessions(lane.sessions, now);
+  const liveRow = (id) => live.find((session) => sessionIdentityKeys(session).includes(String(id || '').toLowerCase())) || null;
+  const self = recipientKey(selfId).toLowerCase();
+  return pruneDirectory(lane.directory, now)
+    .filter((entry) => entry.intent && entry.id.toLowerCase() !== self)
+    .map((entry) => {
+      const row = liveRow(entry.id);
+      const work = entry.work || {};
+      const intentAt = Number(entry.intentAt) || Number(entry.firstSeen) || 0;
+      const completed = Number(entry.completedAt) > 0 && Number(entry.completedAt) >= intentAt;
+      const done = Number(work.doneAt) > 0 && Number(work.doneAt) >= intentAt;
+      const taker = work.takenBy ? liveRow(work.takenBy.id) : null;
+      const quietMs = quietFor(row, now);
+      return { entry, row, work, completed, done, taker, quietMs };
+    })
+    .filter(({ completed, done, quietMs }) => !completed && !done && (includeWorking || quietMs >= UNFINISHED_QUIET_MS))
+    .map(({ entry, row, work, taker, quietMs }) => ({
+      id: entry.id,
+      client: entry.client,
+      intent: entry.intent,
+      intentAt: entry.intentAt || null,
+      branch: entry.branch || null,
+      cwd: entry.cwd || null,
+      files: Array.isArray(entry.files) ? entry.files : [],
+      lastSeen: entry.lastSeen,
+      endedAt: entry.endedAt || null,
+      ageMs: Math.max(0, now - Number(entry.lastSeen || now)),
+      quietMs: Number.isFinite(quietMs) ? quietMs : null,
+      live: Boolean(row),
+      status: row
+        ? (sessionStatusLabel(row, now) || 'live')
+        : (entry.endedAt ? 'closed' : `not seen for ${agoLabel(now - entry.lastSeen).replace(/ ago$/, '')}`),
+      resumeCommand: row ? '' : resumeCommandFor(entry.client, entry.id),
+      lastPrompt: work.lastPrompt || '',
+      lastWords: work.lastWords || '',
+      lastWordsAt: work.lastWordsAt || null,
+      commits: Array.isArray(work.commits) ? work.commits : [],
+      handoffCardId: work.handoffCardId || null,
+      takenBy: work.takenBy
+        ? { ...work.takenBy, live: Boolean(taker), status: taker ? (sessionStatusLabel(taker, now) || 'live') : 'not running' }
+        : null,
+    }))
+    .sort((left, right) => Number(right.lastSeen) - Number(left.lastSeen));
+}
+
+// Stamp unfinished-work state onto one remembered session (directory entry
+// AND its live row when there is one): the writer of a handoff card, the
+// session that takes work over, the one that marks it done. Exact id or a
+// unique prefix; ambiguity and unknown ids fail closed. Machine-local.
+export function stampSessionWork({ brainPath, sessionId, patch, home, now = Date.now() }) {
+  if (!brainPath || !sessionId || !patch || typeof patch !== 'object') return { ok: false, reason: 'invalid-stamp' };
+  const laneFile = laneFileFor(brainPath, home);
+  const lockFile = laneFile + '.lock';
+  if (!acquireLock(lockFile)) return { ok: false, reason: 'lane-locked' };
+  try {
+    const laneRead = readMutableLane(laneFile);
+    if (!laneRead.ok) return { ok: false, reason: laneRead.reason };
+    const data = laneRead.data;
+    const sessions = pruneSessions(data.sessions, now);
+    const directory = pruneDirectory(data.directory, now);
+    const wanted = String(sessionId).trim();
+    const known = resolveDirectoryTarget(wanted, directory);
+    if (known.ambiguous) return { ok: false, reason: 'target-not-unique' };
+    const entry = known.entry;
+    const keys = [wanted.toLowerCase(), ...(entry ? [entry.id.toLowerCase()] : [])];
+    const row = sessions.find((session) => sessionIdentityKeys(session).some((key) => keys.includes(key))) || null;
+    if (!entry && !row) return { ok: false, reason: 'target-unknown' };
+    if (entry) { const merged = mergeWork(entry.work, patch); if (merged) entry.work = merged; else delete entry.work; }
+    if (row) { const merged = mergeWork(row.work, patch); if (merged) row.work = merged; else delete row.work; }
+    fs.mkdirSync(path.dirname(laneFile), { recursive: true });
+    writeLaneFileAtomic(laneFile, JSON.stringify({ ...data, sessions, directory }));
+    return { ok: true, id: entry?.id || row?.logicalSessionId || row?.id, entry: entry || null };
+  } catch (error) {
+    return { ok: false, reason: writeFailureReason(error) };
+  } finally {
+    releaseLock(lockFile);
+  }
+}
+
+// The block every surface prints (brain_sync, the Claude and Codex hooks):
+// one record per unfinished session, newest first, then how to take it over.
+// Quoted text is another session's record and is labelled as such — never as
+// the human's instructions; markers inside it were neutralized at store time.
+export function formatUnfinishedWork(records, { now = Date.now(), max = 5, cardTitles = null } = {}) {
+  const list = Array.isArray(records) ? records : [];
+  if (!list.length) return '';
+  const flat = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+  const lines = [`⏸️ Unfinished work left by other sessions on this project (${list.length}, newest first) — each stopped before its task was done and nobody is working on it now:`];
+  for (const r of list.slice(0, max)) {
+    const who = `${clientWord(r.client)} ${String(r.id).slice(0, 8)}`;
+    const bits = [r.status, `last active ${agoLabel(r.ageMs)}`];
+    if (r.branch) bits.push(`branch ${r.branch}`);
+    lines.push(`- ${who} · “${flat(r.intent).slice(0, 120)}” · ${bits.join(' · ')}`);
+    if (r.commits.length) lines.push(`  commits: ${r.commits.map((c) => `${c.sha} ${c.subject}`).join('; ').slice(0, 320)}`);
+    if (r.files.length) lines.push(`  files: ${r.files.slice(-8).join(', ')}`);
+    if (r.lastWords) lines.push(`  its last words: “${flat(r.lastWords).slice(0, 420)}”`);
+    if (r.handoffCardId) {
+      const title = cardTitles && cardTitles.get ? cardTitles.get(r.handoffCardId) : null;
+      lines.push(`  🤝 it left a handoff card in the brain: ${r.handoffCardId}${title ? ` — “${flat(title).slice(0, 100)}”` : ''} (brain_handoff {action:"list"} prints it in full)`);
+    }
+    if (r.takenBy) lines.push(`  taken over by ${clientWord(r.takenBy.client)} ${String(r.takenBy.id).slice(0, 8)} ${r.takenBy.at ? agoLabel(now - r.takenBy.at) : ''} (${r.takenBy.status}) — coordinate with brain_message before duplicating it`);
+    if (r.resumeCommand) lines.push(`  its own transcript, should the human want it: ${r.resumeCommand}`);
+  }
+  if (list.length > max) lines.push(`- …and ${list.length - max} more — brain_handoff {action:"list"} shows all.`);
+  lines.push('To continue one: brain_handoff {action:"take", session:"<its id>"} (peers then see it is taken), then brain_sync with that intent and files; when it is finished, brain_handoff {action:"done", session:"<its id>"}. If it is not what the human asked for, leave it.');
+  return lines.join('\n');
 }
 
 // ── Reopen on the human's OK (1.91.0) ───────────────────────────────────────

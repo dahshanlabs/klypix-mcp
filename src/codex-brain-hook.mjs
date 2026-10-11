@@ -12,6 +12,8 @@ import {
   findProjectBrain,
   formatPresenceMessage,
   formatReceivedMessages,
+  formatUnfinishedWork,
+  listUnfinishedWork,
   peekMessages,
   postPresenceMessage,
   receiveMessages,
@@ -366,6 +368,31 @@ async function statusDigestContext({ brainPath, sessionId, prompt, sessions, cwd
   return ['## 📊 Computed current state (status-shaped question detected — answer from THIS + `brain_ask`, never from memory of past sessions)', content].join('\n');
 }
 
+// ⏸️ Unfinished work other sessions left — the engine's block (agent-presence
+// listUnfinishedWork + formatUnfinishedWork), read-only, never throws.
+const CONTINUE_PROMPT_RE = /\b(continue|resume|pick (it |this |that )?up|carry on|keep going|where (were|did) we|what('s| is| was) (next|left|remaining|pending)|unfinished|left off|hand[- ]?off|handed (over|off)|take over|finish (what|the work|it|this))\b/i;
+function unfinishedWorkBlock(brainPath, sessionId) {
+  try {
+    return formatUnfinishedWork(listUnfinishedWork({ brainPath, selfId: sessionId }));
+  } catch {
+    return '';
+  }
+}
+
+// Unfinished-work patch for one Codex lifecycle event (session handoff). A
+// human prompt records what was asked; a Stop records the reply tail only if
+// the host put it in the payload. Null when the event carries nothing.
+function codexWorkPatch({ event, humanTurn, prompt, input }) {
+  const patch = {};
+  if (humanTurn && prompt) patch.lastPrompt = String(prompt).slice(0, 240);
+  if (event === 'Stop') {
+    const words = input.last_assistant_message ?? input.lastAssistantMessage ?? input.assistant_message ?? '';
+    const text = typeof words === 'string' ? words.trim() : '';
+    if (text) { patch.lastWords = text.length > 700 ? '…' + text.slice(-699) : text; patch.lastWordsAt = Date.now(); }
+  }
+  return Object.keys(patch).length ? patch : null;
+}
+
 async function compactTaskContext(projectDir, prompt, files) {
   if (!prompt) return '';
   try {
@@ -439,6 +466,11 @@ async function main() {
     logicalSessionId: sessionId,
     identitySource: 'codex-lifecycle',
     cwd,
+    // Unfinished-work state (session handoff, 1.99.0), host-neutral: the last
+    // human prompt on a human turn, and at Stop the reply tail WHEN the host
+    // hands it over (Codex's Stop payload may carry `last_assistant_message`;
+    // this adapter never reads Codex's transcript). Absent = keep the known.
+    ...(codexWorkPatch({ event, humanTurn, prompt, input }) ? { work: codexWorkPatch({ event, humanTurn, prompt, input }) } : {}),
   });
 
   const ignored = event === 'PostToolUse' ? ownBrainMessageText(input) : [];
@@ -481,6 +513,10 @@ async function main() {
       observeShipDrift(projectDir),
       gitHookNotice.trim(),
       stampReceivedMessages(messages, Date.now(), undefined, sessionId),
+      // ⏸️ Unfinished work other sessions left (session handoff, 1.99.0): the
+      // same engine block brain_sync prints, so a Codex session asked to
+      // "continue" what a Claude session stopped in starts from its record.
+      unfinishedWorkBlock(brainPath, sessionId),
     ], event);
     return;
   }
@@ -495,6 +531,8 @@ async function main() {
       context,
       formatPresenceMessage(sessions, sessionId),
       stampReceivedMessages(messages, Date.now(), undefined, sessionId),
+      // Only on a continue-shaped human prompt — SessionStart printed it once.
+      ...(prompt && CONTINUE_PROMPT_RE.test(prompt) ? [unfinishedWorkBlock(brainPath, sessionId)] : []),
     ], event);
     return;
   }

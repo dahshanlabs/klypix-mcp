@@ -86,6 +86,8 @@ const CODEX_GLOBAL_BODY = [
   'To reach another agent session on this project, call `brain_message` with its session id (from',
   '`brain_sync` or `brain_doctor`); a session that has closed receives the note when it next starts.',
   'Never ask the human to carry a message between agents — send it and say it was sent or queued.',
+  'Stopping before the work is done (limit, end of day, blocked)? Call `brain_handoff` {action:"write"} with what is done, what is next, files and how to verify;',
+  'the next session of any agent sees it at its first `brain_sync` and takes it with {action:"take"}. Asked to continue what another session left? Take it there first.',
   'Capture durable decisions and milestones with `brain_note`. Never hand-edit `brain.klypix`.',
   'If the project has no `brain.klypix`, ignore this section.',
   CODEX_GLOBAL_END,
@@ -502,6 +504,16 @@ otherwise ask the human to relay or paste something to another agent session, se
 \`brain_message\` instead and tell the human it was sent or queued — hand them the text only if
 \`brain_message\` refuses. Notes are ephemeral, NOT brain cards — durable decisions still go
 through \`brain_note\`.
+
+**Stopping before the work is done?** (the human asks for a handoff, your context or usage limit
+is near, the day ends, you are blocked, you are switching tool) Call \`brain_handoff\`
+{action:"write"} with the task, what is done, what is NEXT in order, the files and how to verify.
+It is a 🤝 card in this brain the human can see and correct, and the next session on this project —
+any agent — sees it at its first \`brain_sync\` / session start and takes it with {action:"take"},
+then {action:"done"} when finished. KLYPIX also records every session's last reply, files and
+commits automatically, so \`brain_sync\` may list **unfinished work** another session left without
+a card: if the human asks you to continue it, take it with \`brain_handoff\` {action:"take",
+session:"<id>"} first. Never ask the human to paste a summary into the next session.
 
 **Don't** hand-edit \`brain.klypix\` (it's a packaged canvas — use the tools) or dump file contents into it; capture the *decision*, not the file.`;
 

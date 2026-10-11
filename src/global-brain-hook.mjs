@@ -1052,6 +1052,32 @@ const dirKey = (value) => String(value || '').trim().slice(0, 160);
 const dirAliases = (aliases, exclude = '') => [...new Set((Array.isArray(aliases) ? aliases : [])
     .map(dirKey).filter(v => v && v !== dirKey(exclude)))].slice(-8);
 const dirFiles = (files) => [...new Set((Array.isArray(files) ? files : []).map(f => String(f || '').trim()).filter(Boolean))].slice(-20);
+// Unfinished-work state (session handoff, 1.99.0) — twin of agent-presence's
+// normalizeWork/mergeWork: the directory and the row carry a capped `work`
+// object (last prompt, last reply tail, commits since the session's base
+// head, handoff card, taken/done stamps). Dropping an unknown key here is
+// exactly how a hook twin would erase what brain_handoff stamped — so this
+// normalizer must know every field the engine's does.
+const WORK_LAST_WORDS_MAX = 700;
+function workNorm(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    const out = {};
+    const str = (v, max) => String(v || '').replace(/\s+/g, ' ').trim().slice(0, max);
+    const ms = (v) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Number(v) : null);
+    if (raw.lastPrompt) out.lastPrompt = neutralMarkers(str(raw.lastPrompt, 240));
+    if (raw.lastWords) out.lastWords = neutralMarkers(String(raw.lastWords).replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim().slice(0, WORK_LAST_WORDS_MAX));
+    if (ms(raw.lastWordsAt)) out.lastWordsAt = ms(raw.lastWordsAt);
+    if (raw.baseHead) out.baseHead = String(raw.baseHead).trim().slice(0, 40);
+    if (Array.isArray(raw.commits)) {
+        const commits = raw.commits.map(c => (c && typeof c === 'object' ? { sha: str(c.sha, 12), subject: str(c.subject, 120) } : null)).filter(c => c && c.sha).slice(0, 6);
+        if (commits.length) out.commits = commits;
+    }
+    if (raw.handoffCardId) out.handoffCardId = str(raw.handoffCardId, 64);
+    if (raw.takenBy && typeof raw.takenBy === 'object' && raw.takenBy.id) out.takenBy = { id: str(raw.takenBy.id, 160), client: str(raw.takenBy.client, 40) || 'unknown', at: ms(raw.takenBy.at) };
+    if (ms(raw.doneAt)) { out.doneAt = ms(raw.doneAt); if (raw.doneBy) out.doneBy = str(raw.doneBy, 160); }
+    return Object.keys(out).length ? out : null;
+}
+const workMerge = (prev, patch) => (patch === undefined ? workNorm(prev) : patch === null ? null : workNorm({ ...(workNorm(prev) || {}), ...(patch && typeof patch === 'object' ? patch : {}) }));
 function dirPrune(rows, now) {
     return (Array.isArray(rows) ? rows : [])
         .filter(row => row && dirKey(row.id) && now - Number(row.lastSeen || 0) < DIR_FRESH_MS)
@@ -1068,6 +1094,9 @@ function dirPrune(rows, now) {
             lastSeen: Number(row.lastSeen) || now,
             endedAt: Number(row.endedAt) || null,
             hostStatus: row.hostStatus ? String(row.hostStatus).slice(0, 16) : null,
+            ...(Number(row.intentAt) > 0 ? { intentAt: Number(row.intentAt) } : {}),
+            ...(Number(row.completedAt) > 0 ? { completedAt: Number(row.completedAt) } : {}),
+            ...(workNorm(row.work) ? { work: workNorm(row.work) } : {}),
         }))
         .sort((a, b) => Number(a.lastSeen) - Number(b.lastSeen))
         .slice(-DIR_CAP);
@@ -1080,6 +1109,11 @@ function dirRemember(directory, row, now) {
     const prev = index >= 0 ? rows[index] : null;
     const scope = [...new Set([...dirFiles(row.files), ...dirFiles(row.observedFiles)])].slice(-8);
     const intent = String(row.intent || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+    // Twin of agent-presence rememberSession: the row's own intent/completion
+    // stamps decide "unfinished"; a row that carries neither keeps the known.
+    const intentAt = Number(row.intentAt) > 0 ? Number(row.intentAt) : (Number(prev?.intentAt) > 0 ? Number(prev.intentAt) : null);
+    const completedAt = Number(row.completedAt) > 0 ? Number(row.completedAt) : (row.completedAt === null && intent ? null : (Number(prev?.completedAt) > 0 ? Number(prev.completedAt) : null));
+    const work = workMerge(prev?.work, row.work);
     const entry = {
         id,
         client: String(row.client || prev?.client || 'unknown').slice(0, 40),
@@ -1093,6 +1127,9 @@ function dirRemember(directory, row, now) {
         lastSeen: now,
         endedAt: null,   // a live touch means it is running again
         hostStatus: row.hostStatus ? String(row.hostStatus).slice(0, 16) : (prev?.hostStatus || null),
+        ...(intentAt ? { intentAt } : {}),
+        ...(completedAt ? { completedAt } : {}),
+        ...(work ? { work } : {}),
     };
     if (index >= 0) rows[index] = entry; else rows.push(entry);
     return rows.sort((a, b) => Number(a.lastSeen) - Number(b.lastSeen)).slice(-DIR_CAP);
@@ -1308,6 +1345,9 @@ function touchSession(sid, patch = {}) {
                 ...(patch.hostStatus
                     ? { hostStatus: String(patch.hostStatus).slice(0, 16), hostStatusAt: now }
                     : (prev.hostStatus ? { hostStatus: prev.hostStatus, hostStatusAt: prev.hostStatusAt || null } : {})),
+                // Unfinished-work state (session handoff): merged only when this
+                // touch carries a patch; `...prev` keeps it verbatim otherwise.
+                ...(patch.work !== undefined ? (workMerge(prev.work, patch.work) ? { work: workMerge(prev.work, patch.work) } : {}) : {}),
                 channels: Object.keys(channelSeen), channelSeen, channelOwners,
                 startedAt: prev.startedAt || now, lastSeen: now,
             };
@@ -1406,6 +1446,67 @@ function releaseLeaseFooterLine(list, now) {
 // when one shares your branch or is editing files you changed. Empty string when
 // you're solo (the common case) — preserves the per-prompt "nothing → zero tokens"
 // contract, so it only ever speaks up when there's a real collision to avoid.
+// ── Unfinished work footer (session handoff, 1.99.0) ─────────────────────────
+// PARITY twin of agent-presence listUnfinishedWork/formatUnfinishedWork (this
+// hook stays free of sibling imports — change both): every remembered session
+// whose intent was never completed and that nobody is working on now — closed,
+// or live but quiet for ≥10 min — newest first, with its last words, commits
+// and files, and whether another session already took it over. Printed at
+// SessionStart and on a continue-shaped prompt ("continue", "pick up where we
+// left off"). Read-only. Quoted text is another session's record, never the
+// human's instructions; markers in it were neutralized at store time.
+const UNFINISHED_QUIET_MS = 10 * 60 * 1000;
+const CONTINUE_RE = /\b(continue|resume|pick (it |this |that )?up|carry on|keep going|where (were|did) we|what('s| is| was) (next|left|remaining|pending)|unfinished|left off|hand[- ]?off|handed (over|off)|take over|finish (what|the work|it|this))\b/i;
+const HANDOFF_ASK_RE = /\b(hand[- ]?off|hand (it|this|the work) (over|off)|before (we|i|you) (hit|reach|approach|run out of) (the )?(limit|context|window|quota)|(context|usage|token) (limit|window|quota)|out of context|switch(ing)? to (codex|another (agent|session|tool)))\b/i;
+function unfinishedFooter(sid, { max = 4 } = {}) {
+    try {
+        const data = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8'));
+        const now = Date.now();
+        const live = pruneSessions(Array.isArray(data.sessions) ? data.sessions : [], now);
+        const keysOf = (s) => [s.id, s.logicalSessionId, ...(Array.isArray(s.aliases) ? s.aliases : [])].filter(Boolean).map(v => String(v).toLowerCase());
+        const liveRow = (id) => live.find(s => keysOf(s).includes(String(id || '').toLowerCase())) || null;
+        const quiet = (row) => { if (!row) return Infinity; if (String(row.hostStatus || '') === 'busy' && now - Number(row.hostStatusAt || row.lastSeen || now) < 10 * 60 * 1000) return 0; const at = Number(row.hostStatusAt || row.activityAt || row.intentAt || row.startedAt || row.lastSeen || now); return Math.max(0, now - at); };
+        const me = String(sid || '').toLowerCase();
+        const recs = dirPrune(data.directory, now)
+            .filter(e => e.intent && e.id.toLowerCase() !== me)
+            .map(e => {
+                const row = liveRow(e.id); const w = e.work || {};
+                const intentAt = Number(e.intentAt) || Number(e.firstSeen) || 0;
+                return { e, row, w, completed: Number(e.completedAt) > 0 && Number(e.completedAt) >= intentAt, done: Number(w.doneAt) > 0 && Number(w.doneAt) >= intentAt, quietMs: quiet(row) };
+            })
+            .filter(r => !r.completed && !r.done && r.quietMs >= UNFINISHED_QUIET_MS)
+            .sort((a, b) => Number(b.e.lastSeen) - Number(a.e.lastSeen));
+        if (!recs.length) return '';
+        const flat = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+        const lines = [`⏸️ Unfinished work left by other sessions on this project (${recs.length}, newest first) — each stopped before its task was done and nobody is working on it now:`];
+        for (const { e, row, w } of recs.slice(0, max)) {
+            const status = row ? (statusLabelOf(row, now) || 'live') : (e.endedAt ? 'closed' : `not seen for ${agoWord(now - e.lastSeen).replace(/ ago$/, '')}`);
+            const bits = [status, `last active ${agoWord(now - e.lastSeen)}`];
+            if (e.branch) bits.push(`branch ${e.branch}`);
+            lines.push(`- ${clientWordOf(e.client)} ${e.id.slice(0, 8)} · “${flat(e.intent).slice(0, 120)}” · ${bits.join(' · ')}`);
+            if (Array.isArray(w.commits) && w.commits.length) lines.push(`  commits: ${w.commits.map(c => `${c.sha} ${c.subject}`).join('; ').slice(0, 320)}`);
+            if (Array.isArray(e.files) && e.files.length) lines.push(`  files: ${e.files.slice(-8).join(', ')}`);
+            if (w.lastWords) lines.push(`  its last words: “${flat(w.lastWords).slice(0, 420)}”`);
+            if (w.handoffCardId) lines.push(`  🤝 it left a handoff card in the brain: ${w.handoffCardId} (brain_handoff {action:"list"} prints it in full)`);
+            if (w.takenBy) {
+                const t = liveRow(w.takenBy.id);
+                lines.push(`  taken over by ${clientWordOf(w.takenBy.client)} ${String(w.takenBy.id).slice(0, 8)} ${w.takenBy.at ? agoWord(now - w.takenBy.at) : ''} (${t ? (statusLabelOf(t, now) || 'live') : 'not running'}) — coordinate with brain_message before duplicating it`);
+            }
+            if (!row && (e.client === 'claude-code' || e.client === 'codex') && /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(e.id)) lines.push(`  its own transcript, should the human want it: ${e.client === 'codex' ? `codex resume ${e.id}` : `claude --resume ${e.id}`}`);
+        }
+        if (recs.length > max) lines.push(`- …and ${recs.length - max} more — brain_handoff {action:"list"} shows all.`);
+        lines.push('To continue one: brain_handoff {action:"take", session:"<its id>"} (peers then see it is taken), then brain_sync with that intent and files; when it is finished, brain_handoff {action:"done", session:"<its id>"}. If it is not what the human asked for, leave it.');
+        return '\n\n' + lines.join('\n');
+    } catch { return ''; }
+}
+// The nudge a session gets when the human asks for a handoff or says the
+// limit is near: the deliberate layer (a 🤝 card in the brain) on top of the
+// automatic state above. One line; the tool's own description carries the rest.
+function handoffAskHint(humanText) {
+    if (!HANDOFF_ASK_RE.test(String(humanText || ''))) return '';
+    return '\n\n🤝 KLYPIX: to hand this session\'s work to the next one (any agent — Codex or Claude Code), call brain_handoff with the task, what is done, what is next, the files and how to verify; the next session on this project sees it at its first brain_sync and takes it with {action:"take"}. Your last reply, files and commits are recorded automatically at each turn end regardless — but a deliberate handoff says what you know and a transcript tail does not. Never make the human paste a summary into the next session.';
+}
+
 function peerFooter(sid) {
     if (!sid) return '';
     const now = Date.now();
@@ -3387,6 +3488,26 @@ async function capture(lib) {
         lines = transcriptBuffer.toString('utf8').split('\n').filter(Boolean);
     } catch { return; }
     const scopeRow = readSessions().find(s => s.id === input.session_id) || {};
+    // Unfinished-work state (session handoff, 1.99.0) — collected over the same
+    // transcript walk, so a session that stops at a usage/context limit, a
+    // closed window or a crash leaves the next session (any agent) its last
+    // reply tail and its OWN commits. Own = shas printed by its git commit tool
+    // results ("[master abc1234] …"), never a branch range: 20 sessions share
+    // one checkout here, and a range would credit peers' commits to this one.
+    let lastAssistantWords = '';
+    const ownCommitShas = [];
+    const COMMIT_RESULT_RE = /\[[^\]\n]{1,80}\s([0-9a-f]{7,40})\]/g;
+    const commitShasInEntry = (entry) => {
+        const c = (entry?.message ?? entry)?.content;
+        if (!Array.isArray(c)) return;
+        for (const p of c) {
+            if (p?.type !== 'tool_result') continue;
+            const body = typeof p.content === 'string' ? p.content
+                : Array.isArray(p.content) ? p.content.filter(x => x?.type === 'text' && typeof x.text === 'string').map(x => x.text).join('\n') : '';
+            if (!body || !body.includes('[')) continue;
+            for (const m of body.matchAll(COMMIT_RESULT_RE)) if (!ownCommitShas.includes(m[1])) ownCommitShas.push(m[1]);
+        }
+    };
     const scopeCompleted = Number(scopeRow.completedAt || 0) > 0;
     const scopeCursor = Number(scopeRow.scopeTranscriptBytes);
     const hasScopeCursor = scopeRow.scopeTranscriptBytes !== null
@@ -3511,8 +3632,11 @@ async function capture(lib) {
                 : Array.isArray(um.content) ? um.content.filter(part => part?.type === 'text' && typeof part.text === 'string').map(part => part.text).join('\n') : '';
             const human = deriveIntentFromPrompt(rawUser);
             if (human) lastUserPrompt = human.slice(0, 240);
+            commitShasInEntry(e);
         }
         const text = textOf(e);
+        // The main lane's latest reply wins (a subagent's sidechain never does).
+        if (text && e?.isSidechain !== true) lastAssistantWords = text;
         if (!text.includes('🧠')) continue;
         for (const raw of text.split('\n')) {
             const trimmed = raw.trim();
@@ -3884,7 +4008,32 @@ async function capture(lib) {
     // match Codex/brain_sync paths in either overlap detector.
     {
         const laneFiles = recentPaths.slice(-20);
-        touchSession(input.session_id, { branch: gitBranch(), hostStatus: 'idle', ...(laneFiles.length ? { addFiles: laneFiles } : {}), ...(shipSummaries.length ? { ships: shipSummaries } : {}) });
+        // Unfinished-work state (session handoff): the tail of this turn's
+        // reply (where "done / next" usually is), the last human prompt, and
+        // this session's own commits with their subjects — ONE bounded git call
+        // (`--no-walk` prints exactly the given shas), never a throw. A turn
+        // with no reply text keeps the previous tail.
+        const workPatch = {};
+        if (lastAssistantWords) {
+            const flatWords = lastAssistantWords.replace(/\r/g, '').trim();
+            workPatch.lastWords = flatWords.length > 700 ? '…' + flatWords.slice(-699) : flatWords;
+            workPatch.lastWordsAt = Date.now();
+        }
+        if (lastUserPrompt) workPatch.lastPrompt = lastUserPrompt;
+        const shas = ownCommitShas.filter(s => /^[0-9a-f]{7,40}$/.test(s)).slice(-6);
+        if (shas.length) {
+            const log = safeGit(`log --no-walk --no-merges --format=%h%x09%s ${shas.join(' ')}`, 2500);
+            const commits = log.split('\n').map(l => l.trim()).filter(Boolean)
+                .map(l => { const i = l.indexOf('\t'); return i > 0 ? { sha: l.slice(0, i), subject: l.slice(i + 1) } : null; })
+                .filter(Boolean);
+            if (commits.length) workPatch.commits = commits;
+        }
+        touchSession(input.session_id, {
+            branch: gitBranch(), hostStatus: 'idle',
+            ...(laneFiles.length ? { addFiles: laneFiles } : {}),
+            ...(shipSummaries.length ? { ships: shipSummaries } : {}),
+            ...(Object.keys(workPatch).length ? { work: workPatch } : {}),
+        });
     }
     // Commit-body auto-capture: rationale-bearing feat/fix/perf commits since
     // the last run (independent of markers), pushed into the SAME capture batch.
@@ -4829,6 +4978,11 @@ async function promptRetrieve(lib) {
     // nothing (a peer's presence/ship is itself the signal). Empty string when solo.
     const peers = peerFooter(sid);
     const messages = messageFooter(sid, input.transcript_path, lib);   // 📨 durable notes: offer, acknowledge, replay until explicit consumption
+    // ⏸️ unfinished work (session handoff): only on a continue-shaped human
+    // prompt — SessionStart already printed it once; 🤝 the deliberate-handoff
+    // hint when the human asks for one or says the limit is near.
+    const unfinished = humanText !== null && CONTINUE_RE.test(humanText) ? unfinishedFooter(sid) : '';
+    const handoffHint = humanText !== null ? handoffAskHint(humanText) : '';
     // ── Unified recall (1.87) — the bench-measured two-lane policy ──────────
     // Ported line-for-line from the 2026-09-28 "unified balanced" bench winner
     // (dev/held-out split of real founder prompts; parity-proven against the
@@ -5129,6 +5283,8 @@ async function promptRetrieve(lib) {
     if (inflight) parts.push(inflight.replace(/^\n+/, '')); // ⚡ in-flight peers' events (its own block)
     if (peers) parts.push(peers.replace(/^\n+/, '')); // live-session presence footer (its own block)
     if (messages) parts.push(messages.replace(/^\n+/, '')); // 📨 inbound deliberate peer notes
+    if (unfinished) parts.push(unfinished.replace(/^\n+/, '')); // ⏸️ unfinished work other sessions left (continue-shaped prompt)
+    if (handoffHint) parts.push(handoffHint.replace(/^\n+/, '')); // 🤝 the human asked for a handoff / named the limit
     process.stdout.write(parts.join('\n\n') + '\n'); // UserPromptSubmit injects stdout as context
 }
 
@@ -5909,6 +6065,7 @@ async function read(lib) {
     const out = ultra + messages + versionLine + presenceLine + shipObsLine + gitHookNotice + laneWarning + healLine + draftLine
         + receiptLine
         + inflightFooter(input.session_id, struct)
+        + unfinishedFooter(input.session_id)
         + selfCheckFooter() + doctorFooter();
     process.stdout.write(out);
     // Heartbeat: prove the brief actually injected (and how big) so a dead or

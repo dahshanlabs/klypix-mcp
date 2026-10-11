@@ -42,8 +42,8 @@ for (const [label, bin] of [['supervisor', 'klypix-mcp.mjs'], ['worker', 'klypix
     const { tools } = await client.listTools();
     const names = tools.map(t => t.name);
     // show_in_klypix (P1) is app-only: Windows here (KLYPIX_APP_TOOLS is cleared above).
-    const expected = process.platform === 'win32' ? 26 : 25;
-    ok(names.length === expected && names.includes('klypix_status') && names.includes('read_card_contents') && names.includes('show_in_klypix') === (expected === 26),
+    const expected = process.platform === 'win32' ? 27 : 26;   // + brain_handoff (1.99.0)
+    ok(names.length === expected && names.includes('klypix_status') && names.includes('read_card_contents') && names.includes('show_in_klypix') === (expected === 27),
       `[${label}] listTools shows ${expected} tools, the app tools included where they apply (got ${names.length})`);
     const byName = new Map(tools.map(t => [t.name, t]));
     const drifted = snapshot.filter(t => JSON.stringify(byName.get(t.name)?.inputSchema) !== JSON.stringify(t.inputSchema)).map(t => t.name);

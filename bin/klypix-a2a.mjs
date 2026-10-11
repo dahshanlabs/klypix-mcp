@@ -243,6 +243,7 @@ const DELIBERATELY_UNWIRED = Object.freeze({
   opBrainReconcile: 'wire-supplied roots can traverse host directories; keep MCP-only',
   opBrainGarden: 'apply requires an out-of-band human approval code and must never be weakened for A2A',
   opBrainMessage: 'send-only machine-local messaging has no receivable A2A half',
+  opBrainHandoff: 'take/done stamp the calling session identity on the lane; A2A has no authenticated session identity (MCP-only)',
 });
 
 const canonicalPath = (p) => {

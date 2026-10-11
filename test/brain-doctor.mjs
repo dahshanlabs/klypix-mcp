@@ -1285,7 +1285,7 @@ const supervisorReceipt = (brainDir, name, state) => writeJson(path.join(brainDi
   // show_in_klypix (agent parity P1) is app-only: registered where a KLYPIX app
   // can run — Windows, or KLYPIX_APP_TOOLS=on. 25 on the Ubuntu CI, 26 on Windows.
   const appToolsHere = process.platform === 'win32' || process.env.KLYPIX_APP_TOOLS === 'on';
-  const expectedTools = 25 + (appToolsHere ? 1 : 0);
+  const expectedTools = 26 + (appToolsHere ? 1 : 0);   // + brain_handoff (1.99.0)
   ok(names.includes('show_in_klypix') === appToolsHere, `show_in_klypix is registered exactly where a KLYPIX app can run (${appToolsHere ? 'here' : 'not here'})`);
   ok(names.length === expectedTools, `tool manifest is ${expectedTools} verbs on ${process.platform} (got ${names.length})`);
   // Doctor's TOOLS line counts by a static scan; the app tools register from

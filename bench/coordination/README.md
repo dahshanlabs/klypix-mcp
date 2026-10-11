@@ -63,16 +63,26 @@ verified against a pinned version before any number is published.
 node bench/coordination/run.mjs --dry-run
 
 # Real agents. Spends model usage on YOUR account; asks before starting.
-node bench/coordination/run.mjs --live --agent claude --runs 10 --out results.jsonl
-node bench/coordination/run.mjs --live --agent codex  --runs 10 --out results.jsonl \
-  --scenario s1,s3 --condition none,agents-md-kept,klypix
+# Pin the models for reproducible numbers; keep each agent's raw output for auditing.
+node bench/coordination/run.mjs --live --agent claude --claude-model 'opus[1m]' --runs 10 \
+  --transcripts transcripts/ --out results.jsonl
+node bench/coordination/run.mjs --live --agent codex --codex-model gpt-6-astra --runs 10 \
+  --scenario s1,s3 --condition none,agents-md-kept,klypix --transcripts transcripts/ --out results.jsonl
 
 # Table with intervals.
 node bench/coordination/report.mjs results.jsonl > results.md
 ```
 
 `--keep` leaves each run's repo on disk for inspection. `--timeout` is per run,
-in seconds (default 600).
+in seconds (default 600). `--max-budget` caps Claude's dollars per run (default 2).
+
+Live runs leave your own setup alone. The CLIs start directly, never through
+`cmd.exe`, and get the prompt on stdin. The agent's environment carries nothing
+from the session that launched the bench. Claude runs with
+`--no-session-persistence` and Codex with `--ephemeral`. Every KLYPIX file of a
+run (lane, project registry) lives in a throwaway home that is deleted
+afterwards. On Windows, Codex gets `windows.sandbox="elevated"`, the one user
+setting it cannot write without.
 
 The self-test (`node test/coordination-bench.mjs`) runs the dry run, proves each
 grader separates the right answer from the naive one, and starts the real

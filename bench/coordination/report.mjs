@@ -35,6 +35,7 @@ export function summarize(rows) {
       medianMinutes: median(rs.map((r) => (r.durationMs || 0) / 60000)),
       errors,
       versions: [...new Set(rs.map((r) => r.versions).filter(Boolean))],
+      models: [...new Set(rs.map((r) => r.model).filter(Boolean))],
     });
   }
   return cells;
@@ -46,7 +47,11 @@ export function toMarkdown(cells) {
   const out = ['# KLYPIX coordination bench — results', ''];
   const agents = [...new Set(cells.map((c) => c.agent))];
   for (const agent of agents) {
+    const mine = cells.filter((c) => c.agent === agent);
+    const versions = [...new Set(mine.flatMap((c) => c.versions))];
+    const models = [...new Set(mine.flatMap((c) => c.models))];
     out.push(`## Agent: ${agent}`, '');
+    if (versions.length || models.length) out.push(`${versions.length ? `CLI: ${versions.join(', ')}` : ''}${versions.length && models.length ? ' · ' : ''}${models.length ? `model: ${models.join(', ')}` : ''}`, '');
     if (agent === 'oracle') out.push('> **Dry run — not a result.** The scripted oracle answers correctly whenever the facts were delivered. These rows prove the graders and the delivery, never how an agent behaves.', '');
     out.push( '| Scenario | Condition | n | Success (95% CI) | Acted on stale info | Human relays / task | Median cost | Median min |', '|---|---|---|---|---|---|---|---|');
     for (const s of SCENARIOS) {

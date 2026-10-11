@@ -17,7 +17,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildKlypixMap, addBrainConnections, parseKlypix } from '../../src/klypix-format.mjs';
-import { laneFileFor, listActiveSessions, postPresenceMessage, removeSession, upsertSession } from '../../src/agent-presence.mjs';
+import { laneFileFor, listActiveSessions, upsertSession } from '../../src/agent-presence.mjs';
 import { linkProject } from '../../src/agent-rules.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -82,8 +82,10 @@ const agentsMdAppended = {
 // ── KLYPIX (MCP only) ────────────────────────────────────────────────────────
 // The other session's knowledge lives where a real session using KLYPIX puts
 // it: decisions and findings as brain cards (a replaced decision archived with
-// a 'superseded by' edge), live work as a lane presence row, a closed session's
-// note as a directed mailbox message. The agent gets the klypix-mcp server from
+// a 'superseded by' edge), and live work as a lane presence row. A session that
+// has ended leaves its finding as a card too: the mailbox reaches only a session
+// the sender already knew, and the agent under test is a brand-new session (on
+// Codex its server even takes Codex's own thread id). The agent gets the klypix-mcp server from
 // THIS checkout in plugin mode (no self-update, no settings writes) and the
 // project rules `klypix link` writes. Hooks are NOT installed: this is the
 // MCP-only path every MCP host gets — conservative for Claude Code, where the
@@ -92,14 +94,17 @@ const klypix = {
   id: 'klypix',
   label: 'KLYPIX (brain + lane, MCP only)',
   runnable: true,
-  async prepare({ repo, scenario, sessionIds }) {
+  async prepare({ repo, scenario, sessionIds, benchHome = null }) {
     const brainPath = path.join(repo.dir, 'brain.klypix');
-    const home = os.homedir();   // the lane lives under the real user folder; cleanup removes our file
+    // The lane, the project registry and every other KLYPIX file of this run
+    // live under ONE home: the run's throwaway folder (live runs) or the
+    // process home (the self-test sandboxes it). The server below gets the
+    // same folder, so what the actor writes is exactly what the agent reads,
+    // and a live run never registers temp projects in the user's own KLYPIX.
+    const home = benchHome || os.homedir();
     const facts = scenario.facts;
-    const cardFacts = facts.filter((f) => f.via !== 'message');
-    const noteFacts = facts.filter((f) => f.via === 'message');
-    const areas = [{ title: 'Project', cards: cardFacts.length ? cardFacts.map((f) => ({ text: f.text })) : [{ text: 'Project brain started.' }] }];
-    const stale = cardFacts.filter((f) => f.staleLine);
+    const areas = [{ title: 'Project', cards: facts.map((f) => ({ text: f.text })) }];
+    const stale = facts.filter((f) => f.staleLine);
     if (stale.length) areas.push({ title: 'Archive', cards: stale.map((f) => ({ text: `↩︎ superseded ${new Date().toISOString().slice(0, 10)}\n${f.staleLine.replace(/^- /, '')}` })) });
     let buf = await buildKlypixMap({ title: 'brain', kind: 'brain', areas });
     if (stale.length) {
@@ -122,28 +127,12 @@ const klypix = {
     });
     let liveActor = false;
     if (actor.files && actor.files.length && !actor.closed) { touchActor(); liveActor = true; }
-    if (noteFacts.length) {
-      // A session that has ended leaves a directed note for the agent's (known) session.
-      // The directory remembers only exactly-identified sessions; the agent's
-      // MCP server gets the same id through KLYPIX_SESSION_ID below.
-      upsertSession({ brainPath, home, now: Date.now(), id: sessionIds.agent, logicalSessionId: sessionIds.agent, client: 'claude-code' });
-      removeSession({ brainPath, home, id: sessionIds.agent });
-      for (const f of noteFacts) {
-        postPresenceMessage({ brainPath, home, from: actor.id, to: sessionIds.agent, text: f.text, allowKnownOfflineTarget: true });
-      }
-    }
 
     // Read back what the channel actually holds (a broken write must show up
     // as "not delivered", not be assumed delivered).
     const delivered = new Set();
     const { struct } = await parseKlypix(fs.readFileSync(brainPath));
-    for (const f of cardFacts) if (struct.cards.some((c) => (c.text || '').replace(/\s+/g, ' ').includes(f.text.slice(0, 40)))) delivered.add(f.id);
-    if (noteFacts.length) {
-      let lane = null;
-      try { lane = JSON.parse(fs.readFileSync(laneFileFor(brainPath, home), 'utf8')); } catch { lane = null; }
-      const queued = (lane?.messages || []).filter((m) => m.from === actor.id && m.to === sessionIds.agent);
-      for (const f of noteFacts) if (queued.some((m) => String(m.text || '').includes(f.text.slice(0, 40)))) delivered.add(f.id);
-    }
+    for (const f of facts) if (struct.cards.some((c) => (c.text || '').replace(/\s+/g, ' ').includes(f.text.slice(0, 40)))) delivered.add(f.id);
     // A live actor that is not on the lane delivers nothing: its work in
     // progress is what the agent most needs to see.
     if (liveActor && !listActiveSessions({ brainPath, home }).some((s) => s.id === actor.id)) delivered.clear();
@@ -157,7 +146,10 @@ const klypix = {
         'klypix-canvas': {
           command: process.execPath,
           args: [KLYPIX_BIN, '--vault', repo.dir],
-          env: { KLYPIX_PLUGIN: '1', KLYPIX_SESSION_ID: sessionIds.agent },
+          env: {
+            KLYPIX_PLUGIN: '1', KLYPIX_SESSION_ID: sessionIds.agent, KLYPIX_AUTO_UPDATE: '0',
+            HOME: home, USERPROFILE: home, KLYPIX_BRAIN_DIR: path.join(home, '.claude', 'project-brain'),
+          },
         },
       },
       heartbeat: liveActor ? touchActor : null,

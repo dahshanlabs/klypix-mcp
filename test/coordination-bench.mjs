@@ -10,8 +10,11 @@
 //        exactly as an agent would start it (the condition's mcpServers entry,
 //        plugin mode) and its brain_sync shows the agent what the other session
 //        knew — the current decision ahead of the archived one (S1), the peer on
-//        lib/price.js (S2), the closed session's directed note (S3), the other
+//        lib/price.js (S2), the finding an ended session left (S3), the other
 //        vendor's root cause (S4).
+//   B5 — live-run safety: CLIs start without a shell, the agent env carries
+//        nothing from the launching session, results parse to cost / tokens /
+//        model, and a live run keeps KLYPIX files in its own throwaway home.
 //   B4 — cleanup leaves no lane file behind; the report keeps n and intervals,
 //        and calls a gap only when the intervals do not overlap.
 // Run:  node test/coordination-bench.mjs   (exit 0 = pass)
@@ -31,7 +34,7 @@ process.env.KLYPIX_AUTO_UPDATE = '0';
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const { SCENARIOS } = await import('../bench/coordination/scenarios.mjs');
 const { CONDITIONS, conditionById } = await import('../bench/coordination/conditions.mjs');
-const { oracle, composePrompt, codexMcpOverrides } = await import('../bench/coordination/agents.mjs');
+const { oracle, composePrompt, codexMcpOverrides, resolveCli, cleanAgentEnv, claudeAllowedTools, parseClaudeResult, parseCodexEvents } = await import('../bench/coordination/agents.mjs');
 const { runOne } = await import('../bench/coordination/run.mjs');
 const { summarize, toMarkdown } = await import('../bench/coordination/report.mjs');
 const { makeRepo } = await import('../bench/coordination/lib/repo.mjs');
@@ -96,8 +99,8 @@ const expectations = {
   }, 'its context leads with the token decision, ahead of the archived cookie note'],
   's2-overlapping-work': [(sc) => (sc.peers || []).some((p) => p.id === 'actor-s2-currency' && p.branch === 'a/currency' && (p.files || []).includes('lib/price.js')),
     'its peer list shows the session rewriting lib/price.js on a/currency'],
-  's3-note-from-closed-session': [(sc) => (sc.messages || []).some((m) => m.from === 'actor-s3-migrations' && /backfill:emails/.test(m.text) && /migrate:002/.test(m.text)) && !/backfill:emails/.test(hitsText(sc)),
-    'it is handed the ended session\'s directed note (and the brain does not also carry it)'],
+  's3-note-from-closed-session': [(sc) => /backfill:emails/.test(hitsText(sc)) && /migrate:002/.test(hitsText(sc)),
+    'its context carries the finding the ended session left in the brain'],
   's4-root-cause-from-other-vendor': [(sc) => /req\.userId/.test(hitsText(sc)), 'its context carries the other vendor\'s root cause'],
 };
 const syncAs = async (server, repo, sessionId, task) => {
@@ -127,11 +130,6 @@ for (const s of SCENARIOS) {
     }
     const server = prep.mcpServers['klypix-canvas'];
     ok(prep.delivered.length === s.facts.length, `B3 ${s.id}: the condition reads every fact back from its channel`);
-    if (s.id === 's3-note-from-closed-session') {
-      // Directed means directed: another session starting here gets nothing.
-      const other = await syncAs(server, repo, `bench-bystander-${Date.now().toString(36)}`, s.task);
-      ok(!other.isError && !(other.sc.messages || []).some((m) => m.from === 'actor-s3-migrations'), `B3 ${s.id}: a different session starting here is not handed the note`);
-    }
     const { isError, sc } = await syncAs(server, repo, null, s.task);
     const [check, what] = expectations[s.id];
     ok(!isError && check(sc), `B3 ${s.id}: the agent's first brain_sync — ${what}`);
@@ -162,6 +160,59 @@ const md = toMarkdown(summarize(synthetic));
 ok(/A decision changed today: KLYPIX 95% vs none 15%/.test(md) && !/A note left by a session that has ended: KLYPIX/.test(md),
   'B4: the report calls the 20-run gap a difference and the 3-run gap a tie');
 ok(/## Not measured/.test(md) && /MCP Agent Mail/.test(md), 'B4: the report lists the tools it did not measure, with the reason');
+
+// ── B5: live-run safety (no model call) ─────────────────────────────────────
+{
+  // npm shims are read for their real target, so no prompt ever passes through cmd.exe.
+  const files = {
+    'C:\\npm\\claude.cmd': '@ECHO off\r\n"%dp0%\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe"   %*\r\n',
+    'C:\\npm\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe': '',
+    // npm's real node-program shim, which also names a bundled node.exe first.
+    'C:\\npm\\codex.cmd': [
+      '@ECHO off', 'GOTO start', ':find_dp0', 'SET dp0=%~dp0', 'EXIT /b', ':start', 'SETLOCAL', 'CALL :find_dp0', '',
+      'IF EXIST "%dp0%\\node.exe" (', '  SET "_prog=%dp0%\\node.exe"', ') ELSE (', '  SET "_prog=node"', '  SET PATHEXT=%PATHEXT:;.JS;=;%', ')', '',
+      'endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js" %*', '',
+    ].join('\r\n'),
+    'C:\\npm\\node_modules\\@openai\\codex\\bin\\codex.js': '',
+  };
+  const fake = { pathEnv: 'C:\\other;C:\\npm', platform: 'win32', readFile: (p) => files[p], isFile: (p) => p in files };
+  const c = resolveCli('claude', fake);
+  const x = resolveCli('codex', fake);
+  ok(c?.command === 'C:\\npm\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe' && c.prefix.length === 0, 'B5: a shim pointing at a native exe runs that exe directly');
+  ok(x?.command === process.execPath && x.prefix[0] === 'C:\\npm\\node_modules\\@openai\\codex\\bin\\codex.js', 'B5: a shim pointing at a .js entry runs it on this Node');
+  ok(resolveCli('missing', fake) === null, 'B5: a CLI that is not installed resolves to null');
+
+  const env = cleanAgentEnv({ PATH: 'p', CLAUDECODE: '1', CLAUDE_CODE_ENTRYPOINT: 'cli', KLYPIX_SESSION_ID: 'parent', ELECTRON_RUN_AS_NODE: '1', ANTHROPIC_API_KEY: 'k', OPENAI_API_KEY: 'o' });
+  ok(env.PATH === 'p' && env.ANTHROPIC_API_KEY === 'k' && env.OPENAI_API_KEY === 'o' && !('CLAUDECODE' in env) && !('CLAUDE_CODE_ENTRYPOINT' in env) && !('KLYPIX_SESSION_ID' in env) && !('ELECTRON_RUN_AS_NODE' in env),
+    'B5: the agent starts clean — no parent Claude session, KLYPIX id or Electron flag leaks in (credentials stay)');
+  ok(claudeAllowedTools({ 'klypix-canvas': {} }).includes('mcp__klypix-canvas') && !claudeAllowedTools({}).some((t) => t.startsWith('mcp__')),
+    'B5: Claude may use every tool of the condition\'s server, and no MCP tool otherwise');
+
+  const cr = parseClaudeResult('{"type":"result","is_error":false,"num_turns":7,"total_cost_usd":0.4123,"usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":300,"cache_creation_input_tokens":40},"modelUsage":{"claude-opus-5-5":{}}}\n');
+  ok(cr.costUsd === 0.4123 && cr.tokens === 370 && cr.turns === 7 && cr.model === 'claude-opus-5-5' && cr.resultError === null, 'B5: Claude\'s JSON result yields cost, tokens, turns and the model used');
+  ok(parseClaudeResult('{"type":"result","is_error":true,"subtype":"error_max_budget_usd"}').resultError === 'error_max_budget_usd', 'B5: a Claude run stopped by the dollar cap is an error row, not a quiet fail');
+  const xr = parseCodexEvents(['{"type":"thread.started","model":"gpt-5.5-codex"}', 'not json', '{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":50,"output_tokens":25}}'].join('\n'));
+  ok(xr.tokens === 175 && xr.turns === 1 && xr.model === 'gpt-5.5-codex' && xr.failure === null, 'B5: Codex events yield tokens, turns and the model used');
+  ok(parseCodexEvents('{"type":"turn.failed","error":{"message":"usage limit reached"}}').failure === 'usage limit reached', 'B5: a failed Codex turn is an error row');
+
+  // A live run keeps every KLYPIX file of the run in its own throwaway home.
+  const s2 = SCENARIOS.find((s) => s.id === 's2-overlapping-work');
+  const repo = makeRepo('klypix-cobench-b5-');
+  const benchHome = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-cobench-b5home-'));
+  try {
+    s2.build(repo);
+    const prep = await klypix.prepare({ repo, scenario: s2, agent: oracle, sessionIds: { agent: 'bench-agent-b5' }, benchHome });
+    const brain = path.join(repo.dir, 'brain.klypix');
+    const server = prep.mcpServers['klypix-canvas'];
+    ok(server.env.HOME === benchHome && server.env.USERPROFILE === benchHome && server.env.KLYPIX_AUTO_UPDATE === '0', 'B5: the KLYPIX server of a live run gets the run\'s throwaway home');
+    ok(fs.existsSync(laneFileFor(brain, benchHome)) && !fs.existsSync(laneFileFor(brain, os.homedir())) && prep.delivered.length === 1,
+      'B5: the live actor\'s lane row is written in that home — the launching user\'s lane is never touched');
+    prep.cleanup();
+  } finally {
+    repo.remove();
+    try { fs.rmSync(benchHome, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); } catch { /* */ }
+  }
+}
 
 // A server child that is still exiting can hold a file in the sandbox for a
 // moment on Windows (EBUSY); that must never hide the verdict below.

@@ -11,9 +11,6 @@
 //   hidden  — tests written into the repo only AFTER the agent finishes, so
 //             the agent can neither read nor game them.
 //   grade   — deterministic, no LLM judge.
-//   facts[].via — how the KLYPIX condition carries a fact: a brain card
-//             (default: decisions, findings, work in progress) or a directed
-//             note ('message': what a session that has ended leaves behind).
 //   oracle  — two scripted answers (one that uses the facts, one that does
 //             not) so a dry run proves each grader separates them.
 import { runNodeTests, mergeConflictFiles } from './lib/repo.mjs';
@@ -175,7 +172,6 @@ const s3 = {
   actor: { id: 'actor-s3-migrations', client: 'claude-code', intent: 'Write migration 002 (unique emails)', closed: true },
   facts: [{
     id: 'backfill-before-002',
-    via: 'message',   // KLYPIX: a directed note to the next session, the product's channel for this
     text: 'Note from the session that wrote migration 002 (now closed): 002 adds a UNIQUE index on users.email. Run the `backfill:emails` step (scripts/backfill.js) BEFORE `migrate:002`, or the migration fails on existing duplicate emails.',
   }],
   build(repo) {

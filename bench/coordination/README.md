@@ -32,7 +32,7 @@ so the agent cannot read or game them. There is no LLM judge.
 | `relay` | A human pasted the facts into the prompt. **Upper bound**: counts one human relay per fact. |
 | `agents-md-kept` | The other session edited `AGENTS.md` / `CLAUDE.md` tidily (the out-of-date line replaced). |
 | `agents-md-appended` | The other session appended to `AGENTS.md` / `CLAUDE.md` (the out-of-date line left in). |
-| `klypix` | The other session used KLYPIX: decisions as brain cards (a replaced one archived with a "superseded by" arrow), live work as a lane row, a closed session's note as a directed message. The agent gets **only the klypix-mcp server** (plugin mode) and the project rules `klypix link` writes — no hooks. |
+| `klypix` | The other session used KLYPIX: decisions as brain cards (a replaced one archived with a "superseded by" arrow), live work as a lane row, and a finding left by a session that has ended as a card too. The agent gets **only the klypix-mcp server** (plugin mode) and the project rules `klypix link` writes — no hooks. |
 
 The instructions-file conditions are deliberately generous: the other session
 always writes the facts, in the right file, committed. Real teams forget.
@@ -51,7 +51,7 @@ verified against a pinned version before any number is published.
   `--ignore-user-config --ephemeral`. Both get the condition's MCP servers and
   nothing else.
 - A channel's delivery is **read back**, not assumed: if the brain, lane or
-  message write did not land, the run is recorded with `delivered: 0`.
+  write did not land, the run is recorded with `delivered: 0`.
 - Every number is printed with its `n` and a 95% Wilson interval. A difference
   is called out only when the intervals do not overlap; anything else is a tie.
 - Agent CLI versions are recorded on every row.
@@ -80,6 +80,13 @@ klypix-mcp server the way an agent would to check that its first `brain_sync`
 shows the agent what the other session knew.
 
 ## Honest limits
+
+- **The mailbox is not measured here.** KLYPIX's directed notes reach a session the sender
+  already knew, and resume with it. Every agent here is a brand-new session, so a finding left by
+  an ended session travels as a brain card, the way KLYPIX tells a closing session to leave it.
+  On Codex, the server even identifies itself by Codex's own thread id.
+- **Codex's sandbox keeps `.git` read-only,** so Codex cannot commit. The harness commits whatever
+  any agent leaves in the working tree, and grades every agent the same way.
 
 - **Scripted actors.** The "other session" is a script, so every condition
   faces the same history. That isolates the channel; it does not measure how

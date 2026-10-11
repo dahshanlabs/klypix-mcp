@@ -4405,17 +4405,63 @@ export function questionContextToMarkdown(question, result, { mode = 'lexical', 
     }
     const out = [];
     out.push(`# Answer “${flat(question)}” from these ${hits.length} brain card(s)${as_of ? ` (as of ${as_of})` : ''} — ${total} matched, ${mode} ranking`);
-    out.push('_Synthesize a DIRECT answer from the cards below, then cite the ones you used by [Area]+date. Where a card is marked ⚠️ CORRECTED, answer from the correction, NOT the stale card. Include superseded/archived cards only to show how a decision CHANGED. If the cards don\'t actually answer the question, say so — don\'t pad._');
+    out.push('_Synthesize a DIRECT answer from the cards below, then cite the ones you used by [Area]+date. Where a card is marked ⚠️ CORRECTED, the CURRENT truth is printed FIRST — answer from it; the ↩︎ line under it is superseded history, never the answer. Include superseded/archived cards only to show how a decision CHANGED. If the cards don\'t actually answer the question, say so — don\'t pad._');
     out.push('');
     let used = out.join('\n').length;
     let shown = 0;
+    // CURRENT-FIRST corrections (1.97.0). Agents followed a withdrawn rule in
+    // 77% of tries unless its replacement was made prominent (arXiv 2608.25553),
+    // and a stale card can outrank its own replacement (corpseRate). So a
+    // corrected hit prints the current truth BEFORE the stale words, and when
+    // the replacement ranked too, the pair renders ONCE, at the better rank —
+    // never a stale block above a separate current block.
+    const hitById = new Map(hits.map(h => [h.card.id, h]));
+    const replaces = new Map();   // current id → the stale hit it supersedes
     for (const h of hits) {
-        const c = h.card;
+        const succ = h.correction?.by?.id;
+        if (succ && hitById.has(succ) && !replaces.has(succ)) replaces.set(succ, h);
+    }
+    const rendered = new Set();
+    const relOf = (h) => (h && h.sem != null ? ` · sim ${h.sem.toFixed(2)}` : '');
+    for (const h of hits) {
+        if (rendered.has(h.card.id)) continue;
+        let c = h.card;
+        let block;
+        // Pair: either this is the current card of a stale hit, or a stale hit
+        // whose current card is also in this answer — render the pair here.
+        const staleHit = replaces.get(c.id) || (h.correction && hitById.has(h.correction.by.id) ? h : null);
+        if (staleHit) {
+            const currentHit = hitById.get(staleHit.correction.by.id);
+            const cur = currentHit.card;
+            const old = staleHit.card;
+            rendered.add(cur.id); rendered.add(old.id);
+            c = cur;
+            block = `## [${flat(cur.area) || 'Notes'}] ${day(cur.createdAt)} · ✅ CURRENT (supersedes an older card)${relOf(currentHit)}\n`
+                + `⚠️ CORRECTED — the current truth is:\n${flat(cur.text)}\n\n`
+                + `  ↩︎ superseded [${flat(old.area) || 'Notes'}] ${day(old.createdAt)} (do NOT act on it — history only): ${flat(old.text).slice(0, 240)}`;
+            if (typeof evidenceForCard === 'function') {
+                const evidence = evidenceForCard(cur);
+                if (evidence) block += `\n\n${evidence}`;
+            }
+            if (used + block.length + 2 > budgetChars && shown > 0) { out.push(`\n_…and ${hits.filter(x => !rendered.has(x.card.id)).length + 2} more matched card(s) omitted for length — narrow the question or use search for the rest._`); break; }
+            out.push(block, '');
+            used += block.length + 2;
+            shown++;
+            continue;
+        }
+        rendered.add(c.id);
         const status = h.archived ? ' · ⛔ archived/superseded' : '';
-        const rel = h.sem != null ? ` · sim ${h.sem.toFixed(2)}` : '';
-        let block = `## [${flat(c.area) || 'Notes'}] ${day(c.createdAt)}${status}${rel}\n${flat(c.text)}`;
+        const rel = relOf(h);
         if (h.correction) {
-            block += `\n\n  ⚠️ CORRECTED — this card is STALE; the current truth is:\n  ${flat(h.correction.by.text).slice(0, 600)}`;
+            // The replacement is NOT in this answer: still print it first.
+            block = `## [${flat(c.area) || 'Notes'}] ${day(c.createdAt)}${status}${rel}\n`
+                + `⚠️ CORRECTED — this card is STALE; the current truth is:\n${flat(h.correction.by.text).slice(0, 600)}\n\n`
+                + `  ↩︎ stale text (do NOT act on it — history only): ${flat(c.text).slice(0, 240)}`;
+        } else {
+            block = `## [${flat(c.area) || 'Notes'}] ${day(c.createdAt)}${status}${rel}\n${flat(c.text)}`;
+        }
+        if (h.correction) {
+            // (rendered above — current truth first)
         } else if (h.fulfillment && (h.fulfillment.kind === 'plan' || isPlanCard(c))) {
             // A PLAN/PROPOSAL card a newer 🏁 appears to have shipped (2026-08-23
             // incident: "it's only a proposal" answered about a live feature).
@@ -4446,7 +4492,7 @@ export function questionContextToMarkdown(question, result, { mode = 'lexical', 
                 if (correctionEvidence) block += `\n\nCorrection ${correctionEvidence}`;
             }
         }
-        if (used + block.length + 2 > budgetChars && shown > 0) { out.push(`\n_…and ${hits.length - shown} more matched card(s) omitted for length — narrow the question or use search for the rest._`); break; }
+        if (used + block.length + 2 > budgetChars && shown > 0) { out.push(`\n_…and ${hits.filter(x => !rendered.has(x.card.id)).length + 1} more matched card(s) omitted for length — narrow the question or use search for the rest._`); break; }
         out.push(block, '');
         used += block.length + 2;
         shown++;
@@ -4665,7 +4711,7 @@ export function statusContextToMarkdown(struct, { maxOpen = Infinity, budgetChar
         let shown = 0;
         for (const c of top) {
             if (used > budgetChars) break;
-            const flags = `${overdueById.has(c.id) ? ' ⏰OVERDUE' : ''}${overlays.has(c.id) ? ' ⚠️CORRECTED' : ''}${fulfills.has(c.id) ? (fulfills.get(c.id)?.unconfirmed ? ' ⏳likely-fulfilled?' : ' ⏳likely-fulfilled') : ''}`;
+            const flags = `${overdueById.has(c.id) ? ' ⏰OVERDUE' : ''}${overlays.has(c.id) ? ` ⚠️CORRECTED → current: “${cut(flat(overlays.get(c.id).by.text), 80)}”` : ''}${fulfills.has(c.id) ? (fulfills.get(c.id)?.unconfirmed ? ' ⏳likely-fulfilled?' : ' ⏳likely-fulfilled') : ''}`;
             const d = decayStamp(c);
             if (d) pushAlways(`- [${flat(c.area) || 'Notes'}]${flags} ⏱️ LAST KNOWN (${d.age}): ${cut(flat(c.text), perCard)} — VERIFY: ${d.probe}`);
             else pushAlways(`- [${flat(c.area) || 'Notes'}]${flags} ${cut(flat(c.text), perCard)}`);
@@ -5809,6 +5855,16 @@ const reAdoptionReceipt = (prior, today) => {
         .replace(/\s+/g, ' ').trim().slice(0, 140);
     return `↪ re-adopts ${today}: ${headline || 'an earlier superseded decision'}`;
 };
+
+// One wording for "this card was replaced, read that one" on every surface that
+// lists cards (status, read_canvas, search_canvases, search_all_brains), so a
+// stale card is never shown without naming its replacement (1.97.0).
+export function supersededByNote(overlay, max = 100) {
+    if (!overlay || !overlay.by) return '';
+    const head = String(overlay.by.text || '').replace(/\s+/g, ' ').trim();
+    const cutHead = head.length > max ? `${head.slice(0, max - 1)}…` : head;
+    return `superseded by “${cutHead}” (${overlay.by.id})`;
+}
 
 // Recall-side truth guard: label a card stale ONLY when the graph contains an
 // explicit identity-bearing lifecycle edge ("superseded by" / "closed by").
@@ -9675,8 +9731,13 @@ export function structToMarkdown(struct, { assetsDir, parsed = null, lockedBoxes
         if (strokes || lines) L.push(`*Ink: ${strokes} freehand stroke${strokes === 1 ? '' : 's'} · ${lines} drawn line${lines === 1 ? '' : 's'}/shape${lines === 1 ? '' : 's'}${frozenInk ? ` · ${frozenInk} frozen` : ''} (not readable as text)*\n`);
     }
     L.push(`## Cards`);
+    // The replacement rides in the stale card's own heading (1.97.0) — before,
+    // the edge appeared only in the separate connection list at the end.
+    let successors = new Map();
+    try { successors = correctionOverlaysFor(struct, struct.cards.filter(c => c.type !== 'container')); } catch { successors = new Map(); }
     for (const c of struct.cards) {
         const archived = isArchived(c);
+        const replacedNote = successors.has(c.id) ? ` — ${supersededByNote(successors.get(c.id), 90)}` : '';
         const it = items[c.id] || {};
         // Human-set state rides in the heading, where a reader cannot miss it.
         const state = [
@@ -9685,7 +9746,7 @@ export function structToMarkdown(struct, { assetsDir, parsed = null, lockedBoxes
             c.type === 'container' && c.containerKind === 'block' ? 'a frameless block' : null,
             c.type === 'container' && c.collapsed ? 'collapsed by the person (its cards are still listed)' : null,
         ].filter(Boolean);
-        L.push(`### ${c.title || `(${c.type})`}  \`${c.type}\` · id ${c.id}${archived ? '  ⛔ archived' : ''}${c.area && !archived ? `  _[${c.area}]_` : ''}${state.length ? `  · ${state.join(' · ')}` : ''}`);
+        L.push(`### ${c.title || `(${c.type})`}  \`${c.type}\` · id ${c.id}${archived ? `  ⛔ archived${replacedNote}` : (replacedNote ? `  ⚠️${replacedNote}` : '')}${c.area && !archived ? `  _[${c.area}]_` : ''}${state.length ? `  · ${state.join(' · ')}` : ''}`);
         if (c.text) L.push(escapeInstructionLines(c.type === 'text' ? String(c.text).trim() : `→ ${c.text}`));
         if (rich) {
             const extra = [];

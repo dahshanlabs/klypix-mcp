@@ -34,7 +34,7 @@ import {
   challengeBrain, challengeContextToMarkdown, buildRenderSpec, structToBrief,
   brainLensData, lensToMarkdown, deathDateOfCard,
   statusContextToMarkdown, findFulfillmentCandidates, findStaleOpenCards, releaseFulfilledOpens, openStatusSummary, perAreaTableToMarkdown,
-  splitQueryTokens, scoreCardsAgainstQuery, correctionOverlaysFor, currentGuidanceFor, currentGuidancePrefix,
+  splitQueryTokens, scoreCardsAgainstQuery, correctionOverlaysFor, supersededByNote, currentGuidanceFor, currentGuidancePrefix,
   isFastDecayCard, isUnresolvedOpenCard, isSkillCard, validateGuard, guardSidecarPathFor, ensureGuardSidecar, DECAY_STALE_MS, formatDecayAge,
   isPlanCard, planFulfillmentFor, PLAN_PAIR_SIM_BRAIN, isAgconfTwinId,
   readPendingShips, clearPendingShips, pendingShipCards, formatCaptureReceipts, parseVerifySuffix, amendmentFirst,
@@ -435,6 +435,9 @@ export async function opSearchCanvases({ vault, query }) {
       const isArchived = (c) => /^archive$/i.test(c.area || '');
       const n = struct.counts;
       const head = `## ${rel} — "${struct.title}" · ${n.live ?? n.cards} live cards${n.archived ? `, ${n.archived} archived` : ''}, ${n.connections} connections${saved ? ` · saved ${saved}` : ''}${nameMatch && !matched.length ? '  (name/title match)' : ''}`;
+      // A stale hit names its replacement (1.97.0) — never a bare "archived".
+      let successors = new Map();
+      try { successors = correctionOverlaysFor(struct, matched.slice(0, 8)); } catch { successors = new Map(); }
       const body = matched.slice(0, 8).map(c => {
         const pos = (c.pos && c.pos.x != null) ? ` @(${Math.round(c.pos.x)},${Math.round(c.pos.y)})` : '';
         const allTags = [...new Set([...(c.tags || []), ...itemTags(c)])];
@@ -449,7 +452,10 @@ export async function opSearchCanvases({ vault, query }) {
         const fromReading = reading && !hit(c.title) && !hit(c.text) && hit(reading.text)
           ? `\n    in KLYPIX's saved reading: ${escapeInstructionLines(reading.text.replace(/\s+/g, ' ').slice(0, 240))}`
           : '';
-        return `- [${c.type}] "${c.title || '(card)'}" (${c.id})${pos}${date ? ` · ${date}` : ''}${tags}${arch}\n    ${escapeInstructionLines(ownText)}${fromReading}`;
+        const replaced = successors.has(c.id)
+          ? `\n    ↪ ${supersededByNote(successors.get(c.id))} — read that card for the current state`
+          : '';
+        return `- [${c.type}] "${c.title || '(card)'}" (${c.id})${pos}${date ? ` · ${date}` : ''}${tags}${arch}\n    ${escapeInstructionLines(ownText)}${fromReading}${replaced}`;
       }).join('\n');
       hits.push(matched.length ? `${head}\n${body}` : head);
     }
@@ -504,6 +510,12 @@ export async function opSearchAllBrains({ vault, query, as_of, log = () => {} })
     try { ({ struct } = await parseKlypix(fs.readFileSync(b.path))); } catch { continue; }
     let vecs = null;
     if (qv) { try { vecs = await vectorsForBrain(pipe, b.path, struct.cards); } catch { /* lexical for this brain */ } }
+    // Replacement per stale card (1.97.0), only when this brain HAS lifecycle
+    // edges; skipped under as_of (a correction is a present-day fact).
+    let successors = new Map();
+    if (asOfTs == null && (struct.connections || []).some(cn => cn.label === 'superseded by' || cn.label === 'closed by')) {
+      try { successors = correctionOverlaysFor(struct, struct.cards); } catch { successors = new Map(); }
+    }
     for (const c of struct.cards) {
       if (c.type === 'container') continue;
       const t = String(c.text || '').toLowerCase();
@@ -529,7 +541,7 @@ export async function opSearchAllBrains({ vault, query, as_of, log = () => {} })
         if (isArchived) score -= 1;
         if (isCur) score += sem != null ? 1.5 : 1; // current-project locality prior
       }
-      scored.push({ score, sem, cur: isCur, project: b.project || path.basename(path.dirname(b.path)), area: c.area, c });
+      scored.push({ score, sem, cur: isCur, project: b.project || path.basename(path.dirname(b.path)), area: c.area, c, successor: successors.get(c.id) || null });
     }
   }
   if (!scored.length) return { blocks: [text(`No matches for "${query}" across ${brains.length} registered brain(s).`)] };
@@ -537,7 +549,7 @@ export async function opSearchAllBrains({ vault, query, as_of, log = () => {} })
   const top = scored.slice(0, 20);
   const lines = top.map(h => {
     const when = h.c.createdAt ? new Date(h.c.createdAt).toISOString().slice(0, 10) : '';
-    return `- ${h.cur ? '★ ' : ''}[${h.project}${h.area ? ' › ' + h.area : ''}] ${when} ${String(h.c.text || '').replace(/\s+/g, ' ').slice(0, 240)}`;
+    return `- ${h.cur ? '★ ' : ''}[${h.project}${h.area ? ' › ' + h.area : ''}] ${when} ${String(h.c.text || '').replace(/\s+/g, ' ').slice(0, 240)}${h.successor ? `\n    ↪ ${supersededByNote(h.successor)}` : ''}`;
   });
   // Never say "warming — retry" to someone who simply has not installed the
   // runtime: for them that advice is wrong forever, and their results are the

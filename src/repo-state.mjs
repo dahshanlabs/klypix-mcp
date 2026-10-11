@@ -29,7 +29,7 @@
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import { execFileSync } from 'child_process';
+import { execFileSync, spawnSync } from 'child_process';
 
 // Same shape as the presence-side gitBranch / resolveAuthor probes: short
 // timeout, stderr discarded, failure is data (null), never an exception.
@@ -64,6 +64,101 @@ const makeGit = (execGit) => (cwd, args, timeoutMs) => {
     return null;   // no git on PATH, not a repo, timeout — all the same: no data
   }
 };
+
+// ── Test-merge two sessions' branches (git merge-tree) ───────────────────────
+// Declared-file overlap misses the conflicts that matter most at merge time:
+// on 715 pairs of concurrently open agent PRs, 79 of 167 textual conflicts
+// (47%) happened although the two PRs' own file lists did not overlap — each
+// side was compared against a different base (arXiv 2610.04779). A real
+// three-way test merge of the two branch tips catches them, and costs a median
+// 0.02 s (git >= 2.38, `merge-tree --write-tree`, no working tree touched).
+//
+// Contract: committed work only (an uncommitted edit is invisible to git), never
+// throws, null whenever the answer is unknown — git too old (exit 129), unrelated
+// histories (128), a branch that does not exist in THIS repo (a teammate's PC),
+// a timeout, or a ref name that is not safe to hand to git.
+
+// Files the brain tooling regenerates on every branch, so they differ between
+// almost any two branches and a "conflict" in them is projection noise, not
+// work at risk. brain.klypix has its own merge driver. The rest mirror
+// uninstall.mjs PROJECT_TARGETS (test/overlap-tiers.mjs fails if they drift).
+export const MERGE_NOISE_PATHS = Object.freeze([
+  'brain.klypix', 'brain.any',
+  'agents.md', '.agents/agents.md', 'gemini.md', 'conventions.md',
+  '.cursor/rules/klypix-brain.mdc', '.windsurf/rules/klypix-brain.md', '.clinerules/klypix-brain.md',
+  '.github/copilot-instructions.md', '.codex/config.toml',
+  '.mcp.json', '.cursor/mcp.json', '.cline/mcp.json', '.gemini/settings.json', '.vscode/mcp.json',
+]);
+const MERGE_NOISE = new Set(MERGE_NOISE_PATHS);
+export const isMergeNoise = (file) => {
+  const key = String(file || '').replace(/\\/g, '/').replace(/^\.\//, '').trim().toLowerCase();
+  if (!key) return true;
+  const base = key.slice(key.lastIndexOf('/') + 1);
+  return MERGE_NOISE.has(key) || base === 'brain.klypix' || base === 'brain.any';
+};
+
+// A branch name we will put on a git command line: no leading dash (option
+// injection), no "..", no reflog/revision syntax, no whitespace.
+const SAFE_BRANCH = /^(?!-)(?!.*\.\.)(?!.*@\{)[A-Za-z0-9._/+-]{1,200}$/;
+export const isSafeBranchName = (name) => typeof name === 'string' && SAFE_BRANCH.test(name) && !name.endsWith('/') && !name.endsWith('.lock');
+
+function defaultRunMergeTree(args, cwd, timeoutMs) {
+  const r = spawnSync('git', args, {
+    cwd,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+    timeout: Number(timeoutMs) > 0 ? Number(timeoutMs) : GIT_TIMEOUT_MS,
+    windowsHide: true,
+  });
+  return { status: r.error ? null : r.status, stdout: typeof r.stdout === 'string' ? r.stdout : '' };
+}
+
+const mergeTreeCache = new Map();   // `${dir}|${shaA}|${shaB}` → result (tips are immutable)
+const MERGE_TREE_CACHE_MAX = 200;
+
+/**
+ * Test-merge the tips of two local branches without touching any working tree.
+ * Returns { clean, files, shaA, shaB, noiseOnly } or null when unknown.
+ * `files` are the conflicted paths minus MERGE_NOISE_PATHS.
+ */
+export function mergeTreeConflicts(dir, branchA, branchB, {
+  execGit = defaultExecGit,
+  runMergeTree = defaultRunMergeTree,
+  timeoutMs = 1500,
+} = {}) {
+  if (!dir || !isSafeBranchName(branchA) || !isSafeBranchName(branchB) || branchA === branchB) return null;
+  const git = makeGit(execGit);
+  const shaA = git(dir, ['rev-parse', '--verify', '--quiet', `refs/heads/${branchA}^{commit}`]);
+  const shaB = git(dir, ['rev-parse', '--verify', '--quiet', `refs/heads/${branchB}^{commit}`]);
+  if (!shaA || !shaB || !/^[0-9a-f]{7,64}$/i.test(shaA) || !/^[0-9a-f]{7,64}$/i.test(shaB)) return null;
+  if (shaA === shaB) return { clean: true, files: [], shaA, shaB, noiseOnly: false };
+  const key = `${dir}|${shaA}|${shaB}`;
+  if (mergeTreeCache.has(key)) return mergeTreeCache.get(key);
+  let res = null;
+  try { res = runMergeTree(['merge-tree', '--write-tree', '--name-only', '--no-messages', shaA, shaB], dir, timeoutMs); } catch { res = null; }
+  let out = null;
+  if (res && res.status === 0) out = { clean: true, files: [], shaA, shaB, noiseOnly: false };
+  else if (res && res.status === 1) {
+    // Line 1 is the merged tree's OID; the conflicted file names follow, one
+    // per line, until a blank line (informational messages are suppressed).
+    const lines = String(res.stdout || '').split(/\r?\n/);
+    const all = [];
+    for (let i = 1; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (!line) break;
+      all.push(line);
+    }
+    const files = [...new Set(all)].filter((f) => !isMergeNoise(f));
+    out = { clean: files.length === 0, files, shaA, shaB, noiseOnly: all.length > 0 && files.length === 0 };
+  }
+  if (out) {
+    if (mergeTreeCache.size >= MERGE_TREE_CACHE_MAX) mergeTreeCache.delete(mergeTreeCache.keys().next().value);
+    mergeTreeCache.set(key, out);
+  }
+  return out;
+}
+
+export function __resetMergeTreeCacheForTests() { mergeTreeCache.clear(); }
 
 function readPackage(dir) {
   try {

@@ -46,7 +46,7 @@ import {
 // canonical copy lives in the pure module because that one is import-restricted
 // (crypto only), so it can never grow a dependency this file would inherit.
 import { normalizeFileKey } from './finding-routing.mjs';
-import { cmpSemver3, collectRepoState, commitFiles, deleteCommittedClaim, readCommittedClaims, releaseAncestry, releaseAncestryWarnings, repoStateWarnings, settleClaimsAgainstRef, writeCommittedClaim } from './repo-state.mjs';
+import { cmpSemver3, collectRepoState, commitFiles, mergeTreeConflicts, deleteCommittedClaim, readCommittedClaims, releaseAncestry, releaseAncestryWarnings, repoStateWarnings, settleClaimsAgainstRef, writeCommittedClaim } from './repo-state.mjs';
 import { recordResultManifests } from './result-reconcile.mjs';
 
 export const MCP_HEARTBEAT_MS = 60_000;
@@ -797,6 +797,151 @@ const isTaskSession = (session) =>
     // and counting them re-promoted every finished task to "active" for the
     // rest of the host process's life.
     || liveObservedFiles(session).length > 0);
+
+// ── Overlap tiers beyond the exact file (1.97.0) ────────────────────────────
+// Exact-file overlap (findPresenceConflicts) stays the blocking signal and its
+// shape is unchanged. Two further tiers, each with its own honesty limit:
+//
+//   same-directory (advisory) — both sessions work in one folder with no file
+//     in common yet. Most real collisions start as "I'm in the folder you're
+//     in". Noise control borrowed from release ownership: with three or more
+//     scoped sessions, a folder that more than half of them touch (docs/,
+//     src/) says nothing about any one pair and is dropped. Never alerts.
+//   merge-conflict (blocking) — the two sessions' BRANCHES, test-merged with
+//     git merge-tree, conflict in named files although no declared file
+//     overlaps. Committed work only; skipped silently whenever git cannot say.
+
+const dirOfKey = (key) => {
+  const at = String(key || '').lastIndexOf('/');
+  return at > 0 ? key.slice(0, at) : '';   // '' = repo root: never a "folder" signal
+};
+
+const scopeDisplayByKey = (session, root) => {
+  const out = new Map();
+  for (const file of [
+    ...(Array.isArray(session?.files) ? session.files : []),
+    ...liveObservedFiles(session),
+  ]) {
+    const key = normalizeFileKey(file, root);
+    if (key && !out.has(key)) out.set(key, String(file || '').replace(/\\/g, '/'));
+  }
+  return out;
+};
+
+export function findNearbyWork(sessions, selfId, { projectRoot, excludePeerIds = new Set(), maxDirs = 3, maxFiles = 4 } = {}) {
+  const active = Array.isArray(sessions) ? sessions : [];
+  const me = active.find((session) => session.id === selfId);
+  if (!me) return [];
+  const root = projectRoot || me.cwd || null;
+  const mine = scopeDisplayByKey(me, root);
+  if (!mine.size) return [];
+  const scoped = active.filter((s) => s && (s.id === selfId || (!isSuspectedTwin(s, me) && isTaskSession(s))));
+  const dirsOf = (byKey) => {
+    const map = new Map();   // dir → [display files]
+    for (const [key, display] of byKey) {
+      const dir = dirOfKey(key);
+      if (!dir) continue;
+      if (!map.has(dir)) map.set(dir, []);
+      map.get(dir).push(display);
+    }
+    return map;
+  };
+  const myDirs = dirsOf(mine);
+  if (!myDirs.size) return [];
+  // Shared-folder noise: count sessions touching each folder.
+  const dirSessions = new Map();
+  const scopes = new Map();
+  for (const s of scoped) {
+    const byKey = s.id === selfId ? mine : scopeDisplayByKey(s, root);
+    scopes.set(s.id, byKey);
+    for (const dir of dirsOf(byKey).keys()) dirSessions.set(dir, (dirSessions.get(dir) || 0) + 1);
+  }
+  const scopedCount = [...scopes.values()].filter((m) => m.size).length;
+  // Noise needs a CROWD: at least three sessions in the folder AND more than
+  // half of all scoped sessions. Two sessions sharing a folder is exactly the
+  // pair signal this tier exists for, however small the lane.
+  const isNoise = (dir) => {
+    const n = dirSessions.get(dir) || 0;
+    return n >= 3 && n > scopedCount / 2;
+  };
+  const out = [];
+  for (const peer of scoped) {
+    if (peer.id === selfId || excludePeerIds.has(peer.id)) continue;
+    const theirsByKey = scopes.get(peer.id);
+    if (!theirsByKey || !theirsByKey.size) continue;
+    if ([...theirsByKey.keys()].some((key) => mine.has(key))) continue;   // exact overlap is the stronger report
+    const theirDirs = dirsOf(theirsByKey);
+    const shared = [...theirDirs.keys()].filter((dir) => myDirs.has(dir) && !isNoise(dir)).sort();
+    if (!shared.length) continue;
+    const dirs = shared.slice(0, maxDirs);
+    out.push({
+      id: peer.id,
+      client: peer.client,
+      surface: peer.surface || null,
+      branch: peer.branch || null,
+      intent: peer.intent || '',
+      dirs,
+      mine: dirs.flatMap((d) => myDirs.get(d)).slice(0, maxFiles),
+      theirs: dirs.flatMap((d) => theirDirs.get(d)).slice(0, maxFiles),
+      kind: 'same-directory',
+      severity: 'advisory',
+    });
+  }
+  return out;
+}
+
+export function findMergeConflicts(sessions, selfId, {
+  repoDir,
+  maxPeers = 6,
+  budgetMs = 2000,
+  clock = () => Date.now(),
+  mergeTree = mergeTreeConflicts,
+} = {}) {
+  const active = Array.isArray(sessions) ? sessions : [];
+  const me = active.find((session) => session.id === selfId);
+  if (!me || !repoDir || !compact(me.branch)) return [];
+  const candidates = active
+    .filter((peer) => peer && peer.id !== selfId
+      && !isSuspectedTwin(peer, me)
+      && isTaskSession(peer)
+      && compact(peer.branch) && peer.branch !== me.branch
+      // A teammate's PC: its branch refs are not in this repo (the lookup
+      // would simply fail), so do not spend the budget on it.
+      && !(peer.machine && me.machine && peer.machine !== me.machine))
+    .sort((a, b) => Number(b.lastSeen || 0) - Number(a.lastSeen || 0))
+    .slice(0, maxPeers);
+  const started = clock();
+  const byBranch = new Map();
+  const out = [];
+  for (const peer of candidates) {
+    if (clock() - started > budgetMs) break;
+    let result = byBranch.get(peer.branch);
+    if (result === undefined) {
+      try { result = mergeTree(repoDir, me.branch, peer.branch); } catch { result = null; }
+      byBranch.set(peer.branch, result);
+    }
+    if (!result || result.clean || !Array.isArray(result.files) || !result.files.length) continue;
+    out.push({
+      id: peer.id,
+      client: peer.client,
+      surface: peer.surface || null,
+      branch: peer.branch || null,
+      intent: peer.intent || '',
+      files: result.files.slice(0, 12),
+      kind: 'merge-conflict',
+      severity: 'blocking',
+      sameWorktree: false,
+      peerObservedFiles: [],
+      selfObservedFiles: [],
+      refs: {
+        mine: `${me.branch}@${String(result.shaA || '').slice(0, 7)}`,
+        theirs: `${peer.branch}@${String(result.shaB || '').slice(0, 7)}`,
+      },
+      committedOnly: true,
+    });
+  }
+  return out;
+}
 
 const publicSession = (session, now) => {
   const transport = session?.transport && typeof session.transport === 'object'
@@ -2660,16 +2805,28 @@ export function createMcpPresence({
     }
 
     const stamp = now();
-    const conflicts = findPresenceConflicts(report.sessions, sessionId);
+    const exactConflicts = findPresenceConflicts(report.sessions, sessionId);
+    // 1.97.0 tiers (see findNearbyWork / findMergeConflicts). Both are skipped
+    // on completion — a finished task has nothing left to collide with.
+    const mergeConflicts = completing ? [] : findMergeConflicts(report.sessions, sessionId, { repoDir: path.dirname(brainPath) });
+    const nearby = completing ? [] : findNearbyWork(report.sessions, sessionId, {
+      excludePeerIds: new Set([...exactConflicts, ...mergeConflicts].map((c) => c.id)),
+    });
+    // `conflicts` keeps its contract (blocking overlaps, exact-file shape) and
+    // gains the merge-conflict kind additively.
+    const conflicts = [...exactConflicts, ...mergeConflicts];
     const snapshot = buildPresenceSnapshot(report.sessions, sessionId, { now: stamp });
     const alertsQueued = [];
+    const selfLabel = shortestUniqueSessionPrefix(report.sessions, sessionId, 12) || String(sessionId).slice(0, 12);
+    const planLabel = compact(intent) ? ` plans "${compact(intent).slice(0, 110)}"` : ' synchronized a task';
     if (!completing) {
       for (const peer of conflicts) {
         // Explicit arrow: normalizeFileKey now takes an optional `root` second
         // argument, so a bare `.map(normalizeFileKey)` would hand it the array
         // INDEX as the project root.
         const filesKey = peer.files.map((file) => normalizeFileKey(file)).sort().join('|');
-        const key = `${peer.id}|${filesKey}`;
+        const isMerge = peer.kind === 'merge-conflict';
+        const key = `${isMerge ? 'merge|' : ''}${peer.id}|${filesKey}`;
         if (notifiedConflicts.has(key)) continue;
         notifiedConflicts.add(key);
         const annotated = annotateConflictFiles(peer);
@@ -2677,29 +2834,47 @@ export function createMcpPresence({
           brainPath,
           from: sessionId,
           to: peer.id,
-          text: `Automatic KLYPIX overlap alert: ${shortestUniqueSessionPrefix(report.sessions, sessionId, 12) || String(sessionId).slice(0, 12)}`
-            + `${compact(intent) ? ` plans "${compact(intent).slice(0, 110)}"` : ' synchronized a task'}`
-            + ` and reports the same file(s): ${annotated.files.join(', ')}${annotated.legend}. Coordinate before editing.`,
-          dedupeKey: `overlap|${sessionId}|${peer.id}|${taskStartedAt}|${filesKey}`,
+          text: isMerge
+            ? `Automatic KLYPIX merge-conflict alert: ${selfLabel}${planLabel}. A test merge of its branch ${peer.refs?.mine || ''} with yours ${peer.refs?.theirs || ''} conflicts in: ${peer.files.join(', ')} (committed work only; no declared file overlaps). Coordinate before either of you merges.`
+            : `Automatic KLYPIX overlap alert: ${selfLabel}${planLabel}`
+              + ` and reports the same file(s): ${annotated.files.join(', ')}${annotated.legend}. Coordinate before editing.`,
+          dedupeKey: `${isMerge ? 'merge-overlap' : 'overlap'}|${sessionId}|${peer.id}|${taskStartedAt}|${filesKey}`,
           home,
           now: stamp,
         });
-        if (queued.posted) alertsQueued.push({ peerId: peer.id, files: peer.files });
+        if (queued.posted) alertsQueued.push({ peerId: peer.id, files: peer.files, ...(isMerge ? { kind: 'merge-conflict' } : {}) });
       }
     }
 
-    const conflictText = conflicts.length
-      ? [
-        'KLYPIX exact file-overlap warning:',
-        ...conflicts.map((peer) => {
-          const annotated = annotateConflictFiles(peer);
-          return `- ${shortestUniqueSessionPrefix(report.sessions, peer.id, 12) || String(peer.id).slice(0, 12)}${peer.intent ? ` "${String(peer.intent).slice(0, 80)}"` : ''}: ${annotated.files.join(', ')}${annotated.legend}`;
-        }),
-        alertsQueued.length
-          ? 'The earlier peer was automatically queued an exact-once overlap alert; coordinate ownership before editing.'
-          : 'Coordinate ownership before editing the overlapping files.',
-      ].join('\n')
-      : 'No exact file overlap is currently reported by another synchronized task.';
+    const peerLabel = (peer) => `${shortestUniqueSessionPrefix(report.sessions, peer.id, 12) || String(peer.id).slice(0, 12)}${peer.intent ? ` "${String(peer.intent).slice(0, 80)}"` : ''}`;
+    const exactAlerted = alertsQueued.some((a) => a.kind !== 'merge-conflict');
+    const conflictText = [
+      exactConflicts.length
+        ? [
+          'KLYPIX exact file-overlap warning:',
+          ...exactConflicts.map((peer) => {
+            const annotated = annotateConflictFiles(peer);
+            return `- ${peerLabel(peer)}: ${annotated.files.join(', ')}${annotated.legend}`;
+          }),
+          exactAlerted
+            ? 'The earlier peer was automatically queued an exact-once overlap alert; coordinate ownership before editing.'
+            : 'Coordinate ownership before editing the overlapping files.',
+        ].join('\n')
+        : 'No exact file overlap is currently reported by another synchronized task.',
+      mergeConflicts.length
+        ? [
+          'KLYPIX merge-conflict warning (git merge-tree, committed work only — your branches would conflict even though no declared file overlaps):',
+          ...mergeConflicts.map((peer) => `- ${peerLabel(peer)} on ${peer.refs.theirs} vs your ${peer.refs.mine}: ${peer.files.join(', ')}`),
+          'Agree who merges first, or rebase onto the other branch before you finish.',
+        ].join('\n')
+        : '',
+      nearby.length
+        ? [
+          'KLYPIX nearby-work notice (advisory — same folder, no shared file yet):',
+          ...nearby.map((peer) => `- ${peerLabel(peer)}: ${peer.dirs.map((d) => `${d}/`).join(', ')} — theirs: ${peer.theirs.join(', ')}; yours: ${peer.mine.join(', ')}`),
+        ].join('\n')
+        : '',
+    ].filter(Boolean).join('\n\n');
     // Mechanical repo-state (2026-08-14 bundle-currency incident): branch, tag
     // and version truth plus bundled-mirror drift, collected IN THE SERVER so
     // every MCP client — Claude, Codex, Cursor, Cline, Desktop — gets equal
@@ -3352,6 +3527,8 @@ export function createMcpPresence({
       },
       peers: snapshot.peers,
       conflicts,
+      // Additive (1.97.0): same-folder work with no shared file (advisory).
+      ...(nearby.length ? { nearby } : {}),
       messages: report.messages.map((message) => {
         // Raw structured path gets the same decay verdict as the rendered
         // text: a consumer reading structured.messages directly must see the
@@ -3459,6 +3636,7 @@ export function createMcpPresence({
       ...report,
       snapshot,
       conflicts,
+      nearby,
       resultConflicts,
       alertsQueued,
       structured,

@@ -518,12 +518,22 @@ Future hosts get baseline support merely by connecting the MCP server. A deeper 
 
 ## Overlap warnings
 
-When two sessions declare overlapping expected files, `brain_sync` surfaces it: the peer, its
-declared task, and the exact paths in common. A one-time alert is queued to whichever session got
-there first, so a late arrival is not the only one who knows.
+`brain_sync` reports three kinds of overlap with other live sessions on the same brain:
 
-This warns. It does not prevent. Nothing blocks an edit, matching is exact-path, and both sides
-have to have declared their files for the overlap to be visible at all.
+- **Same file.** Both sessions declared, or were observed editing, the same path. You see the peer,
+  its task and the paths in common, and a one-time alert is queued to whichever session got there
+  first, so a late arrival is not the only one who knows.
+- **Would conflict at merge.** The two sessions are on different branches, and a test merge of the
+  two branch tips (`git merge-tree`, git 2.38 or newer) conflicts in named files, even though no
+  declared file overlaps. This sees committed work only: an uncommitted edit is invisible to git.
+  It also gets a one-time alert. Files the brain tooling regenerates on every branch (AGENTS.md,
+  rule files, `.mcp.json`, `brain.klypix`) are not counted.
+- **Same folder (advisory).** Both sessions work in one folder with no file in common yet. No alert
+  is sent. A folder that at least three sessions, and more than half of them, touch is treated as
+  noise and not reported.
+
+This warns. It does not prevent. Nothing blocks an edit. A session that never declared its files
+and was never observed editing is invisible to the file and folder checks.
 
 ## Handoffs and messages
 
@@ -1095,9 +1105,10 @@ Read this section before you build on any of it.
   loop prevention, stable message IDs and per-recipient-machine acknowledgement primitives), but no
   transport: carrying frames between machines is the desktop app's job. With `klypix-mcp` alone,
   coordination is machine-local.
-- **Overlap matching is exact-path, and both sides must declare.** A session that never declares
-  its expected files is invisible to overlap detection, and `src/auth/token.ts` does not match a
-  rename or a parent directory.
+- **File overlap is exact-path.** A session needs declared files or observed edits to be checked;
+  `src/auth/token.ts` does not match a rename. Folder overlap is advisory. The merge test sees
+  committed work only, needs git 2.38 or newer, and runs only for sessions on different local
+  branches of the same repository.
 - **Overlap warnings are advisory.** Nothing is blocked. One severity string in the payload reads
   `blocking`; the mechanism is not.
 - **Codex has no automatic capture**, with or without `--codex-hooks`. The Codex hook never writes

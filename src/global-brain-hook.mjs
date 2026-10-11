@@ -1462,6 +1462,22 @@ function peerFooter(sid) {
     const lines = ['', `## ⚠️ Other live session(s) in this project — ${peers.length} total, as of ${asOf}${hiddenIdle ? ` (+${hiddenIdle} inactive not shown)` : ''} — coordinate (the brain is shared, NOT live-merged)`];
     const releaseLine = releaseLeaseFooterLine(list, now);
     if (releaseLine) lines.push(releaseLine);
+    // Same branch, said ONCE (1.97.0). Two sessions can only share a branch
+    // name by sharing a checkout (git refuses one branch in two worktrees), so
+    // the risk is concrete: a broad `git add` sweeps the other session's edits
+    // into your commit. Per-peer, this line repeated on every row of a busy
+    // lane and stopped being read.
+    const sameBranchCount = myBranch ? peers.filter(p => p.branch === myBranch).length : 0;
+    if (sameBranchCount) lines.push(`- ⚠️ ${sameBranchCount} of these session(s) share your branch \`${myBranch}\` (one checkout): stage only your own files — never \`git add -u\` / \`-A\` — and coordinate before you commit.`);
+    // Same folder, no shared file yet (twin of mcp-presence findNearbyWork, no
+    // git): with 3+ scoped sessions, a folder most of them touch is noise.
+    const dirOf = (k) => { const at = k.lastIndexOf('/'); return at > 0 ? k.slice(0, at) : ''; };
+    const dirsOfScope = (s) => new Set(scopeOf(s).map(fileKey).map(dirOf).filter(Boolean));
+    const myDirs = dirsOfScope(me);
+    const scopedRows = [me, ...peers].filter(s => s && scopeOf(s).length);
+    const dirCount = new Map();
+    for (const s of scopedRows) for (const d of dirsOfScope(s)) dirCount.set(d, (dirCount.get(d) || 0) + 1);
+    const dirIsNoise = (d) => { const n = dirCount.get(d) || 0; return n >= 3 && n > scopedRows.length / 2; };
     for (const p of peers.slice(0, 4)) {
         const bits = [];
         if (p.branch) bits.push(`branch \`${p.branch}\``);
@@ -1496,10 +1512,12 @@ function peerFooter(sid) {
             warn = `  · ⚠️ both edited: ${marked.join(', ')} — expect a conflict, KEEP BOTH${legend}`;
         }
         // State the fact, never the git operation. This runs in a latency-sensitive
-        // hook and must not spawn git, so it cannot know whether the branch is merely
-        // behind or has DIVERGED — and on a diverged branch "pull/rebase" is advice
-        // the real state contradicts. Naming the collision is what this footer is for.
-        else if (p.branch && myBranch && p.branch === myBranch) warn = '  · ⚠️ same branch — your commits will interleave; coordinate before you commit';
+        // hook and must not spawn git. The same-branch fact is stated once above
+        // the list; per peer, only a shared folder is added (advisory).
+        else {
+            const near = [...dirsOfScope(p)].filter(d => myDirs.has(d) && !dirIsNoise(d)).sort().slice(0, 2);
+            if (near.length) warn = `  · 📁 same folder: ${near.map(d => `${d}/`).join(', ')} — no shared file yet`;
+        }
         // Unique over the full live list (not just shown peers) — the MSG router
         // resolves a prefix against every row, so uniqueness must match that set.
         lines.push(`- session ${shortestUniquePeerPrefix(list, p.id)} · ${bits.join(' · ')}${warn}`);

@@ -50,6 +50,9 @@ const run = (variant = '') => new Promise((resolve, reject) => {
       KLYPIX_CACHE_TEST_BRAIN: brain,
       KLYPIX_CACHE_TEST_VARIANT: variant,
       KLYPIX_SEMANTIC_MEMORY_MODE: 'bounded',
+      // This test counts embed CALLS for two cards; pin a batch that holds both
+      // (1.97 embeds one card per call by default).
+      KLYPIX_EMBED_BATCH_SIZE: '16',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,

@@ -56,7 +56,7 @@ import {
   dot, embedTexts, getEmbedder, getEmbedderForUse, withRerankerForUse,
   rerankHits, semanticFallbackNotice, semanticMemorySnapshot,
   semanticRuntimeInstalled, shouldPrewarmSemantic, vectorsForBrain,
-  cachedVectorsForBrain,
+  cachedVectorsForBrain, startBrainPreparation, preparationNotice,
 } from './semantic-memory.mjs';
 
 // The MCP and A2A faces prewarm through this protocol-neutral module. Bounded
@@ -509,7 +509,7 @@ export async function opSearchAllBrains({ vault, query, as_of, log = () => {} })
     let struct;
     try { ({ struct } = await parseKlypix(fs.readFileSync(b.path))); } catch { continue; }
     let vecs = null;
-    if (qv) { try { vecs = await vectorsForBrain(pipe, b.path, struct.cards); } catch { /* lexical for this brain */ } }
+    if (qv) { try { const r = await questionVectors(pipe, b.path, struct.cards); vecs = r.usable ? r.vecs : null; } catch { /* lexical for this brain */ } }
     // Replacement per stale card (1.97.0), only when this brain HAS lifecycle
     // edges; skipped under as_of (a correction is a present-day fact).
     let successors = new Map();
@@ -777,6 +777,21 @@ export async function opBrainTaskContext({
   };
 }
 
+// Card meanings for a question, never waiting on a preparation (1.97.0): at
+// most a few seconds of embedding inline; whatever is still missing is handed
+// to the background preparation (startBrainPreparation) and the answer says
+// so (preparationNotice). Meaning ranking is used once at least
+// MEANING_READY_SHARE of the cards are ready — below that the keyword path
+// covers every card, which a mostly-unprepared meaning ranking would not.
+const MEANING_READY_SHARE = 0.5;
+async function questionVectors(pipe, file, cards) {
+  const stats = {};
+  const vecs = await vectorsForBrain(pipe, file, cards, { stats });
+  if (stats.pending > 0) startBrainPreparation(file);
+  const usable = Boolean(vecs && vecs.size) && (!stats.wanted || stats.ready / stats.wanted >= MEANING_READY_SHARE);
+  return { vecs, stats, usable };
+}
+
 export async function opBrainAsk({ vault, canvas, question, as_of, k = 10, log = () => {} }) {
   // A last line `Also: <words>` is the caller's guess at the card's wording; it
   // joins the meaning query only (splitAskWords in klypix-format.mjs).
@@ -793,13 +808,14 @@ export async function opBrainAsk({ vault, canvas, question, as_of, k = 10, log =
   // Semantic blend (best-effort, time-bounded): embed the question + the brain's
   // cards on-device, hand rankForQuestion a Map<cardId, cosine>. A missing/warming
   // model degrades cleanly to pure lexical.
-  let semantic = null, mode = 'lexical', cardVecs = null;
+  let semantic = null, mode = 'lexical', cardVecs = null, prep = null;
   try {
     const pipe = await getEmbedderForUse(log, 20_000);
     if (pipe) {
       const [qv] = await embedTexts(pipe, [words ? `${q}\n${words}` : q], { kind: 'query' });
-      const vecs = await vectorsForBrain(pipe, t.file, struct.cards);
-      if (qv && vecs && vecs.size) { semantic = new Map(); for (const [id, v] of vecs) semantic.set(id, dot(qv, v)); cardVecs = vecs; mode = `semantic+lexical (on-device)${words ? ' + your Also words' : ''}`; }
+      const { vecs, stats, usable } = await questionVectors(pipe, t.file, struct.cards);
+      prep = stats;
+      if (qv && usable) { semantic = new Map(); for (const [id, v] of vecs) semantic.set(id, dot(qv, v)); cardVecs = vecs; mode = `semantic+lexical (on-device)${words ? ' + your Also words' : ''}`; }
     }
   } catch { semantic = null; cardVecs = null; }
   // Parity with search_all_brains (8445e9c): never say "warming — retry" to a
@@ -813,6 +829,7 @@ export async function opBrainAsk({ vault, canvas, question, as_of, k = 10, log =
   if (!semantic) {
     fallbackNotice = semanticFallbackNotice(false);
     if (fallbackNotice) mode = fallbackNotice.startsWith('LEXICAL ONLY') ? 'lexical-only (no semantic runtime)' : 'lexical (semantic warming)';
+    if (prep?.pending > 0) mode = 'lexical (preparing search by meaning)';
     if (words) mode += ' + your Also words';
   }
   const kk = Math.max(1, Math.min(20, k || 10));
@@ -861,7 +878,11 @@ export async function opBrainAsk({ vault, canvas, question, as_of, k = 10, log =
       mode += ' + status-mode';
     } catch { statusMd = ''; }
   }
-  const noticeMd = fallbackNotice ? `> ${fallbackNotice}\n\n` : '';
+  // While the brain is still being prepared, that is the one thing to say: the
+  // runtime IS installed, so the "warming — retry" fallback line would only
+  // repeat it less precisely.
+  const prepNotice = preparationNotice(t.file, prep, { usedMeaning: Boolean(semantic) });
+  const noticeMd = prepNotice ? `> ${prepNotice}\n\n` : (fallbackNotice ? `> ${fallbackNotice}\n\n` : '');
   const evidenceCache = new Map();
   const evidenceForCard = (card) => formatCardEvidence(inspectCardEvidence(card, { projectRoot: path.dirname(t.file), cache: evidenceCache }));
   return { blocks: [text(stamp + noticeMd + statusMd + questionContextToMarkdown(q, result, { mode, as_of: timeTravel ? as_of : null, evidenceForCard }))] };
@@ -886,8 +907,8 @@ export async function opBrainChallenge({ vault, canvas, claim, k = 8, via, log =
     const pipe = await getEmbedderForUse(log, 20_000);
     if (pipe) {
       const [qv] = await embedTexts(pipe, [q], { kind: 'query' });
-      const vecs = await vectorsForBrain(pipe, t.file, struct.cards);
-      if (qv && vecs && vecs.size) { semantic = new Map(); for (const [id, v] of vecs) semantic.set(id, dot(qv, v)); mode = 'semantic+lexical (on-device)'; }
+      const { vecs, usable } = await questionVectors(pipe, t.file, struct.cards);
+      if (qv && usable) { semantic = new Map(); for (const [id, v] of vecs) semantic.set(id, dot(qv, v)); mode = 'semantic+lexical (on-device)'; }
     }
   } catch { semantic = null; }
   const result = challengeBrain(struct, q, { semantic, k: Math.max(1, Math.min(20, k || 8)) });
@@ -1175,7 +1196,11 @@ export async function opBrainReconcile({ vault, canvas, root, mode = 'all', ref 
         if (mode === 'plans' && cold && installed) {
           try {
             const pipe = await getEmbedderForUse(log, 20_000);
-            if (pipe) vecs = await vectorsForBrain(pipe, file, struct.cards);
+            if (pipe) {
+              const stats = {};
+              vecs = await vectorsForBrain(pipe, file, struct.cards, { stats });
+              if (stats.pending > 0) startBrainPreparation(file);
+            }
           } catch (e) { embedErr = e; }
         }
         let pairSim = null, how;
@@ -1711,7 +1736,9 @@ export async function opBrainConnect({ vault, canvas, apply = false, max = 24, t
   try { pipe = await getEmbedderForUse(log, 20_000); } catch { /* saturated/unavailable → structural */ }
   if (pipe) {
     try {
-      const vecs = await vectorsForBrain(pipe, file, struct.cards);
+      const stats = {};
+      const vecs = await vectorsForBrain(pipe, file, struct.cards, { stats });
+      if (stats.pending > 0) startBrainPreparation(file);
       const items = live.filter(c => vecs.get(c.id));
       const sources = normalizedScope === 'orphans' ? items.filter(c => orphanIds.has(c.id)) : items;
       for (const a of sources) {

@@ -12,6 +12,10 @@
 //   npx klypix-mcp install --codex-hooks  # optional prompt/file awareness; Codex asks for trust
 //   npx klypix-mcp install --allow-untagged  # acknowledge deploying an UNTAGGED source checkout
 //                                            # (dev deploy; also KLYPIX_MCP_ALLOW_UNTAGGED=1)
+//   npx klypix-mcp install --semantic     # also install search by meaning (~150 MB download, once)
+//   npx klypix-mcp install --no-semantic  # never (also KLYPIX_SEMANTIC=0)
+//   A person running install in a terminal gets search by meaning by default;
+//   scripted, CI and agent-run installs (no terminal) only with --semantic.
 //
 // Never-throws-silently: it's an explicit CLI, so it reports what it did and exits
 // non-zero on a real failure. Never wires a broken settings.json (refuse + restore).
@@ -35,6 +39,7 @@ import { brainInstallDecision, deploySourceDecision } from '../src/install-versi
 import { acquireInstallLockSync, releaseInstallLockSync } from '../src/install-lock.mjs';
 import { collectRepoState } from '../src/repo-state.mjs';
 import { runSetup, renderBrief } from '../src/setup.mjs';
+import { SEMANTIC_RUNTIME_MANIFEST, dirBytes, pruneSemanticRuntime, semanticInstallDecision } from '../src/semantic-install.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PKG_ROOT = path.resolve(__dirname, '..');
@@ -60,6 +65,10 @@ const SETUP_JSON = process.argv.includes('--json');
 // this is source authority (knowingly deploy an untagged working tree).
 const ALLOW_UNTAGGED = process.argv.includes('--allow-untagged')
     || process.env.KLYPIX_MCP_ALLOW_UNTAGGED === '1';
+// Search by meaning (1.97.0). Measured 2026-10-11 on the real 102-question
+// set: the right card in the top 5 for 54 questions with it, 19 without.
+const SEMANTIC_FLAG = process.argv.includes('--semantic');
+const NO_SEMANTIC = process.argv.includes('--no-semantic') || process.env.KLYPIX_SEMANTIC === '0';
 
 const HOME = os.homedir();
 const CLAUDE_DIR = path.join(HOME, '.claude');
@@ -141,6 +150,52 @@ function wireCodex() {
         presence,
         ok: mcp.ok && globalMcp.ok && instructions.ok && presence.ok,
     };
+}
+
+// ── Search by meaning: the optional on-device runtime (src/semantic-install.mjs) ──
+function installSemanticRuntimeIfWanted() {
+    const semanticDir = path.join(BRAIN_DIR, 'semantic');
+    const transformers = path.join(semanticDir, 'node_modules', '@huggingface', 'transformers');
+    const decision = semanticInstallDecision({
+        optOut: NO_SEMANTIC,
+        flag: SEMANTIC_FLAG,
+        runtimeOnly: RUNTIME_ONLY,
+        plugin: String(process.env.KLYPIX_PLUGIN ?? '').trim() === '1',
+        present: exists(transformers),
+        ci: Boolean(process.env.CI),
+        tty: Boolean(process.stdout.isTTY),
+    });
+    if (decision !== 'install') return { decision };
+    console.log('• Installing search by meaning (about 150 MB to download, once; skip with --no-semantic)…');
+    const started = Date.now();
+    try {
+        fs.mkdirSync(semanticDir, { recursive: true });
+        fs.writeFileSync(path.join(semanticDir, 'package.json'), `${JSON.stringify(SEMANTIC_RUNTIME_MANIFEST, null, 2)}\n`);
+        const npmArgs = ['install', '--prefix', semanticDir, '--omit=dev', '--no-audit', '--no-fund', '--loglevel=error'];
+        if (process.platform === 'win32') execFileSync('cmd.exe', ['/d', '/s', '/c', 'npm.cmd', ...npmArgs], { stdio: ['ignore', 'ignore', 'pipe'], timeout: 600_000, windowsHide: true });
+        else execFileSync('npm', npmArgs, { stdio: ['ignore', 'ignore', 'pipe'], timeout: 600_000 });
+        if (!exists(transformers)) throw new Error('npm finished but the runtime is missing');
+        let freed = 0;
+        try { freed = pruneSemanticRuntime(semanticDir); } catch { /* pruning is an optimisation */ }
+        return { decision, ok: true, seconds: Math.round((Date.now() - started) / 1000), sizeMb: Math.round(dirBytes(path.join(semanticDir, 'node_modules')) / 1048576), freedMb: Math.round(freed / 1048576) };
+    } catch (error) {
+        const why = String(error?.stderr || error?.message || error).split('\n').map(s => s.trim()).filter(Boolean).slice(-1)[0] || 'npm failed';
+        return { decision, ok: false, error: why.slice(0, 200) };
+    }
+}
+
+function reportSemantic(step) {
+    const turnOn = 'npx klypix-mcp install --semantic';
+    if (!step) return;
+    if (step.decision === 'install' && step.ok) {
+        console.log(`✓ search by meaning installed in ${step.seconds}s (${step.sizeMb} MB on disk). Your project brains are being prepared in the background, newest cards first: questions work right away and get better as it finishes.`);
+    } else if (step.decision === 'install') {
+        console.error(`⚠ search by meaning could not be installed (${step.error}). Keyword search still works. Try again with: ${turnOn}`);
+    } else if (step.decision === 'present') {
+        console.log('✓ search by meaning: on');
+    } else if (step.decision === 'skip-noninteractive' || step.decision === 'skip-ci') {
+        console.log(`• search by meaning is off. Turn it on with: ${turnOn}  (about 150 MB, once; agents then find the right card about 3x as often)`);
+    }
 }
 
 function reportCodex(result) {
@@ -594,6 +649,9 @@ try {
     const notWired = ['SessionStart', 'UserPromptSubmit', 'Stop', 'PostToolUse', 'PreToolUse'].filter(e => !wiredFor(e));
 
     releaseInstallLockSync(installLock);
+    // Search by meaning: installed AFTER the brain itself is committed, so a
+    // slow or failed download never touches a working keyword-only install.
+    const semanticStep = installSemanticRuntimeIfWanted();
     // Users who already enabled the optional local semantic runtime should not
     // pay a multi-minute first question after a model/cache contract upgrade.
     // Migrate registered brains once in a detached process after the atomic
@@ -617,6 +675,7 @@ try {
     }
     if (!RUNTIME_ONLY) reportCodex(codex);
     console.log(`✓ installed klypix brain v${VERSION} → ${BRAIN_DIR}  (${n} scripts, ${deps} dep packages)`);
+    reportSemantic(semanticStep);
     if (RUNTIME_ONLY) console.log('✓ runtime-only update: host settings and project files were preserved');
     else if (!notWired.length) console.log('✓ wired 5 hooks: SessionStart · UserPromptSubmit (--prompt) · Stop (--capture) · PostToolUse (--live) · PreToolUse (--guard) → settings.json');
     else console.error(`⚠ readiness: ${notWired.length} hook(s) did NOT take (${notWired.join(', ')}) — the brain will read but not capture/sync. Re-run \`npx klypix-mcp install --force\` or check ${SETTINGS}.`);

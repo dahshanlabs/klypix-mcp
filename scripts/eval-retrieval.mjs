@@ -85,7 +85,7 @@ async function main() {
       configuration.embedding = { model: runtime.EMBEDDING_MODEL_ID, pooling: runtime.EMBEDDING_POOLING, queryPrefix: runtime.EMBEDDING_QUERY_PREFIX, cacheKey: runtime.EMBEDDING_CACHE_KEY };
       pipe = await runtime.getEmbedderForUse((...items) => console.error(...items), 20_000);
       if (!pipe) throw new Error('Production semantic runtime unavailable; refusing to label a lexical fallback as a semantic result.');
-      vectors = await runtime.vectorsForBrain(pipe, args.brain, struct.cards);
+      vectors = await runtime.vectorsForBrain(pipe, args.brain, struct.cards, { maxEmbed: Infinity });
       if (!vectors?.size) throw new Error('Production card vectors unavailable.');
     }
     const pairSim = vectors ? (a, b) => vectors.has(a) && vectors.has(b) ? runtime.dot(vectors.get(a), vectors.get(b)) : null : null;

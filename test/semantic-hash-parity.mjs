@@ -218,6 +218,9 @@ function scenario(name, mode = 'bounded') {
         KLYPIX_HASH_PARITY_CHILD: '1',
         KLYPIX_HASH_PARITY_PLAN: planFile,
         KLYPIX_SEMANTIC_MEMORY_MODE: mode,
+        // These scenarios count embed CALLS for a handful of cards; pin a batch
+        // that holds them all (1.97 embeds one card per call by default).
+        KLYPIX_EMBED_BATCH_SIZE: '16',
       },
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,

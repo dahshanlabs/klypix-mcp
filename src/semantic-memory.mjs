@@ -10,6 +10,8 @@ import path from 'path';
 import crypto from 'crypto';
 import { enrichmentTextFor, readEnrichment } from './enrichment.mjs';
 import { createRequire } from 'module';
+import { spawn } from 'child_process';
+import { fileURLToPath } from 'url';
 import * as autoUpdateLib from './mcp-auto-update.mjs';
 
 // Plugin mode (KLYPIX_PLUGIN=1) never loads the on-device semantic runtime:
@@ -42,7 +44,13 @@ const intEnv = (name, fallback, min, max) => {
   const n = Number(process.env[name]);
   return Number.isFinite(n) ? Math.max(min, Math.min(max, Math.trunc(n))) : fallback;
 };
-const EMBED_BATCH_SIZE = intEnv('KLYPIX_EMBED_BATCH_SIZE', 16, 1, 64);
+// One card per inference call. A batch pads every card to its longest member
+// (cards run up to 1,500 characters), so batching wastes work on a brain's
+// mixed lengths. Measured 2026-10-11, real bge-small q8, 400 real cards on a
+// laptop CPU: batch 16 = 96 ms a card, 1,176 MB peak; 8 = 79 ms, 720 MB;
+// 4 = 63–70 ms, ~505 MB; 1 = 41–49 ms, ~305 MB. The fastest is also the lightest.
+export const EMBED_BATCH_DEFAULT = 1;
+const EMBED_BATCH_SIZE = intEnv('KLYPIX_EMBED_BATCH_SIZE', EMBED_BATCH_DEFAULT, 1, 64);
 const RERANK_BATCH_SIZE = intEnv('KLYPIX_RERANK_BATCH_SIZE', 4, 1, 32);
 const MAX_INFERENCE_QUEUE = intEnv('KLYPIX_SEMANTIC_MAX_QUEUE', 16, 1, 256);
 const idleRaw = process.env.KLYPIX_SEMANTIC_IDLE_MS;
@@ -351,13 +359,12 @@ export function semanticFallbackNotice(hadSemantic) {
   if (semanticRuntimeInstalled()) {
     return 'lexical only — the on-device semantic model is still warming or the queue is saturated; retry shortly for semantic ranking';
   }
-  // Deliberately names no install command: there is no `--semantic` flag, and
-  // bin/klypix-install.mjs skips @huggingface/transformers on purpose ("optional,
-  // huge"). Inventing a command here would ship a wrong instruction to every
-  // MCP host. State the fact and the location; let the caller decide.
-  return 'LEXICAL ONLY — @huggingface/transformers is not present, so these are keyword matches with no semantic ranking. '
-    + 'Measured on a real 2,377-card brain: recall@5 0% lexical vs ~30% with the runtime. Retrying will not help. '
-    + `Semantic ranking activates once the runtime resolves, or is placed at ${path.join(PB_DIR, 'semantic', 'node_modules', '@huggingface', 'transformers')}.`;
+  // Since 1.97.0 there IS an install command (bin/klypix-install.mjs --semantic,
+  // which a person at a terminal gets by default), so the notice names it: an
+  // agent reading this can offer it to the person instead of guessing.
+  return 'LEXICAL ONLY — search by meaning is not installed, so these are keyword matches. '
+    + 'Measured on a real 3,829-card brain: the right card in the top 5 for 19 of 102 questions with keywords, 54 with search by meaning. Retrying will not help. '
+    + 'Turn it on with: npx klypix-mcp install --semantic (about 150 MB to download, once).';
 }
 
 export function getEmbedder(log = () => {}) {
@@ -500,11 +507,11 @@ function cacheCandidates(brainPath) {
 
 const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-async function withCrossProcessCacheLock(brainPath, fn) {
+async function withCrossProcessCacheLock(brainPath, fn, timeoutMs = CACHE_LOCK_TIMEOUT_MS) {
   const file = cacheCandidates(brainPath)[0].file;
   const lockFile = `${file}.lock`;
   fs.mkdirSync(EMB_DIR, { recursive: true });
-  const deadline = Date.now() + CACHE_LOCK_TIMEOUT_MS;
+  const deadline = Date.now() + timeoutMs;
   let handle = null;
   let waited = false;
   while (!handle) {
@@ -527,7 +534,10 @@ async function withCrossProcessCacheLock(brainPath, fn) {
       await wait(75);
     }
   }
-  try { return await fn(); }
+  // A long holder (the background preparation) refreshes the lock so it is
+  // never mistaken for an abandoned one at CACHE_LOCK_STALE_MS.
+  const touch = () => { try { const now = new Date(); fs.utimesSync(lockFile, now, now); } catch { /* best-effort */ } };
+  try { return await fn(touch); }
   finally {
     try { fs.closeSync(handle); } catch { /* */ }
     try { fs.unlinkSync(lockFile); } catch { /* stale cleanup handles leftovers */ }
@@ -658,7 +668,23 @@ function readCache(brainPath, accept) {
   };
 }
 
-async function vectorsForBrainUnlocked(pipe, brainPath, cards) {
+// PREPARING A BRAIN NEVER HOLDS A QUESTION (1.97.0). Embedding every card of a
+// fresh brain takes ~110 ms a card on a laptop CPU (measured 2026-10-11: 100
+// cards 11 s, 3,670 cards 6.8 min), and the old writer did it inside the first
+// question and saved nothing until the end — the agent's call waited minutes
+// and an interrupted run lost everything. Now an interactive caller embeds at
+// most INTERACTIVE_EMBED_BUDGET missing cards (a few seconds) and gets back
+// what is ready; the rest is prepared by the detached, low-priority warm
+// process (bin/klypix-semantic-warm.mjs, maxEmbed: Infinity), which saves as
+// it goes so progress survives an interruption and readers see it.
+export const INTERACTIVE_EMBED_BUDGET = 32;
+const INTERACTIVE_LOCK_WAIT_MS = 3_000;
+const PERSIST_EVERY_MS = 15_000;
+const EMBED_CHUNK = 64;
+
+async function vectorsForBrainUnlocked(pipe, brainPath, cards, opts = {}) {
+  const maxEmbed = Number.isFinite(opts.maxEmbed) ? Math.max(0, opts.maxEmbed) : (opts.maxEmbed === Infinity ? Infinity : INTERACTIVE_EMBED_BUDGET);
+  const stats = opts.stats && typeof opts.stats === 'object' ? opts.stats : {};
   const want = cards.filter((card) => card.type !== 'container' && (card.text || '').trim());
   // Question enrichment (1.77): the prompt/intent that produced a card is
   // appended to its EMBED input — the asker's own vocabulary bridging the
@@ -692,26 +718,51 @@ ${extra}` : base;
     if (entry.t !== textHashes.get(card.id)) { entry.t = textHashes.get(card.id); repaired++; }
   }
   if (repaired) dirty = true;
-  const missing = want.filter((card) => cache.cards[card.id]?.h !== desiredHashes.get(card.id));
-  if (missing.length) {
-    let vectors;
-    try { vectors = await embedTexts(pipe, missing.map((card) => embedInputFor(card))); }
-    catch (error) {
-      // The repair above needs no model, so it lands even when the embed does
-      // not. Everything the merge refused goes back beside it: those vectors
-      // are still on disk and a reader may still accept them through `t`.
-      // The persisted file is a superset snapshot: it can contain refused
-      // entries and entries for deleted cards. Readers reject them through
-      // the acceptance rule, and the next write that is dirty for another
-      // reason trims them.
-      if (repaired) await persistCache(file, { ...cache, cards: { ...loaded.held, ...cache.cards } });
-      throw error;
+  // Newest first: the cards people ask about most are ready soonest.
+  const missing = want
+    .filter((card) => cache.cards[card.id]?.h !== desiredHashes.get(card.id))
+    .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  const toEmbed = maxEmbed === Infinity ? missing : missing.slice(0, maxEmbed);
+  stats.wanted = want.length;
+  stats.embedded = 0;
+  stats.pending = missing.length - toEmbed.length;
+  if (toEmbed.length) {
+    let lastPersist = Date.now();
+    for (let offset = 0; offset < toEmbed.length; offset += EMBED_CHUNK) {
+      const chunk = toEmbed.slice(offset, offset + EMBED_CHUNK);
+      let vectors;
+      try { vectors = await embedTexts(pipe, chunk.map((card) => embedInputFor(card))); }
+      catch (error) {
+        // The repair above needs no model, so it lands even when the embed does
+        // not, and so do the chunks already embedded. Everything the merge
+        // refused goes back beside them: those vectors are still on disk and a
+        // reader may still accept them through `t`. The persisted file is a
+        // superset snapshot: it can contain refused entries and entries for
+        // deleted cards. Readers reject them through the acceptance rule, and
+        // the next write that is dirty for another reason trims them.
+        if (repaired || stats.embedded) await persistCache(file, { ...cache, cards: { ...loaded.held, ...cache.cards } });
+        stats.pending = missing.length - stats.embedded;
+        throw error;
+      }
+      chunk.forEach((card, index) => {
+        cache.cards[card.id] = { h: desiredHashes.get(card.id), t: textHashes.get(card.id), v: vectors[index] };
+      });
+      stats.embedded += chunk.length;
+      dirty = true;
+      if (typeof opts.touch === 'function') opts.touch();
+      const more = offset + EMBED_CHUNK < toEmbed.length;
+      // Save as it goes, so a long preparation survives an interruption and
+      // readers (cachedVectorsForBrain) see the progress.
+      if (more && Date.now() - lastPersist >= PERSIST_EVERY_MS) {
+        await persistCache(file, { ...cache, cards: { ...loaded.held, ...cache.cards } });
+        lastPersist = Date.now();
+      }
+      if (typeof opts.onProgress === 'function') {
+        try { opts.onProgress({ done: want.length - (missing.length - stats.embedded), total: want.length }); } catch { /* progress is advisory */ }
+      }
     }
-    missing.forEach((card, index) => {
-      cache.cards[card.id] = { h: desiredHashes.get(card.id), t: textHashes.get(card.id), v: vectors[index] };
-    });
-    dirty = true;
   }
+  stats.ready = want.length - stats.pending;
   const live = new Set(want.map((card) => card.id));
   for (const id of Object.keys(cache.cards)) {
     if (!live.has(id)) { delete cache.cards[id]; dirty = true; }
@@ -723,6 +774,72 @@ ${extra}` : base;
     if (entry?.v) map.set(card.id, entry.v);
   }
   return map;
+}
+
+// ── Background preparation: start it, read how far it got ────────────────────
+// startBrainPreparation spawns the detached, low-priority warm process for ONE
+// brain (--only: a question never makes this machine prepare every registered
+// project). At most once a minute per brain from this process; the warm
+// process's own lock makes a second start a no-op. The warm writes its
+// progress to WARM_STATUS_FILE while it runs; brainPreparationStatus reads it
+// so an answer can say how far along the preparation is.
+const WARM_STATUS_FILE = path.join(PB_DIR, '.semantic-update-warm.json');
+const WARM_STALE_MS = 2 * 60_000;
+const lastPreparationStart = new Map();
+
+export function startBrainPreparation(brainPath, { spawnFn = spawn, now = Date.now() } = {}) {
+  if (semanticDisabledByPlugin()) return false;
+  const key = canonicalBrainKey(brainPath);
+  if (now - (lastPreparationStart.get(key) || 0) < 60_000) return false;
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const script = [path.join(here, 'klypix-semantic-warm.mjs'), path.join(here, '..', 'bin', 'klypix-semantic-warm.mjs')]
+    .find((file) => fs.existsSync(file));
+  if (!script) return false;
+  lastPreparationStart.set(key, now);
+  try {
+    const child = spawnFn(process.execPath, [script, '--brain-dir', PB_DIR, '--brain', path.resolve(brainPath), '--only'], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+      env: { ...process.env },
+    });
+    child.unref?.();
+    return true;
+  } catch { return false; }
+}
+
+export function brainPreparationStatus(brainPath, { now = Date.now(), statusFile = WARM_STATUS_FILE } = {}) {
+  try {
+    const status = JSON.parse(fs.readFileSync(statusFile, 'utf8'));
+    if (status?.result !== 'preparing' || typeof status.brain !== 'string') return null;
+    if (canonicalBrainKey(status.brain) !== canonicalBrainKey(brainPath)) return null;
+    const updated = Date.parse(status.updatedAt || '');
+    if (!Number.isFinite(updated) || now - updated > WARM_STALE_MS) return null; // the run died
+    const done = Number(status.done) || 0, total = Number(status.total) || 0;
+    const started = Date.parse(status.startedAt || '');
+    const ratePerMs = done > 0 && Number.isFinite(started) && updated > started ? done / (updated - started) : null;
+    return { done, total, remainingMs: ratePerMs && total > done ? Math.round((total - done) / ratePerMs) : null };
+  } catch { return null; }
+}
+
+// One sentence an answer carries while a brain is being prepared. `stats`
+// comes from vectorsForBrain; the live progress, when the warm reports it,
+// is fresher.
+export function preparationNotice(brainPath, stats, { usedMeaning = false, now = Date.now() } = {}) {
+  if (!stats || !(stats.pending > 0)) return null;
+  const live = brainPreparationStatus(brainPath, { now });
+  const total = live?.total || stats.wanted || 0;
+  const done = live ? live.done : (stats.ready || 0);
+  const minutes = live?.remainingMs != null
+    ? Math.max(1, Math.round(live.remainingMs / 60_000))
+    // ~45 ms a card measured one at a time; ~0.1 s leaves room for a busy
+    // machine and the low-priority run until the live rate is known.
+    : Math.max(1, Math.round(((total - done) * 0.1) / 60));
+  const n = (x) => Number(x).toLocaleString('en-US');
+  return `Getting this brain ready for search by meaning: ${n(done)} of ${n(total)} cards so far, about ${minutes} min left. `
+    + (usedMeaning
+      ? 'This answer used the cards that are ready plus keywords; it gets better as the rest finish.'
+      : 'This answer used keyword search; ask again when it is done for better matches.');
 }
 
 // READ-ONLY card vectors from the warm cache: never loads the model, never
@@ -771,16 +888,32 @@ export function cachedVectorsForBrain(brainPath, cards) {
   return map;
 }
 
-export async function vectorsForBrain(pipe, brainPath, cards) {
-  if (!BOUNDED) return vectorsForBrainUnlocked(pipe, brainPath, cards);
+// opts.maxEmbed: how many missing cards this call may embed — the interactive
+// default is INTERACTIVE_EMBED_BUDGET; the background warm passes Infinity.
+// opts.stats receives { wanted, ready, embedded, pending }; opts.onProgress
+// gets { done, total } after each saved chunk.
+export async function vectorsForBrain(pipe, brainPath, cards, opts = {}) {
+  if (!BOUNDED) return vectorsForBrainUnlocked(pipe, brainPath, cards, opts);
   const key = canonicalBrainKey(brainPath);
   const previous = vectorBuildTails.get(key) || Promise.resolve();
+  // A question never waits behind a preparation: it gets INTERACTIVE_LOCK_WAIT_MS,
+  // then reads what the preparation has saved so far (below).
+  const interactive = opts.maxEmbed !== Infinity;
   const run = previous.catch(() => {}).then(() => withCrossProcessCacheLock(
     brainPath,
-    () => vectorsForBrainUnlocked(pipe, brainPath, cards),
+    (touch) => vectorsForBrainUnlocked(pipe, brainPath, cards, { ...opts, touch }),
+    interactive ? INTERACTIVE_LOCK_WAIT_MS : CACHE_LOCK_TIMEOUT_MS,
   ));
   vectorBuildTails.set(key, run);
   try { return await run; }
+  catch (error) {
+    if (!interactive || error?.code !== 'KLYPIX_SEMANTIC_CACHE_BUSY') throw error;
+    // The background preparation holds the lock: answer from what it has saved.
+    const map = cachedVectorsForBrain(brainPath, cards);
+    const wanted = cards.filter((card) => card && card.type !== 'container' && typeof card.text === 'string' && card.text.trim()).length;
+    if (opts.stats && typeof opts.stats === 'object') Object.assign(opts.stats, { wanted, ready: map.size, embedded: 0, pending: Math.max(0, wanted - map.size), busy: true });
+    return map;
+  }
   finally { if (vectorBuildTails.get(key) === run) vectorBuildTails.delete(key); }
 }
 

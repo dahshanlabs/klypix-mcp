@@ -235,13 +235,23 @@ not a filing convention.
   session's brief. That is brief priority, not a retrieval-ranking boost.
 - **You can ask what the project believed then.** `brain_ask` with `as_of: 2026-03-01` reweights
   ranking by card lifecycle dates, so corrections made later do not leak backwards.
-- **Retrieval is local.** Lexical by default. If the optional on-device model is installed,
-  `brain_ask` and `search_all_brains` use BGE semantic ranking with lexical help for exact
-  identifiers, paths, and versions — still entirely on your machine. The previous cross-encoder
-  is available for experiments with `KLYPIX_RERANK=1`, but is off by default because it reduced
-  precision and added latency on the frozen human-paraphrase evaluation. Without the embedding
-  model, retrieval degrades cleanly to lexical. `npx klypix-mcp install` deliberately does not
-  install that model, so a fresh install is lexical.
+- **Retrieval is local.** With the on-device model ("search by meaning"), `brain_ask` and
+  `search_all_brains` use BGE semantic ranking with lexical help for exact identifiers, paths, and
+  versions — still entirely on your machine. Without it, retrieval is keyword-only. The previous
+  cross-encoder is available for experiments with `KLYPIX_RERANK=1`, but is off by default because
+  it reduced precision and added latency on the frozen human-paraphrase evaluation.
+- **Search by meaning is installed for you (1.97).** `npx klypix-mcp install` run by a person in a
+  terminal installs it: about 150 MB to download once, about 110 MB on disk after the files Node
+  never loads are removed. Skip it with `--no-semantic` (or `KLYPIX_SEMANTIC=0`). Installs with no
+  terminal — CI, scripts, an AI agent running the install — get it only with `--semantic`. The
+  Claude plugin never downloads it. Measured on the frozen 102-question set: the right card in the
+  top 5 for 54 questions with it, 19 without.
+- **Preparing a brain never makes a question wait.** Each card is turned into a meaning vector once
+  (about 45 ms a card on a laptop CPU, one card at a time, ~305 MB peak), newest cards first, by a
+  low-priority background job that saves as it goes. A question on a brain that is not ready yet
+  answers right away from what is ready plus keywords, and says how far along the preparation is
+  ("Getting this brain ready for search by meaning: 900 of 3,670 cards so far, about 5 min left").
+  After that, only new or edited cards are prepared.
 
 ### Bounded semantic-memory runtime
 

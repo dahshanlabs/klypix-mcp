@@ -125,10 +125,15 @@ const bump = (bag, key) => { bag[key] = (bag[key] || 0) + 1; return bag; };
  */
 export function parseClaudeResult(stdout) {
   let out = null;
+  let channelUp = null;
   const mcpCalls = {};
   for (const line of String(stdout).split('\n')) {
     let ev; try { ev = JSON.parse(line); } catch { continue; }
     if (ev?.type === 'result') out = ev;
+    // The init event says whether each condition server actually came up.
+    if (ev?.type === 'system' && ev.subtype === 'init' && Array.isArray(ev.mcp_servers) && ev.mcp_servers.length) {
+      channelUp = ev.mcp_servers.every((s) => s?.status === 'connected');
+    }
     if (ev?.type === 'assistant') {
       for (const block of ev.message?.content || []) {
         if (block?.type === 'tool_use' && /^mcp__/.test(String(block.name || ''))) bump(mcpCalls, String(block.name).replace(/^mcp__[^_]+(?:-[^_]+)*__/, ''));
@@ -145,8 +150,14 @@ export function parseClaudeResult(stdout) {
     resultError: !out ? 'no result event' : (out.is_error ? String(out.subtype || out.result || 'error').slice(0, 300) : null),
     permissionDenials: Array.isArray(out?.permission_denials) ? out.permission_denials.length : null,
     mcpCalls,
+    channelUp,
   };
 }
+
+// A run whose condition server never came up measured nothing about that
+// channel. It is recorded as INVALID (kept, shown, excluded from rates) — never
+// as the channel failing.
+export const CHANNEL_DOWN = 'mcp-server-not-connected';
 
 export const claude = {
   id: 'claude',
@@ -164,16 +175,19 @@ export const claude = {
       '--permission-mode', 'acceptEdits', '--allowedTools', claudeAllowedTools(mcpServers).join(','),
       ...(model ? ['--model', model] : []),
       ...(maxBudgetUsd ? ['--max-budget-usd', String(maxBudgetUsd)] : [])];
-    const r = await run(resolveCli('claude'), args, { cwd: repo.dir, env: cleanAgentEnv(), timeoutMs, input: prompt });
+    const env = { ...cleanAgentEnv(), MCP_TIMEOUT: String(MCP_STARTUP_TIMEOUT_SEC * 1000) };
+    const r = await run(resolveCli('claude'), args, { cwd: repo.dir, env, timeoutMs, input: prompt });
     try { fs.rmSync(cfg, { force: true }); } catch { /* */ }
     const p = parseClaudeResult(r.stdout);
     return {
-      ok: r.code === 0 && !r.timedOut && !p.resultError,
+      ok: r.code === 0 && !r.timedOut && !p.resultError && p.channelUp !== false,
       costUsd: p.costUsd, tokens: p.tokens, turns: p.turns, model: p.model, permissionDenials: p.permissionDenials, mcpCalls: p.mcpCalls,
+      channelUp: p.channelUp,
       raw: { stdout: r.stdout, stderr: r.stderr },
       durationMs: r.durationMs,
       timedOut: r.timedOut,
-      error: r.code === 0 && !p.resultError ? null : (p.resultError || r.stderr || r.stdout).slice(-600),
+      error: p.channelUp === false ? CHANNEL_DOWN
+        : (r.code === 0 && !p.resultError ? null : (p.resultError || r.stderr || r.stdout).slice(-600)),
     };
   },
 };
@@ -183,10 +197,18 @@ const tomlArray = (a) => `[${a.map(tomlString).join(', ')}]`;
 const tomlInline = (o) => `{ ${Object.entries(o).map(([k, v]) => `${k} = ${tomlString(v)}`).join(', ')} }`;
 
 /** The condition's MCP servers as `codex -c key=value` overrides (values are TOML). */
+// How long an agent waits for a condition's MCP server to start. Codex's
+// default is 10 s; on a loaded machine a cold start (modules read from disk
+// while the antivirus scans them) can take longer, and the agent then works
+// without the channel — a run that measures nothing. KLYPIX's own Codex config
+// uses the same 120 s (src/agent-rules.mjs).
+export const MCP_STARTUP_TIMEOUT_SEC = 120;
+
 export function codexMcpOverrides(mcpServers = {}) {
   return Object.entries(mcpServers).flatMap(([name, s]) => [
     '-c', `mcp_servers.${name}.command=${tomlString(s.command)}`,
     '-c', `mcp_servers.${name}.args=${tomlArray(s.args || [])}`,
+    '-c', `mcp_servers.${name}.startup_timeout_sec=${MCP_STARTUP_TIMEOUT_SEC}`,
     ...(s.env ? ['-c', `mcp_servers.${name}.env=${tomlInline(s.env)}`] : []),
   ]);
 }
@@ -199,6 +221,21 @@ export function codexMcpOverrides(mcpServers = {}) {
  */
 export function codexPlatformOverrides(platform = process.platform) {
   return platform === 'win32' ? ['-c', 'windows.sandbox="elevated"'] : [];
+}
+
+/**
+ * Codex does not report its MCP servers' state. A completed call to one proves
+ * it was up; a start-up failure Codex logged for one proves it was not;
+ * anything else is unknown (null) — never assumed up.
+ */
+export function codexChannelUp(serverNames = [], mcpCalls = {}, stderr = '') {
+  if (!serverNames.length) return null;
+  if (Object.keys(mcpCalls || {}).length) return true;
+  const failed = serverNames.some((name) => {
+    const n = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`${n}[^\\n]*(fail|timed? ?out|error)|(fail|timed? ?out)[^\\n]*${n}`, 'i').test(String(stderr));
+  });
+  return failed ? false : null;
 }
 
 export function parseCodexEvents(stdout) {
@@ -231,15 +268,17 @@ export const codex = {
       '-s', 'workspace-write', '-C', repo.dir, ...(model ? ['-m', model] : []), ...codexPlatformOverrides(), ...codexMcpOverrides(mcpServers), '-'];
     const r = await run(resolveCli('codex'), args, { cwd: repo.dir, env: cleanAgentEnv(), timeoutMs, input: prompt });
     const p = parseCodexEvents(r.stdout);
+    const channelUp = codexChannelUp(Object.keys(mcpServers), p.mcpCalls, r.stderr);
     return {
-      ok: r.code === 0 && !r.timedOut && !p.failure,
+      ok: r.code === 0 && !r.timedOut && !p.failure && channelUp !== false,
       costUsd: null,   // Codex reports tokens, not dollars
       // Codex's event stream does not name the model; the row records the pinned one.
-      tokens: p.tokens, turns: p.turns, model: p.model || model, mcpCalls: p.mcpCalls,
+      tokens: p.tokens, turns: p.turns, model: p.model || model, mcpCalls: p.mcpCalls, channelUp,
       raw: { stdout: r.stdout, stderr: r.stderr },
       durationMs: r.durationMs,
       timedOut: r.timedOut,
-      error: r.code === 0 && !p.failure ? null : (p.failure || r.stderr || r.stdout).slice(-600),
+      error: channelUp === false ? CHANNEL_DOWN
+        : (r.code === 0 && !p.failure ? null : (p.failure || r.stderr || r.stdout).slice(-600)),
     };
   },
 };

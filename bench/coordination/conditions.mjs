@@ -117,7 +117,13 @@ const klypix = {
       if (edges.length) buf = (await addBrainConnections(buf, edges)).buffer;
     }
     fs.writeFileSync(brainPath, buf);
-    try { linkProject(repo.dir, { editors: new Set(['claude-code', 'codex']) }); } catch { /* rules are a convenience; the MCP server instructions still apply */ }
+    // The project rules `klypix link` writes, but NOT its MCP configs: those
+    // point at the machine's own global install, so an agent that read
+    // .mcp.json could start the user's installed server against this temp repo
+    // (Codex did, 2026-10-11). The harness's server is the only channel.
+    try {
+      linkProject(repo.dir, { editors: new Set(['claude-code', 'codex']), exclude: new Set(['.mcp.json', '.codex/config.toml']) });
+    } catch { /* rules are a convenience; the MCP server instructions still apply */ }
     repo.commitAll('klypix: project brain and rules');
 
     const actor = scenario.actor || {};

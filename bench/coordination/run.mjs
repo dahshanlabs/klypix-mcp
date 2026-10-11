@@ -17,7 +17,7 @@ import readline from 'node:readline';
 import { pathToFileURL } from 'node:url';
 import { SCENARIOS, scenarioById } from './scenarios.mjs';
 import { CONDITIONS, conditionById } from './conditions.mjs';
-import { agentById, composePrompt } from './agents.mjs';
+import { agentById, composePrompt, CHANNEL_DOWN } from './agents.mjs';
 import { makeRepo, commitAgentWork } from './lib/repo.mjs';
 
 const argv = process.argv.slice(2);
@@ -53,7 +53,7 @@ export async function runOne({ scenario, condition, agent, run, timeoutMs, keep 
       scenario: scenario.id, condition: condition.id, agent: agent.id, run,
       success: !!g.success, staleAction: !!g.staleAction, collision: g.collision,
       relays: prep.relays || 0, delivered: (prep.delivered || []).length, facts: scenario.facts.length,
-      agentOk: res.ok, model: res.model ?? null, permissionDenials: res.permissionDenials ?? null, mcpCalls: res.mcpCalls ?? null, costUsd: res.costUsd ?? null, tokens: res.tokens ?? null, turns: res.turns ?? null,
+      agentOk: res.ok, model: res.model ?? null, permissionDenials: res.permissionDenials ?? null, mcpCalls: res.mcpCalls ?? null, channelUp: res.channelUp ?? null, invalid: res.error === CHANNEL_DOWN, costUsd: res.costUsd ?? null, tokens: res.tokens ?? null, turns: res.turns ?? null,
       durationMs: res.durationMs ?? (Date.now() - started), timedOut: !!res.timedOut,
       error: res.error || null, keptRepo: keep ? repo.dir : null,
     };

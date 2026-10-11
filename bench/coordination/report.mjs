@@ -19,14 +19,19 @@ export function summarize(rows) {
     groups.get(key).push(r);
   }
   const cells = [];
-  for (const [key, rs] of groups) {
+  for (const [key, all] of groups) {
     const [scenario, condition, agent] = key.split('|');
+    // A run whose channel never came up measured nothing about it: shown as
+    // invalid, never counted as a pass or a fail.
+    const rs = all.filter((r) => !r.invalid);
+    const invalidRuns = all.length - rs.length;
+    if (!rs.length) { cells.push({ scenario, condition, agent, n: 0, invalidRuns, success: { k: 0, ...wilson(0, 0) }, staleActions: { k: 0, ...wilson(0, 0) }, relaysPerTask: 0, medianCostUsd: null, medianTokens: null, medianMinutes: null, errors: 0, consulted: 0, versions: [], models: [] }); continue; }
     const n = rs.length;
     const ok = rs.filter((r) => r.success).length;
     const stale = rs.filter((r) => r.staleAction).length;
     const errors = rs.filter((r) => r.error).length;
     cells.push({
-      scenario, condition, agent, n,
+      scenario, condition, agent, n, invalidRuns,
       success: { k: ok, ...wilson(ok, n) },
       staleActions: { k: stale, ...wilson(stale, n) },
       relaysPerTask: rs.reduce((a, r) => a + (r.relays || 0), 0) / n,
@@ -60,7 +65,7 @@ export function toMarkdown(cells) {
       for (const c of CONDITIONS) {
         const cell = cells.find((x) => x.agent === agent && x.scenario === s.id && x.condition === c.id);
         if (!cell) continue;
-        out.push(`| ${s.title} | ${c.label} | ${cell.n} | ${pct(cell.success.p)} (${pct(cell.success.low)}–${pct(cell.success.high)}) | ${cell.staleActions.k}/${cell.n} | ${cell.relaysPerTask.toFixed(1)} | ${c.id === 'klypix' ? `${cell.consulted}/${cell.n}` : '—'} | ${cell.medianCostUsd == null ? '—' : `$${cell.medianCostUsd.toFixed(2)}`} | ${cell.medianMinutes == null ? '—' : cell.medianMinutes.toFixed(1)} |`);
+        out.push(`| ${s.title} | ${c.label} | ${cell.n}${cell.invalidRuns ? ` (+${cell.invalidRuns} invalid)` : ''} | ${pct(cell.success.p)} (${pct(cell.success.low)}–${pct(cell.success.high)}) | ${cell.staleActions.k}/${cell.n} | ${cell.relaysPerTask.toFixed(1)} | ${c.id === 'klypix' ? `${cell.consulted}/${cell.n}` : '—'} | ${cell.medianCostUsd == null ? '—' : `$${cell.medianCostUsd.toFixed(2)}`} | ${cell.medianMinutes == null ? '—' : cell.medianMinutes.toFixed(1)} |`);
       }
     }
     out.push('');
@@ -87,7 +92,7 @@ export function toMarkdown(cells) {
     for (const c of notRun) out.push(`- **${c.label}** — ${c.reason}`);
     out.push('');
   }
-  out.push('_Scripted "other session" actors; hidden tests; no LLM judge. Relay = the human pasted the facts (upper bound)._');
+  out.push('_Scripted "other session" actors; hidden tests; no LLM judge. Relay = the human pasted the facts (upper bound). "invalid" = the server of the condition never came up for that run; it is excluded from the rates, not counted as a fail._');
   return out.join('\n');
 }
 

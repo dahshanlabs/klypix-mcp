@@ -435,7 +435,7 @@ export async function opSearchCanvases({ vault, query }) {
       const isArchived = (c) => /^archive$/i.test(c.area || '');
       const n = struct.counts;
       const head = `## ${rel} — "${struct.title}" · ${n.live ?? n.cards} live cards${n.archived ? `, ${n.archived} archived` : ''}, ${n.connections} connections${saved ? ` · saved ${saved}` : ''}${nameMatch && !matched.length ? '  (name/title match)' : ''}`;
-      // A stale hit names its replacement (1.97.0) — never a bare "archived".
+      // A stale hit names its replacement (1.98.0) — never a bare "archived".
       let successors = new Map();
       try { successors = correctionOverlaysFor(struct, matched.slice(0, 8)); } catch { successors = new Map(); }
       const body = matched.slice(0, 8).map(c => {
@@ -510,7 +510,7 @@ export async function opSearchAllBrains({ vault, query, as_of, log = () => {} })
     try { ({ struct } = await parseKlypix(fs.readFileSync(b.path))); } catch { continue; }
     let vecs = null;
     if (qv) { try { const r = await questionVectors(pipe, b.path, struct.cards); vecs = r.usable ? r.vecs : null; } catch { /* lexical for this brain */ } }
-    // Replacement per stale card (1.97.0), only when this brain HAS lifecycle
+    // Replacement per stale card (1.98.0), only when this brain HAS lifecycle
     // edges; skipped under as_of (a correction is a present-day fact).
     let successors = new Map();
     if (asOfTs == null && (struct.connections || []).some(cn => cn.label === 'superseded by' || cn.label === 'closed by')) {

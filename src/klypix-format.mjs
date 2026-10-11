@@ -4409,7 +4409,7 @@ export function questionContextToMarkdown(question, result, { mode = 'lexical', 
     out.push('');
     let used = out.join('\n').length;
     let shown = 0;
-    // CURRENT-FIRST corrections (1.97.0). Agents followed a withdrawn rule in
+    // CURRENT-FIRST corrections (1.98.0). Agents followed a withdrawn rule in
     // 77% of tries unless its replacement was made prominent (arXiv 2608.25553),
     // and a stale card can outrank its own replacement (corpseRate). So a
     // corrected hit prints the current truth BEFORE the stale words, and when
@@ -5858,7 +5858,7 @@ const reAdoptionReceipt = (prior, today) => {
 
 // One wording for "this card was replaced, read that one" on every surface that
 // lists cards (status, read_canvas, search_canvases, search_all_brains), so a
-// stale card is never shown without naming its replacement (1.97.0).
+// stale card is never shown without naming its replacement (1.98.0).
 export function supersededByNote(overlay, max = 100) {
     if (!overlay || !overlay.by) return '';
     const head = String(overlay.by.text || '').replace(/\s+/g, ' ').trim();
@@ -9731,7 +9731,7 @@ export function structToMarkdown(struct, { assetsDir, parsed = null, lockedBoxes
         if (strokes || lines) L.push(`*Ink: ${strokes} freehand stroke${strokes === 1 ? '' : 's'} · ${lines} drawn line${lines === 1 ? '' : 's'}/shape${lines === 1 ? '' : 's'}${frozenInk ? ` · ${frozenInk} frozen` : ''} (not readable as text)*\n`);
     }
     L.push(`## Cards`);
-    // The replacement rides in the stale card's own heading (1.97.0) — before,
+    // The replacement rides in the stale card's own heading (1.98.0) — before,
     // the edge appeared only in the separate connection list at the end.
     let successors = new Map();
     try { successors = correctionOverlaysFor(struct, struct.cards.filter(c => c.type !== 'container')); } catch { successors = new Map(); }

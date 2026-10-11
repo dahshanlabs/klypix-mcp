@@ -798,7 +798,7 @@ const isTaskSession = (session) =>
     // rest of the host process's life.
     || liveObservedFiles(session).length > 0);
 
-// ── Overlap tiers beyond the exact file (1.97.0) ────────────────────────────
+// ── Overlap tiers beyond the exact file (1.98.0) ────────────────────────────
 // Exact-file overlap (findPresenceConflicts) stays the blocking signal and its
 // shape is unchanged. Two further tiers, each with its own honesty limit:
 //
@@ -2806,7 +2806,7 @@ export function createMcpPresence({
 
     const stamp = now();
     const exactConflicts = findPresenceConflicts(report.sessions, sessionId);
-    // 1.97.0 tiers (see findNearbyWork / findMergeConflicts). Both are skipped
+    // 1.98.0 tiers (see findNearbyWork / findMergeConflicts). Both are skipped
     // on completion — a finished task has nothing left to collide with.
     const mergeConflicts = completing ? [] : findMergeConflicts(report.sessions, sessionId, { repoDir: path.dirname(brainPath) });
     const nearby = completing ? [] : findNearbyWork(report.sessions, sessionId, {
@@ -3527,7 +3527,7 @@ export function createMcpPresence({
       },
       peers: snapshot.peers,
       conflicts,
-      // Additive (1.97.0): same-folder work with no shared file (advisory).
+      // Additive (1.98.0): same-folder work with no shared file (advisory).
       ...(nearby.length ? { nearby } : {}),
       messages: report.messages.map((message) => {
         // Raw structured path gets the same decay verdict as the rendered

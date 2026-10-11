@@ -767,6 +767,15 @@ lost 0 of 46. If the control ever loses nothing, the run reports **inconclusive*
 
 Latest results, with hardware and date: [BENCHMARKS.md](BENCHMARKS.md).
 
+**Does it change what agents do?** That needs real agents, so it lives in the repository rather than
+the package: [`bench/coordination/`](bench/coordination/README.md) runs Claude Code or Codex on four
+small repos where another session knows something the agent needs (a decision changed today, work
+overlapping on another branch, a note from a session that has ended, a root cause another vendor's
+session found). Each run is graded by a test written after the agent finishes, against no shared
+channel, a human copy-paste, `AGENTS.md` kept tidy or appended, and KLYPIX over MCP only. Every number
+is printed with its sample size and interval; tools it has not measured are listed as not measured.
+`--dry-run` costs nothing and proves the graders.
+
 ## Git and concurrency
 
 One file in your repo, committed with your code — versioned, branchable, portable. So two

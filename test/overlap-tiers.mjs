@@ -1,4 +1,4 @@
-// Overlap tiers beyond the exact file (1.97.0).
+// Overlap tiers beyond the exact file (1.98.0).
 //
 // Exact-file overlap stays the blocking signal. This file locks the two new
 // tiers and the footer cleanup:

@@ -1462,7 +1462,7 @@ function peerFooter(sid) {
     const lines = ['', `## ⚠️ Other live session(s) in this project — ${peers.length} total, as of ${asOf}${hiddenIdle ? ` (+${hiddenIdle} inactive not shown)` : ''} — coordinate (the brain is shared, NOT live-merged)`];
     const releaseLine = releaseLeaseFooterLine(list, now);
     if (releaseLine) lines.push(releaseLine);
-    // Same branch, said ONCE (1.97.0). Two sessions can only share a branch
+    // Same branch, said ONCE (1.98.0). Two sessions can only share a branch
     // name by sharing a checkout (git refuses one branch in two worktrees), so
     // the risk is concrete: a broad `git add` sweeps the other session's edits
     // into your commit. Per-peer, this line repeated on every row of a busy

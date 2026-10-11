@@ -1,4 +1,4 @@
-// Current-first corrections (1.97.0).
+// Current-first corrections (1.98.0).
 //
 // Agents followed a withdrawn rule in 77% of tries unless its replacement was
 // made prominent (arXiv 2608.25553). These checks lock that a superseded card

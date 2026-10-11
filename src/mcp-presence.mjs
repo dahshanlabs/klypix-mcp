@@ -82,6 +82,19 @@ export const KLYPIX_MCP_INSTRUCTIONS = [
 
 const compact = (value) => String(value || '').replace(/\s+/g, ' ').trim();
 
+// A `results` value is EVIDENCE-SHAPED when it is an array (the manifest list,
+// even an empty or malformed one) or an object carrying any field a result
+// manifest has. Only evidence-shaped submissions enter the fail-closed result
+// contract. Prose or a summary object claims nothing machine-checkable: it is
+// refused, but it must not lock the task — an AI tool that mistook `results`
+// for "describe what you did" (Codex did, 2026-10-11) finishes with a plain
+// retry instead of staying active to every peer.
+const MANIFEST_FIELDS = ['schemaVersion', 'claimKey', 'metrics', 'provenance', 'evaluation', 'inputFingerprint', 'scopeFingerprint'];
+export function isEvidenceShapedResults(value) {
+  if (Array.isArray(value)) return true;
+  return !!value && typeof value === 'object' && MANIFEST_FIELDS.some((key) => Object.prototype.hasOwnProperty.call(value, key));
+}
+
 const EXACT_FILE_MAX_CHARS = 512;
 const EXACT_FILE_MAX_COUNT = 20;
 const GLOB_FILE_CHARS = new Set(['*', '?', '[', ']', '{', '}']);
@@ -2556,6 +2569,7 @@ export function createMcpPresence({
     }
     if (nextPhase === 'checkpoint') checkpointSinceTaskStart = true;
     const hasDefinedResults = results !== undefined;
+    const resultsAreEvidenceShaped = hasDefinedResults && isEvidenceShapedResults(results);
     let resultReconciliation = null;
     let completionBlocked = false;
     let resultSubmissionRejected = false;
@@ -2582,7 +2596,31 @@ export function createMcpPresence({
       }
     }
 
-    if (hasDefinedResults) {
+    if (hasDefinedResults && !resultsAreEvidenceShaped) {
+      // Refused for THIS call (scope retained), with no durable evidence
+      // obligation: nothing machine-checkable was claimed, so a retry without
+      // `results` is the ordinary completion it always was. A prior
+      // evidence-shaped claim still holds — the next result-less complete reads
+      // it in the branch below and stays blocked.
+      resultSubmissionRejected = true;
+      resultReconciliation = {
+        ok: false,
+        status: 'needs-reconciliation',
+        ledgerWriteOk: null,
+        claims: [],
+        conflicts: [{
+          kind: 'results-not-manifests',
+          severity: 'blocking',
+          reason: '`results` takes only result manifests (machine-checkable claims, a list of 1-8), never a summary of the work. Nothing was recorded and this task owes no evidence: to finish, call brain_sync with phase "complete" again WITHOUT results.',
+        }],
+      };
+      if (completing) {
+        completionBlocked = true;
+        // A tool that writes up its outcome is ending the task, not a turn: the
+        // plain retry must not then be deferred as a premature turn-end.
+        checkpointSinceTaskStart = true;
+      }
+    } else if (hasDefinedResults) {
       resultClaimsPending = true;
       const marked = markResultClaimPendingFn({
         brainPath: resultBrainPath,
@@ -3610,7 +3648,7 @@ export function createMcpPresence({
       ? `KLYPIX message delivery was deferred safely: ${report.deliveryWriteSkippedReason || 'the receipt write did not land'}. No queued note was reported as delivered; retry on the next KLYPIX action.`
       : '';
     const deferralText = completionDeferred
-      ? 'KLYPIX completion deferred: this complete carried no results and arrived moments after task start with no intervening checkpoint, so it reads as turn-end, not task-end. The declared intent/files were RETAINED for peers. When the task is truly finished, complete again after a checkpoint (or include a result manifest) to clear the scope.'
+      ? 'KLYPIX completion deferred: this complete carried no results and arrived moments after task start with no intervening checkpoint, so it reads as turn-end, not task-end. The declared intent/files were RETAINED for peers. When the task is truly finished, call brain_sync with phase "checkpoint", then "complete" again, to clear the scope. (Do not add `results` for this: it takes only machine-checkable result manifests, never a summary.)'
       : '';
     const text = [
       `KLYPIX Context Gateway: session ${sessionId} · phase ${nextPhase} · coordination ${durationMs}ms.`,

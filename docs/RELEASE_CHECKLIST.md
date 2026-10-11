@@ -23,6 +23,22 @@ declares `needs: gate`, so a red gate means npm never sees a tarball.
 | 7 | Verify that committed bundle against the source target | command below |
 | 8 | Sanity-check what will ship | `npm pack --dry-run` |
 
+**Step 6 on a runner.** The suite carries timing checks (git deadlines, lock waits, a
+merge-scale ratio, a handshake budget) that a Windows PC with an antivirus scanning every
+file the suite creates may not pass twice in a row — on 2026-10-11 nine attempts failed on
+six different suites, each green on its own. When that happens, build the bundle where the
+publish gate runs the same suite anyway: push the source commit on any branch, then
+
+```bash
+gh workflow run release-evidence.yml --ref master -f ref="$SOURCE_COMMIT"
+# when it is green:
+gh run download <run-id> --name "release-evidence-v$VERSION" --dir ".release-evidence/v$VERSION"
+```
+
+The workflow verifies the bundle in CI exactly as Gate 6 will (against a throwaway commit it
+never pushes) before uploading it. Steps 6–7 are then unchanged: commit only the bundle, and
+run the verifier locally against `HEAD^` before tagging.
+
 **Step 3b** lists the open cards whose claims the commits in this ref look to have
 fulfilled. Read each one against its commit, then close the pairs you verified with
 `confirm:[{ id, sha }]` (or retire a wrong hint with `dismiss:[…]`); re-running should

@@ -1,0 +1,102 @@
+# Release evidence — build the corroborated bundle on a runner.
+#
+# scripts/build-release-evidence.mjs runs the full suite twice on the SOURCE
+# commit and writes .release-evidence/v<version>/. On a Windows PC whose
+# antivirus scans every file the suite creates, the suite's own timing checks
+# (git deadlines, lock waits, a merge-scale ratio, a handshake budget) failed
+# nine times across six different suites on 2026-10-11, while each check passed
+# on its own. The publish gate already runs this suite on this runner with this
+# pinned Node, so the evidence can be produced here too, from the same bytes.
+#
+# The bundle is committed in CI under a throwaway identity, NEVER pushed, only
+# so the verifier can run exactly as the publish gate runs it (it reads the
+# bundle from git and rejects an untracked file). It is then uploaded as an
+# artifact. The release cutter downloads it, commits it on top of the source
+# commit, verifies it again locally, and tags — docs/RELEASE_CHECKLIST.md §1.
+name: Release evidence
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'The SOURCE commit to qualify — clean tree, version bumped, pushed on any branch'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  evidence:
+    name: Build corroborated evidence (two full suites)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout the source commit (full history + tags)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prove the checkout is the requested commit, and clean
+        env:
+          REQUESTED: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          HEAD_SHA="$(git rev-parse HEAD)"
+          REQ_SHA="$(git rev-parse --verify "${REQUESTED}^{commit}")"
+          if [ "$HEAD_SHA" != "$REQ_SHA" ]; then
+            echo "::error::checked out $HEAD_SHA, but $REQUESTED is $REQ_SHA"
+            exit 1
+          fi
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::the tree is dirty after checkout"
+            git status --porcelain
+            exit 1
+          fi
+          echo "source commit $HEAD_SHA · version $(node -p "require('./package.json').version")"
+
+      - name: Setup Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24.13.1'
+          package-manager-cache: false
+
+      - name: Install (npm ci — lockfile enforced)
+        run: npm ci
+
+      - name: Build the evidence (two independent full-suite runs)
+        env:
+          KLYPIX_AUTO_UPDATE: '0'
+        run: node scripts/build-release-evidence.mjs
+
+      - name: Verify it exactly as the publish gate will
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./package.json').version")"
+          SOURCE_COMMIT="$(git rev-parse HEAD)"
+          # A throwaway local commit, never pushed: the verifier reads the
+          # bundle from git and rejects an untracked file or a dirty tree.
+          git -c user.name=release-evidence -c user.email=release-evidence@users.noreply.github.com \
+            add -- ".release-evidence/v${VERSION}/"
+          git -c user.name=release-evidence -c user.email=release-evidence@users.noreply.github.com \
+            commit -q -m "release: add corroborated ${VERSION} evidence (runner, not pushed)"
+          node scripts/verify-release-evidence.mjs \
+            --project . \
+            --receipt ".release-evidence/v${VERSION}/receipt.json" \
+            --expectations ".release-evidence/v${VERSION}/expectations.json" \
+            --package "$(node -p "require('./package.json').name")" \
+            --version "$VERSION" \
+            --git-commit "$SOURCE_COMMIT" \
+            --require-corroborated
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "SOURCE_COMMIT=$SOURCE_COMMIT" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-evidence-v${{ env.VERSION }}
+          path: .release-evidence/v${{ env.VERSION }}/
+          if-no-files-found: error
+          retention-days: 14

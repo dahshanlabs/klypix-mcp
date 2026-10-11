@@ -39,7 +39,7 @@ import { execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { detectEditors } from '../src/editor-detect.mjs';
 import { linkProject } from '../src/agent-rules.mjs';
-import { readLaunchSpec, verifyMcpConfig } from '../src/mcp-verify.mjs';
+import { readLaunchSpec, verifyMcpConfig, VERIFY_TIMEOUT_MS } from '../src/mcp-verify.mjs';
 import { resolveProjectRoot, projectSignal, runSetup, isProjectOwnedMcp } from '../src/setup.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -188,6 +188,18 @@ try {
   const verdict = await verifyMcpConfig({ file: broken, projectDir: fresh, timeoutMs: 15_000 });
   ok('S10 the container-path regression FAILS the gate', verdict.ok === false);
   ok('S10 and says why', typeof verdict.why === 'string' && verdict.why.length > 0);
+
+  // A server that never answers: setup gives up, says how long it waited and
+  // how to check again, and by default waits a full minute (a busy machine
+  // took 29-92 s for the first handshake on 2026-10-11).
+  cfg.mcpServers[key].command = process.execPath;
+  cfg.mcpServers[key].args = ['-e', 'setInterval(() => {}, 1000)'];
+  const silent = path.join(fresh, 'silent.json');
+  fs.writeFileSync(silent, JSON.stringify(cfg, null, 2));
+  const quiet = await verifyMcpConfig({ file: silent, projectDir: fresh, timeoutMs: 1_500 });
+  ok('S10 a server that never answers times out with the wait and the way to re-check',
+    quiet.ok === false && /no response within 2s/.test(quiet.why || '') && /npx klypix-mcp doctor/.test(quiet.why || ''));
+  ok('S10 setup waits a full minute for the first handshake by default', VERIFY_TIMEOUT_MS >= 60_000);
 
   // ---- S13 — never clobber a project-owned server ------------------------
   // A repo-relative launch is chosen deliberately: it resolves offline and

@@ -72,6 +72,13 @@ export function readLaunchSpec(file) {
   };
 }
 
+// How long setup waits for the first handshake. On a busy machine a first run
+// can spend most of it starting Node and loading the server (the release
+// suite's live handshake took 29-92 s under load on 2026-10-11, about 7 s
+// idle), and a false "did not start a server" sends a person hunting for a
+// fault that is not there. Setup runs once, so waiting longer costs little.
+export const VERIFY_TIMEOUT_MS = 60_000;
+
 /**
  * Launch the server exactly as the editor would and count the tools it offers.
  *
@@ -82,7 +89,7 @@ export function readLaunchSpec(file) {
  * @param {{ file: string, projectDir: string, timeoutMs?: number, env?: object }} opts
  * @returns {Promise<{ ok: boolean, toolCount?: number, ms?: number, why?: string, hasBrainSync?: boolean }>}
  */
-export async function verifyMcpConfig({ file, projectDir, timeoutMs = 25_000, env = process.env }) {
+export async function verifyMcpConfig({ file, projectDir, timeoutMs = VERIFY_TIMEOUT_MS, env = process.env }) {
   const spec = readLaunchSpec(file);
   if (!spec.ok) return { ok: false, why: spec.why };
 
@@ -108,7 +115,7 @@ export async function verifyMcpConfig({ file, projectDir, timeoutMs = 25_000, en
       client.connect(transport).then(() => 'ok'),
       new Promise((r) => setTimeout(() => r('timeout'), timeoutMs)),
     ]);
-    if (connected === 'timeout') return { ok: false, why: `no response within ${Math.round(timeoutMs / 1000)}s` };
+    if (connected === 'timeout') return { ok: false, why: `no response within ${Math.round(timeoutMs / 1000)}s (a busy machine or a first download can be this slow; \`npx klypix-mcp doctor\` checks again)` };
 
     const listed = await Promise.race([
       client.listTools().then((t) => t),

@@ -19,7 +19,7 @@ import { fileURLToPath } from 'url';
 import { execFile } from 'child_process';
 import { detectEditors } from './editor-detect.mjs';
 import { linkProject } from './agent-rules.mjs';
-import { verifyMcpConfig, readLaunchSpec } from './mcp-verify.mjs';
+import { verifyMcpConfig, readLaunchSpec, VERIFY_TIMEOUT_MS } from './mcp-verify.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CLI = path.join(__dirname, '..', 'bin', 'klypix-mcp.mjs');
@@ -228,7 +228,7 @@ export async function runSetup(opts = {}) {
       const res = await verifyMcpConfig({
         file: path.join(root, target.file),
         projectDir: root,
-        timeoutMs: opts.timeoutMs || 25_000,
+        timeoutMs: opts.timeoutMs || VERIFY_TIMEOUT_MS,
       });
       results.push({ tool: target.tool, file: target.file, ...res });
       if (!res.ok) report.warnings.push(`${target.file} did not start a server: ${res.why}`);

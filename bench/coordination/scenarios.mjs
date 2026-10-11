@@ -217,22 +217,38 @@ const s3 = {
 };
 
 // ── S4: another vendor's session found the root cause ────────────────────────
+// The fact must be knowledge the repository cannot give. The first S4 (cache
+// key without the user id) was readable from the code and its failing test, so
+// every agent solved it with no channel at all (pilot, 2026-10-11) — it
+// measured nothing. Now the code looks right and its tests pass; the cause is
+// in production, where the CDN strips the header the key relies on. Only the
+// other session's investigation knows that.
 const s4 = {
   id: 's4-root-cause-from-other-vendor',
   title: 'Another vendor\'s session found the root cause',
-  story: 'A Codex session traced a cross-user cache leak to the cache key. The symptom points at the cache lifetime; the agent is asked to fix it.',
-  actor: { id: 'actor-s4-codex', client: 'codex', intent: 'Investigate the profile leak' },
+  story: 'A Codex session traced a production-only cross-user leak to the CDN stripping a header the cache key relies on. Nothing in the repository shows it, and the symptom invites shortening the cache.',
+  actor: { id: 'actor-s4-codex', client: 'codex', intent: 'Investigate the production profile leak' },
   facts: [{
-    id: 'cache-key-root-cause',
-    text: 'Root cause (found by the Codex session): keyFor() in lib/cache.js builds the key from the path only — it must include req.userId. The cache lifetime is NOT the problem; keep TTL_MS and caching as they are.',
+    id: 'cdn-strips-user-header',
+    text: 'Root cause (found by the Codex session in production logs): the CDN strips the x-user-id header, so keyFor() in lib/cache.js builds profile:undefined:/me for everyone and users share one entry. The user id that survives the CDN is req.session.uid (set by server/session.js) — key the cache on that. The cache lifetime is NOT the problem; keep TTL_MS and caching.',
   }],
   build(repo) {
     repo.write('package.json', PKG);
     notes(repo, '# Project notes\n');
+    repo.write('server/session.js', [
+      '// Signed session cookie -> req.session (runs before every route).',
+      'export function attachSession(req) {',
+      "  const raw = (req.headers && req.headers.cookie) || '';",
+      "  const m = /(?:^|; )sid=([^;]+)/.exec(raw);",
+      '  req.session = m ? { uid: decodeURIComponent(m[1]) } : {};',
+      '  return req;',
+      '}',
+      '',
+    ].join('\n'));
     repo.write('lib/cache.js', [
       'const store = new Map();',
       'export const TTL_MS = 60_000;',
-      'export function keyFor(req) { return `profile:${req.path}`; }',
+      "export function keyFor(req) { return `profile:${req.headers && req.headers['x-user-id']}:${req.path}`; }",
       'export function get(req, now = Date.now()) { const e = store.get(keyFor(req)); return e && now - e.at < TTL_MS ? e.value : undefined; }',
       'export function put(req, value, now = Date.now()) { store.set(keyFor(req), { value, at: now }); }',
       'export function clear() { store.clear(); }',
@@ -242,27 +258,28 @@ const s4 = {
       "import test from 'node:test';",
       "import assert from 'node:assert/strict';",
       "import { get, put, clear } from '../lib/cache.js';",
-      "test('a user never sees another user\\'s cached profile (stale cache?)', () => {",
+      "test('profiles are cached per user', () => {",
       '  clear();',
-      "  put({ path: '/me', userId: 'a' }, { name: 'Alice' });",
-      "  assert.equal(get({ path: '/me', userId: 'b' }), undefined);",
+      "  put({ path: '/me', headers: { 'x-user-id': 'a' } }, { name: 'Alice' });",
+      "  assert.equal(get({ path: '/me', headers: { 'x-user-id': 'b' } }), undefined);",
+      "  assert.deepEqual(get({ path: '/me', headers: { 'x-user-id': 'a' } }), { name: 'Alice' });",
       '});',
       '',
     ].join('\n'));
-    repo.commitAll('base: profile cache with a failing leak test');
+    repo.commitAll('base: per-user profile cache (tests pass locally)');
     return { taskBranch: 'main' };
   },
-  task: 'Users report seeing another user\'s profile for up to a minute. Fix the bug so `node --test test/cache.test.js` passes.',
+  task: 'Users report that in production they sometimes see another user\'s profile for up to a minute. The tests pass locally. Fix the bug.',
   hidden: {
     'test/hidden.cache.test.js': [
       "import test from 'node:test';",
       "import assert from 'node:assert/strict';",
       "import { get, put, clear, TTL_MS } from '../lib/cache.js';",
-      "test('users are isolated and a user\\'s own profile stays cached', () => {",
+      "test('behind the CDN (no x-user-id header) users stay isolated and a user\\'s own profile stays cached', () => {",
       '  clear();',
-      "  put({ path: '/me', userId: 'a' }, { name: 'Alice' }, 1000);",
-      "  assert.equal(get({ path: '/me', userId: 'b' }, 1001), undefined);",
-      "  assert.deepEqual(get({ path: '/me', userId: 'a' }, 1001), { name: 'Alice' });",
+      "  put({ path: '/me', headers: {}, session: { uid: 'a' } }, { name: 'Alice' }, 1000);",
+      "  assert.equal(get({ path: '/me', headers: {}, session: { uid: 'b' } }, 1001), undefined);",
+      "  assert.deepEqual(get({ path: '/me', headers: {}, session: { uid: 'a' } }, 1001), { name: 'Alice' });",
       '  assert.equal(TTL_MS, 60_000);',
       '});',
       '',
@@ -274,10 +291,11 @@ const s4 = {
     return { success: t.pass, staleAction: !/TTL_MS = 60_000/.test(src), collision: null, detail: t.output };
   },
   oracle: {
-    good(repo) { repo.write('lib/cache.js', repo.read('lib/cache.js').replace('`profile:${req.path}`', '`profile:${req.userId}:${req.path}`')); },
+    good(repo) { repo.write('lib/cache.js', repo.read('lib/cache.js').replace("`profile:${req.headers && req.headers['x-user-id']}:${req.path}`", '`profile:${(req.session && req.session.uid) || (req.headers && req.headers[\'x-user-id\'])}:${req.path}`')); },
     naive(repo) { repo.write('lib/cache.js', repo.read('lib/cache.js').replace('TTL_MS = 60_000', 'TTL_MS = 0')); },
   },
 };
+
 
 export const SCENARIOS = [s1, s2, s3, s4];
 export const scenarioById = (id) => SCENARIOS.find((s) => s.id === id || s.id.startsWith(`${id}-`) || s.id.split('-')[0] === id) || null;

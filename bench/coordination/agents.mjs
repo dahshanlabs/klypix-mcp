@@ -224,6 +224,18 @@ export function codexPlatformOverrides(platform = process.platform) {
 }
 
 /**
+ * Codex's workspace-write sandbox keeps `.git` read-only, so it could neither
+ * commit nor `git merge` — S2 (build on the other branch) was impossible for
+ * Codex in EVERY condition (pilot, 2026-10-11: "`.git` is read-only, so
+ * `git merge a/currency` failed"). Only this run's throwaway repo's `.git` is
+ * added as writable; nothing else on the machine is.
+ */
+export function codexGitWritable(repoDir) {
+  const gitDir = path.join(repoDir, '.git').split(path.sep).join('/');
+  return ['-c', `sandbox_workspace_write.writable_roots=${tomlArray([gitDir])}`];
+}
+
+/**
  * Codex does not report its MCP servers' state. A completed call to one proves
  * it was up; a start-up failure Codex logged for one proves it was not;
  * anything else is unknown (null) — never assumed up.
@@ -265,7 +277,7 @@ export const codex = {
   },
   async run({ repo, prompt, mcpServers = {}, timeoutMs, model = null }) {
     const args = ['exec', '--json', '--ephemeral', '--ignore-user-config', '--skip-git-repo-check',
-      '-s', 'workspace-write', '-C', repo.dir, ...(model ? ['-m', model] : []), ...codexPlatformOverrides(), ...codexMcpOverrides(mcpServers), '-'];
+      '-s', 'workspace-write', '-C', repo.dir, ...(model ? ['-m', model] : []), ...codexPlatformOverrides(), ...codexGitWritable(repo.dir), ...codexMcpOverrides(mcpServers), '-'];
     const r = await run(resolveCli('codex'), args, { cwd: repo.dir, env: cleanAgentEnv(), timeoutMs, input: prompt });
     const p = parseCodexEvents(r.stdout);
     const channelUp = codexChannelUp(Object.keys(mcpServers), p.mcpCalls, r.stderr);

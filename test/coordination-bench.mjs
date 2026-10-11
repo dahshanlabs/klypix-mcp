@@ -34,10 +34,10 @@ process.env.KLYPIX_AUTO_UPDATE = '0';
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const { SCENARIOS } = await import('../bench/coordination/scenarios.mjs');
 const { CONDITIONS, conditionById } = await import('../bench/coordination/conditions.mjs');
-const { oracle, composePrompt, codexMcpOverrides, resolveCli, cleanAgentEnv, claudeAllowedTools, parseClaudeResult, parseCodexEvents, codexChannelUp, MCP_STARTUP_TIMEOUT_SEC, CHANNEL_DOWN } = await import('../bench/coordination/agents.mjs');
+const { oracle, composePrompt, codexMcpOverrides, resolveCli, cleanAgentEnv, claudeAllowedTools, parseClaudeResult, parseCodexEvents, codexChannelUp, codexGitWritable, MCP_STARTUP_TIMEOUT_SEC, CHANNEL_DOWN } = await import('../bench/coordination/agents.mjs');
 const { runOne } = await import('../bench/coordination/run.mjs');
 const { summarize, toMarkdown } = await import('../bench/coordination/report.mjs');
-const { makeRepo } = await import('../bench/coordination/lib/repo.mjs');
+const { makeRepo, runNodeTests } = await import('../bench/coordination/lib/repo.mjs');
 const { wilson } = await import('../bench/coordination/lib/stats.mjs');
 const { laneFileFor } = await import('../src/agent-presence.mjs');
 const { parseKlypix } = await import('../src/klypix-format.mjs');
@@ -101,7 +101,7 @@ const expectations = {
     'its peer list shows the session rewriting lib/price.js on a/currency'],
   's3-note-from-closed-session': [(sc) => /backfill:emails/.test(hitsText(sc)) && /migrate:002/.test(hitsText(sc)),
     'its context carries the finding the ended session left in the brain'],
-  's4-root-cause-from-other-vendor': [(sc) => /req\.userId/.test(hitsText(sc)), 'its context carries the other vendor\'s root cause'],
+  's4-root-cause-from-other-vendor': [(sc) => /req\.session\.uid/.test(hitsText(sc)) && /CDN/.test(hitsText(sc)), 'its context carries the other vendor\'s root cause'],
 };
 const syncAs = async (server, repo, sessionId, task) => {
   const c = new Client({ name: 'cobench-agent', version: '1.0.0' }, { capabilities: {} });
@@ -217,6 +217,20 @@ ok(/## Not measured/.test(md) && /MCP Agent Mail/.test(md), 'B4: the report list
   'B5: Codex counts as up only after a KLYPIX call, as down only on a start-up failure naming it, otherwise unknown');
   ok(codexMcpOverrides({ 'klypix-canvas': { command: 'node', args: [] } }).includes(`mcp_servers.klypix-canvas.startup_timeout_sec=${MCP_STARTUP_TIMEOUT_SEC}`) && MCP_STARTUP_TIMEOUT_SEC >= 120,
     'B5: both agents wait up to two minutes for the server to start (Codex defaults to 10 s)');
+  const gw = codexGitWritable(path.join(os.tmpdir(), 'klypix-cobench-x'));
+  ok(gw[0] === '-c' && /^sandbox_workspace_write\.writable_roots=\["[^"]*klypix-cobench-x\/\.git"\]$/.test(gw[1]),
+    'B5: Codex may write only the run repo\'s .git (it could not commit or merge otherwise)');
+
+  // S4 must not be solvable from the repository alone: its visible test
+  // passes before any fix, so the cause can only come from the other session.
+  {
+    const s4 = SCENARIOS.find((s) => s.id === 's4-root-cause-from-other-vendor');
+    const repo4 = makeRepo('klypix-cobench-s4v-');
+    try {
+      s4.build(repo4);
+      ok(runNodeTests(repo4.dir, ['test/cache.test.js']).pass, 'B5: S4\'s visible test already passes — the repository holds no clue to the cause');
+    } finally { repo4.remove(); }
+  }
   const invalidMd = toMarkdown(summarize([
     { scenario: 's1-changed-decision', condition: 'klypix', agent: 'claude', run: 1, success: false, staleAction: true, invalid: true, error: CHANNEL_DOWN },
     { scenario: 's1-changed-decision', condition: 'klypix', agent: 'claude', run: 2, success: true, staleAction: false, mcpCalls: { brain_sync: 1 } },

@@ -15,7 +15,7 @@ reported as **not measured**.
 | S1 | **A decision changed today** | New endpoints use bearer tokens; the "cookie session" note is out of date | Hidden test: logout revokes the token and sets no cookie |
 | S2 | **Two sessions on overlapping work** | A session is rewriting `lib/price.js` on branch `a/currency` right now | Hidden test **and** `git merge-tree` against `a/currency`: a conflict fails the run |
 | S3 | **A note left by a session that has ended** | Run `backfill:emails` before `migrate:002` | Hidden test: the backfill is in the plan, before the migration |
-| S4 | **Another vendor's session found the root cause** | The cache key must include the user id; the cache lifetime is fine | Hidden test: users are isolated **and** a user's own profile stays cached |
+| S4 | **Another vendor's session found the root cause** | In production the CDN strips `x-user-id`, so the cache must key on `req.session.uid`; the cache lifetime is fine. Nothing in the repo shows this, and its tests pass | Hidden test: behind the CDN users are isolated **and** a user's own profile stays cached |
 
 Each scenario also records whether the agent **acted on stale information**
 (used the legacy cookie helper, wrote a conflicting change, ran the migration

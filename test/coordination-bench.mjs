@@ -62,10 +62,13 @@ for (const s of SCENARIOS.filter(applies)) {
       s.oracle[which](repo);
       repo.commitAll(`oracle ${which}`);
       for (const [rel, text] of Object.entries(s.hidden)) repo.write(rel, text);
-      const g = s.grade(repo);
+      const g = s.grade(repo, { finalMessage: s.oracle[`${which}Message`] || '' });
       if (which === 'good') ok(g.success === true && g.staleAction === false, `B1 ${s.id}: the correct answer passes the hidden test and is not flagged stale`);
       else ok(g.success === false && g.staleAction === true, `B1 ${s.id}: the naive answer fails and is flagged as acting on stale information`);
-      if (s.id === 's2-overlapping-work') ok(g.collision === (which === 'naive'), `B1 ${s.id}: git merge-tree reports a conflict only for the naive answer (${which})`);
+      if (s.id === 's2-overlapping-work') {
+        ok(g.collision === (which === 'naive'), `B1 ${s.id}: git merge-tree reports a conflict only for the naive answer (${which})`);
+        ok(g.handled === (which === 'good'), `B1 ${s.id}: "handled" is true when merged, false when the conflict is neither avoided nor named (${which})`);
+      }
     } finally { repo.remove(); }
   }
 }
@@ -74,18 +77,32 @@ for (const s of SCENARIOS.filter(applies)) {
 const runnable = CONDITIONS.filter((c) => c.runnable);
 ok(runnable.map((c) => c.id).join(',') === 'none,relay,agents-md-kept,agents-md-appended,klypix', 'B2: five conditions are runnable on any machine');
 ok(CONDITIONS.filter((c) => !c.runnable).every((c) => c.reason && c.reason.length > 20), 'B2: every planned condition says why it is not measured');
+// Which channel can carry each scenario's knowledge — stated up front, so a
+// broken channel cannot pass as "nothing delivered, fail expected". The
+// appended notes file keeps the stale WIP line in S5, so it delivers nothing
+// there; everything else that applies delivers.
+const expectDelivered = (s, c) => {
+  if (c.id === 'none') return false;
+  if (s.id === 's5-stale-wip-note' && c.id === 'agents-md-appended') return false;
+  return true;
+};
 const rows = [];
 for (const s of SCENARIOS.filter(applies)) {
   for (const c of runnable) {
+    if (s.notApplicable?.[c.id]) continue;
     const r = await runOne({ scenario: s, condition: c, agent: oracle, run: 1, timeoutMs: 60_000 });
     rows.push(r);
-    const expectPass = c.id !== 'none';
-    ok(r.error === null && r.success === expectPass && r.staleAction === !expectPass && r.delivered === (expectPass ? s.facts.length : 0),
+    const expectPass = expectDelivered(s, c);
+    ok(r.error === null && r.success === expectPass && r.staleAction === !expectPass && r.delivered === (expectPass ? r.facts : 0) && r.invalid !== true,
       `B2 ${s.id} × ${c.id}: ${expectPass ? 'facts delivered (read back) → pass' : 'nothing delivered → fail, stale action'}${r.error ? ` — ${r.error.split('\n')[0]}` : ''}`);
   }
 }
 ok(rows.filter((r) => r.condition === 'relay').every((r) => r.relays === r.facts) && rows.filter((r) => r.condition !== 'relay').every((r) => r.relays === 0),
   'B2: only the copy-paste condition counts human relays');
+ok(SCENARIOS.find((s) => s.id === 's6-fact-arrives-mid-task').notApplicable.relay.length > 10 && rows.every((r) => !(r.scenario.startsWith('s6') && r.condition === 'relay')),
+  'B2: S6 declares why a copy-paste at start cannot apply, and the runner never runs that cell');
+ok(rows.filter((r) => r.scenario.startsWith('s6') && r.condition !== 'none').every((r) => Number.isFinite(r.laterFiredAtMs) && r.laterFiredAtMs < 5_000 && r.delivered === 1),
+  'B2: S6\'s mid-task fact is carried by the later() hook (at once for the oracle) and read back');
 
 // ── B3: KLYPIX delivery through the real MCP server ─────────────────────────
 const klypix = conditionById('klypix');
@@ -102,15 +119,24 @@ const expectations = {
   's3-note-from-closed-session': [(sc) => /backfill:emails/.test(hitsText(sc)) && /migrate:002/.test(hitsText(sc)),
     'its context carries the finding the ended session left in the brain'],
   's4-root-cause-from-other-vendor': [(sc) => /req\.session\.uid/.test(hitsText(sc)) && /CDN/.test(hitsText(sc)), 'its context carries the other vendor\'s root cause'],
+  's5-stale-wip-note': [(sc) => !(sc.peers || []).some((p) => p.id === 'actor-s5-report') && !/WIP|do not touch/i.test(hitsText(sc)),
+    'no row on the lane and no card say anyone is on lib/report.js — the ended session left nothing stale'],
+  's6-fact-arrives-mid-task': [(sc) => !/MINOR units/.test(hitsText(sc)) && !(sc.messages || []).some((m) => /MINOR units/.test(m.text || '')),
+    'at start, nothing yet says how amounts are displayed (the decision comes later)'],
+  's7-decision-buried-in-history': [(sc) => {
+    const t = hitsText(sc);
+    return /NOT retried/.test(t) && (!/retry failed webhook deliveries 3 times/.test(t) || t.indexOf('NOT retried') < t.indexOf('retry failed webhook deliveries 3 times'));
+  }, 'its context leads with the no-retry decision, ahead of the archived retry rule, out of forty cards'],
+  's8-partner-limit-not-in-repo': [(sc) => /24 characters/.test(hitsText(sc)), 'its context carries the partner limit no file holds'],
 };
-const syncAs = async (server, repo, sessionId, task) => {
+const syncAs = async (server, repo, sessionId, task, phase = 'start') => {
   const c = new Client({ name: 'cobench-agent', version: '1.0.0' }, { capabilities: {} });
   await c.connect(new StdioClientTransport({
     command: server.command, args: server.args, cwd: repo.dir, stderr: 'pipe',
     env: { ...process.env, ...server.env, ...(sessionId ? { KLYPIX_SESSION_ID: sessionId } : {}) },
   }));
   try {
-    const res = await c.callTool({ name: 'brain_sync', arguments: { project: repo.dir, phase: 'start', intent: task.slice(0, 160), include_context: true } });
+    const res = await c.callTool({ name: 'brain_sync', arguments: { project: repo.dir, phase, intent: task.slice(0, 160), include_context: true } });
     return { isError: !!res.isError, sc: res.structuredContent || {} };
   } finally { try { await c.close(); } catch { /* */ } }
 };
@@ -136,6 +162,20 @@ for (const s of SCENARIOS) {
     const { isError, sc } = await syncAs(server, repo, null, s.task);
     const [check, what] = expectations[s.id];
     ok(!isError && check(sc), `B3 ${s.id}: the agent's first brain_sync — ${what}`);
+    if (s.id === 's6-fact-arrives-mid-task') {
+      // The decision is made while the agent works: a card plus a broadcast
+      // note. The agent's NEXT sync (same session, so its lane row is live)
+      // carries it — as the note, or as context.
+      const out = await klypix.later({ repo, scenario: s, sessionIds });
+      ok(out.delivered.length === 1, `B3 ${s.id}: the mid-task decision is written as a card and read back`);
+      const next = await syncAs(server, repo, null, s.task, 'checkpoint');
+      const seen = (next.sc.messages || []).some((m) => /MINOR units/.test(m.text || '')) || /MINOR units/.test(hitsText(next.sc));
+      ok(!next.isError && seen, `B3 ${s.id}: the agent's next brain_sync hands it the decision (note or context)`);
+    }
+    if (s.id === 's7-decision-buried-in-history') {
+      const { struct } = await parseKlypix(fs.readFileSync(path.join(repo.dir, 'brain.klypix')));
+      ok(struct.cards.length >= 26, `B3 ${s.id}: the brain is as cluttered as the file — ${struct.cards.length} cards, the history included`);
+    }
   } catch (err) {
     ok(false, `B3 ${s.id}: ${String(err?.message || err).split('\n')[0]}`);
   } finally {
@@ -163,6 +203,14 @@ const md = toMarkdown(summarize(synthetic));
 ok(/A decision changed today: KLYPIX 95% vs none 15%/.test(md) && !/A note left by a session that has ended: KLYPIX/.test(md),
   'B4: the report calls the 20-run gap a difference and the 3-run gap a tie');
 ok(/## Not measured/.test(md) && /MCP Agent Mail/.test(md), 'B4: the report lists the tools it did not measure, with the reason');
+const naMd = toMarkdown(summarize([
+  { scenario: 's6-fact-arrives-mid-task', condition: 'relay', agent: 'claude', run: 1, notApplicable: 'a paste at start cannot carry it', success: false, staleAction: false },
+  { scenario: 's2-overlapping-work', condition: 'klypix', agent: 'claude', run: 1, success: false, staleAction: true, handled: true },
+  { scenario: 's2-overlapping-work', condition: 'klypix', agent: 'claude', run: 2, success: true, staleAction: false, handled: true },
+  { scenario: 's2-overlapping-work', condition: 'klypix', agent: 'claude', run: 3, success: false, staleAction: true, handled: false, mcpCalls: { brain_sync: 1 } },
+]));
+ok(/n\/a: a paste at start cannot carry it/.test(naMd), 'B4: a condition a scenario cannot apply to prints as n/a with its reason, never as 0%');
+ok(/\| 2\/3 \| —/.test(naMd) && /Handled overlap/.test(naMd), 'B4: the "handled overlap" column counts a flagged conflict beside the strict grade (2/3)');
 
 // ── B5: live-run safety (no model call) ─────────────────────────────────────
 {

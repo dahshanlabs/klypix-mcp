@@ -44,16 +44,24 @@ function run(cli, args, { cwd, env, timeoutMs, input }) {
   return new Promise((resolve) => {
     const started = Date.now();
     let timedOut = false;
+    // When the agent last acted (a tool call, a command, a file change), from
+    // the stream's own timing. A fact injected after this moment could not
+    // have changed the outcome, and the run says so instead of blaming the channel.
+    let lastToolAtMs = null;
     const child = spawn(cli.command, [...cli.prefix, ...args], { cwd, env, windowsHide: true, detached: process.platform !== 'win32' });
     let stdout = ''; let stderr = '';
-    child.stdout.on('data', (d) => { stdout += d; if (stdout.length > 8e6) stdout = stdout.slice(-8e6); });
+    child.stdout.on('data', (d) => {
+      stdout += d;
+      if (/"tool_use"|"item\.started"|"mcp_tool_call"|"command_execution"|"file_change"/.test(String(d))) lastToolAtMs = Date.now() - started;
+      if (stdout.length > 8e6) stdout = stdout.slice(-8e6);
+    });
     child.stderr.on('data', (d) => { stderr += d; if (stderr.length > 2e6) stderr = stderr.slice(-2e6); });
     const timer = setTimeout(() => { timedOut = true; killTree(child); }, timeoutMs);
     child.stdin.on('error', () => { /* the agent may exit before reading */ });
     if (input != null) child.stdin.write(input);
     child.stdin.end();
-    child.on('close', (code) => { clearTimeout(timer); resolve({ code, stdout, stderr, durationMs: Date.now() - started, timedOut }); });
-    child.on('error', (err) => { clearTimeout(timer); resolve({ code: -1, stdout, stderr: String(err), durationMs: Date.now() - started, timedOut }); });
+    child.on('close', (code) => { clearTimeout(timer); resolve({ code, stdout, stderr, durationMs: Date.now() - started, timedOut, lastToolAtMs }); });
+    child.on('error', (err) => { clearTimeout(timer); resolve({ code: -1, stdout, stderr: String(err), durationMs: Date.now() - started, timedOut, lastToolAtMs }); });
   });
 }
 
@@ -96,9 +104,11 @@ export const oracle = {
   available: () => true,
   async version() { return 'oracle'; },
   async run({ repo, scenario, delivered }) {
-    const all = scenario.facts.every((f) => delivered.includes(f.id));
+    const facts = [...scenario.facts, ...(scenario.later?.facts || [])];
+    const all = facts.every((f) => delivered.includes(f.id));
     (all ? scenario.oracle.good : scenario.oracle.naive)(repo);
-    return { ok: true, costUsd: 0, tokens: null, turns: 0, durationMs: 0, model: null, note: all ? 'used the facts' : 'facts not delivered' };
+    const note = all ? 'used the facts' : 'facts not delivered';
+    return { ok: true, costUsd: 0, tokens: null, turns: 0, durationMs: 0, model: null, note, finalMessage: scenario.oracle[all ? 'goodMessage' : 'naiveMessage'] || note, lastToolAtMs: 0 };
   },
 };
 
@@ -151,6 +161,9 @@ export function parseClaudeResult(stdout) {
     permissionDenials: Array.isArray(out?.permission_denials) ? out.permission_denials.length : null,
     mcpCalls,
     channelUp,
+    // What the agent told its user at the end — a grader may read it (a flagged
+    // conflict is not the same as an unnoticed one).
+    finalMessage: typeof out?.result === 'string' ? out.result : null,
   };
 }
 
@@ -182,7 +195,7 @@ export const claude = {
     return {
       ok: r.code === 0 && !r.timedOut && !p.resultError && p.channelUp !== false,
       costUsd: p.costUsd, tokens: p.tokens, turns: p.turns, model: p.model, permissionDenials: p.permissionDenials, mcpCalls: p.mcpCalls,
-      channelUp: p.channelUp,
+      channelUp: p.channelUp, finalMessage: p.finalMessage, lastToolAtMs: r.lastToolAtMs,
       raw: { stdout: r.stdout, stderr: r.stderr },
       durationMs: r.durationMs,
       timedOut: r.timedOut,
@@ -251,12 +264,13 @@ export function codexChannelUp(serverNames = [], mcpCalls = {}, stderr = '') {
 }
 
 export function parseCodexEvents(stdout) {
-  let tokens = null; let turns = 0; let model = null; let failure = null;
+  let tokens = null; let turns = 0; let model = null; let failure = null; let finalMessage = null;
   const mcpCalls = {};
   for (const line of String(stdout).split('\n')) {
     let ev; try { ev = JSON.parse(line); } catch { continue; }
     const type = String(ev?.type || ev?.msg?.type || '');
     if (type === 'item.completed' && ev.item?.type === 'mcp_tool_call') bump(mcpCalls, String(ev.item.tool || 'unknown'));
+    if (type === 'item.completed' && ev.item?.type === 'agent_message' && typeof ev.item.text === 'string') finalMessage = ev.item.text;
     const usage = ev?.usage || ev?.msg?.usage || ev?.info?.total_token_usage;
     if (usage) tokens = Number(usage.input_tokens || 0) + Number(usage.output_tokens || 0) + Number(usage.cached_input_tokens || 0);
     if (/turn\.completed|task_complete/.test(type)) turns++;
@@ -264,7 +278,7 @@ export function parseCodexEvents(stdout) {
     const m = ev?.model || ev?.msg?.model || ev?.session?.model;
     if (typeof m === 'string' && m) model = m;
   }
-  return { tokens, turns: turns || null, model, failure, mcpCalls };
+  return { tokens, turns: turns || null, model, failure, mcpCalls, finalMessage };
 }
 
 export const codex = {
@@ -286,6 +300,7 @@ export const codex = {
       costUsd: null,   // Codex reports tokens, not dollars
       // Codex's event stream does not name the model; the row records the pinned one.
       tokens: p.tokens, turns: p.turns, model: p.model || model, mcpCalls: p.mcpCalls, channelUp,
+      finalMessage: p.finalMessage, lastToolAtMs: r.lastToolAtMs,
       raw: { stdout: r.stdout, stderr: r.stderr },
       durationMs: r.durationMs,
       timedOut: r.timedOut,

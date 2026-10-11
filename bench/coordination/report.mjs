@@ -21,11 +21,14 @@ export function summarize(rows) {
   const cells = [];
   for (const [key, all] of groups) {
     const [scenario, condition, agent] = key.split('|');
-    // A run whose channel never came up measured nothing about it: shown as
-    // invalid, never counted as a pass or a fail.
-    const rs = all.filter((r) => !r.invalid);
-    const invalidRuns = all.length - rs.length;
-    if (!rs.length) { cells.push({ scenario, condition, agent, n: 0, invalidRuns, success: { k: 0, ...wilson(0, 0) }, staleActions: { k: 0, ...wilson(0, 0) }, relaysPerTask: 0, medianCostUsd: null, medianTokens: null, medianMinutes: null, errors: 0, consulted: 0, versions: [], models: [] }); continue; }
+    // A run whose channel never came up, or whose mid-task fact landed after
+    // the agent's last action, measured nothing about the channel: shown as
+    // invalid, never counted as a pass or a fail. A condition the scenario
+    // cannot apply to is shown as n/a with its reason.
+    const na = all.find((r) => r.notApplicable)?.notApplicable || null;
+    const rs = all.filter((r) => !r.invalid && !r.notApplicable);
+    const invalidRuns = all.filter((r) => r.invalid).length;
+    if (!rs.length) { cells.push({ scenario, condition, agent, n: 0, invalidRuns, notApplicable: na, success: { k: 0, ...wilson(0, 0) }, staleActions: { k: 0, ...wilson(0, 0) }, relaysPerTask: 0, medianCostUsd: null, medianTokens: null, medianMinutes: null, errors: 0, consulted: 0, handled: 0, handledKnown: 0, versions: [], models: [] }); continue; }
     const n = rs.length;
     const ok = rs.filter((r) => r.success).length;
     const stale = rs.filter((r) => r.staleAction).length;
@@ -41,6 +44,11 @@ export function summarize(rows) {
       errors,
       // Runs in which the agent called the condition's MCP server at all.
       consulted: rs.filter((r) => r.mcpCalls && Object.keys(r.mcpCalls).length > 0).length,
+      // Scenarios that define it (S2): the overlap was handled — merged away,
+      // or named in the agent's final message. A flagged conflict is not an
+      // unnoticed one, even when the strict grade fails it.
+      handled: rs.filter((r) => r.handled === true).length,
+      handledKnown: rs.filter((r) => r.handled === true || r.handled === false).length,
       versions: [...new Set(rs.map((r) => r.versions).filter(Boolean))],
       models: [...new Set(rs.map((r) => r.model).filter(Boolean))],
     });
@@ -60,12 +68,13 @@ export function toMarkdown(cells) {
     out.push(`## Agent: ${agent}`, '');
     if (versions.length || models.length) out.push(`${versions.length ? `CLI: ${versions.join(', ')}` : ''}${versions.length && models.length ? ' · ' : ''}${models.length ? `model: ${models.join(', ')}` : ''}`, '');
     if (agent === 'oracle') out.push('> **Dry run — not a result.** The scripted oracle answers correctly whenever the facts were delivered. These rows prove the graders and the delivery, never how an agent behaves.', '');
-    out.push( '| Scenario | Condition | n | Success (95% CI) | Acted on stale info | Human relays / task | Agent consulted KLYPIX | Median cost | Median min |', '|---|---|---|---|---|---|---|---|---|');
+    out.push( '| Scenario | Condition | n | Success (95% CI) | Acted on stale info | Human relays / task | Agent consulted KLYPIX | Handled overlap | Median cost | Median min |', '|---|---|---|---|---|---|---|---|---|---|');
     for (const s of SCENARIOS) {
       for (const c of CONDITIONS) {
         const cell = cells.find((x) => x.agent === agent && x.scenario === s.id && x.condition === c.id);
         if (!cell) continue;
-        out.push(`| ${s.title} | ${c.label} | ${cell.n}${cell.invalidRuns ? ` (+${cell.invalidRuns} invalid)` : ''} | ${pct(cell.success.p)} (${pct(cell.success.low)}–${pct(cell.success.high)}) | ${cell.staleActions.k}/${cell.n} | ${cell.relaysPerTask.toFixed(1)} | ${c.id === 'klypix' ? `${cell.consulted}/${cell.n}` : '—'} | ${cell.medianCostUsd == null ? '—' : `$${cell.medianCostUsd.toFixed(2)}`} | ${cell.medianMinutes == null ? '—' : cell.medianMinutes.toFixed(1)} |`);
+        if (cell.notApplicable) { out.push(`| ${s.title} | ${c.label} | — | n/a: ${cell.notApplicable} | — | — | — | — | — | — |`); continue; }
+        out.push(`| ${s.title} | ${c.label} | ${cell.n}${cell.invalidRuns ? ` (+${cell.invalidRuns} invalid)` : ''} | ${pct(cell.success.p)} (${pct(cell.success.low)}–${pct(cell.success.high)}) | ${cell.staleActions.k}/${cell.n} | ${cell.relaysPerTask.toFixed(1)} | ${c.id === 'klypix' ? `${cell.consulted}/${cell.n}` : '—'} | ${cell.handledKnown ? `${cell.handled}/${cell.handledKnown}` : '—'} | ${cell.medianCostUsd == null ? '—' : `$${cell.medianCostUsd.toFixed(2)}`} | ${cell.medianMinutes == null ? '—' : cell.medianMinutes.toFixed(1)} |`);
       }
     }
     out.push('');

@@ -15,7 +15,24 @@ reported as **not measured**.
 | S1 | **A decision changed today** | New endpoints use bearer tokens; the "cookie session" note is out of date | Hidden test: logout revokes the token and sets no cookie |
 | S2 | **Two sessions on overlapping work** | A session is rewriting `lib/price.js` on branch `a/currency` right now | Hidden test **and** `git merge-tree` against `a/currency`: a conflict fails the run |
 | S3 | **A note left by a session that has ended** | Run `backfill:emails` before `migrate:002` | Hidden test: the backfill is in the plan, before the migration |
-| S4 | **Another vendor's session found the root cause** | In production the CDN strips `x-user-id`, so the cache must key on `req.session.uid`; the cache lifetime is fine. Nothing in the repo shows this, and its tests pass | Hidden test: behind the CDN users are isolated **and** a user's own profile stays cached |
+| S4 | **Control: a root cause that is in the code after all** | In production the CDN strips `x-user-id`, so the cache must key on `req.session.uid`. Meant to be knowledge from another session; both agents inferred it from the code with no channel (pilot, 2026-10-11). Kept as a **control**: every condition should pass it | Hidden test: behind the CDN users are isolated **and** a user's own profile stays cached |
+
+**Round 2 — what a notes file cannot do by construction.** The pilot showed that when the other
+session has already written one short, correct sentence in the right file before the agent starts,
+a notes file ties KLYPIX. These four keep the same fairness rules but test what a file lacks:
+expiry, arrival during the task, ranking inside a long history, and knowledge that is nowhere in
+the repository.
+
+| | Scenario | What the other session knows | Graded by |
+|---|---|---|---|
+| S5 | **A WIP note that outlived its session** | Nothing — the session that wrote "do not touch `lib/report.js`" two days ago is gone. The knowledge is an **absence**: nobody is on the file. A tidy notes file removed the line; an appended one still carries it; KLYPIX's presence row aged out | Hidden test: the one-line bug is fixed. Leaving the file alone "because someone is on it" is the stale action |
+| S6 | **A decision made while the agent is working** | Nothing at start. **25 s in**, finance settles the display format. The notes file changes on disk under the agent; KLYPIX adds a card and a note the agent gets at its next call. Copy-paste is n/a (a paste at start cannot carry it) | Hidden test: `display` is `"2681 USD"`. A run where the fact landed after the agent's last action is **invalid**, not a fail |
+| S7 | **A decision buried in six weeks of notes** | The September retry rule was reversed late in September; two more weeks of notes followed. The file holds 25 dated lines; the brain holds the same 25 as cards, the reversal linked to what it replaced | Hidden test: a failed send is not retried and lands in the dead-letter queue once |
+| S8 | **A partner limit nothing in the repository shows** | The partner drops request ids over 24 characters — learned from their support, in no file, and the visible tests pass. The symptom ("intermittent 400s") invites retries | Hidden test: ids are ≤ 24 alphanumerics and unique; a retry loop is the stale action |
+
+S2 also gains a **handled-overlap** measure beside the strict grade: a conflict the agent avoided
+*or named in its final message* counts as handled. The pilot's two S2 "failures" were Claude
+declining to merge another session's unfinished branch and saying so.
 
 Each scenario also records whether the agent **acted on stale information**
 (used the legacy cookie helper, wrote a conflicting change, ran the migration
@@ -54,6 +71,13 @@ verified against a pinned version before any number is published.
   write did not land, the run is recorded with `delivered: 0`.
 - Every number is printed with its `n` and a 95% Wilson interval. A difference
   is called out only when the intervals do not overlap; anything else is a tie.
+- A run that measured nothing about its channel is **invalid**, shown beside `n`
+  and left out of the rate: the condition's server never came up, or a mid-task
+  fact landed after the agent's last action (timed from the agent's own output
+  stream). A condition a scenario cannot apply to prints as **n/a** with the reason.
+- Each scenario ships two scripted answers, one that uses the facts and one that
+  does not, and the self-test proves every grader tells them apart before any
+  model is called.
 - Agent CLI versions are recorded on every row.
 
 ## Running it

@@ -25,20 +25,44 @@ const flag = (name) => argv.includes(`--${name}`);
 const opt = (name, def = null) => { const i = argv.indexOf(`--${name}`); return i >= 0 && argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[i + 1] : def; };
 const list = (v, all) => (v ? v.split(',').map((s) => s.trim()).filter(Boolean) : all);
 
+// A fact that arrives after the agent has started could not have changed the
+// outcome if it landed after the agent's last action. Such a run is INVALID
+// (kept, shown, excluded from rates) — the channel is not blamed for an agent
+// that had already finished.
+export const FACT_TOO_LATE = 'fact-arrived-after-last-action';
+
 export async function runOne({ scenario, condition, agent, run, timeoutMs, keep = false, agentOptions = {}, transcriptDir = null }) {
   const repo = makeRepo(`klypix-cobench-${scenario.id.slice(0, 2)}-`);
   // KLYPIX files of this run (lane, registry) live here, never in the user's home.
   const benchHome = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-cobench-home-'));
   const sessionIds = { agent: crypto.randomUUID() };
   const started = Date.now();
+  const totalFacts = scenario.facts.length + (scenario.later?.facts?.length || 0);
   let prep = { relays: 0, delivered: [] };
   let hb = null;
+  let laterTimer = null;
+  const later = { fired: false, firedAtMs: null, delivered: [], error: null };
   try {
     scenario.build(repo);
     prep = await condition.prepare({ repo, scenario, agent, sessionIds, benchHome });
     if (prep.heartbeat) hb = setInterval(() => { try { prep.heartbeat(); } catch { /* */ } }, 60_000);
     const prompt = composePrompt(scenario.task, prep.promptAddendum);
-    const res = await agent.run({ repo, scenario, prompt, mcpServers: prep.mcpServers || {}, sessionId: sessionIds.agent, delivered: prep.delivered || [], timeoutMs, ...agentOptions });
+    const agentStart = Date.now();
+    // A decision made WHILE the agent works: the condition carries it the way it
+    // would in real life (a file edited on disk, a brain card and a note), at
+    // scenario.later.afterMs. The scripted oracle acts instantly, so for it the
+    // fact lands at 0 ms — the dry run proves delivery, not timing.
+    if (scenario.later && typeof condition.later === 'function') {
+      const fire = async () => {
+        try { const out = await condition.later({ repo, scenario, sessionIds, benchHome, prep }); later.delivered = out?.delivered || []; } catch (err) { later.error = String(err?.message || err); }
+        later.fired = true; later.firedAtMs = Date.now() - agentStart;
+      };
+      const afterMs = agent.id === 'oracle' ? 0 : scenario.later.afterMs;
+      if (afterMs === 0) await fire(); else laterTimer = setTimeout(fire, afterMs);
+    }
+    const delivered = [...(prep.delivered || []), ...later.delivered];
+    const res = await agent.run({ repo, scenario, prompt, mcpServers: prep.mcpServers || {}, sessionId: sessionIds.agent, delivered, timeoutMs, ...agentOptions });
+    if (laterTimer) { clearTimeout(laterTimer); laterTimer = null; }
     if (transcriptDir && res.raw) {
       // The agent's own output, kept so any published number can be audited run by run.
       fs.mkdirSync(transcriptDir, { recursive: true });
@@ -48,18 +72,24 @@ export async function runOne({ scenario, condition, agent, run, timeoutMs, keep 
     }
     commitAgentWork(repo, 'bench: agent work (uncommitted remainder)');
     for (const [rel, text] of Object.entries(scenario.hidden)) repo.write(rel, text);
-    const g = scenario.grade(repo);
+    const g = scenario.grade(repo, { finalMessage: res.finalMessage || '' });
+    const factTooLate = !!scenario.later && agent.id !== 'oracle'
+      && (!later.fired || (res.lastToolAtMs != null && later.firedAtMs > res.lastToolAtMs));
+    const error = res.error || (factTooLate ? FACT_TOO_LATE : null);
     return {
       scenario: scenario.id, condition: condition.id, agent: agent.id, run,
-      success: !!g.success, staleAction: !!g.staleAction, collision: g.collision,
-      relays: prep.relays || 0, delivered: (prep.delivered || []).length, facts: scenario.facts.length,
-      agentOk: res.ok, model: res.model ?? null, permissionDenials: res.permissionDenials ?? null, mcpCalls: res.mcpCalls ?? null, channelUp: res.channelUp ?? null, invalid: res.error === CHANNEL_DOWN, costUsd: res.costUsd ?? null, tokens: res.tokens ?? null, turns: res.turns ?? null,
+      success: !!g.success, staleAction: !!g.staleAction, collision: g.collision, handled: g.handled ?? null,
+      relays: prep.relays || 0, delivered: [...(prep.delivered || []), ...later.delivered].length, facts: totalFacts,
+      ...(scenario.later ? { laterFiredAtMs: later.firedAtMs, lastToolAtMs: res.lastToolAtMs ?? null, laterError: later.error } : {}),
+      agentOk: res.ok, model: res.model ?? null, permissionDenials: res.permissionDenials ?? null, mcpCalls: res.mcpCalls ?? null, channelUp: res.channelUp ?? null,
+      invalid: error === CHANNEL_DOWN || error === FACT_TOO_LATE, costUsd: res.costUsd ?? null, tokens: res.tokens ?? null, turns: res.turns ?? null,
       durationMs: res.durationMs ?? (Date.now() - started), timedOut: !!res.timedOut,
-      error: res.error || null, keptRepo: keep ? repo.dir : null,
+      error, keptRepo: keep ? repo.dir : null,
     };
   } catch (err) {
-    return { scenario: scenario.id, condition: condition.id, agent: agent.id, run, success: false, staleAction: false, collision: null, relays: prep.relays || 0, delivered: 0, facts: scenario.facts.length, agentOk: false, costUsd: null, tokens: null, turns: null, durationMs: Date.now() - started, timedOut: false, error: String(err?.stack || err).slice(0, 800), keptRepo: keep ? repo.dir : null };
+    return { scenario: scenario.id, condition: condition.id, agent: agent.id, run, success: false, staleAction: false, collision: null, handled: null, relays: prep.relays || 0, delivered: 0, facts: totalFacts, agentOk: false, costUsd: null, tokens: null, turns: null, durationMs: Date.now() - started, timedOut: false, error: String(err?.stack || err).slice(0, 800), keptRepo: keep ? repo.dir : null };
   } finally {
+    if (laterTimer) clearTimeout(laterTimer);
     if (hb) clearInterval(hb);
     try { prep.cleanup?.(); } catch { /* */ }
     if (!keep) repo.remove();
@@ -100,10 +130,17 @@ async function main() {
   for (const a of agents) versions[a.id] = await a.version();
   const results = [];
   for (const scenario of scenarios) for (const condition of runnable) for (const agent of agents) for (let run = 1; run <= runs; run++) {
-    const r = await runOne({ scenario, condition, agent, run, timeoutMs, keep: flag('keep'), agentOptions: agentOptionsFor(agent), transcriptDir: opt('transcripts', null) });
+    // A condition a scenario cannot apply to (a copy-paste at start cannot
+    // carry a decision made later) is recorded as such, never as a fail.
+    const notApplicable = scenario.notApplicable?.[condition.id] || null;
+    const r = notApplicable
+      ? { scenario: scenario.id, condition: condition.id, agent: agent.id, run, notApplicable, success: false, staleAction: false, collision: null, handled: null, relays: 0, delivered: 0, facts: scenario.facts.length + (scenario.later?.facts?.length || 0), agentOk: null, costUsd: null, tokens: null, turns: null, durationMs: 0, timedOut: false, error: null, keptRepo: null }
+      : await runOne({ scenario, condition, agent, run, timeoutMs, keep: flag('keep'), agentOptions: agentOptionsFor(agent), transcriptDir: opt('transcripts', null) });
     r.versions = versions[agent.id];
     results.push(r);
-    console.log(`${r.success ? 'PASS' : 'fail'}  ${scenario.id}  ${condition.id}  ${agent.id}#${run}${r.staleAction ? '  stale-action' : ''}${r.collision ? '  merge-conflict' : ''}${r.error ? `  error: ${r.error.split('\n')[0].slice(0, 120)}` : ''}`);
+    console.log(notApplicable
+      ? `n/a   ${scenario.id}  ${condition.id}  ${agent.id}#${run}  (${notApplicable})`
+      : `${r.success ? 'PASS' : 'fail'}  ${scenario.id}  ${condition.id}  ${agent.id}#${run}${r.staleAction ? '  stale-action' : ''}${r.collision ? '  merge-conflict' : ''}${r.handled === true && !r.success ? '  handled(flagged)' : ''}${r.error ? `  error: ${r.error.split('\n')[0].slice(0, 120)}` : ''}`);
     if (out) fs.appendFileSync(out, `${JSON.stringify({ ...r, at: new Date().toISOString() })}\n`);
   }
   if (!out) process.stdout.write(`${JSON.stringify(results)}\n`);

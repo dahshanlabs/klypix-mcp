@@ -13,13 +13,22 @@
 //   heartbeat()     keep a scripted live peer fresh during a long agent run
 //   cleanup()       remove anything written outside the temp repo
 // later(ctx) carries scenario.later.facts the way the channel would while the
-//   agent is already working, and returns { delivered } read back the same way.
+//   agent is already working, and returns { delivered, notePosted } read back
+//   the same way.
 //
 // Facts come in two shapes. `text` is the sentence the other session would
 // write (a note line, a brain card). `text: null` is an ABSENCE: the right
 // state of the channel is a stale line gone / no presence row, and there is
 // nothing to write (S5). `relayText` is what a human says when pasting;
 // `insertAfterLine` is where a dated log keeps the note (default: the end).
+//
+// One rule for stale lines, applied to every condition that touches the
+// notes file: a stale DECISION stays in the file for the KLYPIX condition
+// (conservative — a KLYPIX team's file may well still carry it, and the
+// brain's current card has to beat it), but an ABSENCE's stale line (a
+// session's "WIP, do not touch") never was a note in a KLYPIX team: work in
+// progress is presence there, so the KLYPIX condition strips it, the tidy
+// file condition strips it, and the appended file keeps it.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -41,13 +50,28 @@ const writeInstructions = (repo, text) => {
 const spoken = (f) => f.text ?? f.relayText ?? null;
 const noteLine = (f) => `- ${f.text}`;
 const compactText = (t) => String(t || '').replace(/\s+/g, ' ');
+const allFacts = (scenario) => [...(scenario.facts || []), ...(scenario.later?.facts || [])];
+
+/**
+ * Where the appended-notes condition would be byte-identical to another
+ * condition it is not a measurement, only a replicate at full cost:
+ *   - no fact has a stale line → identical to "kept tidy";
+ *   - only absences → it appends nothing → identical to "no channel".
+ * Scenarios may also declare notApplicable themselves (S6 for relay).
+ */
+export function appendedNotApplicable(scenario) {
+  const facts = allFacts(scenario);
+  if (!facts.some((f) => f.staleLine)) return 'no stale line to keep — the notes file is identical to the kept-tidy condition';
+  if (!facts.some((f) => f.text != null)) return 'nothing to append — the notes file is identical to the no-channel condition';
+  return null;
+}
 
 const none = {
   id: 'none',
   label: 'No shared channel',
   runnable: true,
   async prepare() { return { relays: 0, delivered: [] }; },
-  async later() { return { delivered: [] }; },
+  async later() { return { delivered: [], notePosted: null }; },
 };
 
 const relay = {
@@ -64,7 +88,7 @@ const relay = {
   },
   // A paste at start cannot carry a decision made later; scenarios that have
   // one declare relay notApplicable, and the runner never reaches this.
-  async later() { return { delivered: [] }; },
+  async later() { return { delivered: [], notePosted: null }; },
 };
 
 // ── The notes file ───────────────────────────────────────────────────────────
@@ -92,41 +116,44 @@ const mdDelivered = (text, facts) => facts
   .filter((f) => (f.text == null ? !!f.staleLine && !text.includes(f.staleLine) : text.includes(f.text)))
   .map((f) => f.id);
 
-const makeNotesCondition = (id, label, replaceStale, commitMessage) => ({
+const makeNotesCondition = (id, label, replaceStale) => ({
   id,
   label,
   runnable: true,
   async prepare({ repo, scenario }) {
     const text = mdApply(repo, scenario.facts, { replaceStale });
-    repo.commitAll(commitMessage);
+    // Commit only when the file changed, under a neutral message: git history
+    // must not announce another session's activity to the agent.
+    repo.commitIfChanged('notes');
     return { relays: 0, delivered: mdDelivered(text, scenario.facts) };
   },
   // Mid-task: the file changes on disk under the agent, as it does when two
   // sessions share one checkout. Not committed — the agent owns the index.
   async later({ repo, scenario }) {
     const text = mdApply(repo, scenario.later.facts, { replaceStale });
-    return { delivered: mdDelivered(text, scenario.later.facts) };
+    return { delivered: mdDelivered(text, scenario.later.facts), notePosted: null };
   },
 });
 
-const agentsMdKept = makeNotesCondition('agents-md-kept', 'AGENTS.md / CLAUDE.md, kept tidy (stale line replaced)', true, 'notes: other session updated the project notes');
-const agentsMdAppended = makeNotesCondition('agents-md-appended', 'AGENTS.md / CLAUDE.md, appended (stale line kept)', false, 'notes: other session appended to the project notes');
+const agentsMdKept = makeNotesCondition('agents-md-kept', 'AGENTS.md / CLAUDE.md, kept tidy (stale line replaced)', true);
+const agentsMdAppended = makeNotesCondition('agents-md-appended', 'AGENTS.md / CLAUDE.md, appended (stale line kept)', false);
 
 // ── KLYPIX (MCP only) ────────────────────────────────────────────────────────
 // The other session's knowledge lives where a real session using KLYPIX puts
 // it: decisions and findings as brain cards (a replaced decision archived with
 // a 'superseded by' edge; the same dated history the file has, as cards), and
-// live work as a lane presence row — which ages out when the session is gone,
-// so an ended session's "WIP" leaves no row (S5). A session that has ended
-// leaves its finding as a card too: the mailbox reaches only a session the
-// sender already knew, and the agent under test is a brand-new session (on
-// Codex its server even takes Codex's own thread id). A decision made while
-// the agent works (S6) becomes a card and a broadcast note that the agent's
-// server hands over at its next call. The agent gets the klypix-mcp server from
-// THIS checkout in plugin mode (no self-update, no settings writes) and the
-// project rules `klypix link` writes. Hooks are NOT installed: this is the
-// MCP-only path every MCP host gets — conservative for Claude Code, where the
-// hooks would also inject the brief.
+// live work as a lane presence row. An ENDED session's row is written as it
+// was and left to the product's own expiry (S5): the lane file still holds it,
+// the active list does not. A session that has ended leaves its finding as a
+// card too: the mailbox reaches only a session the sender already knew, and
+// the agent under test is a brand-new session (on Codex its server even takes
+// Codex's own thread id). A decision made while the agent works (S6) becomes
+// a card and a broadcast note that the agent's server hands over at its next
+// call. The agent gets the klypix-mcp server from THIS checkout in plugin
+// mode (no self-update, no settings writes) and the project rules
+// `klypix link` writes. Hooks are NOT installed: this is the MCP-only path
+// every MCP host gets — conservative for Claude Code, where the hooks would
+// also inject the brief.
 const klypix = {
   id: 'klypix',
   label: 'KLYPIX (brain + lane, MCP only)',
@@ -141,12 +168,14 @@ const klypix = {
     const home = benchHome || os.homedir();
     const facts = scenario.facts;
     const written = facts.filter((f) => f.text != null);
+    const absences = facts.filter((f) => f.text == null && f.staleLine);
     // A replaced DECISION is archived with a 'superseded by' edge. An absence
-    // (S5) archives nothing: its stale line was a session's work in progress,
-    // which in KLYPIX is presence, not a card — and that presence has aged out.
+    // archives nothing: its stale line was a session's work in progress, which
+    // in KLYPIX is presence, not a card — so it never was in the notes either.
+    if (absences.length) mdApply(repo, absences, { replaceStale: true });
     const stale = facts.filter((f) => f.staleLine && f.text != null);
     const staleTexts = new Set(facts.filter((f) => f.staleLine).map((f) => f.staleLine));
-    // The dated history the notes file carries, as cards — the stale line goes
+    // The dated history the notes file carries, as cards — a stale line goes
     // to Archive with its edge instead, so it is never duplicated.
     const history = (scenario.history || []).filter((line) => !staleTexts.has(line)).map((line) => ({ text: line.replace(/^- /, '') }));
     const areas = [{ title: 'Project', cards: written.length ? written.map((f) => ({ text: f.text })) : [{ text: 'Project brain started.' }] }];
@@ -157,7 +186,6 @@ const klypix = {
     if (stale.length) {
       const { struct } = await parseKlypix(buf);
       for (const f of stale) {
-        if (f.text == null) continue;   // an absence has no replacement card to point at
         const oldCard = struct.cards.find((c) => (c.text || '').includes(f.staleLine.replace(/^- /, '')));
         const newCard = struct.cards.find((c) => (c.text || '').startsWith(f.text.slice(0, 40)));
         if (oldCard && newCard) edges.push({ fromId: oldCard.id, toId: newCard.id, label: 'superseded by' });
@@ -175,13 +203,17 @@ const klypix = {
     repo.commitAll('klypix: project brain and rules');
 
     const actor = scenario.actor || {};
-    const touchActor = () => upsertSession({
-      brainPath, home, now: Date.now(), id: actor.id, client: actor.client || 'claude-code',
+    const actorRow = (now) => upsertSession({
+      brainPath, home, now, id: actor.id, logicalSessionId: actor.id, client: actor.client || 'claude-code',
       branch: actor.branch || null, intent: actor.intent || '', files: actor.files || [],
     });
-    // A live actor is on the lane; one that ended is not (its row has aged out).
+    const touchActor = () => actorRow(Date.now());
+    // A live actor is on the lane. An ended actor's row is written AS IT WAS
+    // (its last touch endedAgoMs ago) and left to the product's expiry — the
+    // absence the agent sees is produced by KLYPIX, not by the bench.
     let liveActor = false;
     if (actor.files && actor.files.length && !actor.closed) { touchActor(); liveActor = true; }
+    if (actor.closed && actor.endedAgoMs) actorRow(Date.now() - actor.endedAgoMs);
 
     // Read back what the channel actually holds (a broken write must show up
     // as "not delivered", not be assumed delivered).
@@ -189,11 +221,20 @@ const klypix = {
     const { struct } = await parseKlypix(fs.readFileSync(brainPath));
     const cardTexts = struct.cards.map((c) => compactText(c.text));
     const actorOnLane = listActiveSessions({ brainPath, home }).some((s) => s.id === actor.id);
+    let actorWritten = true;
+    if (actor.closed && actor.endedAgoMs) {
+      try { actorWritten = JSON.parse(fs.readFileSync(laneFileFor(brainPath, home), 'utf8')).sessions.some((s) => s.id === actor.id); } catch { actorWritten = false; }
+    }
+    const notesText = repo.read('AGENTS.md') || '';
+    const claudeText = repo.read('CLAUDE.md') || '';
     for (const f of facts) {
       if (f.text != null) { if (cardTexts.some((t) => t.includes(f.text.slice(0, 40)))) delivered.add(f.id); continue; }
-      // An absence is delivered when no row and no card say otherwise.
+      // An absence is delivered when the row was written and has expired, and
+      // neither a card nor either instructions file still carries the stale words.
       const staleWords = f.staleLine ? compactText(f.staleLine.replace(/^- /, '')).slice(0, 40) : null;
-      if (!actorOnLane && (!staleWords || !cardTexts.some((t) => t.includes(staleWords)))) delivered.add(f.id);
+      const cardFree = !staleWords || !cardTexts.some((t) => t.includes(staleWords));
+      const fileFree = !f.staleLine || (!notesText.includes(f.staleLine) && !claudeText.includes(f.staleLine));
+      if (actorWritten && !actorOnLane && cardFree && fileFree) delivered.add(f.id);
     }
     // A live actor that is not on the lane delivers nothing: its work in
     // progress is what the agent most needs to see.
@@ -223,14 +264,15 @@ const klypix = {
   },
   // Mid-task: the other session captures its decision (a card) and tells the
   // live sessions (a broadcast note). The card is what is read back; the note
-  // is best effort — it reaches only sessions on the lane, i.e. an agent that
-  // has synced, which is the product's reality.
+  // reaches only sessions on the lane, i.e. an agent that has synced, which is
+  // the product's reality — whether it was posted is recorded, never assumed.
   async later({ repo, scenario, benchHome = null }) {
     const brainPath = path.join(repo.dir, 'brain.klypix');
     const home = benchHome || os.homedir();
     const actor = scenario.actor || {};
     const facts = scenario.later?.facts || [];
     let buf = fs.readFileSync(brainPath);
+    let notePosted = null;
     for (const f of facts) {
       if (f.text == null) continue;
       // appendIntoContainers returns the new zip bytes (addBrainConnections
@@ -238,12 +280,19 @@ const klypix = {
       const out = await appendIntoContainers(buf, { cards: [{ text: f.text }] });
       buf = Buffer.isBuffer(out) ? out : out?.buffer;
       if (!Buffer.isBuffer(buf)) throw new Error('appendIntoContainers returned no bytes');
-      try { postPresenceMessage({ brainPath, home, from: actor.id || 'other-session', to: 'all', text: f.text }); } catch { /* no live recipient yet */ }
+      try {
+        const posted = postPresenceMessage({ brainPath, home, from: actor.id || 'other-session', to: 'all', text: f.text });
+        notePosted = notePosted === false ? false : !!posted?.posted;
+      } catch { notePosted = false; }
     }
-    fs.writeFileSync(brainPath, buf);
+    // Written the way the app writes: whole bytes to a temp name, then one
+    // rename — the agent's own server never sees a half-written brain.
+    const tmp = `${brainPath}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, buf);
+    fs.renameSync(tmp, brainPath);
     const { struct } = await parseKlypix(fs.readFileSync(brainPath));
     const cardTexts = struct.cards.map((c) => compactText(c.text));
-    return { delivered: facts.filter((f) => f.text != null && cardTexts.some((t) => t.includes(f.text.slice(0, 40)))).map((f) => f.id) };
+    return { delivered: facts.filter((f) => f.text != null && cardTexts.some((t) => t.includes(f.text.slice(0, 40)))).map((f) => f.id), notePosted };
   },
 };
 

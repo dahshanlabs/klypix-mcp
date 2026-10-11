@@ -4,6 +4,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { mergeTreeConflicts } from '../../../src/repo-state.mjs';
 
 export function makeRepo(prefix = 'klypix-cobench-') {
@@ -20,8 +21,24 @@ export function makeRepo(prefix = 'klypix-cobench-') {
   };
   const read = (rel) => { try { return fs.readFileSync(path.join(dir, rel), 'utf8'); } catch { return null; } };
   const commitAll = (message) => { git('add', '-A'); git('commit', '-q', '--allow-empty', '-m', message); return git('rev-parse', 'HEAD'); };
+  // A condition that changed nothing must leave no trace: an empty "other
+  // session touched the notes" commit is a cue the agent could read.
+  const commitIfChanged = (message) => { git('add', '-A'); if (!git('status', '--porcelain')) return null; git('commit', '-q', '-m', message); return git('rev-parse', 'HEAD'); };
   const remove = () => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ } };
-  return { dir, git, write, read, commitAll, remove };
+  return { dir, git, write, read, commitAll, commitIfChanged, remove };
+}
+
+/**
+ * Run a small ESM snippet against a module of the repo and capture stdout —
+ * graders judge BEHAVIOUR with it (how many times a sender was called, what a
+ * formatter returned) instead of grepping the agent's source for words.
+ * `body` runs with the imported module bound to `m` and must write to stdout.
+ */
+export function runNodeProbe(dir, moduleRel, body, { timeoutMs = 30_000 } = {}) {
+  const url = pathToFileURL(path.join(dir, moduleRel)).href;
+  const code = `import(${JSON.stringify(url)}).then(async (m) => { ${body} }).catch((e) => { process.stderr.write(String(e && e.stack || e)); process.exit(2); });`;
+  const r = spawnSync(process.execPath, ['--input-type=module', '-e', code], { cwd: dir, encoding: 'utf8', timeout: timeoutMs });
+  return { ok: r.status === 0, stdout: String(r.stdout || '').trim(), stderr: String(r.stderr || '').slice(-500) };
 }
 
 /** Run `node --test` on the given files inside the repo; returns { pass, output }. */

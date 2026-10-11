@@ -16,8 +16,15 @@ import path from 'node:path';
 import readline from 'node:readline';
 import { pathToFileURL } from 'node:url';
 import { SCENARIOS, scenarioById } from './scenarios.mjs';
-import { CONDITIONS, conditionById } from './conditions.mjs';
+import { CONDITIONS, conditionById, appendedNotApplicable } from './conditions.mjs';
 import { agentById, composePrompt, CHANNEL_DOWN } from './agents.mjs';
+
+/** Why a (scenario, condition) cell is not run, or null. */
+export function notApplicableReason(scenario, condition) {
+  if (scenario.notApplicable?.[condition.id]) return scenario.notApplicable[condition.id];
+  if (condition.id === 'agents-md-appended') return appendedNotApplicable(scenario);
+  return null;
+}
 import { makeRepo, commitAgentWork } from './lib/repo.mjs';
 
 const argv = process.argv.slice(2);
@@ -41,7 +48,8 @@ export async function runOne({ scenario, condition, agent, run, timeoutMs, keep 
   let prep = { relays: 0, delivered: [] };
   let hb = null;
   let laterTimer = null;
-  const later = { fired: false, firedAtMs: null, delivered: [], error: null };
+  const later = { fired: false, firing: false, firedAtMs: null, anchor: null, delivered: [], notePosted: null, error: null };
+  let onEvent = null;
   try {
     scenario.build(repo);
     prep = await condition.prepare({ repo, scenario, agent, sessionIds, benchHome });
@@ -49,20 +57,34 @@ export async function runOne({ scenario, condition, agent, run, timeoutMs, keep 
     const prompt = composePrompt(scenario.task, prep.promptAddendum);
     const agentStart = Date.now();
     // A decision made WHILE the agent works: the condition carries it the way it
-    // would in real life (a file edited on disk, a brain card and a note), at
-    // scenario.later.afterMs. The scripted oracle acts instantly, so for it the
-    // fact lands at 0 ms — the dry run proves delivery, not timing.
+    // would in real life (a file edited on disk, a brain card and a note). It is
+    // anchored to the agent's own progress — its FIRST file write, seen in its
+    // output stream — so every condition pays the same: the agent has committed
+    // to an answer built on what it knew, then the world changes. A wall clock
+    // would charge KLYPIX its server start-up inside the window and could land
+    // the fact before the agent's first channel read. If the agent never writes,
+    // the fact lands at scenario.later.fallbackMs and the row says so. The
+    // scripted oracle acts instantly, so for it the fact lands at once — the dry
+    // run proves delivery, not timing.
     if (scenario.later && typeof condition.later === 'function') {
-      const fire = async () => {
-        try { const out = await condition.later({ repo, scenario, sessionIds, benchHome, prep }); later.delivered = out?.delivered || []; } catch (err) { later.error = String(err?.message || err); }
+      const fire = async (anchor) => {
+        if (later.fired || later.firing) return;
+        later.firing = true; later.anchor = anchor;
+        try { const out = await condition.later({ repo, scenario, sessionIds, benchHome, prep }); later.delivered = out?.delivered || []; later.notePosted = out?.notePosted ?? null; } catch (err) { later.error = String(err?.message || err); }
         later.fired = true; later.firedAtMs = Date.now() - agentStart;
       };
-      const afterMs = agent.id === 'oracle' ? 0 : scenario.later.afterMs;
-      if (afterMs === 0) await fire(); else laterTimer = setTimeout(fire, afterMs);
+      if (agent.id === 'oracle') await fire('immediate');
+      else {
+        const fallbackMs = scenario.later.fallbackMs ?? 90_000;
+        laterTimer = setTimeout(() => { fire('fallback'); }, fallbackMs);
+        onEvent = (kind) => { if (kind === 'edit') fire('first-edit'); };
+      }
     }
     const delivered = [...(prep.delivered || []), ...later.delivered];
-    const res = await agent.run({ repo, scenario, prompt, mcpServers: prep.mcpServers || {}, sessionId: sessionIds.agent, delivered, timeoutMs, ...agentOptions });
+    const res = await agent.run({ repo, scenario, prompt, mcpServers: prep.mcpServers || {}, sessionId: sessionIds.agent, delivered, timeoutMs, onEvent, ...agentOptions });
     if (laterTimer) { clearTimeout(laterTimer); laterTimer = null; }
+    // A fire still in flight when the agent exits must finish before grading.
+    for (let i = 0; i < 100 && later.firing && !later.fired; i++) await new Promise((r) => setTimeout(r, 100));
     if (transcriptDir && res.raw) {
       // The agent's own output, kept so any published number can be audited run by run.
       fs.mkdirSync(transcriptDir, { recursive: true });
@@ -79,8 +101,10 @@ export async function runOne({ scenario, condition, agent, run, timeoutMs, keep 
     return {
       scenario: scenario.id, condition: condition.id, agent: agent.id, run,
       success: !!g.success, staleAction: !!g.staleAction, collision: g.collision, handled: g.handled ?? null,
+      ...(g.untouched != null ? { untouched: g.untouched } : {}), ...(g.sendCalls != null ? { sendCalls: g.sendCalls } : {}), ...(g.display != null ? { display: g.display } : {}),
       relays: prep.relays || 0, delivered: [...(prep.delivered || []), ...later.delivered].length, facts: totalFacts,
-      ...(scenario.later ? { laterFiredAtMs: later.firedAtMs, lastToolAtMs: res.lastToolAtMs ?? null, laterError: later.error } : {}),
+      ...(scenario.later ? { laterAnchor: later.anchor, laterFiredAtMs: later.firedAtMs, laterNotePosted: later.notePosted, laterError: later.error } : {}),
+      firstToolAtMs: res.firstToolAtMs ?? null, firstEditAtMs: res.firstEditAtMs ?? null, firstMcpAtMs: res.firstMcpAtMs ?? null, lastToolAtMs: res.lastToolAtMs ?? null,
       agentOk: res.ok, model: res.model ?? null, permissionDenials: res.permissionDenials ?? null, mcpCalls: res.mcpCalls ?? null, channelUp: res.channelUp ?? null,
       invalid: error === CHANNEL_DOWN || error === FACT_TOO_LATE, costUsd: res.costUsd ?? null, tokens: res.tokens ?? null, turns: res.turns ?? null,
       durationMs: res.durationMs ?? (Date.now() - started), timedOut: !!res.timedOut,
@@ -131,8 +155,9 @@ async function main() {
   const results = [];
   for (const scenario of scenarios) for (const condition of runnable) for (const agent of agents) for (let run = 1; run <= runs; run++) {
     // A condition a scenario cannot apply to (a copy-paste at start cannot
-    // carry a decision made later) is recorded as such, never as a fail.
-    const notApplicable = scenario.notApplicable?.[condition.id] || null;
+    // carry a decision made later; an appended notes file byte-identical to
+    // another condition) is recorded as such, never as a fail — and never run.
+    const notApplicable = notApplicableReason(scenario, condition);
     const r = notApplicable
       ? { scenario: scenario.id, condition: condition.id, agent: agent.id, run, notApplicable, success: false, staleAction: false, collision: null, handled: null, relays: 0, delivered: 0, facts: scenario.facts.length + (scenario.later?.facts?.length || 0), agentOk: null, costUsd: null, tokens: null, turns: null, durationMs: 0, timedOut: false, error: null, keptRepo: null }
       : await runOne({ scenario, condition, agent, run, timeoutMs, keep: flag('keep'), agentOptions: agentOptionsFor(agent), transcriptDir: opt('transcripts', null) });

@@ -25,10 +25,38 @@ the repository.
 
 | | Scenario | What the other session knows | Graded by |
 |---|---|---|---|
-| S5 | **A WIP note that outlived its session** | Nothing — the session that wrote "do not touch `lib/report.js`" two days ago is gone. The knowledge is an **absence**: nobody is on the file. A tidy notes file removed the line; an appended one still carries it; KLYPIX's presence row aged out | Hidden test: the one-line bug is fixed. Leaving the file alone "because someone is on it" is the stale action |
-| S6 | **A decision made while the agent is working** | Nothing at start. **25 s in**, finance settles the display format. The notes file changes on disk under the agent; KLYPIX adds a card and a note the agent gets at its next call. Copy-paste is n/a (a paste at start cannot carry it) | Hidden test: `display` is `"2681 USD"`. A run where the fact landed after the agent's last action is **invalid**, not a fail |
-| S7 | **A decision buried in six weeks of notes** | The September retry rule was reversed late in September; two more weeks of notes followed. The file holds 25 dated lines; the brain holds the same 25 as cards, the reversal linked to what it replaced | Hidden test: a failed send is not retried and lands in the dead-letter queue once |
-| S8 | **A partner limit nothing in the repository shows** | The partner drops request ids over 24 characters — learned from their support, in no file, and the visible tests pass. The symptom ("intermittent 400s") invites retries | Hidden test: ids are ≤ 24 alphanumerics and unique; a retry loop is the stale action |
+| S5 | **A WIP note that outlived its session** | Nothing — the session that wrote "do not touch `lib/report.js`" two days ago is gone. The knowledge is an **absence**: nobody is on the file. A tidy notes file removed the line; an appended one still carries it (so that cell is n/a: identical to no channel); in KLYPIX the session's row was written two days old and the product's own expiry hides it, and the file never held the line (work in progress is presence there). The task names only the symptom, and the stale note offers a path it does not forbid: fix the caller and leave `lib/report.js` alone | Hidden test calls `lib/report.js` directly, so only the root-cause fix passes. "Stale" = the file untouched **and** either a workaround in the caller or a final message citing the note. May be at ceiling (agents may ignore dead notes) — gated by a no-channel pilot before any matrix |
+| S6 | **A decision made while the agent is working** | Nothing at start. **At the agent's first file write** (seen in its own output stream, so every condition pays the same and KLYPIX's start-up is not charged to the window), finance settles the display format. The notes file changes on disk under the agent; KLYPIX adds a card and posts a note the agent gets at its next call (whether it was posted is recorded). Copy-paste is n/a. The fact states the rule with an amount no test uses | Hidden test on an input neither the visible test nor the fact uses: `display` is `"2144 USD"`. "Stale" is judged on what the function returns (a `# Coordination bench
+
+Does a coding agent do the right thing when **another session** — a different
+agent, vendor, or a session that has already ended — knows something it needs?
+
+This kit measures that with real agents on real repos. It is built so the
+numbers can be published: every task is graded by a hidden test, every
+condition faces the same history, and anything that was not measured is
+reported as **not measured**.
+
+## The four scenarios
+
+| | Scenario | What the other session knows | Graded by |
+|---|---|---|---|
+| S1 | **A decision changed today** | New endpoints use bearer tokens; the "cookie session" note is out of date | Hidden test: logout revokes the token and sets no cookie |
+| S2 | **Two sessions on overlapping work** | A session is rewriting `lib/price.js` on branch `a/currency` right now | Hidden test **and** `git merge-tree` against `a/currency`: a conflict fails the run |
+| S3 | **A note left by a session that has ended** | Run `backfill:emails` before `migrate:002` | Hidden test: the backfill is in the plan, before the migration |
+| S4 | **Control: a root cause that is in the code after all** | In production the CDN strips `x-user-id`, so the cache must key on `req.session.uid`. Meant to be knowledge from another session; both agents inferred it from the code with no channel (pilot, 2026-10-11). Kept as a **control**: every condition should pass it | Hidden test: behind the CDN users are isolated **and** a user's own profile stays cached |
+
+**Round 2 — what a notes file cannot do by construction.** The pilot showed that when the other
+session has already written one short, correct sentence in the right file before the agent starts,
+a notes file ties KLYPIX. These four keep the same fairness rules but test what a file lacks:
+expiry, arrival during the task, ranking inside a long history, and knowledge that is nowhere in
+the repository.
+
+| | Scenario | What the other session knows | Graded by |
+|---|---|---|---|
+| S5 | **A WIP note that outlived its session** | Nothing — the session that wrote "do not touch `lib/report.js`" two days ago is gone. The knowledge is an **absence**: nobody is on the file. A tidy notes file removed the line; an appended one still carries it (so that cell is n/a: identical to no channel); in KLYPIX the session's row was written two days old and the product's own expiry hides it, and the file never held the line (work in progress is presence there). The task names only the symptom, and the stale note offers a path it does not forbid: fix the caller and leave `lib/report.js` alone | Hidden test calls `lib/report.js` directly, so only the root-cause fix passes. "Stale" = the file untouched **and** either a workaround in the caller or a final message citing the note. May be at ceiling (agents may ignore dead notes) — gated by a no-channel pilot before any matrix |
+ or a decimal point), not on the source. **Handled** = applied the decision or surfaced it in the final message (it contradicts the user's own wording). A run where the fact landed after the agent's last action, or never landed, is **invalid**, not a fail |
+| S7 | **A decision buried in six months of notes** | The September retry rule was reversed late in September, in the log's own terse register, without naming the rule it replaces; two more weeks of notes followed, including an email sender that *does* retry. The file holds ~330 dated lines (2–3 per working day since April); the brain holds the same ~330 as cards, the reversal linked to what it replaced | Hidden test: a failed send is not retried and lands in the dead-letter queue once (a rethrow is tolerated). "Stale" = the sender was called more than once on failure, counted by running it |
+| S8 | **A partner limit nothing in the repository shows** | The partner drops request ids over 24 characters, with a hyphen, or without the client prefix `p7` — learned from their support, in no file, and the visible tests pass. The prefix is there so no hardening instinct passes by luck. The symptom ("intermittent 400s") invites retries | Hidden test: ids are `p7` + up to 22 alphanumerics and unique. "Stale" = a 400 was retried (the sender called more than once), counted by running it |
 
 S2 also gains a **handled-overlap** measure beside the strict grade: a conflict the agent avoided
 *or named in its final message* counts as handled. The pilot's two S2 "failures" were Claude
@@ -74,7 +102,20 @@ verified against a pinned version before any number is published.
 - A run that measured nothing about its channel is **invalid**, shown beside `n`
   and left out of the rate: the condition's server never came up, or a mid-task
   fact landed after the agent's last action (timed from the agent's own output
-  stream). A condition a scenario cannot apply to prints as **n/a** with the reason.
+  stream). A condition a scenario cannot apply to prints as **n/a** with the reason,
+  and is never run: copy-paste for a decision made later, and the appended notes
+  file wherever it would be byte-identical to another condition (no stale line to
+  keep, or nothing to append).
+- "Acted on stale information" is counted over completed runs only; a timed-out
+  or budget-capped run is an error, not deference. Graders judge behaviour by
+  running the agent's code (how many times a sender was called, what a formatter
+  returned), never by searching its source for words.
+- A notes-file condition commits only when the file changed, under a neutral
+  message: git history never announces another session's activity to the agent.
+- A replaced **decision** stays in the file for the KLYPIX condition too
+  (conservative: the brain's current card has to beat it). Only an **absence**'s
+  stale line is stripped there, because a session's work in progress never was a
+  note in a KLYPIX team.
 - Each scenario ships two scripted answers, one that uses the facts and one that
   does not, and the self-test proves every grader tells them apart before any
   model is called.

@@ -40,19 +40,39 @@ function killTree(child) {
   else { try { process.kill(-child.pid, 'SIGKILL'); } catch { try { child.kill('SIGKILL'); } catch { /* */ } } }
 }
 
-function run(cli, args, { cwd, env, timeoutMs, input }) {
+/**
+ * What a chunk of the agent's own output stream says it is doing — the
+ * runner's clock for "the agent acted", "the agent wrote a file" and "the
+ * agent asked the channel". Claude Code (stream-json): tool_use blocks named
+ * Edit/Write/…; MCP tools are named mcp__<server>__<tool>. Codex (--json):
+ * item.started events typed file_change / command_execution / mcp_tool_call.
+ */
+export function classifyChunk(text) {
+  const s = String(text);
+  const tool = /"tool_use"|"item\.started"|"mcp_tool_call"|"command_execution"|"file_change"/.test(s);
+  const edit = /"name":"(Edit|Write|MultiEdit|NotebookEdit)"|"type":"file_change"/.test(s);
+  const mcp = /"name":"mcp__|"mcp_tool_call"/.test(s);
+  return { tool, edit, mcp };
+}
+
+function run(cli, args, { cwd, env, timeoutMs, input, onEvent = null }) {
   return new Promise((resolve) => {
     const started = Date.now();
     let timedOut = false;
-    // When the agent last acted (a tool call, a command, a file change), from
-    // the stream's own timing. A fact injected after this moment could not
-    // have changed the outcome, and the run says so instead of blaming the channel.
-    let lastToolAtMs = null;
+    // The agent's own timeline, from its output stream: first and last action,
+    // first file write, first call to the channel. A mid-task fact is anchored
+    // to the first write; a fact injected after the last action could not have
+    // changed the outcome, and the run says so instead of blaming the channel.
+    let lastToolAtMs = null; let firstToolAtMs = null; let firstEditAtMs = null; let firstMcpAtMs = null;
     const child = spawn(cli.command, [...cli.prefix, ...args], { cwd, env, windowsHide: true, detached: process.platform !== 'win32' });
     let stdout = ''; let stderr = '';
     child.stdout.on('data', (d) => {
       stdout += d;
-      if (/"tool_use"|"item\.started"|"mcp_tool_call"|"command_execution"|"file_change"/.test(String(d))) lastToolAtMs = Date.now() - started;
+      const at = Date.now() - started;
+      const k = classifyChunk(d);
+      if (k.tool) { lastToolAtMs = at; if (firstToolAtMs == null) { firstToolAtMs = at; try { onEvent?.('tool', at); } catch { /* */ } } }
+      if (k.edit && firstEditAtMs == null) { firstEditAtMs = at; try { onEvent?.('edit', at); } catch { /* */ } }
+      if (k.mcp && firstMcpAtMs == null) { firstMcpAtMs = at; try { onEvent?.('mcp', at); } catch { /* */ } }
       if (stdout.length > 8e6) stdout = stdout.slice(-8e6);
     });
     child.stderr.on('data', (d) => { stderr += d; if (stderr.length > 2e6) stderr = stderr.slice(-2e6); });
@@ -60,8 +80,9 @@ function run(cli, args, { cwd, env, timeoutMs, input }) {
     child.stdin.on('error', () => { /* the agent may exit before reading */ });
     if (input != null) child.stdin.write(input);
     child.stdin.end();
-    child.on('close', (code) => { clearTimeout(timer); resolve({ code, stdout, stderr, durationMs: Date.now() - started, timedOut, lastToolAtMs }); });
-    child.on('error', (err) => { clearTimeout(timer); resolve({ code: -1, stdout, stderr: String(err), durationMs: Date.now() - started, timedOut, lastToolAtMs }); });
+    const timeline = () => ({ lastToolAtMs, firstToolAtMs, firstEditAtMs, firstMcpAtMs });
+    child.on('close', (code) => { clearTimeout(timer); resolve({ code, stdout, stderr, durationMs: Date.now() - started, timedOut, ...timeline() }); });
+    child.on('error', (err) => { clearTimeout(timer); resolve({ code: -1, stdout, stderr: String(err), durationMs: Date.now() - started, timedOut, ...timeline() }); });
   });
 }
 
@@ -180,7 +201,7 @@ export const claude = {
     const r = await run(resolveCli('claude'), ['--version'], { cwd: os.tmpdir(), env: cleanAgentEnv(), timeoutMs: 30_000 });
     return r.stdout.trim();
   },
-  async run({ repo, prompt, mcpServers = {}, sessionId, timeoutMs, model = null, maxBudgetUsd = null }) {
+  async run({ repo, prompt, mcpServers = {}, sessionId, timeoutMs, model = null, maxBudgetUsd = null, onEvent = null }) {
     const cfg = path.join(path.dirname(repo.dir), `${path.basename(repo.dir)}.mcp.json`);
     fs.writeFileSync(cfg, JSON.stringify({ mcpServers }, null, 2));
     const args = ['-p', '--output-format', 'stream-json', '--verbose', '--session-id', sessionId, '--no-session-persistence',
@@ -189,13 +210,14 @@ export const claude = {
       ...(model ? ['--model', model] : []),
       ...(maxBudgetUsd ? ['--max-budget-usd', String(maxBudgetUsd)] : [])];
     const env = { ...cleanAgentEnv(), MCP_TIMEOUT: String(MCP_STARTUP_TIMEOUT_SEC * 1000) };
-    const r = await run(resolveCli('claude'), args, { cwd: repo.dir, env, timeoutMs, input: prompt });
+    const r = await run(resolveCli('claude'), args, { cwd: repo.dir, env, timeoutMs, input: prompt, onEvent });
     try { fs.rmSync(cfg, { force: true }); } catch { /* */ }
     const p = parseClaudeResult(r.stdout);
     return {
       ok: r.code === 0 && !r.timedOut && !p.resultError && p.channelUp !== false,
       costUsd: p.costUsd, tokens: p.tokens, turns: p.turns, model: p.model, permissionDenials: p.permissionDenials, mcpCalls: p.mcpCalls,
-      channelUp: p.channelUp, finalMessage: p.finalMessage, lastToolAtMs: r.lastToolAtMs,
+      channelUp: p.channelUp, finalMessage: p.finalMessage,
+      lastToolAtMs: r.lastToolAtMs, firstToolAtMs: r.firstToolAtMs, firstEditAtMs: r.firstEditAtMs, firstMcpAtMs: r.firstMcpAtMs,
       raw: { stdout: r.stdout, stderr: r.stderr },
       durationMs: r.durationMs,
       timedOut: r.timedOut,
@@ -289,10 +311,10 @@ export const codex = {
     const r = await run(resolveCli('codex'), ['--version'], { cwd: os.tmpdir(), env: cleanAgentEnv(), timeoutMs: 30_000 });
     return r.stdout.trim();
   },
-  async run({ repo, prompt, mcpServers = {}, timeoutMs, model = null }) {
+  async run({ repo, prompt, mcpServers = {}, timeoutMs, model = null, onEvent = null }) {
     const args = ['exec', '--json', '--ephemeral', '--ignore-user-config', '--skip-git-repo-check',
       '-s', 'workspace-write', '-C', repo.dir, ...(model ? ['-m', model] : []), ...codexPlatformOverrides(), ...codexGitWritable(repo.dir), ...codexMcpOverrides(mcpServers), '-'];
-    const r = await run(resolveCli('codex'), args, { cwd: repo.dir, env: cleanAgentEnv(), timeoutMs, input: prompt });
+    const r = await run(resolveCli('codex'), args, { cwd: repo.dir, env: cleanAgentEnv(), timeoutMs, input: prompt, onEvent });
     const p = parseCodexEvents(r.stdout);
     const channelUp = codexChannelUp(Object.keys(mcpServers), p.mcpCalls, r.stderr);
     return {
@@ -300,7 +322,8 @@ export const codex = {
       costUsd: null,   // Codex reports tokens, not dollars
       // Codex's event stream does not name the model; the row records the pinned one.
       tokens: p.tokens, turns: p.turns, model: p.model || model, mcpCalls: p.mcpCalls, channelUp,
-      finalMessage: p.finalMessage, lastToolAtMs: r.lastToolAtMs,
+      finalMessage: p.finalMessage,
+      lastToolAtMs: r.lastToolAtMs, firstToolAtMs: r.firstToolAtMs, firstEditAtMs: r.firstEditAtMs, firstMcpAtMs: r.firstMcpAtMs,
       raw: { stdout: r.stdout, stderr: r.stderr },
       durationMs: r.durationMs,
       timedOut: r.timedOut,

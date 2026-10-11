@@ -24,7 +24,7 @@
 //   notApplicable — conditions the scenario cannot apply to, with the reason.
 //   oracle  — two scripted answers (one that uses the facts, one that does
 //             not) so a dry run proves each grader separates them.
-import { runNodeTests, mergeConflictFiles } from './lib/repo.mjs';
+import { runNodeTests, mergeConflictFiles, runNodeProbe } from './lib/repo.mjs';
 
 // Claude Code reads CLAUDE.md natively, Codex and most other hosts AGENTS.md.
 // Every scenario writes both, identically, so no agent starts with less.
@@ -320,11 +320,23 @@ const s4 = {
 // (every channel gets its best shot) but test what a file structurally lacks:
 // expiry (S5), arrival during the task (S6), ranking inside a long history
 // (S7), and knowledge that is not in the repository at all (S8).
+//
+// Revised after an adversarial review (2026-10-12) that found, with line-level
+// evidence: S5's task ordered the very edit the hidden test graded; S6's fact
+// quoted the hidden assertion and its stale regex matched every template
+// literal; S7's "six weeks" was 27 lines injected whole, with the reversal
+// naming what it replaced; S8's stale detector was a word match. Graders now
+// judge behaviour with runNodeProbe, never vocabulary.
 
 // ── S5: a WIP note that outlived its session ────────────────────────────────
 // A notes file cannot expire a line; presence ages out on its own. The other
-// session is gone, its "do not touch" note is not. The knowledge the agent
-// needs is an ABSENCE: nobody is working on the file now.
+// session is gone, its "do not touch lib/report.js" note is not. The task
+// names only the symptom, and the stale note offers a path the task does not
+// forbid: fix the caller (lib/weekly.js) and leave lib/report.js alone. The
+// hidden test calls lib/report.js directly, so only the root-cause fix passes.
+// What the scenario measures is whether a dead note steers the agent away
+// from the right file. (It may be at ceiling — agents may ignore the note —
+// which is why it is gated by a no-channel pilot before any matrix run.)
 const S5_WIP_LINE = '- 2026-10-09 WIP (session Q): rewriting lib/report.js top to bottom — please do not touch it until this note is gone.';
 const S5_REPORT = [
   '// Column sums for the weekly report.',
@@ -335,10 +347,18 @@ const S5_REPORT = [
   '}',
   '',
 ].join('\n');
+const S5_WEEKLY = [
+  "import { sumColumn } from './report.js';",
+  '// Weekly total of the amount column, as the report page shows it.',
+  'export function weeklyTotal(rows) {',
+  "  return sumColumn(rows, 'amount');",
+  '}',
+  '',
+].join('\n');
 const s5 = {
   id: 's5-stale-wip-note',
   title: 'A WIP note that outlived its session',
-  story: 'Two days ago a session wrote "do not touch lib/report.js" in the notes, then ended without removing it. Nobody is working on the file now. The agent is asked to fix a bug in it.',
+  story: 'Two days ago a session wrote "do not touch lib/report.js" in the notes, then ended without removing it. Nobody is working on the file now. The agent is asked to make a failing weekly-total test pass; the real bug is in lib/report.js.',
   actor: { id: 'actor-s5-report', client: 'claude-code', intent: 'Rewrite lib/report.js', files: ['lib/report.js'], closed: true, endedAgoMs: 2 * 24 * 3600 * 1000 },
   facts: [{
     id: 'report-is-free',
@@ -367,19 +387,20 @@ const s5 = {
       '',
     ].join('\n'));
     repo.write('lib/report.js', S5_REPORT);
-    repo.write('test/report.test.js', [
+    repo.write('lib/weekly.js', S5_WEEKLY);
+    repo.write('test/weekly.test.js', [
       "import test from 'node:test';",
       "import assert from 'node:assert/strict';",
-      "import { sumColumn } from '../lib/report.js';",
-      "test('sumColumn adds numeric strings as numbers', () => {",
-      "  assert.equal(sumColumn([{ amount: '1' }, { amount: '2' }, { amount: '3' }], 'amount'), 6);",
+      "import { weeklyTotal } from '../lib/weekly.js';",
+      "test('the weekly total is a number', () => {",
+      "  assert.equal(weeklyTotal([{ amount: '1' }, { amount: '2' }, { amount: '3' }]), 6);",
       '});',
       '',
     ].join('\n'));
-    repo.commitAll('base: weekly report helpers (sumColumn test failing)');
+    repo.commitAll('base: weekly report (weekly total test failing)');
     return { taskBranch: 'main' };
   },
-  task: '`node --test test/report.test.js` fails: sumColumn in lib/report.js concatenates numeric strings instead of adding them. Fix it so the test passes.',
+  task: '`node --test test/weekly.test.js` fails: the weekly total comes out as a concatenated string instead of a number. Fix it so the test passes.',
   hidden: {
     'test/hidden.report.test.js': [
       "import test from 'node:test';",
@@ -387,36 +408,48 @@ const s5 = {
       "import { sumColumn } from '../lib/report.js';",
       "test('sumColumn adds numeric strings and numbers', () => {",
       "  assert.equal(sumColumn([{ amount: '1' }, { amount: '2' }, { amount: '3' }], 'amount'), 6);",
-      "  assert.equal(sumColumn([{ amount: 2.5 }, { amount: '2.5' }], 'amount'), 5);",
+      "  assert.equal(sumColumn([{ n: 4 }, { n: '5' }], 'n'), 9);",
       '});',
       '',
     ].join('\n'),
   },
-  grade(repo) {
+  grade(repo, ctx = {}) {
     const t = runNodeTests(repo.dir, ['test/hidden.report.test.js']);
-    const src = repo.read('lib/report.js') || '';
-    // Acting on the stale note = leaving the file alone because "someone is on it".
-    return { success: t.pass, staleAction: src === S5_REPORT, collision: null, detail: t.output };
+    const report = repo.read('lib/report.js') || '';
+    const weekly = repo.read('lib/weekly.js') || '';
+    // "Stale" needs the stale REASON, not merely an untouched file (a timed-out
+    // or budget-capped run also leaves it untouched): a workaround in the
+    // caller, or a final message that cites the WIP note.
+    const untouched = report === S5_REPORT;
+    const workedAround = untouched && weekly !== S5_WEEKLY;
+    const citedNote = /session Q|WIP|do not touch|rewrit|someone (else )?is (working|on it)|left (it|the file|lib\/report\.js) alone/i.test(String(ctx.finalMessage || ''));
+    return { success: t.pass, staleAction: untouched && (workedAround || citedNote), untouched, collision: null, detail: t.output };
   },
   oracle: {
     good(repo) { repo.write('lib/report.js', S5_REPORT.replace('total += row[key];', 'total += Number(row[key]);')); },
-    naive() { /* defers: "session Q is rewriting this file" */ },
-    naiveMessage: 'Not changed: the project notes say session Q is rewriting lib/report.js; I left it alone.',
+    naive(repo) { repo.write('lib/weekly.js', S5_WEEKLY.replace("return sumColumn(rows, 'amount');", "return sumColumn(rows.map((r) => ({ ...r, amount: Number(r.amount) })), 'amount');")); },
+    goodMessage: 'Fixed sumColumn in lib/report.js to add numbers; test/weekly.test.js passes.',
+    naiveMessage: 'Fixed it in lib/weekly.js by converting amounts before summing; I left lib/report.js alone because the notes say session Q is rewriting it.',
   },
 };
 
 // ── S6: a decision made while the agent is working ──────────────────────────
-// Nothing is known when the agent starts. Twenty-five seconds in, another
-// session settles the display format. A file edited on disk is only seen if
-// the agent re-reads it; KLYPIX hands a note to the agent at its next call.
-const S6_DECISION = 'Decision (finance, just now): invoice amounts are displayed in MINOR units followed by the currency code, e.g. "2681 USD" — never "$26.81" or "26.81 USD". The PDF renderer breaks on currency symbols and decimal points.';
+// Nothing is known when the agent starts. When the agent makes its FIRST EDIT
+// (it has committed to an answer built on what it knew), another session
+// settles the display format. A file edited on disk is only seen if the agent
+// re-reads it; KLYPIX hands a note to the agent at its next call. The fact
+// states the rule with an amount no test uses, so uptake means applying the
+// rule, not recognising a string.
+const S6_DECISION = 'Decision (finance, just now): invoice amounts are displayed in MINOR units followed by the currency code, e.g. 1050 → "1050 USD" — never "$10.50" or "10.50 USD". The PDF renderer breaks on currency symbols and decimal points.';
 const s6 = {
   id: 's6-fact-arrives-mid-task',
   title: 'A decision made while the agent is working',
-  story: 'The agent starts implementing invoice formatting. Twenty-five seconds in, another session settles how amounts are displayed. Nothing said so when the agent began.',
+  story: 'The agent starts implementing invoice formatting. At its first edit, another session settles how amounts are displayed. Nothing said so when the agent began.',
   actor: { id: 'actor-s6-finance', client: 'codex', intent: 'Settle the invoice display format with finance' },
   facts: [],
-  later: { afterMs: 25_000, facts: [{ id: 'display-minor-units', text: S6_DECISION }] },
+  // anchor 'first-edit': the runner fires the fact when it first sees the
+  // agent write a file; if the agent never edits, at fallbackMs (recorded).
+  later: { anchor: 'first-edit', fallbackMs: 90_000, facts: [{ id: 'display-minor-units', text: S6_DECISION }] },
   notApplicable: { relay: 'a copy-paste at start cannot carry a decision that is made after the agent begins' },
   build(repo) {
     repo.write('package.json', PKG);
@@ -448,71 +481,98 @@ const s6 = {
   },
   task: 'Implement formatInvoice(lines) in lib/invoice.js: sum unit × qty (minor units), apply the rate from config/tax.json, round to the nearest minor unit, and return { total, display } where display is the human-readable amount. Make test/invoice.test.js pass, then add one more test of your own for an edge case and make it pass too.',
   hidden: {
+    // A different input from both the visible test and the fact's example.
     'test/hidden.invoice.test.js': [
       "import test from 'node:test';",
       "import assert from 'node:assert/strict';",
       "import { formatInvoice } from '../lib/invoice.js';",
       "test('display is minor units plus the currency code', () => {",
-      '  const r = formatInvoice([{ unit: 1000, qty: 2 }, { unit: 500, qty: 1 }]);',
-      '  assert.equal(r.total, 2681);',
-      "  assert.equal(r.display, '2681 USD');",
+      '  const r = formatInvoice([{ unit: 1999, qty: 1 }]);',
+      '  assert.equal(r.total, 2144);',
+      "  assert.equal(r.display, '2144 USD');",
       '});',
       '',
     ].join('\n'),
   },
-  grade(repo) {
+  grade(repo, ctx = {}) {
     const t = runNodeTests(repo.dir, ['test/hidden.invoice.test.js']);
+    // Judge what the function RETURNS, not the source (a `$` grep matched every `${…}`).
+    const probe = runNodeProbe(repo.dir, 'lib/invoice.js', "process.stdout.write(String(m.formatInvoice([{ unit: 1999, qty: 1 }]).display));");
     const src = repo.read('lib/invoice.js') || '';
-    // The natural answer without the decision: a currency symbol or decimals.
-    return { success: t.pass, staleAction: !t.pass && /\$|toFixed\(2\)|\/\s*100/.test(src), collision: null, detail: t.output };
+    const staleAction = !t.pass && (probe.ok ? /[$.]/.test(probe.stdout) : /\$(?!\{)|toFixed\(|\/\s*100\b|Intl\.NumberFormat/.test(src));
+    // Handled = applied the decision, or surfaced it (it contradicts the user's
+    // own "human-readable" wording, so a careful agent may keep that and say so).
+    const msg = String(ctx.finalMessage || '');
+    const handled = t.pass || /PDF renderer|\bfinance\b|minor units? (followed by|plus|\+|and|then|with) (the )?currency|currency code/i.test(msg);
+    return { success: t.pass, staleAction, handled, display: probe.ok ? probe.stdout : null, collision: null, detail: t.output };
   },
   oracle: {
     good(repo) { repo.write('lib/invoice.js', repo.read('lib/invoice.js').replace("  throw new Error('not implemented');", '  const total = Math.round(lines.reduce((a, l) => a + l.unit * l.qty, 0) * (1 + tax.rate));\n  return { total, display: `${total} USD` };')); },
-    naive(repo) { repo.write('lib/invoice.js', repo.read('lib/invoice.js').replace("  throw new Error('not implemented');", '  const total = Math.round(lines.reduce((a, l) => a + l.unit * l.qty, 0) * (1 + tax.rate));\n  return { total, display: `${(total / 100).toFixed(2)}` };')); },
+    naive(repo) { repo.write('lib/invoice.js', repo.read('lib/invoice.js').replace("  throw new Error('not implemented');", '  const total = Math.round(lines.reduce((a, l) => a + l.unit * l.qty, 0) * (1 + tax.rate));\n  return { total, display: `$${(total / 100).toFixed(2)}` };')); },
+    goodMessage: 'Implemented formatInvoice; display follows the finance decision (minor units followed by the currency code).',
+    naiveMessage: 'Implemented formatInvoice with a human-readable dollar amount and added an edge-case test.',
   },
 };
 
-// ── S7: a decision buried in six weeks of notes ─────────────────────────────
+// ── S7: a decision buried in six months of notes ────────────────────────────
 // Appended notes never lose a line: the retry rule from September and its
-// reversal both sit in the log, with a fortnight of unrelated notes after the
-// reversal. The brain holds the same forty cards; what differs is that the
-// reversal is linked to what it replaced and served first.
+// reversal both sit in a log of ~330 dated lines, with a fortnight of notes
+// (and two retry-adjacent distractors) after the reversal. The brain holds the
+// same ~330 cards; what differs is that the reversal is linked to what it
+// replaced and served first. The reversal is written in the log's own terse
+// register and does not name the rule it replaces — the reader has to notice.
 const S7_STALE = '- 2026-09-02 Decision (billing): retry failed webhook deliveries 3 times with exponential backoff (lib/webhooks.js).';
-const S7_HISTORY = [
-  '- 2026-08-26 Infra: staging database moved to the eu-west region.',
-  '- 2026-08-27 Decision (auth): sessions expire after 14 days of inactivity.',
-  '- 2026-08-29 Infra: CI runners upgraded to Node 24.',
-  '- 2026-09-01 Billing: partner X onboarding starts; webhooks go live on the 3rd.',
+const S7_FIXED = [
+  '- 2026-09-01 Billing: partner X onboarding starts; deliveries go live on the 3rd.',
   S7_STALE,
-  '- 2026-09-03 Infra: webhook sender gets its own worker queue.',
-  '- 2026-09-05 Decision (ui): dates are shown in the viewer\'s local time zone.',
-  '- 2026-09-08 Billing: invoices are numbered per fiscal year.',
-  '- 2026-09-10 Infra: log retention cut to 30 days.',
-  '- 2026-09-12 Decision (api): list endpoints page at 50 by default, 200 max.',
-  '- 2026-09-15 Auth: password reset links expire after 1 hour.',
-  '- 2026-09-17 Infra: nightly backup verified by restore drill.',
-  '- 2026-09-19 Decision (ui): empty states carry one primary action.',
-  '- 2026-09-22 Billing: refunds post to the original payment method only.',
-  '- 2026-09-24 Infra: moved error tracking to the new project key.',
-  '- 2026-09-26 Decision (api): errors return RFC 7807 problem documents.',
-  '- 2026-09-27 Billing: partner X reported duplicate charges; investigating.',
+  '- 2026-09-03 Infra: the delivery sender gets its own worker queue.',
+  '- 2026-09-27 Billing: partner X reported two duplicate charges; investigating with their finance team.',
   '- 2026-09-28 Infra: moved the cron runner to the new box.',
-  '- 2026-09-30 Decision (ui): the sidebar collapses below 1024px.',
-  '- 2026-10-02 Infra: dependency audit clean; two dev-only advisories ignored.',
-  '- 2026-10-03 Auth: SSO pilot with two customers.',
-  '- 2026-10-06 Decision (api): rate limits are per API key, 600/min.',
-  '- 2026-10-08 Billing: dunning emails go out on days 3, 7 and 14.',
-  '- 2026-10-09 Infra: image builds cached per branch.',
-  '- 2026-10-10 Decision (ui): keyboard shortcuts are listed under "?".',
+  '- 2026-10-04 Infra: the outbound email sender retries 3 times with backoff.',
+  '- 2026-10-07 Billing: partner Y webhook signature header renamed to X-Partner-Signature.',
 ];
+// Deterministic filler: two or three lines per working day from April to
+// October, cycling through a fixed vocabulary that avoids "webhook" and
+// "retr", so a grep for either returns the stale rule first, then distractors.
+function s7History() {
+  const areas = [
+    ['Infra', ['staging database moved to the eu-west region', 'CI runners upgraded to Node 24', 'log retention cut to 30 days', 'nightly backup verified by restore drill', 'moved error tracking to the new project key', 'dependency audit clean; two dev-only advisories ignored', 'image builds cached per branch', 'rotated the object-store credentials', 'added a read replica for reports', 'alert thresholds tuned after the false pages', 'TLS certificates renewed for all three domains', 'queue depth now graphed on the ops dashboard']],
+    ['Decision (auth)', ['sessions expire after 14 days of inactivity', 'password reset links expire after 1 hour', 'MFA is required for admin accounts', 'OAuth refresh tokens rotate on every use', 'API keys are shown once at creation']],
+    ['Decision (ui)', ['dates are shown in the viewer\'s local time zone', 'empty states carry one primary action', 'the sidebar collapses below 1024px', 'keyboard shortcuts are listed under "?"', 'destructive actions ask once, with the noun named', 'tables remember their sort per user']],
+    ['Decision (api)', ['list endpoints page at 50 by default, 200 max', 'errors return RFC 7807 problem documents', 'rate limits are per API key, 600/min', 'timestamps are ISO 8601 in UTC', 'deprecated fields keep working for 90 days']],
+    ['Billing', ['invoices are numbered per fiscal year', 'refunds post to the original payment method only', 'dunning emails go out on days 3, 7 and 14', 'proration is to the day, never the hour', 'tax rates come from config, not code', 'credit notes reference the original invoice']],
+    ['Auth', ['SSO pilot with two customers', 'the login page gets the new brand', 'service accounts are listed separately', 'audit log keeps sign-ins for a year']],
+    ['Support', ['the weekly report goes out Mondays at 09:00', 'macros updated for the new refund flow', 'escalation path documented for billing disputes', 'status page subscriptions enabled']],
+  ];
+  const fixedByDate = new Map(S7_FIXED.map((line) => [line.slice(2, 12), line]));
+  const lines = [];
+  let k = 0;
+  for (let d = new Date(Date.UTC(2026, 3, 6)); d <= new Date(Date.UTC(2026, 9, 10)); d.setUTCDate(d.getUTCDate() + 1)) {
+    const dow = d.getUTCDay();
+    const date = d.toISOString().slice(0, 10);
+    // Filler on working days only; the fixed lines land on their own dates,
+    // weekends included (the incident was reported on a Saturday).
+    if (dow !== 0 && dow !== 6) {
+      const perDay = dow === 1 ? 3 : 2;
+      for (let n = 0; n < perDay; n++) {
+        const [area, items] = areas[k % areas.length];
+        lines.push(`- ${date} ${area}: ${items[Math.floor(k / areas.length) % items.length]}.`);
+        k++;
+      }
+    }
+    if (fixedByDate.has(date)) lines.push(fixedByDate.get(date));
+  }
+  return lines;
+}
+const S7_HISTORY = s7History();
 const s7 = {
   id: 's7-decision-buried-in-history',
-  title: 'A decision buried in six weeks of notes',
-  story: 'The notes log says in September to retry failed webhooks three times. Later in September that rule was reversed because retries caused duplicate charges. Two more weeks of notes followed. The agent is asked to implement webhook delivery.',
+  title: 'A decision buried in six months of notes',
+  story: 'The notes log says in September to retry failed webhooks three times. Later in September that rule was reversed because retries caused duplicate charges. Two more weeks of notes followed, including an email sender that does retry. The agent is asked to implement webhook delivery.',
   actor: { id: 'actor-s7-billing', client: 'claude-code', intent: 'Stop webhook retries after the duplicate-charge incident' },
   facts: [{
     id: 'webhooks-no-retry',
-    text: 'Decision 2026-09-28 (billing, replaces the 09-02 retry rule): webhook deliveries are NOT retried. On a failed send, push the event to the dead-letter queue (lib/dlq.js) once and return. The retries caused the duplicate charges at partner X on 09-27.',
+    text: 'Decision 2026-09-28 (billing): webhook deliveries are not retried. On a failed send, push the event to the dead-letter queue (lib/dlq.js) once and return. Retries were behind the duplicate charges at partner X on 09-27.',
     staleLine: S7_STALE,
     // The note belongs where it was written — in September, not at the end of the file.
     insertAfterLine: '- 2026-09-28 Infra: moved the cron runner to the new box.',
@@ -547,6 +607,8 @@ const s7 = {
   },
   task: 'Implement deliver(event, send) in lib/webhooks.js following the project\'s rules for webhook delivery failures, and make test/webhooks.test.js pass.',
   hidden: {
+    // Tolerates a rethrow: the decision is about retries and dead-lettering,
+    // not about swallowing the error.
     'test/hidden.webhooks.test.js': [
       "import test from 'node:test';",
       "import assert from 'node:assert/strict';",
@@ -555,7 +617,7 @@ const s7 = {
       "test('a failed send is not retried and lands in the dead-letter queue once', async () => {",
       '  let calls = 0;',
       "  const event = { id: 'e2' };",
-      "  await deliver(event, async () => { calls++; throw new Error('503'); });",
+      "  await deliver(event, async () => { calls++; throw new Error('503'); }).catch(() => {});",
       '  assert.equal(calls, 1);',
       "  assert.equal(queue.filter((e) => e.id === 'e2').length, 1);",
       '});',
@@ -564,8 +626,11 @@ const s7 = {
   },
   grade(repo) {
     const t = runNodeTests(repo.dir, ['test/hidden.webhooks.test.js']);
+    // Stale = it RETRIED (sender called more than once on failure), by probe, not by words.
+    const probe = runNodeProbe(repo.dir, 'lib/webhooks.js', "let calls = 0; await m.deliver({ id: 'probe' }, async () => { calls++; throw new Error('503'); }).catch(() => {}); process.stdout.write(String(calls));");
     const src = repo.read('lib/webhooks.js') || '';
-    return { success: t.pass, staleAction: !t.pass && /retr|attempt|backoff/i.test(src), collision: null, detail: t.output };
+    const staleAction = !t.pass && (probe.ok ? Number(probe.stdout) > 1 : /retr|attempt|backoff/i.test(src));
+    return { success: t.pass, staleAction, sendCalls: probe.ok ? Number(probe.stdout) : null, collision: null, detail: t.output };
   },
   oracle: {
     good(repo) { repo.write('lib/webhooks.js', repo.read('lib/webhooks.js').replace("  throw new Error('not implemented');", '  try { await send(event); } catch { dlq.push(event); }')); },
@@ -576,8 +641,10 @@ const s7 = {
 // ── S8: a partner limit nothing in the repository shows ─────────────────────
 // Both earlier attempts at "knowledge from another vendor's session" were
 // inferable from the code, and both agents inferred them with no channel at
-// all. A partner's undocumented header limit, learned from their support, is
-// not in any file here — and the symptom ("intermittent 400s") invites retries.
+// all. A partner's undocumented header rule, learned from their support, is
+// not in any file here — and the symptom ("intermittent 400s") invites
+// retries. The rule includes a client prefix no hardening instinct produces,
+// so nobody passes by shortening an id on a hunch.
 const S8_PARTNER = [
   "import { randomUUID } from 'node:crypto';",
   "export const BASE = 'https://api.partner.example';",
@@ -595,11 +662,11 @@ const S8_PARTNER = [
 const s8 = {
   id: 's8-partner-limit-not-in-repo',
   title: 'A partner limit nothing in the repository shows',
-  story: 'A Codex session spent an afternoon with the partner\'s support and learned why production calls fail: the partner drops request ids longer than 24 characters. Nothing in the code or its tests shows that. The agent is told only that calls fail intermittently.',
+  story: 'A Codex session spent an afternoon with the partner\'s support and learned why production calls fail: request ids must be short, plain, and start with the client prefix. Nothing in the code or its tests shows that. The agent is told only that calls fail intermittently.',
   actor: { id: 'actor-s8-codex', client: 'codex', intent: 'Work the partner 400s with their support' },
   facts: [{
     id: 'partner-request-id-limit',
-    text: 'Found with partner support (ticket #4821): the partner API rejects any x-request-id longer than 24 characters or containing "-" — their edge cache drops it and answers 400, which looks random. Our ids are 36-character UUIDs. Send a 20-character [a-z0-9] id instead. Do not add retries: the same long id fails again.',
+    text: 'Found with partner support (ticket #4821): the partner API rejects any x-request-id longer than 24 characters, containing "-", or not starting with our client prefix "p7" — their edge cache drops it and answers 400, which looks random. Our ids are 36-character UUIDs. Send "p7" followed by 18 [a-z0-9] characters instead. Do not add retries: the same id fails again.',
   }],
   build(repo) {
     repo.write('package.json', PKG);
@@ -627,12 +694,12 @@ const s8 = {
       "import test from 'node:test';",
       "import assert from 'node:assert/strict';",
       "import { callPartner } from '../lib/partner.js';",
-      "test('request ids fit the partner\\'s limit and stay unique', async () => {",
+      "test('request ids carry the client prefix, fit the limit and stay unique', async () => {",
       '  const ids = [];',
       "  const fake = async (url, init) => { ids.push(init.headers['x-request-id']); return { ok: true, status: 200, json: async () => ({}) }; };",
       "  await callPartner('/a', {}, fake);",
       "  await callPartner('/b', {}, fake);",
-      '  for (const id of ids) assert.match(String(id), /^[A-Za-z0-9]{1,24}$/);',
+      '  for (const id of ids) assert.match(String(id), /^p7[A-Za-z0-9]{1,22}$/);',
       '  assert.notEqual(ids[0], ids[1]);',
       '});',
       '',
@@ -640,11 +707,14 @@ const s8 = {
   },
   grade(repo) {
     const t = runNodeTests(repo.dir, ['test/hidden.partner.test.js']);
+    // Stale = it RETRIED a 400 (sender called more than once), by probe, not by words.
+    const probe = runNodeProbe(repo.dir, 'lib/partner.js', "let calls = 0; const fake = async () => { calls++; return { ok: false, status: 400, json: async () => ({}) }; }; await m.callPartner('/a', {}, fake).catch(() => {}); process.stdout.write(String(calls));");
     const src = repo.read('lib/partner.js') || '';
-    return { success: t.pass, staleAction: !t.pass && /retr|attempt/i.test(src), collision: null, detail: t.output };
+    const staleAction = !t.pass && (probe.ok ? Number(probe.stdout) > 1 : /retr|attempt/i.test(src));
+    return { success: t.pass, staleAction, sendCalls: probe.ok ? Number(probe.stdout) : null, collision: null, detail: t.output };
   },
   oracle: {
-    good(repo) { repo.write('lib/partner.js', S8_PARTNER.replace("import { randomUUID } from 'node:crypto';", "import { randomBytes } from 'node:crypto';").replace("'x-request-id': randomUUID()", "'x-request-id': randomBytes(10).toString('hex')")); },
+    good(repo) { repo.write('lib/partner.js', S8_PARTNER.replace("import { randomUUID } from 'node:crypto';", "import { randomBytes } from 'node:crypto';").replace("'x-request-id': randomUUID()", "'x-request-id': 'p7' + randomBytes(9).toString('hex')")); },
     naive(repo) { repo.write('lib/partner.js', S8_PARTNER.replace('  const res = await fetchImpl(BASE + path, {', '  let res;\n  for (let attempt = 0; attempt < 3; attempt++) {\n  res = await fetchImpl(BASE + path, {').replace("  if (!res.ok) throw new Error(`partner ${res.status}`);", '  if (res.ok) break;\n  }\n  if (!res.ok) throw new Error(`partner ${res.status}`);')); },
   },
 };

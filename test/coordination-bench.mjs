@@ -34,12 +34,12 @@ process.env.KLYPIX_AUTO_UPDATE = '0';
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const { SCENARIOS } = await import('../bench/coordination/scenarios.mjs');
 const { CONDITIONS, conditionById } = await import('../bench/coordination/conditions.mjs');
-const { oracle, composePrompt, codexMcpOverrides, resolveCli, cleanAgentEnv, claudeAllowedTools, parseClaudeResult, parseCodexEvents, codexChannelUp, codexGitWritable, MCP_STARTUP_TIMEOUT_SEC, CHANNEL_DOWN } = await import('../bench/coordination/agents.mjs');
-const { runOne } = await import('../bench/coordination/run.mjs');
+const { oracle, composePrompt, codexMcpOverrides, resolveCli, cleanAgentEnv, claudeAllowedTools, parseClaudeResult, parseCodexEvents, codexChannelUp, codexGitWritable, MCP_STARTUP_TIMEOUT_SEC, CHANNEL_DOWN, classifyChunk } = await import('../bench/coordination/agents.mjs');
+const { runOne, notApplicableReason } = await import('../bench/coordination/run.mjs');
 const { summarize, toMarkdown } = await import('../bench/coordination/report.mjs');
 const { makeRepo, runNodeTests } = await import('../bench/coordination/lib/repo.mjs');
 const { wilson } = await import('../bench/coordination/lib/stats.mjs');
-const { laneFileFor } = await import('../src/agent-presence.mjs');
+const { laneFileFor, listActiveSessions, upsertSession } = await import('../src/agent-presence.mjs');
 const { parseKlypix } = await import('../src/klypix-format.mjs');
 const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
 const { StdioClientTransport } = await import('@modelcontextprotocol/sdk/client/stdio.js');
@@ -81,15 +81,11 @@ ok(CONDITIONS.filter((c) => !c.runnable).every((c) => c.reason && c.reason.lengt
 // broken channel cannot pass as "nothing delivered, fail expected". The
 // appended notes file keeps the stale WIP line in S5, so it delivers nothing
 // there; everything else that applies delivers.
-const expectDelivered = (s, c) => {
-  if (c.id === 'none') return false;
-  if (s.id === 's5-stale-wip-note' && c.id === 'agents-md-appended') return false;
-  return true;
-};
+const expectDelivered = (s, c) => c.id !== 'none';
 const rows = [];
 for (const s of SCENARIOS.filter(applies)) {
   for (const c of runnable) {
-    if (s.notApplicable?.[c.id]) continue;
+    if (notApplicableReason(s, c)) continue;
     const r = await runOne({ scenario: s, condition: c, agent: oracle, run: 1, timeoutMs: 60_000 });
     rows.push(r);
     const expectPass = expectDelivered(s, c);
@@ -99,10 +95,16 @@ for (const s of SCENARIOS.filter(applies)) {
 }
 ok(rows.filter((r) => r.condition === 'relay').every((r) => r.relays === r.facts) && rows.filter((r) => r.condition !== 'relay').every((r) => r.relays === 0),
   'B2: only the copy-paste condition counts human relays');
+const byId = (id) => SCENARIOS.find((s) => s.id === id);
+const appended = conditionById('agents-md-appended');
+ok(notApplicableReason(byId('s1-changed-decision'), appended) === null && notApplicableReason(byId('s7-decision-buried-in-history'), appended) === null
+  && /identical to the kept-tidy/.test(notApplicableReason(byId('s8-partner-limit-not-in-repo'), appended) || '') && /identical to the no-channel/.test(notApplicableReason(byId('s5-stale-wip-note'), appended) || ''),
+  'B2: the appended-notes cell runs only where it differs from another condition (S1, S7) and names why it is n/a elsewhere (S5, S8)');
 ok(SCENARIOS.find((s) => s.id === 's6-fact-arrives-mid-task').notApplicable.relay.length > 10 && rows.every((r) => !(r.scenario.startsWith('s6') && r.condition === 'relay')),
   'B2: S6 declares why a copy-paste at start cannot apply, and the runner never runs that cell');
 ok(rows.filter((r) => r.scenario.startsWith('s6') && r.condition !== 'none').every((r) => Number.isFinite(r.laterFiredAtMs) && r.laterFiredAtMs < 5_000 && r.delivered === 1),
-  'B2: S6\'s mid-task fact is carried by the later() hook (at once for the oracle) and read back');
+  'B2: S6\'s mid-task fact is carried by the later() hook (at once for the oracle; anchored to the first edit for a live agent) and read back');
+ok(rows.filter((r) => r.scenario.startsWith('s6') && r.condition !== 'none').every((r) => r.laterAnchor === 'immediate'), 'B2: for the oracle the mid-task fact is anchored "immediate" and the row records the anchor');
 
 // ── B3: KLYPIX delivery through the real MCP server ─────────────────────────
 const klypix = conditionById('klypix');
@@ -125,8 +127,9 @@ const expectations = {
     'at start, nothing yet says how amounts are displayed (the decision comes later)'],
   's7-decision-buried-in-history': [(sc) => {
     const t = hitsText(sc);
-    return /NOT retried/.test(t) && (!/retry failed webhook deliveries 3 times/.test(t) || t.indexOf('NOT retried') < t.indexOf('retry failed webhook deliveries 3 times'));
-  }, 'its context leads with the no-retry decision, ahead of the archived retry rule, out of forty cards'],
+    const cur = t.search(/are not retried/i); const old = t.indexOf('retry failed webhook deliveries 3 times');
+    return cur >= 0 && (old < 0 || cur < old);
+  }, 'its context leads with the no-retry decision, ahead of the archived retry rule, out of three hundred cards'],
   's8-partner-limit-not-in-repo': [(sc) => /24 characters/.test(hitsText(sc)), 'its context carries the partner limit no file holds'],
 };
 const syncAs = async (server, repo, sessionId, task, phase = 'start') => {
@@ -159,22 +162,38 @@ for (const s of SCENARIOS) {
     ok(!fs.existsSync(path.join(repo.dir, '.mcp.json')) && !fs.existsSync(path.join(repo.dir, '.codex', 'config.toml'))
       && /brain_sync/.test(fs.readFileSync(path.join(repo.dir, 'AGENTS.md'), 'utf8')),
     `B3 ${s.id}: the repo gets the project rules but no MCP config pointing at the machine's own install`);
+    if (s.id === 's5-stale-wip-note') {
+      const brain = path.join(repo.dir, 'brain.klypix');
+      const lane = JSON.parse(fs.readFileSync(laneFileFor(brain, os.homedir()), 'utf8'));
+      ok(lane.sessions.some((r) => r.id === 'actor-s5-report') && !listActiveSessions({ brainPath: brain, home: os.homedir() }).some((r) => r.id === 'actor-s5-report'),
+        `B3 ${s.id}: session Q's row was written two days old and KLYPIX's own expiry hides it — the absence is produced by the product, not by the bench`);
+      upsertSession({ brainPath: brain, home: os.homedir(), now: Date.now() - 60_000, id: 'actor-s5-control', client: 'claude-code', intent: 'control', files: ['lib/report.js'] });
+      ok(listActiveSessions({ brainPath: brain, home: os.homedir() }).some((r) => r.id === 'actor-s5-control'), `B3 ${s.id}: control — the same row written a minute ago is still listed (expiry, not a broken lane)`);
+      ok(!(repo.read('AGENTS.md') || '').includes('do not touch') && !(repo.read('CLAUDE.md') || '').includes('do not touch'), `B3 ${s.id}: the KLYPIX condition's instructions files carry no WIP line — work in progress is presence there`);
+    }
     const { isError, sc } = await syncAs(server, repo, null, s.task);
     const [check, what] = expectations[s.id];
     ok(!isError && check(sc), `B3 ${s.id}: the agent's first brain_sync — ${what}`);
     if (s.id === 's6-fact-arrives-mid-task') {
       // The decision is made while the agent works: a card plus a broadcast
-      // note. The agent's NEXT sync (same session, so its lane row is live)
+      // note. As in a real run the agent's server stays connected (its lane
+      // row is live), so the note has a recipient; the agent's NEXT sync
       // carries it — as the note, or as context.
-      const out = await klypix.later({ repo, scenario: s, sessionIds });
-      ok(out.delivered.length === 1, `B3 ${s.id}: the mid-task decision is written as a card and read back`);
-      const next = await syncAs(server, repo, null, s.task, 'checkpoint');
-      const seen = (next.sc.messages || []).some((m) => /MINOR units/.test(m.text || '')) || /MINOR units/.test(hitsText(next.sc));
-      ok(!next.isError && seen, `B3 ${s.id}: the agent's next brain_sync hands it the decision (note or context)`);
+      const live = new Client({ name: 'cobench-agent', version: '1.0.0' }, { capabilities: {} });
+      await live.connect(new StdioClientTransport({ command: server.command, args: server.args, cwd: repo.dir, stderr: 'pipe', env: { ...process.env, ...server.env } }));
+      try {
+        await live.callTool({ name: 'brain_sync', arguments: { project: repo.dir, phase: 'start', intent: s.task.slice(0, 160), include_context: true } });
+        const out = await klypix.later({ repo, scenario: s, sessionIds });
+        ok(out.delivered.length === 1 && out.notePosted === true, `B3 ${s.id}: the mid-task decision is written as a card (read back) and the note was posted to the live session`);
+        const next = await live.callTool({ name: 'brain_sync', arguments: { project: repo.dir, phase: 'checkpoint', intent: s.task.slice(0, 160), include_context: true } });
+        const nsc = next.structuredContent || {};
+        const seen = (nsc.messages || []).some((m) => /MINOR units/.test(m.text || '')) || /MINOR units/.test(hitsText(nsc));
+        ok(!next.isError && seen, `B3 ${s.id}: the agent's next brain_sync hands it the decision (note or context)`);
+      } finally { try { await live.close(); } catch { /* */ } }
     }
     if (s.id === 's7-decision-buried-in-history') {
       const { struct } = await parseKlypix(fs.readFileSync(path.join(repo.dir, 'brain.klypix')));
-      ok(struct.cards.length >= 26, `B3 ${s.id}: the brain is as cluttered as the file — ${struct.cards.length} cards, the history included`);
+      ok(struct.cards.length >= 250, `B3 ${s.id}: the brain is as cluttered as the file — ${struct.cards.length} cards, six months of history included`);
     }
   } catch (err) {
     ok(false, `B3 ${s.id}: ${String(err?.message || err).split('\n')[0]}`);
@@ -191,6 +210,17 @@ ok(composePrompt('Do X.', null).startsWith('Do X.\n\n') && composePrompt('Do X.'
 const overrides = codexMcpOverrides({ 'klypix-canvas': { command: 'C:\\node.exe', args: ['C:\\a b\\klypix-mcp.mjs', '--vault', 'C:\\r'], env: { KLYPIX_PLUGIN: '1' } } });
 ok(overrides.includes('mcp_servers.klypix-canvas.command="C:\\\\node.exe"') && overrides.includes('mcp_servers.klypix-canvas.args=["C:\\\\a b\\\\klypix-mcp.mjs", "--vault", "C:\\\\r"]') && overrides.includes('mcp_servers.klypix-canvas.env={ KLYPIX_PLUGIN = "1" }'),
   'B4: Codex gets the same server through -c overrides, Windows paths escaped as TOML strings');
+const c1 = classifyChunk('{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Edit","input":{}}]}}');
+const c2 = classifyChunk('{"type":"item.started","item":{"type":"mcp_tool_call","tool":"brain_sync"}}');
+const c3 = classifyChunk('{"type":"assistant","message":{"content":[{"type":"tool_use","name":"mcp__klypix-canvas__brain_sync"}]}}');
+const c4 = classifyChunk('{"type":"item.started","item":{"type":"file_change"}}');
+ok(c1.edit && c1.tool && !c1.mcp && c2.mcp && c2.tool && !c2.edit && c3.mcp && !c3.edit && c4.edit && !c4.mcp,
+  'B5: the stream classifier tells edits (Claude Edit/Write, Codex file_change) from channel calls (mcp__…, mcp_tool_call) — the mid-task fact is anchored to the first edit');
+const staleCell = summarize([
+  { scenario: 's5-stale-wip-note', condition: 'none', agent: 'claude', run: 1, success: false, staleAction: true, error: 'timed out' },
+  { scenario: 's5-stale-wip-note', condition: 'none', agent: 'claude', run: 2, success: false, staleAction: true },
+]).find((c) => c.scenario === 's5-stale-wip-note');
+ok(staleCell.staleActions.k === 1 && staleCell.staleActions.n === 1 && staleCell.errors === 1, 'B5: "acted on stale information" is counted over completed runs only — a timed-out run is an error, not deference');
 const w = wilson(5, 5);
 ok(w.p === 1 && w.low > 0.5 && w.low < 0.6 && w.high === 1, 'B4: Wilson interval for 5/5 is about 57%–100% (five runs prove little)');
 const synthetic = [

@@ -53,7 +53,7 @@ export async function runOne({ scenario, condition, agent, run, timeoutMs, keep 
       scenario: scenario.id, condition: condition.id, agent: agent.id, run,
       success: !!g.success, staleAction: !!g.staleAction, collision: g.collision,
       relays: prep.relays || 0, delivered: (prep.delivered || []).length, facts: scenario.facts.length,
-      agentOk: res.ok, model: res.model ?? null, permissionDenials: res.permissionDenials ?? null, costUsd: res.costUsd ?? null, tokens: res.tokens ?? null, turns: res.turns ?? null,
+      agentOk: res.ok, model: res.model ?? null, permissionDenials: res.permissionDenials ?? null, mcpCalls: res.mcpCalls ?? null, costUsd: res.costUsd ?? null, tokens: res.tokens ?? null, turns: res.turns ?? null,
       durationMs: res.durationMs ?? (Date.now() - started), timedOut: !!res.timedOut,
       error: res.error || null, keptRepo: keep ? repo.dir : null,
     };

@@ -187,6 +187,20 @@ ok(/## Not measured/.test(md) && /MCP Agent Mail/.test(md), 'B4: the report list
     'B5: the agent starts clean — no parent Claude session, KLYPIX id or Electron flag leaks in (credentials stay)');
   ok(claudeAllowedTools({ 'klypix-canvas': {} }).includes('mcp__klypix-canvas') && !claudeAllowedTools({}).some((t) => t.startsWith('mcp__')),
     'B5: Claude may use every tool of the condition\'s server, and no MCP tool otherwise');
+  ok(['Bash(git *)', 'PowerShell(git *)', 'PowerShell(node *)', 'PowerShell(npm test*)'].every((t) => claudeAllowedTools({}).includes(t)),
+    'B5: Claude\'s git/node/test rules cover its PowerShell tool too (Windows runs shell commands there)');
+  const stream = [
+    '{"type":"system","subtype":"init"}',
+    '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"mcp__klypix-canvas__brain_sync"},{"type":"tool_use","name":"Read"}]}}',
+    '{"type":"assistant","message":{"content":[{"type":"text","text":"x"},{"type":"tool_use","name":"mcp__klypix-canvas__brain_ask"},{"type":"tool_use","name":"mcp__klypix-canvas__brain_sync"}]}}',
+    '{"type":"result","is_error":false,"num_turns":3,"total_cost_usd":0.1,"usage":{"input_tokens":1,"output_tokens":2},"modelUsage":{"m":{}},"permission_denials":[]}',
+  ].join('\n');
+  const sr = parseClaudeResult(stream);
+  ok(sr.mcpCalls.brain_sync === 2 && sr.mcpCalls.brain_ask === 1 && !('Read' in sr.mcpCalls) && sr.turns === 3 && sr.permissionDenials === 0,
+    'B5: Claude\'s event stream yields which KLYPIX tools it called, and how often');
+  ok(parseClaudeResult('{"type":"assistant","message":{"content":[]}}').resultError === 'no result event', 'B5: a Claude stream that never reached its result is an error row');
+  const xm = parseCodexEvents(['{"type":"item.completed","item":{"type":"mcp_tool_call","tool":"brain_sync"}}', '{"type":"item.started","item":{"type":"mcp_tool_call","tool":"brain_sync"}}', '{"type":"item.completed","item":{"type":"command_execution"}}'].join('\n'));
+  ok(xm.mcpCalls.brain_sync === 1 && Object.keys(xm.mcpCalls).length === 1, 'B5: Codex events yield its completed KLYPIX tool calls');
 
   const cr = parseClaudeResult('{"type":"result","is_error":false,"num_turns":7,"total_cost_usd":0.4123,"usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":300,"cache_creation_input_tokens":40},"modelUsage":{"claude-opus-5-5":{}}}\n');
   ok(cr.costUsd === 0.4123 && cr.tokens === 370 && cr.turns === 7 && cr.model === 'claude-opus-5-5' && cr.resultError === null, 'B5: Claude\'s JSON result yields cost, tokens, turns and the model used');

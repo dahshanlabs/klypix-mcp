@@ -102,15 +102,39 @@ export const oracle = {
   },
 };
 
-/** Claude Code's permission list: the edit/test tools, plus every tool of each condition server. */
+/**
+ * Claude Code's permission list: the edit/test tools, plus every tool of each
+ * condition server. On Windows Claude Code runs shell commands through its
+ * PowerShell tool, so the same git/node/test rules are granted there too —
+ * without them every git and node call was denied (4–5 denials per run in the
+ * first pilot, 2026-10-11), an unfair handicap no other agent had.
+ */
 export function claudeAllowedTools(mcpServers = {}) {
-  return ['Read', 'Edit', 'Write', 'Glob', 'Grep', 'Bash(git *)', 'Bash(node *)', 'Bash(npm test*)',
+  const shell = ['git *', 'node *', 'npm test*'];
+  return ['Read', 'Edit', 'Write', 'Glob', 'Grep',
+    ...shell.map((c) => `Bash(${c})`), ...shell.map((c) => `PowerShell(${c})`),
     ...Object.keys(mcpServers).map((name) => `mcp__${name}`)];
 }
 
+const bump = (bag, key) => { bag[key] = (bag[key] || 0) + 1; return bag; };
+
+/**
+ * Claude's stream-json output: every event, then a final `result` event.
+ * `mcpCalls` counts the agent's MCP tool calls by tool name — whether it
+ * consulted the condition's channel at all is what explains a pass or a fail.
+ */
 export function parseClaudeResult(stdout) {
   let out = null;
-  try { out = JSON.parse(String(stdout).trim().split('\n').filter(Boolean).pop()); } catch { out = null; }
+  const mcpCalls = {};
+  for (const line of String(stdout).split('\n')) {
+    let ev; try { ev = JSON.parse(line); } catch { continue; }
+    if (ev?.type === 'result') out = ev;
+    if (ev?.type === 'assistant') {
+      for (const block of ev.message?.content || []) {
+        if (block?.type === 'tool_use' && /^mcp__/.test(String(block.name || ''))) bump(mcpCalls, String(block.name).replace(/^mcp__[^_]+(?:-[^_]+)*__/, ''));
+      }
+    }
+  }
   const u = out?.usage;
   const models = out?.modelUsage ? Object.keys(out.modelUsage) : [];
   return {
@@ -118,8 +142,9 @@ export function parseClaudeResult(stdout) {
     tokens: u ? Number(u.input_tokens || 0) + Number(u.output_tokens || 0) + Number(u.cache_read_input_tokens || 0) + Number(u.cache_creation_input_tokens || 0) : null,
     turns: Number.isFinite(out?.num_turns) ? out.num_turns : null,
     model: models.join('+') || null,
-    resultError: out?.is_error ? String(out.subtype || out.result || 'error').slice(0, 300) : null,
+    resultError: !out ? 'no result event' : (out.is_error ? String(out.subtype || out.result || 'error').slice(0, 300) : null),
     permissionDenials: Array.isArray(out?.permission_denials) ? out.permission_denials.length : null,
+    mcpCalls,
   };
 }
 
@@ -134,7 +159,7 @@ export const claude = {
   async run({ repo, prompt, mcpServers = {}, sessionId, timeoutMs, model = null, maxBudgetUsd = null }) {
     const cfg = path.join(path.dirname(repo.dir), `${path.basename(repo.dir)}.mcp.json`);
     fs.writeFileSync(cfg, JSON.stringify({ mcpServers }, null, 2));
-    const args = ['-p', '--output-format', 'json', '--session-id', sessionId, '--no-session-persistence',
+    const args = ['-p', '--output-format', 'stream-json', '--verbose', '--session-id', sessionId, '--no-session-persistence',
       '--setting-sources', 'project', '--strict-mcp-config', '--mcp-config', cfg,
       '--permission-mode', 'acceptEdits', '--allowedTools', claudeAllowedTools(mcpServers).join(','),
       ...(model ? ['--model', model] : []),
@@ -144,7 +169,7 @@ export const claude = {
     const p = parseClaudeResult(r.stdout);
     return {
       ok: r.code === 0 && !r.timedOut && !p.resultError,
-      costUsd: p.costUsd, tokens: p.tokens, turns: p.turns, model: p.model, permissionDenials: p.permissionDenials,
+      costUsd: p.costUsd, tokens: p.tokens, turns: p.turns, model: p.model, permissionDenials: p.permissionDenials, mcpCalls: p.mcpCalls,
       raw: { stdout: r.stdout, stderr: r.stderr },
       durationMs: r.durationMs,
       timedOut: r.timedOut,
@@ -178,9 +203,11 @@ export function codexPlatformOverrides(platform = process.platform) {
 
 export function parseCodexEvents(stdout) {
   let tokens = null; let turns = 0; let model = null; let failure = null;
+  const mcpCalls = {};
   for (const line of String(stdout).split('\n')) {
     let ev; try { ev = JSON.parse(line); } catch { continue; }
     const type = String(ev?.type || ev?.msg?.type || '');
+    if (type === 'item.completed' && ev.item?.type === 'mcp_tool_call') bump(mcpCalls, String(ev.item.tool || 'unknown'));
     const usage = ev?.usage || ev?.msg?.usage || ev?.info?.total_token_usage;
     if (usage) tokens = Number(usage.input_tokens || 0) + Number(usage.output_tokens || 0) + Number(usage.cached_input_tokens || 0);
     if (/turn\.completed|task_complete/.test(type)) turns++;
@@ -188,7 +215,7 @@ export function parseCodexEvents(stdout) {
     const m = ev?.model || ev?.msg?.model || ev?.session?.model;
     if (typeof m === 'string' && m) model = m;
   }
-  return { tokens, turns: turns || null, model, failure };
+  return { tokens, turns: turns || null, model, failure, mcpCalls };
 }
 
 export const codex = {
@@ -208,7 +235,7 @@ export const codex = {
       ok: r.code === 0 && !r.timedOut && !p.failure,
       costUsd: null,   // Codex reports tokens, not dollars
       // Codex's event stream does not name the model; the row records the pinned one.
-      tokens: p.tokens, turns: p.turns, model: p.model || model,
+      tokens: p.tokens, turns: p.turns, model: p.model || model, mcpCalls: p.mcpCalls,
       raw: { stdout: r.stdout, stderr: r.stderr },
       durationMs: r.durationMs,
       timedOut: r.timedOut,

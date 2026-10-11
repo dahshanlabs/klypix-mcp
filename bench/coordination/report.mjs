@@ -34,6 +34,8 @@ export function summarize(rows) {
       medianTokens: median(rs.map((r) => r.tokens)),
       medianMinutes: median(rs.map((r) => (r.durationMs || 0) / 60000)),
       errors,
+      // Runs in which the agent called the condition's MCP server at all.
+      consulted: rs.filter((r) => r.mcpCalls && Object.keys(r.mcpCalls).length > 0).length,
       versions: [...new Set(rs.map((r) => r.versions).filter(Boolean))],
       models: [...new Set(rs.map((r) => r.model).filter(Boolean))],
     });
@@ -53,12 +55,12 @@ export function toMarkdown(cells) {
     out.push(`## Agent: ${agent}`, '');
     if (versions.length || models.length) out.push(`${versions.length ? `CLI: ${versions.join(', ')}` : ''}${versions.length && models.length ? ' · ' : ''}${models.length ? `model: ${models.join(', ')}` : ''}`, '');
     if (agent === 'oracle') out.push('> **Dry run — not a result.** The scripted oracle answers correctly whenever the facts were delivered. These rows prove the graders and the delivery, never how an agent behaves.', '');
-    out.push( '| Scenario | Condition | n | Success (95% CI) | Acted on stale info | Human relays / task | Median cost | Median min |', '|---|---|---|---|---|---|---|---|');
+    out.push( '| Scenario | Condition | n | Success (95% CI) | Acted on stale info | Human relays / task | Agent consulted KLYPIX | Median cost | Median min |', '|---|---|---|---|---|---|---|---|---|');
     for (const s of SCENARIOS) {
       for (const c of CONDITIONS) {
         const cell = cells.find((x) => x.agent === agent && x.scenario === s.id && x.condition === c.id);
         if (!cell) continue;
-        out.push(`| ${s.title} | ${c.label} | ${cell.n} | ${pct(cell.success.p)} (${pct(cell.success.low)}–${pct(cell.success.high)}) | ${cell.staleActions.k}/${cell.n} | ${cell.relaysPerTask.toFixed(1)} | ${cell.medianCostUsd == null ? '—' : `$${cell.medianCostUsd.toFixed(2)}`} | ${cell.medianMinutes == null ? '—' : cell.medianMinutes.toFixed(1)} |`);
+        out.push(`| ${s.title} | ${c.label} | ${cell.n} | ${pct(cell.success.p)} (${pct(cell.success.low)}–${pct(cell.success.high)}) | ${cell.staleActions.k}/${cell.n} | ${cell.relaysPerTask.toFixed(1)} | ${c.id === 'klypix' ? `${cell.consulted}/${cell.n}` : '—'} | ${cell.medianCostUsd == null ? '—' : `$${cell.medianCostUsd.toFixed(2)}`} | ${cell.medianMinutes == null ? '—' : cell.medianMinutes.toFixed(1)} |`);
       }
     }
     out.push('');

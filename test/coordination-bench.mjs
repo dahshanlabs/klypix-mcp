@@ -75,13 +75,13 @@ for (const s of SCENARIOS.filter(applies)) {
 
 // ── B2: dry run over every runnable condition ───────────────────────────────
 const runnable = CONDITIONS.filter((c) => c.runnable);
-ok(runnable.map((c) => c.id).join(',') === 'none,relay,agents-md-kept,agents-md-appended,klypix', 'B2: five conditions are runnable on any machine');
+ok(runnable.map((c) => c.id).join(',') === 'none,relay,agents-md-kept,agents-md-appended,klypix,klypix-installed', 'B2: six conditions are runnable on any machine');
 ok(CONDITIONS.filter((c) => !c.runnable).every((c) => c.reason && c.reason.length > 20), 'B2: every planned condition says why it is not measured');
 // Which channel can carry each scenario's knowledge — stated up front, so a
 // broken channel cannot pass as "nothing delivered, fail expected". The
 // appended notes file keeps the stale WIP line in S5, so it delivers nothing
 // there; everything else that applies delivers.
-const expectDelivered = (s, c) => c.id !== 'none';
+const expectDelivered = (s, c) => c.id !== 'none' || s.truthInNotes === true;
 const rows = [];
 for (const s of SCENARIOS.filter(applies)) {
   for (const c of runnable) {
@@ -131,16 +131,25 @@ const expectations = {
     return cur >= 0 && (old < 0 || cur < old);
   }, 'its context leads with the no-retry decision, ahead of the archived retry rule, out of three hundred cards'],
   's8-partner-limit-not-in-repo': [(sc) => /24 characters/.test(hitsText(sc)), 'its context carries the partner limit no file holds'],
+  's5b-dead-note-held-out': [(sc) => !(sc.peers || []).some((p) => p.id === 'actor-s5x-ledger') && !/Hands off|mid-refactor/i.test(hitsText(sc)),
+    'no live row and no card say anyone is on lib/ledger.js (the note lives only in the file)'],
+  's5c-valid-note-held-out': [(sc) => !(sc.peers || []).some((p) => p.id === 'actor-s5x-ledger'),
+    'no live row claims lib/ledger.js — the lock is held by a person, through the note'],
+  's9-continue-stopped-session': [(sc, text) => (sc.handoffs?.sessions || []).some((r) => r.id === 'actor-s9-pagination' && r.state === 'ended' && r.holdsFiles === false)
+    && /default limit 20, never more than 50/.test(text),
+    'a continue-shaped task lists the stopped session as unfinished work, and the text carries its last words (the plan)'],
+  's10-live-peer-wrote-nothing': [(sc) => (sc.peers || []).some((p) => p.id === 'actor-s10-tax' && (p.files || []).includes('lib/tax.js') && p.branch === 'a/per-line-tax'),
+    'its peer list shows the live session on lib/tax.js, on a/per-line-tax — though that session wrote nothing'],
 };
-const syncAs = async (server, repo, sessionId, task, phase = 'start') => {
+const syncAs = async (server, repo, sessionId, task, phase = 'start', files = undefined) => {
   const c = new Client({ name: 'cobench-agent', version: '1.0.0' }, { capabilities: {} });
   await c.connect(new StdioClientTransport({
     command: server.command, args: server.args, cwd: repo.dir, stderr: 'pipe',
     env: { ...process.env, ...server.env, ...(sessionId ? { KLYPIX_SESSION_ID: sessionId } : {}) },
   }));
   try {
-    const res = await c.callTool({ name: 'brain_sync', arguments: { project: repo.dir, phase, intent: task.slice(0, 160), include_context: true } });
-    return { isError: !!res.isError, sc: res.structuredContent || {} };
+    const res = await c.callTool({ name: 'brain_sync', arguments: { project: repo.dir, phase, intent: task.slice(0, 160), include_context: true, ...(files ? { files } : {}) } });
+    return { isError: !!res.isError, sc: res.structuredContent || {}, text: (res.content || []).map((x) => x.text || '').join('\n') };
   } finally { try { await c.close(); } catch { /* */ } }
 };
 for (const s of SCENARIOS) {
@@ -172,9 +181,24 @@ for (const s of SCENARIOS) {
       ok((repo.read('AGENTS.md') || '').includes('do not touch') && (repo.read('CLAUDE.md') || '').includes('do not touch'),
         `B3 ${s.id}: the KLYPIX condition leaves the dead WIP line in both instructions files — KLYPIX's empty lane has to beat it (a cleaned file would make this the tidy cell plus a server)`);
     }
-    const { isError, sc } = await syncAs(server, repo, null, s.task);
+    const { isError, sc, text } = await syncAs(server, repo, null, s.task);
     const [check, what] = expectations[s.id];
-    ok(!isError && check(sc), `B3 ${s.id}: the agent's first brain_sync — ${what}`);
+    ok(!isError && check(sc, text), `B3 ${s.id}: the agent's first brain_sync — ${what}`);
+    if (s.id === 's5b-dead-note-held-out' || s.id === 's5c-valid-note-held-out') {
+      // Declaring the locked file surfaces the stopped session — as ENDED and
+      // holding no file, in both scenarios (the product cannot tell a finished
+      // refactor from a paused one; the bench measures what that does).
+      const withFile = await syncAs(server, repo, null, s.task, 'start', ['lib/ledger.js']);
+      const row = (withFile.sc.handoffs?.sessions || []).find((r) => r.id === 'actor-s5x-ledger');
+      ok(!withFile.isError && row?.state === 'ended' && row?.holdsFiles === false && /no longer applies/.test(withFile.text),
+        `B3 ${s.id}: declaring lib/ledger.js lists the stopped session as ended, holding no file, its "do not touch" note "no longer applies"`);
+      ok((repo.read('AGENTS.md') || '').includes('Hands off lib/ledger.js'), `B3 ${s.id}: KLYPIX leaves the note in the notes file`);
+    }
+    if (s.id === 's10-live-peer-wrote-nothing') {
+      const withFile = await syncAs(server, repo, null, s.task, 'start', ['lib/tax.js']);
+      ok(!withFile.isError && (withFile.sc.conflicts || []).some((c) => c.id === 'actor-s10-tax' && c.kind === 'exact-file'),
+        `B3 ${s.id}: declaring lib/tax.js reports an exact-file overlap with the live session`);
+    }
     if (s.id === 's6-fact-arrives-mid-task') {
       // The decision is made while the agent works: a card plus a broadcast
       // note. As in a real run the agent's server stays connected (its lane
@@ -292,6 +316,56 @@ ok(/\| 2\/3 \| —/.test(naMd) && /\| Handled \|/.test(naMd), 'B4: the "handled"
   const cdMd = toMarkdown(summarize(cdRows), cdRows);
   ok(/KLYPIX BEHIND agents-md-kept — 0% vs 100%/.test(cdMd) && !/vs agents-md-appended|agents-md-appended —/.test(cdMd) && !/KLYPIX ahead of none/.test(cdMd),
     'B4: the report lists a clear KLYPIX loss, and never compares against a cell that was not run');
+}
+
+// ── B6: KLYPIX as installed (round 3) ───────────────────────────────────────
+{
+  const { INSTALLED_CLAUDE_HOOKS, claudeHookSettings } = await import('../bench/coordination/conditions.mjs');
+  // The bench wires the same five hooks the installer wires: event, matcher,
+  // argument and timeout, read from bin/klypix-install.mjs itself.
+  const installer = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'klypix-install.mjs'), 'utf8').replace(/\r/g, '');
+  const wired = [...installer.matchAll(/\['(SessionStart|UserPromptSubmit|Stop|PostToolUse|PreToolUse)', \{ (?:matcher: '([^']+)', )?hooks: \[\{ type: 'command', command: brainCmd\('([^']*)'\)(?:, timeout: (\d+))? \}\] \}\]/g)]
+    .map((m) => [m[1], m[2] || null, m[3], m[4] ? Number(m[4]) : null]);
+  ok(wired.length === 5 && JSON.stringify(wired) === JSON.stringify(INSTALLED_CLAUDE_HOOKS.map((h) => [...h])),
+    'B6: the installed condition wires exactly the hooks bin/klypix-install.mjs wires (event, matcher, argument, timeout)');
+  const settings = claudeHookSettings('"node" "w.mjs"');
+  ok(settings.hooks.UserPromptSubmit[0].hooks[0].command === '"node" "w.mjs" --prompt' && settings.hooks.SessionStart[0].matcher === 'startup|resume|clear',
+    'B6: hook commands carry the installer\'s arguments');
+
+  const installed = conditionById('klypix-installed');
+  ok(/CODEX_HOME/.test(notApplicableReason(SCENARIOS[0], installed, { id: 'codex' }) || '') && notApplicableReason(SCENARIOS[0], installed, { id: 'claude' }) === null,
+    'B6: KLYPIX as installed runs for Claude and is n/a for Codex, with the reason');
+
+  const s9 = SCENARIOS.find((s) => s.id === 's9-continue-stopped-session');
+  const repo = makeRepo('klypix-cobench-b6-');
+  const benchHome = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-cobench-b6home-'));
+  let prep = null;
+  try {
+    s9.build(repo);
+    prep = await installed.prepare({ repo, scenario: s9, agent: oracle, sessionIds: { agent: 'bench-agent-b6' }, benchHome });
+    const server = prep.mcpServers['klypix-canvas'];
+    ok(!('KLYPIX_PLUGIN' in server.env) && server.env.HOME === benchHome, 'B6: the installed server is not in plugin mode and runs in the run\'s home');
+    const hooks = JSON.parse(fs.readFileSync(path.join(repo.dir, '.claude', 'settings.json'), 'utf8')).hooks;
+    const wrapperPath = path.join(benchHome, 'klypix-hook.mjs');
+    const wrapper = fs.readFileSync(wrapperPath, 'utf8');
+    ok(Object.keys(hooks).length === 5 && hooks.Stop[0].hooks[0].command.includes(wrapperPath.replace(/\\/g, '/')),
+      'B6: the run repo carries the five hooks, each through the run\'s wrapper');
+    ok(wrapper.includes(JSON.stringify(benchHome)) && wrapper.includes('KLYPIX_BRAIN_DIR') && wrapper.includes('global-brain-hook.mjs') && /delete env\.KLYPIX_PLUGIN/.test(wrapper),
+      'B6: the wrapper pins HOME, USERPROFILE and KLYPIX_BRAIN_DIR to the run\'s home and runs this checkout\'s hook');
+    ok(repo.git('status', '--porcelain') === '' && /\.claude\//.test(fs.readFileSync(path.join(repo.dir, '.git', 'info', 'exclude'), 'utf8')),
+      'B6: the hook settings stay out of git, like a user-scope file');
+    ok(prep.delivered.includes('s9-plan') && prep.actorListed === true, 'B6: the stopped session\'s work record is listed (installed condition)');
+  } catch (err) {
+    ok(false, 'B6: ' + String(err?.message || err).split('\n')[0]);
+  } finally {
+    prep?.cleanup?.();
+    repo.remove();
+    try { fs.rmSync(benchHome, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); } catch { /* */ }
+  }
+  // Codex gets the condition server's tools approved, and only that server's.
+  const ov = codexMcpOverrides({ 'klypix-canvas': { command: 'node', args: [] } });
+  ok(ov.includes('mcp_servers.klypix-canvas.default_tools_approval_mode="approve"') && ov.filter((a) => /approval/.test(a)).length === 1,
+    'B6: Codex approves the KLYPIX server\'s tools (round 2 refused 29 calls) — nothing else is approved');
 }
 
 // ── B5: live-run safety (no model call) ─────────────────────────────────────

@@ -78,7 +78,7 @@ export function toMarkdown(cells, rows = []) {
         const cell = cells.find((x) => x.agent === agent && x.scenario === s.id && x.condition === c.id);
         if (!cell) continue;
         if (cell.notApplicable) { out.push(`| ${s.title} | ${c.label} | — | n/a: ${cell.notApplicable} | — | — | — | — | — | — |`); continue; }
-        out.push(`| ${s.title}${s.role ? ` _(${s.role})_` : ''} | ${c.label} | ${cell.n}${cell.invalidRuns ? ` (+${cell.invalidRuns} invalid)` : ''} | ${pct(cell.success.p)} (${pct(cell.success.low)}–${pct(cell.success.high)}) | ${cell.staleActions.k}/${cell.staleActions.n ?? cell.n}${cell.errors ? ` (+${cell.errors} err)` : ''} | ${cell.relaysPerTask.toFixed(1)} | ${c.id === 'klypix' ? `${cell.consulted}/${cell.n}` : '—'} | ${cell.handledKnown ? `${cell.handled}/${cell.handledKnown}` : '—'} | ${cell.medianCostUsd == null ? '—' : `$${cell.medianCostUsd.toFixed(2)}`} | ${cell.medianMinutes == null ? '—' : cell.medianMinutes.toFixed(1)} |`);
+        out.push(`| ${s.title}${s.role ? ` _(${s.role})_` : ''} | ${c.label} | ${cell.n}${cell.invalidRuns ? ` (+${cell.invalidRuns} invalid)` : ''} | ${pct(cell.success.p)} (${pct(cell.success.low)}–${pct(cell.success.high)}) | ${cell.staleActions.k}/${cell.staleActions.n ?? cell.n}${cell.errors ? ` (+${cell.errors} err)` : ''} | ${cell.relaysPerTask.toFixed(1)} | ${String(c.id).startsWith('klypix') ? `${cell.consulted}/${cell.n}` : '—'} | ${cell.handledKnown ? `${cell.handled}/${cell.handledKnown}` : '—'} | ${cell.medianCostUsd == null ? '—' : `$${cell.medianCostUsd.toFixed(2)}`} | ${cell.medianMinutes == null ? '—' : cell.medianMinutes.toFixed(1)} |`);
       }
     }
     out.push('');
@@ -90,14 +90,15 @@ export function toMarkdown(cells, rows = []) {
     const measured = (c) => c && !c.notApplicable && c.n > 0 && c.success.low != null;
     for (const s of SCENARIOS) {
       const forS = cells.filter((x) => x.agent === agent && x.scenario === s.id);
-      const k = forS.find((x) => x.condition === 'klypix');
-      if (!measured(k)) continue;
-      for (const other of forS) {
-        if (other.condition === 'klypix' || !measured(other)) continue;
-        if (!overlaps(k.success, other.success)) {
-          const ahead = k.success.p > other.success.p;
-          out.push(`- ${s.title}: KLYPIX ${ahead ? 'ahead of' : 'BEHIND'} ${other.condition} — ${pct(k.success.p)} vs ${pct(other.success.p)}`);
-          any = true;
+      for (const k of forS.filter((x) => String(x.condition).startsWith('klypix') && measured(x))) {
+        const name = k.condition === 'klypix' ? 'KLYPIX' : k.condition;
+        for (const other of forS) {
+          if (String(other.condition).startsWith('klypix') || !measured(other)) continue;
+          if (!overlaps(k.success, other.success)) {
+            const ahead = k.success.p > other.success.p;
+            out.push(`- ${s.title}: ${name} ${ahead ? 'ahead of' : 'BEHIND'} ${other.condition} — ${pct(k.success.p)} vs ${pct(other.success.p)}`);
+            any = true;
+          }
         }
       }
     }

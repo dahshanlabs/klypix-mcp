@@ -246,6 +246,10 @@ export function codexMcpOverrides(mcpServers = {}) {
     '-c', `mcp_servers.${name}.command=${tomlString(s.command)}`,
     '-c', `mcp_servers.${name}.args=${tomlArray(s.args || [])}`,
     '-c', `mcp_servers.${name}.startup_timeout_sec=${MCP_STARTUP_TIMEOUT_SEC}`,
+    // Claude may use every tool of the condition's server (claudeAllowedTools);
+    // Codex gets the same: without this its approval policy refuses every
+    // tool but brain_sync (round 2: 29 refused calls).
+    '-c', `mcp_servers.${name}.default_tools_approval_mode="approve"`,
     ...(s.env ? ['-c', `mcp_servers.${name}.env=${tomlInline(s.env)}`] : []),
   ]);
 }
@@ -313,9 +317,9 @@ export const codex = {
     const r = await run(resolveCli('codex'), ['--version'], { cwd: os.tmpdir(), env: cleanAgentEnv(), timeoutMs: 30_000 });
     return r.stdout.trim();
   },
-  async run({ repo, prompt, mcpServers = {}, timeoutMs, model = null, onEvent = null }) {
+  async run({ repo, prompt, mcpServers = {}, timeoutMs, model = null, effort = null, onEvent = null }) {
     const args = ['exec', '--json', '--ephemeral', '--ignore-user-config', '--skip-git-repo-check',
-      '-s', 'workspace-write', '-C', repo.dir, ...(model ? ['-m', model] : []), ...codexPlatformOverrides(), ...codexGitWritable(repo.dir), ...codexMcpOverrides(mcpServers), '-'];
+      '-s', 'workspace-write', '-C', repo.dir, ...(model ? ['-m', model] : []), ...(effort ? ['-c', `model_reasoning_effort="${effort}"`] : []), ...codexPlatformOverrides(), ...codexGitWritable(repo.dir), ...codexMcpOverrides(mcpServers), '-'];
     const r = await run(resolveCli('codex'), args, { cwd: repo.dir, env: cleanAgentEnv(), timeoutMs, input: prompt, onEvent });
     const p = parseCodexEvents(r.stdout);
     const channelUp = codexChannelUp(Object.keys(mcpServers), p.mcpCalls, r.stderr);
@@ -323,7 +327,7 @@ export const codex = {
       ok: r.code === 0 && !r.timedOut && !p.failure && channelUp !== false,
       costUsd: null,   // Codex reports tokens, not dollars
       // Codex's event stream does not name the model; the row records the pinned one.
-      tokens: p.tokens, turns: p.turns, model: p.model || model, mcpCalls: p.mcpCalls, channelUp,
+      tokens: p.tokens, turns: p.turns, model: p.model || model, effort, mcpCalls: p.mcpCalls, channelUp,
       finalMessage: p.finalMessage,
       startedAt: r.startedAt, lastToolAtMs: r.lastToolAtMs, firstToolAtMs: r.firstToolAtMs, firstEditAtMs: r.firstEditAtMs, firstMcpAtMs: r.firstMcpAtMs,
       raw: { stdout: r.stdout, stderr: r.stderr },

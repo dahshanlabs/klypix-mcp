@@ -7,6 +7,8 @@
 //       [--claude-model <id>] [--codex-model <id>] [--max-budget 2]   (Claude's per-run dollar cap)
 //       [--transcripts <dir>]   (each agent's raw output, for auditing a published number)
 //       [--klypix-bin <path>]   (the KLYPIX server to measure; default this checkout's bin/klypix-mcp.mjs)
+//       [--codex-effort <none|low|medium|high|…>]   (pinned on every Codex run and recorded)
+//       KLYPIX_BENCH_SEMANTIC_DIR=<dir>   (a prepared copy of semantic/ + hf-cache/ for klypix-installed)
 //
 // A live run spends model usage on YOUR account. It prints the run count and
 // waits for --yes (or asks on a TTY) before the first agent starts.
@@ -17,11 +19,12 @@ import path from 'node:path';
 import readline from 'node:readline';
 import { pathToFileURL } from 'node:url';
 import { SCENARIOS, scenarioById } from './scenarios.mjs';
-import { CONDITIONS, conditionById, appendedNotApplicable, klypixServerInfo } from './conditions.mjs';
+import { CONDITIONS, conditionById, appendedNotApplicable, klypixServerInfo, isKlypixCondition } from './conditions.mjs';
 import { agentById, composePrompt, CHANNEL_DOWN } from './agents.mjs';
 
 /** Why a (scenario, condition) cell is not run, or null. */
-export function notApplicableReason(scenario, condition) {
+export function notApplicableReason(scenario, condition, agent = null) {
+  if (agent && typeof condition.notApplicableFor === 'function') { const why = condition.notApplicableFor(agent); if (why) return why; }
   if (scenario.notApplicable?.[condition.id]) return scenario.notApplicable[condition.id];
   if (condition.id === 'agents-md-appended') return appendedNotApplicable(scenario);
   return null;
@@ -53,6 +56,9 @@ export function validityError({ scenario, condition, agent, prep, later, laterFi
   if (condition.id === 'none') return null;   // carries nothing by design
   const startFacts = scenario.facts.length;
   if ((prep.delivered || []).length < startFacts) return `${FACT_NOT_DELIVERED}: ${(prep.delivered || []).length}/${startFacts} at start`;
+  // A scenario that needs the product to LIST the stopped session (its own
+  // window and evidence rules) measured nothing about KLYPIX when it did not.
+  if (scenario.requireListed && isKlypixCondition(condition) && !prep.actorListed) return `${FACT_NOT_DELIVERED}: the stopped session is not listed as unfinished work`;
   if (!scenario.later) return null;
   if (!later.fired) return agent.id === 'oracle' ? null : FACT_NOT_FIRED;
   const want = scenario.later.facts?.length || 0;
@@ -129,7 +135,9 @@ export async function runOne({ scenario, condition, agent, run, timeoutMs, keep 
       agentOk: res.ok, model: res.model ?? null, permissionDenials: res.permissionDenials ?? null, mcpCalls: res.mcpCalls ?? null, channelUp: res.channelUp ?? null,
       invalid: isInvalidReason(error), costUsd: res.costUsd ?? null, tokens: res.tokens ?? null, turns: res.turns ?? null,
       durationMs: res.durationMs ?? (Date.now() - started), timedOut: !!res.timedOut,
-      ...(condition.id === 'klypix' && klypixServer ? { klypixServer } : {}),
+      ...(isKlypixCondition(condition) && klypixServer ? { klypixServer } : {}),
+      ...(isKlypixCondition(condition) ? { actorListed: prep.actorListed ?? null, semantic: prep.semantic ?? false } : {}),
+      ...(res.effort ? { effort: res.effort } : {}),
       error, keptRepo: keep ? repo.dir : null,
     };
   } catch (err) {
@@ -167,6 +175,7 @@ async function main() {
   const agentOptionsFor = (agent) => ({
     model: opt(`${agent.id}-model`, null),
     ...(agent.id === 'claude' ? { maxBudgetUsd: Number(opt('max-budget', '2')) || null } : {}),
+    ...(agent.id === 'codex' && opt('codex-effort', null) ? { effort: opt('codex-effort', null) } : {}),
   });
   const out = opt('out', null);
   const klypixBin = opt('klypix-bin', null);
@@ -175,7 +184,7 @@ async function main() {
   for (const a of agents) if (!a.available()) { console.error(`agent ${a.id} is not installed on this machine`); process.exit(2); }
   const total = scenarios.length * runnable.length * agents.length * runs;
   console.log(`${dry ? 'DRY RUN (oracle, no model calls)' : 'LIVE RUN'}: ${scenarios.length} scenario(s) × ${runnable.length} condition(s) × ${agents.length} agent(s) × ${runs} run(s) = ${total} run(s)`);
-  if (runnable.some((c) => c.id === 'klypix')) console.log(`KLYPIX server: ${klypixServer.version ?? '?'} @ ${klypixServer.commit ?? 'no git'}${klypixServer.dirty ? ' (modified)' : ''} — ${klypixServer.bin}`);
+  if (runnable.some(isKlypixCondition)) console.log(`KLYPIX server: ${klypixServer.version ?? '?'} @ ${klypixServer.commit ?? 'no git'}${klypixServer.dirty ? ' (modified)' : ''} — ${klypixServer.bin}`);
   if (!dry && !flag('yes') && !(await confirm('This spends model usage on your account. Continue? [y/N] '))) { console.log('cancelled'); return; }
   const versions = {};
   for (const a of agents) versions[a.id] = await a.version();
@@ -184,7 +193,7 @@ async function main() {
     // A condition a scenario cannot apply to (a copy-paste at start cannot
     // carry a decision made later; an appended notes file byte-identical to
     // another condition) is recorded as such, never as a fail — and never run.
-    const notApplicable = notApplicableReason(scenario, condition);
+    const notApplicable = notApplicableReason(scenario, condition, agent);
     const r = notApplicable
       ? { scenario: scenario.id, condition: condition.id, agent: agent.id, run, notApplicable, success: false, staleAction: false, collision: null, handled: null, relays: 0, delivered: 0, facts: scenario.facts.length + (scenario.later?.facts?.length || 0), agentOk: null, costUsd: null, tokens: null, turns: null, durationMs: 0, timedOut: false, error: null, keptRepo: null }
       : await runOne({ scenario, condition, agent, run, timeoutMs, keep: flag('keep'), agentOptions: agentOptionsFor(agent), transcriptDir: opt('transcripts', null), klypixServer });

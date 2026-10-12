@@ -42,7 +42,7 @@ so the agent cannot read or game them. There is no LLM judge.
 | Condition | How the other session's knowledge reaches the agent |
 |---|---|
 | `none` | It does not. The project notes still carry whatever they said before. |
-| `relay` | A human pasted the facts into the prompt. **Upper bound**: counts one human relay per fact. |
+| `relay` | A teammate pasted the facts into the prompt ("A teammate pasted this from another agent session: …"). Meant as an **upper bound**, counting one human relay per fact — but it is a second-hand claim, and an agent may weigh it against a written record that contradicts it (round 2, S7). |
 | `agents-md-kept` | The other session edited `AGENTS.md` / `CLAUDE.md` tidily (the out-of-date line removed). |
 | `agents-md-appended` | The other session appended to `AGENTS.md` / `CLAUDE.md` (the out-of-date line left in). |
 | `klypix` | The other session used KLYPIX: decisions as brain cards (a replaced one archived with a "superseded by" arrow), live work as a lane row, an ended session as an expired row. **KLYPIX never edits the notes file**: whatever it said before is still there, and KLYPIX's signal has to beat it. The agent gets **only the klypix-mcp server** (plugin mode) and the project rules `klypix link` writes — no hooks. Those rules go into `AGENTS.md` (read by Codex); `klypix link` writes no `CLAUDE.md` target, because Claude Code's rules channel is hooks, so **for Claude Code the only pointer to the brain is the server's own instructions** — a conservative setup. |
@@ -131,8 +131,10 @@ that its first `brain_sync` shows the agent what the other session knew.
   well a real second agent *writes* notes, or how often real sessions forget to.
 - **Small repos.** Eight scenarios on tiny projects. They test whether
   knowledge crosses sessions, not whether an agent can navigate a large codebase.
-- **The relay condition is an upper bound**, not a competitor: a human
-  carrying every fact by hand, at the moment it is needed.
+- **The relay condition is meant as an upper bound**, not a competitor: a
+  human carrying every fact by hand, at the moment it is needed. It is not
+  always one: when the notes file contradicts the paste, an agent may side with
+  the file (round 2, S7).
 - **The mailbox is not measured.** KLYPIX's directed notes reach a session the
   sender already knew. Every agent here is a brand-new session, so a finding
   left by an ended session travels as a brain card.

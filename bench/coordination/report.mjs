@@ -47,9 +47,10 @@ export function summarize(rows) {
       errors,
       // Runs in which the agent called the condition's MCP server at all.
       consulted: rs.filter((r) => r.mcpCalls && Object.keys(r.mcpCalls).length > 0).length,
-      // Scenarios that define it (S2): the overlap was handled — merged away,
-      // or named in the agent's final message. A flagged conflict is not an
-      // unnoticed one, even when the strict grade fails it.
+      // Scenarios that define it: S2, the overlap was handled — merged away,
+      // or named in the agent's final message (a flagged conflict is not an
+      // unnoticed one, even when the strict grade fails it); S6, the decision
+      // was applied or surfaced with its source, only where it was delivered.
       handled: rs.filter((r) => r.handled === true).length,
       handledKnown: rs.filter((r) => r.handled === true || r.handled === false).length,
       versions: [...new Set(rs.map((r) => r.versions).filter(Boolean))],
@@ -71,7 +72,7 @@ export function toMarkdown(cells, rows = []) {
     out.push(`## Agent: ${agent}`, '');
     if (versions.length || models.length) out.push(`${versions.length ? `CLI: ${versions.join(', ')}` : ''}${versions.length && models.length ? ' · ' : ''}${models.length ? `model: ${models.join(', ')}` : ''}`, '');
     if (agent === 'oracle') out.push('> **Dry run — not a result.** The scripted oracle answers correctly whenever the facts were delivered. These rows prove the graders and the delivery, never how an agent behaves.', '');
-    out.push( '| Scenario | Condition | n | Success (95% CI) | Acted on stale info | Human relays / task | Agent consulted KLYPIX | Handled overlap | Median cost | Median min |', '|---|---|---|---|---|---|---|---|---|---|');
+    out.push( '| Scenario | Condition | n | Success (95% CI) | Acted on stale info | Human relays / task | Agent consulted KLYPIX | Handled | Median cost | Median min |', '|---|---|---|---|---|---|---|---|---|---|');
     for (const s of SCENARIOS) {
       for (const c of CONDITIONS) {
         const cell = cells.find((x) => x.agent === agent && x.scenario === s.id && x.condition === c.id);
@@ -111,7 +112,7 @@ export function toMarkdown(cells, rows = []) {
     for (const [k, n] of reasons) out.push(`- ${k}: ${n}`);
     out.push('');
   }
-  out.push('_Scripted "other session" actors; hidden tests; no LLM judge. Relay = the human pasted the facts (upper bound). "invalid" = the run measured nothing about its channel (server never came up, a write did not land, a mid-task fact never fired or landed after the last action, or the bench itself failed); it is excluded from the rates, not counted as a fail. _(control)_ rows are solvable without any channel; _(calibration)_ rows check that delivery works, not which channel is better._');
+  out.push('_Scripted "other session" actors; hidden tests; no LLM judge. Relay = a teammate pasted the facts into the prompt — meant as an upper bound, but an agent may weigh a paste against a written record that contradicts it. "invalid" = the run measured nothing about its channel (server never came up, a write did not land, a mid-task fact never fired or landed after the last action, or the bench itself failed); it is excluded from the rates, not counted as a fail. _(control)_ rows are solvable without any channel; _(calibration)_ rows check that delivery works, not which channel is better. "Handled" is scored only where a scenario defines it: S2, the overlap was avoided or named in the final message; S6, the decision was applied or surfaced with its source, counted only where it was delivered._');
   return out.join('\n');
 }
 

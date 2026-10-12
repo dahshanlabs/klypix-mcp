@@ -283,7 +283,7 @@ const naMd = toMarkdown(summarize([
   { scenario: 's2-overlapping-work', condition: 'klypix', agent: 'claude', run: 3, success: false, staleAction: true, handled: false, mcpCalls: { brain_sync: 1 } },
 ]));
 ok(/n\/a: a paste at start cannot carry it/.test(naMd), 'B4: a condition a scenario cannot apply to prints as n/a with its reason, never as 0%');
-ok(/\| 2\/3 \| —/.test(naMd) && /Handled overlap/.test(naMd), 'B4: the "handled overlap" column counts a flagged conflict beside the strict grade (2/3)');
+ok(/\| 2\/3 \| —/.test(naMd) && /| Handled |/.test(naMd), 'B4: the "handled" column counts a flagged conflict beside the strict grade (2/3)');
 
 // ── B5: live-run safety (no model call) ─────────────────────────────────────
 {

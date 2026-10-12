@@ -410,7 +410,11 @@ const klypixInstalled = {
       '',
     ].join('\n'));
     const fwd = (p) => p.replace(/\\/g, '/');
-    const command = `"${fwd(process.execPath)}" "${fwd(wrapper)}"`;
+    // The installer's exact form: a bare `node`, then the quoted script. On
+    // Windows Claude Code runs hook commands through PowerShell, where a
+    // command line that STARTS with a quoted path is a parse error (the
+    // round-3 smoke run: every hook failed that way, silently).
+    const command = `node "${fwd(wrapper)}"`;
     const settingsFile = path.join(ctx.repo.dir, '.claude', 'settings.json');
     let settings = {};
     try { settings = JSON.parse(fs.readFileSync(settingsFile, 'utf8')); } catch { /* none yet */ }

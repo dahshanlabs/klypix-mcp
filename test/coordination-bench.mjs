@@ -348,6 +348,12 @@ ok(/\| 2\/3 \| —/.test(naMd) && /\| Handled \|/.test(naMd), 'B4: the "handled"
     const hooks = JSON.parse(fs.readFileSync(path.join(repo.dir, '.claude', 'settings.json'), 'utf8')).hooks;
     const wrapperPath = path.join(benchHome, 'klypix-hook.mjs');
     const wrapper = fs.readFileSync(wrapperPath, 'utf8');
+    // The installer's exact command form: a bare node, then the quoted script.
+    // On Windows Claude Code runs hooks through PowerShell, where a line that
+    // starts with a quoted path is a parse error (round-3 smoke: every hook failed).
+    const installerForm = installer.includes('const brainCmd = (arg) => ' + String.fromCharCode(96) + 'node "$' + '{');
+    ok(installerForm && Object.values(hooks).every((g) => /^node "[^"]+"( --[a-z]+)?$/.test(g[0].hooks[0].command)),
+      'B6: every hook command has the installer\'s form, a bare node then the quoted script');
     ok(Object.keys(hooks).length === 5 && hooks.Stop[0].hooks[0].command.includes(wrapperPath.replace(/\\/g, '/')),
       'B6: the run repo carries the five hooks, each through the run\'s wrapper');
     ok(wrapper.includes(JSON.stringify(benchHome)) && wrapper.includes('KLYPIX_BRAIN_DIR') && wrapper.includes('global-brain-hook.mjs') && /delete env\.KLYPIX_PLUGIN/.test(wrapper),

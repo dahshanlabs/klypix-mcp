@@ -68,7 +68,7 @@ export function validityError({ scenario, condition, agent, prep, later, laterFi
 }
 
 export async function runOne({ scenario, condition, agent, run, timeoutMs, keep = false, agentOptions = {}, transcriptDir = null, klypixServer = null }) {
-  const repo = makeRepo(`klypix-cobench-${scenario.id.slice(0, 2)}-`);
+  const repo = makeRepo(`klypix-cobench-${scenario.id.split('-')[0]}-`);
   // KLYPIX files of this run (lane, registry) live here, never in the user's home.
   const benchHome = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-cobench-home-'));
   const sessionIds = { agent: crypto.randomUUID() };
@@ -115,7 +115,9 @@ export async function runOne({ scenario, condition, agent, run, timeoutMs, keep 
     if (transcriptDir && res.raw) {
       // The agent's own output, kept so any published number can be audited run by run.
       fs.mkdirSync(transcriptDir, { recursive: true });
-      const base = path.join(transcriptDir, `${scenario.id.slice(0, 2)}-${condition.id}-${agent.id}-${run}`);
+      // The scenario's own short id (s10, s5b): two characters would file S10's
+      // transcripts over S1's.
+      const base = path.join(transcriptDir, `${scenario.id.split('-')[0]}-${condition.id}-${agent.id}-${run}`);
       fs.writeFileSync(`${base}.out.jsonl`, res.raw.stdout || '');
       if (res.raw.stderr) fs.writeFileSync(`${base}.err.txt`, res.raw.stderr);
     }

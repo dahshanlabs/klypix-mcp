@@ -597,16 +597,29 @@ and the person opens Codex (or a fresh Claude Code) and says *continue*. Until 1
 handoff was whatever the person pasted. Now there are two layers, and the person does not have
 to ask for either.
 
-**Automatic.** At every turn end the hooks record the session's last state on the lane that already
-remembers sessions for two weeks: the last human prompt, the tail of the last reply (where "done /
-next" usually is), the files it touched, and its *own* commits (the shas its `git commit` printed —
-never a branch range, because twenty sessions can share one checkout). When that session goes quiet
-for ten minutes or closes with its task uncompleted, every new session on the project sees
-**⏸️ Unfinished work left by other sessions** at its first `brain_sync` and at session start — in
-Claude Code, Codex, and any MCP host — with a status (*closed*, *idle 83m*), the files, the commits,
-the last words, and the resume command should the person want the old transcript. The agent takes it
-over with `brain_handoff {action:"take", session:"<id>"}` so peers see it is taken, continues from
-the record, and marks it `done`. Machine-local, like the rest of the lane.
+**Automatic — whichever agent stopped.** Each session's last state is recorded on the lane that
+already remembers sessions for two weeks, by whatever that host offers:
+
+| Host | Recorded automatically |
+|---|---|
+| Claude Code (hooks) | last prompt, the tail of the last reply, files edited, its *own* commits |
+| Codex (hooks) | last prompt, the tail of the last reply, files edited, its *own* commits |
+| Any MCP host — Cursor, VS Code, Windsurf, Gemini CLI, … | the task and files it declared with `brain_sync` |
+
+*Own* commits are the shas that session's `git commit` printed, never a branch range, because
+twenty sessions can share one checkout. A session is listed when it stopped in the last 24 hours
+without completing its task — quiet for ten minutes, or closed — and left a record. A session that
+recorded nothing is never listed, so finished chats do not pile up.
+
+The next session on the project, in any agent, sees **⏸️ Work other sessions may have left
+unfinished** at its first `brain_sync` when its task is to continue something ("continue what Codex
+was doing on the invoice" puts that session first) or touches a file one of them touched. It sees the
+same list at session start. Each record carries its status, files, commits, last words and resume
+command. It says, in the text and in the JSON (`state`, `working:false`, `holdsFiles:false`), that
+the session is not running, holds no claim on any file, and that a "do not touch" note it left no
+longer applies: the list is history, not a lock. The agent takes a record over with
+`brain_handoff {action:"take", session:"<id>"}` so peers see it is taken, then marks it `done`. This
+layer is machine-local, like the rest of the lane.
 
 **Deliberate.** When a session knows it is stopping — the person asks for a handoff, the context or
 usage limit is near, the day ends, it is blocked, it is switching tool — it calls

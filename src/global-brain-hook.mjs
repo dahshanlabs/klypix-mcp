@@ -1086,6 +1086,7 @@ function workNorm(raw) {
     if (raw.handoffCardId) out.handoffCardId = str(raw.handoffCardId, 64);
     if (raw.takenBy && typeof raw.takenBy === 'object' && raw.takenBy.id) out.takenBy = { id: str(raw.takenBy.id, 160), client: str(raw.takenBy.client, 40) || 'unknown', at: ms(raw.takenBy.at) };
     if (ms(raw.doneAt)) { out.doneAt = ms(raw.doneAt); if (raw.doneBy) out.doneBy = str(raw.doneBy, 160); }
+    if (ms(raw.declaredAt)) out.declaredAt = ms(raw.declaredAt);   // 1.99.1 twin: a brain_sync-declared task (any MCP host)
     return Object.keys(out).length ? out : null;
 }
 const workMerge = (prev, patch) => (patch === undefined ? workNorm(prev) : patch === null ? null : workNorm({ ...(workNorm(prev) || {}), ...(patch && typeof patch === 'object' ? patch : {}) }));
@@ -1470,7 +1471,7 @@ const UNFINISHED_QUIET_MS = 10 * 60 * 1000;
 // 1.99.1 twin of agent-presence UNFINISHED_WINDOW_MS / hasWorkEvidence: only a
 // session that stopped in the last 24h AND left a 1.99+ work record is listed.
 const UNFINISHED_WINDOW_MS = 24 * 60 * 60 * 1000;
-const hasWorkEvidence = (w) => Boolean(w && (w.lastWords || (Array.isArray(w.commits) && w.commits.length) || w.handoffCardId));
+const hasWorkEvidence = (w) => Boolean(w && (w.lastWords || (Array.isArray(w.commits) && w.commits.length) || w.handoffCardId || w.declaredAt));
 const CONTINUE_RE = /\b(continue|resume|pick (it |this |that )?up|carry on|keep going|where (were|did) we|what('s| is| was) (next|left|remaining|pending)|unfinished|left off|hand[- ]?off|handed (over|off)|take over|finish (what|the work|it|this))\b/i;
 const HANDOFF_ASK_RE = /\b(hand[- ]?off|hand (it|this|the work) (over|off)|before (we|i|you) (hit|reach|approach|run out of) (the )?(limit|context|window|quota)|(context|usage|token) (limit|window|quota)|out of context|switch(ing)? to (codex|another (agent|session|tool)))\b/i;
 function unfinishedFooter(sid, { max = 4 } = {}) {

@@ -535,12 +535,28 @@ export function normalizeWork(raw) {
     out.takenBy = { id: str(raw.takenBy.id, 160), client: str(raw.takenBy.client, 40) || 'unknown', at: ms(raw.takenBy.at) };
   }
   if (ms(raw.doneAt)) { out.doneAt = ms(raw.doneAt); if (raw.doneBy) out.doneBy = str(raw.doneBy, 160); }
+  // 1.99.1 (universal): a task DECLARED through brain_sync — any MCP host,
+  // hooks or not — stamps when it was declared, so a Cursor / Gemini / VS Code
+  // session that stopped mid-task is still found by the next session.
+  if (ms(raw.declaredAt)) out.declaredAt = ms(raw.declaredAt);
   return Object.keys(out).length ? out : null;
 }
 export function mergeWork(previous, patch) {
   if (patch === undefined) return normalizeWork(previous);
   if (patch === null) return null;
-  return normalizeWork({ ...(normalizeWork(previous) || {}), ...(patch && typeof patch === 'object' ? patch : {}) });
+  const prev = normalizeWork(previous) || {};
+  const next = patch && typeof patch === 'object' ? { ...patch } : {};
+  // `addCommits` APPENDS (Codex records one commit per tool result; the
+  // Claude Stop hook replaces the full list with `commits`), newest last,
+  // de-duplicated by sha, capped like `commits`.
+  if (Array.isArray(next.addCommits)) {
+    const seen = new Set();
+    next.commits = [...(prev.commits || []), ...next.addCommits]
+      .filter((c) => c && c.sha && !seen.has(String(c.sha).slice(0, 7)) && seen.add(String(c.sha).slice(0, 7)))
+      .slice(-WORK_COMMITS_MAX);
+    delete next.addCommits;
+  }
+  return normalizeWork({ ...prev, ...next });
 }
 const pruneDirectory = (rows, now) => (Array.isArray(rows) ? rows : [])
   .filter((row) => row && recipientKey(row.id) && now - Number(row.lastSeen || 0) < DIRECTORY_FRESH_MS)
@@ -1186,7 +1202,14 @@ export function upsertSession({
       ...(statusDigestHash !== undefined ? { statusDigestHash: String(statusDigestHash || '').slice(0, 16) } : {}),
       // ADDITIVE unfinished-work state: merged only when this touch carries a
       // patch; the `...previous` spread keeps it verbatim otherwise.
-      ...(work !== undefined ? (mergeWork(previous.work, work) ? { work: mergeWork(previous.work, work) } : {}) : {}),
+      ...(() => {
+        // A brain_sync-DECLARED task (any MCP host) is itself a work record:
+        // stamp declaredAt beside whatever patch this touch carries.
+        const declared = intentSource === 'declared' && intentChanged && nextIntent ? { declaredAt: now } : null;
+        if (work === undefined && !declared) return {};
+        const merged = mergeWork(previous.work, { ...(work && typeof work === 'object' ? work : {}), ...(declared || {}) });
+        return merged ? { work: merged } : {};
+      })(),
       // ADDITIVE host status: stamped only when this touch carries one, kept
       // verbatim otherwise, so a heartbeat never turns "working" into unknown.
       ...(nextHostStatus
@@ -2914,7 +2937,10 @@ export const UNFINISHED_QUIET_MS = 10 * 60 * 1000;
 // and every record says, in text and JSON, that it is not running and holds
 // no claim on any file.
 export const UNFINISHED_WINDOW_MS = 24 * 60 * 60 * 1000;
-export const hasWorkEvidence = (work) => Boolean(work && (work.lastWords || (Array.isArray(work.commits) && work.commits.length) || work.handoffCardId));
+// Evidence of real work, from ANY host: a reply tail (Claude and Codex Stop
+// hooks), own commits (Claude transcript, Codex tool results), a handoff card
+// (brain_handoff), or a task declared through brain_sync (every MCP host).
+export const hasWorkEvidence = (work) => Boolean(work && (work.lastWords || (Array.isArray(work.commits) && work.commits.length) || work.handoffCardId || work.declaredAt));
 export function clientWord(client) {
   const key = String(client || '').toLowerCase();
   if (key === 'claude-code' || key === 'claude') return 'Claude Code';
@@ -3026,11 +3052,11 @@ export function stampSessionWork({ brainPath, sessionId, patch, home, now = Date
 // one record per unfinished session, newest first, then how to take it over.
 // Quoted text is another session's record and is labelled as such — never as
 // the human's instructions; markers inside it were neutralized at store time.
-export function formatUnfinishedWork(records, { now = Date.now(), max = 5, cardTitles = null } = {}) {
+export function formatUnfinishedWork(records, { now = Date.now(), max = 5, cardTitles = null, ranked = false } = {}) {
   const list = Array.isArray(records) ? records : [];
   if (!list.length) return '';
   const flat = (value) => String(value || '').replace(/\s+/g, ' ').trim();
-  const lines = [`⏸️ Work other sessions may have left unfinished (${list.length}, stopped in the last 24h, newest first). None of them is running: they hold NO claim on any file, and a "do not touch" or WIP note one of them left no longer applies. Use this only if the human asks you to continue their work:`];
+  const lines = [`⏸️ Work other sessions may have left unfinished (${list.length}, stopped in the last 24h, ${ranked ? 'most relevant first' : 'newest first'}). None of them is running: they hold NO claim on any file, and a "do not touch" or WIP note one of them left no longer applies. Use this only if the human asks you to continue their work:`];
   for (const r of list.slice(0, max)) {
     const who = `${clientWord(r.client)} ${String(r.id).slice(0, 8)}`;
     const bits = [r.state === 'ended' ? 'ended' : `stopped (${r.status})`, `last active ${agoLabel(r.ageMs)}`];

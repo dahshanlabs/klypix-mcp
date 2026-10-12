@@ -16,6 +16,7 @@
 // Both CLIs are started directly — never through cmd.exe, which would mangle
 // the prompt and the TOML values — and the prompt goes in on stdin.
 import { spawn, spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -260,6 +261,11 @@ export function codexMcpOverrides(mcpServers = {}) {
  * without it every shell command is "blocked by policy" and the agent can
  * neither read with a shell nor edit (seen on the first live run, 2026-10-11).
  */
+export function codexGlobalRulesFingerprint(env = process.env) {
+  const file = path.join(env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'AGENTS.md');
+  try { const text = fs.readFileSync(file, 'utf8'); return { sha: crypto.createHash('sha256').update(text).digest('hex').slice(0, 12), klypix: /klypix/i.test(text) }; } catch { return null; }
+}
+
 export function codexPlatformOverrides(platform = process.platform) {
   return platform === 'win32' ? ['-c', 'windows.sandbox="elevated"'] : [];
 }
@@ -328,6 +334,10 @@ export const codex = {
       costUsd: null,   // Codex reports tokens, not dollars
       // Codex's event stream does not name the model; the row records the pinned one.
       tokens: p.tokens, turns: p.turns, model: p.model || model, effort, mcpCalls: p.mcpCalls, channelUp,
+      // --ignore-user-config skips config.toml only: Codex still loads the
+      // user's global AGENTS.md (on a KLYPIX machine, a KLYPIX rules block).
+      // Its fingerprint is recorded on every row.
+      codexGlobalRules: codexGlobalRulesFingerprint(),
       finalMessage: p.finalMessage,
       startedAt: r.startedAt, lastToolAtMs: r.lastToolAtMs, firstToolAtMs: r.firstToolAtMs, firstEditAtMs: r.firstEditAtMs, firstMcpAtMs: r.firstMcpAtMs,
       raw: { stdout: r.stdout, stderr: r.stderr },

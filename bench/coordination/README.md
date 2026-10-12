@@ -74,9 +74,12 @@ The instructions-file conditions are deliberately generous: the other session
 always writes the facts, in the right file, committed. Real teams forget.
 
 **Not measured yet** (listed in every report, never simulated):
-KLYPIX with Claude Code hooks, Claude Code cross-session messaging, MCP Agent
-Mail, Concord, and memory tools such as OpenMemory. Each needs an adapter
-verified against a pinned version before any number is published.
+KLYPIX's hooks on **Codex** (they live only in the user's own `CODEX_HOME`),
+Claude Code cross-session messaging, Claude Code's and Codex's native session
+resume (S9 makes every handoff cross-vendor so no native resume applies), MCP
+Agent Mail, Concord, and memory tools such as OpenMemory. Each needs an adapter
+verified against a pinned version before any number is published. KLYPIX's
+hooks on **Claude Code** are measured from round 3 (`klypix-installed`).
 
 ## Fairness rules
 
@@ -161,9 +164,28 @@ that its first `brain_sync` shows the agent what the other session knew.
 - **The mailbox is not measured.** KLYPIX's directed notes reach a session the
   sender already knew. Every agent here is a brand-new session, so a finding
   left by an ended session travels as a brain card.
-- **Claude Code without hooks.** The KLYPIX condition gives Claude Code only the
-  MCP server's instructions; Claude Code with KLYPIX's hooks is a planned,
-  separate condition.
+- **Two KLYPIX setups.** `klypix` is the MCP server alone (plugin mode); for
+  Claude Code the rules reach it only if it opens `AGENTS.md`. `klypix-installed`
+  (round 3, Claude Code only) is the installed product. Its known deviations from
+  a field install: Claude runs with `--no-session-persistence`, so the Stop hook
+  has no transcript (no capture-gap nudge, no work stamp for the agent itself) —
+  do not compare its turns or cost with field use; the hooks run through a
+  wrapper that pins the run's home; search by meaning comes from a prepared copy
+  that is checked before and after the run.
+- **Codex loads the user's global `AGENTS.md`.** `--ignore-user-config` skips
+  `config.toml` only. On a KLYPIX machine that file carries a KLYPIX rules block
+  (inert where there is no `brain.klypix`); every Codex row records its
+  fingerprint (`codexGlobalRules`). Rounds 1–2 ran the same way.
+- **Codex's reasoning effort is the model's own default** unless `--codex-effort`
+  pins it: the CLI sends none, and the API refuses an explicit `none` for
+  `gpt-6-astra`. Rounds 1–2 ran at that default (not "effort none").
+- **S10 and S2 are the shared-checkout case.** Both sessions work in one
+  checkout, so they share one brain and lane. Sessions in separate worktrees
+  have separate brains; that case is not measured.
+- **S9's plan lives where the scenario puts it.** In S9 the stopped session's
+  last reply is a mid-step line and the plan is in its last prompt; S9s is the
+  case where its last reply happened to summarise the plan. Real last replies
+  vary between the two.
 - **One machine.** KLYPIX's lane is machine-local; a teammate on another PC is
   out of scope here, as it is in the product.
 - **Small samples prove little.** Five runs that all pass give an interval of

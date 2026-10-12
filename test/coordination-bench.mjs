@@ -136,8 +136,10 @@ const expectations = {
   's5c-valid-note-held-out': [(sc) => !(sc.peers || []).some((p) => p.id === 'actor-s5x-ledger'),
     'no live row claims lib/ledger.js — the lock is held by a person, through the note'],
   's9-continue-stopped-session': [(sc, text) => (sc.handoffs?.sessions || []).some((r) => r.id === 'actor-s9-pagination' && r.state === 'ended' && r.holdsFiles === false)
-    && /default limit 20, never more than 50/.test(text),
-    'a continue-shaped task lists the stopped session as unfinished work, and the text carries its last words (the plan)'],
+    && /Now wiring them into listUsers/.test(text) && !/default limit 20/.test(text),
+    'a continue-shaped task lists the stopped session; its last words are a mid-step line, and the plan (in its last prompt) is not shown'],
+  's9s-continue-stopped-session-summary': [(sc, text) => (sc.handoffs?.sessions || []).some((r) => r.id === 'actor-s9-pagination') && /default limit 20, never more than 50/.test(text),
+    'the summary variant: the stopped session\'s last words carry the plan, in the text'],
   's10-live-peer-wrote-nothing': [(sc) => (sc.peers || []).some((p) => p.id === 'actor-s10-tax' && (p.files || []).includes('lib/tax.js') && p.branch === 'a/per-line-tax'),
     'its peer list shows the live session on lib/tax.js, on a/per-line-tax — though that session wrote nothing'],
 };
@@ -344,7 +346,10 @@ ok(/\| 2\/3 \| —/.test(naMd) && /\| Handled \|/.test(naMd), 'B4: the "handled"
     s9.build(repo);
     prep = await installed.prepare({ repo, scenario: s9, agent: oracle, sessionIds: { agent: 'bench-agent-b6' }, benchHome });
     const server = prep.mcpServers['klypix-canvas'];
-    ok(!('KLYPIX_PLUGIN' in server.env) && server.env.HOME === benchHome, 'B6: the installed server is not in plugin mode and runs in the run\'s home');
+    ok(!('KLYPIX_PLUGIN' in server.env) && server.env.HOME === benchHome && !('KLYPIX_SESSION_ID' in server.env),
+      'B6: the installed server is not in plugin mode, runs in the run\'s home, and gets no pinned session id (the installer sets none)');
+    ok(server.env.KLYPIX_APP_BRIDGE_DIR && server.env.KLYPIX_APP_BRIDGE_DIR.startsWith(benchHome),
+      'B6: the desktop app\'s bridge is looked up inside the run\'s home — no run can reach the user\'s open canvases');
     const hooks = JSON.parse(fs.readFileSync(path.join(repo.dir, '.claude', 'settings.json'), 'utf8')).hooks;
     const wrapperPath = path.join(benchHome, 'klypix-hook.mjs');
     const wrapper = fs.readFileSync(wrapperPath, 'utf8');
@@ -356,11 +361,22 @@ ok(/\| 2\/3 \| —/.test(naMd) && /\| Handled \|/.test(naMd), 'B4: the "handled"
       'B6: every hook command has the installer\'s form, a bare node then the quoted script');
     ok(Object.keys(hooks).length === 5 && hooks.Stop[0].hooks[0].command.includes(wrapperPath.replace(/\\/g, '/')),
       'B6: the run repo carries the five hooks, each through the run\'s wrapper');
-    ok(wrapper.includes(JSON.stringify(benchHome)) && wrapper.includes('KLYPIX_BRAIN_DIR') && wrapper.includes('global-brain-hook.mjs') && /delete env\.KLYPIX_PLUGIN/.test(wrapper),
+    ok(wrapper.includes(JSON.stringify(benchHome)) && wrapper.includes('KLYPIX_BRAIN_DIR') && wrapper.includes('global-brain-hook.mjs') && /delete process\.env\.KLYPIX_PLUGIN/.test(wrapper) && /await import\(/.test(wrapper),
       'B6: the wrapper pins HOME, USERPROFILE and KLYPIX_BRAIN_DIR to the run\'s home and runs this checkout\'s hook');
     ok(repo.git('status', '--porcelain') === '' && /\.claude\//.test(fs.readFileSync(path.join(repo.dir, '.git', 'info', 'exclude'), 'utf8')),
       'B6: the hook settings stay out of git, like a user-scope file');
     ok(prep.delivered.includes('s9-plan') && prep.actorListed === true, 'B6: the stopped session\'s work record is listed (installed condition)');
+    {
+      // Run the SessionStart hook the way Claude Code would (a bare node, the
+      // wrapper, the hook's JSON on stdin) and read the run log back.
+      const r = spawnSync('node', [wrapperPath], { cwd: repo.dir, input: JSON.stringify({ session_id: 'bench-agent-b6', cwd: repo.dir, hook_event_name: 'SessionStart', source: 'startup' }), encoding: 'utf8', timeout: 60_000 });
+      const runs = prep.hookRuns();
+      ok(r.status === 0 && runs.sessionStart === 1 && !runs.failed['session-start'], 'B6: the SessionStart hook runs through the wrapper and its run is logged (exit 0)');
+      ok(validityError({ scenario: s9, condition: installed, agent: { id: 'claude' }, prep, later: {}, hookRuns: { started: {}, failed: {}, sessionStart: 0 } }) === 'hooks-did-not-run'
+        && validityError({ scenario: s9, condition: installed, agent: { id: 'claude' }, prep, later: {}, hookRuns: runs }) === null,
+        'B6: a run whose hooks never started is invalid; one whose hooks ran is valid');
+    }
+    ok(repo.git('status', '--porcelain') === '', 'B6: the project harness a real install has is in place before the agent starts — nothing appears in git status');
   } catch (err) {
     ok(false, 'B6: ' + String(err?.message || err).split('\n')[0]);
   } finally {
@@ -372,6 +388,21 @@ ok(/\| 2\/3 \| —/.test(naMd) && /\| Handled \|/.test(naMd), 'B4: the "handled"
   const ov = codexMcpOverrides({ 'klypix-canvas': { command: 'node', args: [] } });
   ok(ov.includes('mcp_servers.klypix-canvas.default_tools_approval_mode="approve"') && ov.filter((a) => /approval/.test(a)).length === 1,
     'B6: Codex approves the KLYPIX server\'s tools (round 2 refused 29 calls) — nothing else is approved');
+}
+
+{
+  const { namesPeer, S10_NAME, S5C_NAME } = await import('../bench/coordination/scenarios-round3.mjs');
+  const yes = [
+    'Heads-up: session T is rewriting lib/tax.js on a/per-line-tax, so this will conflict at merge.',
+    'Another live Codex session is rewriting lib/tax.js right now; coordinate before merging.',
+    'Note: a concurrent session is changing the same file (lib/tax.js) — expect a merge conflict.',
+    'KLYPIX shows peer actor-s10-tax editing lib/tax.js.',
+  ];
+  const no = ['Tests pass, no conflicts.', 'brain_sync complete; no file conflicts reported.', 'I did not touch any other branch.', 'Raised the rate to 8% and committed.', 'The work is no longer in progress.'];
+  ok(yes.every((m) => namesPeer(m, S10_NAME).named) && no.every((m) => !namesPeer(m, S10_NAME).named),
+    'B4: S10 counts a message as naming the peer only when it points at the live session and its file — "no conflicts" and the like never count');
+  ok(namesPeer("Left lib/ledger.js alone: Priya's refactor is in progress on a/ledger-refactor.", S5C_NAME).named && !namesPeer('Fixed roundCents. No conflicts.', S5C_NAME).named,
+    'B4: S5c records whether the agent named Priya\'s work, by the same rule');
 }
 
 // ── B5: live-run safety (no model call) ─────────────────────────────────────

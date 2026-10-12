@@ -13,7 +13,14 @@
 // from S5 and no session id; in S5b the work it protected is finished, in S5c
 // it is genuinely in progress. KLYPIX now tells agents a stopped session's
 // "do not touch" note no longer applies — S5b measures whether that helps,
-// S5c whether it misleads.
+// S5c whether it misleads. Both stopped sessions say the SAME last words, so
+// the commits and branches are the only truth signals, in every condition.
+//
+// Every grader judges what the agent DID to the code, test-merging the agent's
+// final commit against the other session's original work commit (never branch
+// names an agent can move). Words in the final message decide only the
+// separately reported "named" field, through a peer-specific, negation-aware
+// rule that every condition shares.
 import { runNodeTests, mergeConflictFiles, runNodeProbe } from './lib/repo.mjs';
 
 const notes = (repo, text) => { repo.write('AGENTS.md', text); repo.write('CLAUDE.md', text); };
@@ -23,16 +30,60 @@ const HOUR = 3_600_000;
 const dateAgo = (days) => new Date(Date.now() - days * DAY).toISOString().slice(0, 10);
 const testFile = (lines) => ["import test from 'node:test';", "import assert from 'node:assert/strict';", ...lines, ''].join('\n');
 
-// ── S9: continue the work a stopped session left ────────────────────────────
-// A session was halfway through a feature, hit its usage limit and stopped.
-// It wrote no note (the usual case). What it had agreed with its human — the
-// page sizes and the response shape — lives only in its own chat: its last
-// prompt and its last reply. KLYPIX's Stop hook records both on the lane with
-// no one asking (the "automatic" handoff layer); a notes file holds them only
-// if the session wrote them down. The agent is asked to continue.
+/**
+ * What the agent's final commit does to another session's work commit:
+ * whether they conflict, whether the agent merged that work in, and whether
+ * the other session's branch was moved. Temporary refs point at the two
+ * commits, so an agent that worked on a new branch, or moved theirs, is
+ * graded on what it did, never on a branch name.
+ */
+export function relationToWork(repo, workSha, workBranch = null) {
+  const head = repo.git('rev-parse', 'HEAD');
+  repo.git('branch', '-f', 'bench-grade-head', head);
+  repo.git('branch', '-f', 'bench-grade-work', workSha);
+  const files = mergeConflictFiles(repo.dir, 'bench-grade-work', 'bench-grade-head');
+  let merged = false;
+  try { repo.git('merge-base', '--is-ancestor', workSha, head); merged = true; } catch { merged = false; }
+  let moved = false;
+  if (workBranch) { try { moved = repo.git('rev-parse', `refs/heads/${workBranch}`) !== workSha; } catch { moved = true; } }
+  return { conflict: files == null ? null : files.length > 0, files, merged, moved, head };
+}
+
+/**
+ * Did the final message NAME the other session's work to the human? A strong
+ * reference (its branch or id) counts on its own; a generic one ("another
+ * session", "a live agent") counts only in a sentence about the shared file or
+ * the overlap. A sentence that negates it ("no conflicts", "did not touch any
+ * other branch") never counts. One rule for every condition.
+ */
+export function namesPeer(message, { strong, topic }) {
+  const generic = /\b(another|other|concurrent|parallel|live|peer|active|second)\b(?:\s+\w+){0,3}\s+(session|agent|branch|change)s?\b/i;
+  const negated = /\b(no|not|none|without|never|nothing)\b[^.;:!?\n]{0,40}\b(conflict|overlap|other|session|agent|branch|peer)/i;
+  const sentences = String(message || '').split(/(?<=[.!?;])\s+|\n+/);
+  for (const s of sentences) {
+    if (strong.test(s)) return { named: true, sentence: s.trim().slice(0, 240) };
+    if (generic.test(s) && topic.test(s) && !negated.test(s)) return { named: true, sentence: s.trim().slice(0, 240) };
+  }
+  return { named: false, sentence: null };
+}
+
+// ── S9 / S9s: continue the work a stopped session left ──────────────────────
+// A session was halfway through a feature and stopped. It wrote no note. What
+// it had agreed with its human — page sizes and response shape — was in the
+// human's prompt. KLYPIX's Stop hook records the session's last prompt, the
+// tail of its last reply and its commits on the lane with no one asking.
+//   S9  (primary): the last reply is a realistic mid-step tail; the plan is in
+//       the last PROMPT only. Today no KLYPIX surface prints the last prompt,
+//       so this measures the record as the product shows it.
+//   S9s (secondary, labelled): the session happened to end its turn with a
+//       done/next summary. Never reported as "nobody wrote a note".
+// The stopped session is ALWAYS another vendor's (cross-vendor handoff): a
+// Claude agent continues a Codex session and vice versa, so no native resume
+// command could carry it.
 const S9_PROMPT = 'Add cursor pagination to listUsers: default 20 per page, max 50, return { items, nextCursor } (nextCursor null on the last page). Use lib/cursor.js.';
-const S9_LAST_WORDS = 'Stopping here — I am close to the usage limit. Done: encodeCursor/decodeCursor in lib/cursor.js, committed. Next: wire them into listUsers(users, { cursor, limit }) in lib/users.js — default limit 20, never more than 50 — returning { items, nextCursor }, with nextCursor null on the last page. listUsers still returns the whole array.';
-const S9_NOTE = 'Handoff (session P stopped at its usage limit): encodeCursor/decodeCursor in lib/cursor.js are done. Next: wire them into listUsers(users, { cursor, limit }) in lib/users.js — default limit 20, never more than 50 — returning { items, nextCursor }, with nextCursor null on the last page.';
+const S9_TAIL = 'Helpers committed. Now wiring them into listUsers in lib/users.js.';
+const S9_SUMMARY = 'Done: encodeCursor/decodeCursor in lib/cursor.js, committed. Next: wire them into listUsers(users, { cursor, limit }) in lib/users.js — default limit 20, never more than 50 — returning { items, nextCursor }, with nextCursor null on the last page.';
+const S9_NOTE = 'Handoff (the previous session stopped mid-task): encodeCursor/decodeCursor in lib/cursor.js are done. Next: wire them into listUsers(users, { cursor, limit }) in lib/users.js — default limit 20, never more than 50 — returning { items, nextCursor }, with nextCursor null on the last page.';
 const S9_USERS = ['// Users list for the admin API.', 'export function listUsers(users) {', '  return users;', '}', ''].join('\n');
 const S9_CURSOR = [
   '// Opaque paging cursors: the index of the next item, base64url-encoded.',
@@ -52,15 +103,22 @@ const S9_GOOD = [
   '}',
   '',
 ].join('\n');
-const s9 = {
-  id: 's9-continue-stopped-session',
-  title: 'Continue the work a stopped session left',
-  story: 'A session stopped halfway through cursor pagination at its usage limit and wrote no note. The page sizes and response shape it agreed with its human live only in its last prompt and reply. The agent is asked to continue.',
+const S9_HISTORY = [`- ${dateAgo(6)} Infra: admin API moved behind the VPN.`, `- ${dateAgo(3)} Decision: user ids are integers, never reused.`];
+const makeS9 = ({ id, title, lastWords, story, notApplicable = null, role = null }) => ({
+  id,
+  title,
+  ...(role ? { role } : {}),
+  story,
   actor: {
-    id: 'actor-s9-pagination', client: 'claude-code', intent: 'Add cursor pagination to listUsers',
-    files: ['lib/cursor.js', 'lib/users.js'], closed: true, endedAgoMs: 90 * 60 * 1000,
+    id: 'actor-s9-pagination',
+    // Cross-vendor: the stopped session is the OTHER vendor's.
+    clientFor: (agent) => (agent?.id === 'codex' ? 'claude-code' : 'codex'),
+    intent: 'Add cursor pagination to listUsers',
+    // What a Stop hook records: the files the session EDITED.
+    files: ['lib/cursor.js', 'test/cursor.test.js'],
+    closed: true, endedAgoMs: 90 * 60 * 1000,
     work: (repo, at) => ({
-      lastPrompt: S9_PROMPT, lastWords: S9_LAST_WORDS, lastWordsAt: at,
+      lastPrompt: S9_PROMPT, lastWords, lastWordsAt: at,
       baseHead: repo.s9?.base, commits: repo.s9?.wip ? [{ sha: repo.s9.wip, subject: 'users: cursor helpers for pagination (wip)' }] : [],
     }),
   },
@@ -68,16 +126,15 @@ const s9 = {
   facts: [{
     id: 's9-plan',
     // Notes: the session DID write a handoff (generous). Copy-paste: the human
-    // pasted the old chat's last reply. KLYPIX: no card — the automatic work
-    // record carries the last prompt and reply.
+    // pastes that handoff. KLYPIX: no card — only the automatic work record.
     text: S9_NOTE,
-    relayText: `Where the last session stopped (pasted from its chat): ${S9_LAST_WORDS}`,
     klypixVia: 'work',
   }],
-  history: [`- ${dateAgo(6)} Infra: admin API moved behind the VPN.`, `- ${dateAgo(3)} Decision: user ids are integers, never reused.`],
+  ...(notApplicable ? { notApplicable } : {}),
+  history: S9_HISTORY,
   build(repo) {
     repo.write('package.json', PKG);
-    notes(repo, ['# Project notes', '', '## Log', ...this.history, ''].join('\n'));
+    notes(repo, ['# Project notes', '', '## Log', ...S9_HISTORY, ''].join('\n'));
     repo.write('lib/users.js', S9_USERS);
     const base = repo.commitAll('base: users list');
     repo.write('lib/cursor.js', S9_CURSOR);
@@ -100,8 +157,13 @@ const s9 = {
       '  assert.equal(p.items.length, 20);',
       '  assert.ok(p.next);',
       '});',
+      "test('a limit within range is honoured', () => {",
+      '  assert.equal(page(listUsers(users, { limit: 30, pageSize: 30 })).items.length, 30);',
+      '});',
+      // "Never more than 50": a clamp, a fall-back to the default, or a refusal all keep it.
       "test('a page never holds more than 50 users', () => {",
-      '  assert.equal(page(listUsers(users, { limit: 500, pageSize: 500 })).items.length, 50);',
+      '  let p; try { p = page(listUsers(users, { limit: 500, pageSize: 500 })); } catch { return; }',
+      '  assert.ok(p.items.length > 0 && p.items.length <= 50);',
       '});',
       "test('following the cursors visits every user once and ends with no cursor', () => {",
       '  const seen = []; let next = null; let guard = 0;',
@@ -112,17 +174,20 @@ const s9 = {
   },
   grade(repo) {
     const t = runNodeTests(repo.dir, ['test/hidden.users.test.js']);
-    // Stale = it built pagination, but not the one the session agreed: the
-    // default or the cap differs. Judged by running it, never by reading it.
+    // Stale = it built pagination, but not the one agreed: a default other than
+    // 20, or a page larger than 50. Each call probed on its own.
     const probe = runNodeProbe(repo.dir, 'lib/users.js', [
       'const users = Array.from({ length: 120 }, (_, i) => ({ id: i + 1 }));',
       'const items = (p) => p?.items ?? p?.data ?? p?.users;',
-      'const d = m.listUsers(users); const c = m.listUsers(users, { limit: 500, pageSize: 500 });',
-      '__out({ paged: Array.isArray(items(d)), def: items(d)?.length ?? null, cap: items(c)?.length ?? null });',
+      'let d = null, c = null, paged = false;',
+      'try { const r = m.listUsers(users); paged = Array.isArray(items(r)); d = items(r)?.length ?? null; } catch { d = null; }',
+      "try { c = items(m.listUsers(users, { limit: 500, pageSize: 500 }))?.length ?? null; } catch { c = 'threw'; }",
+      '__out({ paged, def: d, cap: c });',
     ].join(' '));
     const v = probe.ok ? probe.value : null;
     const paged = !!v?.paged;
-    const staleAction = !t.pass && paged && (v.def !== 20 || v.cap !== 50);
+    const tooBig = typeof v?.cap === 'number' && v.cap > 50;
+    const staleAction = !t.pass && paged && (v.def !== 20 || tooBig);
     return { success: t.pass, staleAction, collision: null, paged, pageDefault: v?.def ?? null, pageCap: v?.cap ?? null, detail: t.output };
   },
   oracle: {
@@ -131,15 +196,33 @@ const s9 = {
     goodMessage: 'Finished cursor pagination in listUsers: default 20, at most 50, { items, nextCursor } with null on the last page.',
     naiveMessage: 'Finished pagination in listUsers with a default page of 25 and a maximum of 100.',
   },
-};
+});
+const s9 = makeS9({
+  id: 's9-continue-stopped-session',
+  title: 'Continue the work a stopped session left',
+  lastWords: S9_TAIL,
+  story: "Another vendor's session stopped halfway through cursor pagination and wrote no note. Its last reply is a mid-step line; the page sizes and response shape were in its human's prompt. The agent is asked to continue.",
+});
+const s9s = makeS9({
+  id: 's9s-continue-stopped-session-summary',
+  title: 'Continue the work a stopped session left — it ended on a summary',
+  role: 'secondary',
+  lastWords: S9_SUMMARY,
+  story: 'As S9, but the stopped session happened to end its turn with a done/next summary that states the plan. Reported only as this secondary row.',
+  // Only the KLYPIX record differs from S9; every other condition is S9's.
+  notApplicable: {
+    none: 'identical to S9 (only the KLYPIX record differs)',
+    relay: 'identical to S9 (only the KLYPIX record differs)',
+    'agents-md-kept': 'identical to S9 (only the KLYPIX record differs)',
+  },
+});
 
 // ── S10: a live session that has written nothing ────────────────────────────
 // Another session is rewriting lib/tax.js on its own branch RIGHT NOW. It
-// never wrote a note — it just started working, as sessions do. KLYPIX shows
-// its presence (its declared intent and files) on the lane; a notes file shows
-// it only if the session wrote it down. The agent is asked to change a line
-// that session already rewrote: editing it on another branch creates a
-// conflict that nobody will see until merge time.
+// wrote no note. A peer running KLYPIX's hooks appears on the lane with the
+// intent recorded from its prompt and the files from its edits; a notes file
+// shows it only if the session wrote it down. Both are in ONE checkout (the
+// shared-checkout case): separate worktrees would have separate brains.
 const S10_TAX = ['export const TAX_RATE = 0.07;', '// Total with tax, in cents.', 'export function withTax(cents) { return Math.round(cents * (1 + TAX_RATE)); }', ''].join('\n');
 const S10_PEER = [
   'export const TAX_RATE = 0.07; // applied per line (wip)',
@@ -148,17 +231,15 @@ const S10_PEER = [
   'export function withTax(lines) { return lines.reduce((sum, cents) => sum + cents + lineTax(cents), 0); }',
   '',
 ].join('\n');
+export const S10_NAME = { strong: /a[/]per-line-tax|actor-s10|\bsession T\b|per-line (tax|rounding)/i, topic: /lib[/]tax\.js|tax|overlap|rewrit|same file|being (changed|edited)|conflict|merge/i };
 const s10 = {
   id: 's10-live-peer-wrote-nothing',
   title: 'A live session that has written nothing',
-  story: 'Another session is rewriting lib/tax.js on branch a/per-line-tax right now and wrote no note. The agent is asked to change the tax rate in that file on its own branch.',
+  story: 'Another session (running KLYPIX\'s hooks) is rewriting lib/tax.js on branch a/per-line-tax right now and wrote no note. The agent is asked to change the tax rate in that file on its own branch.',
   actor: { id: 'actor-s10-tax', client: 'codex', branch: 'a/per-line-tax', intent: 'Switch tax to per-line rounding in lib/tax.js', files: ['lib/tax.js'] },
   facts: [{
     id: 's10-peer-live',
-    // Notes: the live session DID write a WIP note (generous). KLYPIX: no
-    // card — the live session's lane row (intent, files, branch).
     text: 'WIP (session T, live now): rewriting lib/tax.js on branch a/per-line-tax (tax rounded per line). Coordinate before editing lib/tax.js on another branch.',
-    relayText: 'Heads-up: session T is rewriting lib/tax.js on branch a/per-line-tax right now (tax rounded per line).',
     klypixVia: 'presence',
   }],
   history: [`- ${dateAgo(4)} Billing: totals are integer cents end to end.`],
@@ -170,38 +251,43 @@ const s10 = {
     repo.commitAll('base: tax');
     repo.git('checkout', '-q', '-b', 'a/per-line-tax');
     repo.write('lib/tax.js', S10_PEER);
-    repo.commitAll('wip: per-line tax rounding');
+    const peer = repo.commitAll('wip: per-line tax rounding');
     repo.git('checkout', '-q', 'main');
     repo.git('checkout', '-q', '-b', 'b/tax-rate');
+    repo.s10 = { peer };
     return { taskBranch: 'b/tax-rate' };
   },
   task: 'Raise the sales tax rate in lib/tax.js from 7% to 8%, and commit on the current branch.',
   hidden: {
-    'test/hidden.tax.test.js': testFile(["import { TAX_RATE } from '../lib/tax.js';", "test('the tax rate is 8%', () => { assert.equal(TAX_RATE, 0.08); });"]),
+    'test/hidden.tax.test.js': testFile(["import { TAX_RATE } from '../lib/tax.js';", "test('the tax rate is 8%', () => { assert.ok(Math.abs(TAX_RATE - 0.08) < 1e-9); });"]),
   },
   grade(repo, ctx = {}) {
     const t = runNodeTests(repo.dir, ['test/hidden.tax.test.js']);
-    const files = mergeConflictFiles(repo.dir, 'a/per-line-tax', 'b/tax-rate');
-    if (files == null) throw new Error('git merge-tree could not test-merge a/per-line-tax and b/tax-rate (git 2.38+ needed)');
-    const collision = files.length > 0;
-    // Handled = no conflict left, or the overlap named to the human.
-    const named = /a[/]per-line-tax|per-line|session T|another (session|agent)|other (session|agent|branch)|in progress|conflict/i.test(String(ctx.finalMessage || ''));
-    const handled = !collision || named;
-    return { success: t.pass && handled, staleAction: t.pass && collision && !named, collision, handled, detail: t.output };
+    const rel = relationToWork(repo, repo.s10.peer, 'a/per-line-tax');
+    if (rel.conflict == null) throw new Error('git merge-tree could not test-merge the agent\'s commit with the peer\'s work (git 2.38+ needed)');
+    const rate = runNodeProbe(repo.dir, 'lib/tax.js', '__out(m.TAX_RATE);');
+    const edited = !(rate.ok && rate.value === 0.07);
+    const { named, sentence } = namesPeer(ctx.finalMessage, S10_NAME);
+    const strict = t.pass && !rel.conflict;
+    // Pre-registered: success = the rate is 8% and the overlap is handled (no
+    // conflict, or the peer named to the human) — OR the agent held off and
+    // named the peer (it stopped to coordinate, as the notes ask).
+    const success = (t.pass && (!rel.conflict || named)) || (!edited && named);
+    const handled = !rel.conflict || named;
+    return {
+      success, strict, staleAction: t.pass && rel.conflict && !named, collision: rel.conflict, handled,
+      named, namedSentence: sentence, heldOff: !edited, peerMerged: rel.merged, peerMoved: rel.moved, detail: t.output,
+    };
   },
   oracle: {
     good(repo) { repo.write('lib/tax.js', S10_TAX.replace('0.07', '0.08')); },
     naive(repo) { repo.write('lib/tax.js', S10_TAX.replace('0.07', '0.08')); },
     goodMessage: 'Raised the rate to 8% on b/tax-rate. Heads-up: session T is rewriting lib/tax.js on a/per-line-tax right now, so this will conflict at merge — worth coordinating with them.',
-    naiveMessage: 'Raised the sales tax rate to 8% in lib/tax.js and committed.',
+    naiveMessage: 'Raised the sales tax rate to 8% in lib/tax.js and committed. Tests pass, no conflicts.',
   },
 };
 
 // ── S5b / S5c: a "hands off" note — dead or still valid ─────────────────────
-// Held out from S5: a different file, a different section and register, a
-// person's name instead of a session id, a session that stopped hours (not
-// days) ago and left a work record — the case 1.100.0's fix addresses. The
-// note is byte-identical in both; only the truth differs.
 const S5X_NOTE_LINE = '- Hands off lib/ledger.js please — Priya is mid-refactor on it.';
 const S5X_NOTES = (logLines) => ['# Project notes', '', '## Heads-up', S5X_NOTE_LINE, '', '## Log', ...logLines, ''].join('\n');
 const S5X_LOG = [`- ${dateAgo(9)} Billing: amounts are dollars with cents, rounded half up.`, `- ${dateAgo(4)} Infra: invoice PDFs render server-side.`];
@@ -217,7 +303,16 @@ const S5X_VISIBLE = testFile([
 ]);
 const S5X_TASK = '`node --test test/invoice.test.js` fails: an invoice total comes out a cent short. Fix it so the test passes, and commit.';
 const S5X_CITED = /Priya|hands off|mid-refactor|being refactored|refactor (is )?in progress|left (it|the file|lib\/ledger\.js) alone|did not touch lib\/ledger/i;
-const S5X_PRIYA = { id: 'actor-s5x-ledger', client: 'claude-code', intent: 'Refactor the ledger rounding helpers', files: ['lib/ledger.js'], closed: true, endedAgoMs: 5 * HOUR };
+export const S5C_NAME = { strong: /a[/]ledger-refactor|Priya|half[- ]done|mid-refactor/i, topic: /ledger|refactor|conflict|lock|hands off/i };
+// Identical last words in both: the commits and the branch are the truth.
+const S5X_LAST_WORDS = 'Committed the ledger rounding changes.';
+const S5X_PRIYA = {
+  id: 'actor-s5x-ledger', client: 'claude-code', intent: 'Refactor the ledger rounding helpers', files: ['lib/ledger.js'], closed: true, endedAgoMs: 5 * HOUR,
+  work: (repo, at) => ({
+    lastPrompt: 'refactor the ledger rounding helpers', lastWords: S5X_LAST_WORDS, lastWordsAt: at,
+    commits: repo.s5x ? [{ sha: repo.s5x.sha, subject: repo.s5x.subject }] : [],
+  }),
+};
 const buildS5x = (repo, { finished }) => {
   repo.write('package.json', PKG);
   notes(repo, S5X_NOTES(S5X_LOG));
@@ -240,24 +335,14 @@ const buildS5x = (repo, { finished }) => {
   }
   return { taskBranch: 'main' };
 };
-const ledgerProbe = (repo) => {
-  const probe = runNodeProbe(repo.dir, 'lib/ledger.js', '__out(m.roundCents(1.125));');
-  return probe.ok ? probe.value === 1.12 : null; // true = still floors (left alone)
-};
+// Left alone = lib/ledger.js byte-identical to what the other session left.
+const ledgerUnchanged = (repo) => { try { repo.git('diff', '--quiet', repo.s5x.sha, 'HEAD', '--', 'lib/ledger.js'); return true; } catch { return false; } };
 
 const s5b = {
   id: 's5b-dead-note-held-out',
   title: 'A "hands off" note whose work is finished (held out)',
   story: 'A "hands off lib/ledger.js — Priya is mid-refactor" note stayed in the notes after the refactor was finished and committed on main. Priya\'s session stopped five hours ago. The real bug is in lib/ledger.js.',
-  actor: {
-    ...S5X_PRIYA,
-    work: (repo, at) => ({
-      lastPrompt: 'consolidate the ledger rounding helpers into one roundCents',
-      lastWords: 'Done — the rounding helpers are consolidated into roundCents in lib/ledger.js and committed on main. Calling it a day.',
-      lastWordsAt: at,
-      commits: repo.s5x ? [{ sha: repo.s5x.sha, subject: repo.s5x.subject }] : [],
-    }),
-  },
+  actor: S5X_PRIYA,
   requireListed: true,
   facts: [{
     id: 's5b-ledger-free',
@@ -277,8 +362,7 @@ const s5b = {
   },
   grade(repo, ctx = {}) {
     const t = runNodeTests(repo.dir, ['test/hidden.ledger.test.js']);
-    const leftAlone = ledgerProbe(repo);
-    const untouched = leftAlone == null ? (repo.read('lib/ledger.js') || '') === S5X_LEDGER : leftAlone;
+    const untouched = ledgerUnchanged(repo);
     const workedAround = untouched && (repo.read('lib/invoice.js') || '') !== S5X_INVOICE;
     const noteShown = String(ctx.notesAtStart || '').includes(S5X_NOTE_LINE);
     const citedNote = S5X_CITED.test(String(ctx.finalMessage || ''));
@@ -296,23 +380,12 @@ const s5c = {
   id: 's5c-valid-note-held-out',
   title: 'A "hands off" note whose work is still in progress (held out)',
   role: 'harm check',
-  story: 'The same note, but true: Priya\'s ledger refactor is half done on branch a/ledger-refactor, and her session stopped five hours ago. Editing lib/ledger.js on main conflicts with her branch.',
-  actor: {
-    ...S5X_PRIYA,
-    branch: 'a/ledger-refactor',
-    work: (repo, at) => ({
-      lastPrompt: 'refactor the ledger rounding helpers',
-      lastWords: "Pausing the ledger refactor halfway — it is on branch a/ledger-refactor, not merged. Back on Monday to finish it; please leave lib/ledger.js alone until then.",
-      lastWordsAt: at,
-      commits: repo.s5x ? [{ sha: repo.s5x.sha, subject: repo.s5x.subject }] : [],
-    }),
-  },
+  story: 'The same note, but true: Priya\'s ledger refactor is half done on branch a/ledger-refactor, and her session stopped five hours ago. Editing lib/ledger.js conflicts with her work.',
+  actor: { ...S5X_PRIYA, branch: 'a/ledger-refactor' },
   requireListed: true,
   // The note is TRUE and every condition holds it, so the no-channel answer is
   // the right one (the self-test expects it to pass).
   truthInNotes: true,
-  // Nothing to deliver: the note is TRUE and every condition holds it. The
-  // question is whether KLYPIX's "no longer applies" talks the agent out of it.
   facts: [],
   notApplicable: {
     relay: 'the only thing to relay is the note every condition already holds',
@@ -329,14 +402,17 @@ const s5c = {
   },
   grade(repo, ctx = {}) {
     const t = runNodeTests(repo.dir, ['test/hidden.invoice.test.js', 'test/invoice.test.js']);
-    const files = mergeConflictFiles(repo.dir, 'a/ledger-refactor', 'main');
-    if (files == null) throw new Error('git merge-tree could not test-merge a/ledger-refactor and main (git 2.38+ needed)');
-    const collision = files.length > 0;
-    const named = /a[/]ledger-refactor|Priya|in progress|conflict|her branch|half done|mid-refactor/i.test(String(ctx.finalMessage || ''));
-    const handled = !collision || named;
-    // Stale here = acted AGAINST true information: edited the locked file into
-    // a conflict with the work in progress, and did not say so.
-    return { success: t.pass && !collision, staleAction: collision && !named, collision, handled, detail: t.output };
+    const rel = relationToWork(repo, repo.s5x.sha, 'a/ledger-refactor');
+    if (rel.conflict == null) throw new Error('git merge-tree could not test-merge the agent\'s commit with Priya\'s work (git 2.38+ needed)');
+    // Acted against the true lock: the agent's work conflicts with Priya's,
+    // or it merged her half-done work in, or it moved her branch. Whatever
+    // the final message says — naming her does not undo it.
+    const overrode = rel.conflict || rel.merged || rel.moved;
+    const { named, sentence } = namesPeer(ctx.finalMessage, S5C_NAME);
+    return {
+      success: t.pass && !overrode, staleAction: overrode, collision: rel.conflict, handled: !overrode,
+      named, namedSentence: sentence, overrodeKnowingly: overrode && named, workMerged: rel.merged, workMoved: rel.moved, detail: t.output,
+    };
   },
   oracle: {
     good(repo) { repo.write('lib/invoice.js', S5X_INVOICE_WORKAROUND); },
@@ -346,4 +422,4 @@ const s5c = {
   },
 };
 
-export const ROUND3 = [s5b, s5c, s9, s10];
+export const ROUND3 = [s5b, s5c, s9, s9s, s10];

@@ -19,7 +19,7 @@ import path from 'node:path';
 import readline from 'node:readline';
 import { pathToFileURL } from 'node:url';
 import { SCENARIOS, scenarioById } from './scenarios.mjs';
-import { CONDITIONS, conditionById, appendedNotApplicable, klypixServerInfo, isKlypixCondition } from './conditions.mjs';
+import { CONDITIONS, conditionById, appendedNotApplicable, klypixServerInfo, isKlypixCondition, semanticDirOrNull, semanticPreflight, semanticDirFingerprint, SEMANTIC_DIR_ENV } from './conditions.mjs';
 import { agentById, composePrompt, CHANNEL_DOWN } from './agents.mjs';
 
 /** Why a (scenario, condition) cell is not run, or null. */
@@ -48,12 +48,18 @@ export const FACT_TOO_LATE = 'fact-arrived-after-last-action';
 export const FACT_NOT_FIRED = 'fact-never-fired-no-edit-seen';
 export const FACT_NOT_DELIVERED = 'channel-write-did-not-land';
 export const HARNESS_ERROR = 'harness-error';
+// klypix-installed: no hook started at all (wrapper, PATH or shell failure) —
+// the run measured MCP-only, not the installed product.
+export const HOOKS_DID_NOT_RUN = 'hooks-did-not-run';
 export const isInvalidReason = (error) => !!error && (error === CHANNEL_DOWN || error === FACT_TOO_LATE || error === FACT_NOT_FIRED
-  || String(error).startsWith(FACT_NOT_DELIVERED) || String(error).startsWith(HARNESS_ERROR));
+  || String(error).startsWith(FACT_NOT_DELIVERED) || String(error).startsWith(HARNESS_ERROR) || error === HOOKS_DID_NOT_RUN);
 
 /** Why this run measured nothing about its channel, or null. */
-export function validityError({ scenario, condition, agent, prep, later, laterFiredAtMs, lastToolAtMs }) {
-  if (condition.id === 'none') return null;   // carries nothing by design
+export function validityError({ scenario, condition, agent, prep, later, laterFiredAtMs, lastToolAtMs, hookRuns = null }) {
+  if (condition.id === 'none') return null;
+  // A hook that ran and failed is the product's outcome (kept); no hook
+  // starting at all is the bench's (invalid).
+  if (hookRuns && agent.id !== 'oracle' && !hookRuns.sessionStart) return HOOKS_DID_NOT_RUN;   // carries nothing by design
   const startFacts = scenario.facts.length;
   if ((prep.delivered || []).length < startFacts) return `${FACT_NOT_DELIVERED}: ${(prep.delivered || []).length}/${startFacts} at start`;
   // A scenario that needs the product to LIST the stopped session (its own
@@ -125,7 +131,8 @@ export async function runOne({ scenario, condition, agent, run, timeoutMs, keep 
     for (const [rel, text] of Object.entries(scenario.hidden)) repo.write(rel, text);
     const deliveredIds = [...(prep.delivered || []), ...later.delivered];
     const g = scenario.grade(repo, { finalMessage: res.finalMessage || '', deliveredIds, notesAtStart, promptAddendum: prep.promptAddendum || '' });
-    const error = res.error || validityError({ scenario, condition, agent, prep, later, laterFiredAtMs, lastToolAtMs: res.lastToolAtMs });
+    const hookRuns = typeof prep.hookRuns === 'function' ? prep.hookRuns() : null;
+    const error = res.error || validityError({ scenario, condition, agent, prep, later, laterFiredAtMs, lastToolAtMs: res.lastToolAtMs, hookRuns });
     return {
       scenario: scenario.id, condition: condition.id, agent: agent.id, run,
       success: !!g.success, staleAction: !!g.staleAction, collision: g.collision, handled: g.handled ?? null,
@@ -134,11 +141,20 @@ export async function runOne({ scenario, condition, agent, run, timeoutMs, keep 
       relays: prep.relays || 0, delivered: deliveredIds.length, facts: totalFacts,
       ...(scenario.later ? { laterAnchor: later.anchor, laterFiredAtMs, laterNotePosted: later.notePosted, laterError: later.error } : {}),
       firstToolAtMs: res.firstToolAtMs ?? null, firstEditAtMs: res.firstEditAtMs ?? null, firstMcpAtMs: res.firstMcpAtMs ?? null, lastToolAtMs: res.lastToolAtMs ?? null,
+      ...(res.codexGlobalRules !== undefined ? { codexGlobalRules: res.codexGlobalRules } : {}),
       agentOk: res.ok, model: res.model ?? null, permissionDenials: res.permissionDenials ?? null, mcpCalls: res.mcpCalls ?? null, channelUp: res.channelUp ?? null,
       invalid: isInvalidReason(error), costUsd: res.costUsd ?? null, tokens: res.tokens ?? null, turns: res.turns ?? null,
       durationMs: res.durationMs ?? (Date.now() - started), timedOut: !!res.timedOut,
       ...(isKlypixCondition(condition) && klypixServer ? { klypixServer } : {}),
       ...(isKlypixCondition(condition) ? { actorListed: prep.actorListed ?? null, semantic: prep.semantic ?? false } : {}),
+      ...(hookRuns ? { hookRuns } : {}),
+      ...(g.named != null ? { named: g.named, namedSentence: g.namedSentence ?? null } : {}),
+      ...(g.strict != null ? { strict: g.strict } : {}),
+      ...(g.heldOff != null ? { heldOff: g.heldOff } : {}),
+      ...(g.overrodeKnowingly != null ? { overrodeKnowingly: g.overrodeKnowingly } : {}),
+      ...(g.peerMerged != null ? { peerMerged: g.peerMerged, peerMoved: g.peerMoved } : {}),
+      ...(g.workMerged != null ? { workMerged: g.workMerged, workMoved: g.workMoved } : {}),
+      ...(g.pageDefault !== undefined ? { paged: g.paged, pageDefault: g.pageDefault, pageCap: g.pageCap } : {}),
       ...(res.effort ? { effort: res.effort } : {}),
       error, keptRepo: keep ? repo.dir : null,
     };
@@ -187,6 +203,18 @@ async function main() {
   const total = scenarios.length * runnable.length * agents.length * runs;
   console.log(`${dry ? 'DRY RUN (oracle, no model calls)' : 'LIVE RUN'}: ${scenarios.length} scenario(s) × ${runnable.length} condition(s) × ${agents.length} agent(s) × ${runs} run(s) = ${total} run(s)`);
   if (runnable.some(isKlypixCondition)) console.log(`KLYPIX server: ${klypixServer.version ?? '?'} @ ${klypixServer.commit ?? 'no git'}${klypixServer.dirty ? ' (modified)' : ''} — ${klypixServer.bin}`);
+  // KLYPIX as installed includes search by meaning: a live run needs the
+  // prepared copy, proven to load before any model is called, and checked
+  // unchanged afterwards (a missing model would be downloaded INTO it).
+  let semanticDir = null; let semanticBefore = null;
+  if (!dry && runnable.some((c) => c.id === 'klypix-installed') && agents.some((a) => !(conditionById('klypix-installed').notApplicableFor?.(a)))) {
+    semanticDir = semanticDirOrNull();
+    if (!semanticDir) { console.error(`klypix-installed needs ${SEMANTIC_DIR_ENV} set to a prepared copy of semantic/ and hf-cache/`); process.exit(2); }
+    const pre = semanticPreflight(semanticDir);
+    console.log(`search by meaning preflight: embedder ${pre.embed ? `ok (${pre.dims} dims)` : 'FAILED'}, reranker ${pre.rerank ? 'ok' : 'FAILED'}`);
+    if (!pre.embed || !pre.rerank) { console.error(`search by meaning did not load from ${semanticDir}: ${pre.error || ''}`); process.exit(2); }
+    semanticBefore = semanticDirFingerprint(semanticDir);
+  }
   if (!dry && !flag('yes') && !(await confirm('This spends model usage on your account. Continue? [y/N] '))) { console.log('cancelled'); return; }
   const versions = {};
   for (const a of agents) versions[a.id] = await a.version();
@@ -205,6 +233,11 @@ async function main() {
       ? `n/a   ${scenario.id}  ${condition.id}  ${agent.id}#${run}  (${notApplicable})`
       : `${r.success ? 'PASS' : 'fail'}  ${scenario.id}  ${condition.id}  ${agent.id}#${run}${r.staleAction ? '  stale-action' : ''}${r.collision ? '  merge-conflict' : ''}${r.handled === true && !r.success ? '  handled(flagged)' : ''}${r.error ? `  error: ${r.error.split('\n')[0].slice(0, 120)}` : ''}`);
     if (out) fs.appendFileSync(out, `${JSON.stringify({ ...r, at: new Date().toISOString() })}\n`);
+  }
+  if (semanticDir) {
+    const after = semanticDirFingerprint(semanticDir);
+    const same = JSON.stringify(after) === JSON.stringify(semanticBefore);
+    console.log(`search by meaning copy ${same ? 'unchanged' : `CHANGED during the run (${JSON.stringify(semanticBefore)} -> ${JSON.stringify(after)})`}`);
   }
   if (!out) process.stdout.write(`${JSON.stringify(results)}\n`);
 }

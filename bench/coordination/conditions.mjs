@@ -22,13 +22,20 @@
 // nothing to write (S5). `relayText` is what a human says when pasting;
 // `insertAfterLine` is where a dated log keeps the note (default: the end).
 //
-// One rule for stale lines, applied to every condition that touches the
-// notes file: a stale DECISION stays in the file for the KLYPIX condition
-// (conservative — a KLYPIX team's file may well still carry it, and the
-// brain's current card has to beat it), but an ABSENCE's stale line (a
-// session's "WIP, do not touch") never was a note in a KLYPIX team: work in
-// progress is presence there, so the KLYPIX condition strips it, the tidy
-// file condition strips it, and the appended file keeps it.
+// One rule for stale lines: the KLYPIX condition never edits the notes file.
+// Whatever the file said before — a replaced decision (S1, S7) or a dead
+// "WIP, do not touch" line (S5) — is still there, and KLYPIX's own signal
+// (the current card first; an empty lane where the ended session's row has
+// expired) has to beat it. That is conservative, and it is the one thing a
+// notes file cannot do: only the tidy-file condition gets a human-cleaned
+// file. (Stripping the WIP line for KLYPIX made its S5 cell the tidy cell
+// plus a server — a replicate, not a measurement.)
+//
+// Claude Code note: `klypix link` writes its rules block into AGENTS.md (read
+// by Codex) and deliberately writes no CLAUDE.md target — Claude Code's rules
+// channel is hooks, which this MCP-only condition does not install. So in the
+// KLYPIX condition Claude's CLAUDE.md is the same file as with no channel, and
+// its only pointer to the brain is the server's own instructions.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -168,11 +175,9 @@ const klypix = {
     const home = benchHome || os.homedir();
     const facts = scenario.facts;
     const written = facts.filter((f) => f.text != null);
-    const absences = facts.filter((f) => f.text == null && f.staleLine);
     // A replaced DECISION is archived with a 'superseded by' edge. An absence
     // archives nothing: its stale line was a session's work in progress, which
-    // in KLYPIX is presence, not a card — so it never was in the notes either.
-    if (absences.length) mdApply(repo, absences, { replaceStale: true });
+    // in KLYPIX is presence (a lane row that expires), not a card.
     const stale = facts.filter((f) => f.staleLine && f.text != null);
     const staleTexts = new Set(facts.filter((f) => f.staleLine).map((f) => f.staleLine));
     // The dated history the notes file carries, as cards — a stale line goes
@@ -225,16 +230,14 @@ const klypix = {
     if (actor.closed && actor.endedAgoMs) {
       try { actorWritten = JSON.parse(fs.readFileSync(laneFileFor(brainPath, home), 'utf8')).sessions.some((s) => s.id === actor.id); } catch { actorWritten = false; }
     }
-    const notesText = repo.read('AGENTS.md') || '';
-    const claudeText = repo.read('CLAUDE.md') || '';
     for (const f of facts) {
       if (f.text != null) { if (cardTexts.some((t) => t.includes(f.text.slice(0, 40)))) delivered.add(f.id); continue; }
-      // An absence is delivered when the row was written and has expired, and
-      // neither a card nor either instructions file still carries the stale words.
+      // An absence is delivered when the ended session's row was written and
+      // the product's expiry hides it, and no card carries the stale words.
+      // (The notes file still does — that is the stale file KLYPIX must beat.)
       const staleWords = f.staleLine ? compactText(f.staleLine.replace(/^- /, '')).slice(0, 40) : null;
       const cardFree = !staleWords || !cardTexts.some((t) => t.includes(staleWords));
-      const fileFree = !f.staleLine || (!notesText.includes(f.staleLine) && !claudeText.includes(f.staleLine));
-      if (actorWritten && !actorOnLane && cardFree && fileFree) delivered.add(f.id);
+      if (actorWritten && !actorOnLane && cardFree) delivered.add(f.id);
     }
     // A live actor that is not on the lane delivers nothing: its work in
     // progress is what the agent most needs to see.
@@ -286,10 +289,18 @@ const klypix = {
       } catch { notePosted = false; }
     }
     // Written the way the app writes: whole bytes to a temp name, then one
-    // rename — the agent's own server never sees a half-written brain.
+    // rename — the agent's own server never sees a half-written brain. On
+    // Windows the rename can meet a sharing violation while the server reads
+    // the file, so it retries with backoff (as the format module does) before
+    // giving up; a failure is reported, and the runner marks the run invalid.
     const tmp = `${brainPath}.${process.pid}.tmp`;
     fs.writeFileSync(tmp, buf);
-    fs.renameSync(tmp, brainPath);
+    let renamed = false;
+    for (const wait of [0, 15, 40, 100, 250, 500]) {
+      if (wait) await new Promise((r) => setTimeout(r, wait));
+      try { fs.renameSync(tmp, brainPath); renamed = true; break; } catch (err) { if (!/EPERM|EACCES|EBUSY/.test(String(err?.code))) throw err; }
+    }
+    if (!renamed) { try { fs.rmSync(tmp, { force: true }); } catch { /* */ } throw new Error('brain rename kept failing (file in use)'); }
     const { struct } = await parseKlypix(fs.readFileSync(brainPath));
     const cardTexts = struct.cards.map((c) => compactText(c.text));
     return { delivered: facts.filter((f) => f.text != null && cardTexts.some((t) => t.includes(f.text.slice(0, 40)))).map((f) => f.id), notePosted };

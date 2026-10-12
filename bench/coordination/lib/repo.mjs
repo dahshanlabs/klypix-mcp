@@ -34,11 +34,25 @@ export function makeRepo(prefix = 'klypix-cobench-') {
  * formatter returned) instead of grepping the agent's source for words.
  * `body` runs with the imported module bound to `m` and must write to stdout.
  */
+export const PROBE_MARK = '@@KLYPIX_PROBE@@';
 export function runNodeProbe(dir, moduleRel, body, { timeoutMs = 30_000 } = {}) {
   const url = pathToFileURL(path.join(dir, moduleRel)).href;
-  const code = `import(${JSON.stringify(url)}).then(async (m) => { ${body} }).catch((e) => { process.stderr.write(String(e && e.stack || e)); process.exit(2); });`;
+  // The module under test runs in this process, so anything it prints must
+  // never be read as the grader's answer (one console.log inside a retry loop
+  // used to turn a call count into NaN). Console is silenced before the
+  // import, and the body reports ONCE through __out(value): a marked line
+  // that only the last marker counts for.
+  const code = [
+    "for (const k of ['log', 'info', 'debug', 'warn', 'error', 'trace', 'dir', 'table']) console[k] = () => {};",
+    `const __out = (v) => process.stdout.write('\\n' + ${JSON.stringify(PROBE_MARK)} + JSON.stringify(v) + '\\n');`,
+    `import(${JSON.stringify(url)}).then(async (m) => { ${body} }).catch((e) => { process.stderr.write(String(e && e.stack || e)); process.exit(2); });`,
+  ].join('\n');
   const r = spawnSync(process.execPath, ['--input-type=module', '-e', code], { cwd: dir, encoding: 'utf8', timeout: timeoutMs });
-  return { ok: r.status === 0, stdout: String(r.stdout || '').trim(), stderr: String(r.stderr || '').slice(-500) };
+  const out = String(r.stdout || '');
+  const at = out.lastIndexOf(PROBE_MARK);
+  let value; let found = false;
+  if (at >= 0) { try { value = JSON.parse(out.slice(at + PROBE_MARK.length).split('\n')[0]); found = true; } catch { found = false; } }
+  return { ok: r.status === 0 && found, value, stderr: String(r.stderr || '').slice(-500) };
 }
 
 /** Run `node --test` on the given files inside the repo; returns { pass, output }. */

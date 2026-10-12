@@ -80,7 +80,9 @@ function run(cli, args, { cwd, env, timeoutMs, input, onEvent = null }) {
     child.stdin.on('error', () => { /* the agent may exit before reading */ });
     if (input != null) child.stdin.write(input);
     child.stdin.end();
-    const timeline = () => ({ lastToolAtMs, firstToolAtMs, firstEditAtMs, firstMcpAtMs });
+    // startedAt is absolute (ms since epoch) so the runner can put the moment it
+    // fired a mid-task fact on the same clock as the agent's own timeline.
+    const timeline = () => ({ startedAt: started, lastToolAtMs, firstToolAtMs, firstEditAtMs, firstMcpAtMs });
     child.on('close', (code) => { clearTimeout(timer); resolve({ code, stdout, stderr, durationMs: Date.now() - started, timedOut, ...timeline() }); });
     child.on('error', (err) => { clearTimeout(timer); resolve({ code: -1, stdout, stderr: String(err), durationMs: Date.now() - started, timedOut, ...timeline() }); });
   });
@@ -217,7 +219,7 @@ export const claude = {
       ok: r.code === 0 && !r.timedOut && !p.resultError && p.channelUp !== false,
       costUsd: p.costUsd, tokens: p.tokens, turns: p.turns, model: p.model, permissionDenials: p.permissionDenials, mcpCalls: p.mcpCalls,
       channelUp: p.channelUp, finalMessage: p.finalMessage,
-      lastToolAtMs: r.lastToolAtMs, firstToolAtMs: r.firstToolAtMs, firstEditAtMs: r.firstEditAtMs, firstMcpAtMs: r.firstMcpAtMs,
+      startedAt: r.startedAt, lastToolAtMs: r.lastToolAtMs, firstToolAtMs: r.firstToolAtMs, firstEditAtMs: r.firstEditAtMs, firstMcpAtMs: r.firstMcpAtMs,
       raw: { stdout: r.stdout, stderr: r.stderr },
       durationMs: r.durationMs,
       timedOut: r.timedOut,
@@ -323,7 +325,7 @@ export const codex = {
       // Codex's event stream does not name the model; the row records the pinned one.
       tokens: p.tokens, turns: p.turns, model: p.model || model, mcpCalls: p.mcpCalls, channelUp,
       finalMessage: p.finalMessage,
-      lastToolAtMs: r.lastToolAtMs, firstToolAtMs: r.firstToolAtMs, firstEditAtMs: r.firstEditAtMs, firstMcpAtMs: r.firstMcpAtMs,
+      startedAt: r.startedAt, lastToolAtMs: r.lastToolAtMs, firstToolAtMs: r.firstToolAtMs, firstEditAtMs: r.firstEditAtMs, firstMcpAtMs: r.firstMcpAtMs,
       raw: { stdout: r.stdout, stderr: r.stderr },
       durationMs: r.durationMs,
       timedOut: r.timedOut,

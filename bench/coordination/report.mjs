@@ -61,7 +61,7 @@ export function summarize(rows) {
 
 const overlaps = (a, b) => a.low != null && b.low != null && !(a.high < b.low || b.high < a.low);
 
-export function toMarkdown(cells) {
+export function toMarkdown(cells, rows = []) {
   const out = ['# KLYPIX coordination bench — results', ''];
   const agents = [...new Set(cells.map((c) => c.agent))];
   for (const agent of agents) {
@@ -77,7 +77,7 @@ export function toMarkdown(cells) {
         const cell = cells.find((x) => x.agent === agent && x.scenario === s.id && x.condition === c.id);
         if (!cell) continue;
         if (cell.notApplicable) { out.push(`| ${s.title} | ${c.label} | — | n/a: ${cell.notApplicable} | — | — | — | — | — | — |`); continue; }
-        out.push(`| ${s.title} | ${c.label} | ${cell.n}${cell.invalidRuns ? ` (+${cell.invalidRuns} invalid)` : ''} | ${pct(cell.success.p)} (${pct(cell.success.low)}–${pct(cell.success.high)}) | ${cell.staleActions.k}/${cell.staleActions.n ?? cell.n}${cell.errors ? ` (+${cell.errors} err)` : ''} | ${cell.relaysPerTask.toFixed(1)} | ${c.id === 'klypix' ? `${cell.consulted}/${cell.n}` : '—'} | ${cell.handledKnown ? `${cell.handled}/${cell.handledKnown}` : '—'} | ${cell.medianCostUsd == null ? '—' : `$${cell.medianCostUsd.toFixed(2)}`} | ${cell.medianMinutes == null ? '—' : cell.medianMinutes.toFixed(1)} |`);
+        out.push(`| ${s.title}${s.role ? ` _(${s.role})_` : ''} | ${c.label} | ${cell.n}${cell.invalidRuns ? ` (+${cell.invalidRuns} invalid)` : ''} | ${pct(cell.success.p)} (${pct(cell.success.low)}–${pct(cell.success.high)}) | ${cell.staleActions.k}/${cell.staleActions.n ?? cell.n}${cell.errors ? ` (+${cell.errors} err)` : ''} | ${cell.relaysPerTask.toFixed(1)} | ${c.id === 'klypix' ? `${cell.consulted}/${cell.n}` : '—'} | ${cell.handledKnown ? `${cell.handled}/${cell.handledKnown}` : '—'} | ${cell.medianCostUsd == null ? '—' : `$${cell.medianCostUsd.toFixed(2)}`} | ${cell.medianMinutes == null ? '—' : cell.medianMinutes.toFixed(1)} |`);
       }
     }
     out.push('');
@@ -104,7 +104,14 @@ export function toMarkdown(cells) {
     for (const c of notRun) out.push(`- **${c.label}** — ${c.reason}`);
     out.push('');
   }
-  out.push('_Scripted "other session" actors; hidden tests; no LLM judge. Relay = the human pasted the facts (upper bound). "invalid" = the server of the condition never came up for that run; it is excluded from the rates, not counted as a fail._');
+  const reasons = new Map();
+  for (const r of rows) if (r.invalid) { const k = String(r.error || 'invalid').split(':')[0]; reasons.set(k, (reasons.get(k) || 0) + 1); }
+  if (reasons.size) {
+    out.push('## Invalid runs (excluded from every rate)', '');
+    for (const [k, n] of reasons) out.push(`- ${k}: ${n}`);
+    out.push('');
+  }
+  out.push('_Scripted "other session" actors; hidden tests; no LLM judge. Relay = the human pasted the facts (upper bound). "invalid" = the run measured nothing about its channel (server never came up, a write did not land, a mid-task fact never fired or landed after the last action, or the bench itself failed); it is excluded from the rates, not counted as a fail. _(control)_ rows are solvable without any channel; _(calibration)_ rows check that delivery works, not which channel is better._');
   return out.join('\n');
 }
 
@@ -113,5 +120,5 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   if (!file) { console.error('usage: report.mjs results.jsonl [--json]'); process.exit(2); }
   const rows = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
   const cells = summarize(rows);
-  process.stdout.write(process.argv.includes('--json') ? `${JSON.stringify(cells, null, 2)}\n` : `${toMarkdown(cells)}\n`);
+  process.stdout.write(process.argv.includes('--json') ? `${JSON.stringify(cells, null, 2)}\n` : `${toMarkdown(cells, rows)}\n`);
 }

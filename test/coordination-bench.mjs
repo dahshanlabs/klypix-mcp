@@ -35,9 +35,9 @@ const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const { SCENARIOS } = await import('../bench/coordination/scenarios.mjs');
 const { CONDITIONS, conditionById } = await import('../bench/coordination/conditions.mjs');
 const { oracle, composePrompt, codexMcpOverrides, resolveCli, cleanAgentEnv, claudeAllowedTools, parseClaudeResult, parseCodexEvents, codexChannelUp, codexGitWritable, MCP_STARTUP_TIMEOUT_SEC, CHANNEL_DOWN, classifyChunk } = await import('../bench/coordination/agents.mjs');
-const { runOne, notApplicableReason } = await import('../bench/coordination/run.mjs');
+const { runOne, notApplicableReason, validityError, isInvalidReason, FACT_NOT_FIRED, FACT_TOO_LATE, FACT_NOT_DELIVERED, HARNESS_ERROR } = await import('../bench/coordination/run.mjs');
 const { summarize, toMarkdown } = await import('../bench/coordination/report.mjs');
-const { makeRepo, runNodeTests } = await import('../bench/coordination/lib/repo.mjs');
+const { makeRepo, runNodeTests, runNodeProbe } = await import('../bench/coordination/lib/repo.mjs');
 const { wilson } = await import('../bench/coordination/lib/stats.mjs');
 const { laneFileFor, listActiveSessions, upsertSession } = await import('../src/agent-presence.mjs');
 const { parseKlypix } = await import('../src/klypix-format.mjs');
@@ -169,7 +169,8 @@ for (const s of SCENARIOS) {
         `B3 ${s.id}: session Q's row was written two days old and KLYPIX's own expiry hides it — the absence is produced by the product, not by the bench`);
       upsertSession({ brainPath: brain, home: os.homedir(), now: Date.now() - 60_000, id: 'actor-s5-control', client: 'claude-code', intent: 'control', files: ['lib/report.js'] });
       ok(listActiveSessions({ brainPath: brain, home: os.homedir() }).some((r) => r.id === 'actor-s5-control'), `B3 ${s.id}: control — the same row written a minute ago is still listed (expiry, not a broken lane)`);
-      ok(!(repo.read('AGENTS.md') || '').includes('do not touch') && !(repo.read('CLAUDE.md') || '').includes('do not touch'), `B3 ${s.id}: the KLYPIX condition's instructions files carry no WIP line — work in progress is presence there`);
+      ok((repo.read('AGENTS.md') || '').includes('do not touch') && (repo.read('CLAUDE.md') || '').includes('do not touch'),
+        `B3 ${s.id}: the KLYPIX condition leaves the dead WIP line in both instructions files — KLYPIX's empty lane has to beat it (a cleaned file would make this the tidy cell plus a server)`);
     }
     const { isError, sc } = await syncAs(server, repo, null, s.task);
     const [check, what] = expectations[s.id];
@@ -221,6 +222,48 @@ const staleCell = summarize([
   { scenario: 's5-stale-wip-note', condition: 'none', agent: 'claude', run: 2, success: false, staleAction: true },
 ]).find((c) => c.scenario === 's5-stale-wip-note');
 ok(staleCell.staleActions.k === 1 && staleCell.staleActions.n === 1 && staleCell.errors === 1, 'B5: "acted on stale information" is counted over completed runs only — a timed-out run is an error, not deference');
+// The probe's answer cannot be forged or corrupted by what the module prints.
+{
+  const repo = makeRepo('klypix-cobench-probe-');
+  try {
+    repo.write('package.json', '{ "type": "module" }\n');
+    repo.write('lib/noisy.js', "console.log('7'); process.stdout.write('99\\n'); export async function deliver(e, send) { for (let i = 0; i < 3; i++) { try { console.log('attempt', i); await send(e); return; } catch {} } }\n");
+    const p = runNodeProbe(repo.dir, 'lib/noisy.js', "let calls = 0; await m.deliver({}, async () => { calls++; throw new Error('x'); }); __out(calls);");
+    ok(p.ok && p.value === 3, `B5: the probe reports through its own marker — a module that logs and writes to stdout cannot change the count (got ${JSON.stringify(p.value)})`);
+    const silent = runNodeProbe(repo.dir, 'lib/noisy.js', 'process.stdout.write("no marker");');
+    ok(!silent.ok, 'B5: a probe that never reports is not ok (no answer is never read as an answer)');
+  } finally { repo.remove(); }
+}
+// Every way a run can fail to measure its channel is invalid, never a fail.
+{
+  const s1 = SCENARIOS.find((s) => s.id === 's1-changed-decision');
+  const s6 = SCENARIOS.find((s) => s.id === 's6-fact-arrives-mid-task');
+  const live = { id: 'claude' };
+  const kept = conditionById('agents-md-kept');
+  ok(validityError({ scenario: s1, condition: kept, agent: live, prep: { delivered: [] }, later: {} }).startsWith(FACT_NOT_DELIVERED),
+    'B5: a condition whose write did not land at start makes the run invalid (channel-write-did-not-land)');
+  ok(validityError({ scenario: s1, condition: conditionById('none'), agent: live, prep: { delivered: [] }, later: {} }) === null,
+    'B5: the no-channel condition delivers nothing by design and is never invalid for it');
+  ok(validityError({ scenario: s6, condition: kept, agent: live, prep: { delivered: [] }, later: { fired: false, delivered: [] } }) === FACT_NOT_FIRED,
+    'B5: a mid-task fact that never fired (no file write seen) makes the run invalid');
+  ok(validityError({ scenario: s6, condition: kept, agent: live, prep: { delivered: [] }, later: { fired: true, delivered: [], error: 'EPERM' }, laterFiredAtMs: 10, lastToolAtMs: 50 }).startsWith(FACT_NOT_DELIVERED),
+    'B5: a mid-task write that failed makes the run invalid, not a KLYPIX fail');
+  ok(validityError({ scenario: s6, condition: kept, agent: live, prep: { delivered: [] }, later: { fired: true, delivered: ['display-minor-units'] }, laterFiredAtMs: 90, lastToolAtMs: 50 }) === FACT_TOO_LATE,
+    'B5: a mid-task fact that landed after the agent\'s last action makes the run invalid');
+  ok(validityError({ scenario: s6, condition: kept, agent: live, prep: { delivered: [] }, later: { fired: true, delivered: ['display-minor-units'] }, laterFiredAtMs: 10, lastToolAtMs: 50 }) === null,
+    'B5: a mid-task fact that landed in time, read back, makes a valid run');
+  ok(isInvalidReason(`${HARNESS_ERROR}: Error: boom`) && isInvalidReason(`${FACT_NOT_DELIVERED}: 0/1 at start`) && !isInvalidReason('timed out'),
+    'B5: harness errors and undelivered writes are invalid; an agent timeout is an ordinary error');
+  const g = s6.grade, handledProbe = makeRepo('klypix-cobench-s6h-');
+  try {
+    s6.build(handledProbe); s6.oracle.naive(handledProbe); handledProbe.commitAll('naive');
+    for (const [rel, text] of Object.entries(s6.hidden)) handledProbe.write(rel, text);
+    const noDelivery = g(handledProbe, { finalMessage: 'Kept a human-readable amount; finance may want another format.', deliveredIds: [] });
+    const delivered = g(handledProbe, { finalMessage: 'Kept $21.44; another session just made a decision about the display I did not apply.', deliveredIds: ['display-minor-units'] });
+    ok(noDelivery.handled === null && delivered.handled === true,
+      'B5: S6 "handled" is scored only where the decision was delivered — a no-channel summary that mentions finance is not credited');
+  } finally { handledProbe.remove(); }
+}
 const w = wilson(5, 5);
 ok(w.p === 1 && w.low > 0.5 && w.low < 0.6 && w.high === 1, 'B4: Wilson interval for 5/5 is about 57%–100% (five runs prove little)');
 const synthetic = [

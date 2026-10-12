@@ -32,11 +32,33 @@ const flag = (name) => argv.includes(`--${name}`);
 const opt = (name, def = null) => { const i = argv.indexOf(`--${name}`); return i >= 0 && argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[i + 1] : def; };
 const list = (v, all) => (v ? v.split(',').map((s) => s.trim()).filter(Boolean) : all);
 
-// A fact that arrives after the agent has started could not have changed the
-// outcome if it landed after the agent's last action. Such a run is INVALID
-// (kept, shown, excluded from rates) — the channel is not blamed for an agent
-// that had already finished.
+// Every way a run can fail to measure its channel is INVALID — kept, shown
+// beside n, excluded from rates — never counted as the channel failing:
+//   CHANNEL_DOWN        the condition's server never came up (agents.mjs)
+//   FACT_NOT_DELIVERED  the condition's write did not land (read back short),
+//                       at start or mid-task
+//   FACT_NOT_FIRED      a mid-task fact never fired: no file write was seen
+//   FACT_TOO_LATE       it fired after the agent's last action
+//   HARNESS_ERROR       the bench itself threw (build, write, grader)
 export const FACT_TOO_LATE = 'fact-arrived-after-last-action';
+export const FACT_NOT_FIRED = 'fact-never-fired-no-edit-seen';
+export const FACT_NOT_DELIVERED = 'channel-write-did-not-land';
+export const HARNESS_ERROR = 'harness-error';
+export const isInvalidReason = (error) => !!error && (error === CHANNEL_DOWN || error === FACT_TOO_LATE || error === FACT_NOT_FIRED
+  || String(error).startsWith(FACT_NOT_DELIVERED) || String(error).startsWith(HARNESS_ERROR));
+
+/** Why this run measured nothing about its channel, or null. */
+export function validityError({ scenario, condition, agent, prep, later, laterFiredAtMs, lastToolAtMs }) {
+  if (condition.id === 'none') return null;   // carries nothing by design
+  const startFacts = scenario.facts.length;
+  if ((prep.delivered || []).length < startFacts) return `${FACT_NOT_DELIVERED}: ${(prep.delivered || []).length}/${startFacts} at start`;
+  if (!scenario.later) return null;
+  if (!later.fired) return agent.id === 'oracle' ? null : FACT_NOT_FIRED;
+  const want = scenario.later.facts?.length || 0;
+  if (later.error || later.delivered.length < want) return `${FACT_NOT_DELIVERED}: mid-task${later.error ? ` (${later.error})` : ` ${later.delivered.length}/${want}`}`;
+  if (agent.id !== 'oracle' && lastToolAtMs != null && laterFiredAtMs != null && laterFiredAtMs > lastToolAtMs) return FACT_TOO_LATE;
+  return null;
+}
 
 export async function runOne({ scenario, condition, agent, run, timeoutMs, keep = false, agentOptions = {}, transcriptDir = null }) {
   const repo = makeRepo(`klypix-cobench-${scenario.id.slice(0, 2)}-`);
@@ -47,44 +69,42 @@ export async function runOne({ scenario, condition, agent, run, timeoutMs, keep 
   const totalFacts = scenario.facts.length + (scenario.later?.facts?.length || 0);
   let prep = { relays: 0, delivered: [] };
   let hb = null;
-  let laterTimer = null;
-  const later = { fired: false, firing: false, firedAtMs: null, anchor: null, delivered: [], notePosted: null, error: null };
+  const later = { fired: false, firing: false, firedAt: null, anchor: null, delivered: [], notePosted: null, error: null };
   let onEvent = null;
   try {
     scenario.build(repo);
     prep = await condition.prepare({ repo, scenario, agent, sessionIds, benchHome });
     if (prep.heartbeat) hb = setInterval(() => { try { prep.heartbeat(); } catch { /* */ } }, 60_000);
     const prompt = composePrompt(scenario.task, prep.promptAddendum);
-    const agentStart = Date.now();
+    // What the instructions files said when the agent started — a grader may
+    // need to know whether a stale line was in front of the agent (S5).
+    const notesAtStart = `${repo.read('AGENTS.md') || ''}\n${repo.read('CLAUDE.md') || ''}`;
     // A decision made WHILE the agent works: the condition carries it the way it
     // would in real life (a file edited on disk, a brain card and a note). It is
     // anchored to the agent's own progress — its FIRST file write, seen in its
     // output stream — so every condition pays the same: the agent has committed
-    // to an answer built on what it knew, then the world changes. A wall clock
-    // would charge KLYPIX its server start-up inside the window and could land
-    // the fact before the agent's first channel read. If the agent never writes,
-    // the fact lands at scenario.later.fallbackMs and the row says so. The
-    // scripted oracle acts instantly, so for it the fact lands at once — the dry
-    // run proves delivery, not timing.
+    // to an answer built on what it knew, then the world changes. There is no
+    // clock fallback (a clock from launch would charge KLYPIX its server start-up
+    // and could land the fact before the agent's first channel read): a run in
+    // which no write was seen never gets the fact and is invalid. The scripted
+    // oracle acts instantly, so for it the fact lands at once — the dry run
+    // proves delivery, not timing.
     if (scenario.later && typeof condition.later === 'function') {
       const fire = async (anchor) => {
         if (later.fired || later.firing) return;
         later.firing = true; later.anchor = anchor;
         try { const out = await condition.later({ repo, scenario, sessionIds, benchHome, prep }); later.delivered = out?.delivered || []; later.notePosted = out?.notePosted ?? null; } catch (err) { later.error = String(err?.message || err); }
-        later.fired = true; later.firedAtMs = Date.now() - agentStart;
+        later.fired = true; later.firedAt = Date.now();
       };
       if (agent.id === 'oracle') await fire('immediate');
-      else {
-        const fallbackMs = scenario.later.fallbackMs ?? 90_000;
-        laterTimer = setTimeout(() => { fire('fallback'); }, fallbackMs);
-        onEvent = (kind) => { if (kind === 'edit') fire('first-edit'); };
-      }
+      else onEvent = (kind) => { if (kind === 'edit') fire('first-edit'); };
     }
     const delivered = [...(prep.delivered || []), ...later.delivered];
     const res = await agent.run({ repo, scenario, prompt, mcpServers: prep.mcpServers || {}, sessionId: sessionIds.agent, delivered, timeoutMs, onEvent, ...agentOptions });
-    if (laterTimer) { clearTimeout(laterTimer); laterTimer = null; }
     // A fire still in flight when the agent exits must finish before grading.
     for (let i = 0; i < 100 && later.firing && !later.fired; i++) await new Promise((r) => setTimeout(r, 100));
+    // On the agent's own clock (both stamps are absolute, so no origin drift).
+    const laterFiredAtMs = later.fired && later.firedAt != null ? (res.startedAt != null ? later.firedAt - res.startedAt : 0) : null;
     if (transcriptDir && res.raw) {
       // The agent's own output, kept so any published number can be audited run by run.
       fs.mkdirSync(transcriptDir, { recursive: true });
@@ -94,26 +114,27 @@ export async function runOne({ scenario, condition, agent, run, timeoutMs, keep 
     }
     commitAgentWork(repo, 'bench: agent work (uncommitted remainder)');
     for (const [rel, text] of Object.entries(scenario.hidden)) repo.write(rel, text);
-    const g = scenario.grade(repo, { finalMessage: res.finalMessage || '' });
-    const factTooLate = !!scenario.later && agent.id !== 'oracle'
-      && (!later.fired || (res.lastToolAtMs != null && later.firedAtMs > res.lastToolAtMs));
-    const error = res.error || (factTooLate ? FACT_TOO_LATE : null);
+    const deliveredIds = [...(prep.delivered || []), ...later.delivered];
+    const g = scenario.grade(repo, { finalMessage: res.finalMessage || '', deliveredIds, notesAtStart, promptAddendum: prep.promptAddendum || '' });
+    const error = res.error || validityError({ scenario, condition, agent, prep, later, laterFiredAtMs, lastToolAtMs: res.lastToolAtMs });
     return {
       scenario: scenario.id, condition: condition.id, agent: agent.id, run,
       success: !!g.success, staleAction: !!g.staleAction, collision: g.collision, handled: g.handled ?? null,
-      ...(g.untouched != null ? { untouched: g.untouched } : {}), ...(g.sendCalls != null ? { sendCalls: g.sendCalls } : {}), ...(g.display != null ? { display: g.display } : {}),
-      relays: prep.relays || 0, delivered: [...(prep.delivered || []), ...later.delivered].length, facts: totalFacts,
-      ...(scenario.later ? { laterAnchor: later.anchor, laterFiredAtMs: later.firedAtMs, laterNotePosted: later.notePosted, laterError: later.error } : {}),
+      ...(g.untouched != null ? { untouched: g.untouched } : {}), ...(g.workedAround != null ? { workedAround: g.workedAround } : {}),
+      ...(g.sendCalls != null ? { sendCalls: g.sendCalls } : {}), ...(g.display != null ? { display: g.display } : {}),
+      relays: prep.relays || 0, delivered: deliveredIds.length, facts: totalFacts,
+      ...(scenario.later ? { laterAnchor: later.anchor, laterFiredAtMs, laterNotePosted: later.notePosted, laterError: later.error } : {}),
       firstToolAtMs: res.firstToolAtMs ?? null, firstEditAtMs: res.firstEditAtMs ?? null, firstMcpAtMs: res.firstMcpAtMs ?? null, lastToolAtMs: res.lastToolAtMs ?? null,
       agentOk: res.ok, model: res.model ?? null, permissionDenials: res.permissionDenials ?? null, mcpCalls: res.mcpCalls ?? null, channelUp: res.channelUp ?? null,
-      invalid: error === CHANNEL_DOWN || error === FACT_TOO_LATE, costUsd: res.costUsd ?? null, tokens: res.tokens ?? null, turns: res.turns ?? null,
+      invalid: isInvalidReason(error), costUsd: res.costUsd ?? null, tokens: res.tokens ?? null, turns: res.turns ?? null,
       durationMs: res.durationMs ?? (Date.now() - started), timedOut: !!res.timedOut,
       error, keptRepo: keep ? repo.dir : null,
     };
   } catch (err) {
-    return { scenario: scenario.id, condition: condition.id, agent: agent.id, run, success: false, staleAction: false, collision: null, handled: null, relays: prep.relays || 0, delivered: 0, facts: totalFacts, agentOk: false, costUsd: null, tokens: null, turns: null, durationMs: Date.now() - started, timedOut: false, error: String(err?.stack || err).slice(0, 800), keptRepo: keep ? repo.dir : null };
+    // The bench's own failure (a scenario build, a condition write, a grader)
+    // measured nothing about the agent or the channel: invalid, never a fail.
+    return { scenario: scenario.id, condition: condition.id, agent: agent.id, run, success: false, staleAction: false, collision: null, handled: null, relays: prep.relays || 0, delivered: 0, facts: totalFacts, agentOk: false, costUsd: null, tokens: null, turns: null, durationMs: Date.now() - started, timedOut: false, invalid: true, error: `${HARNESS_ERROR}: ${String(err?.stack || err).slice(0, 780)}`, keptRepo: keep ? repo.dir : null };
   } finally {
-    if (laterTimer) clearTimeout(laterTimer);
     if (hb) clearInterval(hb);
     try { prep.cleanup?.(); } catch { /* */ }
     if (!keep) repo.remove();

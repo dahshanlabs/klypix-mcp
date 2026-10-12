@@ -371,6 +371,8 @@ async function statusDigestContext({ brainPath, sessionId, prompt, sessions, cwd
 // ⏸️ Unfinished work other sessions left — the engine's block (agent-presence
 // listUnfinishedWork + formatUnfinishedWork), read-only, never throws.
 const CONTINUE_PROMPT_RE = /\b(continue|resume|pick (it |this |that )?up|carry on|keep going|where (were|did) we|what('s| is| was) (next|left|remaining|pending)|unfinished|left off|hand[- ]?off|handed (over|off)|take over|finish (what|the work|it|this))\b/i;
+const HANDOFF_ASK_PROMPT_RE = /\b(hand[- ]?off|hand (it|this|the work) (over|off)|before (we|i|you) (hit|reach|approach|run out of) (the )?(limit|context|window|quota)|(context|usage|token|rate) (limit|window|quota)|out of context|switch(ing)? to (claude|another (agent|session|tool)))\b/i;
+const CODEX_HANDOFF_HINT = '🤝 KLYPIX: to hand this session\'s work to the next one (any agent — Claude Code or Codex), call brain_handoff with the task, what is done, what is next, the files and how to verify; the next session on this project sees it at its first brain_sync and takes it with {action:"take"}. Your last reply and commits are recorded automatically at each turn end regardless — but a deliberate handoff says what you know. Never make the human paste a summary into the next session.';
 function unfinishedWorkBlock(brainPath, sessionId) {
   try {
     return formatUnfinishedWork(listUnfinishedWork({ brainPath, selfId: sessionId }));
@@ -390,7 +392,30 @@ function codexWorkPatch({ event, humanTurn, prompt, input }) {
     const text = typeof words === 'string' ? words.trim() : '';
     if (text) { patch.lastWords = text.length > 700 ? '…' + text.slice(-699) : text; patch.lastWordsAt = Date.now(); }
   }
+  // 1.99.1 (universal): this session's OWN commits, from the output git
+  // printed for a commit it ran ("[branch abc1234] subject") — never a branch
+  // range, which would credit a peer's commits in a shared checkout.
+  if (event === 'PostToolUse') {
+    const commits = commitsFromToolResult(input);
+    if (commits.length) patch.addCommits = commits;
+  }
   return Object.keys(patch).length ? patch : null;
+}
+function toolOutputText(input) {
+  const r = input.tool_response ?? input.toolResponse ?? input.tool_output ?? input.toolOutput;
+  if (typeof r === 'string') return r;
+  if (!r || typeof r !== 'object') return '';
+  const parts = [r.output, r.stdout, r.aggregated_output, r.formatted_output, r.text, r.content];
+  return parts.map((p) => (typeof p === 'string' ? p : Array.isArray(p) ? p.map((x) => (typeof x === 'string' ? x : x?.text || '')).join('\n') : '')).filter(Boolean).join('\n');
+}
+export function commitsFromToolResult(input) {
+  const ti = input.tool_input || input.toolInput || {};
+  const cmd = typeof ti === 'string' ? ti : [ti.command, ti.cmd, Array.isArray(ti.command) ? ti.command.join(' ') : ''].filter((v) => typeof v === 'string').join(' ');
+  if (!/\bgit\b[^\n]*\bcommit\b/.test(cmd)) return [];
+  const out = toolOutputText(input);
+  const commits = [];
+  for (const m of out.matchAll(/^\[[^\]\n]{1,80}?\s([0-9a-f]{7,40})\]\s+(.+)$/gm)) commits.push({ sha: m[1].slice(0, 12), subject: m[2].trim().slice(0, 120) });
+  return commits.slice(0, 6);
 }
 
 async function compactTaskContext(projectDir, prompt, files) {
@@ -533,6 +558,8 @@ async function main() {
       stampReceivedMessages(messages, Date.now(), undefined, sessionId),
       // Only on a continue-shaped human prompt — SessionStart printed it once.
       ...(prompt && CONTINUE_PROMPT_RE.test(prompt) ? [unfinishedWorkBlock(brainPath, sessionId)] : []),
+      // The human asked for a handoff or named the limit (Codex has one too).
+      ...(prompt && HANDOFF_ASK_PROMPT_RE.test(prompt) ? [CODEX_HANDOFF_HINT] : []),
     ], event);
     return;
   }

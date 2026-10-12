@@ -299,6 +299,61 @@ try {
     ok(cont.content[0].text.includes('Rewrite lib/report.js') && cont.content[0].text.includes('files it touched (free — not reserved)'), 'D12 a continue-shaped task sees it with its last words');
     await c.callTool({ name: 'brain_sync', arguments: { project, phase: 'complete' } });
     await c.close();
+
+    // ── E. Universal (1.99.1): not only Claude Code ─────────────────────────
+    // E1–E4: an MCP-only host (Cursor, Gemini CLI, VS Code — no hooks at all)
+    // declares a task through brain_sync and stops without completing it. The
+    // declaration IS the work record, so the next session finds it.
+    const cursor = await connect('cursor-session-eeee-0005');
+    await cursor.callTool({ name: 'brain_sync', arguments: { project, intent: 'Add CSV export to the billing page', files: ['src/billing/export.ts'], phase: 'start' } });
+    await cursor.close();
+    const cursorEntry = entryOf('cursor-session-eeee-0005');
+    ok(cursorEntry?.work?.declaredAt > 0, 'E1 a brain_sync-declared task stamps declaredAt on the session record (any MCP host)');
+    const later = Date.now() + 15 * MIN;
+    const mcpOnly = listUnfinishedWork({ brainPath, home, now: later }).find((r) => r.id === 'cursor-session-eeee-0005');
+    ok(mcpOnly && mcpOnly.intent === 'Add CSV export to the billing page' && mcpOnly.files.includes('src/billing/export.ts'), 'E2 a hookless MCP session that stopped mid-task is listed as unfinished work');
+    const finisher = await connect('cursor-session-ffff-0006');
+    await finisher.callTool({ name: 'brain_sync', arguments: { project, intent: 'Tidy the docs index', files: ['docs/index.md'], phase: 'start' } });
+    // A checkpoint between start and complete — brain_sync defers a completion
+    // that follows its start with no work in between (premature-complete guard).
+    await finisher.callTool({ name: 'brain_sync', arguments: { project, phase: 'checkpoint', files: ['docs/index.md'] } });
+    await finisher.callTool({ name: 'brain_sync', arguments: { project, phase: 'complete' } });
+    await finisher.close();
+    ok(!listUnfinishedWork({ brainPath, home, now: later }).some((r) => r.id === 'cursor-session-ffff-0006'), 'E3 the same host that completed its task is not listed');
+
+    // E4–E7: Codex through its REAL lifecycle hook.
+    const codexHook = path.join(__dirname, '..', 'src', 'codex-brain-hook.mjs');
+    const runCodex = (input) => execFileSync(process.execPath, [codexHook], { cwd: project, env: { ...workerEnv, HOME: home, USERPROFILE: home }, encoding: 'utf8', input: JSON.stringify({ cwd: project, ...input }) });
+    const cx = 'codex-thread-limit-0007';
+    runCodex({ session_id: cx, hook_event_name: 'SessionStart' });
+    runCodex({ session_id: cx, hook_event_name: 'UserPromptSubmit', prompt: 'build the invoice PDF generator' });
+    runCodex({ session_id: cx, hook_event_name: 'PostToolUse', tool_name: 'shell', tool_input: { command: 'git commit -m "feat(invoice): pdf layout"' }, tool_response: { output: '[main 1a2b3c4] feat(invoice): pdf layout\n 2 files changed', exit_code: 0 } });
+    runCodex({ session_id: cx, hook_event_name: 'Stop', last_assistant_message: 'Layout is committed. Next: totals table, then the tests in test/invoice.test.ts.' });
+    const cxEntry = entryOf(cx);
+    ok(cxEntry?.work?.lastWords?.startsWith('Layout is committed') && cxEntry.work.lastPrompt === 'build the invoice PDF generator', 'E4 Codex Stop records its last reply and the last prompt');
+    ok(cxEntry.work.commits?.[0]?.sha === '1a2b3c4' && cxEntry.work.commits[0].subject === 'feat(invoice): pdf layout', 'E5 Codex records its OWN commit from the git commit tool output');
+    runCodex({ session_id: cx, hook_event_name: 'PostToolUse', tool_name: 'shell', tool_input: { command: 'git commit -m "feat(invoice): totals"' }, tool_response: { output: '[main 5d6e7f8] feat(invoice): totals' } });
+    ok(entryOf(cx).work.commits.map((x) => x.sha).join(',') === '1a2b3c4,5d6e7f8', 'E6 a second Codex commit is appended, not replacing the first');
+    const hint = JSON.parse(runCodex({ session_id: cx, hook_event_name: 'UserPromptSubmit', prompt: 'we are near the usage limit, hand it off' }) || '{}');
+    ok(/brain_handoff/.test(hint.hookSpecificOutput?.additionalContext || hint.systemMessage || ''), 'E7 Codex gets the write-a-handoff hint when the human names the limit');
+    // E8: Codex hits its limit — 15 quiet minutes — and a fresh Claude session
+    // asked to continue sees the Codex work.
+    {
+      const lf = laneFileFor(brainPath, home);
+      const lane = JSON.parse(fs.readFileSync(lf, 'utf8'));
+      const back = (v) => (Number(v) ? Number(v) - 15 * MIN : v);
+      for (const row of lane.sessions || []) if (row.id === cx || row.logicalSessionId === cx) Object.assign(row, { lastSeen: back(row.lastSeen), hostStatusAt: back(row.hostStatusAt), activityAt: back(row.activityAt), hostStatus: 'idle' });
+      for (const row of lane.directory || []) if (row.id === cx) row.lastSeen = back(row.lastSeen);
+      fs.writeFileSync(lf, JSON.stringify(lane));
+    }
+    const cl = await connect('claude-after-codex-0008');
+    const pick = await cl.callTool({ name: 'brain_sync', arguments: { project, intent: 'continue what codex was doing on the invoice', phase: 'start' } });
+    const pickText = pick.content[0].text;
+    const afterHeader = pickText.slice(pickText.indexOf('may have left unfinished'));
+    const firstRecord = afterHeader.split('\n').find((l) => l.startsWith('- ')) || '';
+    ok(pickText.includes('1a2b3c4 feat(invoice): pdf layout') && pickText.includes('Layout is committed') && firstRecord.startsWith('- Codex codex-th') && pickText.includes('most relevant first'), `E8 asked to continue "what codex was doing on the invoice", a Claude session gets the Codex work FIRST — commits, last words (first: ${firstRecord.slice(0, 60)})`);
+    await cl.callTool({ name: 'brain_sync', arguments: { project, phase: 'complete' } });
+    await cl.close();
   }
 } finally {
   fs.rmSync(root, { recursive: true, force: true });

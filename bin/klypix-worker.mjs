@@ -1418,13 +1418,28 @@ server.registerTool('brain_sync', {
       const wantsContinue = HANDOFF_CONTINUE_RE.test(String(intent || ''));
       const normPath = (p) => String(p || '').replace(/\\/g, '/').toLowerCase();
       const mine = new Set((Array.isArray(files) ? files : []).map(normPath));
-      const lane = (h?.structured?.unfinished || []).filter((r) => wantsContinue
-        || (Array.isArray(r.files) && r.files.some((p) => mine.has(normPath(p)))));
+      const overlaps = (r) => Array.isArray(r.files) && r.files.some((p) => mine.has(normPath(p)));
+      // "continue what codex was doing on the invoice": rank by what the
+      // request names — the agent, words of the task, last words, files,
+      // commit subjects — then by recency, so the one meant leads the list.
+      const words = new Set(String(intent || '').toLowerCase().match(/[\p{L}\p{N}_-]{3,}/gu) || []);
+      for (const w of ['continue', 'resume', 'what', 'was', 'were', 'doing', 'the', 'and', 'left', 'off', 'where', 'session', 'other', 'work', 'pick', 'carry', 'keep', 'going', 'finish', 'take', 'over', 'handoff', 'hand']) words.delete(w);
+      const relevance = (r) => {
+        const hay = [r.client === 'claude-code' ? 'claude' : r.client, r.intent, r.lastPrompt, r.lastWords, ...(r.files || []), ...(r.commits || []).map((c) => c.subject)].join(' ').toLowerCase();
+        let n = 0;
+        for (const w of words) if (hay.includes(w)) n++;
+        return n + (overlaps(r) ? 3 : 0);
+      };
+      const lane = (h?.structured?.unfinished || [])
+        .filter((r) => wantsContinue || overlaps(r))
+        .map((r) => ({ r, score: relevance(r) }))
+        .sort((a, b) => b.score - a.score || Number(b.r.lastSeen || 0) - Number(a.r.lastSeen || 0))
+        .map(({ r }) => r);
       if (!h?.isError && (cards.length || lane.length)) {
         const now = Date.now();
         handoffText = [
           formatHandoffCards(cards, { now, max: 5 }),
-          formatUnfinishedWork(lane, { now, max: 4 }),
+          formatUnfinishedWork(lane, { now, max: 4, ranked: wantsContinue && words.size > 0 }),
         ].filter(Boolean).join('\n\n');
         handoffData = {
           cards: cards.length,

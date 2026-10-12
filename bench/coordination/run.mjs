@@ -7,7 +7,8 @@
 //       [--claude-model <id>] [--codex-model <id>] [--max-budget 2]   (Claude's per-run dollar cap)
 //       [--transcripts <dir>]   (each agent's raw output, for auditing a published number)
 //       [--klypix-bin <path>]   (the KLYPIX server to measure; default this checkout's bin/klypix-mcp.mjs)
-//       [--codex-effort <none|low|medium|high|…>]   (pinned on every Codex run and recorded)
+//       [--codex-effort <low|medium|high|xhigh|max>]   (pinned on every Codex run and recorded; default: the model's own)
+//       [--shuffle <seed>]   (seeded random run order across all cells; recorded per row)
 //       KLYPIX_BENCH_SEMANTIC_DIR=<dir>   (a prepared copy of semantic/ + hf-cache/ for klypix-installed)
 //
 // A live run spends model usage on YOUR account. It prints the run count and
@@ -21,6 +22,14 @@ import { pathToFileURL } from 'node:url';
 import { SCENARIOS, scenarioById } from './scenarios.mjs';
 import { CONDITIONS, conditionById, appendedNotApplicable, klypixServerInfo, isKlypixCondition, semanticDirOrNull, semanticPreflight, semanticDirFingerprint, SEMANTIC_DIR_ENV } from './conditions.mjs';
 import { agentById, composePrompt, CHANNEL_DOWN } from './agents.mjs';
+
+/** Deterministic in-place shuffle (mulberry32), so an order can be reproduced from its seed. */
+export function shuffleInPlace(list, seed) {
+  let a = seed >>> 0;
+  const rand = () => { a = (a + 0x6D2B79F5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  for (let i = list.length - 1; i > 0; i--) { const j = Math.floor(rand() * (i + 1)); [list[i], list[j]] = [list[j], list[i]]; }
+  return list;
+}
 
 /** Why a (scenario, condition) cell is not run, or null. */
 export function notApplicableReason(scenario, condition, agent = null) {
@@ -219,7 +228,16 @@ async function main() {
   const versions = {};
   for (const a of agents) versions[a.id] = await a.version();
   const results = [];
-  for (const scenario of scenarios) for (const condition of runnable) for (const agent of agents) for (let run = 1; run <= runs; run++) {
+  // Run order: by default scenario by scenario, conditions in a fixed order.
+  // --shuffle <seed> interleaves every run of every cell in a seeded random
+  // order, so no condition always runs last or under the same machine load;
+  // each row records its position.
+  const plan = [];
+  for (const scenario of scenarios) for (const condition of runnable) for (const agent of agents) for (let run = 1; run <= runs; run++) plan.push({ scenario, condition, agent, run });
+  const seed = opt('shuffle', null);
+  if (seed != null) shuffleInPlace(plan, Number(seed) || 1);
+  if (seed != null) console.log(`order: shuffled (seed ${Number(seed) || 1})`);
+  for (const [order, { scenario, condition, agent, run }] of plan.entries()) {
     // A condition a scenario cannot apply to (a copy-paste at start cannot
     // carry a decision made later; an appended notes file byte-identical to
     // another condition) is recorded as such, never as a fail — and never run.
@@ -228,6 +246,8 @@ async function main() {
       ? { scenario: scenario.id, condition: condition.id, agent: agent.id, run, notApplicable, success: false, staleAction: false, collision: null, handled: null, relays: 0, delivered: 0, facts: scenario.facts.length + (scenario.later?.facts?.length || 0), agentOk: null, costUsd: null, tokens: null, turns: null, durationMs: 0, timedOut: false, error: null, keptRepo: null }
       : await runOne({ scenario, condition, agent, run, timeoutMs, keep: flag('keep'), agentOptions: agentOptionsFor(agent), transcriptDir: opt('transcripts', null), klypixServer });
     r.versions = versions[agent.id];
+    r.order = order;
+    if (seed != null) r.shuffleSeed = Number(seed) || 1;
     results.push(r);
     console.log(notApplicable
       ? `n/a   ${scenario.id}  ${condition.id}  ${agent.id}#${run}  (${notApplicable})`

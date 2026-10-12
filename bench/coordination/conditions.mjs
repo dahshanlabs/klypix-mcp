@@ -100,7 +100,7 @@ const none = {
 
 const relay = {
   id: 'relay',
-  label: 'Human copy-paste (upper bound)',
+  label: 'Human copy-paste (meant as upper bound)',
   runnable: true,
   async prepare({ scenario }) {
     const said = scenario.facts.filter((f) => spoken(f) != null);
@@ -180,7 +180,7 @@ const agentsMdAppended = makeNotesCondition('agents-md-appended', 'AGENTS.md / C
 // also inject the brief.
 const klypix = {
   id: 'klypix',
-  label: 'KLYPIX (brain + lane, MCP only)',
+  label: 'KLYPIX (MCP server + AGENTS.md rules, no hooks)',
   runnable: true,
   async prepare({ repo, scenario, sessionIds, benchHome = null, klypixBin = null }) {
     const brainPath = path.join(repo.dir, 'brain.klypix');
@@ -327,7 +327,7 @@ const klypix = {
 // Planned conditions: listed with the reason they are not run yet, so a
 // report can never imply they were measured.
 const planned = [
-  { id: 'klypix-hooks', label: 'KLYPIX with Claude Code hooks', reason: 'needs project-scoped hook settings pointed at this checkout; MCP-only KLYPIX is measured instead (conservative)' },
+  { id: 'klypix-hooks', label: 'KLYPIX with Claude Code hooks', reason: 'needs project-scoped hook settings pointed at this checkout; the MCP server with the AGENTS.md rules block is measured instead (whether hooks change the result is not measured)' },
   { id: 'claude-messaging', label: 'Claude Code cross-session messaging', reason: 'needs two LIVE Claude sessions; cannot reach a closed session or another vendor, so S3/S4 do not apply by design' },
   { id: 'agent-mail', label: 'MCP Agent Mail', reason: 'third-party server not installed here; adapter must be verified against a pinned version before any result is published' },
   { id: 'concord', label: 'Concord MCP', reason: 'third-party server not installed here; adapter must be verified against a pinned version before any result is published' },

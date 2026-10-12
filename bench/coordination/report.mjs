@@ -82,16 +82,21 @@ export function toMarkdown(cells, rows = []) {
       }
     }
     out.push('');
-    out.push('**Clear differences** (95% intervals do not overlap):');
+    // Both directions, every measured condition: a KLYPIX loss is listed as
+    // plainly as a win. A cell that was not run (n/a, or n = 0) has no
+    // interval and is never compared.
+    out.push('**Clear differences** (95% intervals do not overlap), KLYPIX against each other condition:');
     let any = false;
+    const measured = (c) => c && !c.notApplicable && c.n > 0 && c.success.low != null;
     for (const s of SCENARIOS) {
       const forS = cells.filter((x) => x.agent === agent && x.scenario === s.id);
       const k = forS.find((x) => x.condition === 'klypix');
-      if (!k) continue;
+      if (!measured(k)) continue;
       for (const other of forS) {
-        if (other.condition === 'klypix' || other.condition === 'relay') continue;
-        if (!overlaps(k.success, other.success) && k.success.p > other.success.p) {
-          out.push(`- ${s.title}: KLYPIX ${pct(k.success.p)} vs ${other.condition} ${pct(other.success.p)}`);
+        if (other.condition === 'klypix' || !measured(other)) continue;
+        if (!overlaps(k.success, other.success)) {
+          const ahead = k.success.p > other.success.p;
+          out.push(`- ${s.title}: KLYPIX ${ahead ? 'ahead of' : 'BEHIND'} ${other.condition} — ${pct(k.success.p)} vs ${pct(other.success.p)}`);
           any = true;
         }
       }

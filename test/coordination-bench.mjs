@@ -273,7 +273,7 @@ const synthetic = [
   ...Array.from({ length: 3 }, (_, i) => ({ scenario: 's3-note-from-closed-session', condition: 'none', agent: 'claude', run: i, success: i < 1, staleAction: i >= 1, relays: 0 })),
 ];
 const md = toMarkdown(summarize(synthetic));
-ok(/A decision changed today: KLYPIX 95% vs none 15%/.test(md) && !/A note left by a session that has ended: KLYPIX/.test(md),
+ok(/A decision changed today: KLYPIX ahead of none — 95% vs 15%/.test(md) && !/A note left by a session that has ended: KLYPIX/.test(md),
   'B4: the report calls the 20-run gap a difference and the 3-run gap a tie');
 ok(/## Not measured/.test(md) && /MCP Agent Mail/.test(md), 'B4: the report lists the tools it did not measure, with the reason');
 const naMd = toMarkdown(summarize([
@@ -283,7 +283,16 @@ const naMd = toMarkdown(summarize([
   { scenario: 's2-overlapping-work', condition: 'klypix', agent: 'claude', run: 3, success: false, staleAction: true, handled: false, mcpCalls: { brain_sync: 1 } },
 ]));
 ok(/n\/a: a paste at start cannot carry it/.test(naMd), 'B4: a condition a scenario cannot apply to prints as n/a with its reason, never as 0%');
-ok(/\| 2\/3 \| —/.test(naMd) && /| Handled |/.test(naMd), 'B4: the "handled" column counts a flagged conflict beside the strict grade (2/3)');
+ok(/\| 2\/3 \| —/.test(naMd) && /\| Handled \|/.test(naMd), 'B4: the "handled" column counts a flagged conflict beside the strict grade (2/3)');
+{
+  // The clear-differences list names a KLYPIX loss as plainly as a win, and
+  // never compares against a cell that was not run.
+  const mk = (condition, success, extra = {}) => Array.from({ length: 5 }, (_, i) => ({ scenario: 's5-stale-wip-note', condition, agent: 'claude', run: i + 1, success, staleAction: !success, handled: null, relays: 0, delivered: 1, facts: 1, ...extra }));
+  const cdRows = [...mk('klypix', false), ...mk('agents-md-kept', true), ...mk('none', false), ...mk('agents-md-appended', false, { notApplicable: 'identical to none' })];
+  const cdMd = toMarkdown(summarize(cdRows), cdRows);
+  ok(/KLYPIX BEHIND agents-md-kept — 0% vs 100%/.test(cdMd) && !/vs agents-md-appended|agents-md-appended —/.test(cdMd) && !/KLYPIX ahead of none/.test(cdMd),
+    'B4: the report lists a clear KLYPIX loss, and never compares against a cell that was not run');
+}
 
 // ── B5: live-run safety (no model call) ─────────────────────────────────────
 {

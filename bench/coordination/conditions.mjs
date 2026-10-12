@@ -36,6 +36,7 @@
 // channel is hooks, which this MCP-only condition does not install. So in the
 // KLYPIX condition Claude's CLAUDE.md is the same file as with no channel, and
 // its only pointer to the brain is the server's own instructions.
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -45,7 +46,23 @@ import { laneFileFor, listActiveSessions, postPresenceMessage, upsertSession } f
 import { linkProject } from '../../src/agent-rules.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-const KLYPIX_BIN = path.join(ROOT, 'bin', 'klypix-mcp.mjs');
+export const KLYPIX_BIN = path.join(ROOT, 'bin', 'klypix-mcp.mjs');
+
+/**
+ * Which KLYPIX server a run talks to — its entry point, package version and
+ * git commit — so every KLYPIX row names the exact build it measured. The bench
+ * can be pointed at another build (`--klypix-bin`, e.g. a released tag's
+ * checkout) to compare two versions on the same scenarios.
+ */
+export function klypixServerInfo(bin = KLYPIX_BIN) {
+  const root = path.resolve(path.dirname(bin), '..');
+  let version = null;
+  try { version = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')).version ?? null; } catch { /* */ }
+  const git = (args) => { const r = spawnSync('git', ['-C', root, ...args], { encoding: 'utf8' }); return r.status === 0 ? String(r.stdout).trim() : null; };
+  const commit = git(['rev-parse', '--short', 'HEAD']);
+  const dirty = commit ? (git(['status', '--porcelain', '--', 'src', 'bin', 'package.json']) || '') !== '' : null;
+  return { bin, version, commit, dirty };
+}
 
 const writeInstructions = (repo, text) => {
   // Claude Code reads CLAUDE.md natively; Codex and most others read AGENTS.md.
@@ -165,7 +182,7 @@ const klypix = {
   id: 'klypix',
   label: 'KLYPIX (brain + lane, MCP only)',
   runnable: true,
-  async prepare({ repo, scenario, sessionIds, benchHome = null }) {
+  async prepare({ repo, scenario, sessionIds, benchHome = null, klypixBin = null }) {
     const brainPath = path.join(repo.dir, 'brain.klypix');
     // The lane, the project registry and every other KLYPIX file of this run
     // live under ONE home: the run's throwaway folder (live runs) or the
@@ -251,7 +268,7 @@ const klypix = {
       mcpServers: {
         'klypix-canvas': {
           command: process.execPath,
-          args: [KLYPIX_BIN, '--vault', repo.dir],
+          args: [klypixBin || KLYPIX_BIN, '--vault', repo.dir],
           env: {
             KLYPIX_PLUGIN: '1', KLYPIX_SESSION_ID: sessionIds.agent, KLYPIX_AUTO_UPDATE: '0',
             HOME: home, USERPROFILE: home, KLYPIX_BRAIN_DIR: path.join(home, '.claude', 'project-brain'),

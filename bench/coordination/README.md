@@ -106,6 +106,9 @@ node bench/coordination/report.mjs results.jsonl > results.md
 `--scenario` and `--condition` take comma lists. `--keep` leaves each run's repo
 on disk for inspection. `--timeout` is per run, in seconds (default 600).
 `--max-budget` caps Claude's dollars per run (default 2).
+`--klypix-bin` points the KLYPIX condition at another server build — for
+example a released tag's checkout — so two versions can be compared on the same
+scenarios; every KLYPIX row records the server's version and commit.
 
 Live runs leave your own setup alone. The CLIs start directly, never through
 `cmd.exe`, and get the prompt on stdin. The agent's environment carries nothing

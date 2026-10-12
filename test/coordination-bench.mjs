@@ -33,7 +33,7 @@ process.env.KLYPIX_AUTO_UPDATE = '0';
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const { SCENARIOS } = await import('../bench/coordination/scenarios.mjs');
-const { CONDITIONS, conditionById } = await import('../bench/coordination/conditions.mjs');
+const { CONDITIONS, conditionById, KLYPIX_BIN, klypixServerInfo } = await import('../bench/coordination/conditions.mjs');
 const { oracle, composePrompt, codexMcpOverrides, resolveCli, cleanAgentEnv, claudeAllowedTools, parseClaudeResult, parseCodexEvents, codexChannelUp, codexGitWritable, MCP_STARTUP_TIMEOUT_SEC, CHANNEL_DOWN, classifyChunk } = await import('../bench/coordination/agents.mjs');
 const { runOne, notApplicableReason, validityError, isInvalidReason, FACT_NOT_FIRED, FACT_TOO_LATE, FACT_NOT_DELIVERED, HARNESS_ERROR } = await import('../bench/coordination/run.mjs');
 const { summarize, toMarkdown } = await import('../bench/coordination/report.mjs');
@@ -378,6 +378,13 @@ ok(/\| 2\/3 \| —/.test(naMd) && /Handled overlap/.test(naMd), 'B4: the "handle
     ok(fs.existsSync(laneFileFor(brain, benchHome)) && !fs.existsSync(laneFileFor(brain, os.homedir())) && prep.delivered.length === 1,
       'B5: the live actor\'s lane row is written in that home — the launching user\'s lane is never touched');
     prep.cleanup();
+    const other = path.join(os.tmpdir(), 'elsewhere', 'bin', 'klypix-mcp.mjs');
+    const prep2 = await klypix.prepare({ repo, scenario: s2, agent: oracle, sessionIds: { agent: 'bench-agent-b5b' }, benchHome, klypixBin: other });
+    ok(prep2.mcpServers['klypix-canvas'].args[0] === other && server.args[0] === KLYPIX_BIN, 'B5: --klypix-bin points the KLYPIX condition at another build; the default is this checkout');
+    prep2.cleanup();
+    const info = klypixServerInfo();
+    ok(info.bin === KLYPIX_BIN && info.version === JSON.parse(fs.readFileSync(path.join(path.dirname(KLYPIX_BIN), '..', 'package.json'), 'utf8')).version && (info.commit === null || /^[0-9a-f]{7,}$/.test(info.commit)),
+      'B5: every KLYPIX row can name the server build it measured (version and commit)');
   } finally {
     repo.remove();
     try { fs.rmSync(benchHome, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); } catch { /* */ }

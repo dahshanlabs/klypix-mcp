@@ -11,6 +11,13 @@ import { wilson, median, pct } from './lib/stats.mjs';
 import { SCENARIOS } from './scenarios.mjs';
 import { CONDITIONS } from './conditions.mjs';
 
+/** A run re-run after a crash (--resume) keeps only its LAST row; several files may be passed. */
+export function lastRowPerRun(rows) {
+  const by = new Map();
+  for (const r of rows) by.set(`${r.scenario}|${r.condition}|${r.agent}|${r.run}`, r);
+  return [...by.values()];
+}
+
 export function summarize(rows) {
   const groups = new Map();
   for (const r of rows) {
@@ -125,7 +132,7 @@ export function toMarkdown(cells, rows = []) {
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const file = process.argv[2];
   if (!file) { console.error('usage: report.mjs results.jsonl [--json]'); process.exit(2); }
-  const rows = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  const rows = lastRowPerRun(process.argv.slice(2).filter((x) => !x.startsWith('--')).flatMap((p) => fs.readFileSync(p, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l))));
   const cells = summarize(rows);
   process.stdout.write(process.argv.includes('--json') ? `${JSON.stringify(cells, null, 2)}\n` : `${toMarkdown(cells, rows)}\n`);
 }

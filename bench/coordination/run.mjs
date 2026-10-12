@@ -9,6 +9,7 @@
 //       [--klypix-bin <path>]   (the KLYPIX server to measure; default this checkout's bin/klypix-mcp.mjs)
 //       [--codex-effort <low|medium|high|xhigh|max>]   (pinned on every Codex run and recorded; default: the model's own)
 //       [--shuffle <seed>]   (seeded random run order across all cells; recorded per row)
+//       [--resume]   (skip runs the --out file already finished; re-run errored ones)
 //       KLYPIX_BENCH_SEMANTIC_DIR=<dir>   (a prepared copy of semantic/ + hf-cache/ for klypix-installed)
 //
 // A live run spends model usage on YOUR account. It prints the run count and
@@ -236,6 +237,17 @@ async function main() {
   for (const scenario of scenarios) for (const condition of runnable) for (const agent of agents) for (let run = 1; run <= runs; run++) plan.push({ scenario, condition, agent, run });
   const seed = opt('shuffle', null);
   if (seed != null) shuffleInPlace(plan, Number(seed) || 1);
+  // --resume: skip every run the --out file already holds a finished row for
+  // (same scenario, condition, agent and run, no error); a run cut off by a
+  // crash or an agent error runs again, and the report keeps the LAST row of
+  // each run.
+  if (flag('resume') && out && fs.existsSync(out)) {
+    const done = new Set(fs.readFileSync(out, 'utf8').split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } })
+      .filter((r) => r && !r.error).map((r) => `${r.scenario}|${r.condition}|${r.agent}|${r.run}`));
+    const before = plan.length;
+    for (let i = plan.length - 1; i >= 0; i--) { const p = plan[i]; if (done.has(`${p.scenario.id}|${p.condition.id}|${p.agent.id}|${p.run}`)) plan.splice(i, 1); }
+    console.log(`resume: ${before - plan.length} finished run(s) skipped, ${plan.length} to go`);
+  }
   if (seed != null) console.log(`order: shuffled (seed ${Number(seed) || 1})`);
   for (const [order, { scenario, condition, agent, run }] of plan.entries()) {
     // A condition a scenario cannot apply to (a copy-paste at start cannot

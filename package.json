@@ -1,13 +1,18 @@
 {
   "name": "klypix-mcp",
-  "version": "1.101.0",
+  "version": "1.101.1",
   "mcpName": "io.github.dahshanlabs/klypix-mcp",
-  "description": "Active state management for multi-agent coding: a shared, versioned project brain over MCP.",
+  "description": "Shared project memory for Claude Code, Codex and Cursor: decisions and corrections through MCP.",
   "type": "module",
   "license": "Apache-2.0",
   "keywords": [
     "mcp",
     "model-context-protocol",
+    "mcp-server",
+    "claude-code",
+    "codex",
+    "cursor",
+    "shared-memory",
     "multi-agent",
     "agent-coordination",
     "project-memory",
@@ -24,7 +29,7 @@
     "klypix",
     "ai"
   ],
-  "homepage": "https://github.com/dahshanlabs/klypix-mcp#readme",
+  "homepage": "https://klypix.com/developers",
   "repository": {
     "type": "git",
     "url": "https://github.com/dahshanlabs/klypix-mcp"

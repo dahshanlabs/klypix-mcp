@@ -1,12 +1,26 @@
-# Every project gets a brain.
+# klypix-mcp — shared project memory for Claude Code, Codex and Cursor
+
+**Every project gets a brain.**
 
 Shared project memory for **Claude Code, Codex, Cursor** and other MCP coding tools. One
 `brain.klypix` file, committed with your code, carries the project's decisions, corrections and open
 questions across sessions and between tools. Corrections supersede stale decisions; sessions declare
 the files they expect to touch and get warned about same-machine overlap. Versioned in Git. Served
-over MCP by a process on your machine; Klypix uploads nothing (your agent's provider still receives
-what the agent reads). Integration depth differs by host — see
+over MCP by a process on your machine. In the standalone setup, brain data stays in your files;
+your agent's provider can still receive what the agent reads. Integration depth differs by host — see
 [Supported hosts](#supported-hosts-and-their-integration-level).
+
+The **Apache-2.0 engine works without the KLYPIX desktop app or a KLYPIX account**. The optional
+[Windows workspace](https://klypix.com/developers) lets people inspect the same project brain
+beside their files. App-based sharing has its own cloud path; see [Security and permissions](#security-and-permissions).
+
+[Install](#quick-start) · [Try your first decision](#your-first-decision-and-correction) ·
+[Supported hosts](#supported-hosts-and-their-integration-level) ·
+[Privacy](#security-and-permissions) · [Limits](#current-limitations) · [Uninstall](#uninstall)
+
+For a team walkthrough, read the [shared project memory setup guide](https://klypix.com/guides/shared-project-memory).
+Choosing an approach? Our [memory tools comparison](https://klypix.com/guides/shared-project-memory-tools)
+links each tool's official documentation and discloses that Klypix wrote it.
 
 ![Two real MCP sessions on one project: Session B declares a file Session A already declared, and the server's exact-file-overlap warning fires; Session A then records a correction that supersedes its stale card](docs/demo/demo.gif)
 
@@ -14,7 +28,7 @@ what the agent reads). Integration depth differs by host — see
 ([docs/demo/](docs/demo/) — the GIF is rendered by CI from a scripted tape against this server, not
 hand-recorded, and re-rendered when the server's responses change).</sub>
 
-Run this inside your project:
+With **Node.js 20 or newer**, run this inside your project:
 
 ```bash
 npx klypix-mcp install
@@ -59,15 +73,14 @@ carry forward into supported coding-agent sessions.
 ## The problem
 
 You are running more than one coding agent on one codebase — a Claude Code session here, Codex in
-another terminal, Cursor open on the side. Each one has excellent memory of *itself* and none of
-the others:
+another terminal, Cursor open on the side. Context saved in one tool may be missing from the next:
 
-- Every new session starts from zero, and you explain the same architecture again.
-- Codex does not know what Claude learned an hour ago.
+- A new session misses a prior decision, and you explain the same architecture again.
+- A decision captured only in a Claude conversation is unavailable to your Codex session.
 - One agent implements an approach the team already rejected, because the reason it was rejected
   lived in a chat that ended.
 - Two sessions start changing the same files and nobody finds out until review.
-- Git stores the code history. It does not store a reliable history of project *intent*.
+- Git stores the code history; the reasons behind a change still need to be recorded.
 
 Your agents may run independently. Their project understanding should not.
 
@@ -75,10 +88,14 @@ Your agents may run independently. Their project understanding should not.
 
 ## 60 seconds: two agents, one project
 
+Illustrative calls and responses: replace `/absolute/path/to/project` with the same project root
+in both sessions (for example, `C:/work/api` on Windows).
+
 Session A — Claude Code, in your repo:
 
 ```jsonc
-brain_sync { intent: "rewrite the auth token refresh", files: ["src/auth/token.ts"] }
+brain_sync { project: "/absolute/path/to/project", phase: "start",
+             intent: "rewrite the auth token refresh", files: ["src/auth/token.ts"] }
 // → task-relevant memory capsule (bounded, ~2.8KB)
 // → peers: none
 ```
@@ -86,7 +103,8 @@ brain_sync { intent: "rewrite the auth token refresh", files: ["src/auth/token.t
 Session B — Codex, same repo, half a minute later:
 
 ```jsonc
-brain_sync { intent: "add rate limiting to the auth routes",
+brain_sync { project: "/absolute/path/to/project", phase: "start",
+             intent: "add rate limiting to the auth routes",
              files: ["src/auth/token.ts", "src/auth/routes.ts"] }
 // → task capsule
 // → peers: 1 active session (claude-code) — "rewrite the auth token refresh"
@@ -100,7 +118,7 @@ expected to touch.
 Then the brain pushes back before the decision, not after:
 
 ```jsonc
-brain_challenge { "move token storage to localStorage" }
+brain_challenge { claim: "move token storage to localStorage" }
 // → "reversed on June 12 — here's the correction card, captured by a different agent."
 ```
 
@@ -212,6 +230,59 @@ npx klypix-mcp link --check    # audits without writing; exits non-zero on drift
 **Give a project a brain** by dropping a `brain.klypix` into it — the
 [KLYPIX app](https://klypix.com) does it in one click (*Save canvas as project brain*), or
 `create_canvas` makes one from any agent.
+
+### Your first decision and correction
+
+After installation, reopen your coding tool or reconnect its MCP server, and allow the KLYPIX
+tools if your host asks. Run `npx klypix-mcp doctor` in the project to inspect the installation;
+a clean config report does not prove that your host has loaded the tools.
+
+Try the following in a **disposable trial project**, or replace the example decision with a real
+one before saving it. These are MCP tool calls for your agent, not shell commands. Replace
+`/absolute/path/to/project` with your project root throughout. The `files: []` scope means this
+trial does not plan source-code edits.
+
+1. **Record a decision and its reason.** Ask your agent to call:
+
+   ```jsonc
+   brain_sync { project: "/absolute/path/to/project", phase: "start",
+                intent: "Record the trial storage decision", files: [] }
+   brain_note { area: "Storage",
+                text: "Use SQLite for the trial project database because this prototype runs on one machine." }
+   brain_sync { project: "/absolute/path/to/project", phase: "complete" }
+   ```
+
+2. **Open a fresh session in the same project**, optionally in a different supported coding tool.
+   Ask it to retrieve the decision rather than infer the answer from your code:
+
+   ```jsonc
+   brain_sync { project: "/absolute/path/to/project", phase: "start",
+                intent: "Review the trial storage decision", files: [] }
+   brain_ask { question: "Which database does the trial project use, and why?" }
+   ```
+
+   Check that the returned card contains SQLite and the one-machine rationale. If the tool is
+   missing, reconnect the host and check the [host integration table](#supported-hosts-and-their-integration-level).
+   If the card is missing, confirm both sessions used the same project and that `brain_note`
+   reported a successful capture. A fresh brain only knows what has been recorded.
+
+3. **Change the trial decision explicitly**, then ask again:
+
+   ```jsonc
+   brain_note { area: "Storage",
+                text: "CORRECTION: Use PostgreSQL instead of SQLite for the trial project database because the trial now needs concurrent writes from several machines." }
+   brain_ask { question: "Which database does the trial project use now, and why?" }
+   brain_sync { project: "/absolute/path/to/project", phase: "complete" }
+   ```
+
+   Inspect the returned source cards: PostgreSQL should be the current decision, with SQLite
+   retained as superseded history. Confirm that the correction names the earlier decision; a
+   correction cue alone is not a guarantee of a match. This small trial checks your capture and
+   recall path. It does not establish retrieval quality for a larger brain or prove host automation.
+
+For a team on different machines, follow the [Git sharing steps](https://klypix.com/guides/shared-project-memory#team)
+and install in each clone. Standalone live presence and file-overlap warnings stay local to one
+machine and OS user. Keep approved architecture records and stable conventions alongside the brain.
 
 ---
 
@@ -1187,8 +1258,11 @@ Read this section before you build on any of it.
   that list together with the shared one.
 - **`npx klypix-mcp link` does not manage `CLAUDE.md`.** It manages `AGENTS.md` and seven other
   rules files. Only the desktop app writes `CLAUDE.md`.
-- **A fresh `npx klypix-mcp install` gets lexical retrieval.** The optional on-device model is
-  deliberately not installed.
+- **Semantic retrieval depends on the install path.** An interactive terminal install enables
+  the on-device search runtime by default. CI and noninteractive installs need `--semantic`;
+  `--no-semantic` (or `KLYPIX_SEMANTIC=0`) opts out. The Claude plugin stays keyword-only. Without
+  the model, retrieval uses keywords; a model download or a brain still being prepared is not a
+  guarantee that a particular decision will be found.
 - **The capture lock is fail-open** past ~3.6 seconds of contention (see *Git and concurrency*).
 - **`test/` is not in the published tarball.** Run the suite from a clone. The publish workflow
   *does* gate on it — a `gate` job runs `npm ci`, asserts the test chain is intact, runs `npm test`,
@@ -1221,7 +1295,8 @@ independently validated.
   2026-10-11 on the same brain grown to 3,829 cards (102 of the frozen questions still answerable),
   with words written by Gemini 2.5 Flash as a stand-in for the calling agent: recall@5 54% → 59%
   (8 found, 3 lost), recall@8 61% → 68%, recall@20 68% → 76%, MRR 0.375 → 0.424. With no local
-  model (a fresh install, the Claude plugin) the words count as extra keywords at half weight:
+  model (for example, an install with `--no-semantic` or the Claude plugin) the words count as extra
+  keywords at half weight:
   recall@5 19% → 24% (5 found, none lost), recall@10 25% → 31%. Without the line, ranking is
   unchanged byte for byte.
 - **Second brain.** The same ranker on a different project's brain (1,601 cards, 19 hand-written
@@ -1253,14 +1328,17 @@ independently validated.
 ## Uninstall
 
 ```bash
-npx klypix-mcp uninstall --check   # full inventory — writes nothing
-npx klypix-mcp uninstall           # asks, then removes the machine-global install
-npx klypix-mcp uninstall unlink    # run inside a project: removes the files `link` wrote there
+npx klypix-mcp uninstall --check          # preview machine-global removal — writes nothing
+npx klypix-mcp uninstall --yes            # remove the machine-global install
+npx klypix-mcp uninstall unlink --check   # preview this project's managed files
+npx klypix-mcp uninstall unlink --yes     # remove this project's managed files
 ```
 
 It strips only KLYPIX's own entries — every other hook and setting in
 `~/.claude/settings.json` stays — backs up each file it edits, and **never deletes a `.klypix`**.
-`--yes` skips the prompt for scripted removal.
+Removal requires `--yes`. Without it, the command prints the plan and changes nothing;
+there is no interactive confirmation prompt. Run the project-local form in each project you
+want to unlink. A preview exits non-zero while managed files remain.
 
 Your `brain.klypix` is yours — it is a plain ZIP and stays readable with or without this package.
 
@@ -1279,10 +1357,9 @@ are not in the published tarball, though the publish workflow does run them as a
 
 ## Why this exists
 
-A model provider can fix continuity inside its own sessions, and several are. None of them will
-ever carry a competitor's context. Cross-tool, cross-agent and cross-provider understanding is the
-seam that stays open — so it should live in a file you own, in your repo, that any agent can read
-and write.
+Coding tools have their own memory and instruction systems. A team using several tools still
+needs a shared place for decisions, reasons and corrections. Keeping that record in a file you
+own lets supported agents read and update it through the same interface.
 
 **Your project, your file, any supported agent, offline.**
 

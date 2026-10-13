@@ -1,10 +1,10 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.dahshanlabs/klypix-mcp",
-  "title": "KLYPIX Project Brain",
-  "description": "Active state management for multi-agent coding: a shared, versioned project brain over MCP.",
+  "title": "KLYPIX Shared Project Memory",
+  "description": "Shared project memory for Claude Code, Codex and Cursor: decisions and corrections through MCP.",
   "version": "1.81.1",
-  "websiteUrl": "https://klypix.com",
+  "websiteUrl": "https://klypix.com/developers",
   "repository": {
     "url": "https://github.com/dahshanlabs/klypix-mcp",
     "source": "github",

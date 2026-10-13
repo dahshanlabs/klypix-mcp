@@ -19,10 +19,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
-import { pathToFileURL } from 'node:url';
+import { pathToFileURL, fileURLToPath } from 'node:url';
 import { SCENARIOS, scenarioById } from './scenarios.mjs';
 import { CONDITIONS, conditionById, appendedNotApplicable, klypixServerInfo, isKlypixCondition, semanticDirOrNull, semanticPreflight, semanticDirFingerprint, SEMANTIC_DIR_ENV } from './conditions.mjs';
-import { agentById, composePrompt, CHANNEL_DOWN } from './agents.mjs';
+import { agentById, composePrompt, CHANNEL_DOWN, codexGlobalRulesFingerprint } from './agents.mjs';
+import { experimentId, sourceFingerprint, parseResults, pendingRuns } from './lib/results.mjs';
 
 /** Deterministic in-place shuffle (mulberry32), so an order can be reproduced from its seed. */
 export function shuffleInPlace(list, seed) {
@@ -145,7 +146,7 @@ export async function runOne({ scenario, condition, agent, run, timeoutMs, keep 
     const error = res.error || validityError({ scenario, condition, agent, prep, later, laterFiredAtMs, lastToolAtMs: res.lastToolAtMs, hookRuns });
     return {
       scenario: scenario.id, condition: condition.id, agent: agent.id, run,
-      success: !!g.success, staleAction: !!g.staleAction, collision: g.collision, handled: g.handled ?? null,
+      success: !!g.success && !error && res.ok !== false && !res.timedOut, staleAction: !!g.staleAction, collision: g.collision, handled: g.handled ?? null,
       ...(g.untouched != null ? { untouched: g.untouched } : {}), ...(g.workedAround != null ? { workedAround: g.workedAround } : {}),
       ...(g.sendCalls != null ? { sendCalls: g.sendCalls } : {}), ...(g.display != null ? { display: g.display } : {}),
       relays: prep.relays || 0, delivered: deliveredIds.length, facts: totalFacts,
@@ -206,6 +207,7 @@ async function main() {
     ...(agent.id === 'codex' && opt('codex-effort', null) ? { effort: opt('codex-effort', null) } : {}),
   });
   const out = opt('out', null);
+  if (flag('resume') && !out) throw new Error('--resume requires --out');
   const klypixBin = opt('klypix-bin', null);
   if (klypixBin && !fs.existsSync(klypixBin)) { console.error(`--klypix-bin: no such file: ${klypixBin}`); process.exit(2); }
   const klypixServer = klypixServerInfo(klypixBin ? path.resolve(klypixBin) : undefined);
@@ -233,23 +235,37 @@ async function main() {
   // --shuffle <seed> interleaves every run of every cell in a seeded random
   // order, so no condition always runs last or under the same machine load;
   // each row records its position.
-  const plan = [];
+  let plan = [];
   for (const scenario of scenarios) for (const condition of runnable) for (const agent of agents) for (let run = 1; run <= runs; run++) plan.push({ scenario, condition, agent, run });
   const seed = opt('shuffle', null);
   if (seed != null) shuffleInPlace(plan, Number(seed) || 1);
+  plan.forEach((p, order) => { p.order = order; });
+  const experiment = {
+    schema: 1,
+    harness: sourceFingerprint(path.dirname(fileURLToPath(import.meta.url)), ['run.mjs', 'report.mjs', 'agents.mjs', 'conditions.mjs', 'scenarios.mjs', 'scenarios-round3.mjs', 'lib']),
+    server: runnable.some(isKlypixCondition) ? { ...klypixServer, source: sourceFingerprint(path.dirname(path.dirname(klypixServer.bin)), ['src', 'bin', 'package.json', 'package-lock.json']) } : null,
+    agents: agents.map(a => ({ id: a.id, cli: versions[a.id], options: agentOptionsFor(a) })),
+    codexGlobalRules: agents.some(a => a.id === 'codex') ? codexGlobalRulesFingerprint() : null,
+    scenarios: scenarios.map(s => s.id), conditions: runnable.map(c => c.id), runs, timeoutMs,
+    shuffleSeed: seed == null ? null : Number(seed) || 1, semantic: semanticBefore,
+  };
+  const id = experimentId(experiment);
+  if (out && fs.existsSync(out) && fs.statSync(out).size && !flag('resume')) throw new Error('--out already contains results; use --resume with the same configuration or choose a new file');
   // --resume: skip every run the --out file already holds a finished row for
   // (same scenario, condition, agent and run, no error); a run cut off by a
   // crash or an agent error runs again, and the report keeps the LAST row of
   // each run.
   if (flag('resume') && out && fs.existsSync(out)) {
-    const done = new Set(fs.readFileSync(out, 'utf8').split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } })
-      .filter((r) => r && !r.error).map((r) => `${r.scenario}|${r.condition}|${r.agent}|${r.run}`));
+    const text = fs.readFileSync(out, 'utf8');
+    const previous = parseResults(text, out);
     const before = plan.length;
-    for (let i = plan.length - 1; i >= 0; i--) { const p = plan[i]; if (done.has(`${p.scenario.id}|${p.condition.id}|${p.agent.id}|${p.run}`)) plan.splice(i, 1); }
+    plan = pendingRuns(plan, previous.rows, id);
+    if (previous.repairedText !== text) fs.writeFileSync(out, previous.repairedText);
+    if (previous.discardedTail) console.warn('resume: discarded an unfinished final JSON line');
     console.log(`resume: ${before - plan.length} finished run(s) skipped, ${plan.length} to go`);
   }
   if (seed != null) console.log(`order: shuffled (seed ${Number(seed) || 1})`);
-  for (const [order, { scenario, condition, agent, run }] of plan.entries()) {
+  for (const { scenario, condition, agent, run, order } of plan) {
     // A condition a scenario cannot apply to (a copy-paste at start cannot
     // carry a decision made later; an appended notes file byte-identical to
     // another condition) is recorded as such, never as a fail — and never run.
@@ -258,6 +274,8 @@ async function main() {
       ? { scenario: scenario.id, condition: condition.id, agent: agent.id, run, notApplicable, success: false, staleAction: false, collision: null, handled: null, relays: 0, delivered: 0, facts: scenario.facts.length + (scenario.later?.facts?.length || 0), agentOk: null, costUsd: null, tokens: null, turns: null, durationMs: 0, timedOut: false, error: null, keptRepo: null }
       : await runOne({ scenario, condition, agent, run, timeoutMs, keep: flag('keep'), agentOptions: agentOptionsFor(agent), transcriptDir: opt('transcripts', null), klypixServer });
     r.versions = versions[agent.id];
+    r.experimentId = id;
+    r.experiment = experiment;
     r.order = order;
     if (seed != null) r.shuffleSeed = Number(seed) || 1;
     results.push(r);

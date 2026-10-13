@@ -39,6 +39,7 @@ const { runOne, notApplicableReason, validityError, isInvalidReason, FACT_NOT_FI
 const { summarize, toMarkdown } = await import('../bench/coordination/report.mjs');
 const { makeRepo, runNodeTests, runNodeProbe } = await import('../bench/coordination/lib/repo.mjs');
 const { wilson } = await import('../bench/coordination/lib/stats.mjs');
+await import('./coordination-results.mjs');
 const { laneFileFor, listActiveSessions, upsertSession } = await import('../src/agent-presence.mjs');
 const { parseKlypix } = await import('../src/klypix-format.mjs');
 const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
@@ -300,7 +301,7 @@ const synthetic = [
 ];
 const md = toMarkdown(summarize(synthetic));
 ok(/A decision changed today: KLYPIX ahead of none — 95% vs 15%/.test(md) && !/A note left by a session that has ended: KLYPIX/.test(md),
-  'B4: the report calls the 20-run gap a difference and the 3-run gap a tie');
+  'B4: the report calls the 20-run gap a difference and does not claim a difference for the 3-run gap');
 ok(/## Not measured/.test(md) && /MCP Agent Mail/.test(md), 'B4: the report lists the tools it did not measure, with the reason');
 const naMd = toMarkdown(summarize([
   { scenario: 's6-fact-arrives-mid-task', condition: 'relay', agent: 'claude', run: 1, notApplicable: 'a paste at start cannot carry it', success: false, staleAction: false },

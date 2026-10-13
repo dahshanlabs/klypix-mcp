@@ -3,22 +3,17 @@
 //   node bench/coordination/report.mjs results.jsonl [--json]
 //
 // Every number carries its n and a 95% Wilson interval. A "difference" is only
-// called out when the two intervals do not overlap — anything else is a tie,
-// and the report says so.
+// called out when the two intervals do not overlap. Overlap does not prove a tie.
 import fs from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { wilson, median, pct } from './lib/stats.mjs';
 import { SCENARIOS } from './scenarios.mjs';
 import { CONDITIONS } from './conditions.mjs';
-
-/** A run re-run after a crash (--resume) keeps only its LAST row; several files may be passed. */
-export function lastRowPerRun(rows) {
-  const by = new Map();
-  for (const r of rows) by.set(`${r.scenario}|${r.condition}|${r.agent}|${r.run}`, r);
-  return [...by.values()];
-}
+import { lastRowPerRun, parseResults, assertSameExperiment } from './lib/results.mjs';
+export { lastRowPerRun } from './lib/results.mjs';
 
 export function summarize(rows) {
+  assertSameExperiment(rows);
   const groups = new Map();
   for (const r of rows) {
     const key = `${r.scenario}|${r.condition}|${r.agent}`;
@@ -37,12 +32,12 @@ export function summarize(rows) {
     const invalidRuns = all.filter((r) => r.invalid).length;
     if (!rs.length) { cells.push({ scenario, condition, agent, n: 0, invalidRuns, notApplicable: na, success: { k: 0, ...wilson(0, 0) }, staleActions: { k: 0, ...wilson(0, 0) }, relaysPerTask: 0, medianCostUsd: null, medianTokens: null, medianMinutes: null, errors: 0, consulted: 0, handled: 0, handledKnown: 0, versions: [], models: [] }); continue; }
     const n = rs.length;
-    const ok = rs.filter((r) => r.success).length;
+    const ok = rs.filter((r) => r.success && !r.error && !r.timedOut && r.agentOk !== false).length;
     // "Acted on stale information" is judged only over runs that completed: a
     // timed-out or budget-capped run leaves files untouched, which is not deference.
-    const completed = rs.filter((r) => !r.error);
+    const completed = rs.filter((r) => !r.error && !r.timedOut && r.agentOk !== false);
     const stale = completed.filter((r) => r.staleAction).length;
-    const errors = rs.filter((r) => r.error).length;
+    const errors = n - completed.length;
     cells.push({
       scenario, condition, agent, n, invalidRuns,
       success: { k: ok, ...wilson(ok, n) },
@@ -71,6 +66,8 @@ const overlaps = (a, b) => a.low != null && b.low != null && !(a.high < b.low ||
 
 export function toMarkdown(cells, rows = []) {
   const out = ['# KLYPIX coordination bench — results', ''];
+  if (rows.some(r => !r.experimentId)) out.push('> Historical rows: experiment identity was not recorded. Configuration compatibility cannot be verified; these numbers are not evidence for the current build.', '');
+  else if (rows.length) out.push(`Experiment: \`${rows[0].experimentId}\``, '');
   const agents = [...new Set(cells.map((c) => c.agent))];
   for (const agent of agents) {
     const mine = cells.filter((c) => c.agent === agent);
@@ -109,7 +106,7 @@ export function toMarkdown(cells, rows = []) {
         }
       }
     }
-    if (!any) out.push('- none at this sample size — report these as ties.');
+    if (!any) out.push('- none at this sample size — overlapping intervals do not establish equivalence.');
     out.push('');
   }
   const notRun = CONDITIONS.filter((c) => !c.runnable);
@@ -132,7 +129,14 @@ export function toMarkdown(cells, rows = []) {
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const file = process.argv[2];
   if (!file) { console.error('usage: report.mjs results.jsonl [--json]'); process.exit(2); }
-  const rows = lastRowPerRun(process.argv.slice(2).filter((x) => !x.startsWith('--')).flatMap((p) => fs.readFileSync(p, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l))));
+  const files = process.argv.slice(2).filter((x) => !x.startsWith('--'));
+  const input = files.flatMap(p => {
+    const parsed = parseResults(fs.readFileSync(p, 'utf8'), p);
+    if (parsed.discardedTail) console.error(`${p}: ignored unfinished final JSON line`);
+    return parsed.rows;
+  });
+  if (files.length > 1 && input.some(r => !r.experimentId) && !process.argv.includes('--legacy-merge')) throw new Error('Historical files have no experiment identity. Report separately, or use --legacy-merge only after verifying they are continuations of the same experiment.');
+  const rows = lastRowPerRun(input);
   const cells = summarize(rows);
   process.stdout.write(process.argv.includes('--json') ? `${JSON.stringify(cells, null, 2)}\n` : `${toMarkdown(cells, rows)}\n`);
 }

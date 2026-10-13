@@ -91,7 +91,8 @@ hooks on **Claude Code** are measured from round 3 (`klypix-installed`).
   nothing else.
 - A channel's delivery is **read back**, not assumed.
 - Every number is printed with its `n` and a 95% Wilson interval. A difference
-  is called out only when the intervals do not overlap; anything else is a tie.
+  is called out only when the intervals do not overlap. Overlap means no clear
+  difference at this sample size; it does not establish equivalence.
 - A run that measured nothing about its channel is **invalid** — shown beside
   `n`, listed by reason, and left out of every rate: the condition's server
   never came up; a write did not land (read back short, at start or mid-task); a
@@ -116,6 +117,10 @@ hooks on **Claude Code** are measured from round 3 (`klypix-installed`).
 
 ## Running it
 
+The [round-3 historical reconciliation](results/2026-10-13-round3-reconciliation.md)
+preserves the existing result rows, including failures, and explains why they
+are not an evaluation of the current build.
+
 ```bash
 # Free: scripted oracle, no model calls. Proves graders and delivery.
 node bench/coordination/run.mjs --dry-run
@@ -135,6 +140,25 @@ on disk for inspection. `--timeout` is per run, in seconds (default 600).
 `--klypix-bin` points the KLYPIX condition at another server build — for
 example a released tag's checkout — so two versions can be compared on the same
 scenarios; every KLYPIX row records the server's version and commit.
+
+`--shuffle <seed>` interleaves the runs reproducibly. To continue an interrupted
+run, repeat the **same command** with `--resume`. The output must match the
+recorded source fingerprints, server revision, CLI versions, requested models,
+effort, budget, timeout, scenario/condition selection, run count, semantic assets
+and shuffle seed. Changed configurations need a new output file. Pin explicit
+models: an unpinned provider default can change outside this harness.
+
+Resume uses the latest attempt for each run and preserves its original order.
+Only completed attempts are skipped. A partially written final JSON line is
+removed before appending; malformed interior lines fail visibly. An existing
+nonempty output cannot be appended to without `--resume`.
+
+Reports reject different experiment identities instead of silently pooling them.
+Historical files without that identity remain readable with a warning, but cannot
+be resumed. Combining several historical files requires `--legacy-merge` and a
+manual check that they continue the same experiment; this flag does not establish
+their provenance. A grader passing after an agent error is counted as an error,
+not a completed success.
 
 Live runs leave your own setup alone. The CLIs start directly, never through
 `cmd.exe`, and get the prompt on stdin. The agent's environment carries nothing

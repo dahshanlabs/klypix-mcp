@@ -91,29 +91,60 @@ function toolInput(input) {
   return candidate && typeof candidate === 'object' ? candidate : {};
 }
 
-function projectRelative(file, projectDir) {
+// A relative path resolves against `baseDir`, the session's working directory
+// (see touchedFiles). A path outside the project returns null, including one
+// on another drive, where path.relative returns an absolute path.
+function projectRelative(file, projectDir, baseDir = projectDir) {
   if (!file) return null;
-  const absolute = path.isAbsolute(file) ? path.normalize(file) : path.resolve(projectDir, file);
-  const relative = path.relative(projectDir, absolute).replace(/\\/g, '/');
+  const absolute = path.isAbsolute(file) ? path.normalize(file) : path.resolve(baseDir, file);
+  const fromProject = path.relative(projectDir, absolute);
+  if (path.isAbsolute(fromProject)) return null;
+  const relative = fromProject.replace(/\\/g, '/');
   if (!relative || relative === '.' || relative === '..' || relative.startsWith('../')) return null;
   return relative;
 }
 
-function touchedFiles(input, projectDir) {
+// File headers of Codex's apply_patch format. `*** Move to:` follows an
+// `*** Update File:` header and names the rename target, so a move touches the
+// old path and the new one. A header starts its line with no indent: every
+// hunk line starts with ' ', '+' or '-', so patched text that only looks like
+// a header is never read as one. `[ \t]*`, not `\s*`, so an empty header
+// cannot take the next line as its path.
+const APPLY_PATCH_PATH_RE = /^\*\*\* (?:(?:Add|Update|Delete) File|Move to):[ \t]*(.+)$/gm;
+
+// The apply_patch body. The official Codex hooks docs
+// (https://learn.chatgpt.com/docs/hooks) say: "Bash and apply_patch use
+// tool_input.command". Codex builds both PreToolUse and PostToolUse input as
+// { tool_name: "apply_patch", tool_input: { command: <the raw patch> } }.
+// Before 2026-10-16 only `patch`, `input` and `content` were read, so no real
+// Codex edit was attributed. `command` is read first; those three stay as
+// fallbacks, and a bare-string tool_input is taken as the patch itself.
+function applyPatchBody(input) {
+  const args = toolInput(input);
+  const raw = input.tool_input ?? input.toolInput ?? input.tool?.input;
+  const command = Array.isArray(args.command) ? args.command : [args.command];
+  return [...command, args.patch, args.input, args.content, raw]
+    .find((value) => typeof value === 'string' && value.includes('*** ')) || '';
+}
+
+// Project-relative paths this tool call names. `cwd` is the session's working
+// directory: Codex applies a patch's relative paths from there, and
+// findProjectBrain walks UP from it, so the brain's folder can be an ancestor.
+export function touchedFiles(input, projectDir,
+  cwd = typeof input?.cwd === 'string' && input.cwd ? path.resolve(input.cwd) : projectDir) {
   const name = toolName(input);
   const args = toolInput(input);
   const candidates = [];
   for (const key of ['path', 'file_path', 'filePath', 'target_file', 'targetFile']) {
     if (typeof args[key] === 'string') candidates.push(args[key]);
   }
-  const patch = [args.patch, args.input, args.content]
-    .find((value) => typeof value === 'string' && value.includes('*** '));
+  const patch = applyPatchBody(input);
   if (patch && /apply_patch|Edit|Write/i.test(name)) {
-    for (const match of patch.matchAll(/^\*\*\* (?:Add|Update|Delete) File:\s*(.+)$/gm)) {
+    for (const match of patch.matchAll(APPLY_PATCH_PATH_RE)) {
       candidates.push(match[1].trim());
     }
   }
-  return [...new Set(candidates.map((file) => projectRelative(file, projectDir)).filter(Boolean))];
+  return [...new Set(candidates.map((file) => projectRelative(file, projectDir, cwd)).filter(Boolean))];
 }
 
 function ownBrainMessageText(input) {
@@ -262,7 +293,7 @@ function formatConflictWarning(conflicts, event, sessions = []) {
 // klypix-format predates guards degrades to silence, never a throw. This lane
 // only ever WARNS: block-severity guards are named as such so the model treats
 // them as a hard stop, but no mechanism here denies anything.
-async function guardWarnings(projectDir, brainPath, input) {
+async function guardWarnings(projectDir, brainPath, input, cwd) {
   try {
     if (typeof brainFormat.evaluateGuards !== 'function'
       || typeof brainFormat.ensureGuardSidecar !== 'function') return '';
@@ -273,7 +304,7 @@ async function guardWarnings(projectDir, brainPath, input) {
     const ensured = await brainFormat.ensureGuardSidecar(brainPath);
     const guards = Array.isArray(ensured.guards) ? ensured.guards : [];
     if (!guards.length) return '';
-    const files = touchedFiles(input, projectDir);
+    const files = touchedFiles(input, projectDir, cwd);
     const cmd = toolInput(input).command;
     const needWt = guards.some((g) => g?.when?.multiWorktree);
     const fired = brainFormat.evaluateGuards(guards, {
@@ -492,7 +523,7 @@ async function main() {
   // while marking them observed, and skips any path the session's DECLARED
   // scope (brain_sync) already covers.
   const observed = event === 'PreToolUse' || event === 'PostToolUse'
-    ? touchedFiles(input, projectDir)
+    ? touchedFiles(input, projectDir, cwd)
     : undefined;
   const files = humanTurn ? [] : undefined;
   const sessions = upsertSession({
@@ -594,7 +625,7 @@ async function main() {
       // call — Codex hook output is `continue: true` by design — so a matching
       // guard renders as a warning; a block-severity guard says it should be
       // treated as a hard stop, without claiming a mechanism this lane lacks.
-      ...(event === 'PreToolUse' ? [await guardWarnings(projectDir, brainPath, input)] : []),
+      ...(event === 'PreToolUse' ? [await guardWarnings(projectDir, brainPath, input, cwd)] : []),
       stampReceivedMessages(messages, Date.now(), undefined, sessionId),
     ], event);
     return;

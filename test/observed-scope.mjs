@@ -22,9 +22,15 @@
 //        distinction in the both-edited warning.
 //   O9 — the REAL Codex hook reports touched paths as observations (dual-
 //        written for old readers, marked for new ones); a human turn resets
-//        declared scope but keeps observations.
+//        declared scope but keeps observations. It also attributes the payload
+//        Codex really sends (tool_input.command) and resolves a relative patch
+//        path against the session cwd.
 //   O10 — the cross-PC relay carries observedFiles end to end (frame → accept
 //        → upsertRemoteSessions), additive on the same wire version.
+//   O13 — touchedFiles reads the apply_patch body from tool_input.command (the
+//        official Codex hooks docs), keeps patch/input/content as fallbacks,
+//        reads Add/Update/Delete/Move to headers, and never reads hunk text or
+//        a Bash command as a header.
 import { execFileSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
@@ -278,8 +284,8 @@ const now = 2_000_000_000_000;
   }));
   const env = { ...process.env, HOME: codexHome, USERPROFILE: codexHome };
   delete env.KLYPIX_BRAIN_NO_MAIN;
-  const runCodex = (input) => execFileSync(process.execPath, [CODEX_HOOK], {
-    cwd: codexProj, env, encoding: 'utf8', input: JSON.stringify(input),
+  const runCodex = (input, cwd = codexProj) => execFileSync(process.execPath, [CODEX_HOOK], {
+    cwd, env, encoding: 'utf8', input: JSON.stringify(input),
   });
   runCodex({
     session_id: 'codex-obs', cwd: codexProj, hook_event_name: 'PostToolUse',
@@ -314,6 +320,46 @@ const now = 2_000_000_000_000;
     && /src\/touched\.mjs\*/.test(warnJson.systemMessage)
     && /observed from live edits, scope not declared/.test(warnJson.systemMessage),
     'O9: the Codex overlap warning states the observed/declared confidence — and never claims to BLOCK');
+  // The payload Codex really sends (2026-10-16). The official hooks docs say
+  // "Bash and apply_patch use tool_input.command"; the `{ patch }` fixtures
+  // above use the key the hook read before, kept as a fallback. Before the
+  // fix this exact payload recorded no file at all.
+  const patchOf = (...lines) => ['*** Begin Patch', ...lines, '*** End Patch', ''].join('\n');
+  runCodex({
+    session_id: 'codex-doc', cwd: codexProj, hook_event_name: 'PostToolUse',
+    turn_id: 'turn-doc', tool_name: 'apply_patch', tool_use_id: 'call-doc',
+    tool_input: { command: patchOf('*** Update File: src/before.mjs', '*** Move to: src/after.mjs', '@@', '-old', '+new') },
+    tool_response: 'Success. Updated the following files:\nM src/after.mjs\n',
+  });
+  row = listActiveSessions({ brainPath: codexBrain, home: codexHome })
+    .find((session) => session.id === 'codex-doc');
+  ok((row?.observedFiles || []).includes('src/before.mjs') && (row?.observedFiles || []).includes('src/after.mjs'),
+    'O9: an apply_patch sent as tool_input.command is observed, and a rename touches both the old and the new path');
+  // The hook prints nothing when it has nothing to say, so parse defensively.
+  const parseHookOutput = (out) => { try { return JSON.parse(out); } catch { return {}; } };
+  const docWarn = parseHookOutput(runCodex({
+    session_id: 'codex-doc-b', cwd: codexProj, hook_event_name: 'PreToolUse',
+    turn_id: 'turn-doc-b', tool_name: 'apply_patch', tool_use_id: 'call-doc-b',
+    tool_input: { command: patchOf('*** Update File: src/after.mjs', '@@', '-new', '+mine') },
+  }));
+  ok(/WARNING — exact-file overlap/.test(docWarn.systemMessage || '')
+    && /src\/after\.mjs\*/.test(docWarn.systemMessage || '')
+    && docWarn.continue === true
+    && docWarn.hookSpecificOutput?.permissionDecision === undefined,
+    'O9: a tool_input.command PreToolUse warns on the overlap, advisory only (no permission decision)');
+  // A session started in a subfolder: Codex applies the patch from its cwd,
+  // and findProjectBrain walks UP from there to the brain's folder.
+  const subDir = path.join(codexProj, 'admin');
+  fs.mkdirSync(subDir, { recursive: true });
+  runCodex({
+    session_id: 'codex-sub', cwd: subDir, hook_event_name: 'PostToolUse',
+    turn_id: 'turn-sub', tool_name: 'apply_patch', tool_use_id: 'call-sub',
+    tool_input: { command: patchOf('*** Update File: package.json', '@@', '-a', '+b') },
+  }, subDir);
+  row = listActiveSessions({ brainPath: codexBrain, home: codexHome })
+    .find((session) => session.id === 'codex-sub');
+  ok((row?.observedFiles || []).includes('admin/package.json') && !(row?.observedFiles || []).includes('package.json'),
+    'O9: a relative patch path resolves against the session cwd, not the brain folder above it');
   fs.rmSync(codexHome, { recursive: true, force: true });
   fs.rmSync(codexProj, { recursive: true, force: true });
 }
@@ -432,6 +478,113 @@ const now = 2_000_000_000_000;
     'O12: a re-edit of a declared file never re-labels it as observed');
   ok(row.files.length <= 20,
     `O12: the files[] cap still holds (got ${row.files.length})`);
+}
+
+// ── O13: Codex apply_patch attribution reads where Codex sends the patch ────
+// Official Codex hooks docs (https://learn.chatgpt.com/docs/hooks): tool_input
+// is "Tool-specific input. Bash and apply_patch use tool_input.command", and
+// apply_patch hook input "still reports tool_name: "apply_patch"". Until
+// 2026-10-16 touchedFiles read only patch/input/content, so every real Codex
+// edit was attributed to no file. touchedFiles is path-only, so these call the
+// pure export directly; the real hook end to end is in O9.
+{
+  process.env.KLYPIX_BRAIN_NO_MAIN = '1';   // pure exports only; every child env above deletes it
+  const codexHook = await import('../src/codex-brain-hook.mjs');
+  delete process.env.KLYPIX_BRAIN_NO_MAIN;
+  ok(typeof codexHook.touchedFiles === 'function', 'O13: touchedFiles is exported for direct checks');
+  const touched = typeof codexHook.touchedFiles === 'function' ? codexHook.touchedFiles : () => null;
+  const proj = path.join(os.tmpdir(), 'klypix-observed-o13');   // never created: nothing here touches disk
+  const patchOf = (...lines) => ['*** Begin Patch', ...lines, '*** End Patch', ''].join('\n');
+  const update = (file) => patchOf(`*** Update File: ${file}`, '@@', '-old', '+new');
+  const payload = (toolInput, extra = {}) => ({
+    session_id: 'codex-o13', hook_event_name: 'PostToolUse', turn_id: 'turn-o13',
+    tool_name: 'apply_patch', tool_use_id: 'call-o13', cwd: proj, tool_input: toolInput, ...extra,
+  });
+  const same = (got, want) => JSON.stringify(got) === JSON.stringify(want);
+
+  ok(same(touched(payload({ command: update('src/a.mjs') }), proj), ['src/a.mjs']),
+    'O13: the documented payload (tool_input.command) is attributed');
+  ok(same(touched(payload({ command: patchOf(
+    '*** Add File: src/new.mjs', '+export const fresh = true;',
+    '*** Update File: src/old-name.mjs', '*** Move to: src/new-name.mjs', '@@', '-a', '+b',
+    '*** Delete File: src/gone.mjs',
+  ) }), proj), ['src/new.mjs', 'src/old-name.mjs', 'src/new-name.mjs', 'src/gone.mjs']),
+    'O13: Add, Update, Move to and Delete headers are all read (a rename touches the old and the new path)');
+  ok(same(touched(payload({ command: update('src/from-command.mjs'), patch: update('src/from-patch.mjs') }), proj),
+    ['src/from-command.mjs']),
+    'O13: tool_input.command is read first, before the old keys');
+  for (const key of ['patch', 'input', 'content']) {
+    ok(same(touched(payload({ [key]: update(`src/legacy-${key}.mjs`) }), proj), [`src/legacy-${key}.mjs`]),
+      `O13: the old "${key}" key still works as a fallback`);
+  }
+  ok(same(touched(payload(update('src/raw.mjs')), proj), ['src/raw.mjs']),
+    'O13: a bare-string tool_input is read as the patch itself');
+  ok(same(touched(payload({ command: ['apply_patch', update('src/argv.mjs')] }), proj), ['src/argv.mjs']),
+    'O13: an argv-style command array is searched for the patch');
+  ok(same(touched(payload({ command: update('src/crlf.mjs').replace(/\n/g, '\r\n') }), proj), ['src/crlf.mjs']),
+    'O13: a CRLF patch gives clean paths (no trailing carriage return)');
+  ok(same(touched(payload({ command: patchOf(
+    '*** Update File: src/real.mjs', '@@',
+    ' *** Update File: src/context-line.mjs',
+    '-*** Delete File: src/removed-line.mjs',
+    '+*** Add File: src/added-line.mjs',
+    '+*** Move to: src/moved-line.mjs',
+  ) }), proj), ['src/real.mjs']),
+    'O13: hunk text that only looks like a header is never read as one');
+  ok(same(touched(payload({ command: patchOf('*** Update File:', '@@', '-a', '+b') }), proj), []),
+    'O13: an empty header never takes the next line as its path');
+  // Codex's streaming_parser.rs process_line matches a header on the line
+  // trimmed both ends everywhere except inside an Update hunk, where it only
+  // trims the end (an indented line there is context). The path is the rest
+  // after "*** <Kind> File: " with nothing more trimmed.
+  ok(same(touched(payload({ command: patchOf('  *** Update File: src/indented.mjs', '@@', '-x', '+y') }), proj),
+    ['src/indented.mjs']),
+    'O13: an indented first header is still a header (Codex trims it and edits the file)');
+  ok(same(touched(payload({ command: patchOf(
+    '*** Add File: src/added.mjs', '+x',
+    '   *** Delete File: src/deleted.mjs',
+    '\t*** Update File: src/updated.mjs', '@@',
+    '  *** Update File: src/context-indented.mjs',
+    '*** Update File: src/renamed.mjs',
+    '  *** Move to: src/not-a-move.mjs',
+  ) }), proj), ['src/added.mjs', 'src/deleted.mjs', 'src/updated.mjs', 'src/renamed.mjs']),
+    'O13: indented headers count after Add and Delete hunks, but inside an Update hunk an indented header or Move to is context');
+  ok(same(touched(payload({ command: patchOf('*** Update File:src/no-space.mjs', '@@', '-a', '+b') }), proj), []),
+    'O13: a header without the space after the colon is not a header (Codex does not read it as one)');
+  ok(same(touched(payload({ command: patchOf('*** Update File:  src/two-spaces.mjs', '@@', '-a', '+b') }), proj),
+    [' src/two-spaces.mjs']),
+    'O13: the path is not trimmed past the marker space, so a double space names the file Codex targets');
+  ok(same(touched(payload({ command: patchOf('*** Update File: src/trail.mjs  ', '*** Move to: src/moved.mjs\t', '@@') }), proj),
+    ['src/trail.mjs', 'src/moved.mjs']),
+    'O13: trailing whitespace is trimmed from a header and a Move to, as Codex does');
+  ok(same(touched(payload({ command: `cat > notes.md <<'EOF'\n${update('src/not-an-edit.mjs')}EOF\n` },
+    { tool_name: 'Bash' }), proj), []),
+    'O13: a Bash command that only contains patch text attributes nothing (the tool-name gate is unchanged)');
+  ok(same(touched(payload({ command: update('src/alias.mjs') }, { tool_name: 'Edit' }), proj), ['src/alias.mjs']),
+    'O13: the Edit/Write matcher aliases are still read');
+  // Paths. Codex applies a patch from the session cwd and findProjectBrain
+  // walks UP from it, so a relative path resolves against that cwd; absolute
+  // paths inside the project become relative; anything outside drops.
+  ok(same(touched(payload({ command: update('package.json') }, { cwd: path.join(proj, 'admin') }), proj),
+    ['admin/package.json']),
+    'O13: a relative path resolves against the session cwd, not the brain folder above it');
+  ok(same(touched(payload({ command: update('package.json') }, { cwd: undefined }), proj), ['package.json']),
+    'O13: with no cwd in the payload, a relative path resolves against the project (the old behaviour)');
+  ok(same(touched(payload({ command: patchOf(
+    `*** Update File: ${path.join(proj, 'src', 'abs.mjs')}`, '@@', '-a', '+b',
+    '*** Update File: ../outside.mjs', '@@', '-a', '+b',
+    `*** Update File: ${path.join(os.tmpdir(), 'klypix-elsewhere', 'x.mjs')}`, '@@', '-a', '+b',
+  ) }), proj), ['src/abs.mjs']),
+    'O13: an absolute path inside the project is made relative; paths outside it are dropped');
+  if (process.platform === 'win32') {
+    const otherDrive = `${/^[zZ]/.test(proj) ? 'Y' : 'Z'}:/elsewhere/notes.md`;
+    ok(same(touched(payload({ command: update(otherDrive) }), proj), []),
+      'O13: a path on another drive is outside the project (dropped, never recorded as a drive path)');
+  }
+  ok(same(touched(payload({ command: update('docs/release notes/ملاحظات.md') }), proj), ['docs/release notes/ملاحظات.md']),
+    'O13: a path with spaces and non-ASCII letters is kept exactly');
+  ok(same(touched(payload({ path: 'src/p.mjs' }, { tool_name: 'mcp__fs__write_file' }), proj), ['src/p.mjs']),
+    'O13: path-like keys are still read (unchanged)');
 }
 
 for (const dir of [home, project]) fs.rmSync(dir, { recursive: true, force: true });

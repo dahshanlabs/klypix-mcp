@@ -435,6 +435,42 @@ runHook({
 ok(!listActiveSessions({ brainPath, home }).some((session) => session.id === 'codex-real-a'),
   'real Codex SessionEnd removes the session immediately');
 
+// The payload Codex really sends (2026-10-16). The official hooks docs say
+// "Bash and apply_patch use tool_input.command"; the fixtures above send the
+// `{ patch }` key the hook read before, which stays a fallback. Before the fix
+// this exact payload attributed no file, so no Codex overlap was ever seen.
+const documentedPatch = (line) => `*** Begin Patch\n*** Update File: src/documented.mjs\n@@\n-old\n+${line}\n*** End Patch\n`;
+const parseHookOutput = (out) => { try { return JSON.parse(out); } catch { return {}; } };
+runHook({
+  session_id: 'codex-doc-a',
+  cwd: project,
+  hook_event_name: 'PostToolUse',
+  turn_id: 'turn-doc',
+  tool_name: 'apply_patch',
+  tool_use_id: 'call-doc-a',
+  tool_input: { command: documentedPatch('peer') },
+  tool_response: 'Success. Updated the following files:\nM src/documented.mjs\n',
+});
+ok(listActiveSessions({ brainPath, home }).find((session) => session.id === 'codex-doc-a')?.files.includes('src/documented.mjs'),
+  'PostToolUse records the file of an apply_patch sent as tool_input.command (the documented shape)');
+const documentedPre = parseHookOutput(runHook({
+  session_id: 'codex-doc-b',
+  cwd: project,
+  hook_event_name: 'PreToolUse',
+  turn_id: 'turn-doc',
+  tool_name: 'apply_patch',
+  tool_use_id: 'call-doc-b',
+  tool_input: { command: documentedPatch('mine') },
+}));
+ok(/WARNING — exact-file overlap/.test(documentedPre.systemMessage || '')
+  && /src\/documented\.mjs/.test(documentedPre.systemMessage || '')
+  && documentedPre.continue === true
+  && documentedPre.hookSpecificOutput?.permissionDecision === undefined,
+  'PreToolUse warns before an overlapping documented-shape edit, and still never denies');
+for (const id of ['codex-doc-a', 'codex-doc-b']) {
+  runHook({ session_id: id, cwd: project, hook_event_name: 'SessionEnd' });
+}
+
 // ── 2026-07-30 hardening regression locks (added 2026-08-01) ────────────────
 // These two behaviors shipped as comments-and-code with no test pinning them;
 // the cross-PC presence lane inherits both, so they must not silently regress.

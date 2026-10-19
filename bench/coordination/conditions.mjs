@@ -372,7 +372,7 @@ export const INSTALLED_CLAUDE_HOOKS = Object.freeze([
   ['SessionStart', 'startup|resume|clear', '', null],
   ['UserPromptSubmit', null, '--prompt', 10],
   ['Stop', null, '--capture', null],
-  ['PostToolUse', 'Bash|PowerShell|Edit|Write', '--live', 10],
+  ['PostToolUse', 'Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit', '--live', 10],
   ['PreToolUse', 'Bash|PowerShell|Edit|Write', '--guard', 10],
 ]);
 export function claudeHookSettings(command) {

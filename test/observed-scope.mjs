@@ -533,6 +533,30 @@ const now = 2_000_000_000_000;
     'O13: hunk text that only looks like a header is never read as one');
   ok(same(touched(payload({ command: patchOf('*** Update File:', '@@', '-a', '+b') }), proj), []),
     'O13: an empty header never takes the next line as its path');
+  // Codex's streaming_parser.rs process_line matches a header on the line
+  // trimmed both ends everywhere except inside an Update hunk, where it only
+  // trims the end (an indented line there is context). The path is the rest
+  // after "*** <Kind> File: " with nothing more trimmed.
+  ok(same(touched(payload({ command: patchOf('  *** Update File: src/indented.mjs', '@@', '-x', '+y') }), proj),
+    ['src/indented.mjs']),
+    'O13: an indented first header is still a header (Codex trims it and edits the file)');
+  ok(same(touched(payload({ command: patchOf(
+    '*** Add File: src/added.mjs', '+x',
+    '   *** Delete File: src/deleted.mjs',
+    '\t*** Update File: src/updated.mjs', '@@',
+    '  *** Update File: src/context-indented.mjs',
+    '*** Update File: src/renamed.mjs',
+    '  *** Move to: src/not-a-move.mjs',
+  ) }), proj), ['src/added.mjs', 'src/deleted.mjs', 'src/updated.mjs', 'src/renamed.mjs']),
+    'O13: indented headers count after Add and Delete hunks, but inside an Update hunk an indented header or Move to is context');
+  ok(same(touched(payload({ command: patchOf('*** Update File:src/no-space.mjs', '@@', '-a', '+b') }), proj), []),
+    'O13: a header without the space after the colon is not a header (Codex does not read it as one)');
+  ok(same(touched(payload({ command: patchOf('*** Update File:  src/two-spaces.mjs', '@@', '-a', '+b') }), proj),
+    [' src/two-spaces.mjs']),
+    'O13: the path is not trimmed past the marker space, so a double space names the file Codex targets');
+  ok(same(touched(payload({ command: patchOf('*** Update File: src/trail.mjs  ', '*** Move to: src/moved.mjs\t', '@@') }), proj),
+    ['src/trail.mjs', 'src/moved.mjs']),
+    'O13: trailing whitespace is trimmed from a header and a Move to, as Codex does');
   ok(same(touched(payload({ command: `cat > notes.md <<'EOF'\n${update('src/not-an-edit.mjs')}EOF\n` },
     { tool_name: 'Bash' }), proj), []),
     'O13: a Bash command that only contains patch text attributes nothing (the tool-name gate is unchanged)');

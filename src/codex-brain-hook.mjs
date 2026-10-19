@@ -104,13 +104,60 @@ function projectRelative(file, projectDir, baseDir = projectDir) {
   return relative;
 }
 
-// File headers of Codex's apply_patch format. `*** Move to:` follows an
-// `*** Update File:` header and names the rename target, so a move touches the
-// old path and the new one. A header starts its line with no indent: every
-// hunk line starts with ' ', '+' or '-', so patched text that only looks like
-// a header is never read as one. `[ \t]*`, not `\s*`, so an empty header
-// cannot take the next line as its path.
-const APPLY_PATCH_PATH_RE = /^\*\*\* (?:(?:Add|Update|Delete) File|Move to):[ \t]*(.+)$/gm;
+// File paths an apply_patch body names, read the way Codex's own parser reads
+// them (codex-rs/apply-patch/src/streaming_parser.rs, process_line):
+// - Outside an Update hunk (right after *** Begin Patch, among an Add File's
+//   '+' lines, after a Delete File) a header is matched on the line with
+//   leading and trailing whitespace trimmed, so an indented header there is
+//   still a header and Codex edits that file.
+// - Inside an Update hunk only trailing whitespace is trimmed, so a header
+//   must start at column 0 and an indented one is a context line. Hunk lines
+//   that start with '+', '-' or ' ' are never headers.
+// - The marker includes its one space ("*** Update File: ") and the path is
+//   the rest of the line with nothing more trimmed, as Codex's PathBuf::from
+//   takes it: "*** Update File:a.md" is no header, and a double space names
+//   " a.md". An empty path is no header (trimming removes the space).
+// - "*** Move to: " is read only on the line straight after an Update File
+//   header. A move touches the old path and the new one.
+const APPLY_PATCH_HEADERS = [
+  ['*** Add File: ', 'add'],
+  ['*** Delete File: ', 'delete'],
+  ['*** Update File: ', 'update'],
+];
+const APPLY_PATCH_MOVE = '*** Move to: ';
+
+function applyPatchHeader(line) {
+  for (const [marker, mode] of APPLY_PATCH_HEADERS) {
+    if (line.startsWith(marker) && line.length > marker.length) return { mode, path: line.slice(marker.length) };
+  }
+  return null;
+}
+
+function applyPatchPaths(patch) {
+  const paths = [];
+  let mode = 'started';
+  let moveAllowed = false;
+  for (const line of patch.trim().split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (trimmed === '*** Begin Patch') { mode = 'started'; moveAllowed = false; continue; }
+    if (trimmed === '*** End Patch') { mode = 'ended'; moveAllowed = false; continue; }
+    if (mode === 'ended') continue;
+    const candidate = mode === 'update' ? line.trimEnd() : trimmed;
+    const header = applyPatchHeader(candidate);
+    if (header) {
+      paths.push(header.path);
+      mode = header.mode;
+      moveAllowed = header.mode === 'update';
+      continue;
+    }
+    if (mode === 'update' && moveAllowed && candidate.startsWith(APPLY_PATCH_MOVE)
+      && candidate.length > APPLY_PATCH_MOVE.length) {
+      paths.push(candidate.slice(APPLY_PATCH_MOVE.length));
+    }
+    moveAllowed = false;
+  }
+  return paths;
+}
 
 // The apply_patch body. The official Codex hooks docs
 // (https://learn.chatgpt.com/docs/hooks) say: "Bash and apply_patch use
@@ -140,9 +187,7 @@ export function touchedFiles(input, projectDir,
   }
   const patch = applyPatchBody(input);
   if (patch && /apply_patch|Edit|Write/i.test(name)) {
-    for (const match of patch.matchAll(APPLY_PATCH_PATH_RE)) {
-      candidates.push(match[1].trim());
-    }
+    candidates.push(...applyPatchPaths(patch));
   }
   return [...new Set(candidates.map((file) => projectRelative(file, projectDir, cwd)).filter(Boolean))];
 }

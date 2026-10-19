@@ -19,7 +19,7 @@ const PKG_VERSION = (() => {
   }
 })();
 
-const DIRECT = new Set(['install', 'link', 'doctor', 'runtime', 'conformance', 'garden-code', 'init', 'git-driver', 'git-hook', 'brain-history', 'brain-deleted', 'orphans', 'diff', 'pr-brief', 'uninstall', 'bench', 'sessions']);
+const DIRECT = new Set(['install', 'link', 'doctor', 'runtime', 'conformance', 'garden-code', 'init', 'git-driver', 'git-hook', 'brain-history', 'brain-deleted', 'orphans', 'diff', 'pr-brief', 'uninstall', 'bench', 'sessions', 'rescue']);
 
 const USAGE = [
   `klypix-mcp ${PKG_VERSION} — shared project brain + MCP coordination server.`,
@@ -41,6 +41,8 @@ const USAGE = [
   '  git-hook [install|remove|status]    wire the agent-neutral commit-capture hook (any agent/branch/worktree → brain cards)',
   '  brain-history [list|restore <id>]   restore points for this brain — undo an accidental delete, edit, or overwrite',
   '  brain-deleted [list|restore|purge]  recycle bin for this brain — cards you deleted, kept recoverable',
+  '  rescue [list|show <id>|restore <id> [paths…]|prune]',
+  '                                      copies of uncommitted files KLYPIX saved before a git command could discard them',
   '  orphans [brain] [--apply|--areas]   orphan gardener backfill: report unconnected cards, link the confident subset (dry-run default)',
   '  diff [ref] [--brain <path>]         readable brain diff vs a git ref (default HEAD) — markdown to stdout',
   '  pr-brief [baseRef] [--brain <path>] brain decisions touching the files changed since baseRef — PR-comment markdown',

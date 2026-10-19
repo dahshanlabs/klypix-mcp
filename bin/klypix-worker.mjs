@@ -190,6 +190,11 @@ await runVerb('pr-brief', './klypix-pr-brief.mjs');
 // CLI's own --help) said no uninstall existed at all.
 await runVerb('uninstall', './klypix-uninstall.mjs');
 
+// `npx klypix-mcp rescue` — list, show and restore the rescue copies KLYPIX
+// takes before a git command could discard uncommitted files (whose-rescue.mjs).
+// A restore writes the working tree only, after saving what it replaces.
+await runVerb('rescue', './klypix-rescue.mjs');
+
 // `npx klypix-mcp garden-code` — the HUMAN half of the garden approval gate.
 // brain_garden's apply requires an 8-char code derived from the exact dormant
 // candidate set + day; the agent is deliberately never shown it. The human runs

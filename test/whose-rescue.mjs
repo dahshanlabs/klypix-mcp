@@ -444,6 +444,165 @@ if (!WIN) {
     'R3 …and restored as a link (POSIX)');
 }
 
+// ── Review fixes (2026-10-19): folders, time budget, links, case, junction, cwd ─
+{
+  // F1  A folder (and '.') means what `git add -- <folder>` means: tracked
+  //     files that differ from HEAD are in it, not only untracked ones — they
+  //     are exactly what `checkout -- <dir>` / `restore .` / `reset --hard`
+  //     throw away.
+  const fr = makeRepo('folder pathspec repo');
+  write(fr, 'src/a.txt', 'committed\n');
+  write(fr, 'src/same.txt', 'never changed\n');
+  write(fr, 'src/staged.txt', 'staged v1\n');
+  write(fr, 'src/gone.txt', 'deleted later\n');
+  write(fr, 'top.txt', 'committed top\n');
+  write(fr, '.gitignore', '*.env\n');
+  git(fr, ['add', '.']);
+  git(fr, ['commit', '-q', '-m', 'seed']);
+  write(fr, 'src/a.txt', 'UNCOMMITTED WORK\n');
+  write(fr, 'src/staged.txt', 'staged v2\n');
+  git(fr, ['add', 'src/staged.txt']);
+  fs.rmSync(path.join(fr, 'src/gone.txt'));
+  write(fr, 'src/new.txt', 'untracked\n');
+  write(fr, 'src/k.env', 'ignored\n');
+  write(fr, 'top.txt', 'UNCOMMITTED TOP\n');
+  const idxBefore = indexState(fr);
+  const treeBefore = treeSnapshot(fr);
+  const sub = createRescue({ repoRoot: fr, paths: ['src'], sid: 'fold2', reason: 'git checkout -- src' });
+  ok(sub.ok && JSON.stringify(sub.paths) === JSON.stringify(['src/a.txt', 'src/gone.txt', 'src/new.txt', 'src/staged.txt'])
+    && JSON.stringify(sub.deleted) === '["src/gone.txt"]' && whyOf(sub, 'src/k.env') === 'ignored'
+    && blobAt(fr, sub.commit, 'src/a.txt').toString() === 'UNCOMMITTED WORK\n',
+  'F1 a folder holds its modified, staged and deleted tracked files plus untracked ones (unchanged and ignored left out)', sub);
+  const dot = createRescue({ repoRoot: fr, paths: ['.'], sid: 'fold2', reason: 'git restore .' });
+  ok(dot.ok && JSON.stringify(dot.paths) === JSON.stringify(['src/a.txt', 'src/gone.txt', 'src/new.txt', 'src/staged.txt', 'top.txt']),
+    "F1 '.' is the whole repository, not 'not a file path'", dot);
+  const viaTop = createRescue({ repoRoot: fr, paths: [fr], sid: 'fold3', reason: 'toplevel path' });
+  ok(viaTop.ok && viaTop.paths.includes('top.txt'), 'F1 the toplevel as an absolute path is the whole repository too', viaTop);
+  ok(sameIndex(idxBefore, indexState(fr)) && treeSnapshot(fr) === treeBefore && gitDirLeftovers(fr).length === 0,
+    'F1 …and expanding folders leaves the index, the working tree and .git exactly as they were');
+  git(fr, ['checkout', '--', 'src']);
+  git(fr, ['reset', '-q', '--hard']);
+  const back = restoreRescue({ repoRoot: fr, id: dot.id, paths: ['.'] });
+  ok(back.ok && read(fr, 'src/a.txt').toString() === 'UNCOMMITTED WORK\n' && read(fr, 'top.txt').toString() === 'UNCOMMITTED TOP\n'
+    && read(fr, 'src/staged.txt').toString() === 'staged v2\n' && !exists(fr, 'src/gone.txt'),
+  "F1 after `checkout -- src` + `reset --hard`, restoring '.' brings every tracked edit back", back);
+}
+
+{
+  // F2/F3  The 2.5 s budget is kept by leaving out what the time cannot
+  //        write, largest first — a big fresh binary never costs a small
+  //        source edit its copy, and a human-run restore (minutes) still
+  //        saves files up to the 50 MB cap.
+  const br = makeRepo('budget repo');
+  write(br, 'a.txt', 'a\n');
+  git(br, ['add', '.']);
+  git(br, ['commit', '-q', '-m', 'seed']);
+  write(br, 'a.txt', 'IMPORTANT SOURCE EDIT\n');
+  write(br, 'data0.bin', crypto.randomBytes(20 * 1024 * 1024));
+  write(br, 'data1.bin', crypto.randomBytes(20 * 1024 * 1024));
+  const t0 = Date.now();
+  const quick = createRescue({ repoRoot: br, paths: ['a.txt', 'data0.bin', 'data1.bin'], sid: 'budget', reason: 'git reset --hard' });
+  const took = Date.now() - t0;
+  ok(quick.ok && JSON.stringify(quick.paths) === '["a.txt"]' && /too large to save in the 2\.5 s/.test(whyOf(quick, 'data0.bin') || '')
+    && /too large to save/.test(whyOf(quick, 'data1.bin') || '') && blobAt(br, quick.commit, 'a.txt').toString() === 'IMPORTANT SOURCE EDIT\n'
+    && took < RESCUE_BUDGET_MS + 1000 && gitDirLeftovers(br).length === 0,
+  `F2/F3 two fresh 20 MB binaries: the source edit is saved, the binaries listed as too large for the time, within budget (${took} ms)`, quick);
+  const roomy = createRescue({ repoRoot: br, paths: ['a.txt', 'data0.bin'], sid: 'budget', reason: 'before restoring', budgetMs: 120_000 });
+  ok(roomy.ok && JSON.stringify(roomy.paths) === '["a.txt","data0.bin"]' && blobAt(br, roomy.commit, 'data0.bin').equals(read(br, 'data0.bin')),
+    'F3 with a restore-sized budget the same 20 MB file is saved (the caps, not the clock, decide)', roomy.skipped);
+}
+
+{
+  // F4  A symbolic link stays a link: an unchanged link is left alone, a
+  //     removed one comes back as a link, and the undo does not turn it into
+  //     a file holding its target (Windows included, where links can be made).
+  const lr = makeRepo('link repo');
+  write(lr, 'target.txt', 'T\n');
+  git(lr, ['add', '.']);
+  git(lr, ['commit', '-q', '-m', 'seed']);
+  let canLink = true;
+  try { fs.symlinkSync('target.txt', path.join(lr, 'lnk')); } catch { canLink = false; }
+  if (canLink) {
+    write(lr, 'other.txt', 'x\n');
+    const lk = createRescue({ repoRoot: lr, paths: ['lnk', 'other.txt'], sid: 'link', reason: 'link' });
+    ok(lk.ok && git(lr, ['ls-tree', lk.commit, '--', 'lnk']).startsWith('120000 ') && blobAt(lr, lk.commit, 'lnk').toString() === 'target.txt',
+      'F4 a link is saved as a link whose target uses / (as git stores it)', lk);
+    write(lr, 'other.txt', 'changed\n');
+    const rs = restoreRescue({ repoRoot: lr, id: lk.id });
+    ok(rs.ok && JSON.stringify(rs.restored) === '["other.txt"]' && rs.unchanged.includes('lnk') && fs.lstatSync(path.join(lr, 'lnk')).isSymbolicLink(),
+      'F4 restore leaves an unchanged link alone (it is not rewritten as a file)', rs);
+    const undo = restoreRescue({ repoRoot: lr, id: rs.backupId });
+    ok(undo.ok && fs.lstatSync(path.join(lr, 'lnk')).isSymbolicLink() && read(lr, 'other.txt').toString() === 'changed\n',
+      'F4 …and its undo keeps the link a link', undo);
+    fs.rmSync(path.join(lr, 'lnk'));
+    const again = restoreRescue({ repoRoot: lr, id: lk.id, paths: ['lnk'] });
+    ok(again.ok && fs.lstatSync(path.join(lr, 'lnk')).isSymbolicLink() && read(lr, 'lnk').toString() === 'T\n',
+      'F4 a removed link is restored as a link to the same target', again);
+  } else ok(true, 'F4 (skipped: this system cannot create symbolic links)');
+}
+
+if (WIN) {
+  // F5  A path given in another case (the lowercased ledger key) is saved
+  //     under its real spelling, so show and restore agree with the copy.
+  const cr = makeRepo('case repo');
+  write(cr, 'Src/Foo.TXT', 'v1\n');
+  git(cr, ['add', '.']);
+  git(cr, ['commit', '-q', '-m', 'seed']);
+  write(cr, 'Src/Foo.TXT', 'WORK\n');
+  write(cr, 'Docs/Note.md', 'untracked note\n');
+  const cs = createRescue({ repoRoot: cr, paths: ['src/foo.txt', 'docs/note.md'], sid: 'case', reason: 'case' });
+  ok(cs.ok && JSON.stringify(cs.paths) === '["Docs/Note.md","Src/Foo.TXT"]' && blobAt(cr, cs.commit, 'Src/Foo.TXT').toString() === 'WORK\n',
+    'F5 tracked and untracked paths in another case are recorded under their real spelling', cs);
+  const sh = showRescue({ repoRoot: cr, id: cs.id });
+  ok(sh.ok && sh.files.find((f) => f.path === 'Src/Foo.TXT')?.change === 'modified', 'F5 show reports the file as modified, not "same as HEAD"', sh.files);
+  git(cr, ['checkout', '--', '.']);
+  const rc = restoreRescue({ repoRoot: cr, id: cs.id, paths: ['src/foo.txt'] });
+  ok(rc.ok && JSON.stringify(rc.restored) === '["Src/Foo.TXT"]' && read(cr, 'Src/Foo.TXT').toString() === 'WORK\n',
+    'F5 restore (asked in any case) writes the work back', rc);
+}
+
+{
+  // F6  A repository reached through a junction / folder symlink works.
+  const jr = makeRepo('junction repo');
+  write(jr, 'a.txt', 'v1\n');
+  git(jr, ['add', '.']);
+  git(jr, ['commit', '-q', '-m', 'seed']);
+  write(jr, 'a.txt', 'WORK\n');
+  const link = path.join(ROOT, 'junction link');
+  let linked = true;
+  try { fs.symlinkSync(jr, link, 'junction'); } catch { linked = false; }
+  if (linked) {
+    const jx = createRescue({ repoRoot: link, paths: ['a.txt', path.join(link, 'a.txt')], sid: 'junction', reason: 'junction' });
+    ok(jx.ok && JSON.stringify(jx.paths) === '["a.txt"]' && listRescues({ repoRoot: link }).some((e) => e.id === jx.id),
+      'F6 createRescue and list work through a junction (an absolute path through it maps onto the repository)', jx);
+    git(jr, ['checkout', '--', 'a.txt']);
+    const jb = restoreRescue({ repoRoot: link, id: jx.id });
+    ok(jb.ok && read(jr, 'a.txt').toString() === 'WORK\n', 'F6 …and restore does too', jb);
+  } else ok(true, 'F6 (skipped: this system cannot create a folder link)');
+}
+
+{
+  // F7  `restore <id> foo.txt` typed in src/ means src/foo.txt, as in git;
+  //     the repository-relative reading is only the fallback.
+  const cw = makeRepo('cwd repo');
+  write(cw, 'foo.txt', 'root v1\n');
+  write(cw, 'src/foo.txt', 'src v1\n');
+  write(cw, 'src/only.txt', 'only v1\n');
+  git(cw, ['add', '.']);
+  git(cw, ['commit', '-q', '-m', 'seed']);
+  write(cw, 'foo.txt', 'root WORK\n');
+  write(cw, 'src/foo.txt', 'src WORK\n');
+  write(cw, 'src/only.txt', 'only WORK\n');
+  const cc = createRescue({ repoRoot: cw, paths: ['foo.txt', 'src/foo.txt', 'src/only.txt'], sid: 'cwd', reason: 'cwd' });
+  git(cw, ['checkout', '--', '.']);
+  const fromSrc = restoreRescue({ repoRoot: path.join(cw, 'src'), id: cc.id, paths: ['foo.txt'], cwd: path.join(cw, 'src') });
+  ok(fromSrc.ok && JSON.stringify(fromSrc.restored) === '["src/foo.txt"]' && read(cw, 'foo.txt').toString() === 'root v1\n'
+    && read(cw, 'src/foo.txt').toString() === 'src WORK\n',
+  'F7 a relative path from a subfolder restores that subfolder\'s file, not the root one', fromSrc);
+  const fallback = restoreRescue({ repoRoot: path.join(cw, 'src'), id: cc.id, paths: ['src/only.txt'], cwd: path.join(cw, 'src') });
+  ok(fallback.ok && JSON.stringify(fallback.restored) === '["src/only.txt"]', 'F7 …and a repository-relative path still works from there', fallback);
+}
+
 // ── R4: prune keeps the newest N ──────────────────────────────────────────────
 const pr = makeRepo('prune repo');
 write(pr, 'p.txt', 'seed\n');

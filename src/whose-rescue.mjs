@@ -55,6 +55,16 @@ export const RESCUE_MAX_FILE_BYTES = 50 * 1024 * 1024;
 export const RESCUE_MAX_TOTAL_BYTES = 300 * 1024 * 1024;
 export const RESCUE_KEEP = 50;
 export const RESCUE_MAX_AGE_MS = 14 * 86400000;
+// What one rescue may write per second of the time it has left: below the
+// slowest cold pack write measured on Windows (6 MB/s, 2026-10-19), so the
+// 2.5 s budget holds about 11 MB and a slower machine still finishes in time.
+// A human-run restore has minutes, so its backup is bounded only by the caps.
+export const RESCUE_BYTES_PER_SEC = 6 * 1024 * 1024;
+// Kept back from the time left for the spawns after the byte count is fixed
+// (one for-each-ref, fast-import start-up and its index write).
+const RESCUE_RESERVE_MS = 400;
+// However little time is left, small files are still attempted.
+const RESCUE_MIN_BYTES = 256 * 1024;
 
 const META_TAG = 'klypix-rescue-v1 ';
 const NUL = '\x00';
@@ -147,19 +157,40 @@ function storable(rel, isLink) {
 
 const foldKey = (rel) => (WIN ? rel.toLowerCase() : rel);
 
-// Request path → repository-relative, '/'-separated, or { why }.
+// The real path of `abs`, resolving the deepest part of it that exists (so a
+// path reached through a junction or a folder symlink maps onto the real tree
+// git reports as the toplevel, even when the file itself is gone).
+function realpathNearest(abs) {
+  const tail = [];
+  let cur = path.resolve(abs);
+  for (;;) {
+    try { return path.join(fs.realpathSync.native(cur), ...tail.reverse()); } catch { /* go up */ }
+    const up = path.dirname(cur);
+    if (up === cur) return null;
+    tail.push(path.basename(cur));
+    cur = up;
+  }
+}
+
+const outside = (relative) => relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative);
+
+// Request path → repository-relative, '/'-separated, or { why }. The whole
+// repository ('.', or the toplevel itself) is rel '' — a folder pathspec like
+// any other, as in `git restore .` / `git checkout -- .`.
 function repoRel(top, raw) {
   if (typeof raw !== 'string' || !raw.trim()) return { why: 'empty path' };
   let rel = raw.replace(/\\/g, '/');
   if (path.isAbsolute(raw) || /^[a-zA-Z]:\//.test(rel)) {
-    const relative = path.relative(top, path.resolve(raw));
-    if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
-      return { why: relative ? 'outside the repository' : 'not a file path' };
+    let relative = path.relative(top, path.resolve(raw));
+    if (outside(relative)) {
+      const real = realpathNearest(raw);
+      if (real) relative = path.relative(top, real);
     }
+    if (outside(relative)) return { why: 'outside the repository' };
     rel = relative.replace(/\\/g, '/');
   }
   rel = path.posix.normalize(rel).replace(/^(\.\/)+/, '').replace(/\/+$/, '');
-  if (!rel || rel === '.') return { why: 'not a file path' };
+  if (!rel || rel === '.') return { rel: '' };
   const parts = rel.split('/');
   if (parts.includes('..')) return { why: 'outside the repository' };
   if (parts.some(isDotGit)) return { why: 'inside .git' };
@@ -245,12 +276,16 @@ function blobId(bytes, oidLen) {
 // with the first three lines printed when the branch has no commit yet.
 function repoContext(repoRoot, deadline) {
   const dir = path.resolve(String(repoRoot || '.'));
-  if (!lstatOrNull(dir)?.isDirectory()) return { ok: false, error: `not a folder: ${dir}` };
+  // statSync follows a junction or a folder symlink, as git itself does: a
+  // project opened through one is still that project.
+  let isDir = false;
+  try { isDir = fs.statSync(dir).isDirectory(); } catch { /* not there */ }
+  if (!isDir) return { ok: false, error: `not a folder: ${dir}` };
   const probe = makeGit(dir, deadline)(
-    ['rev-parse', '--path-format=absolute', '--show-toplevel', '--git-dir', '--show-object-format', '--verify', '-q', 'HEAD^{commit}'],
+    ['rev-parse', '--path-format=absolute', '--show-toplevel', '--git-dir', '--git-common-dir', '--show-object-format', '--verify', '-q', 'HEAD^{commit}'],
     { allow: [0, 1] },
   );
-  const [top, gitDir, format, head] = String(probe.out).split('\n').map((s) => s.trim());
+  const [top, gitDir, commonDir, format, head] = String(probe.out).split('\n').map((s) => s.trim());
   if (!probe.ok || !top || !gitDir) {
     if (probe.timedOut) return { ok: false, error: TOO_LONG };
     return { ok: false, error: /not a git repository/i.test(probe.err) ? `not inside a git working tree: ${dir}` : gitError('rev-parse', probe) };
@@ -260,6 +295,7 @@ function repoContext(repoRoot, deadline) {
     git: makeGit(top, deadline),
     top,
     gitDir,
+    commonDir: commonDir || gitDir,
     oidLen: format === 'sha256' ? 64 : 40,
     head: probe.code === 0 && /^[0-9a-f]{40,64}$/.test(head || '') ? head : null,
   };
@@ -277,11 +313,18 @@ function branchOf(gitDir) {
 // Git config for every writing call: the user's hooks stay out of it.
 const noHooks = (ctx) => ['-c', `core.hooksPath=${path.join(ctx.gitDir, 'klypix-rescue', 'no-hooks')}`];
 
-// Real-index entries for the given paths: Map rel → { mode, oid }. Read-only.
+// A literal pathspec (never a glob). On Windows it is also case-insensitive,
+// like the file system: `src/foo.txt` finds the tracked `Src/Foo.TXT`. The
+// magic is per path because git refuses the global --literal-pathspecs
+// together with --icase-pathspecs. '' (the whole repository) is '.'.
+const spec = (rel) => `:(${WIN ? 'literal,icase' : 'literal'})${rel || '.'}`;
+
+// Real-index entries for the given paths: Map rel → { mode, oid }, keyed by
+// the index's own spelling. Read-only.
 function indexEntries(git, rels) {
   const entries = new Map();
-  for (const chunk of chunkByLength(rels)) {
-    const r = git(['--literal-pathspecs', 'ls-files', '-s', '-z', '--', ...chunk]);
+  for (const chunk of chunkByLength(rels.map(spec))) {
+    const r = git(['ls-files', '-s', '-z', '--', ...chunk]);
     if (!r.ok) return { error: gitError('ls-files', r) };
     for (const rec of r.out.split(NUL)) {
       const m = /^(\d{6}) ([0-9a-f]+) \d\t([\s\S]+)$/.exec(rec);
@@ -289,6 +332,31 @@ function indexEntries(git, rels) {
     }
   }
   return { entries };
+}
+
+// The spelling the disk uses for an existing path (Windows: a request in
+// another case opens the same file, but git must be told the real name).
+// Falls back to the request for any part it cannot read.
+function diskCase(top, rel, cache) {
+  const out = [];
+  let dir = top;
+  for (const part of rel.split('/')) {
+    let names = cache.get(dir);
+    if (names === undefined) {
+      try { names = fs.readdirSync(dir); } catch { names = null; }
+      cache.set(dir, names);
+    }
+    const real = !names || names.includes(part) ? part : names.find((n) => n.toLowerCase() === part.toLowerCase()) || part;
+    out.push(real);
+    dir = path.join(dir, real);
+  }
+  return out.join('/');
+}
+
+// A link's target as git stores it: '/' separators (Windows keeps '\').
+function linkBytes(abs) {
+  const raw = fs.readlinkSync(abs, { encoding: 'buffer' });
+  return WIN ? Buffer.from(raw.toString('utf8').replace(/\\/g, '/'), 'utf8') : raw;
 }
 
 // Which of these UNTRACKED paths .gitignore & co. exclude. --no-index is right
@@ -400,6 +468,22 @@ function removeCrashReport(top, err) {
   if (/^fast_import_crash_\d+$/.test(path.basename(file))) { try { fs.rmSync(file, { force: true }); } catch { /* best effort */ } }
 }
 
+// A fast-import stopped by the time limit leaves its half-written pack as
+// objects/pack/tmp_pack_*. Only one that came into being after this import
+// started is removed; a file another git still holds open refuses (Windows) or
+// is left to that git's own clean-up.
+function removeKilledPack(commonDir, since) {
+  const dir = path.join(commonDir, 'objects', 'pack');
+  let names = [];
+  try { names = fs.readdirSync(dir); } catch { return; }
+  for (const name of names) {
+    if (!/^tmp_pack_[A-Za-z0-9]+$/.test(name)) continue;
+    const st = lstatOrNull(path.join(dir, name));
+    const born = st && (st.birthtimeMs > 0 ? st.birthtimeMs : st.ctimeMs);
+    if (st?.isFile() && born >= since - 1000) { try { fs.rmSync(path.join(dir, name), { force: true }); } catch { /* best effort */ } }
+  }
+}
+
 function readLastNote(file) {
   try {
     const note = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -423,8 +507,12 @@ function writeLastNote(file, note) {
 /**
  * Save the current bytes of `paths` as refs/klypix/rescue/<id>.
  * paths: repository-relative (as `git status --porcelain` prints them) or
- * absolute. A folder is expanded to the untracked, non-ignored files inside it
- * (what `git clean -d` would remove). Budget 2.5 s; never throws.
+ * absolute; '.' is the whole repository. A folder is expanded as `git add --
+ * <folder>` would see it: tracked files that differ from HEAD (modified,
+ * staged, deleted) and untracked, non-ignored files — what `checkout --`,
+ * `restore`, `reset --hard` and `clean -d` would discard. On Windows a path
+ * in another case is saved under its real spelling. Budget 2.5 s, kept by
+ * leaving out the largest files the time cannot write (listed); never throws.
  * → { ok, id, ref, commit, paths, deleted, skipped:[{path,why}], ms, reused? }
  */
 export function createRescue({
@@ -450,7 +538,7 @@ export function createRescue({
     const wanted = [];
     for (const raw of Array.isArray(paths) ? paths : paths == null ? [] : [paths]) {
       const r = repoRel(top, raw);
-      if (!r.rel) { skip(String(raw ?? ''), r.why); continue; }
+      if (r.rel == null) { skip(String(raw ?? ''), r.why); continue; }
       if (seen.has(foldKey(r.rel))) continue;
       seen.add(foldKey(r.rel));
       wanted.push(r.rel);
@@ -459,9 +547,15 @@ export function createRescue({
 
     // 2. What is on disk now.
     const ancestors = new Map();
-    const items = [];             // { rel, kind: 'file'|'link'|'missing', size, exec, expanded }
+    const items = [];             // { rel, kind: 'file'|'link'|'missing', size, exec, expanded, untracked }
     const folders = [];
+    const statItem = (rel, st, extra = {}) => {
+      if (st.isSymbolicLink()) return { rel, kind: 'link', size: st.size, ...extra };
+      if (st.isFile()) return { rel, kind: 'file', size: st.size, exec: (st.mode & 0o111) !== 0, ...extra };
+      return null;
+    };
     for (const rel of wanted) {
+      if (rel === '') { folders.push(rel); continue; }   // the whole repository
       const problem = ancestorProblem(top, rel, ancestors);
       if (problem) {
         // A path under a folder that is now a file is simply gone.
@@ -476,48 +570,68 @@ export function createRescue({
         else skip(rel, 'unreadable');
         continue;
       }
-      if (st.isSymbolicLink()) items.push({ rel, kind: 'link', size: st.size });
-      else if (st.isFile()) items.push({ rel, kind: 'file', size: st.size, exec: (st.mode & 0o111) !== 0 });
+      const item = statItem(rel, st);
+      if (item) items.push(item);
       else if (st.isDirectory()) {
         if (lstatOrNull(path.join(abs, '.git'))) skip(rel, 'nested repository');
         else folders.push(rel);
       } else skip(rel, 'not a regular file');
     }
 
-    // 3. The real index (read only): modes, submodules, tracked or not.
-    const idx = indexEntries(git, [...items.map((i) => i.rel), ...folders]);
+    // 3. Folders: what `git add -- <folder>` would take from them, which is
+    //    exactly what `checkout -- <folder>`, `restore <folder>`, `reset
+    //    --hard` and `clean -d` throw away: every tracked file that differs
+    //    from HEAD (modified, staged or deleted) and every untracked,
+    //    non-ignored file. One read-only `status` per chunk (optional locks
+    //    off, so it never refreshes the real index); ignored content listed.
+    const known = new Set(items.map((i) => foldKey(i.rel)));
+    for (const chunk of chunkByLength(folders.map(spec))) {
+      const st = git(['status', '--porcelain=v1', '-z', '--untracked-files=all', '--no-renames', '--ignore-submodules=all', '--', ...chunk]);
+      if (!st.ok) return fail(gitError('status', st));
+      for (const rec of st.out.split(NUL)) {
+        if (rec.length < 4) continue;
+        const xy = rec.slice(0, 2);
+        const rel = rec.slice(3);
+        if (xy === '!!') continue;
+        if (rel.endsWith('/')) { skip(rel.slice(0, -1), 'nested repository'); continue; }
+        if (known.has(foldKey(rel))) continue;
+        known.add(foldKey(rel));
+        const problem = ancestorProblem(top, rel, ancestors);
+        if (problem && problem !== 'a parent folder is a file') { skip(rel, problem); continue; }
+        const lst = problem ? null : lstatOrNull(path.join(top, rel));
+        const untracked = xy === '??';
+        const item = lst && statItem(rel, lst, { expanded: true, untracked });
+        if (item) items.push(item);
+        else if (!lst || (lst.isDirectory() && !untracked)) items.push({ rel, kind: 'missing', expanded: true });
+        else skip(rel, 'not a regular file');
+      }
+      const ignoredHere = git(['ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--directory', '--', ...chunk]);
+      if (!ignoredHere.ok) return fail(gitError('ls-files', ignoredHere));
+      for (const rel of ignoredHere.out.split(NUL).filter(Boolean)) skip(rel.replace(/\/$/, ''), 'ignored');
+    }
+
+    // 4. The real index (read only): modes, submodules, tracked or not. On
+    //    Windows also the real spelling of a path asked for in another case
+    //    (the index's spelling when tracked, the disk's otherwise), so the
+    //    copy, its file list, `show` and `restore` all name the same file.
+    const idx = indexEntries(git, [...items.filter((i) => !i.untracked).map((i) => i.rel), ...folders.filter(Boolean)]);
     if (idx.error) return fail(idx.error);
     const tracked = idx.entries;
+    if (WIN) {
+      const byFold = new Map();
+      for (const rel of tracked.keys()) if (!byFold.has(foldKey(rel))) byFold.set(foldKey(rel), rel);
+      const dirCache = new Map();
+      const canon = (rel) => (tracked.has(rel) ? rel : byFold.get(foldKey(rel)) || diskCase(top, rel, dirCache));
+      for (const item of items) if (!item.expanded) item.rel = canon(item.rel);
+      for (let i = 0; i < folders.length; i++) if (folders[i]) folders[i] = canon(folders[i]);
+    }
     for (let i = items.length - 1; i >= 0; i--) {
       if (tracked.get(items[i].rel)?.mode === '160000') { skip(items[i].rel, 'submodule'); items.splice(i, 1); }
     }
-    const expandable = [];
     for (const rel of folders) {
       const mode = tracked.get(rel)?.mode;
       if (mode === '160000') { skip(rel, 'submodule'); continue; }
-      if (mode) items.push({ rel, kind: 'missing' });   // a tracked FILE is now a folder
-      expandable.push(rel);
-    }
-
-    // 4. Folders → their untracked, non-ignored files; ignored content listed.
-    if (expandable.length) {
-      const known = new Set(items.map((i) => foldKey(i.rel)));
-      for (const chunk of chunkByLength(expandable)) {
-        const others = git(['--literal-pathspecs', 'ls-files', '-z', '--others', '--exclude-standard', '--', ...chunk]);
-        if (!others.ok) return fail(gitError('ls-files', others));
-        for (const rel of others.out.split(NUL).filter(Boolean)) {
-          if (rel.endsWith('/')) { skip(rel.slice(0, -1), 'nested repository'); continue; }
-          if (known.has(foldKey(rel))) continue;
-          known.add(foldKey(rel));
-          const st = lstatOrNull(path.join(top, rel));
-          if (st?.isSymbolicLink()) items.push({ rel, kind: 'link', size: st.size, expanded: true });
-          else if (st?.isFile()) items.push({ rel, kind: 'file', size: st.size, exec: (st.mode & 0o111) !== 0, expanded: true });
-          else if (st) skip(rel, 'not a regular file');
-        }
-        const ignoredHere = git(['--literal-pathspecs', 'ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--directory', '--', ...chunk]);
-        if (!ignoredHere.ok) return fail(gitError('ls-files', ignoredHere));
-        for (const rel of ignoredHere.out.split(NUL).filter(Boolean)) skip(rel.replace(/\/$/, ''), 'ignored');
-      }
+      if (mode && !items.some((i) => i.rel === rel)) items.push({ rel, kind: 'missing' });   // a tracked FILE is now a folder
     }
 
     // 5. Ignored files are never rescued (V1 decision 5). Only untracked paths
@@ -531,21 +645,32 @@ export function createRescue({
       return true;
     });
 
-    // 6. Size caps: per file, then the total with the largest dropped first.
+    // 6. Size caps: per file, then the total, then what the time left can
+    //    write. Each time the LARGEST go first, so a big binary never costs
+    //    the small source edits beside it their copy.
     keep = keep.filter((i) => {
       if (i.kind === 'file' && i.size > maxFileBytes) { skip(i.rel, `${mb(i.size)}, over the ${mb(maxFileBytes)} limit`); return false; }
       return true;
     });
-    let total = keep.reduce((n, i) => n + (i.kind === 'missing' ? 0 : i.size || 0), 0);
-    if (total > maxTotalBytes) {
-      for (const big of keep.filter((i) => i.kind !== 'missing').sort((a, b) => b.size - a.size)) {
-        if (total <= maxTotalBytes) break;
-        total -= big.size;
+    const sizeOf = (i) => (i.kind === 'missing' ? 0 : i.size || 0);
+    const dropLargest = (limit, why) => {
+      let total = keep.reduce((n, i) => n + sizeOf(i), 0);
+      if (total <= limit) return;
+      for (const big of keep.filter((i) => sizeOf(i) > 0).sort((a, b) => sizeOf(b) - sizeOf(a))) {
+        if (total <= limit) break;
+        total -= sizeOf(big);
         big.dropped = true;
-        skip(big.rel, `${mb(big.size)}, over the ${mb(maxTotalBytes)} total`);
+        skip(big.rel, `${mb(sizeOf(big))}, ${why}`);
       }
       keep = keep.filter((i) => !i.dropped);
-    }
+    };
+    dropLargest(maxTotalBytes, `over the ${mb(maxTotalBytes)} total`);
+    // The kill a timeout sends does not reliably stop git on Windows while it
+    // finishes a large pack (measured 2026-10-19: a 2.2 s timeout returned
+    // after 3.0-3.8 s; a cold write ran at 6-20 MB/s). So the time limit is
+    // kept by never starting more than the time left can write.
+    const writable = Math.max(RESCUE_MIN_BYTES, Math.floor(((deadline - Date.now() - RESCUE_RESERVE_MS) / 1000) * RESCUE_BYTES_PER_SEC));
+    dropLargest(writable, `too large to save in the ${Math.max(0.1, Math.round((deadline - started) / 100) / 10)} s a check may take`);
 
     // 7. The raw bytes (a link's bytes are its target, as git stores it).
     const files = [];
@@ -554,7 +679,7 @@ export function createRescue({
       if (item.kind === 'missing') { deletes.push(item.rel); continue; }
       const abs = path.join(top, item.rel);
       let bytes;
-      try { bytes = item.kind === 'link' ? fs.readlinkSync(abs, { encoding: 'buffer' }) : fs.readFileSync(abs); } catch {
+      try { bytes = item.kind === 'link' ? linkBytes(abs) : fs.readFileSync(abs); } catch {
         skip(item.rel, 'unreadable');
         continue;
       }
@@ -626,6 +751,7 @@ export function createRescue({
     let commit = '';
     let pending = files;
     for (let attempt = 0; attempt < 4 && !commit; attempt++) {
+      const importStarted = Date.now();
       const r = git([...noHooks(ctx), '-c', 'fastimport.unpackLimit=0', '-c', 'pack.compression=1', 'fast-import', '--quiet', '--date-format=raw'], {
         input: fastImportStream({ ref: `${RESCUE_REF_PREFIX}${id}`, head: ctx.head, message: messageOf(), date, deletes, files: pending }),
         env: guardEnv,
@@ -647,7 +773,7 @@ export function createRescue({
         break;
       }
       removeCrashReport(top, r.err);
-      if (r.timedOut) return fail(TOO_LONG);
+      if (r.timedOut) { removeKilledPack(ctx.commonDir, importStarted); return fail(TOO_LONG); }
       // A name this check missed but git refuses: list it, try once more without it.
       const bad = /invalid path '([\s\S]*?)'\s*$/m.exec(r.err)?.[1];
       const culprit = bad && pending.find((f) => f.rel === bad);
@@ -835,9 +961,17 @@ function currentState(abs) {
   return { kind, size: st.size, mtimeMs: st.mtimeMs, mode: st.mode };
 }
 
+// A link's stored target compared the way git compares it ('/' on Windows).
+const sameLink = (abs, bytes) => linkBytes(abs).equals(WIN ? Buffer.from(bytes.toString('utf8').replace(/\\/g, '/'), 'utf8') : bytes);
+
 function matchesRescue(abs, cur, bytes, mode) {
   try {
-    if (mode === '120000' && !WIN) return cur.kind === 'link' && fs.readlinkSync(abs, { encoding: 'buffer' }).equals(bytes);
+    if (mode === '120000') {
+      if (cur.kind === 'link') return sameLink(abs, bytes);
+      // Windows with core.symlinks=false checks a link out as a file holding
+      // its target; that file is the link's unchanged form there.
+      if (!WIN) return false;
+    }
     if (cur.kind !== 'file' || cur.size !== bytes.length) return false;
     if (!WIN && ((cur.mode & 0o111) !== 0) !== (mode === '100755')) return false;
     return fs.readFileSync(abs).equals(bytes);
@@ -846,10 +980,27 @@ function matchesRescue(abs, cur, bytes, mode) {
 
 function writeRescued(abs, bytes, mode, cur) {
   fs.mkdirSync(path.dirname(abs), { recursive: true });
-  if (mode === '120000' && !WIN) {
-    if (cur.kind !== 'missing') fs.unlinkSync(abs);
-    fs.symlinkSync(bytes, abs);
-    return;
+  // A link comes back as a link. On Windows the one exception is git's own:
+  // where a link already stands as a plain file (core.symlinks=false), or
+  // links cannot be made at all, it is written as that file, never by
+  // replacing a real link with one.
+  if (mode === '120000' && (!WIN || cur.kind !== 'file')) {
+    const target = WIN ? bytes.toString('utf8').replace(/\//g, '\\') : bytes;
+    const tmp = path.join(path.dirname(abs), `.${path.basename(abs)}.klypix-restore-${crypto.randomBytes(4).toString('hex')}`);
+    let made = false;
+    try { fs.symlinkSync(target, tmp); made = true; } catch (error) {
+      if (!WIN || cur.kind === 'link' || !['EPERM', 'EACCES'].includes(error?.code)) throw error;
+    }
+    if (made) {
+      try {
+        if (cur.kind !== 'missing') fs.unlinkSync(abs);
+        fs.renameSync(tmp, abs);
+      } catch (error) {
+        try { fs.unlinkSync(tmp); } catch { /* best effort */ }
+        throw error;
+      }
+      return;
+    }
   }
   // Replace a link itself; never write through it to wherever it points.
   if (cur.kind === 'link') fs.unlinkSync(abs);
@@ -905,14 +1056,18 @@ export function restoreRescue({
     if (paths != null) {
       const picked = new Set();
       for (const raw of Array.isArray(paths) ? paths : [paths]) {
-        const forms = [repoRel(top, String(raw)).rel];
+        // As in every git pathspec, a relative path typed in a subfolder means
+        // that subfolder's file first; the repository-relative reading (what
+        // `rescue show` prints) is the fallback when that names nothing.
+        const forms = [];
         if (cwd && !path.isAbsolute(String(raw))) forms.push(repoRel(top, path.resolve(cwd, String(raw))).rel);
+        forms.push(repoRel(top, String(raw)).rel);
         let hit = false;
-        for (const form of forms.filter(Boolean)) {
+        for (const form of forms.filter((f) => f != null)) {
           const want = foldKey(form);
           for (const p of entry.paths) {
             const key = foldKey(p);
-            if (key === want || key.startsWith(`${want}/`)) { picked.add(p); hit = true; }
+            if (want === '' || key === want || key.startsWith(`${want}/`)) { picked.add(p); hit = true; }
           }
           if (hit) break;
         }

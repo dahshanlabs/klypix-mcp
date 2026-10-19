@@ -41,9 +41,12 @@ delete process.env.GIT_CONFIG_PARAMETERS;
 for (const k of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_LITERAL_PATHSPECS']) delete process.env[k];
 
 const {
-  createRescue, listRescues, listRescuesResult, showRescue, restoreRescue, pruneRescues,
+  createRescue: createRescueRaw, listRescues, listRescuesResult, showRescue, restoreRescue, pruneRescues,
   notIncludedText, rescueRestoreCommand, RESCUE_BUDGET_MS,
 } = await import('../src/whose-rescue.mjs');
+// A busy machine (other sessions building) can push one rescue past the hook's
+// 2.5 s budget; setup rescues get room, budget tests pass budgetMs explicitly.
+const createRescue = (opts) => createRescueRaw({ budgetMs: 60_000, ...opts });
 
 let failures = 0;
 let checks = 0;
@@ -501,7 +504,7 @@ if (!WIN) {
   write(br, 'data0.bin', crypto.randomBytes(20 * 1024 * 1024));
   write(br, 'data1.bin', crypto.randomBytes(20 * 1024 * 1024));
   const t0 = Date.now();
-  const quick = createRescue({ repoRoot: br, paths: ['a.txt', 'data0.bin', 'data1.bin'], sid: 'budget', reason: 'git reset --hard' });
+  const quick = createRescueRaw({ repoRoot: br, paths: ['a.txt', 'data0.bin', 'data1.bin'], sid: 'budget', reason: 'git reset --hard' });
   const took = Date.now() - t0;
   ok(quick.ok && JSON.stringify(quick.paths) === '["a.txt"]' && /too large to save in the 2\.5 s/.test(whyOf(quick, 'data0.bin') || '')
     && /too large to save/.test(whyOf(quick, 'data1.bin') || '') && blobAt(br, quick.commit, 'a.txt').toString() === 'IMPORTANT SOURCE EDIT\n'

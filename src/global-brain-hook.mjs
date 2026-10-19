@@ -6236,8 +6236,46 @@ async function registerBrain() {
     } catch { /* registry is best-effort */ }
 }
 
+// "Whose is this?" (1.104.0): a risky git command that would sweep, discard or
+// stash ANOTHER session's uncommitted work gets deny / ask / context, and edits
+// are recorded so ownership is known. Runs before the brain-at-cwd check because
+// it finds the brain by walking up (an agent may have cd'd into a subfolder).
+// Cheap gates first: only edit tools (--live) or a command that mentions git
+// (--guard) pay the dynamic import. Never throws.
+const WHOSE_EDIT_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'edit_file', 'write_file']);
+async function whoseStep(isGuard) {
+    try {
+        const input = readHookInput();
+        const tool = String(input.tool_name || '');
+        if (!isGuard) {
+            if (!WHOSE_EDIT_TOOLS.has(tool)) return null;
+            const w = await import(new URL('./whose.mjs', import.meta.url).href);
+            await w.recordFromClaudeHook(input);
+            return null;
+        }
+        if (tool !== 'Bash' && tool !== 'PowerShell') return null;
+        const cmd = input.tool_input && input.tool_input.command;
+        if (typeof cmd !== 'string' || !/\bgit|\bgh\b/i.test(cmd)) return null;
+        const w = await import(new URL('./whose.mjs', import.meta.url).href);
+        let r = await w.decide(input);
+        if (r && w.whoseMode() === 'shadow') r = w.shadowOf(r);
+        return r;
+    } catch { return null; }
+}
+function emitWhose(r) {
+    if (!r || !r.text) return;
+    const out = r.decision === 'deny' || r.decision === 'ask'
+        ? { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: r.decision, permissionDecisionReason: r.text } }
+        : { hookSpecificOutput: { hookEventName: 'PreToolUse', additionalContext: r.text } };
+    try { fs.writeSync(1, JSON.stringify(out)); } catch { /* stdout gone */ }
+}
+
 async function main() {
-    if (!fs.existsSync(BRAIN)) return;                  // not a brain project → instant no-op
+    const isLive = process.argv.includes('--live');
+    const isGuard = process.argv.includes('--guard');
+    const whose = (isLive || isGuard) ? await whoseStep(isGuard) : null;
+    if (whose && (whose.decision === 'deny' || whose.decision === 'ask')) { emitWhose(whose); return; }
+    if (!fs.existsSync(BRAIN)) { if (whose) emitWhose(whose); return; }   // not a brain project → instant no-op
     // --live (PostToolUse) is the cheapest mode: pure payload string-work + at most
     // one tiny locked append. It must NOT pay the lazy klypix-format import, so it
     // runs BEFORE everything else and returns. (Fires on Bash|PowerShell|Edit|Write.)
@@ -6245,7 +6283,15 @@ async function main() {
     // --guard (PreToolUse) is the second fast path: stat + sidecar read on the
     // common case; it lazy-imports the lib itself only when a compiled guard's
     // tool pattern could match this call. Runs before the unconditional import.
-    if (process.argv.includes('--guard')) { await guardCheck(); return; }
+    if (process.argv.includes('--guard')) {
+        // A brain guard card's own decision wins; Whose context rides only when it said nothing.
+        let wrote = false;
+        const orig = process.stdout.write.bind(process.stdout);
+        process.stdout.write = (...a) => { wrote = true; return orig(...a); };
+        try { await guardCheck(); } finally { process.stdout.write = orig; }
+        if (!wrote && whose) emitWhose(whose);
+        return;
+    }
     const lib = await import('./klypix-format.mjs');    // lazy: only when a brain exists
     // Per-prompt retrieval runs on EVERY prompt — skip the registry write and
     // go straight to the (mtime-cached) ranked lookup to keep it cheap.

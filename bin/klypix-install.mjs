@@ -495,7 +495,7 @@ try {
     // a newer klypix-format cannot. merge-brains and the driver ship here so
     // brain-history's restore merge, the KLYPIX core and the git driver all
     // find one engine in this directory.
-    for (const f of ['global-brain-hook.mjs', 'klypix-format.mjs', 'brain-graveyard.mjs', 'merge-brains.mjs', 'klypix-merge-driver.mjs', 'capture-gap.mjs', 'brain-semantic.mjs', 'semantic-memory.mjs', 'enrichment.mjs', 'provenance.mjs', 'brain-note.mjs', 'brain-evidence.mjs', 'brain-git-hook.mjs', 'git-capture-install.mjs', 'brain-history.mjs', 'app-lease.mjs', 'klypix-core.mjs', 'app-bridge-protocol.mjs', 'app-bridge-client.mjs', 'app-tools.mjs', 'card-files.mjs', 'brain-write-lock.mjs', 'agent-rules.mjs', 'brain-doctor.mjs', 'editor-detect.mjs', 'agent-presence.mjs', 'mcp-presence.mjs', 'repo-state.mjs', 'result-reconcile.mjs', 'finding-routing.mjs', 'presence-relay.mjs', 'mcp-supervisor.mjs', 'mcp-auto-update.mjs', 'runtime-inspector.mjs', 'project-graph.mjs', 'bench.mjs', 'codex-brain-hook.mjs', 'codex-hooks.mjs', 'session-handoff.mjs', 'canvas-view-app.html']) {
+    for (const f of ['global-brain-hook.mjs', 'klypix-format.mjs', 'brain-graveyard.mjs', 'merge-brains.mjs', 'klypix-merge-driver.mjs', 'capture-gap.mjs', 'brain-semantic.mjs', 'semantic-memory.mjs', 'enrichment.mjs', 'provenance.mjs', 'brain-note.mjs', 'brain-evidence.mjs', 'brain-git-hook.mjs', 'git-capture-install.mjs', 'brain-history.mjs', 'app-lease.mjs', 'klypix-core.mjs', 'app-bridge-protocol.mjs', 'app-bridge-client.mjs', 'app-tools.mjs', 'card-files.mjs', 'brain-write-lock.mjs', 'agent-rules.mjs', 'brain-doctor.mjs', 'editor-detect.mjs', 'agent-presence.mjs', 'mcp-presence.mjs', 'repo-state.mjs', 'result-reconcile.mjs', 'finding-routing.mjs', 'presence-relay.mjs', 'mcp-supervisor.mjs', 'mcp-auto-update.mjs', 'runtime-inspector.mjs', 'project-graph.mjs', 'bench.mjs', 'codex-brain-hook.mjs', 'codex-hooks.mjs', 'session-handoff.mjs', 'whose.mjs', 'whose-classify.mjs', 'whose-ledger.mjs', 'whose-rescue.mjs', 'canvas-view-app.html']) {
         const s = path.join(SRC, f); if (exists(s)) staged.push({ dst: f, content: fs.readFileSync(s, 'utf8') });
     }
     for (const [src, dst] of [
@@ -568,7 +568,7 @@ try {
         ['SessionStart', { matcher: 'startup|resume|clear', hooks: [{ type: 'command', command: brainCmd('') }] }],
         ['UserPromptSubmit', { hooks: [{ type: 'command', command: brainCmd('--prompt'), timeout: 10 }] }],
         ['Stop', { hooks: [{ type: 'command', command: brainCmd('--capture') }] }],
-        ['PostToolUse', { matcher: 'Bash|PowerShell|Edit|Write', hooks: [{ type: 'command', command: brainCmd('--live'), timeout: 10 }] }],
+        ['PostToolUse', { matcher: 'Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit', hooks: [{ type: 'command', command: brainCmd('--live'), timeout: 10 }] }],
         // Guard cards (2026-08-24): pre-action lane. Fast path — reads only the
         // compiled guard sidecar; 'warn' injects context, 'block' denies with
         // the card's message. Absent guards = stat + one tiny read, then no-op.

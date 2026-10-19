@@ -515,7 +515,8 @@ commits and the checkouts it worked in (with their uncommitted files) automatica
 \`brain_sync\` may list **unfinished work** another session left without a card: if the human asks
 you to continue it, take it with \`brain_handoff\` {action:"take", session:"<id>"} first, and look
 first in the checkout the record names — it may be a side folder, not the project. That list is history, not a lock — a stopped session holds no claim on its
-files. Never ask the human to paste a summary into the next session.
+files, but the uncommitted edits it left are still its work: never sweep, discard or stash them
+(\`git add -A\`, \`commit -a\`, \`reset --hard\`, \`stash\`); commit only your own files. Never ask the human to paste a summary into the next session.
 
 **A note that asks agents to keep off a file**, whatever its wording (here, in AGENTS.md / CLAUDE.md or any
 notes file) can outlive the work it protected. Before you obey one, or before you edit the file

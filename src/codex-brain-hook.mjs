@@ -570,6 +570,14 @@ async function main() {
   const observed = event === 'PreToolUse' || event === 'PostToolUse'
     ? touchedFiles(input, projectDir, cwd)
     : undefined;
+  // Whose is this? (1.104.0): remember the bytes Codex's edits left, so a Claude
+  // session's sweeping git command can name this session as the owner.
+  if (event === 'PostToolUse' && Array.isArray(observed) && observed.length) {
+    try {
+      const whose = await import(new URL('./whose.mjs', import.meta.url).href);
+      await whose.recordEdits({ brainPath, sid: sessionId, client: 'codex', cwd: projectDir, files: observed });
+    } catch { /* attribution is best-effort */ }
+  }
   const files = humanTurn ? [] : undefined;
   const workPatch = codexWorkPatch({ event, humanTurn, prompt, input }) || {};
   // Where it works (1.103.0): the directory a tool call ran in (Codex's exec

@@ -26,7 +26,8 @@
 // open, read, hash and append. Every export except hashBytes never throws:
 // failure is `null`, an empty Map or `{ rotated: false }`.
 //
-// Rotation (past 512 KiB) and appends need no lock between them. Rotation
+// Rotation (past 512 KiB) and appends need no lock between them; rotations
+// exclude each other with `<ledger>.rotate-lock`. Rotation
 // copies new lines before the rename, again before each retry (on Windows a
 // writer's open handle blocks the rename), and after the rename through a
 // hard link to the old file. On POSIX, a writer that wrote through a handle
@@ -447,8 +448,12 @@ function readForHash(file, maxBytes) {
  * session touched it; nothing can match its bytes). Returns the record, or null
  * when nothing was written: bad arguments, a path outside the repo or inside
  * `.git`, a directory, or a failed append. `repoRoot` should be the git top
- * level; when absent, the nearest ancestor with `.git` is used, then the
- * brain's directory. Never throws.
+ * level of the repo the BRAIN belongs to; when absent, the nearest ancestor of
+ * the brain with `.git` is used, then the brain's directory. Never the edited
+ * file's own repo: a file in a sibling repo would be keyed relative to that
+ * repo and collide with a same-named path here, and a file in a nested
+ * worktree (`.worktrees/x/src/a.ts`) would pose as `src/a.ts`. A file outside
+ * the brain's repo is not recorded. Never throws.
  */
 export function recordEdit({ brainPath, home, sid, client, repoRoot, absPath, now = Date.now(), maxHashBytes = LEDGER_HASH_MAX_BYTES } = {}) {
   try {
@@ -459,7 +464,8 @@ export function recordEdit({ brainPath, home, sid, client, repoRoot, absPath, no
     const platform = process.platform;
     const given = typeof repoRoot === 'string' && repoRoot ? repoRoot : null;
     const target = path.resolve(given ? nativeInput(given, platform) : process.cwd(), nativeInput(absPath, platform));
-    const root = given || findRepoRoot(target) || path.dirname(path.resolve(brainPath));
+    const brainDir = path.dirname(path.resolve(nativeInput(brainPath, platform)));
+    const root = given || findRepoRoot(brainDir) || brainDir;
     const key = fileKey(root, target);
     if (!key || key.length > LEDGER_KEY_MAX || /(?:^|\/)\.git(?:\/|$)/.test(key)) return null;
     const cap = Number(maxHashBytes) >= 0 ? Number(maxHashBytes) : LEDGER_HASH_MAX_BYTES;
@@ -568,6 +574,50 @@ function stillSameFile(identity, file) {
   } catch { return false; }
 }
 
+// Rotations exclude each other with a lock file (appends never take it). The
+// identity checks below cannot do it alone: the check and the rename are two
+// steps, and a rotation that ran to completion between them, plus any append
+// to its new file, would be overwritten by the slower one's tmp. A lock older
+// than ROTATE_LOCK_STALE_MS belongs to a process that died; it is taken over
+// by renaming it aside (only one taker can win that rename).
+const ROTATE_LOCK_STALE_MS = 60 * 1000;
+
+function lockToken(lock) {
+  try { return fs.readFileSync(lock, 'utf8'); } catch { return null; }
+}
+
+function takeRotateLock(file) {
+  const lock = `${file}.rotate-lock`;
+  const token = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  const create = () => {
+    const fd = fs.openSync(lock, 'wx');
+    try { fs.writeSync(fd, token); } finally { fs.closeSync(fd); }
+    return { lock, token };
+  };
+  try { return create(); }
+  catch (error) { if (error?.code !== 'EEXIST') return null; }
+  try {
+    if (Date.now() - fs.statSync(lock).mtimeMs <= ROTATE_LOCK_STALE_MS) return null;
+    const aside = `${lock}.stale-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+    fs.renameSync(lock, aside);
+    // Between our stat and our rename another taker may have put a fresh lock
+    // there: give it back.
+    if (Date.now() - fs.statSync(aside).mtimeMs <= ROTATE_LOCK_STALE_MS) {
+      try { fs.linkSync(aside, lock); } catch { /* someone holds it already */ }
+      try { fs.unlinkSync(aside); } catch { /* best effort */ }
+      return null;
+    }
+    try { fs.unlinkSync(aside); } catch { /* best effort */ }
+    return create();
+  } catch { return null; }
+}
+
+function releaseRotateLock(held) {
+  if (!held) return;
+  // Only our own: a lock taken over after we went stale is someone else's now.
+  if (lockToken(held.lock) === held.token) { try { fs.unlinkSync(held.lock); } catch { /* best effort */ } }
+}
+
 /**
  * Past `maxBytes`, rewrite the ledger with only what ownership() reads (the
  * newest record per (key, session) and the latest clean per key, within the
@@ -576,7 +626,8 @@ function stillSameFile(identity, file) {
  * refuses to rename over a file another process holds open, so a blocked
  * rename means an append was in progress), and once more after it, read
  * through a hard link to the old file. If another rotation replaced the file
- * first, this one leaves it alone ('raced').
+ * first, this one leaves it alone ('raced'); while another rotation holds the
+ * rotation lock, this one does nothing ('busy').
  * A header line remembers the compacted size, and the next rotation waits
  * until the file has doubled, so a ledger that is legitimately larger than
  * `maxBytes` is not rewritten on every call. `_seams` ({ afterRead, beforeRename }) is for tests.
@@ -588,6 +639,7 @@ export function rotateLedgerIfLarge({ brainPath, home, maxBytes = LEDGER_MAX_BYT
   let fd = null;
   let tmp = null;
   let link = null;
+  let held = null;
   try {
     let size;
     try { size = fs.statSync(file).size; }
@@ -599,6 +651,16 @@ export function rotateLedgerIfLarge({ brainPath, home, maxBytes = LEDGER_MAX_BYT
     const head = Buffer.alloc(Math.min(512, size));
     const previous = rotationHeaderBytes(head.subarray(0, fs.readSync(fd, head, 0, head.length, 0)));
     if (previous > 0 && size <= Math.max(limit, 2 * previous)) return { rotated: false, reason: 'recently-rotated', bytes: size };
+    fs.closeSync(fd);
+    fd = null;
+    held = takeRotateLock(file);
+    if (!held) return { rotated: false, reason: 'busy', bytes: size };
+    // Under the lock, look again: a rotation that finished just before we took
+    // it has replaced the file we measured.
+    fd = fs.openSync(file, 'r');
+    const st = fs.fstatSync(fd, { bigint: true });
+    if (!(identity.ino === 0n && st.ino === 0n) && (st.ino !== identity.ino || st.dev !== identity.dev)) return { rotated: false, reason: 'raced', bytes: size };
+    size = Number(st.size);
 
     const raw = readRange(fd, 0, size);
     let readTo = raw.lastIndexOf(NEWLINE) + 1; // a line still being written is read during catch-up
@@ -679,6 +741,7 @@ export function rotateLedgerIfLarge({ brainPath, home, maxBytes = LEDGER_MAX_BYT
     if (fd !== null) { try { fs.closeSync(fd); } catch { /* best effort */ } }
     if (tmp) { try { fs.unlinkSync(tmp); } catch { /* best effort */ } }
     if (link) { try { fs.unlinkSync(link); } catch { /* best effort */ } }
+    releaseRotateLock(held);
   }
 }
 

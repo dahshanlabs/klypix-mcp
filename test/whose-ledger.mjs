@@ -15,7 +15,8 @@
 //   L3  fileKey: repo-relative, '/' separators, NFC, lowercased on win32 only;
 //       null outside the repo; MSYS, \\?\ and junction/symlink spellings;
 //   L4  recordEdit / recordClean append exactly the V1 record shapes, find the
-//       repo root when none is given, and never throw;
+//       repo root when none is given (the BRAIN's repo: a sibling repo's or a
+//       nested worktree's file never collides with a path here), and never throw;
 //   L5  readLedger: TTL, oldest first with stable ties, torn and garbage
 //       lines, a torn tail followed by a new append, Windows case folding;
 //   L6  several processes appending at once: nothing lost, nothing torn, and a
@@ -27,7 +28,8 @@
 //       clean per key, drops expired, retired and garbage lines, keeps a newer
 //       build's records, leaves ownership() unchanged on random ledgers,
 //       carries over appends that race it (also under real concurrent load),
-//       backs off when another rotation won, and does not rewrite a
+//       backs off when another rotation won or holds the rotation lock (a
+//       stale lock is taken over), and does not rewrite a
 //       legitimately large ledger on every call;
 //   L9  end to end in a real repo, including the safety-B3 cases: a discarded
 //       edit is never billed for the next change nobody recorded.
@@ -348,6 +350,37 @@ try {
     const viaGit = recordEdit({ brainPath: nested, home, sid: 'me', client: 'claude-code', absPath: path.join(repo, 'pkg', 'x.ts'), now: T + 4 });
     ok(viaGit && viaGit.key === fold('pkg/x.ts'), 'L4 without repoRoot the repo root is found by walking up to .git (keys stay repo-relative under a nested brain)');
     ok(findRepoRoot(path.join(repo, 'pkg', 'x.ts')) === repo && findRepoRoot(repo) === repo, 'L4 findRepoRoot: the nearest ancestor holding .git');
+
+    // Without repoRoot the root is the BRAIN's repo, never the edited file's:
+    // a sibling repo's README.md must not land here as 'readme.md', and a
+    // nested worktree's src/a.ts must not pose as this repo's src/a.ts.
+    const crossP = gitInit(path.join(root, 'CrossP'));
+    const crossQ = gitInit(path.join(root, 'CrossQ'));
+    const crossBrain = makeBrain(crossP);
+    fs.writeFileSync(path.join(crossQ, 'README.md'), 'sibling readme\n');
+    fs.writeFileSync(path.join(crossQ, 'LICENSE'), 'MIT 2026\n');
+    const crossFile = ledgerFileFor(crossBrain, home);
+    const sibling = recordEdit({ brainPath: crossBrain, home, sid: 'peer-O', client: 'claude-code', absPath: path.join(crossQ, 'README.md'), now: T + 5 });
+    const siblingLicense = recordEdit({ brainPath: crossBrain, home, sid: 'peer-O', client: 'claude-code', absPath: path.join(crossQ, 'LICENSE'), now: T + 6 });
+    ok(sibling === null && siblingLicense === null && !fs.existsSync(crossFile), "L4 without repoRoot an edit in a sibling repo is not recorded in this brain's ledger");
+    fs.writeFileSync(path.join(crossP, 'LICENSE'), 'MIT 2026\n');
+    const crossOwn = ownership({
+      ledger: readLedger({ brainPath: crossBrain, home, now: T + 10 }),
+      dirty: [{ key: 'README.md', hash: null }, { key: 'LICENSE', hash: hashBytes(fs.readFileSync(path.join(crossP, 'LICENSE'))) }],
+      selfIds: ['self-S'],
+    });
+    ok(crossOwn.get('README.md').cls === 'UNATTRIBUTED' && crossOwn.get('LICENSE').cls === 'UNATTRIBUTED',
+      'L4 ... so files here with the same name or the same bytes are never FOREIGN to a session that only touched the sibling');
+    const nestedWt = path.join(crossP, '.worktrees', 'feat');
+    fs.mkdirSync(path.join(nestedWt, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(nestedWt, '.git'), 'gitdir: elsewhere\n');
+    fs.writeFileSync(path.join(nestedWt, 'src', 'a.ts'), 'x\n');
+    const inWt = recordEdit({ brainPath: crossBrain, home, sid: 'peer-O', client: 'claude-code', absPath: path.join(nestedWt, 'src', 'a.ts'), now: T + 7 });
+    ok(inWt && inWt.key === fold('.worktrees/feat/src/a.ts'), "L4 without repoRoot a nested worktree's file keeps its .worktrees/ prefix (no collision with src/a.ts)");
+    const subBrain = makeBrain(path.join(crossP, 'docs'));
+    fs.writeFileSync(path.join(crossP, 'top.ts'), 'x\n');
+    const fromSub = recordEdit({ brainPath: subBrain, home, sid: 'me', client: 'claude-code', absPath: path.join(crossP, 'top.ts'), now: T + 8 });
+    ok(fromSub && fromSub.key === 'top.ts', "L4 ... and a brain in a subfolder still keys from its repo's top level");
     const wt = path.join(root, 'Worktree');
     fs.mkdirSync(path.join(wt, 'a'), { recursive: true });
     fs.writeFileSync(path.join(wt, '.git'), 'gitdir: elsewhere\n');
@@ -670,6 +703,35 @@ try {
       `L8 two rotations at once: one wins, the other backs off (inner ${inner.reason}, outer ${outer.reason})`);
     same(readLedger({ brainPath: seamBrain, home, now: now + 400 }), expected, 'L8 ... and every record is still there');
     ok(tmpLeft(seamBrain).length === 0, 'L8 ... with no tmp file or link left behind');
+
+    // Two rotations that overlap past the identity check: the slower one used
+    // to rename its tmp over the faster one's fresh file and drop what was
+    // appended to it. The rotation lock makes the second one back off.
+    const dblBrain = makeBrain(path.join(root, 'DoubleRotate'));
+    const dblFile = ledgerFileFor(dblBrain, home);
+    for (let i = 0; i < 60; i++) recordClean({ brainPath: dblBrain, home, key: `filler-${i}.ts`, now: now + i });
+    let dblInner = null;
+    const dblOuter = rotateLedgerIfLarge({
+      brainPath: dblBrain, home, maxBytes: 256, now: now + 100,
+      _seams: { beforeRename: (attempt) => {
+        if (attempt) return;
+        dblInner = rotateLedgerIfLarge({ brainPath: dblBrain, home, maxBytes: 256, now: now + 100 });
+        recordClean({ brainPath: dblBrain, home, key: 'stopped-session.ts', now: now + 101 });
+      } },
+    });
+    ok(dblOuter.rotated && dblInner && !dblInner.rotated && dblInner.reason === 'busy',
+      `L8 a rotation that starts while another holds the lock backs off (inner ${dblInner?.reason}, outer ${dblOuter.reason})`);
+    ok(readLedger({ brainPath: dblBrain, home, now: now + 200 }).has('stopped-session.ts'), 'L8 ... and a record appended meanwhile survives the rename');
+    ok(!fs.existsSync(`${dblFile}.rotate-lock`) && tmpLeft(dblBrain).length === 0, 'L8 ... with the lock released and no tmp left behind');
+    // A lock left by a process that died is taken over once stale; a fresh one is respected.
+    for (let i = 0; i < 200; i++) recordClean({ brainPath: dblBrain, home, key: `grow-${i}.ts`, now: now + 300 + i });
+    fs.writeFileSync(`${dblFile}.rotate-lock`, 'someone-else');
+    ok(rotateLedgerIfLarge({ brainPath: dblBrain, home, maxBytes: 256, now: now + 600 }).reason === 'busy' && fs.readFileSync(`${dblFile}.rotate-lock`, 'utf8') === 'someone-else',
+      'L8 a fresh rotation lock held by another process is respected (and left alone)');
+    const staleAt = new Date(Date.now() - 5 * 60 * 1000);
+    fs.utimesSync(`${dblFile}.rotate-lock`, staleAt, staleAt);
+    ok(rotateLedgerIfLarge({ brainPath: dblBrain, home, maxBytes: 256, now: now + 600 }).rotated && !fs.existsSync(`${dblFile}.rotate-lock`),
+      'L8 a stale rotation lock (its process died) is taken over and released');
 
     // The very last moment: a line appended after the final copy, just before
     // the rename, reaches only the old file. The hard link carries it over.

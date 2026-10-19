@@ -18,7 +18,7 @@ import os from 'os';
 import path from 'path';
 import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
-import { classifyCommand, TIERS, tierRank, mentionsGit, GIT_OPTION_SPECS } from '../src/whose-classify.mjs';
+import { classifyCommand, TIERS, tierRank, mentionsGit, GIT_OPTION_SPECS, GIT_HIDDEN_OPTION_SPECS } from '../src/whose-classify.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const BS = String.fromCharCode(92);
@@ -146,26 +146,26 @@ C('reset --keep moves', 'git reset --keep main', { strongest: 'MOVE' });
 C('reset --soft moves', 'git reset --soft HEAD~2', { strongest: 'MOVE' });
 C('reset -p is interactive', 'git reset -p', { strongest: 'SAFE' });
 C('reset main: commit or path, ask the repository', 'git reset main', { ok: true, strongest: 'UNSTAGE', step: { needsRefCheck: 'main', paths: ['main'], readings: { commit: { tier: 'MOVE', scope: 'index', paths: null }, path: { tier: 'UNSTAGE', scope: 'index', paths: ['main'] } } } });
-C('reset X a.ts reports the narrower reading', 'git reset main a.ts', { strongest: 'UNSTAGE', step: { paths: ['a.ts'], needsRefCheck: 'main', readings: { commit: { tier: 'UNSTAGE', scope: 'index', paths: ['a.ts'] }, path: { tier: 'UNSTAGE', scope: 'index', paths: ['main', 'a.ts'] } } } });
+C('reset X a.ts reports the union of both readings', 'git reset main a.ts', { strongest: 'UNSTAGE', step: { paths: ['main', 'a.ts'], needsRefCheck: 'main', readings: { commit: { tier: 'UNSTAGE', scope: 'index', paths: ['a.ts'] }, path: { tier: 'UNSTAGE', scope: 'index', paths: ['main', 'a.ts'] } } } });
 C('reset HEAD unstages and does not move', 'git reset HEAD', { strongest: 'UNSTAGE', step: { paths: null } });
 C('reset --hard origin/main discards', 'git reset --hard origin/main', { strongest: 'DISCARD' });
 C('reset <sha> moves', 'git reset abc1234', { strongest: 'MOVE' });
 
 // E — checkout
-C('checkout main: branch or file, ask the repository', 'git checkout main', { ok: true, strongest: 'MOVE', step: { sub: 'checkout', needsRefCheck: 'main', scope: 'all', paths: null, readings: { commit: { tier: 'MOVE', scope: 'all', paths: null }, path: { tier: 'DISCARD', scope: 'tracked', paths: ['main'] } } } });
-C('checkout file.txt: the same question, weaker reading reported', 'git checkout file.txt', { strongest: 'MOVE', step: { needsRefCheck: 'file.txt', paths: null, readings: { commit: { tier: 'MOVE', scope: 'all', paths: null }, path: { tier: 'DISCARD', scope: 'tracked', paths: ['file.txt'] } } } });
+C('checkout main: branch or file, the DISCARD reading is reported', 'git checkout main', { ok: true, strongest: 'DISCARD', step: { sub: 'checkout', needsRefCheck: 'main', scope: 'tracked', paths: ['main'], readings: { commit: { tier: 'MOVE', scope: 'all', paths: null }, path: { tier: 'DISCARD', scope: 'tracked', paths: ['main'] } } } });
+C('checkout file.txt: the same question, the file is covered', 'git checkout file.txt', { strongest: 'DISCARD', step: { needsRefCheck: 'file.txt', paths: ['file.txt'], readings: { commit: { tier: 'MOVE', scope: 'all', paths: null }, path: { tier: 'DISCARD', scope: 'tracked', paths: ['file.txt'] } } } });
 C('checkout -- . discards', 'git checkout -- .', { strongest: 'DISCARD', step: { scope: 'tracked', paths: ['.'] } });
 C('checkout -- a.ts discards', 'git checkout -- a.ts', { strongest: 'DISCARD', step: { paths: ['a.ts'] } });
 C('checkout . is always a path', 'git checkout .', { strongest: 'DISCARD', step: { needsRefCheck: null, readings: null } });
 C('checkout -b moves', 'git checkout -b feat', { strongest: 'MOVE' });
 C('checkout -f discards the whole tree', 'git checkout -f', { strongest: 'DISCARD', step: { paths: null } });
-C('checkout -f main discards (narrower reading reported)', 'git checkout -f main', { strongest: 'DISCARD', step: { needsRefCheck: 'main', paths: ['main'], readings: { commit: { tier: 'DISCARD', scope: 'tracked', paths: null }, path: { tier: 'DISCARD', scope: 'tracked', paths: ['main'] } } } });
+C('checkout -f main discards every tracked file (wider reading reported)', 'git checkout -f main', { strongest: 'DISCARD', step: { needsRefCheck: 'main', scope: 'tracked', paths: null, readings: { commit: { tier: 'DISCARD', scope: 'tracked', paths: null }, path: { tier: 'DISCARD', scope: 'tracked', paths: ['main'] } } } });
 C('checkout HEAD~1 is a revision', 'git checkout HEAD~1', { strongest: 'MOVE', step: { needsRefCheck: null } });
 C('checkout - is the previous branch', 'git checkout -', { strongest: 'MOVE' });
 C('checkout main -- a.ts discards a.ts', 'git checkout main -- a.ts', { strongest: 'DISCARD', step: { paths: ['a.ts'] } });
 C('checkout -p is interactive', 'git checkout -p', { strongest: 'SAFE' });
 C('checkout --theirs a.ts discards', 'git checkout --theirs a.ts', { strongest: 'DISCARD', step: { paths: ['a.ts'] } });
-C('checkout a.ts b.ts discards', 'git checkout a.ts b.ts', { strongest: 'DISCARD', step: { paths: ['b.ts'], needsRefCheck: 'a.ts', readings: { commit: { tier: 'DISCARD', scope: 'tracked', paths: ['b.ts'] }, path: { tier: 'DISCARD', scope: 'tracked', paths: ['a.ts', 'b.ts'] } } } });
+C('checkout a.ts b.ts discards both files', 'git checkout a.ts b.ts', { strongest: 'DISCARD', step: { paths: ['a.ts', 'b.ts'], needsRefCheck: 'a.ts', readings: { commit: { tier: 'DISCARD', scope: 'tracked', paths: ['b.ts'] }, path: { tier: 'DISCARD', scope: 'tracked', paths: ['a.ts', 'b.ts'] } } } });
 C('checkout ./a.ts b.ts: both are paths', 'git checkout ./a.ts b.ts', { strongest: 'DISCARD', step: { paths: ['./a.ts', 'b.ts'], needsRefCheck: null, readings: null } });
 C('checkout HEAD~1 a.ts: a commit then a path', 'git checkout HEAD~1 a.ts', { strongest: 'DISCARD', step: { paths: ['a.ts'], needsRefCheck: null } });
 C('checkout -B main origin/main moves', 'git checkout -B main origin/main', { strongest: 'MOVE' });
@@ -174,7 +174,7 @@ C('checkout ./src/a.ts is a path', 'git checkout ./src/a.ts', { strongest: 'DISC
 C('checkout main -- with no paths moves', 'git checkout main --', { strongest: 'MOVE' });
 C('checkout --detach moves', 'git checkout --detach', { strongest: 'MOVE' });
 C('checkout <abbreviated hash> is a revision', 'git checkout abc1234', { strongest: 'MOVE', step: { needsRefCheck: null } });
-C('an all-letter hex word is left to the repository', 'git checkout deadbeef', { strongest: 'MOVE', step: { needsRefCheck: 'deadbeef' } });
+C('an all-letter hex word is left to the repository', 'git checkout deadbeef', { strongest: 'DISCARD', step: { needsRefCheck: 'deadbeef', paths: ['deadbeef'] } });
 
 // F — switch
 C('switch -c moves', 'git switch -c feat', { strongest: 'MOVE', step: { sub: 'switch' } });
@@ -453,6 +453,62 @@ C('cd to a computed top level is unverified', 'cd "$(git rev-parse --show-toplev
 C('CRLF line endings', 'git add a.ts\r\ngit commit -m x\r\n', { ok: true, staged: { 1: ['a.ts'] } });
 C('a backslash-newline continuation', 'git commit \\\n  -m x', { ok: true, step: { scope: 'index', flags: ['--message'] } });
 
+// R — adversarial review 2026-10-19: each case pins one fix
+// ambiguous words: the step covers everything either reading could destroy
+C('review: checkout a.txt b.txt covers both files', 'git checkout a.txt b.txt', { ok: true, strongest: 'DISCARD', step: { tier: 'DISCARD', scope: 'tracked', paths: ['a.txt', 'b.txt'], needsRefCheck: 'a.txt' } });
+C('review: checkout src/a.ts src/b.ts covers both files', 'git checkout src/a.ts src/b.ts', { strongest: 'DISCARD', step: { paths: ['src/a.ts', 'src/b.ts'] } });
+C('review: reset a.txt b.txt unstages both files', 'git reset a.txt b.txt', { strongest: 'UNSTAGE', step: { paths: ['a.txt', 'b.txt'] } });
+C('review: checkout -f <branch> discards every tracked file', 'git checkout -f main', { strongest: 'DISCARD', step: { scope: 'tracked', paths: null } });
+C('review: checkout README.md is DISCARD of the file, not MOVE', 'git checkout README.md', { ok: true, strongest: 'DISCARD', step: { tier: 'DISCARD', scope: 'tracked', paths: ['README.md'], needsRefCheck: 'README.md' } });
+C('review: checkout src/a.ts is DISCARD of the file', 'git checkout src/a.ts', { strongest: 'DISCARD', step: { paths: ['src/a.ts'] } });
+C('review: reset X stays the weaker UNSTAGE (MOVE loses nothing)', 'git reset file.txt', { strongest: 'UNSTAGE', step: { paths: ['file.txt'] } });
+C('review: an ambiguous reset of two files leaves nothing staged for the commit', 'git add a.txt b.txt && git reset a.txt b.txt && git commit -m x', { staged: { 2: [] } });
+// (( … )), $(( … )) and arrays that hide git
+C('review: ((x) ) is nested subshells', '((git reset --hard) )', { ok: false, strongest: 'DISCARD', step: { sub: 'reset' } });
+C('review: ((cd … && git add -A) && …) is nested subshells', '((cd sub && git add -A) && git status)', { ok: false, strongest: 'SWEEP', git: [{ sub: 'add', cwd: 'sub' }, { sub: 'status' }] });
+C('review: $( ) inside (( )) runs', '(( $(git clean -fdx) ))', { ok: false, strongest: 'DISCARD' });
+C('review: $( ) inside $(( )) runs', 'echo $(( $(git clean -fdx | wc -l) + 1 ))', { ok: false, strongest: 'DISCARD' });
+C('review: $( ) in a for (( )) header is unverified', 'for ((i=0; i<$(git rev-list --count HEAD); i++)); do :; done', { ok: false });
+C('review: plain arithmetic is still SAFE', '(( n > 1 )) && echo big', { ok: true, strongest: 'SAFE', gitCount: 0 });
+C('review: $( ) in an array assignment runs', 'arr=( $(git add -A) )', { strongest: 'SWEEP', step: { sub: 'add' } });
+C('review: backticks in an array assignment run', 'arr=( a `git clean -fdx` b )', { strongest: 'DISCARD' });
+C('review: a multi-line array assignment', 'arr=(\n  one\n  $(git stash)\n)', { strongest: 'PARK' });
+C('review: a plain array assignment', 'arr=(a b c); git status', { ok: true, strongest: 'READ' });
+// pathspec magic
+C('review: :(literal) is stripped from an EXPLICIT path', 'git add ":(literal)a.txt" && git commit -m x', { ok: true, step: { tier: 'EXPLICIT', paths: ['a.txt'] }, staged: { 1: ['a.txt'] } });
+C('review: :/ is stripped and unverified (relative to the top)', 'cd src && git add :/a.txt && git commit -m x', { ok: false, step: { tier: 'EXPLICIT', paths: ['a.txt'] }, reason: /top of the repository/ });
+C('review: :(top) is stripped and unverified', 'git add ":(top)a.txt"', { ok: false, step: { paths: ['a.txt'] } });
+C('review: :/ alone is the whole tree', 'git add :/', { ok: false, strongest: 'SWEEP' });
+C('review: an exclusion keeps its magic', 'git add a.txt ":!b.txt"', { ok: true, step: { tier: 'EXPLICIT', paths: ['a.txt', ':!b.txt'] } });
+// PowerShell aliases
+C('review: Set-Alias g git', 'Set-Alias g git; g reset --hard', { strongest: 'DISCARD', step: { sub: 'reset' } }, PS);
+C('review: New-Alias g git', 'New-Alias g git; g reset --hard', { strongest: 'DISCARD' }, PS);
+C('review: sal with named parameters', 'sal -Value git.exe -Name gg; gg add -A', { strongest: 'SWEEP' }, PS);
+C('review: New-Alias to a full git path', `New-Alias -Name g -Value 'C:${BS}Program Files${BS}Git${BS}cmd${BS}git.exe' -Scope Global; g stash`, { strongest: 'PARK' }, PS);
+C('review: an alias to something else stays SAFE', 'Set-Alias ll Get-ChildItem; ll', { ok: true, strongest: 'SAFE' }, PS);
+C('review: an alias to a variable is unverified', 'Set-Alias g $x; g reset --hard', { ok: false }, PS);
+// submodule foreach
+C('review: submodule foreach is walked, unverified', "git submodule foreach 'git clean -fdx'", { ok: false, strongest: 'DISCARD', git: [{ sub: 'submodule' }, { sub: 'clean', ok: false }] });
+C('review: submodule foreach --recursive with bare words', 'git submodule foreach --recursive git reset --hard', { ok: false, strongest: 'DISCARD' });
+C('review: submodule update is SAFE', 'git submodule update --init --recursive', { ok: true, strongest: 'SAFE' });
+// a cd before ; or a newline may have failed
+C('review: cd ; git add is unverified', 'cd nonexist 2>/dev/null; git add a.txt', { ok: false, step: { cwd: 'nonexist', ok: false } });
+C('review: cd newline git add is unverified', 'cd src\ngit add a.txt', { ok: false });
+C('review: Set-Location ; git add is unverified', 'cd src; git add a.txt', { ok: false }, PS);
+C('review: cd || exit ; git add is certain', 'cd src || exit 1; git add a.txt', { ok: true, step: { cwd: 'src', ok: true } });
+C('review: cd && git add stays certain', 'cd src && git add a.txt', { ok: true, step: { cwd: 'src' } });
+// hidden options
+C('review: commit --allow-empty is read', 'git commit --allow-empty -m x', { ok: true, strongest: 'SWEEP', step: { flags: ['--allow-empty'] } });
+C('review: commit --allow-empty-message with paths', 'git commit --allow-empty-message -m "" -- a.txt', { ok: true, strongest: 'EXPLICIT' });
+C('review: add --warn-embedded-repo is read', 'git add --no-warn-embedded-repo a.txt', { ok: true, strongest: 'EXPLICIT' });
+// limits keep a visible destructive step in strongest
+C('review: past the step limit strongest still sees git reset --hard', 'true;'.repeat(401) + 'git reset --hard', { ok: false, strongest: 'DISCARD', reason: /rough reading/ });
+C('review: past the length limit strongest still sees git reset --hard', 'git reset --hard # ' + 'x'.repeat(200001), { ok: false, strongest: 'DISCARD', steps: 0 });
+// home directory
+C('review: cd ~/proj is unverified', 'cd ~/proj && git add a.txt', { ok: false, reason: /home directory/ });
+C('review: git -C ~/proj is unverified', 'git -C ~/proj add a.txt', { ok: false });
+C('review: bare cd goes home, unverified', 'cd && git add a.txt', { ok: false });
+
 // ── run the table ───────────────────────────────────────────────────────────
 const sameJSON = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 function checkStep(actual, expected, where) {
@@ -509,14 +565,20 @@ console.log('R1 result contract');
         && Array.isArray(s.flags) && typeof s.ok === 'boolean' && (s.action === null || typeof s.action === 'string')
         && (s.needsRefCheck === null || typeof s.needsRefCheck === 'string')
         && ((s.needsRefCheck === null && s.readings === null) || (typeof s.needsRefCheck === 'string' && s.readings && TIERS.includes(s.readings.commit.tier) && TIERS.includes(s.readings.path.tier)))
-        && (s.readings === null || tierRank(s.tier) === Math.min(tierRank(s.readings.commit.tier), tierRank(s.readings.path.tier)));
+        && (s.readings === null || (() => {
+          const hi = Math.max(tierRank(s.readings.commit.tier), tierRank(s.readings.path.tier));
+          const lo = Math.min(tierRank(s.readings.commit.tier), tierRank(s.readings.path.tier));
+          return tierRank(s.tier) === (hi >= tierRank('PARK') ? hi : lo);
+        })());
       if (!good) { shapeProblems++; console.log(`      bad step shape in ${JSON.stringify(c.command)}: ${JSON.stringify(s)}`); }
       if (!s.git && s.tier !== 'SAFE') shapeProblems++;
       if (s.tier !== 'SAFE' && !r.reasons.some((x) => x.startsWith(`step ${s.index} `) && x.includes(s.tier))) reasonProblems++;
       if (!s.ok && r.ok) shapeProblems++;
     });
     const max = r.steps.reduce((t, s) => (tierRank(s.tier) > tierRank(t) ? s.tier : t), 'SAFE');
-    if (r.strongest !== max) strongestProblems++;
+    // past an input limit a rough reading of the unread text may raise strongest (never with ok: true)
+    const rough = !r.ok && r.reasons.some((x) => /rough reading/.test(x));
+    if (rough ? tierRank(r.strongest) < tierRank(max) : r.strongest !== max) strongestProblems++;
     for (const k of Object.keys(r.stagedBeforeCommit)) {
       const s = r.steps[Number(k)];
       if (!s || s.sub !== 'commit' || s.tier === 'SAFE' || !Array.isArray(r.stagedBeforeCommit[k])) stagedProblems++;
@@ -524,7 +586,7 @@ console.log('R1 result contract');
     for (const s of r.steps) if (s.sub === 'commit' && s.tier !== 'SAFE' && !(String(s.index) in r.stagedBeforeCommit)) stagedProblems++;
   }
   ok(shapeProblems === 0, `every step has the V1_SCOPE fields with the right types (${shapeProblems} problems)`);
-  ok(strongestProblems === 0, `strongest is the max tier over steps (${strongestProblems} problems)`);
+  ok(strongestProblems === 0, `strongest is the max tier over steps (or above it, from a rough reading past a limit) (${strongestProblems} problems)`);
   ok(stagedProblems === 0, `stagedBeforeCommit has exactly one entry per committing step (${stagedProblems} problems)`);
   ok(reasonProblems === 0, `every risky step has a reason naming its tier (${reasonProblems} missing)`);
   const cmd = 'cd sub && git add a.ts && git commit -m "$(cat <<\'EOF\'\nx\nEOF\n)"';
@@ -547,6 +609,18 @@ console.log('R1 result contract');
   ok(mentionsGit('git status') && mentionsGit('cd x && git.exe add -A') && mentionsGit('gh pr checkout 3'), 'mentionsGit: the guard gate matches git invocations');
   ok(!mentionsGit('ls -la') && !mentionsGit('digit 3'), 'mentionsGit: unrelated commands stay out of the classifier');
   ok(mentionsGit(`powershell -enc ${Buffer.from('git add -A', 'utf16le').toString('base64')}`), 'mentionsGit: an encoded PowerShell command is let through to be decoded');
+  ok(mentionsGit('pwsh -NoProfile -EncodedCommand ZwBpAHQA') && mentionsGit('echo x\npowershell.exe /e ZwBpAHQA ') && !mentionsGit('powershell -NoProfile -Command Get-Date'), 'mentionsGit: the encoded switch is found anywhere after the program name, line by line');
+  {
+    const t0 = Date.now();
+    mentionsGit('powershell '.repeat(20000));
+    mentionsGit('pwsh x '.repeat(30000));
+    const ms = Date.now() - t0;
+    ok(ms < 300, `mentionsGit stays linear on long input (${ms} ms for 380k characters)`);
+    const t1 = Date.now();
+    const big = classifyCommand('git reset x; '.repeat(16000));
+    const ms1 = Date.now() - t1;
+    ok(big.ok === false && ms1 < 4000, `a long command past every limit answers inside the hook budget (${ms1} ms)`);
+  }
   const step = classifyCommand('git add -A').steps[0];
   ok(sameJSON(Object.keys(step), ['index', 'raw', 'git', 'cwd', 'sub', 'tier', 'scope', 'paths', 'flags', 'action', 'needsRefCheck', 'readings', 'ok']), 'a step carries the V1_SCOPE fields plus action, needsRefCheck, readings and ok');
 }
@@ -655,6 +729,24 @@ console.log('R3 option tables vs git -h');
         }
       }
       if (strict) ok(drift === 0, `every option table matches git ${probe.stdout.trim()} (${Object.keys(GIT_OPTION_SPECS).length} verbs)`);
+      // hidden options: --git-completion-helper-all minus --git-completion-helper (long, positive names)
+      let hiddenDrift = 0;
+      for (const verb of Object.keys(GIT_OPTION_SPECS)) {
+        const words = (flag) => String(git(...verb.split(' '), flag).stdout || '').trim().split(/\s+/).filter(Boolean);
+        const visible = new Set(words('--git-completion-helper'));
+        const live = new Set(words('--git-completion-helper-all').filter((x) => !visible.has(x) && x.startsWith('--') && !x.startsWith('--no-')).map((x) => x.slice(2).replace(/=$/, '')));
+        const shown = new Set(GIT_OPTION_SPECS[verb].split(/\s+/).map((t) => (/\|([\w-]+)/.exec(t) || [])[1]).filter(Boolean));
+        for (const x of shown) live.delete(x);
+        const ours = new Set(String(GIT_HIDDEN_OPTION_SPECS[verb] || '').split(/\s+/).filter(Boolean).map((t) => t.replace(/^\|/, '').replace(/=$/, '')));
+        const missing = [...live].filter((t) => !ours.has(t));
+        const extra = [...ours].filter((t) => !live.has(t));
+        if (missing.length || extra.length) {
+          hiddenDrift++;
+          const note = `git ${verb} hidden options differ: missing ${missing.join(' ') || '-'}; not in git ${extra.join(' ') || '-'}`;
+          if (strict) ok(false, note); else console.log(`  (git ${version}) ${note}`);
+        }
+      }
+      if (strict) ok(hiddenDrift === 0, 'every hidden-option table matches --git-completion-helper-all');
       else console.log(`  (git ${version} is not the 2.53 baseline: ${drift} table(s) differ, reported above, not failed)`);
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });

@@ -16,9 +16,10 @@
 // directory only the shell knows (`cd $DIR`, a `cd` that may not have run), git pointed elsewhere
 // (GIT_DIR, --git-dir, GIT_INDEX_FILE), a git verb that is not a built-in (an alias) and an
 // ambiguous dialect. Where git's reading depends on the repository (`git checkout X` switches
-// branches when X is a branch and discards changes when X is a file) the step reports the weaker
-// reading, plus `needsRefCheck: X` and both readings, so the caller can settle it with one
-// `git rev-parse --verify --quiet --end-of-options X^{commit}`.
+// branches when X is a branch and discards changes when X is a file) the step covers everything
+// either reading could destroy (the reading that takes work out of the tree, or the union of the
+// paths at equal tiers), plus `needsRefCheck: X` and both readings, so the caller can narrow it with
+// one `git rev-parse --verify --quiet --end-of-options X^{commit}`.
 //
 // FALSE-POSITIVE GUARDS. Only command words are classified. Text that is data never is: arguments
 // of echo / printf / Write-Host, patterns of grep / rg / Select-String, `git log -S/-G/--grep`
@@ -57,7 +58,8 @@
 //     needsRefCheck  (additive) the word whose meaning depends on the repository, or null
 //     readings       (additive) with needsRefCheck: { commit, path }, each { tier, scope, paths }:
 //                    the reading when the word names a commit and when it does not. The step's
-//                    own tier/scope/paths are the weaker of the two (the narrower at equal tiers).
+//                    own tier/scope/paths cover both: the stronger reading when it is PARK or
+//                    above, else the weaker; at equal tiers the union of the paths.
 //     ok             (additive) false when this step could not be verified
 //   strongest  the strongest tier over all steps
 //   stagedBeforeCommit  { [commitStepIndex]: string[] } for every step that creates a commit: the
@@ -82,10 +84,20 @@ const stronger = (a, b) => (tierRank(b) > tierRank(a) ? b : a);
 // The guard's cheap pre-check (spec §1.7) plus PowerShell's encoded-command switch, whose payload can
 // start git without the word "git" appearing anywhere in the text.
 export const GIT_GATE_RE = /\bgit(?:\.exe|\.cmd)?\b|\bgh(?:\.exe)?\s+pr\s+(?:checkout|merge)\b/i;
-const ENCODED_SWITCH_RE = /\b(?:powershell|pwsh)(?:\.exe)?\b[^\n]*?\s[-/]e(?:c|n[a-z]*)?\s/i;
+// Linear: per line only the first powershell/pwsh matters, since every later one sees a suffix of
+// the same tail (one regex rescanned the line from each occurrence, which is quadratic).
+const PS_NAME_RE = /\b(?:powershell|pwsh)(?:\.exe)?\b/i;
+const ENCODED_TAIL_RE = /\s[-/]e(?:c|n[a-z]*)?\s/i;
+function mentionsEncodedSwitch(text) {
+  for (const line of text.split('\n')) {
+    const m = PS_NAME_RE.exec(line);
+    if (m && ENCODED_TAIL_RE.test(line.slice(m.index + m[0].length))) return true;
+  }
+  return false;
+}
 export function mentionsGit(command) {
   const text = Array.isArray(command) ? command.map(String).join(' ') : String(command ?? '');
-  return GIT_GATE_RE.test(text) || ENCODED_SWITCH_RE.test(text);
+  return GIT_GATE_RE.test(text) || mentionsEncodedSwitch(text);
 }
 
 const MAX_INPUT = 200000;
@@ -137,13 +149,24 @@ export const GIT_OPTION_SPECS = Object.freeze({
   'ls-files': 'z| t| v| f| c|cached d|deleted m|modified o|others i|ignored s|stage k|killed |directory |eol |empty-directory u|unmerged |resolve-undo x|exclude= X|exclude-from= |exclude-per-directory= |exclude-standard |full-name |recurse-submodules |error-unmatch |with-tree= |abbrev? |debug |deduplicate |sparse |format=',
 });
 
+// Options git accepts but leaves out of `-h` (PARSE_OPT_HIDDEN): `git <verb> --git-completion-helper-all`
+// minus `--git-completion-helper` (Git 2.53.0), so a command that uses one is still read.
+export const GIT_HIDDEN_OPTION_SPECS = Object.freeze({
+  add: '|warn-embedded-repo',
+  commit: '|allow-empty |allow-empty-message',
+  rebase: '|ignore-date |preserve-merges |keep-empty |allow-empty-message',
+  pull: '|summary',
+  am: '|binary |rebasing',
+  'read-tree': '|super-prefix=',
+});
+
 const TABLES = new Map();
 function optTable(key) {
   let table = TABLES.get(key);
   if (table) return table;
   const short = new Map();
   const long = new Map();
-  for (const token of String(GIT_OPTION_SPECS[key] || '').split(/\s+/)) {
+  for (const token of `${GIT_OPTION_SPECS[key] || ''} ${GIT_HIDDEN_OPTION_SPECS[key] || ''}`.split(/\s+/)) {
     const m = /^([^|]?)\|([A-Za-z0-9][\w-]*)?([=?]?)$/.exec(token);
     if (!m) continue;
     const entry = { name: m[2] || m[1], short: m[1] || null, long: m[2] || null, arity: m[3] === '=' ? 'req' : m[3] === '?' ? 'opt' : 'none' };
@@ -246,6 +269,9 @@ function normDir(p) {
   if (/^[A-Za-z]:$/.test(n)) n += '/';
   return n === '.' ? '' : n;
 }
+// `~` is the user's home: a pure module cannot expand it, so a directory under it is never certain
+const underHome = (p) => /^~/.test(String(p ?? ''));
+const homeWhy = (what, p) => `${what} ${clip(p, 40)} is under the home directory, which only the caller can resolve`;
 const isAbsDir = (p) => /^(?:[A-Za-z]:(?:[\\/]|$)|[\\/]|~(?:[\\/]|$))/.test(p);
 function joinDir(base, next) {
   const n = String(next ?? '').replace(/\\/g, '/');
@@ -265,13 +291,16 @@ function isDirLike(p) {
 }
 // 'narrow' (one file, as far as text can tell), 'broad' (a directory, a glob, the whole tree) or
 // 'exclude' (an exclusion that adds nothing by itself).
+// Returns { kind, rest, top }: `rest` is the path with its magic prefix removed, `top` is true when the
+// magic makes it relative to the top of the repository (`:/x`, `:(top)x`) rather than to the cwd.
 function pathspecKind(spec, literal) {
   let rest = spec;
+  const at = (kind, top = false) => ({ kind, rest, top });
   if (!literal && spec.startsWith(':')) {
     const magic = new Set();
     if (spec[1] === '(') {
       const close = spec.indexOf(')');
-      if (close < 0) return 'broad';
+      if (close < 0) return at('broad');
       for (const m of spec.slice(2, close).split(',')) magic.add(m.trim().toLowerCase().split(':')[0]);
       rest = spec.slice(close + 1);
     } else {
@@ -280,24 +309,31 @@ function pathspecKind(spec, literal) {
       if (spec[k] === ':') k++;
       rest = spec.slice(k);
     }
-    if (magic.has('exclude')) return 'exclude';
-    if (magic.has('glob') || magic.has('icase') || magic.has('attr')) return 'broad';
-    if (isDirLike(rest)) return 'broad';
-    if (magic.has('literal')) return 'narrow';
+    const top = magic.has('top');
+    if (magic.has('exclude')) return at('exclude', top);
+    if (magic.has('glob') || magic.has('icase') || magic.has('attr')) return at('broad', top);
+    if (isDirLike(rest)) return at('broad', top);
+    if (magic.has('literal')) return at('narrow', top);
+    if (/[*?[]/.test(rest)) return at('broad', top);
+    return at('narrow', top);
   }
-  if (isDirLike(rest)) return 'broad';
-  if (!literal && /[*?[]/.test(rest)) return 'broad';
-  return 'narrow';
+  if (isDirLike(rest)) return at('broad');
+  if (!literal && /[*?[]/.test(rest)) return at('broad');
+  return at('narrow');
 }
 function pathspecs(words, info) {
   const out = { paths: [], broad: false, unknown: false, why: [] };
   let positive = false;
   let exclude = false;
   for (const w of words) {
-    out.paths.push(hostPath(w.value, info.ctx));
-    if (w.dyn) { out.unknown = true; out.why.push(`the pathspec ${clip(w.raw, 40)} is only known when the shell runs`); continue; }
-    if (w.glob && info.ctx.dialect === 'posix') { out.unknown = true; out.why.push(`the shell expands ${clip(w.raw, 40)} against the disk first`); continue; }
-    const kind = pathspecKind(w.value, info.literal);
+    if (w.dyn) { out.paths.push(hostPath(w.value, info.ctx)); out.unknown = true; out.why.push(`the pathspec ${clip(w.raw, 40)} is only known when the shell runs`); continue; }
+    if (w.glob && info.ctx.dialect === 'posix') { out.paths.push(hostPath(w.value, info.ctx)); out.unknown = true; out.why.push(`the shell expands ${clip(w.raw, 40)} against the disk first`); continue; }
+    const spec = pathspecKind(w.value, info.literal);
+    const kind = spec.kind;
+    // the path is reported without its magic, so a file key can match it (an exclusion keeps its
+    // magic: it names a file the command leaves alone)
+    out.paths.push(hostPath(kind === 'exclude' ? w.value : spec.rest || '.', info.ctx));
+    if (spec.top && info.unc) info.unc.push(`${clip(w.raw, 40)} is relative to the top of the repository, not to the current directory`);
     if (kind === 'exclude') { exclude = true; continue; }
     positive = true;
     if (kind === 'broad') out.broad = true;
@@ -490,8 +526,15 @@ function commandP(P, closer) {
   const start = P.i;
   if (src[P.i] === '(') {
     if (src[P.i + 1] === '(') {
-      P.i = skipArith(P, P.i + 2);
-      return { kind: 'simple', words: [], assigns: [], redirs: [], start, end: P.i, depth: P.cdepth, src };
+      const end = skipArith(P, P.i + 2);
+      if (!mentionsGitWord(src.slice(start, end))) {
+        P.i = end;
+        return { kind: 'simple', words: [], assigns: [], redirs: [], start, end: P.i, depth: P.cdepth, src };
+      }
+      // bash reads `((x) )` as two nested subshells and runs the `$( )` inside `(( ))`: text that
+      // mentions git is read as nested subshells so its git steps are found, and the command is
+      // never decided on that reading
+      P.errors.push('(( … )) that mentions git may be nested subshells or a command substitution');
     }
     P.i++;
     const seq = nestedSeqP(P);
@@ -554,7 +597,12 @@ function forHeaderP(P, cmd) {
   const { src } = P;
   cmd.header = true;
   skipBlankP(P);
-  if (src.startsWith('((', P.i)) { P.i = skipArith(P, P.i + 2); return; }
+  if (src.startsWith('((', P.i)) {
+    const start = P.i;
+    P.i = skipArith(P, P.i + 2);
+    if (mentionsGitWord(src.slice(start, P.i))) P.errors.push('for (( … )) that mentions git may run a command substitution');
+    return;
+  }
   wordP(P, false);
   skipBlankP(P);
   const save = P.i;
@@ -668,25 +716,41 @@ function procSubstP(P, w) {
   addDyn(w, P.src.slice(start, P.i));
 }
 
+// NAME=( words ): each element is a word, so its substitutions (`$( )`, backticks) are walked.
 function arrayAssignP(P, w) {
   const { src } = P;
   const start = P.i;
-  let depth = 0;
-  for (; P.i < src.length; P.i++) {
-    if (src[P.i] === '(') depth++;
-    else if (src[P.i] === ')') { depth--; if (depth === 0) { P.i++; break; } }
+  P.i++;
+  for (;;) {
+    for (;;) { skipBlankP(P); if (src[P.i] === '\n') { P.i++; continue; } break; }
+    if (P.i >= src.length) { P.errors.push("missing ')' after an array assignment"); break; }
+    if (src[P.i] === ')') { P.i++; break; }
+    const at = P.i;
+    const el = wordP(P, false);
+    w.subs.push(...el.subs);
+    if (P.i === at) { P.errors.push('an array assignment is not analysed'); P.i = src.length; break; }
   }
   addText(w, src.slice(start, P.i), false);
 }
+const mentionsGitWord = (text) => /\bgit\b/i.test(text);
 
 function dollarP(P, w, inDouble) {
   const { src } = P;
   const n = src[P.i + 1];
   if (n === '(' && src[P.i + 2] === '(') {
     const start = P.i;
-    P.i = skipArith(P, P.i + 3);
-    const text = src.slice(start, P.i);
-    if (/\bgit\b/.test(text)) P.errors.push('$(( … )) that mentions git may be a command substitution');
+    const end = skipArith(P, P.i + 3);
+    const text = src.slice(start, end);
+    if (mentionsGitWord(text)) {
+      // read as `$(` around a subshell, so a git command inside is found; never decided on it
+      P.errors.push('$(( … )) that mentions git may be a command substitution');
+      P.i += 2;
+      const seq = nestedSeqP(P);
+      w.subs.push({ seq, kind: '$(' });
+      addDyn(w, src.slice(start, P.i));
+      return;
+    }
+    P.i = end;
     addDyn(w, text);
     return;
   }
@@ -1349,7 +1413,13 @@ function newCtx(dialect, platform) {
 const forkCtx = (ctx) => ({ ...ctx, stack: ctx.stack.slice(), env: { ...ctx.env } });
 
 function walkSeq(seq, ctx, R) {
-  for (const list of seq.lists) walkList(list, ctx, R);
+  for (const list of seq.lists) {
+    walkList(list, ctx, R);
+    if (ctx.cdLoose) {
+      ctx.cdLoose = false;
+      ctx.cwdUnc = ctx.cwdUnc || 'a cd whose failure would not stop the commands after it decides the directory';
+    }
+  }
 }
 
 function walkList(list, ctx, R) {
@@ -1362,6 +1432,9 @@ function walkList(list, ctx, R) {
     if (walkPipeline(list.items[k], c, R)) cdAt = k;
   }
   c.localUnc = outer;
+  // a failed cd does not stop what comes after `;` or a newline (Set-Location failing is not
+  // terminating either), so the directory of later commands is only certain behind `cd … || exit`
+  if (cdAt >= 0 && !list.bg && !(list.ops[cdAt] === '||' && isExitLike(list.items[cdAt + 1]))) c.cdLoose = true;
   if (cdAt > 0) c.cwdUnc = c.cwdUnc || 'a cd that runs only if an earlier command succeeds decides the directory';
   else if (cdAt === 0 && list.ops[0] === '||' && !isExitLike(list.items[1])) c.cwdUnc = c.cwdUnc || 'after `cd … || …` the next command runs in either directory';
 }
@@ -1542,6 +1615,7 @@ function uncertainAt(R, step, why) {
   R.uncertain.push(`step ${step.index} \`${clip(step.raw)}\`: could not verify — ${why}`);
 }
 
+const PS_ALIAS_NAMES = new Set(['set-alias', 'new-alias', 'sal', 'nal']);
 const POSIX_SHELLS = new Set(['bash', 'sh', 'zsh', 'dash', 'ksh', 'ash', 'mksh']);
 const CD_NAMES = {
   posix: new Set(['cd', 'pushd', 'popd', 'chdir']),
@@ -1565,8 +1639,33 @@ function classifyArgv(argv, ctx, R, base) {
     return false;
   }
   const name = progName(a0);
-  if (isGitName(name)) return gitStep(u.argv.slice(1), ctx, R, { ...base, env, notes, u });
+  if (isGitName(name) || (ps && R.psGitAliases && R.psGitAliases.has(name))) return gitStep(u.argv.slice(1), ctx, R, { ...base, env, notes, u });
   const rest = u.argv.slice(1);
+  if (ps && PS_ALIAS_NAMES.has(name)) {
+    // `Set-Alias g git` makes `g` run git for the rest of the runspace
+    const step = pushStep(R, ctx, { raw: base.raw, notes });
+    const named = {};
+    const pos = [];
+    for (let j = 0; j < rest.length; j++) {
+      const a = rest[j];
+      const m = !a.dyn && /^-(name|value|n|v|definition)$/i.exec(a.value);
+      if (m) { named[m[1][0].toLowerCase()] = rest[++j]; continue; }
+      if (!a.dyn && /^-/.test(a.value)) { if (/^-(?:option|scope|description)$/i.test(a.value)) j++; continue; }
+      pos.push(a);
+    }
+    const alias = named.n || pos[0];
+    const value = named.v || named.d || pos[named.n ? 0 : 1];
+    if (!alias || !value) return false;
+    if (value.dyn || alias.dyn) {
+      uncertainAt(R, step, 'an alias whose name or target is only known when the shell runs may stand for git');
+      return false;
+    }
+    if (isGitName(progName(value))) {
+      if (!R.psGitAliases) R.psGitAliases = new Set();
+      R.psGitAliases.add(alias.value.toLowerCase());
+    }
+    return false;
+  }
   if (CD_NAMES[ctx.dialect] && CD_NAMES[ctx.dialect].has(name)) {
     pushStep(R, ctx, { raw: base.raw, notes });
     const before = [ctx.cwd, ctx.cwdUnc];
@@ -1634,6 +1733,7 @@ function unwrap(argv, ctx) {
   const setCwd = (d) => {
     if (!d) return;
     if (d.dyn) out.unc.push(`the directory ${clip(d.raw, 40)} is only known when the shell runs`);
+    else if (underHome(d.value)) out.unc.push(homeWhy('the directory', d.value));
     out.cwd = joinDir(out.cwd, hostPath(d.value, ctx));
   };
   for (let guard = 0; guard < 16 && out.argv.length; guard++) {
@@ -1802,6 +1902,7 @@ function applyCd(name, args, ctx, cmd) {
     return;
   }
   if (dyn) ctx.cwdUnc = ctx.cwdUnc || `cd ${clip(target, 40)} goes to a directory that is only known when the shell runs`;
+  else if (underHome(target)) ctx.cwdUnc = ctx.cwdUnc || homeWhy(name, target);
   if (kind === 'push') ctx.stack.push(before);
   ctx.oldpwd = before;
   ctx.cwd = joinDir(before, hostPath(target, ctx));
@@ -2019,6 +2120,12 @@ function gitStep(args, ctx, R, base) {
     unc: [...unc, ...r.unc],
     commitsIndex: r.commitsIndex,
   });
+  if (r.subScript !== undefined) {
+    const c = forkCtx(ctx);
+    c.cwd = r.cwd;
+    c.cwdUnc = 'git submodule foreach runs it inside each submodule checkout, not in this working tree';
+    walkSource(r.subScript, 'posix', c, R, true);
+  }
   if (r.shellAlias !== undefined) {
     // git runs a `!` alias with sh from the top level of the repository
     const c = forkCtx(ctx);
@@ -2053,6 +2160,7 @@ function classifyGitArgs(args, info) {
       const dir = args[++i];
       if (!dir) { out.notes.push('git -C without a directory: git refuses'); return out; }
       if (dir.dyn) out.unc.push('git -C points at a directory that is only known when the shell runs');
+      if (!dir.dyn && underHome(dir.value)) out.unc.push(homeWhy('git -C', dir.value));
       if (dir.value !== '') out.cwd = joinDir(out.cwd, hostPath(dir.value, info.ctx));
       continue;
     }
@@ -2120,7 +2228,9 @@ function classifyGitArgs(args, info) {
   out.sub = verb;
   const handler = VERBS[verb];
   if (!handler) return out; // a known command that never touches uncommitted work
-  const r = handler(rest, { ctx: info.ctx, literal, config });
+  const pathUnc = [];
+  const r = handler(rest, { ctx: info.ctx, literal, config, unc: pathUnc });
+  out.unc.push(...new Set(pathUnc));
   out.tier = r.tier;
   out.scope = r.scope;
   out.paths = r.paths;
@@ -2128,6 +2238,7 @@ function classifyGitArgs(args, info) {
   out.needsRefCheck = r.needsRefCheck;
   out.readings = r.readings;
   out.commitsIndex = r.commitsIndex;
+  if (r.subScript !== undefined) out.subScript = r.subScript;
   out.flags.push(...r.flags);
   out.why.push(...r.why);
   out.notes.push(...r.notes);
@@ -2150,18 +2261,35 @@ function put(r, tier, scope, paths, why) {
 }
 
 // A word git reads as a commit when one by that name exists and as a path otherwise (`checkout X`,
-// `reset X`, `checkout X Y`). The step reports the weaker reading (or, at equal tiers, the narrower
-// one), so a caller that never resolves the word cannot ask or deny on a guess; both readings are
-// handed over for the caller that runs `git rev-parse --verify --quiet --end-of-options X^{commit}`.
+// `reset X`, `checkout X Y`). The step must cover everything the command could destroy for a caller
+// that reads only tier/scope/paths, so:
+//   - when the readings differ in tier and the stronger one takes work out of the tree (PARK and up),
+//     the stronger reading is reported (a rescue copy and the ownership check then cover its paths);
+//   - when they differ in tier below that, the weaker reading is reported (nothing is lost either
+//     way, and no caller should ask on a guess);
+//   - at equal tiers the UNION is reported: paths null in either reading (every file in scope) wins,
+//     otherwise both path lists merged.
+// Both readings are handed over for the caller that runs
+// `git rev-parse --verify --quiet --end-of-options X^{commit}` and can narrow the answer.
 function ambiguous(r, word, asCommit, asPath, note) {
   const shape = (x) => ({ tier: x.tier, scope: x.scope, paths: x.paths && x.paths.length ? x.paths : null });
-  const width = (x) => (x.paths && x.paths.length ? x.paths.length : Infinity);
   r.needsRefCheck = word;
   r.readings = { commit: shape(asCommit), path: shape(asPath) };
   r.notes.push(note);
   const rankDiff = tierRank(asCommit.tier) - tierRank(asPath.tier);
-  const pick = rankDiff < 0 || (rankDiff === 0 && width(asCommit) <= width(asPath)) ? asCommit : asPath;
-  return put(r, pick.tier, pick.scope, pick.paths, pick.why);
+  if (rankDiff !== 0) {
+    const strong = rankDiff > 0 ? asCommit : asPath;
+    const weak = rankDiff > 0 ? asPath : asCommit;
+    const pick = tierRank(strong.tier) >= tierRank('PARK') ? strong : weak;
+    return put(r, pick.tier, pick.scope, pick.paths, pick.why);
+  }
+  const pc = shape(asCommit).paths;
+  const pp = shape(asPath).paths;
+  const paths = pc && pp ? [...new Set([...pp, ...pc])] : null;
+  const scope = paths ? (asCommit.scope === asPath.scope ? asCommit.scope : asPath.scope) : (pc ? asPath.scope : asCommit.scope);
+  const wide = paths ? null : pc ? asPath : asCommit;
+  const why = wide ? wide.why : `${asPath.why} (or, if ${word} is a commit, ${asCommit.why})`;
+  return put(r, asCommit.tier, scope, paths, why);
 }
 const listOf = (paths, max = 3) => (paths.length > max ? `${paths.slice(0, max).join(', ')} and ${paths.length - max} more` : paths.join(', '));
 function unknownPaths(r, ps, extra) {
@@ -2336,6 +2464,28 @@ const VERBS = {
       { tier: 'DISCARD', scope: 'tracked', paths: after, why: `overwrites ${listOf(after)} with the version in ${first.value}` },
       { tier: 'DISCARD', scope: 'tracked', paths: all.paths, why: `throws away unstaged changes to ${listOf(all.paths)}` },
       `"${first.value}" is a commit to check the other paths out of, or one more path; the caller resolves it with git rev-parse --verify`);
+  },
+
+  submodule(rest) {
+    // `git submodule [--quiet] foreach [--recursive] <command>` runs a shell command inside every
+    // submodule checkout; the command is walked so its git steps show (never decided: they act on
+    // the submodules, not on this working tree)
+    let j = 0;
+    while (j < rest.length && !rest[j].dyn && /^(?:-q|--quiet)$/.test(rest[j].value)) j++;
+    const r = res(null);
+    const verb = rest[j];
+    if (!verb) return r;
+    if (verb.dyn) { r.unc.push('the submodule command is only known when the shell runs'); return r; }
+    r.action = verb.value;
+    if (verb.value !== 'foreach') return r;
+    j++;
+    while (j < rest.length && !rest[j].dyn && /^(?:-q|--quiet|--recursive)$/.test(rest[j].value)) j++;
+    const script = rest.slice(j);
+    if (!script.length) return r;
+    if (script.some((a) => a.dyn)) r.unc.push('git submodule foreach runs a command that is only known when the shell runs');
+    r.subScript = script.length === 1 ? script[0].value : script.map((a) => `'${a.value.replace(/'/g, "'\\''")}'`).join(' ');
+    r.notes.push('git submodule foreach runs its command inside every submodule checkout');
+    return r;
   },
 
   switch(rest) {
@@ -2588,12 +2738,40 @@ function run(source, dialect, platform) {
     const parsed = parseSource(source, dialect, 0);
     for (const e of parsed.errors) R.errors.push(e);
     walkSeq(parsed.seq, newCtx(dialect, platform), R);
-    return finish(R, dialect);
+    const out = finish(R, dialect);
+    if (R.errors.includes(TOO_MANY_STEPS)) {
+      // the commands past the cutoff were never read: a rough reading keeps a visible
+      // `git reset --hard` from hiding behind padding
+      const seen = glimpse(source, dialect, platform);
+      if (tierRank(seen) > tierRank(out.strongest)) {
+        out.strongest = seen;
+        out.reasons.push(`strongest is a rough reading of the git commands visible in the text (${seen})`);
+      }
+    }
+    return out;
   } catch (err) {
     // The guard's contract is "never throw": a bug here must turn into "could not verify".
     R.errors.push(`classifier error: ${clip(err && err.message ? err.message : err, 120)}`);
     return finish(R, dialect);
   }
+}
+
+// A rough reading for text the parser gave up on: each `git ...` up to the next command separator is
+// classified on its own, and the strongest tier wins. Only ever used with ok: false.
+const GLIMPSE_MAX = 500;
+function glimpse(text, dialect, platform) {
+  let best = 'SAFE';
+  const re = /\bgit(?:\.exe|\.cmd)?\b/gi;
+  let m;
+  let n = 0;
+  while ((m = re.exec(text)) && n++ < GLIMPSE_MAX) {
+    const tail = text.slice(m.index, m.index + 600);
+    const cut = tail.search(/[;&|\n)`#]/);
+    const seg = cut < 0 ? tail : tail.slice(0, cut);
+    for (const d of dialect ? [dialect] : ['posix', 'powershell']) best = stronger(best, run(seg, d, platform).strongest);
+    if (best === 'SWEEP') break;
+  }
+  return best;
 }
 
 export function classifyCommand(command, options = {}) {
@@ -2604,7 +2782,8 @@ export function classifyCommand(command, options = {}) {
     return { ok: false, dialect: d, steps: [], strongest: 'SAFE', stagedBeforeCommit: {}, reasons: ['could not parse: the command is not text'] };
   }
   if (command.length > MAX_INPUT) {
-    return { ok: false, dialect: d, steps: [], strongest: 'SAFE', stagedBeforeCommit: {}, reasons: [`could not parse: the command is longer than ${MAX_INPUT} characters`] };
+    const seen = glimpse(command, d, platform);
+    return { ok: false, dialect: d, steps: [], strongest: seen, stagedBeforeCommit: {}, reasons: [`could not parse: the command is longer than ${MAX_INPUT} characters`, ...(seen !== 'SAFE' ? [`strongest is a rough reading of the git commands visible in the text (${seen})`] : [])] };
   }
   if (d) return run(command, d, platform);
   // Ambiguous dialect: a backtick is an escape in PowerShell and a command substitution in POSIX,

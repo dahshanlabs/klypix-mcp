@@ -1,7 +1,7 @@
 # Checking temporary file reservations
 
-Introduced in klypix-mcp 1.102.0; the note-kind guidance described below was added
-after 1.102.0. Release receipts and publication status are tracked by the tagged
+Introduced in klypix-mcp 1.102.0; the note-kind guidance described below ships in
+1.103.0. Release receipts and publication status are tracked by the tagged
 release and its publication workflow.
 
 An agent can leave “hands off this file” in project instructions after its work

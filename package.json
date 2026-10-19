@@ -1,6 +1,6 @@
 {
   "name": "klypix-mcp",
-  "version": "1.102.0",
+  "version": "1.103.0",
   "mcpName": "io.github.dahshanlabs/klypix-mcp",
   "description": "Shared project memory for Claude Code, Codex and Cursor: decisions and corrections through MCP.",
   "type": "module",

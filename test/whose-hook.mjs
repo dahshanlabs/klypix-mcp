@@ -15,6 +15,8 @@
 //   W7  nobody else's edits → the hook says nothing (fast path);
 //   W8  from a subfolder the check still finds the brain;
 //   W9  once A's work is committed, it no longer counts as A's.
+//   W10 once A has STOPPED, a sweep gets context (a continuing session may finish
+//       and commit A's leftovers); a discard still asks.
 //
 // Run:  node test/whose-hook.mjs        (exit 0 = pass, 1 = fail)
 import assert from 'node:assert/strict';
@@ -24,6 +26,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { buildKlypixMap } from '../src/klypix-format.mjs';
+import { upsertSession, endSession } from '../src/agent-presence.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const HOOK = path.join(__dirname, '..', 'src', 'global-brain-hook.mjs');
@@ -72,6 +75,8 @@ try {
   const n = await whose.recordEdits({ brainPath: path.join(repo, 'brain.klypix'), sid: A, client: 'codex', cwd: repo, files: ['src/tax.js'], home });
   process.env.HOME = prevHome; process.env.USERPROFILE = prevUP;
   ok(n === 1, 'setup: Codex edit of src/tax.js recorded in the ledger');
+  const brainPath = path.join(repo, 'brain.klypix');
+  upsertSession({ brainPath, home, id: A, client: 'codex', channel: 'lifecycle', event: 'UserPromptSubmit', logicalSessionId: A, identitySource: 'codex-lifecycle', intent: 'new tax rate', files: ['src/tax.js'] });
 
   // W1
   const sweep = hook('--guard', bash('git add -A && git commit -m wip'));
@@ -115,6 +120,13 @@ try {
   // W8
   const sub = hook('--guard', bash('git add -A', { cwd: path.join(repo, 'src', 'deep') }));
   ok(decision(sub) === 'deny', 'W8 from a subfolder the guard still finds the brain and denies', sub);
+
+  // W10: once Codex has STOPPED, its leftovers may be finished by whoever continues: a sweep gets context, not a deny; a discard still asks.
+  endSession({ brainPath, home, id: A });
+  const stoppedSweep = hook('--guard', bash('git add -A && git commit -m continue'));
+  ok(decision(stoppedSweep) === 'context' && /has stopped/.test(reason(stoppedSweep)) && /continuing that session/.test(reason(stoppedSweep)), "W10 a stopped session's leftovers: a sweep gets context (finish them if you are continuing its work), not a deny", stoppedSweep);
+  const stoppedReset = hook('--guard', bash('git reset --hard'));
+  ok(decision(stoppedReset) === 'ask', "W10 discarding a stopped session's leftovers still asks the human", stoppedReset);
 
   // W9: A commits its work; it is no longer A's uncommitted work.
   git('add', 'src/tax.js'); git('commit', '-q', '-m', 'A: new rate');

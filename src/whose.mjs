@@ -169,9 +169,17 @@ export async function decide(input, { findProjectBrain, listActiveSessions, home
   const selfIds = [input.session_id].filter(Boolean);
   const sameHostIds = [];
   const adoptedIds = [];
+  // Live owners only block commits (round-4 bench, 2026-10-20): a session asked
+  // to CONTINUE a stopped session's work must be able to finish and commit it;
+  // KLYPIX blocking that turned a 8/11 handoff into 3/10. A stopped session's
+  // leftovers still get ask + rescue before anything DISCARDS them.
+  const liveKeys = new Set();
+  let liveKnown = false;
   try {
     const list = listActiveSessions || (await import(new URL('./agent-presence.mjs', import.meta.url).href)).listActiveSessions;
     const live = list({ brainPath, home, now });
+    liveKnown = true;
+    for (const r of live) for (const k of [r.id, r.logicalSessionId, ...(Array.isArray(r.aliases) ? r.aliases : [])]) if (k) liveKeys.add(String(k).toLowerCase());
     const mine = live.find((r) => String(r.id || '').toLowerCase() === self);
     if (mine && mine.hostPid && mine.hostPidSource === 'env') {
       for (const r of live) if (r !== mine && r.hostPid === mine.hostPid && r.hostPidSource === 'env' && r.machine === mine.machine) sameHostIds.push(r.id);
@@ -211,7 +219,9 @@ export async function decide(input, { findProjectBrain, listActiveSessions, home
     for (const d of hit) {
       const o = info.get(d.path);
       if (!o) continue;
-      if (o.cls === 'FOREIGN') foreign.set(d.path, { o, step });
+      const ownerLive = !liveKnown || (o.owners || []).some((w) => liveKeys.has(String(w.sid || '').toLowerCase()));
+      if (o.cls === 'FOREIGN' && (ownerLive || step.tier === 'DISCARD' || step.tier === 'PARK')) foreign.set(d.path, { o, step });
+      else if (o.cls === 'FOREIGN') shared.set(d.path, { o: { ...o, stopped: true }, step });
       else if (o.cls === 'SHARED') shared.set(d.path, { o, step });
     }
     if (hit.some((d) => ['FOREIGN', 'SHARED'].includes(info.get(d.path)?.cls))) {
@@ -253,7 +263,10 @@ export async function decide(input, { findProjectBrain, listActiveSessions, home
   if (isSweep) {
     if (!fList.length) {
       if (!sList.length) return null;
-      return { decision: 'context', text: `KLYPIX: these files also contain uncommitted edits by another session since the last commit — check the diff before you commit them:\n${sList.slice(0, 12).map(ownerLine).join('\n')}`, log };
+      const stoppedOnly = sList.every(([, { o }]) => o.stopped);
+      return { decision: 'context', text: stoppedOnly
+        ? `KLYPIX: these uncommitted files were left by a session that has stopped:\n${sList.slice(0, 12).map(ownerLine).join('\n')}\nIf you are continuing that session's work, they are yours to finish and commit. If not, leave them out of your commit.`
+        : `KLYPIX: these files also contain uncommitted edits by another session since the last commit — check the diff before you commit them:\n${sList.slice(0, 12).map(ownerLine).join('\n')}`, log };
     }
     const narrow = mineList.length ? `git add -- ${mineList.slice(0, 12).map((p) => (/\s/.test(p) ? `"${p}"` : p)).join(' ')} && git commit -m "<message>"` : 'git add -- <only the files you changed> && git commit -m "<message>"';
     const text = `KLYPIX stopped this command: it would ${tier === 'SWEEP' ? 'sweep' : 'commit'} another session's uncommitted work into your commit:\n${fList.slice(0, 12).map(ownerLine).join('\n')}\nCommit only your own files instead:\n  ${narrow}\nLeave the other session's files as they are. If the human wants them included, ask the human.`;

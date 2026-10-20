@@ -1571,7 +1571,7 @@ function unfinishedFooter(sid, { max = 4 } = {}) {
 // live sessions, local branches and uncommitted changes — at session start,
 // before the agent decides to obey or ignore it. Same code as brain_sync
 // (session-handoff.mjs). Never edits the note; '' on any failure.
-async function lockNotesFooter(sid) {
+async function lockNotesFooter(sid, { budgetMs } = {}) {
     try {
         const lib = await import(new URL('./session-handoff.mjs', import.meta.url).href);
         if (typeof lib.readLockNotes !== 'function') return '';
@@ -1586,13 +1586,35 @@ async function lockNotesFooter(sid) {
         // Lines naming a file a stopped session worked on ride too, whatever
         // their wording (bench S5d/S5f: the agent with hooks never asked).
         const mentions = [...new Set(stopped.flatMap(r => Array.isArray(r.files) ? r.files : []))].slice(0, 20);
-        const probe = lib.createLockNoteProbe(CWD);
+        const probe = lib.createLockNoteProbe(CWD, budgetMs ? { budgetMs } : {});
         const notes = lib.readLockNotes(CWD, { mentions, probe });
         if (!notes.length) return '';
         const assessed = notes.slice(0, 6).map(n => lib.assessLockNote(CWD, n, { live, stopped, selfId: sid ? [sid] : [], now, probe }));
         const text = lib.formatLockNotes(assessed);
         return text ? '\n\n' + text : '';
     } catch { return ''; }
+}
+
+// Live projection (1.104.0, bench rounds 2–3): write the machine-local half of
+// the brain's state — who is live on this PC and what they hold, the work a
+// stopped session left, the evidence beside every keep-off note — into the
+// files the hosts load by themselves and never commit (CLAUDE.local.md and the
+// Codex global instructions file), at session start and at every Stop. The
+// inputs are the SAME strings this hook prints, so the file and the context
+// cannot disagree. Dynamic import so a stale flat deployment no-ops; never throws.
+async function writeLiveProjection(sid, { lockText = null, unfinishedText = null, budgetMs } = {}) {
+    try {
+        const lib = await import(new URL('./live-projection.mjs', import.meta.url).href);
+        if (typeof lib.projectLive !== 'function') return null;
+        const lock = lockText === null ? await lockNotesFooter(sid, budgetMs ? { budgetMs } : {}) : lockText;
+        const unfinished = unfinishedText === null ? unfinishedFooter(sid) : unfinishedText;
+        return lib.projectLive({
+            projectDir: CWD,
+            peers: livePeers(sid).map(p => ({ id: p.id, client: p.client, intent: p.intent, files: p.files, observedFiles: p.observedFiles })),
+            lockNotesText: String(lock || '').trim(),
+            unfinishedText: String(unfinished || '').trim(),
+        });
+    } catch { return null; }
 }
 
 // The nudge a session gets when the human asks for a handoff or says the
@@ -6185,12 +6207,16 @@ async function read(lib) {
     // The full brief keeps its order.
     const messages = messageFooter(input.session_id || '', input.transcript_path, lib);
     const lockLine = await lockNotesFooter(input.session_id);
+    const unfinishedLine = unfinishedFooter(input.session_id);
     const out = ultra + messages + lockLine + versionLine + presenceLine + shipObsLine + gitHookNotice + laneWarning + healLine + draftLine
         + receiptLine
         + inflightFooter(input.session_id, struct)
-        + unfinishedFooter(input.session_id)
+        + unfinishedLine
         + selfCheckFooter() + doctorFooter();
     process.stdout.write(out);
+    // The same lock / unfinished strings go into CLAUDE.local.md and the Codex
+    // global file for the NEXT session of any host (live projection).
+    await writeLiveProjection(input.session_id, { lockText: lockLine, unfinishedText: unfinishedLine });
     // Heartbeat: prove the brief actually injected (and how big) so a dead or
     // stale live-copy of the hook stops being a silent no-op.
     appendJsonl(HEALTH, { ts: nowIso(), project: path.basename(CWD), mode: 'read', ok: true, briefBytes: Buffer.byteLength(out), fullBriefBytes: Buffer.byteLength(full), cards: struct?.counts?.cards ?? null }, 500);
@@ -6308,6 +6334,9 @@ async function main() {
         // without paying the rebuild itself. Best-effort; guardCheck's currency
         // stat is the backstop.
         try { if (typeof lib.ensureGuardSidecar === 'function') await lib.ensureGuardSidecar(BRAIN); } catch { /* backstopped */ }
+        // Refresh the live projection after the turn: the lane now carries this
+        // session's files and reply tail. A short git budget — a Stop must not wait.
+        await writeLiveProjection(readHookInput().session_id, { budgetMs: 1000 });
         // Ambient version-currency: piggyback the post-session Stop hook to refresh the
         // npm-latest cache (≤ once/day, best-effort, failure-silent) so the next
         // SessionStart footer can surface a stale install with ZERO network. Awaited so

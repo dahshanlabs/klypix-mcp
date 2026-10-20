@@ -461,7 +461,7 @@ function unfinishedWorkBlock(brainPath, sessionId) {
 // a "do not touch" / hands-off / WIP line in AGENTS.md checked against live
 // sessions, local branches and uncommitted changes. Dynamic import so a stale
 // deployment without it no-ops; never throws.
-async function lockNotesBlock(projectDir, brainPath, sessionId, sessions) {
+async function lockNotesBlock(projectDir, brainPath, sessionId, sessions, { budgetMs } = {}) {
   try {
     const lib = await import(new URL('./session-handoff.mjs', import.meta.url).href);
     if (typeof lib.readLockNotes !== 'function') return '';
@@ -469,13 +469,29 @@ async function lockNotesBlock(projectDir, brainPath, sessionId, sessions) {
     try { stopped = listUnfinishedWork({ brainPath, selfId: sessionId }); } catch { /* git still answers */ }
     // Lines naming a file a stopped session worked on ride too, whatever their wording.
     const mentions = [...new Set(stopped.flatMap((r) => (Array.isArray(r.files) ? r.files : [])))].slice(0, 20);
-    const probe = lib.createLockNoteProbe(projectDir);
+    const probe = lib.createLockNoteProbe(projectDir, budgetMs ? { budgetMs } : {});
     const notes = lib.readLockNotes(projectDir, { mentions, probe });
     if (!notes.length) return '';
     const assessed = notes.slice(0, 6).map((n) => lib.assessLockNote(projectDir, n, { live: sessions || [], stopped, selfId: sessionId ? [sessionId] : [], probe }));
     return lib.formatLockNotes(assessed);
   } catch {
     return '';
+  }
+}
+
+// Live projection (1.104.0): the same presence / unfinished / keep-off strings
+// this hook emits, written into CLAUDE.local.md and the Codex global
+// instructions file for the NEXT session of any host (session start and Stop).
+// Dynamic import so a stale deployment no-ops; never throws.
+async function projectLiveSafe({ projectDir, sessions, sessionId, lockNotes = '', unfinished = '' }) {
+  try {
+    const lib = await import(new URL('./live-projection.mjs', import.meta.url).href);
+    if (typeof lib.projectLive !== 'function') return null;
+    const peers = (Array.isArray(sessions) ? sessions : []).filter((s) => s && s.id && s.id !== sessionId)
+      .map((s) => ({ id: s.id, client: s.client, intent: s.intent, files: s.files, observedFiles: s.observedFiles }));
+    return lib.projectLive({ projectDir, peers, lockNotesText: String(lockNotes || '').trim(), unfinishedText: String(unfinished || '').trim() });
+  } catch {
+    return null;
   }
 }
 
@@ -671,6 +687,8 @@ async function main() {
       } catch { return ''; }
     })();
     const lockNotes = await lockNotesBlock(projectDir, brainPath, sessionId, sessions);
+    const unfinished = unfinishedWorkBlock(brainPath, sessionId);
+    await projectLiveSafe({ projectDir, sessions, sessionId, lockNotes, unfinished });
     emitSystemMessage([
       formatPresenceMessage(sessions, sessionId, { includeSolo: true }),
       lockNotes,
@@ -684,9 +702,15 @@ async function main() {
       // ⏸️ Unfinished work other sessions left (session handoff, 1.99.0): the
       // same engine block brain_sync prints, so a Codex session asked to
       // "continue" what a Claude session stopped in starts from its record.
-      unfinishedWorkBlock(brainPath, sessionId),
+      unfinished,
     ], event);
     return;
+  }
+  if (event === 'Stop') {
+    // The lane now carries this turn's files and reply tail: refresh the live
+    // projection for the next session, with a short git budget (a Stop must not wait).
+    const lockNotes = await lockNotesBlock(projectDir, brainPath, sessionId, sessions, { budgetMs: 1000 });
+    await projectLiveSafe({ projectDir, sessions, sessionId, lockNotes, unfinished: unfinishedWorkBlock(brainPath, sessionId) });
   }
   if (event === 'UserPromptSubmit') {
     const me = sessions.find((session) => session.id === sessionId);

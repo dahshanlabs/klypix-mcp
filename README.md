@@ -515,6 +515,33 @@ so fresh relevant findings are not crowded out by older area vocabulary.
 Briefs are **not** injected automatically on Cursor, Cline, Copilot, Gemini CLI or Antigravity —
 there are no lifecycle hooks on those hosts.
 
+### The live projection — the file the agent obeys
+
+The coordination bench showed that an agent trusts the instruction file it was launched with
+over anything a tool or hook tells it, and that each host reads a different surface. So the
+brain's state is projected into those files, in two halves:
+
+- **Committed, from the brain:** the compact brief block in `AGENTS.md` (standing rules,
+  corrections, open handoff cards), refreshed by the Claude Code Stop hook only when its content
+  changed, so diffs stay quiet.
+- **Machine-local, from the lane (klypix-mcp 1.104.0):** which sessions are live on this PC and
+  which files they hold, the work a stopped session left, and the evidence beside every
+  "keep off this file" note — written at session start and at every Stop by the Claude Code and
+  Codex hooks into `CLAUDE.local.md` at the project root (Claude Code loads it beside
+  `CLAUDE.md`; KLYPIX keeps it out of git through `.git/info/exclude`, never a committed file)
+  and into one section per project of the Codex global instructions file
+  (`~/.codex/AGENTS.override.md` when you have one, else `~/.codex/AGENTS.md`). A project-level
+  `AGENTS.override.md` is never written: Codex loads one file per directory, so it would hide
+  your `AGENTS.md`.
+
+The block is a snapshot and says so: bounded to about 2.4KB, rewritten only when its content
+changed (the time stamp alone never causes a write), with the keep-off evidence kept first when
+the budget bites, and "nothing live" written in words so an older snapshot never stands. It
+holds the same strings the hooks print, so the file and the session context cannot disagree.
+Sections for projects not touched in a day are pruned from the Codex file, at most eight are
+kept, and `uninstall unlink` strips the block (deleting `CLAUDE.local.md` only when nothing else
+is in it). `brain_sync` remains the live source; the block tells the agent to call it.
+
 ## Capture and corrections
 
 `brain_note` accepts structured supporting references and inert verification text:
@@ -1350,7 +1377,10 @@ It strips only KLYPIX's own entries — every other hook and setting in
 `~/.claude/settings.json` stays — backs up each file it edits, and **never deletes a `.klypix`**.
 Removal requires `--yes`. Without it, the command prints the plan and changes nothing;
 there is no interactive confirmation prompt. Run the project-local form in each project you
-want to unlink. A preview exits non-zero while managed files remain.
+want to unlink. A preview exits non-zero while managed files remain. The project-local form also
+strips the live-projection block from `CLAUDE.local.md` (the file goes only when nothing else is
+in it) and this project's section from the Codex global file; the machine-global form strips
+every live section there.
 
 Your `brain.klypix` is yours — it is a plain ZIP and stays readable with or without this package.
 

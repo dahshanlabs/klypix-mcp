@@ -47,6 +47,11 @@ Structured results use `workFound: true | false | null` and
 - Fenced examples and KLYPIX managed blocks are skipped. Each source is limited
   to 64 KiB; at most six selected notes are assessed per hook/sync. Paths must be
   project-relative. Instruction sources resolving outside the project are skipped.
+- Surfaces (1.104.0): the verdict block is printed at session start by the Claude
+  Code and Codex hooks and by `brain_sync`, and the same text is written into the
+  live-projection block of `CLAUDE.local.md` and of the Codex global instructions
+  file at session start and at every Stop, so a host that reads files rather than
+  hook output sees it too. `CLAUDE.local.md` is never itself a note source.
 - Evidence: observed local sessions, up to 30 local branches, up to 20 registered
   worktrees (including detached and dirty worktrees), and recorded commits.
   Connected-but-idle sessions use the same activity window as the handoff list;

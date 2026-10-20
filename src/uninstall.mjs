@@ -43,6 +43,13 @@ import {
   removeCodexPresenceHooks,
   resolveCodexHooksPath,
 } from './codex-hooks.mjs';
+import {
+  CLAUDE_LOCAL_FILE,
+  hasLiveBlock,
+  removeLiveProjection,
+  listLiveSections,
+  stripLiveBlocks,
+} from './live-projection.mjs';
 
 // ── the one absolute rule ────────────────────────────────────────────────────
 // A canvas is USER DATA. install/link never created one and uninstall must never
@@ -290,6 +297,20 @@ export function planUnlink(projectDir, { sidecars = false } = {}) {
     const target = { file, kind: meta.kind, wrapKey: meta.wrapKey, frontmatter: meta.frontmatter };
     items.push({ label: r.tool, rel, file, ...target, ...planOne(target) });
   }
+  // Live projection block (1.104.0). CLAUDE.local.md is not a managed install
+  // target — the person may own the rest of the file — so only KLYPIX's own
+  // marked block goes, and the file only when nothing else is in it. The
+  // project's section in the Codex global file goes with it.
+  {
+    const file = path.join(root, CLAUDE_LOCAL_FILE);
+    const raw = readText(file);
+    items.push({
+      label: 'Live projection (machine-local snapshot)', rel: CLAUDE_LOCAL_FILE, file, kind: 'live-block',
+      ...(raw !== null && hasLiveBlock(raw, root)
+        ? { action: 'strip-block', why: 'remove the KLYPIX live block (and this project\'s section in the Codex global file); your own lines stay' }
+        : { action: 'none', why: 'not present' }),
+    });
+  }
   if (sidecars) {
     for (const rel of PROJECT_SIDECARS) {
       const file = path.join(root, rel);
@@ -332,6 +353,18 @@ export function planUninstall({ home = os.homedir(), installDir, keepRegistry = 
       ? { action: 'strip-block', why: 'remove the fenced KLYPIX block; your own guidance stays' }
       : { action: 'none', why: 'no managed block' }),
   });
+  // 2b) Live projection sections (1.104.0): one per project, in whichever
+  // global file Codex loads. Stripped whole; the person's own text stays.
+  for (const name of ['AGENTS.override.md', 'AGENTS.md']) {
+    const file = path.join(HOME, '.codex', name);
+    const raw = readText(file);
+    const count = raw === null ? 0 : listLiveSections(raw).length;
+    if (!count && name === 'AGENTS.override.md') continue;
+    items.push({
+      label: 'Live projection sections (Codex global)', rel: `.codex/${name}`, file, kind: 'live-sections',
+      ...(count ? { action: 'strip-block', why: `remove ${count} machine-local KLYPIX live section(s); your own guidance stays` } : { action: 'none', why: 'no live section' }),
+    });
+  }
   if (codexGlobalInstructionsInstalled(HOME)) {
     notes.push('~/.codex/AGENTS.md carries no version/hash stamp, so an edit you made INSIDE the KLYPIX block cannot be detected — the .klypix-bak backup is your only copy of it.');
   }
@@ -432,8 +465,28 @@ function applyOne(item, { root } = {}) {
     : item.kind === 'codex-hooks' ? null
       : item.kind === 'codex-agents' ? null
         : item.kind === 'bundle' ? null
-          : planOne(item);
+          : item.kind === 'live-block' || item.kind === 'live-sections' ? null
+            : planOne(item);
   try {
+    if (item.kind === 'live-block') {
+      // Both files at once: the project's CLAUDE.local.md block and its section
+      // in the Codex global file (the module owns the markers; never a blind delete).
+      const projectDir = root || path.dirname(item.file);
+      const raw = readText(item.file);
+      if (raw === null || !hasLiveBlock(raw, projectDir)) return { ok: true, action: 'none' };
+      const backup = backupFile(item.file);
+      const res = removeLiveProjection(projectDir, { claudeFile: item.file });
+      return { ok: true, action: res.claude === 'file-removed' ? 'delete-file' : res.claude === 'block-removed' ? 'strip-block' : 'none', backup };
+    }
+    if (item.kind === 'live-sections') {
+      const raw = readText(item.file);
+      if (raw === null || !listLiveSections(raw).length) return { ok: true, action: 'none' };
+      const backup = backupFile(item.file);
+      const next = stripLiveBlocks(raw);
+      if (next.trim() === '') { deleteFile(item.file); return { ok: true, action: 'delete-file', backup }; }
+      writeAtomic(item.file, next);
+      return { ok: true, action: 'strip-block', backup };
+    }
     if (item.kind === 'codex-agents') {
       if (!codexGlobalInstructionsInstalled(path.resolve(item.file, '..', '..'))) return { ok: true, action: 'none' };
       const res = removeCodexGlobalInstructions(path.resolve(item.file, '..', '..'));

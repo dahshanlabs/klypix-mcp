@@ -356,8 +356,9 @@ const HOME_A = tmp('home-a');
   const ghost = path.join(os.tmpdir(), 'klypix-uninstall-ghost', 'nope');
   rmrf(path.dirname(ghost));
   const plan = planUnlink(ghost);
-  ok(plan.items.length === 14 && plan.items.every((i) => i.action === 'none'),
-    'plan: an unlinked project plans 14 no-ops');
+  // 14 managed files + the live-projection block (1.104.0), a no-op when absent.
+  ok(plan.items.length === 15 && plan.items.every((i) => i.action === 'none'),
+    'plan: an unlinked project plans 15 no-ops (14 managed files + the live block)');
   ok(!fs.existsSync(ghost), 'plan: planning a non-existent directory did not create it');
 }
 

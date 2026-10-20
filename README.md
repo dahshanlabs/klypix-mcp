@@ -10,9 +10,16 @@ over MCP by a process on your machine. In the standalone setup, brain data stays
 your agent's provider can still receive what the agent reads. Integration depth differs by host — see
 [Supported hosts](#supported-hosts-and-their-integration-level).
 
-The **Apache-2.0 engine works without the KLYPIX desktop app or a KLYPIX account**. The optional
+Klypix is a **portable project workspace with a shared brain**. This repository provides its
+local MCP server for shared project memory in coding tools. The **Apache-2.0 engine works without the KLYPIX
+desktop app or a KLYPIX account**. The optional
 [Windows workspace](https://klypix.com/developers) lets people inspect the same project brain
 beside their files. App-based sharing has its own cloud path; see [Security and permissions](#security-and-permissions).
+
+For the **Projects & Ideas** path — saved project materials in ChatGPT or Claude chat — follow
+[Save project materials and use them with your assistant](https://klypix.com/guides/connect-klypix-to-chatgpt-and-claude).
+That uses Klypix's separate hosted connection for the spaces you authorize. Installing this local
+MCP server does not set up that connection.
 
 [Install](#quick-start) · [Try your first decision](#your-first-decision-and-correction) ·
 [Supported hosts](#supported-hosts-and-their-integration-level) ·
@@ -37,6 +44,11 @@ npx klypix-mcp install
 It creates `brain.klypix` if the project has none, wires the editors it finds on this machine,
 registers the `.klypix` merge driver if this is a git repo, and exits only after a real MCP
 handshake has counted the tools that answered.
+
+Next, reconnect your coding host and [try your first decision and correction](#your-first-decision-and-correction).
+A successful trial means a fresh session finds your recorded decision and its reason, then finds
+the corrected decision as current. Check the returned source cards; a successful install alone
+does not prove that your host has loaded the tools or that a particular decision was retrieved.
 
 [![Claude Code](https://img.shields.io/badge/Claude_Code-5_lifecycle_hooks-475569?style=flat-square)](#supported-hosts-and-their-integration-level)
 [![Codex](https://img.shields.io/badge/Codex-native_MCP_%2B_presence-475569?style=flat-square)](#supported-hosts-and-their-integration-level)
@@ -157,6 +169,9 @@ One command for supported editors detected on this machine. It finds the project
 so running it from `src/` is fine), gives the project a brain if it doesn't have one, wires the
 agent tools you actually have installed, registers the card-level `.klypix` merge driver if it's a
 git repo, and then **proves the result** before it exits:
+
+Illustrative output; detected editors, file counts, tool counts and timings vary with the machine
+and installed version:
 
 ```text
   project   E:\work\api  (git repository root)

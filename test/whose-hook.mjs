@@ -26,7 +26,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { buildKlypixMap } from '../src/klypix-format.mjs';
-import { upsertSession, endSession } from '../src/agent-presence.mjs';
+import { upsertSession, endSession, listActiveSessions } from '../src/agent-presence.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const HOOK = path.join(__dirname, '..', 'src', 'global-brain-hook.mjs');
@@ -132,6 +132,13 @@ try {
   git('add', 'src/tax.js'); git('commit', '-q', '-m', 'A: new rate');
   const after = hook('--guard', bash('git add -A && git commit -m mine'));
   ok(after === null || decision(after) === 'context', 'W9 once Codex committed its file, my sweep is no longer blocked', after);
+
+  // W11: Claude Code's SessionEnd hook (--end) takes the session off the lane at once.
+  const C2 = 'c2c2c2c2-dddd-4eee-8fff-000000000011';
+  upsertSession({ brainPath, home, id: C2, client: 'claude-code', channel: 'lifecycle', event: 'UserPromptSubmit', logicalSessionId: C2, identitySource: 'claude-lifecycle', intent: 'about to be cut off', files: ['src/mine.js'] });
+  ok(listActiveSessions({ brainPath, home }).some((r) => r.id === C2), 'W11 setup: the session is live on the lane');
+  hook('--end', { session_id: C2, cwd: path.join(repo, 'src'), hook_event_name: 'SessionEnd', reason: 'other' });
+  ok(!listActiveSessions({ brainPath, home }).some((r) => r.id === C2), 'W11 SessionEnd (--end) takes the session off the lane immediately, found from a subfolder');
 
   console.log(`\nwhose-hook: all ${checks} assertions passed`);
 } finally {

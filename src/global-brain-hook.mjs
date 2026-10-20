@@ -6296,7 +6296,23 @@ function emitWhose(r) {
     try { fs.writeSync(1, JSON.stringify(out)); } catch { /* stdout gone */ }
 }
 
+// --end (SessionEnd, 1.105.0): the session is over — remove its live rows and
+// tombstone it through the engine's own endSession (the same call Codex's
+// SessionEnd makes), so peers stop reading a dead session as working. Walks up
+// for the brain like Whose does. Never throws.
+async function endStep() {
+    try {
+        const input = readHookInput();
+        const sid = String(input.session_id || '');
+        if (!sid) return;
+        const ap = await import(new URL('./agent-presence.mjs', import.meta.url).href);
+        const brainPath = ap.findProjectBrain(input.cwd || process.cwd());
+        if (brainPath) ap.endSession({ brainPath, id: sid });
+    } catch { /* never fail a session's exit */ }
+}
+
 async function main() {
+    if (process.argv.includes('--end')) { await endStep(); return; }
     const isLive = process.argv.includes('--live');
     const isGuard = process.argv.includes('--guard');
     const whose = (isLive || isGuard) ? await whoseStep(isGuard) : null;

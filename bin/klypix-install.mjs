@@ -573,6 +573,11 @@ try {
         // compiled guard sidecar; 'warn' injects context, 'block' denies with
         // the card's message. Absent guards = stat + one tiny read, then no-op.
         ['PreToolUse', { matcher: 'Bash|PowerShell|Edit|Write', hooks: [{ type: 'command', command: brainCmd('--guard'), timeout: 10 }] }],
+        // Session end (1.105.0): a closed or cut-off Claude Code session leaves
+        // the lane at once. Before this, only the 10-minute TTL removed it, so the
+        // next session read a dead peer as "live" and refused to continue its
+        // work (round-4 continuity bench, 2026-10-20). Codex already had this.
+        ['SessionEnd', { hooks: [{ type: 'command', command: brainCmd('--end'), timeout: 10 }] }],
     ];
     const stripOurs = (arr) => (Array.isArray(arr) ? arr : [])
         .map(g => (g && Array.isArray(g.hooks)) ? { ...g, hooks: g.hooks.filter(h => !(typeof h?.command === 'string' && h.command.includes(HOOK_MARK))) } : g)
@@ -679,7 +684,7 @@ try {
     console.log(`✓ installed klypix brain v${VERSION} → ${BRAIN_DIR}  (${n} scripts, ${deps} dep packages)`);
     reportSemantic(semanticStep);
     if (RUNTIME_ONLY) console.log('✓ runtime-only update: host settings and project files were preserved');
-    else if (!notWired.length) console.log('✓ wired 5 hooks: SessionStart · UserPromptSubmit (--prompt) · Stop (--capture) · PostToolUse (--live) · PreToolUse (--guard) → settings.json');
+    else if (!notWired.length) console.log('✓ wired 6 hooks: SessionEnd (--end) · SessionStart · UserPromptSubmit (--prompt) · Stop (--capture) · PostToolUse (--live) · PreToolUse (--guard) → settings.json');
     else console.error(`⚠ readiness: ${notWired.length} hook(s) did NOT take (${notWired.join(', ')}) — the brain will read but not capture/sync. Re-run \`npx klypix-mcp install --force\` or check ${SETTINGS}.`);
     console.log(`✓ MCP supervisor runs from the local bundle (node ${fwd(path.join(BRAIN_DIR, 'klypix-mcp-server.mjs'))}) — compatible core updates activate without restarting the host.`);
     if (migrated) console.log(`✓ migrated ${migrated.file} klypix-canvas server: ${migrated.from} → ${migrated.to} (backup: .mcp.json.klypix-bak). Reconnect (/mcp) or restart to pick it up.`);

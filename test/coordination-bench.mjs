@@ -356,12 +356,12 @@ ok(/\| 2\/3 \| —/.test(naMd) && /\| Handled \|/.test(naMd), 'B4: the "handled"
 // ── B6: KLYPIX as installed (round 3) ───────────────────────────────────────
 {
   const { INSTALLED_CLAUDE_HOOKS, claudeHookSettings } = await import('../bench/coordination/conditions.mjs');
-  // The bench wires the same five hooks the installer wires: event, matcher,
+  // The bench wires the same six hooks the installer wires: event, matcher,
   // argument and timeout, read from bin/klypix-install.mjs itself.
   const installer = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'klypix-install.mjs'), 'utf8').replace(/\r/g, '');
-  const wired = [...installer.matchAll(/\['(SessionStart|UserPromptSubmit|Stop|PostToolUse|PreToolUse)', \{ (?:matcher: '([^']+)', )?hooks: \[\{ type: 'command', command: brainCmd\('([^']*)'\)(?:, timeout: (\d+))? \}\] \}\]/g)]
+  const wired = [...installer.matchAll(/\['(SessionStart|UserPromptSubmit|Stop|PostToolUse|PreToolUse|SessionEnd)', \{ (?:matcher: '([^']+)', )?hooks: \[\{ type: 'command', command: brainCmd\('([^']*)'\)(?:, timeout: (\d+))? \}\] \}\]/g)]
     .map((m) => [m[1], m[2] || null, m[3], m[4] ? Number(m[4]) : null]);
-  ok(wired.length === 5 && JSON.stringify(wired) === JSON.stringify(INSTALLED_CLAUDE_HOOKS.map((h) => [...h])),
+  ok(wired.length === 6 && JSON.stringify(wired) === JSON.stringify(INSTALLED_CLAUDE_HOOKS.map((h) => [...h])),
     'B6: the installed condition wires exactly the hooks bin/klypix-install.mjs wires (event, matcher, argument, timeout)');
   const settings = claudeHookSettings('"node" "w.mjs"');
   ok(settings.hooks.UserPromptSubmit[0].hooks[0].command === '"node" "w.mjs" --prompt' && settings.hooks.SessionStart[0].matcher === 'startup|resume|clear',
@@ -392,8 +392,8 @@ ok(/\| 2\/3 \| —/.test(naMd) && /\| Handled \|/.test(naMd), 'B4: the "handled"
     const installerForm = installer.includes('const brainCmd = (arg) => ' + String.fromCharCode(96) + 'node "$' + '{');
     ok(installerForm && Object.values(hooks).every((g) => /^node "[^"]+"( --[a-z]+)?$/.test(g[0].hooks[0].command)),
       'B6: every hook command has the installer\'s form, a bare node then the quoted script');
-    ok(Object.keys(hooks).length === 5 && hooks.Stop[0].hooks[0].command.includes(wrapperPath.replace(/\\/g, '/')),
-      'B6: the run repo carries the five hooks, each through the run\'s wrapper');
+    ok(Object.keys(hooks).length === 6 && hooks.Stop[0].hooks[0].command.includes(wrapperPath.replace(/\\/g, '/')),
+      'B6: the run repo carries the six hooks, each through the run\'s wrapper');
     ok(wrapper.includes(JSON.stringify(benchHome)) && wrapper.includes('KLYPIX_BRAIN_DIR') && wrapper.includes('global-brain-hook.mjs') && /delete process\.env\.KLYPIX_PLUGIN/.test(wrapper) && /await import\(/.test(wrapper),
       'B6: the wrapper pins HOME, USERPROFILE and KLYPIX_BRAIN_DIR to the run\'s home and runs this checkout\'s hook');
     ok(repo.git('status', '--porcelain') === '' && /\.claude\//.test(fs.readFileSync(path.join(repo.dir, '.git', 'info', 'exclude'), 'utf8')),

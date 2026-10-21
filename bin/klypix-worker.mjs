@@ -523,7 +523,7 @@ server.registerTool('brain_ask', {
     as_of: z.string().optional().describe('Optional YYYY-MM-DD: answer as of that date (superseded cards count as live if they were current then).'),
     k: z.number().optional().describe('Max cards to surface for synthesis (default 10, capped 20).'),
   },
-}, async ({ question, canvas, as_of, k }) => toContent(await opBrainAsk({ vault: mcpPresence.vault, canvas: boundBrainCanvas(canvas), question, as_of, k, log })));
+}, async ({ question, canvas, as_of, k }, extra) => toContent(await opBrainAsk({ vault: mcpPresence.vault, canvas: boundBrainCanvas(canvas), question, as_of, k, log, sessionId: extra?.klypixRequestIdentity?.sessionId || mcpPresence.id })));
 
 server.registerTool('project_map_context', {
   title: 'Project Map context - current code structure plus brain decisions',
@@ -844,7 +844,7 @@ server.registerTool('brain_note', {
   // vocabulary for retrieval) AND the per-session capture receipt below. Since
   // 1.86 the authored `question` (the pattern) rides beside the declared intent
   // (the instance); the sidecar's quality gate decides what is worth keeping.
-  const result = await opBrainNote({ vault: mcpPresence.vault, canvas: boundBrainCanvas(canvas), text, area, marker: marker || '', closes, evidence, verify, guard, via: extra.klypixClientName, enrichmentQuestion: [question, mcpPresence.declaredIntent] });
+  const result = await opBrainNote({ vault: mcpPresence.vault, canvas: boundBrainCanvas(canvas), text, area, marker: marker || '', closes, evidence, verify, guard, via: extra.klypixClientName, session: extra?.klypixRequestIdentity?.sessionId || mcpPresence.id, enrichmentQuestion: [question, mcpPresence.declaredIntent] });
   // Per-session capture receipt — this is what stops the uncaptured-work nudge
   // from firing at a session that DID record its reasoning, just through MCP
   // rather than a 🧠 marker. The Stop hook and this server share one session-id

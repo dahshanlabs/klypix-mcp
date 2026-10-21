@@ -40,6 +40,13 @@ export function resolveAuthor() {
 // Test seam: clears the per-process cache so env overrides can be exercised.
 export function __resetAuthorCache() { cachedAuthor = undefined; }
 const authorField = () => { const a = resolveAuthor(); return a ? { author: a } : {}; };
+// WHICH SESSION wrote a card (2026-10-21 incident): the host's session id
+// (Claude Code / Codex / MCP request identity), stamped by the capture paths
+// beside createdVia. Additive, ignored by older readers; a card without it
+// simply has no known owner. Capped like every lane id (160).
+export const SESSION_ID_MAX = 160;
+export const cleanSessionId = (v) => (typeof v === 'string' ? v.trim().slice(0, SESSION_ID_MAX) : '');
+const sessionField = (card) => { const s = cleanSessionId(card?.createdSession); return s ? { createdSession: s } : {}; };
 
 // Valid fractional-indexing z-keys. Hand-rolled keys (e.g. 'a0000' / 'z00013')
 // are REJECTED by the fractional-indexing lib the KLYPIX app uses and crash it
@@ -1042,6 +1049,9 @@ export async function parseKlypix(buffer) {
             // git / gardener / …) — persisted by the capture paths, surfaced for
             // brain_challenge's "captured by another agent" twist + view badges.
             createdVia: it.createdVia ?? null,
+            // WHICH SESSION captured it (1.106.0) — only when stamped; the
+            // owner/takeover view in status mode reads it (areaOwnership).
+            ...(cleanSessionId(it.createdSession) ? { createdSession: cleanSessionId(it.createdSession) } : {}),
             // 'user' | 'agent' — the coarse authorship bit (brain_lens provenance).
             createdBy: it.createdBy ?? null,
             parentId: it.parentId ?? null,
@@ -1656,6 +1666,7 @@ export async function buildKlypix(spec) {
                 // Machine-field parity with the other writers (2026-08-24) —
                 // additive, ignored by older readers.
                 ...(card.createdVia ? { createdVia: String(card.createdVia) } : {}),
+                ...sessionField(card),
                 ...(Array.isArray(card.evidence) && card.evidence.length ? { evidence: card.evidence } : {}),
                 ...(typeof card.verify === 'string' && card.verify.trim() ? { verify: card.verify.trim() } : {}),
                 ...(card.guard && typeof card.guard === 'object' ? { guard: card.guard } : {}),
@@ -1854,6 +1865,7 @@ export async function appendToKlypix(buffer, addition) {
         zip.file(`items/${shard(id)}/${id}.json`, JSON.stringify({
             type: 'text', locked: false, createdAt: now, createdBy: 'agent', ...authorField(),
             ...(c.createdVia ? { createdVia: String(c.createdVia) } : {}),
+            ...sessionField(c),
             ...(c.guard && typeof c.guard === 'object' ? { guard: c.guard } : {}),
             content: String(c.text), fontSize: FONT,
             // A plain (unbordered) card renders at max-content width unless
@@ -2078,6 +2090,8 @@ export async function appendIntoContainers(buffer, addition) {
             // …and WHICH agent remembered this (claude-code / cursor /
             // cline / …) — both additive fields, ignored by older readers.
             ...(card.createdVia ? { createdVia: String(card.createdVia) } : {}),
+            // …and WHICH SESSION of that agent (owner/takeover in status mode).
+            ...sessionField(card),
             // Evidence anchors (file:line / PR#) — additive, ignored by older readers.
             ...(Array.isArray(card.evidence) && card.evidence.length ? { evidence: card.evidence } : {}),
             // Live-probe command for a fast-decay claim — additive, ignored by older readers.
@@ -3104,7 +3118,260 @@ export function resolveAreaScope(struct, areas) {
     }
     return { keep, total, hint: areas.map(flat).filter(Boolean).join(', ') };
 }
-export function areaStatusDigest(struct, { activeDays = 30, maxAreas = 20, now = Date.now(), areas = null, summary = null } = {}) {
+// ── Area ownership + takeover (1.106.0, 2026-10-21 incident) ─────────────────
+// A session answering "what is remaining?" listed "iPhone 1.1.5 → press
+// Release after Apple approves" as its own open work. Another session had
+// taken the iOS work over the day before (klypix-ios #95 bumped it to 1.1.6),
+// and the brain held both cards — but nothing on either said WHO wrote it, so
+// the asking session trusted its own memory of being the iOS owner. The brain
+// recorded events, not ownership.
+//
+// Ownership here is computed, never declared: an area's OWNER is the session
+// whose stamped card (createdSession) is newest there. A TAKEOVER, for the
+// asking session, is an area where it wrote and another session wrote
+// something newer since; a brain_handoff the asker wrote that another session
+// took (or finished) is the explicit form of the same thing. Liveness and the
+// owner's current intent come from the presence lane the caller passes
+// (ownershipSessionsFromLane) — this module reads no file. One O(cards) pass;
+// cards without a session stamp (older cards, commits, gardener, ship
+// observations) own nothing, so an old brain simply shows no owners.
+export const OWNERSHIP_RECENT_MS = 24 * 3_600_000;
+const OWNERSHIP_BUSY_FRESH_MS = 10 * 60 * 1000;   // PARITY: agent-presence HOST_STATUS_BUSY_FRESH_MS
+const OWNERSHIP_SKIP_AREA = /^(archive|handoffs?)$/i;
+export function ownershipClientWord(client) {
+    const key = String(client || '').trim().toLowerCase();
+    if (!key) return 'Unknown';
+    if (key === 'claude-code' || key === 'claude' || key === 'claude code') return 'Claude Code';
+    if (key === 'codex') return 'Codex';
+    if (key === 'klypix' || key === 'klypix-auto') return 'KLYPIX';
+    return key.replace(/(^|[-_ ])([a-z])/g, (_m, p, c) => `${p}${c.toUpperCase()}`);
+}
+const ownKey = (v) => cleanSessionId(v).toLowerCase();
+/**
+ * Presence rows → the session list areaOwnership joins against. `live` are
+ * the lane's live rows (already pruned by the caller: agent-presence
+ * listActiveSessions, or the hook's pruneSessions twin); `directory` is the
+ * lane's two-week session memory (raw rows or listKnownSessions entries).
+ * Returns [{ id, keys, client, live, status, intent, lastSeen }] — status is
+ * "working" | "idle 14m" | "live" for a live row, "ended" | "not running"
+ * otherwise. Never throws on malformed rows.
+ */
+export function ownershipSessionsFromLane({ live = [], directory = [] } = {}, now = Date.now()) {
+    const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+    const keysOf = (r) => [...new Set([r?.id, r?.logicalSessionId, ...(Array.isArray(r?.aliases) ? r.aliases : [])].map(ownKey).filter(Boolean))];
+    const statusOf = (r) => {
+        const st = String(r?.hostStatus || '');
+        if (!st) return 'live';
+        const at = Number(r?.hostStatusAt || r?.lastSeen || now);
+        if (st === 'busy' && now - at < OWNERSHIP_BUSY_FRESH_MS) return 'working';
+        const min = Math.max(0, Math.round((now - at) / 60_000));
+        return min <= 0 ? 'idle' : `idle ${min}m`;
+    };
+    const out = [];
+    const byKey = new Map();
+    for (const r of (Array.isArray(live) ? live : [])) {
+        if (!r || typeof r !== 'object') continue;
+        const keys = keysOf(r); if (!keys.length) continue;
+        const row = { id: cleanSessionId(r.logicalSessionId || r.id), keys, client: String(r.client || 'unknown').slice(0, 40), live: true, status: statusOf(r), intent: flat(r.intent).slice(0, 120), lastSeen: Number(r.lastSeen) || 0 };
+        out.push(row);
+        for (const k of keys) if (!byKey.has(k)) byKey.set(k, row);
+    }
+    for (const e of (Array.isArray(directory) ? directory : [])) {
+        if (!e || typeof e !== 'object') continue;
+        const keys = keysOf(e); if (!keys.length) continue;
+        const known = keys.map(k => byKey.get(k)).find(Boolean);
+        if (known) {   // the live row wins; the directory only adds aliases and a remembered intent
+            for (const k of keys) if (!byKey.has(k)) { byKey.set(k, known); known.keys.push(k); }
+            if (!known.intent && e.intent) known.intent = flat(e.intent).slice(0, 120);
+            continue;
+        }
+        const liveFlag = e.live === true;   // a listKnownSessions entry joins the live lane itself
+        const row = {
+            id: cleanSessionId(e.id), keys, client: String(e.client || 'unknown').slice(0, 40), live: liveFlag,
+            status: liveFlag ? String(e.status || 'live').slice(0, 24) : (Number(e.endedAt) > 0 || e.status === 'closed' ? 'ended' : 'not running'),
+            intent: flat(e.intent).slice(0, 120), lastSeen: Number(e.lastSeen) || 0,
+        };
+        out.push(row);
+        for (const k of keys) byKey.set(k, row);
+    }
+    return out;
+}
+/**
+ * Per-area owner + the asker's takeovers. Pure, one pass over the cards.
+ * → { byArea: Map(area → { owner, session, handedTo }), takeovers, attributed, askerWrote }
+ *   owner     = { sessionId, client, at, cardId, text, session } — the newest stamped card
+ *   session   = the owner's presence row, or null (no longer in the lane)
+ *   handedTo  = { sessionId, client, at, title, cardId, fromId, session } when the
+ *               owner's own handoff was taken or finished by another session
+ *   takeovers = the asker's areas another session has since written in
+ *               (kind 'newer-card'), areas it still leads but whose handoff
+ *               another session took ('handed-area'), and each of its handoffs
+ *               another session took ('handoff'); newest first.
+ */
+export function areaOwnership(struct, { sessions = null, askerId = '', areas = null } = {}) {
+    const empty = { byArea: new Map(), takeovers: [], attributed: 0, askerWrote: 0, laneKnown: false };
+    if (!struct || !Array.isArray(struct.cards)) return empty;
+    const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+    const sessByKey = new Map();
+    for (const r of (Array.isArray(sessions) ? sessions : [])) {
+        const keys = Array.isArray(r?.keys) && r.keys.length ? r.keys : [ownKey(r?.id)];
+        for (const k of keys) if (k && !sessByKey.has(k)) sessByKey.set(k, r);
+    }
+    const sessionFor = (sid) => sessByKey.get(ownKey(sid)) || null;
+    // The asker's identities: its id plus every alias the lane knows for it
+    // (a /clear or a rekey keeps the logical session and changes the raw id).
+    const askerRow = askerId ? sessionFor(askerId) : null;
+    const askerKeys = new Set([ownKey(askerId), ...((askerRow && askerRow.keys) || [])].filter(Boolean));
+    const isAsker = (sid) => askerKeys.size > 0 && askerKeys.has(ownKey(sid));
+    // Two stamps are the SAME session when they match or the lane joins them.
+    const sameSession = (a, b) => {
+        const ka = ownKey(a), kb = ownKey(b);
+        if (!ka || !kb) return false;
+        if (ka === kb) return true;
+        const ra = sessByKey.get(ka);
+        return !!ra && ra === sessByKey.get(kb);
+    };
+    const scope = resolveAreaScope(struct, areas);
+    const scoped = !!(scope && scope.keep.size);
+    const newest = new Map();   // area → newest stamped card
+    const mine = new Map();     // area → the asker's newest stamped card
+    const handedTo = new Map(); // from-session key → newest take/finish by another session
+    let attributed = 0, askerWrote = 0;
+    for (const c of struct.cards) {
+        if (!c || c.type === 'container') continue;
+        // Handoffs count wherever they sit (a finished one is archived).
+        const h = c.handoff && typeof c.handoff === 'object' ? c.handoff : null;
+        if (h && h.from && h.from.sessionId) {
+            const by = (h.taken && h.taken.sessionId) ? h.taken : (h.done && h.done.sessionId ? h.done : null);
+            if (by && !sameSession(by.sessionId, h.from.sessionId)) {
+                const k = ownKey(h.from.sessionId);
+                const at = Number(by.at) || Number(c.createdAt) || 0;
+                const prev = handedTo.get(k);
+                if (!prev || at > prev.at) handedTo.set(k, { sessionId: cleanSessionId(by.sessionId), client: String(by.client || 'unknown'), at, title: flat(h.title || '').slice(0, 120), cardId: c.id, fromId: cleanSessionId(h.from.sessionId) });
+            }
+        }
+        const sid = cleanSessionId(c.createdSession);
+        if (!sid || !(c.text || '').trim()) continue;
+        const area = flat(c.area);
+        if (!area || OWNERSHIP_SKIP_AREA.test(area)) continue;
+        if (scoped && !scope.keep.has(normTitleKey(area))) continue;
+        attributed++;
+        const at = Number(c.createdAt) || 0;
+        const n = newest.get(area);
+        if (!n || at > n.at) newest.set(area, { at, sessionId: sid, client: String(c.createdVia || ''), cardId: c.id, text: flat(c.text) });
+        if (isAsker(sid)) {
+            askerWrote++;
+            const m = mine.get(area);
+            if (!m || at > m.at) mine.set(area, { at, cardId: c.id });
+        }
+    }
+    const handoffOf = (sid) => handedTo.get(ownKey(sid)) || [...handedTo.values()].find(x => sameSession(x.fromId, sid)) || null;
+    const byArea = new Map();
+    for (const [area, n] of newest) {
+        const s = sessionFor(n.sessionId);
+        const owner = { ...n, client: s ? s.client : (n.client || 'unknown'), session: s };
+        // A handoff taken BEFORE the owner wrote again is history: it came back.
+        const h0 = handoffOf(n.sessionId);
+        const h = h0 && h0.at >= n.at ? h0 : null;
+        byArea.set(area, { owner, session: s, handedTo: h ? { ...h, session: sessionFor(h.sessionId) } : null });
+    }
+    const takeovers = [];
+    if (askerKeys.size) {
+        for (const [area, m] of mine) {
+            const o = byArea.get(area);
+            if (!o) continue;
+            if (!isAsker(o.owner.sessionId) && o.owner.at > m.at) {
+                takeovers.push({ kind: 'newer-card', area, mine: m, other: o.owner, session: o.session });
+            } else if (o.handedTo && !isAsker(o.handedTo.sessionId)) {
+                takeovers.push({ kind: 'handed-area', area, mine: m, other: o.handedTo, session: o.handedTo.session });
+            }
+        }
+        for (const h of handedTo.values()) {
+            if (!isAsker(h.fromId) || isAsker(h.sessionId)) continue;
+            takeovers.push({ kind: 'handoff', title: h.title, cardId: h.cardId, other: h, session: sessionFor(h.sessionId) });
+        }
+        takeovers.sort((a, b) => (b.other.at || 0) - (a.other.at || 0));
+    }
+    return { byArea, takeovers, attributed, askerWrote, laneKnown: Array.isArray(sessions) && sessions.length > 0 };
+}
+// "Claude Code caf5af36 (idle 248m: “its intent”)" — one renderer for every
+// surface. A session no longer in the lane prints its stamp and says so,
+// rather than a guessed state.
+export function ownerLabel(o, { withIntent = true, intentMax = 60, lane = true } = {}) {
+    if (!o) return '';
+    const s = o.session || null;
+    const who = `${ownershipClientWord(s ? s.client : o.client)} ${String(o.sessionId || '').slice(0, 8)}`.trim();
+    // No lane passed (a caller that only has the file) → no state at all,
+    // never a guessed one.
+    if (!s && !lane) return who;
+    const state = s ? s.status : 'not in the session list';
+    const intent = withIntent && s && s.live && s.intent
+        ? `: “${s.intent.length > intentMax ? s.intent.slice(0, intentMax - 1).trimEnd() + '…' : s.intent}”` : '';
+    return `${who} (${state}${intent})`;
+}
+// The session HANDLING an area for the asker's purposes: its owner (or the
+// session that took the owner's handoff) when that is not the asker and is
+// live, or wrote there within OWNERSHIP_RECENT_MS. null otherwise — an old,
+// gone owner says nothing about who is on the work today.
+export function ownerIsActiveOther(entry, { askerId = '', now = Date.now() } = {}) {
+    if (!entry || !entry.owner) return null;
+    const pick = entry.handedTo && entry.handedTo.sessionId ? entry.handedTo : entry.owner;
+    const askerKey = ownKey(askerId);
+    const keys = pick.session && Array.isArray(pick.session.keys) ? pick.session.keys : [];
+    if (askerKey && (ownKey(pick.sessionId) === askerKey || keys.includes(askerKey))) return null;
+    const live = !!(pick.session && pick.session.live);
+    if (!live && now - (Number(pick.at) || 0) > OWNERSHIP_RECENT_MS) return null;
+    return pick;
+}
+// The "↪ Taken over from you" block — shared by status mode and the brief.
+// [] when the asker has no takeover. Header + up to `max` lines + an honest
+// overflow line; a handoff line names the areas it carried.
+export function takeoverLines(own, { max = 8 } = {}) {
+    if (!own || !Array.isArray(own.takeovers) || !own.takeovers.length) return [];
+    const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+    const day = (ts) => ts ? new Date(ts).toISOString().slice(0, 16).replace('T', ' ') + 'Z' : '';   // minute: both notes are often the same day
+    const cut = (t, n) => { let s = String(t).slice(0, n); if (/[\uD800-\uDBFF]$/.test(s)) s = s.slice(0, -1); return String(t).length > n ? s.trimEnd() + '…' : s; };
+    const label = (o) => ownerLabel(o, { lane: own.laneKnown, intentMax: 40 });
+    const handedAreas = new Map();   // handoff card (or taker) → areas you still lead but handed off
+    for (const t of own.takeovers) if (t.kind === 'handed-area') {
+        const k = t.other.cardId || t.other.sessionId;
+        if (!handedAreas.has(k)) handedAreas.set(k, { other: t.other, areas: [] });
+        handedAreas.get(k).areas.push(t.area);
+    }
+    const lines = [];
+    const listed = new Set();
+    for (const t of own.takeovers) {
+        if (t.kind === 'newer-card') {
+            lines.push(`- ↪ [${t.area}] taken over by ${label(t.other)} since your last note here (yours ${day(t.mine.at)}, theirs ${day(t.other.at)}: “${cut(flat(t.other.text).replace(/^[^:]{1,40}:\s*/, ''), 70)}”) — report this area’s items as handled there, not as yours.`);
+        } else if (t.kind === 'handoff') {
+            listed.add(t.other.cardId);
+            const as = (handedAreas.get(t.other.cardId) || { areas: [] }).areas;
+            lines.push(`- ↪ your handoff “${cut(t.title || 'untitled', 70)}” was taken by ${label(t.other)} ${day(t.other.at)}${as.length ? ` (areas: ${as.join(', ')})` : ''} — its items are being handled there, not yours.`);
+        }
+    }
+    // A handed area whose handoff card is not in this brain any more still warns.
+    for (const [k, h] of handedAreas) if (!listed.has(k)) lines.push(`- ↪ [${h.areas.join(', ')}] handed to ${label(h.other)} — report these areas’ items as handled there, not as yours.`);
+    if (!lines.length) return [];
+    const out = [`## ↪ Taken over from you (${lines.length}) — areas you worked in that another session now holds`, ...lines.slice(0, max)];
+    if (lines.length > max) out.push(`- ⚠️ …and ${lines.length - max} more taken-over area(s) — check brain_sync peers before reporting any of your earlier work as still yours.`);
+    return out;
+}
+// " · owner Claude Code caf5af36 (idle 3m)" for one digest row — or the
+// asker's own mark, or the session its handoff went to. '' when nobody is
+// recorded (unstamped cards) or no ownership was computed.
+function ownerSuffix(ownership, area, askerId) {
+    const e = ownership && ownership.byArea instanceof Map ? ownership.byArea.get(area) : null;
+    if (!e || !e.owner) return '';
+    const key = ownKey(askerId);
+    const mineKey = (o) => !!key && (ownKey(o.sessionId) === key || !!(o.session && Array.isArray(o.session.keys) && o.session.keys.includes(key)));
+    const label = (o) => ownerLabel(o, { lane: ownership.laneKnown });
+    if (e.handedTo && e.handedTo.sessionId) {
+        if (mineKey(e.handedTo)) return ` · owner you (this session — you took ${label(e.owner)}'s handoff)`;
+        return ` · owner ${mineKey(e.owner) ? 'you' : label(e.owner)} → handed to ${label(e.handedTo)}`;
+    }
+    return mineKey(e.owner) ? ' · owner you (this session)' : ` · owner ${label(e.owner)}`;
+}
+export function areaStatusDigest(struct, { activeDays = 30, maxAreas = 20, now = Date.now(), areas = null, summary = null, ownership = null, askerId = '' } = {}) {
     if (!struct || !Array.isArray(struct.cards)) return [];
     // ONE count (1.85.0): the per-area "(K look done)" reads the same
     // openStatusSummary the header prints; a caller that already has it
@@ -3153,7 +3420,7 @@ export function areaStatusDigest(struct, { activeDays = 30, maxAreas = 20, now =
         const mileStale = m && mAge >= DECAY_STALE_MS && isFastDecayCard(m)
             ? ` (${formatDecayAge(mAge)} — verify live)` : '';
         const mileTxt = m ? `last 🏁 ${day(m.createdAt)}${mileStale} “${cut(flat(m.text).replace(/^[^:\n]{1,40}:\s*/, '').replace(/^🏁\s*/, ''), 70)}”` : 'no 🏁 yet';
-        rows.push({ newest, line: `- ${area} — ${mileTxt} · ${opens.length} open${done ? ` (${done} look done)` : ''} · latest ${day(newest)}` });
+        rows.push({ newest, line: `- ${area} — ${mileTxt} · ${opens.length} open${done ? ` (${done} look done)` : ''} · latest ${day(newest)}${ownerSuffix(ownership, area, askerId)}` });
     }
     rows.sort((a, b) => b.newest - a.newest);
     const out = [...lead, ...rows.slice(0, maxAreas).map(r => r.line)];
@@ -3166,7 +3433,7 @@ export function areaStatusDigest(struct, { activeDays = 30, maxAreas = 20, now =
 // decisions + milestones. Everything older stays in the file, reachable via the
 // klypix-canvas MCP search or `--full`. Keeps the session-start cost flat as
 // the brain grows (the full markdown scales with history; this doesn't).
-export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMilestones = 8, maxConnections = 30, maxSkills = 24, detailRecent = 8, freshness = null, summary = null } = {}) {
+export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMilestones = 8, maxConnections = 30, maxSkills = 24, detailRecent = 8, freshness = null, summary = null, sessions = null, askerId = '' } = {}) {
     const cutoff = Date.now() - recentDays * 86_400_000;
     const texts = struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim());
     const containers = struct.cards.filter(c => c.type === 'container');
@@ -3349,8 +3616,13 @@ export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMile
     // the "where does each area stand today" answer (the 2026-07-23 incident:
     // the portal-shipped 🏁 fell out of the milestone tier and a week-old
     // "remaining:" claim answered a status question).
-    const digest = areaStatusDigest(struct, { summary: baseSummary });
-    if (digest.length) { push('', '## Area status (computed — newest 🏁 + open count per active area)'); for (const l of digest) push(l); }
+    // Owner per area + the asker's takeovers (1.106.0) — from card session
+    // stamps and, when the caller passes it, the presence lane.
+    let own = null;
+    try { own = areaOwnership(struct, { sessions, askerId }); } catch { own = null; }
+    const digest = areaStatusDigest(struct, { summary: baseSummary, ownership: own, askerId });
+    if (digest.length) { push('', `## Area status (computed — newest 🏁 + open count${own && own.attributed ? ' + owner = the session with the newest card' : ''} per active area)`); for (const l of digest) push(l); }
+    { const taken = takeoverLines(own); if (taken.length) { push(''); for (const l of taken) push(l); } }
     if (miles.length) {
         push('', '## Milestones');
         for (const c of miles.sort((a, b) => b.createdAt - a.createdAt).slice(0, maxMilestones)) push(`- ${fr(c)}${headline(c)}`);
@@ -4729,7 +5001,7 @@ export const decayMessageStamp = (ageMs) =>
 // maxOpen defaults to NO cap: the open list is the answer to a status question,
 // so it is sized to fit (per-card width adapts) rather than sliced. Callers can
 // still pass a cap explicitly.
-export function statusContextToMarkdown(struct, { maxOpen = Infinity, budgetChars = 4200, now = Date.now(), areas = null, summary = null } = {}) {
+export function statusContextToMarkdown(struct, { maxOpen = Infinity, budgetChars = 4200, now = Date.now(), areas = null, summary = null, sessions = null, askerId = '', ownership = null } = {}) {
     if (!struct || !Array.isArray(struct.cards)) return '';
     const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
     // Area scope (1.85.0): when the prompt named areas that exist on this brain,
@@ -4766,6 +5038,11 @@ export function statusContextToMarkdown(struct, { maxOpen = Infinity, budgetChar
     // (2026-07-25 field incident: 9 of 27 opens shown, no notice, answer wrong.)
     // Structural lines — headers, counts, overflow notices — bypass the budget.
     const pushAlways = (l) => { out.push(l); used += l.length + 1; };
+    // Ownership warnings (1.106.0) ride OUTSIDE the content budget: they are
+    // additive, and measured on the real brain, counting them pushed 7 open
+    // cards behind the overflow line — the asker would trade the list it asked
+    // for for the note about who holds it.
+    const pushWarn = (l) => { out.push(l); };
     const cut = (t, n) => { let s = String(t).slice(0, n); if (/[\uD800-\uDBFF]$/.test(s)) s = s.slice(0, -1); return String(t).length > n ? s.trimEnd() + '…' : s; };
     pushAlways('# Computed current state (status mode)');
     pushAlways('_A status-shaped question answers from THIS computed section first — the ranked cards below are supporting context only. A card marked ⏳ or ⚠️ must not be reported as plainly still-open._');
@@ -4788,9 +5065,32 @@ export function statusContextToMarkdown(struct, { maxOpen = Infinity, budgetChar
     // never even bound: the budget cut the list at 9 first. Derive the area cap
     // from what's actually left instead of a fixed number — areaStatusDigest
     // prints its own honest "…and N more active area(s)" line when it trims.
+    // OWNERSHIP (1.106.0): who wrote each area last, and — for the asking
+    // session — the areas another session has written in since. Computed
+    // from card stamps + the presence lane the caller passes; one O(cards)
+    // pass, best-effort (a failure renders today's block, never a throw).
+    let own = ownership;
+    if (!own) { try { own = areaOwnership(struct, { sessions, askerId, areas }); } catch { own = null; } }
+    const owned = !!(own && own.attributed > 0);
     const openReserve = opens.length ? Math.floor(budgetChars * 0.6) : 0;
+    // The area cap is sized BEFORE the ownership lines, on purpose: only
+    // owned rows grow, and measured on the real brain a per-row allowance for
+    // owners cost three area rows (the owned iOS row among them).
     const maxAreas = Math.max(4, Math.min(14, Math.floor((budgetChars - openReserve - used) / 100)));
-    for (const l of areaStatusDigest(struct, { maxAreas, areas, now, summary: base })) pushAlways(l);
+    if (owned || (own && own.takeovers.length)) {
+        // The instruction rides pushAlways: it is what makes the flags below
+        // mean something, so a crowded brain may shorten cards, never this.
+        pushWarn('_Owner = the session with the newest card in an area. 👤 = another session holds that area (live, or wrote there in the last 24h): report the item as being handled in that session, not as yours to do. ↪ = an area you worked in that another session has written in since._');
+    }
+    for (const l of areaStatusDigest(struct, { maxAreas, areas, now, summary: base, ownership: own, askerId })) {
+        pushAlways(l);
+        const at = l.indexOf(' · owner ');   // the owner suffix is a warning, not content (see pushWarn)
+        if (at >= 0) used -= l.length - at;
+    }
+    // Warnings, not content: every line rides pushAlways, capped by COUNT
+    // with an honest overflow line (the v1.32.0 law).
+    const taken = own ? takeoverLines(own) : [];
+    if (taken.length) { pushWarn(''); for (const l of taken) pushWarn(l); }
     if (opens.length) {
         const overdueById = sum.overdueById;
         // Overdue first, then OLDEST first. Age IS an open item's urgency signal,
@@ -4821,7 +5121,10 @@ export function statusContextToMarkdown(struct, { maxOpen = Infinity, budgetChar
         let shown = 0;
         for (const c of top) {
             if (used > budgetChars) break;
-            const flags = `${overdueById.has(c.id) ? ' ⏰OVERDUE' : ''}${overlays.has(c.id) ? ` ⚠️CORRECTED → current: “${cut(flat(overlays.get(c.id).by.text), 80)}”` : ''}${fulfills.has(c.id) ? (fulfills.get(c.id)?.unconfirmed ? ' ⏳likely-fulfilled?' : ' ⏳likely-fulfilled') : ''}`;
+            const handler = own ? ownerIsActiveOther(own.byArea.get(flat(c.area)), { askerId, now }) : null;
+            const held = handler ? ` 👤area held by ${ownerLabel(handler, { lane: own.laneKnown, withIntent: false })}` : '';
+            used -= held.length;   // a warning, not content (see pushWarn)
+            const flags = `${held}${overdueById.has(c.id) ? ' ⏰OVERDUE' : ''}${overlays.has(c.id) ? ` ⚠️CORRECTED → current: “${cut(flat(overlays.get(c.id).by.text), 80)}”` : ''}${fulfills.has(c.id) ? (fulfills.get(c.id)?.unconfirmed ? ' ⏳likely-fulfilled?' : ' ⏳likely-fulfilled') : ''}`;
             const d = decayStamp(c);
             if (d) pushAlways(`- [${flat(c.area) || 'Notes'}]${flags} ⏱️ LAST KNOWN (${d.age}): ${cut(flat(c.text), perCard)} — VERIFY: ${d.probe}`);
             else pushAlways(`- [${flat(c.area) || 'Notes'}]${flags} ${cut(flat(c.text), perCard)}`);
@@ -7008,6 +7311,11 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                     j.createdAt = now;
                     j.borderColor = 'rgba(16,185,129,0.6)';
                     if (u.createdVia) j.createdVia = String(u.createdVia);
+                    // The rewrite restamps createdAt, so the card now reads as
+                    // the area's newest write: it belongs to the session that
+                    // made it, and to no session when the writer gave none (the
+                    // old stamp would name a session that did not write this).
+                    if (cleanSessionId(u.createdSession)) j.createdSession = cleanSessionId(u.createdSession); else delete j.createdSession;
                     // Omission preserves metadata; explicit empties clear stale anchors.
                     // A cleared verify is PERSISTED as '' (1.86.1): deleting the
                     // field let the reader derive a probe from the card's prose
@@ -7035,7 +7343,7 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                 // a glyph-less guard card was silently consolidatable while
                 // still enforcing (review 2026-08-24). remove-sentinels add no
                 // glyph and no field: an unmatched disarm is inert by design.
-                cards.push({ text: (u.area ? `${u.area}: ` : '') + (u.guard && u.guard.remove !== true && !/🛠/.test(u.text) ? '🛠️ ' : '') + u.text + (u.area ? `\n#${u.area.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : ''), area: u.area, createdVia: u.createdVia, ...(Array.isArray(u.evidence) && u.evidence.length ? { evidence: u.evidence } : {}), ...(typeof u.verify === 'string' && u.verify.trim() ? { verify: u.verify.trim() } : {}), ...(u.guard && typeof u.guard === 'object' && u.guard.remove !== true ? { guard: u.guard } : {}) });
+                cards.push({ text: (u.area ? `${u.area}: ` : '') + (u.guard && u.guard.remove !== true && !/🛠/.test(u.text) ? '🛠️ ' : '') + u.text + (u.area ? `\n#${u.area.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : ''), area: u.area, createdVia: u.createdVia, ...sessionField(u), ...(Array.isArray(u.evidence) && u.evidence.length ? { evidence: u.evidence } : {}), ...(typeof u.verify === 'string' && u.verify.trim() ? { verify: u.verify.trim() } : {}), ...(u.guard && typeof u.guard === 'object' && u.guard.remove !== true ? { guard: u.guard } : {}) });
             }
         } catch (error) {
             (stats.captureErrors ||= []).push({ kind: 'update', i: uIndex, ...describeFailed(u, 'text'), error: errText(error) });
@@ -7344,6 +7652,7 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                     j.content = String(card.text);
                     j.createdAt = now;
                     if (card.createdVia) j.createdVia = String(card.createdVia);
+                    if (cleanSessionId(card.createdSession)) j.createdSession = cleanSessionId(card.createdSession); else delete j.createdSession;
                     if (Array.isArray(card.evidence) && card.evidence.length) j.evidence = card.evidence;
                     if (typeof card.verify === 'string' && card.verify.trim()) j.verify = card.verify.trim();
                     if (card.guard && typeof card.guard === 'object') j.guard = card.guard;
@@ -9457,18 +9766,19 @@ export function repairRawMarker(text) {
     return wrapText([lead, ...lines.slice(i)].join('\n'), cpl);
 }
 
-export function noteToCaptureInput({ text = '', area = '', marker = '', closes = '', evidence = null, verify = null, guard = null, createdVia = 'mcp' } = {}) {
+export function noteToCaptureInput({ text = '', area = '', marker = '', closes = '', evidence = null, verify = null, guard = null, createdVia = 'mcp', createdSession = '' } = {}) {
+    const sess = cleanSessionId(createdSession) ? { createdSession: cleanSessionId(createdSession) } : {};
     ({ marker, text } = liftLeadingMarker(marker, text));
     const body = String(text).trim();
     if (!body) return { cards: [], resolutions: [], updates: [] };
     const a = String(area || '').trim();
     if (marker === '✓') return { cards: [], resolutions: [{ area: a, text: body }], updates: [] };
-    if (marker === '~') return { cards: [], resolutions: [], updates: [{ area: a, text: body, createdVia, ...(Array.isArray(evidence) ? { evidence } : {}), ...(typeof verify === 'string' ? { verify } : {}), ...(guard ? { guard } : {}) }] };
+    if (marker === '~') return { cards: [], resolutions: [], updates: [{ area: a, text: body, createdVia, ...sess, ...(Array.isArray(evidence) ? { evidence } : {}), ...(typeof verify === 'string' ? { verify } : {}), ...(guard ? { guard } : {}) }] };
     const prefix = marker === '?' ? '❓ ' : marker === '!' ? '🏁 ' : marker === '+' ? '🛠️ ' : '';
     const borderColor = marker === '?' ? 'rgba(245,166,35,0.8)' : marker === '!' ? 'rgba(59,130,246,0.8)' : marker === '+' ? 'rgba(139,92,246,0.85)' : 'rgba(16,185,129,0.6)';
     const tag = a ? `\n#${a.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : '';
     const cardText = (a ? `${a}: ${prefix}${body}` : `${prefix}${body}`) + tag;
-    return { cards: [{ text: cardText, area: a, color: '#e8e8ed', borderColor, createdVia, ...(closes ? { closes } : {}), ...(evidence ? { evidence } : {}), ...(verify ? { verify } : {}), ...(guard ? { guard } : {}) }], resolutions: [], updates: [] };
+    return { cards: [{ text: cardText, area: a, color: '#e8e8ed', borderColor, createdVia, ...sess, ...(closes ? { closes } : {}), ...(evidence ? { evidence } : {}), ...(verify ? { verify } : {}), ...(guard ? { guard } : {}) }], resolutions: [], updates: [] };
 }
 
 /**

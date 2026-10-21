@@ -1521,6 +1521,25 @@ function checkoutLinesOf(w, cwd) {
 }
 const CONTINUE_RE =/\b(continue|resume|pick (it |this |that )?up|carry on|keep going|where (were|did) we|what('s| is| was) (next|left|remaining|pending)|unfinished|left off|hand[- ]?off|handed (over|off)|take over|finish (what|the work|it|this))\b/i;
 const HANDOFF_ASK_RE = /\b(hand[- ]?off|hand (it|this|the work) (over|off)|before (we|i|you) (hit|reach|approach|run out of) (the )?(limit|context|window|quota)|(context|usage|token) (limit|window|quota)|out of context|switch(ing)? to (codex|another (agent|session|tool)))\b/i;
+// Presence rows for the owner/takeover view (1.106.0): live rows pruned by the
+// hook's own pruneSessions twin, the two-week directory by dirPrune — the same
+// two sources unfinishedFooter reads. The engine does the join and labels
+// (ownershipSessionsFromLane); null on an older engine or an unreadable lane,
+// and the status block then shows owners from card stamps alone.
+function ownershipSessions(lib, now = Date.now()) {
+    if (!lib || typeof lib.ownershipSessionsFromLane !== 'function') return null;
+    try {
+        const data = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8'));
+        return lib.ownershipSessionsFromLane({
+            live: pruneSessions(Array.isArray(data.sessions) ? data.sessions : [], now),
+            directory: dirPrune(data.directory, now),
+        }, now);
+    } catch { return null; }
+}
+// The status block's dedup hash must not change just because a peer's idle
+// minutes ticked over (the owner labels carry "idle 14m"); everything else in
+// the block still invalidates it.
+const statusHashText = (content) => String(content || '').replace(/\bidle \d+m\b/g, 'idle');
 function unfinishedFooter(sid, { max = 4 } = {}) {
     try {
         const data = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8'));
@@ -4310,6 +4329,16 @@ async function capture(lib) {
             }
         } catch { /* the nudge is never allowed to break a capture */ }
     }
+    // WHICH SESSION wrote each card (1.106.0): stamped here, on this session's
+    // own batch, BEFORE it can be queued — a queued batch is drained by
+    // whichever session's Stop takes the lock next, and must keep its author.
+    // Commit cards and out-of-session ship observations are not this
+    // session's authorship (any session's commit, a ship nobody narrated),
+    // so they stay unstamped and own nothing.
+    if (sid) {
+        for (const c of cards) if (c && !c.createdSession && c.createdVia !== 'commit' && c.createdVia !== 'ship-observed') c.createdSession = String(sid).slice(0, 160);
+        for (const u of updates) if (u && !u.createdSession) u.createdSession = String(sid).slice(0, 160);
+    }
     // A queued batch from a prior lock-refused capture counts as work to do —
     // the authoritative drain happens INSIDE the brain lock (doCapture), so two
     // concurrent sessions can never both land the same queued batch.
@@ -4410,7 +4439,7 @@ async function capture(lib) {
                 });
             } catch { return list; /* parse failed → land unfiltered; the supersede pass copes */ }
         };
-        const toEngine = (c) => ({ text: c.text, color: '#e8e8ed', borderColor: c.borderColor, area: c.area, createdVia: c.createdVia || 'claude-code', ...(c.closes ? { closes: c.closes } : {}), ...(c.closes && typeof c.closesFallbackText === 'string' ? { closesFallbackText: c.closesFallbackText, closesAnchored: c.closesAnchored === true } : {}), ...(typeof c.repairStub === 'string' ? { repairStub: c.repairStub } : {}), ...(c.evidence ? { evidence: c.evidence } : {}), ...(c.verify ? { verify: c.verify } : {}) });
+        const toEngine = (c) => ({ text: c.text, color: '#e8e8ed', borderColor: c.borderColor, area: c.area, createdVia: c.createdVia || 'claude-code', ...(c.createdSession ? { createdSession: c.createdSession } : {}), ...(c.closes ? { closes: c.closes } : {}), ...(c.closes && typeof c.closesFallbackText === 'string' ? { closesFallbackText: c.closesFallbackText, closesAnchored: c.closesAnchored === true } : {}), ...(typeof c.repairStub === 'string' ? { repairStub: c.repairStub } : {}), ...(c.evidence ? { evidence: c.evidence } : {}), ...(c.verify ? { verify: c.verify } : {}) });
         // → null when this subset has nothing left to land (every card was
         // already carded by the git hook), else the engine's result.
         const land = async (cs, rs, us) => {
@@ -5261,14 +5290,17 @@ async function promptRetrieve(lib) {
                         // hash-deduped per session, and it replaces freshHits
                         // rather than adding to them. Paying ~1.2k tokens once
                         // per status conversation beats answering it wrong.
-                        const md = lib.statusContextToMarkdown(struct, { budgetChars: 5200, areas, summary });
+                        // Owner per area + this session's takeovers (1.106.0):
+                        // the 2026-10-21 incident — a session reported work
+                        // another session had taken over as its own to-do.
+                        const md = lib.statusContextToMarkdown(struct, { budgetChars: 5200, areas, summary, sessions: ownershipSessions(lib), askerId: sid });
                         // Drop its own H1; the hook's stronger header replaces it.
                         if (md && md.trim()) body = md.split('\n').slice(1).join('\n').trimEnd();
                     } catch { body = null; }
                 }
                 const content = body || digest.join('\n');
                 if (digest.length) {
-                    const h = crypto.createHash('sha1').update(content).digest('hex').slice(0, 12);
+                    const h = crypto.createHash('sha1').update(statusHashText(content)).digest('hex').slice(0, 12);
                     let lane = null; try { lane = readSessions().find(s => s.id === sid) || null; } catch { /* */ }
                     if (lane && lane.statusDigestHash === h) {
                         statusMd = '## 📊 Current state — unchanged since the digest shown earlier this session (`brain_ask` gives the full computed status view).';
@@ -6149,7 +6181,7 @@ async function read(lib) {
     adoptCaptureReceipts(input.session_id);
     // ONE version notice for both tiers, built from the plan loaded above.
     const versionLine = versionCurrencyFooter(update);
-    const full = ((typeof lib.structToBrief === 'function') ? lib.structToBrief(struct, { freshness, summary }) : lib.structToMarkdown(struct))
+    const full = ((typeof lib.structToBrief === 'function') ? lib.structToBrief(struct, { freshness, summary, sessions: ownershipSessions(lib), askerId: input.session_id || '' }) : lib.structToMarkdown(struct))
         + inflightFooter(input.session_id, struct) + selfHealFooter(drifted) + reconcileFooter(lib, struct) + staleOpenFooter(stale)
         + ruleDraftsFooter(input.session_id, struct, { markShown: false })
         + receiptLine + selfCheckFooter() + doctorFooter() + versionLine + legendFooter() + memoryFooter();

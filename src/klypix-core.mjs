@@ -34,7 +34,7 @@ import {
   rankForQuestion, splitAskWords, questionContextToMarkdown, findLegacyShipCards,
   challengeBrain, challengeContextToMarkdown, buildRenderSpec, structToBrief,
   brainLensData, lensToMarkdown, deathDateOfCard,
-  statusContextToMarkdown, findFulfillmentCandidates, findStaleOpenCards, releaseFulfilledOpens, openStatusSummary, perAreaTableToMarkdown,
+  statusContextToMarkdown, ownershipSessionsFromLane, findFulfillmentCandidates, findStaleOpenCards, releaseFulfilledOpens, openStatusSummary, perAreaTableToMarkdown,
   splitQueryTokens, scoreCardsAgainstQuery, correctionOverlaysFor, supersededByNote, currentGuidanceFor, currentGuidancePrefix,
   isFastDecayCard, isUnresolvedOpenCard, isSkillCard, validateGuard, guardSidecarPathFor, ensureGuardSidecar, DECAY_STALE_MS, formatDecayAge,
   isPlanCard, planFulfillmentFor, PLAN_PAIR_SIM_BRAIN, isAgconfTwinId,
@@ -794,7 +794,7 @@ async function questionVectors(pipe, file, cards) {
   return { vecs, stats, usable };
 }
 
-export async function opBrainAsk({ vault, canvas, question, as_of, k = 10, log = () => {} }) {
+export async function opBrainAsk({ vault, canvas, question, as_of, k = 10, log = () => {}, sessionId = '' }) {
   // A last line `Also: <words>` is the caller's guess at the card's wording; it
   // joins the meaning query only (splitAskWords in klypix-format.mjs).
   const { question: q, words } = splitAskWords(question);
@@ -874,7 +874,14 @@ export async function opBrainAsk({ vault, canvas, question, as_of, k = 10, log =
     // rows already carry the counts and its budget cannot afford a twin).
     try {
       const summary = openStatusSummary(struct, { pairSim });
-      statusMd = statusContextToMarkdown(struct, { areas: result.areas || null, summary });
+      // Owner per area + the asker's takeovers (1.106.0), from the presence
+      // lane of THIS brain; a lane read failure leaves owners from card stamps.
+      let sessions = null;
+      try {
+        const now = Date.now();
+        sessions = ownershipSessionsFromLane({ live: listActiveSessions({ brainPath: t.file, now }), directory: listKnownSessions({ brainPath: t.file, now }) }, now);
+      } catch { sessions = null; }
+      statusMd = statusContextToMarkdown(struct, { areas: result.areas || null, summary, sessions, askerId: sessionId || '' });
       const table = perAreaTableToMarkdown(summary, { cap: 12, areas: result.areas || null });
       if (table) statusMd += table + '\n';
       mode += ' + status-mode';
@@ -1926,7 +1933,7 @@ export async function opAddToCanvas({ vault, canvas, cards, connections, via }) 
 // open file any agent reads AND writes": a hookless client (Cursor/Cline/Desktop)
 // can now record a decision, ask an open question, mark a milestone, resolve a card,
 // or correct one — with the full lifecycle, not just a flat append.
-export async function opBrainNote({ vault, canvas, text: noteText, area, marker = '', closes, via, evidence, verify, guard = null, enrichmentQuestion = '' }) {
+export async function opBrainNote({ vault, canvas, text: noteText, area, marker = '', closes, via, session = '', evidence, verify, guard = null, enrichmentQuestion = '' }) {
   const t = brainTarget(vault, canvas);
   if (t.ambiguous) return ambiguousBrainErr(t.ambiguous);
   if (!t.file) return err(`No brain found — looked for ./brain.klypix in the project, then ${vault}. Pass canvas: "<name>".`);
@@ -1948,7 +1955,7 @@ export async function opBrainNote({ vault, canvas, text: noteText, area, marker 
   }
   const metadata = prepareBrainEvidence({ projectRoot: path.dirname(file), evidence, verify, marker, text: noteText, deriveVerify: parseVerifySuffix });
   if (!metadata.ok) return err(`Invalid brain note metadata: ${metadata.error}`);
-  const input = noteToCaptureInput({ text: noteText, area, marker, closes: closes || '', evidence: metadata.evidence, verify: metadata.verify, guard: guardField, createdVia: via || 'mcp' });
+  const input = noteToCaptureInput({ text: noteText, area, marker, closes: closes || '', evidence: metadata.evidence, verify: metadata.verify, guard: guardField, createdVia: via || 'mcp', createdSession: session || '' });
   // Deliver any queued out-of-session ship observations on THIS write. The
   // Claude Stop hook is not the only writer — an MCP-only or Codex-driven
   // project would otherwise queue observations that never drain (2026-07-29
@@ -2254,7 +2261,7 @@ export async function opBrainHandoff({ vault, canvas, action = 'write', from = {
       } catch (e) { continuedNote = `\nThe earlier handoff ${continues} was NOT closed: ${e.message}`; }
     }
     const noteResult = await opBrainNote({
-      vault, canvas: file, text: body, area: value.area, marker: '?', via: via || me.client,
+      vault, canvas: file, text: body, area: value.area, marker: '?', via: via || me.client, session: me.sessionId,
       evidence: evidence.length ? evidence : undefined,
       verify: value.verify || undefined,
       enrichmentQuestion: [`what was ${handoffClientWord(me.client)} session ${me.sessionId.slice(0, 8)} working on and where did it leave off?`, `how do I continue ${value.title}?`],

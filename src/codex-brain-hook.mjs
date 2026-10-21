@@ -13,6 +13,7 @@ import {
   formatPresenceMessage,
   formatReceivedMessages,
   formatUnfinishedWork,
+  listKnownSessions,
   listUnfinishedWork,
   peekMessages,
   postPresenceMessage,
@@ -429,13 +430,19 @@ async function statusDigestContext({ brainPath, sessionId, prompt, sessions, cwd
   let body = null;
   if (typeof lib.statusContextToMarkdown === 'function') {
     try {
-      const md = lib.statusContextToMarkdown(struct, { budgetChars: 5200, areas, summary });
+      // Owner per area + this session's takeovers (1.106.0, Claude-lane parity).
+      let owners = null;
+      if (typeof lib.ownershipSessionsFromLane === 'function') {
+        try { owners = lib.ownershipSessionsFromLane({ live: sessions, directory: listKnownSessions({ brainPath }) }); } catch { owners = null; }
+      }
+      const md = lib.statusContextToMarkdown(struct, { budgetChars: 5200, areas, summary, sessions: owners, askerId: sessionId || '' });
       // Drop its own H1; the hook's stronger header replaces it (Claude-lane parity).
       if (md && md.trim()) body = md.split('\n').slice(1).join('\n').trimEnd();
     } catch { body = null; }
   }
   const content = body || digest.join('\n');
-  const h = crypto.createHash('sha1').update(content).digest('hex').slice(0, 12);
+  // An owner's "idle 14m" ticks every minute; it must not defeat the dedup (Claude-lane parity).
+  const h = crypto.createHash('sha1').update(content.replace(/\bidle \d+m\b/g, 'idle')).digest('hex').slice(0, 12);
   const me = (Array.isArray(sessions) ? sessions : []).find((session) => session.id === sessionId);
   if (me && me.statusDigestHash === h) {
     return '## 📊 Current state — unchanged since the digest shown earlier this session (`brain_ask` gives the full computed status view).';

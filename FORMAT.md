@@ -134,6 +134,11 @@ strings: `text`, `box`, `image`, `file`, `container`, `approval`, `link`,
 
 `createdBy` (`user` | `agent`) and the optional `createdVia` (which agent/channel
 captured it) are the provenance bits the brain surfaces as badges and lenses.
+The optional `createdSession` (since 1.106.0, at most 160 characters) is the host
+session id that wrote or last rewrote the card. Status mode reads it to name each
+area's owner (the session with the newest stamped card) and to tell a session which
+of its areas another session has written in since. A card without it has no known
+owner; readers that predate it ignore it.
 
 Brain cards may also carry `evidence` and `verify`. An evidence reference has `kind`
 (`file`, `pr`, `url`, `commit`, or `run`), `ref`, optional caller-supplied file blob `oid`,

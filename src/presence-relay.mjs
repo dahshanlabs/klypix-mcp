@@ -100,7 +100,7 @@ export function canonicalWireFiles(files, root) {
 // structural, not a filter that can miss a field.
 export function buildPresenceFrame(session, { machineId, hostLabel = null, root = null, now = Date.now() } = {}) {
   if (!session || !session.id || !machineId) return null;
-  if (session.via === 'cloud') return null;   // loop prevention: never re-broadcast a received row
+  if ((session.via === 'cloud' || session.via === 'network')) return null;   // loop prevention: never re-broadcast a received row
   return {
     v: PRESENCE_WIRE_VERSION,
     kind: 'presence',

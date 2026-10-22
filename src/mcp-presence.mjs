@@ -38,8 +38,10 @@ import {
   sessionStatusLabel,
   shortestUniqueSessionPrefix,
   switchMcpSessionIdentity,
+  upsertRemoteSessions,
   upsertSession,
 } from './agent-presence.mjs';
+import { createNetworkBridge } from './network-bridge.mjs';
 // ONE definition of the file key. Exact-overlap detection (here) and finding
 // ROUTING (there) must agree byte for byte — a file "owned" by a peer under one
 // normalizer and not the other is a route that silently never happens. The
@@ -1427,6 +1429,10 @@ export function createMcpPresence({
   // KNOWN. Injection (not an import) keeps this file builtin-only; absent or
   // partial (old bundle), delivery degrades to unstamped — never a throw.
   decay = {},
+  // KLYPIX network (network-bridge.mjs): teammates' sessions on OTHER computers
+  // in the same project, as remote lane rows. Advisory and inert without the
+  // engine installed; injectable so tests never touch a real engine.
+  networkBridge = createNetworkBridge({ env, ...(home ? { home } : {}) }),
 } = {}) {
   const seedIdentity = resolveMcpSessionSeed({ env });
   let sessionId = seedIdentity.id;
@@ -2093,6 +2099,28 @@ export function createMcpPresence({
     return pending;
   };
 
+  // Publish this session's project context to the KLYPIX network and mirror
+  // teammates' sessions on other computers into the lane, so the peer footer,
+  // brain_sync peers and overlap warnings show them with no reader changes.
+  // Best-effort: any failure leaves the local result exactly as it was.
+  const mergeNetworkPeers = (sessions, stamp) => {
+    if (!networkBridge?.available?.() || !Array.isArray(sessions) || sessions.laneWriteOk === false) return sessions;
+    try {
+      const own = sessions.find((row) => row?.id === sessionId) || {};
+      const synced = networkBridge.sync({ root: path.dirname(brainPath), intent: own.intent || '', files: own.files || [] });
+      if (!synced?.ok || !synced.rows.length) return sessions;
+      const written = upsertRemoteSessions({ brainPath, rows: synced.rows, home, now: stamp });
+      if (written?.laneWriteOk === false) return sessions;
+      const merged = listActiveSessions({ brainPath, home, now: stamp });
+      for (const key of ['laneWriteOk', 'laneWriteSkippedReason']) {
+        Object.defineProperty(merged, key, { value: sessions[key], enumerable: false, configurable: true });
+      }
+      return merged;
+    } catch {
+      return sessions;
+    }
+  };
+
   const touch = ({
     event = 'McpHeartbeat',
     includePresence = false,
@@ -2123,7 +2151,7 @@ export function createMcpPresence({
       };
     }
     const { client, surface } = clientInfoPrepared || clientInfo();
-    const sessions = upsertSession({
+    let sessions = upsertSession({
       brainPath,
       id: sessionId,
       client,
@@ -2145,6 +2173,7 @@ export function createMcpPresence({
       home,
       now: stamp,
     });
+    sessions = mergeNetworkPeers(sessions, stamp);
     let messages = [];
     let deliveryWriteOk = null;
     let deliveryWriteSkippedReason = null;
@@ -3761,6 +3790,8 @@ export function createMcpPresence({
     decorateToolResult,
     get brainPath() { return brainPath; },
     get vault() { return vault; },
+    // KLYPIX network delivery for brain_message (sessions on other computers).
+    networkSend: (message) => (networkBridge?.available?.() ? networkBridge.send(message) : { ok: false, reason: 'no-engine' }),
     // The session's own declared intent (or ''), read fresh from the lane —
     // the enrichment question source for MCP-side brain_note captures.
     get declaredIntent() {

@@ -114,7 +114,7 @@ export function isProcessAlive(pid) {
 }
 
 export function isDeadHostRow(session, now = Date.now(), probe = isProcessAlive) {
-  if (!session || session.via === 'cloud') return false;
+  if (!session || (session.via === 'cloud' || session.via === 'network')) return false;
   if (String(session.hostPidSource || '') !== 'env') return false;
   if (!session.machine || String(session.machine) !== String(MACHINE_ID)) return false;
   if (now - Number(session.lastSeen || 0) < DEAD_HOST_GRACE_MS) return false;
@@ -635,7 +635,7 @@ const pruneDirectory = (rows, now) => (Array.isArray(rows) ? rows : [])
 function rememberSession(directory, row, now, { ended = false } = {}) {
   const rows = pruneDirectory(directory, now);
   const id = recipientKey(row?.logicalSessionId || '');
-  if (!id || row?.via === 'cloud') return rows;
+  if (!id || (row?.via === 'cloud' || row?.via === 'network')) return rows;
   const index = rows.findIndex((entry) => entry.id === id);
   const prev = index >= 0 ? rows[index] : null;
   const scope = [...new Set([...normalizeFiles(row.files), ...normalizeFiles(row.observedFiles)])].slice(-8);
@@ -1297,6 +1297,9 @@ export function upsertSession({
 // machine renders once, as local. Rows land with via:'cloud' + channelSeen.cloud
 // so existing TTL pruning governs their lifetime (P3) and buildPresenceFrame
 // refuses to re-broadcast them (loop prevention).
+// Where a remote row came from. Only these are ever written by upsertRemoteSessions.
+export const REMOTE_VIAS = new Set(['cloud', 'network']);
+
 export function upsertRemoteSessions({ brainPath, rows, machineId = MACHINE_ID, home, now = Date.now() }) {
   if (!brainPath || !Array.isArray(rows) || !rows.length) return withWriteVerdict([], false, 'nothing-to-write');
   const laneFile = laneFileFor(brainPath, home);
@@ -1309,10 +1312,12 @@ export function upsertRemoteSessions({ brainPath, rows, machineId = MACHINE_ID, 
     const data = laneRead.data;
     const sessions = pruneSessions(data.sessions, now);
     for (const row of rows) {
-      if (!row?.id || !row.machine || row.via !== 'cloud') continue;
+      // 'cloud' rows ride the Supabase presence channel; 'network' rows come from
+      // the KLYPIX network engine (network-bridge.mjs). Both are remote, never local.
+      if (!row?.id || !row.machine || !REMOTE_VIAS.has(row.via)) continue;
       if (String(row.machine) === String(machineId)) continue;   // never a remote row for this machine
       const existingIdx = sessions.findIndex((session) => session.id === row.id);
-      if (existingIdx >= 0 && sessions[existingIdx].via !== 'cloud') continue;   // local row wins
+      if (existingIdx >= 0 && !REMOTE_VIAS.has(sessions[existingIdx].via)) continue;   // local row wins
       const previous = existingIdx >= 0 ? sessions[existingIdx] : {};
       // REPLACE semantics, like `files` below: the frame is a full snapshot of
       // the sender's row, so an empty/absent observed lane must CLEAR the
@@ -1338,11 +1343,12 @@ export function upsertRemoteSessions({ brainPath, rows, machineId = MACHINE_ID, 
         ...(remoteObserved.length ? { observedFiles: remoteObserved } : {}),
         machine: String(row.machine),
         host: row.host ?? previous.host ?? null,
-        via: 'cloud',
-        channels: ['cloud'],
-        transport: { cloud: { status: 'relay-best-effort', at: now } },
+        via: row.via,
+        channels: [row.via],
+        ...(row.via === 'network' && row.address ? { networkAddress: String(row.address).slice(0, 200) } : {}),
+        transport: { [row.via]: { status: 'relay-best-effort', at: now } },
         deliveryReachability: 'relay-best-effort',
-        channelSeen: { cloud: now },   // receiver clock (P4) — frame time never decides freshness
+        channelSeen: { [row.via]: now },   // receiver clock (P4) — frame time never decides freshness
         startedAt: previous.startedAt || now,
         lastSeen: now,
       };
@@ -1399,7 +1405,7 @@ export function purgeRemotePresence({ brainPath, home, now = Date.now() }) {
     };
     const data = laneRead.data;
     const maintainedSessions = pruneSessions(data.sessions, now);
-    const sessions = maintainedSessions.filter((session) => session.via !== 'cloud');
+    const sessions = maintainedSessions.filter((session) => !REMOTE_VIAS.has(session.via));
     const maintainedMessages = maintainMessages(data.messages, now);
     const messages = maintainedMessages.filter((message) =>
       !String(message?.dedupeKey || '').startsWith(REMOTE_MESSAGE_DEDUPE_PREFIX));
@@ -2032,7 +2038,7 @@ export function rotateEndedSessionIdentity({
 
     const existing = sessions.find((session) => recipientKey(session.id) === toKey
       || normalizeAliases(session.aliases).includes(toKey)) || null;
-    if (existing?.via === 'cloud') {
+    if ((existing?.via === 'cloud' || existing?.via === 'network')) {
       return { ok: false, changed: false, reason: 'destination-remote-only' };
     }
     const channelSeen = freshChannelSeen(existing?.channelSeen, now);
@@ -2141,7 +2147,7 @@ export function switchMcpSessionIdentity({
     // A stale alias on A must not turn this fresh switch back into an A→B
     // rekey. Only an independently stored B row may contribute B's own state.
     const existing = destinationCandidate === from ? null : destinationCandidate;
-    if (existing?.via === 'cloud') {
+    if ((existing?.via === 'cloud' || existing?.via === 'network')) {
       return { ok: false, changed: false, reason: 'destination-remote-only' };
     }
 
@@ -2809,7 +2815,11 @@ export function postPresenceMessage({
     // Receipt truth must survive peers ending before the sender checks doctor.
     // Snapshot only recipient session ids (already lane metadata) at SEND time;
     // old messages without this additive field retain reconstruction fallback.
-    const resolution = resolveMessageTarget({ to: target }, sessions);
+    // A session on another computer reached over the KLYPIX network is never a
+    // local-lane recipient: nothing on this PC would ever collect the note, so
+    // it would only age into a failed receipt. brain_message routes those
+    // through the engine (klypix-core.mjs opBrainMessage).
+    const resolution = resolveMessageTarget({ to: target }, sessions.filter((row) => row?.via !== 'network'));
     const candidateIds = resolution.ids
       .filter((id) => id && id !== senderId)
       .map((id) => String(id).slice(0, 160));
@@ -3629,7 +3639,7 @@ export function mergePresenceRows(sessions) {
     || (Array.isArray(row.channels) && row.channels.includes('lifecycle')));
   const isFoldableOrphan = (group) => group.length === 1
     && group.every((row) => !recipientKey(row.logicalSessionId)
-      && row.via !== 'cloud'
+      && (row.via !== 'cloud' && row.via !== 'network')
       && Number(row.hostPid) > 0
       && row.machine
       && Array.isArray(row.channels) && row.channels.length

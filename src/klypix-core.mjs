@@ -45,7 +45,7 @@ import {
   leaseVerdict, readEndpoint, pathHash, canvasWriteLockPath, tellUser, LEASE_SINCE_APP_VERSION,
 } from './app-lease.mjs';
 import { LIMITS, assetBytes, dataUrlImage, fitImage, imageSkipReason, locateAsset, mb } from './card-files.mjs';
-import { findProjectBrain, neutralizeMarkers, postPresenceMessage, readReleaseLease, listActiveSessions, listKnownSessions, sessionStatusLabel, stampSessionWork, listUnfinishedWork, formatUnfinishedWork, formatCheckoutLines, resumeCommandFor } from './agent-presence.mjs';
+import { findProjectBrain, neutralizeMarkers, postPresenceMessage, resolveMessageTarget, readReleaseLease, listActiveSessions, listKnownSessions, sessionStatusLabel, stampSessionWork, listUnfinishedWork, formatUnfinishedWork, formatCheckoutLines, resumeCommandFor } from './agent-presence.mjs';
 import { normalizeHandoffInput, renderHandoffCard, handoffMachineField, parseHandoffCard, listOpenHandoffCards, formatHandoffCards, isHandoffLine1, HANDOFF_REASONS, clientWord as handoffClientWord, autoHandoffCandidates, draftHandoffFromWork } from './session-handoff.mjs';
 import { collectRepoState, commitsInRange, makeContainmentProbe } from './repo-state.mjs';
 
@@ -2051,7 +2051,68 @@ export async function opBrainNote({ vault, canvas, text: noteText, area, marker 
   }, { brain: true });
 }
 
-export async function opBrainMessage({ vault, canvas, text: msgText, to, via, from, sessionId }) {
+// KLYPIX network: sessions on OTHER computers in this project appear on the
+// lane as 'network' rows (network-bridge.mjs). A note to one of them goes out
+// through the engine (`networkSend`, injected by the worker); a broadcast goes
+// to the local lane AND to each of them. Without the engine, or with no such
+// row, this is exactly the local brain_message.
+export async function opBrainMessage(args = {}) {
+  const { vault, canvas, text: msgText, to, networkSend } = args;
+  if (typeof networkSend !== 'function') return opBrainMessageLocal(args);
+  const t = brainTarget(vault, canvas);
+  const body = String(msgText || '').trim();
+  if (t.ambiguous || !t.file || !body) return opBrainMessageLocal(args);
+  let live = [];
+  try { live = listActiveSessions({ brainPath: t.file, now: Date.now() }); } catch { live = []; }
+  const remote = live.filter((row) => row?.via === 'network' && row.networkAddress);
+  if (!remote.length) return opBrainMessageLocal(args);
+  // Everything here came from another computer: never let it speak as KLYPIX.
+  const labelOf = (row) => neutralizeMarkers(`${row.client || 'agent'} on ${row.host || 'another computer'} (${row.networkAddress})`).slice(0, 160);
+  const deliver = (row) => {
+    try { return networkSend({ address: row.networkAddress, text: body.slice(0, 400) }) || { ok: false }; }
+    catch (error) { return { ok: false, reason: String(error?.message || error).slice(0, 120) }; }
+  };
+  const NET_NOTE = 'It lands in that session’s KLYPIX network inbox on its computer; there is no read receipt across computers.';
+  const target = String(to || 'all').replace(/\s+/g, ' ').trim() || 'all';
+  if (!/^(?:all|\*)$/i.test(target)) {
+    const resolved = resolveMessageTarget({ to: target }, live);
+    const row = !resolved.ambiguous && resolved.ids.length === 1
+      ? remote.find((r) => String(r.id) === resolved.ids[0])
+      : null;
+    if (!row) return opBrainMessageLocal(args);
+    const sent = deliver(row);
+    if (!sent.ok) {
+      return err(`brain_message refused: KLYPIX network could not deliver to ${labelOf(row)} (${neutralizeMarkers(String(sent.reason || 'unknown')).slice(0, 120)}). Nothing was sent — check that KLYPIX network is running on both computers (\`klypix-network who\`).`);
+    }
+    return {
+      blocks: [text(`📨 Sent over KLYPIX network to ${labelOf(row)} — a session on another computer in this project. You do not need to ask the human to relay anything. ${NET_NOTE}`)],
+      recipients: [row],
+      network: { sent: [row.networkAddress], failed: [] },
+    };
+  }
+  const sent = [];
+  const failed = [];
+  for (const row of remote) (deliver(row).ok ? sent : failed).push(row);
+  const netLines = [
+    sent.length ? `Also sent over KLYPIX network to ${sent.length} session(s) on other computers: ${sent.map(labelOf).join('; ')}. ${NET_NOTE}` : '',
+    failed.length ? `KLYPIX network could not reach: ${failed.map(labelOf).join('; ')}.` : '',
+  ].filter(Boolean).join(' ');
+  const network = { sent: sent.map((r) => r.networkAddress), failed: failed.map((r) => r.networkAddress) };
+  const local = await opBrainMessageLocal(args);
+  if (local?.isError && sent.length && /no other session is live/.test(local.blocks?.[0]?.text || '')) {
+    return {
+      blocks: [text(`📨 Sent over KLYPIX network to ${sent.length} session(s) on other computers: ${sent.map(labelOf).join('; ')}. No other session is live on this computer. ${NET_NOTE}${failed.length ? ` KLYPIX network could not reach: ${failed.map(labelOf).join('; ')}.` : ''}`)],
+      recipients: sent,
+      network,
+    };
+  }
+  if (!local?.isError && netLines && local.blocks?.[0]?.kind === 'text') {
+    return { ...local, blocks: [text(`${local.blocks[0].text} ${netLines}`), ...local.blocks.slice(1)], network };
+  }
+  return local;
+}
+
+async function opBrainMessageLocal({ vault, canvas, text: msgText, to, via, from, sessionId }) {
   const t = brainTarget(vault, canvas);
   if (t.ambiguous) return ambiguousBrainErr(t.ambiguous);
   if (!t.file) return err(`No brain found — looked for ./brain.klypix in the project, then ${vault}. Pass canvas: "<name>".`);

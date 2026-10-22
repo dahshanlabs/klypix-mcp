@@ -878,6 +878,7 @@ server.registerTool('brain_message', {
     to,
     via: extra.klypixClientName,
     from: extra.klypixRequestIdentity.sessionId,
+    networkSend: mcpPresence.networkSend,
   }));
 });
 

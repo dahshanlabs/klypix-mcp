@@ -901,7 +901,7 @@ const isProcessAlive = (pid) => {
     }
 };
 const isDeadHostRow = (s, now) => {
-    if (!s || s.via === 'cloud') return false;
+    if (!s || (s.via === 'cloud' || s.via === 'network')) return false;
     if (String(s.hostPidSource || '') !== 'env') return false;
     if (!s.machine || String(s.machine) !== MACHINE_ID) return false;
     if (now - Number(s.lastSeen || 0) < DEAD_HOST_GRACE_MS) return false;
@@ -1996,7 +1996,9 @@ function snapshotMsgAudience(messages) {
         const target = String(m.to || '').trim().toLowerCase();
         const broadcast = !target || target === 'all' || target === '*';
         if (!Array.isArray(m.candidateIds)) {
-            const resolution = resolveMsgTarget(m, live);
+            // KLYPIX network rows (other computers) are never local-lane recipients —
+            // the same rule as agent-presence.mjs postPresenceMessage.
+            const resolution = resolveMsgTarget(m, live.filter(s => s?.via !== 'network'));
             m.candidateIds = [...new Set(resolution.ids
                 .filter(id => id && id !== m.from)
                 .map(id => String(id).slice(0, 160)))];

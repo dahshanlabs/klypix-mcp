@@ -82,13 +82,14 @@ The same engine runs at three points.
 At edit time a `listed-in` rule never denies the edit, because the registry change may be the next
 edit. The commit hook checks the finished change.
 
-What an agent reads when a rule stops it:
+What an agent reads when a rule stops it. This is the rule above, run on the commit that failed
+AgentMug's CI in PR #790 (from the [backtest](brain-checks-proof.md)):
 
 ```text
-✗ BLOCKED — project rule `admin-tests-relative-imports` (lesson txt_nxj3c0nm)
-  Found: admin/tests/network.test.ts:3 adds `import { parseKlypix } from '@/lib/parseKlypix';`
-  Why:   The root vitest config has no @/ alias for admin/, so an admin test importing @/… fails to load in the Windows ci job.
-  Fix:   Import with a relative path from admin/tests (../lib/…).
+✗ BLOCKED — project rule `frontend-routes-registered` (lesson txt_w4fbw7m1)
+  Found: artifacts/agentforge/src/App.tsx:522 adds `<Route path="/organization"`, but `"/organization"` is not in artifacts/api-server/src/middlewares/frontend-fallback.ts
+  Why:   Every new App.tsx route must also be listed in frontend-fallback.ts, or a direct link to it returns 404.
+  Fix:   Add "/organization" to PRIVATE_ROUTES (or PUBLIC_ROUTES) in artifacts/api-server/src/middlewares/frontend-fallback.ts.
 ```
 
 You can also run the check by hand, or as a step in CI:
@@ -108,7 +109,9 @@ rules file must not stop every commit.
 
 1. **Propose.** An agent calls `brain_rules` with `action: "propose"`. It reads the brain's lessons
    and sends each one to one of three routes, and says why:
-   - **rule** — the lesson names a file and something checkable. A draft comes with it.
+   - **rule** — the lesson's own sentence states a constraint (*must*, *never*, *only*, …, or the
+     card is a 🛠️ skill) and names a file or folder that exists in this repository, or, for a
+     forbidden pattern, the code it forbids. A draft comes with it, with the paths resolved.
    - **instruction** — the lesson is about how to work, not about a file's content ("amend locally
      and push once"). It belongs in the agent instructions, not in a check.
    - **note** — a record of what happened. It stays a card.
@@ -141,9 +144,9 @@ rules file must not stop every commit.
    hook manager (husky, lefthook) owns `core.hooksPath`, it writes nothing and prints the line to
    add to each of that manager's hooks.
 
-`rules code` and `rules allow` refuse to run inside an agent's shell. Claude Code, Codex, Cursor,
-Cline and Windsurf mark the commands they run (`CLAUDECODE`, `CODEX_THREAD_ID`, …), so an agent
-cannot print the approval code for itself by accident. This prevents mistakes; it is not a
+`rules code` and `rules allow` refuse to run inside an agent's shell. Claude Code and Codex mark
+every command their agent runs (`CLAUDECODE`, `CODEX_THREAD_ID`), so an agent cannot print the
+approval code for itself by accident. This prevents mistakes; it is not a
 security boundary. An agent that strips its environment is deliberately working around you, and
 any change to `.klypix/rules.json` still shows in review.
 
@@ -166,10 +169,13 @@ person's choice.
 npx klypix-mcp rules
 ```
 
+In a scratch repository with those two rules, after one blocked commit that was then pushed
+through with `--no-verify`:
+
 ```text
 .klypix/rules.json: 2 rule(s) · git hooks: installed
-  [active] frontend-routes-registered (listed-in, block) — fires 4, blocks 3, overrides 0, false alarms 0 · lesson txt_w4fbw7m1
-  [active] runner-impacting-paths (cloud-required, advise) — fires 11, blocks 0, overrides 0, false alarms 0 · lesson txt_k0y07qny
+  [active] frontend-routes-registered (listed-in, block) — fires 1, blocks 1, overrides 1, false alarms 0 · lesson txt_w4fbw7m1
+  [active] runner-impacting-paths (cloud-required, advise) — fires 0, blocks 0, overrides 0, false alarms 0 · lesson txt_k0y07qny
 ```
 
 It suggests retiring a rule that has not fired for 30 days, and narrowing a rule that is often
@@ -194,8 +200,8 @@ cards, so everyone sees them through Git.
 - **The approval code and the agent-shell refusal prevent accidents.** They do not stop someone
   who sets out to get around them. Review of `.klypix/rules.json` and the bypass cards are the
   backstop.
-- **Plugin mode** (`KLYPIX_PLUGIN=1`) can propose, check and show status. It does not write
-  `.klypix/rules.json`.
+- **Plugin mode** (`KLYPIX_PLUGIN=1`) can propose, check, show status and record false alarms. It
+  does not write `.klypix/rules.json`.
 
 ## Rule fields
 

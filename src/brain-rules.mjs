@@ -540,6 +540,29 @@ export function parseAddedLines(diffText) {
  *   'range'    — base..head commits (pre-push, a PR, a backtest);
  *   'worktree' — the working tree (tracked + untracked) against HEAD.
  */
+/**
+ * Old-file line numbers whose ONLY change is the line ending: lines the plain
+ * diff reports that `--ignore-cr-at-eol` does not. Catches a mixed CRLF/LF file
+ * whose overall style survives while untouched lines flip. Null when git cannot say.
+ */
+function eolOnlyChangedLines(repo, revArgs, file) {
+  const args = ['diff', '-U0', '--no-color', '--no-ext-diff', '--no-textconv'];
+  const plain = gitTry(repo, [...args, ...revArgs, '--', file]);
+  const loose = plain === null ? null : gitTry(repo, [...args, '--ignore-cr-at-eol', ...revArgs, '--', file]);
+  if (plain === null || loose === null) return null;
+  const removed = (text) => {
+    const lines = new Set();
+    for (const m of String(text).matchAll(/^@@ -(\d+)(?:,(\d+))? \+/gm)) {
+      const start = Number(m[1]);
+      const count = m[2] === undefined ? 1 : Number(m[2]);
+      for (let i = 0; i < count; i++) lines.add(start + i);
+    }
+    return lines;
+  };
+  const content = removed(loose);
+  return [...removed(plain)].filter((n) => !content.has(n)).sort((a, b) => a - b);
+}
+
 export function gitDiffSource(repo, { mode = 'worktree', base = null, head = null } = {}) {
   if (mode === 'range' && (!base || !head)) throw new Error('range mode needs base and head');
   const patchArgs = ['diff', '-U0', '--no-color', '--no-ext-diff', '--no-textconv', '-M', '--src-prefix=a/', '--dst-prefix=b/'];
@@ -581,6 +604,7 @@ export function gitDiffSource(repo, { mode = 'worktree', base = null, head = nul
     mode, files, added,
     readOld: (p) => one(specOf('old', p), oldFilters),
     readNew: (p) => (mode === 'worktree' ? fromDisk(p) : one(specOf('new', p), false)),
+    eolOnlyLines: (p) => eolOnlyChangedLines(repo, mode === 'range' ? [base, head] : mode === 'staged' ? ['--cached', ...(hasHead ? ['HEAD'] : [])] : (hasHead ? ['HEAD'] : []), p),
     /** Read many blobs with ONE git process (`cat-file --batch`) before the checks ask for them. */
     prefetch: (requests) => {
       const groups = new Map();
@@ -615,9 +639,11 @@ export function gitDiffSource(repo, { mode = 'worktree', base = null, head = nul
 // ── EOL style ────────────────────────────────────────────────────────────────
 export function eolStyle(buf) {
   if (!buf || !buf.length) return 'none';
+  // git's own test: a NUL in the first 8000 bytes means binary. A NUL further in
+  // (a raw "\0" inside a string literal) leaves the file text, as it does for git.
+  if (buf.subarray(0, 8000).includes(0)) return 'binary';
   let crlf = 0; let lf = 0;
   for (let i = 0; i < buf.length; i++) {
-    if (buf[i] === 0) return 'binary';
     if (buf[i] === 10) { if (i > 0 && buf[i - 1] === 13) crlf++; else lf++; }
   }
   if (crlf && lf) return 'mixed';
@@ -700,8 +726,15 @@ function checkEol(rule, diff) {
     const before = eolStyle(diff.readOld(f.path));
     if (before === 'none' || before === 'binary') continue;
     const after = eolStyle(diff.readNew(f.path));
-    if (after === 'binary' || after === 'none' || after === before) continue;
-    findings.push({ file: f.path, line: null, found: `changes its line endings from ${before} to ${after}`, fix: expandTemplate(rule.fix, fileVars(rule, f.path)) });
+    if (after === 'binary' || after === 'none') continue;
+    if (after !== before) {
+      findings.push({ file: f.path, line: null, found: `changes its line endings from ${before} to ${after}`, fix: expandTemplate(rule.fix, fileVars(rule, f.path)) });
+      continue;
+    }
+    // The overall style survived, but lines the change does not otherwise touch
+    // had their endings flipped (an editor or script normalised part of a mixed file).
+    const flipped = typeof diff.eolOnlyLines === 'function' ? diff.eolOnlyLines(f.path) : null;
+    if (flipped?.length) findings.push({ file: f.path, line: null, found: `changes the line ending of ${flipped.length} line${flipped.length === 1 ? '' : 's'} it does not otherwise change (line${flipped.length === 1 ? '' : 's'} ${flipped.slice(0, 5).join(', ')}${flipped.length > 5 ? ', …' : ''} of the committed file)`, fix: expandTemplate(rule.fix, fileVars(rule, f.path)) });
   }
   return findings;
 }
@@ -790,7 +823,11 @@ export function rulesForFiles(projectRoot, files, { limit = 6, rules: given = nu
       if (!mixed.length) continue;
       note = ` (mixed CRLF/LF today: ${mixed.slice(0, 3).join(', ')})`;
     }
-    out.push({ id: rule.id, kind: rule.kind, severity: rule.severity, why: rule.why + note, fix: rule.fix, card: rule.source.card, files: hit.slice(0, 5) });
+    // Before any edit there is no finding to fill the fix template from: name the
+    // file and registry, and say "the new entry" for the value the edit will add.
+    const vars = { ...fileVars(rule, hit[0]), registry: (rule.registry || []).join(', '), line: '', match: 'the new entry', 1: 'the new entry' };
+    vars.needle = rule.kind === 'listed-in' && rule.when === 'added-files' ? expandTemplate(rule.needle || '{basename}', vars) : 'the new entry';
+    out.push({ id: rule.id, kind: rule.kind, severity: rule.severity, why: rule.why + note, fix: expandTemplate(rule.fix, vars), card: rule.source.card, files: hit.slice(0, 5) });
     if (out.length >= limit) break;
   }
   return { rules: out, problems: doc.ok ? [] : doc.errors };
@@ -916,6 +953,7 @@ export function evaluateEditResult(projectRoot, filePath) {
     // The working-tree form of HEAD's copy (checkout filters + EOL conversion), compared with the file on disk.
     readOld: (p) => { const s = Number(String(gitTry(projectRoot, ['cat-file', '-s', `HEAD:${p}`]) || '').trim()); return Number.isFinite(s) && s > 0 && s <= MAX_BLOB ? gitTry(projectRoot, ['cat-file', '--filters', `HEAD:${p}`], { buffer: true }) : null; },
     readNew: (p) => { try { return fs.readFileSync(path.join(projectRoot, p)); } catch { return null; } },
+    eolOnlyLines: (p) => eolOnlyChangedLines(projectRoot, ['HEAD'], p),
   };
   return runRules(hit, diff, { allowances: readAllowances(projectRoot) }).flatMap((r) => r.findings.map((f) => ({ rule: r.rule, finding: f })));
 }
@@ -999,6 +1037,20 @@ const BRANCHISH_RE = /^(?:feat|fix|chore|hotfix|wip|refs|origin|heads|remotes)\/
 // a dotted identifier (`secrets.NPM_TOKEN`) or a domain (`gmail.com`).
 const PATH_SHAPED = (t) => !/\s/.test(t) && !/^[a-z]+:\/\//i.test(t) && !t.startsWith('@') && !BRANCHISH_RE.test(t)
   && (SOURCE_EXT_RE.test(t) || /^\.?[\w.-]+(?:\/[\w.*{},-]+)+\/?$/.test(t));
+// A lesson states a constraint; history ("shipped", "merged") does not. A rule
+// draft needs one of these words in the sentence that names the kind (or a 🛠️
+// skill card), so a long release note that mentions a lockfile stays a note.
+const CONSTRAINT_RE = /\b(must|never|always|only|do not|don't|cannot|can't|needs? to|has to|have to|requires?|required|otherwise|gotcha)\b|\bor (?:CI|it|the build|a direct link)\b/i;
+// Sentence boundaries in a whitespace-normalised card: end punctuation, or a spaced dash.
+const SENTENCE_END_RE = /[.!?](?=\s+[A-Z0-9`"'(#~\u2600-\u27BF\uD83C-\uDBFF])|\s[—–]\s/g;
+function sentenceWindow(text, at) {
+  const ends = [...text.matchAll(SENTENCE_END_RE)].map((m) => m.index + m[0].length);
+  const starts = [0, ...ends];
+  let i = 0;
+  while (i + 1 < starts.length && starts[i + 1] <= at) i++;
+  // The sentence that names the kind, and the one after it ("…runner-impacting. Touching `artifacts/runtime`…").
+  return { from: starts[i], to: i + 2 < starts.length ? starts[i + 2] : text.length };
+}
 const ROUTES = [
   { kind: 'listed-in', re: /must (?:also )?be (?:added|listed|registered|wired|enumerated)|(?:added|listed|registered|enumerated) (?:to|in) `[^`]+`|not (?:wired|listed|enumerated) (?:into|in)|enumerated in|copy lists?|or (?:CI|it) never runs/i },
   { kind: 'preserve-eol', re: /CRLF|line.endings?|\bEOL\b|mixed (?:CRLF|line)/i },
@@ -1007,13 +1059,16 @@ const ROUTES = [
 ];
 
 /**
- * What a lesson's file token names in this repository: tracked or untracked
- * (not ignored) files, a folder (as `dir/**`), a glob that matches something,
+ * What a lesson's file token names in this repository: a tracked file, a
+ * tracked folder (as `dir/**`), a glob that matches something,
  * a bare file name with at most three matches, or a path relative to a
- * sub-package. Empty when it names nothing that exists. One `git ls-files`.
+ * sub-package. Empty when it names nothing that exists. One git call.
  */
-export function repoPathResolver(root) {
-  const out = gitTry(root, ['ls-files', '-z', '--cached', '--others', '--exclude-standard']);
+export function repoPathResolver(root, { ref = null } = {}) {
+  // Tracked files only: untracked scratch trees (nested worktrees, .tmp copies) would
+  // resolve a bare name to a copy that is not the project's file. `ref` reads a
+  // commit's tree instead of the index (a backtest against the default branch).
+  const out = gitTry(root, ref ? ['ls-tree', '-r', '-z', '--name-only', ref] : ['ls-files', '-z']);
   if (out === null) return null;
   const files = [...new Set(String(out).split('\0').filter(Boolean))];
   const fileSet = new Set(files);
@@ -1082,19 +1137,25 @@ export function proposeFromCards(cards, { limit = 30, query = '', existing = [],
     const fragments = codes.filter((c) => !paths.some((p) => p.at === c.at));
     const kindHit = ROUTES.find((r) => r.re.test(text));
     const phraseAt = kindHit ? text.search(kindHit.re) : -1;
+    // Only what the lesson's own sentence names counts, not every path a long card mentions.
+    const win = kindHit ? sentenceWindow(text, phraseAt) : { from: 0, to: 0 };
+    const inWin = (x) => x.at >= win.from && x.at < win.to;
+    const lessonShaped = /🛠️/.test(text) || CONSTRAINT_RE.test(text.slice(win.from, win.to));
     let route; let reason; let draft = null;
     if (usedCards.has(id)) {
       route = 'rule (already in rules.json)';
       reason = 'a rule in .klypix/rules.json already cites this lesson';
-    } else if (kindHit) {
+    } else if (kindHit && lessonShaped) {
+      const near = paths.filter(inWin);
+      const nearFragments = fragments.filter(inWin);
       // The value a forbid-pattern draft forbids: the code fragment right after the prohibition, else just before it.
       const pattern = kindHit.kind === 'forbid-pattern'
-        ? (fragments.find((c) => c.at >= phraseAt && c.at - phraseAt <= 150) || [...fragments].reverse().find((c) => c.at < phraseAt && phraseAt - c.at <= 60))?.t
+        ? (nearFragments.find((c) => c.at >= phraseAt && c.at - phraseAt <= 150) || [...nearFragments].reverse().find((c) => c.at < phraseAt && phraseAt - c.at <= 60))?.t
         : null;
-      const filePaths = uniq(paths.flatMap((p) => p.paths));
+      const filePaths = uniq(near.flatMap((p) => p.paths));
       // listed-in: paths named after "must be added to / listed in" are the registry; the ones before it trigger the rule.
-      const registry = kindHit.kind === 'listed-in' ? uniq(paths.filter((p) => p.at > phraseAt).flatMap((p) => p.paths)).filter((p) => !p.endsWith('/**')) : [];
-      const triggers = kindHit.kind === 'listed-in' ? uniq(paths.filter((p) => p.at <= phraseAt).flatMap((p) => p.paths)) : filePaths;
+      const registry = kindHit.kind === 'listed-in' ? uniq(near.filter((p) => p.at > phraseAt).flatMap((p) => p.paths)).filter((p) => !p.endsWith('/**')) : [];
+      const triggers = kindHit.kind === 'listed-in' ? uniq(near.filter((p) => p.at <= phraseAt).flatMap((p) => p.paths)) : filePaths;
       const exact = filePaths.filter((f) => !f.includes('*'));
       const checkable = kindHit.kind === 'forbid-pattern' ? Boolean(pattern) : kindHit.kind === 'preserve-eol' ? exact.length > 0 : filePaths.length > 0;
       if (checkable) {
@@ -1115,8 +1176,11 @@ export function proposeFromCards(cards, { limit = 30, query = '', existing = [],
         };
       } else {
         route = IMPERATIVE_RE.test(text) ? 'instruction' : 'note';
-        reason = `${kindHit.kind}-shaped, but it names ${kindHit.kind === 'forbid-pattern' ? 'no code to forbid next to the rule' : `no path that exists${pathResolver ? ' in this repository' : ''}`} — a diff cannot test it as written`;
+        reason = `${kindHit.kind}-shaped, but its sentence names ${kindHit.kind === 'forbid-pattern' ? 'no code to forbid' : `no path that exists${pathResolver ? ' in this repository' : ''}`} — a diff cannot test it as written`;
       }
+    } else if (kindHit) {
+      route = 'note';
+      reason = `${kindHit.kind}-shaped words in a record of what happened, not a constraint — stays a note`;
     } else if (IMPERATIVE_RE.test(text)) {
       route = 'instruction';
       reason = 'a standing instruction, not something a diff can test (it already resurfaces in session briefs)';

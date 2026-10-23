@@ -146,12 +146,46 @@ write(P.dir, 'admin/tests/x.test.ts', "import y from '../lib/y';\n");
 write(P.dir, 'src/mixed.ts', 'one\r\ntwo\nthree\r\nfour\n');
 res = R.runRules(R.activeRules(R.loadRulesDoc(P.dir)), R.gitDiffSource(P.dir, { mode: 'worktree' }));
 ok(res.filter((r) => r.status === 'fail').length === 0, 'after the fixes (registry entries, a relative import, mixed endings kept) nothing blocks');
+// A raw NUL deep inside a string literal leaves a file text, as git decides (AgentMug's
+// managed-run-worker.ts has one at byte ~180,000); only a NUL in the first 8000 bytes is binary.
+ok(R.eolStyle(Buffer.concat([Buffer.from('a\r\n'.repeat(3000)), Buffer.from('x\0y\n')])) === 'mixed' && R.eolStyle(Buffer.from('a\0b\r\n')) === 'binary',
+  'eolStyle: a NUL past the first 8000 bytes does not make a file binary');
+// Still "mixed" overall, but two untouched lines flipped: caught line by line.
+write(P.dir, 'src/mixed.ts', 'one\r\ntwo\r\nthree\nfour\n');
+res = R.runRules(R.activeRules(R.loadRulesDoc(P.dir)), R.gitDiffSource(P.dir, { mode: 'worktree' }));
+{
+  const eol = res.find((r) => r.rule.id === 'mixed-eol');
+  ok(eol?.status === 'fail' && /line ending of 2 lines it does not otherwise change \(lines 2, 3 of the committed file\)/.test(eol.findings[0].found),
+    'preserve-eol: untouched lines whose endings flipped are caught even when the file stays mixed');
+}
+write(P.dir, 'src/mixed.ts', 'one\r\ntwo\nthree\r\nfour\n');
 
 // ── plan time: brain_sync ────────────────────────────────────────────────────
 let planned = R.rulesForFiles(P.dir, ['src/App.tsx', 'admin/tests/new.test.ts', 'docs/readme.md']);
 ok(planned.rules.map((r) => r.id).sort().join() === 'admin-relative,private-routes', 'rulesForFiles: only the rules whose files match the declared scope');
 ok(R.rulesForFiles(P.dir, [path.join(P.dir, 'src', 'mixed.ts')]).rules.some((r) => r.id === 'mixed-eol' && /mixed CRLF\/LF today/.test(r.why)), 'preserve-eol shows at plan time only while the file is really mixed (absolute paths are accepted)');
 ok(/KLYPIX project rules for the files in your scope/.test(R.formatRulesNotice(planned.rules)), 'the brain_sync notice names the rules, fixes and lessons');
+{
+  // The real brain_sync, end to end: declare a file a rule covers, get the rule back.
+  const { createMcpPresence } = await import('../src/mcp-presence.mjs');
+  const presence = createMcpPresence({
+    server: { server: { getClientVersion: () => ({ name: 'rules-test', version: 'test' }) }, sendLoggingMessage: () => {} },
+    initialVault: P.dir, env: { KLYPIX_SESSION_ID: 'rules-plan-session' }, home: HOME,
+    setIntervalFn: () => ({ unref() {} }), clearIntervalFn: () => {},
+  });
+  const synced = presence.sync({ project: P.dir, phase: 'start', intent: 'add a dashboard route', files: ['src/App.tsx'] });
+  const text = String(synced.text || '');
+  if (process.env.DBG_SYNC) console.log('DBG', JSON.stringify(synced.structured?.rules), text.slice(-900));
+  ok(synced.structured?.rules?.some((r) => r.id === 'private-routes' && r.card === cards.routes) && /KLYPIX project rules for the files in your scope/.test(text) && /Add "the new entry" to PRIVATE_ROUTES in src\/routes\.ts/.test(text) && !/\{1\}|\{registry\}/.test(text),
+    'brain_sync: a session that declares src/App.tsx is told the route rule, its fix (templates filled) and its lesson before it edits');
+  const other = createMcpPresence({
+    server: { server: { getClientVersion: () => ({ name: 'rules-test', version: 'test' }) }, sendLoggingMessage: () => {} },
+    initialVault: P.dir, env: { KLYPIX_SESSION_ID: 'rules-docs-session' }, home: HOME,
+    setIntervalFn: () => ({ unref() {} }), clearIntervalFn: () => {},
+  });
+  const quiet = other.sync({ project: P.dir, phase: 'start', intent: 'docs only', files: ['docs/readme.md'] });
+  ok(!quiet.structured?.rules, 'brain_sync: no rules block when no declared file is covered');
+}
 
 // ── staged mode, the git hooks, a bypass recorded ────────────────────────────
 write(P.dir, 'src/App.tsx', '<Route path="/a" />\n<Route path="/b" />\n<Route path="/c" />\n');

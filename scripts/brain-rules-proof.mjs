@@ -383,6 +383,15 @@ const preventable = prRuns.filter((run) => LOG_WORKFLOWS.has(run.name) && run.fa
 const preventableShas = new Set(preventable.map((r) => r.head_sha));
 const sameCommitRuns = prRuns.filter((r) => preventableShas.has(r.head_sha));
 
+// How long CI took to report the failure: run created → first failing job done.
+const feedbackMinutes = (run) => {
+  const failed = (run.jobs || []).filter((j) => j.conclusion === 'failure' && j.steps > 0 && j.completed_at);
+  return failed.length ? Math.round((Math.min(...failed.map((j) => Date.parse(j.completed_at))) - Date.parse(run.created_at)) / 60000) : null;
+};
+const prCost = new Map();
+const prRunCount = new Map();
+for (const r of prRuns) { prCost.set(r.pr, (prCost.get(r.pr) || 0) + r.cost); prRunCount.set(r.pr, (prRunCount.get(r.pr) || 0) + 1); }
+const avg = (xs) => (xs.length ? round(xs.reduce((s, x) => s + x, 0) / xs.length) : null);
 const perRule = {};
 for (const rule of rules) {
   const fired = prRuns.filter((r) => firedAt(r, rule.id));
@@ -402,9 +411,14 @@ for (const rule of rules) {
     set: rule.set, kind: rule.kind, severity: rule.severity, card: rule.source.card,
     prRunsFired: fired.length,
     prsFired: [...new Set(fired.map((r) => r.pr))].sort((a, b) => a - b),
+    // Whole-PR Actions spend for the PRs this rule fired in, against every other PR in the window.
+    prsFiredAvgCost: avg([...new Set(fired.map((r) => r.pr))].map((n) => prCost.get(n))),
+    prsFiredAvgRuns: avg([...new Set(fired.map((r) => r.pr))].map((n) => prRunCount.get(n))),
+    otherPrsAvgCost: avg([...prCost.keys()].filter((n) => !fired.some((r) => r.pr === n)).map((n) => prCost.get(n))),
+    otherPrsAvgRuns: avg([...prRunCount.keys()].filter((n) => !fired.some((r) => r.pr === n)).map((n) => prRunCount.get(n))),
     preRegistryRuns: prRuns.filter((r) => r.check?.preRegistry?.some((x) => x.id === rule.id)).length,
     signature: signatures.some((s) => s.id === rule.id),
-    runsWithSignature: withSig.map((r) => ({ run: r.id, workflow: r.name, pr: r.pr, branch: r.pr ? null : r.head_branch, sha: r.head_sha.slice(0, 7), created: r.created_at, attempts: r.run_attempt, checked: Boolean(r.check), ruleFired: r.check ? firedAt(r, rule.id) : null, evidence: r.hits[rule.id], cost: round(r.cost) })),
+    runsWithSignature: withSig.map((r) => ({ run: r.id, workflow: r.name, pr: r.pr, branch: r.pr ? null : r.head_branch, sha: r.head_sha.slice(0, 7), created: r.created_at, attempts: r.run_attempt, checked: Boolean(r.check), ruleFired: r.check ? firedAt(r, rule.id) : null, evidence: r.hits[rule.id], feedbackMinutes: feedbackMinutes(r), cost: round(r.cost) })),
     distinctFindings: [...distinct.values()].map((d) => ({ ...d, prs: [...d.prs].sort((a, b) => a - b) })).sort((a, b) => a.firstSeen.localeCompare(b.firstSeen)),
     mergedWithFinding: mergedFindings.filter((m) => m.rule === rule.id),
     perCommit: perCommit.filter((c) => c.rule === rule.id),
@@ -426,7 +440,7 @@ const summary = {
   distinctChangesChecked: evaluations.size,
   perCommitAlarms: perCommit.length,
   preventable: {
-    runs: preventable.map((r) => ({ run: r.id, workflow: r.name, pr: r.pr, sha: r.head_sha.slice(0, 7), attempts: r.run_attempt, rules: Object.keys(r.hits).filter((id) => firedAt(r, id)), cost: round(r.cost) })),
+    runs: preventable.map((r) => ({ run: r.id, workflow: r.name, pr: r.pr, sha: r.head_sha.slice(0, 7), attempts: r.run_attempt, rules: Object.keys(r.hits).filter((id) => firedAt(r, id)), feedbackMinutes: feedbackMinutes(r), cost: round(r.cost) })),
     cost: round(sum(preventable, (r) => r.cost)),
     failedAttemptCost: round(sum(preventable, (r) => r.failedAttemptCost)),
     upperBoundAllRunsAtThoseCommits: round(sum(sameCommitRuns, (r) => r.cost)),

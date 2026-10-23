@@ -121,6 +121,12 @@ rules file must not stop every commit.
    - **instruction** — the lesson is about how to work, not about a file's content ("amend locally
      and push once"). It belongs in the agent instructions, not in a check.
    - **note** — a record of what happened. It stays a card.
+
+   A lesson recorded rule-ready (a `rule:` suffix on its 🧠 marker or at the end of `brain_note`'s
+   text, stored as a `⚙ rule candidate:` line) skips the routing: its globs and its check are the
+   draft. `never "…"` and `never /…/` become forbid-pattern, `listed-in` becomes listed-in,
+   `keep-eol` preserve-eol and `costly` cloud-required. `must "…"` stays an instruction: no rule
+   kind checks a required pattern yet.
 2. **Add.** The agent completes a draft (pattern, registry, fix) and calls `brain_rules` with
    `action: "add"`. The rule is written to `.klypix/rules.json` as a `candidate`. It checks
    nothing yet. A rule must cite a card that exists in the brain.

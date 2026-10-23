@@ -132,8 +132,8 @@ try {
   ok(reordered.body === 'did x' && reordered.verify === 'gh release list; gh run list' && reordered.closes === 'Old q', 'G2 verify: before closes:, PS-safe ; chain kept');
   const selfHeal = splitMarkerSuffixes('Auth tokens rotate every 7 days in the session store ev: src/auth/session.ts:42');
   ok(selfHeal.body === 'Auth tokens rotate every 7 days in the session store' && selfHeal.evidence?.[0]?.ref === 'src/auth/session.ts:42', 'G2 the self-heal footer form (claim ev: file:line)');
-  const ruleSuffix = splitMarkerSuffixes(`Admin tests import relatively rule: admin/tests/**/*.test.ts never "from '@/" ev: admin/tests/setup.ts`);
-  ok(ruleSuffix.body === 'Admin tests import relatively' && ruleSuffix.rule === `admin/tests/**/*.test.ts never "from '@/"` && ruleSuffix.evidence?.[0]?.ref === 'admin/tests/setup.ts',
+  const ruleSuffix = splitMarkerSuffixes(`Web tests import relatively rule: web/tests/**/*.test.ts never "from '@/" ev: web/tests/setup.ts`);
+  ok(ruleSuffix.body === 'Web tests import relatively' && ruleSuffix.rule === `web/tests/**/*.test.ts never "from '@/"` && ruleSuffix.evidence?.[0]?.ref === 'web/tests/setup.ts',
     'G2 rule: (1.107) with another suffix after it');
   const ruleListed = splitMarkerSuffixes('New pages are registered rule: app/pages/*.tsx, app/admin/*.tsx listed-in src/routes.ts');
   ok(ruleListed.body === 'New pages are registered' && ruleListed.rule === 'app/pages/*.tsx, app/admin/*.tsx listed-in src/routes.ts', 'G2 rule: with two globs and listed-in');

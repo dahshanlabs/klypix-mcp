@@ -1063,8 +1063,8 @@ const ROUTES = [
   { kind: 'listed-in', re: /must (?:also )?(?:\w+ly )?be (?:added|listed|registered|wired|enumerated)|(?:added|listed|registered|enumerated) (?:to|in) `[^`]+`|not (?:wired|listed|enumerated) (?:into|in)|enumerated in|copy lists?|or (?:CI|it) never runs/i },
   { kind: 'preserve-eol', re: /CRLF|line.endings?|\bEOL\b|mixed (?:CRLF|line)/i },
   // The code actions a lesson forbids, with an optional adverb (1.107:
-  // "Never synchronously decode…", "NEVER put…", "never @import…", "Never
-  // pass a Blob…", `never dir="auto"` were routed as instructions). A draft
+  // "never synchronously decode…", "never put…", "never pass…" were routed
+  // as instructions). A draft
   // still needs a quoted code fragment next to the prohibition.
   { kind: 'forbid-pattern', re: /\bnever (?:\w+ly )?(?:use|set|import|@import|call|write|add|put|pass|require|decode|combine|spawn|embed|dump|return|store|hardcode|inline|bundle)\b|\bnever (?=[`"'])|\bmust not (?:\w+ly )?(?:use|import|call|set|write|appear|contain|include|pass|put|add)\b|\b(?:do not|don't) (?:use|import|set|call|write|put|pass|add)\b|import (?:it |them )?relatively|has no `?@\/`? alias|is (?:banned|forbidden)/i },
   { kind: 'cloud-required', re: /runner-impacting|lockfile|pnpm-workspace|\.github\/workflows|supply.chain|full (?:cloud )?CI|full desktop matrix/i },
@@ -1128,7 +1128,7 @@ const SHELLISH_FRAGMENT = /^(?:git|gh|npm|npx|pnpm|yarn|node|cd|curl|wget|printf
 
 // Cards written before 1.107 cut long tokens with a forced break: a line of
 // exactly the card width (37) with no whitespace, continued on the next line.
-// Rejoin those before whitespace is collapsed, or "…/managed-\nrun-worker.ts"
+// Rejoin those before whitespace is collapsed, or "…/notification-\nsettings.ts"
 // reads as two words. (Mirrors klypix-format.mjs unwrapCardText; this module
 // keeps its format import lazy, and proposeFromCards is synchronous.)
 const FORCED_BREAK_WIDTH = 37;
@@ -1145,7 +1145,7 @@ function rejoinForcedBreaks(text) {
 }
 
 // A lesson recorded rule-ready (the `rule:` marker suffix / brain_note's
-// `rule` field, read back by parseKlypix as card.ruleDraft) needs no routing:
+// `rule:` text suffix, read back by parseKlypix as card.ruleDraft) needs no routing:
 // its globs and its check were written by the agent at the moment of the fix.
 function draftFromRuleCandidate(id, d) {
   const short = id.replace(/^txt_/, '').replace(/[^a-z0-9]/gi, '').slice(0, 8).toLowerCase();

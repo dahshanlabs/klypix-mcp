@@ -592,7 +592,10 @@ Every other host gets a bounded ~2.8KB task capsule from one `brain_sync` call, 
 always-loaded `AGENTS.md` block that tells the agent to make that call at task start, when scope
 changes, and on completion. The gateway capsule is lexical-fast by design. A newly captured open
 gap can claim a labeled `RECENT OPEN` slot only after clearing the normal lexical-relevance floor,
-so fresh relevant findings are not crowded out by older area vocabulary.
+so fresh relevant findings are not crowded out by older area vocabulary. When the call declares
+`files`, the lessons that name those files come first, under "Lessons for your files": at most
+four, ranked exact path, then file name, glob and folder. The Claude Code brief does the same for
+the files the checkout is changing (uncommitted, and the last three commits), then lists the newest.
 
 Briefs are **not** injected automatically on Cursor, Cline, Copilot, Gemini CLI or Antigravity —
 there are no lifecycle hooks on those hosts.
@@ -654,7 +657,9 @@ On Claude Code, decisions are captured automatically at turn end from inline `�
 markers in the transcript, deduped, under a capture lock.
 
 A marker can end with optional suffixes, in any order: `closes: <card title or [[wikilink]]>`,
-`ev: <file[:line]>, PR#<n>`, `verify: <command>` and `q: <the question this answers?>`. They count
+`ev: <file[:line]>, PR#<n>`, `verify: <command>`, `q: <the question this answers?>` and
+`rule: <glob>[,<glob>] never "<text>"` (or `never /<regex>/`, `must "<text>"`,
+`listed-in <file>[,<file>]`, `keep-eol`, `costly`). They count
 only as one run at the end of the line, written lowercase as `key: value`, and each value must
 have its key's shape: references for `ev:`, a command for `verify:`, a question (question word
 first, `?` last) for `q:`. Anything else is kept as card text, so "a Q: and A: layout", "the ev:
@@ -668,6 +673,13 @@ already closed closes nothing else. A `~` update too thin to replace its card (f
 content words and under half the card's) is appended to that card as a dated `(~ amended …)` line
 instead. The card keeps its date, colour and probe, and previews show the newest amendment first.
 The correction lands and nothing is lost.
+
+A `rule:` suffix makes a new lesson (a decision, `+` or `!`) rule-ready. Its globs must name files
+tracked in the repository and a `/regex/` must compile; the rule lands as a visible
+`⚙ rule candidate:` line on a 🛠️ card, and `brain_rules` propose reads it before any prose. It
+checks nothing until a person approves the rule. A rule that fails those checks is not recorded,
+the lesson is, and the hook says why on the next prompt. `brain_note` takes the same suffix at the
+end of its text.
 
 The Stop hook reads the whole transcript every time, so a `~` or `✓` line applies once. A marker
 that an older hook (1.85 or 1.86.0) already captured is not captured again after an upgrade. If

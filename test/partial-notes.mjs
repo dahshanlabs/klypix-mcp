@@ -199,10 +199,10 @@ const idOf = async (buf) => (await parseKlypix(buf)).struct.cards.find(c => /rem
   const p1 = await captureIntoBrain(buf0, { resolutions: [marker] });
   const c1 = (await parseKlypix(p1.buffer)).struct.cards.find(c => c.id === id7);
   ok(p1.stats.partialResolved === 1 && countNotes(c1.text) === 1, 'P7 the first pass writes exactly one note');
-  // The seam is the cause: the rejoined run carries a space the body never had.
-  ok(partialNoteRuns(c1.text)[0].key.replace(/\s+/g, '') === partialNoteKey(PATHY).replace(/\s+/g, '')
-    && partialNoteRuns(c1.text)[0].key !== partialNoteKey(PATHY),
-    'P7 the stored key differs from the body by WHITESPACE ONLY (the mid-word wrap seam)');
+  // The seam was the cause: a mid-word wrap put a space the body never had into
+  // the rejoined run. Since 1.107 the writer keeps the token whole, so the
+  // stored key IS the body's key; a note an older writer cut is checked below.
+  ok(partialNoteRuns(c1.text)[0].key === partialNoteKey(PATHY), 'P7 the stored key is the body key (the writer no longer cuts the token)');
 
   const p2 = await captureIntoBrain(p1.buffer, { resolutions: [marker] });
   const c2 = (await parseKlypix(p2.buffer)).struct.cards.find(c => c.id === id7);
@@ -212,6 +212,22 @@ const idOf = async (buf) => (await parseKlypix(buf)).struct.cards.find(c => /rem
   ok(!p2.stats.partialResolved && !p3.stats.partialResolved, 'P7 neither repeat counts as a fresh partial resolve');
   ok(countNotes(c3.text) === 1, `P7 THE HEADLINE: still exactly ONE ✔ partial note after three captures (got ${countNotes(c3.text)})`);
   ok(flat(c3.text) === flat(c1.text) && flat(c2.text) === flat(c1.text), 'P7 the card is unchanged by the repeats');
+
+  // The same note as a pre-1.107 writer stored it — the token cut at the width.
+  const legacyWrap = (text, cpl = 37) => text.split('\n').flatMap((l) => {
+    const out = [];
+    for (let rest = l; rest.length > cpl && !/\s/.test(rest); rest = rest.slice(cpl)) out.push(rest.slice(0, cpl)), l = rest.slice(cpl);
+    return [...out, l];
+  }).join('\n');
+  const legacyText = legacyWrap(c1.text);
+  const bufL = await buildKlypix({ title: 'partials-wide-legacy', cards: [{ text: legacyText, area: 'Canvas' }] });
+  const cardL = (await parseKlypix(bufL)).struct.cards.find(c => /remaining: ship the arrow/.test(flat(c.text)));
+  ok(cardL.text === legacyText && partialNoteRuns(legacyText)[0].key !== partialNoteKey(PATHY)
+    && partialNoteRuns(legacyText)[0].key.replace(/\s+/g, '') === partialNoteKey(PATHY).replace(/\s+/g, ''),
+  'P7 (legacy) the older writer\'s note carries the seam: its key differs from the body by whitespace only');
+  const pL = await captureIntoBrain(bufL, { resolutions: [marker] });
+  const cL = (await parseKlypix(pL.buffer)).struct.cards.find(c => c.id === cardL.id);
+  ok(pL.stats.partialSkipped === 1 && countNotes(cL.text) === 1, 'P7 (legacy) a note an older writer cut mid-word is still "already noted"');
 
   // Same body, one batch — the in-batch mirror must agree with the disk copy.
   const bufB = await buildKlypix({ title: 'partials-wide-batch', cards: [{ text: CLAUSE7, area: 'Canvas' }] });

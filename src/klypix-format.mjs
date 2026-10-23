@@ -1939,13 +1939,13 @@ function brainCPL() { return Math.max(8, Math.floor((BRAIN_GEOM.CARD_W - 24) / (
 // captured decision with no newlines runs off the box. Baking in line breaks
 // makes brain cards render as tidy multi-line blocks regardless of that.
 // The visible line a rule-ready lesson carries (the `rule:` marker suffix and
-// brain_note's `rule` field write it). It is a CANDIDATE only: nothing checks
+// brain_note's text suffix write it). It is a CANDIDATE only: nothing checks
 // it until brain_rules adds it and a person approves it.
 export const RULE_CANDIDATE_PREFIX = '⚙ rule candidate:';
 
 // A token longer than a line (a path, a URL) stays WHOLE on its own line: the
 // bordered card wraps it visually (pre-wrap + break-word), and cutting it with a
-// "\n" split real paths ("…/managed-\nrun-worker.ts") so no reader could match
+// "\n" split real paths ("…/notification-\nsettings.ts") so no reader could match
 // them (1.107, after a two-brain study found cut paths in hundreds of cards).
 // A `⚙ rule candidate:` line is never wrapped: it is parsed back as one line.
 function wrapText(text, cpl = brainCPL()) {
@@ -1982,8 +1982,8 @@ export function unwrapCardText(text, cpl = brainCPL()) {
 
 // ── Lessons for the files a task touches (1.107) ────────────────────────────
 // brain_sync used to turn declared files into WORDS only, so a lesson naming
-// `admin/tests/network*.test.ts` ranked 58th for a session that declared
-// admin/tests/networkInvite.test.ts. This reads the paths a lesson names — a
+// a test-folder glob ranked 58th for a session that declared a test file in
+// that folder. This reads the paths a lesson names — a
 // full path, a bare file name, a glob or placeholder (`../src/<module>.mjs`,
 // `X.mjs`), a folder, the globs of its own `⚙ rule candidate:` line, its
 // #file-/#dir- tags — and ranks lessons by how closely they name a declared
@@ -2139,7 +2139,7 @@ export function lessonsForFiles(struct, files, { limit = 4, skillsOnly = false, 
         .map(({ card, tier, file, via }) => ({ card, tier, file, via }));
 }
 
-// A rule spec, as the `rule:` suffix and brain_note's `rule` field write it:
+// A rule spec, as the `rule:` suffix writes it (a marker, or brain_note's text):
 // `<glob>[,<glob>] never "…" | never /re/flags | must "…" | listed-in <file>[,…]
 // | keep-eol | costly`. Same shape test as the marker grammar.
 export function parseRuleSpec(spec) {

@@ -60,24 +60,24 @@ const legacyWrap = (text, cpl = 37) => {
 };
 let clock = Date.parse('2026-09-01T00:00:00Z');
 const L = (id, text, extra = {}) => ({ id, type: 'text', area: 'Lessons', text, createdAt: (clock += 1000), ...extra });
-const INVITE = 'admin/tests/networkInvite.test.ts';
+const CHECKOUT = 'web/tests/checkoutForm.test.ts';
 
 // ── 1. Writer and reader ─────────────────────────────────────────────────────
 {
-  const longPath = 'electron/canvas/managed-run-worker-helpers/zipAppend.ts';
-  const rule = `${RULE_CANDIDATE_PREFIX} admin/tests/**/*.test.ts never "from '@/"`;
+  const longPath = 'src/features/notifications/preferencesPanelRenderer.ts';
+  const rule = `${RULE_CANDIDATE_PREFIX} web/tests/**/*.test.ts never "from '@/"`;
   const seed = await buildKlypixMap({ title: 'brain', areas: [{ title: 'Seed', cards: [{ text: 'Seed: the fixture brain' }] }] });
   const { buffer: buf } = await captureIntoBrain(seed, { cards: [
     { area: 'Canvas', text: `Canvas: 🛠️ Never edit ${longPath} by hand — the build writes it`, createdVia: 'test' },
-    { area: 'Admin', text: `Admin: 🛠️ Admin tests import relatively\n${rule}`, createdVia: 'test' },
+    { area: 'Web', text: `Web: 🛠️ Web tests import relatively\n${rule}`, createdVia: 'test' },
   ] });
   const { struct } = await parseKlypix(buf);
-  const [pathCard, ruleCard] = [/zipAppend/, /Admin tests/].map((re) => live(struct).find((c) => re.test(c.text)));
+  const [pathCard, ruleCard] = [/preferencesPanelRenderer/, /Web tests/].map((re) => live(struct).find((c) => re.test(c.text)));
   const lines = pathCard.text.split('\n');
   ok(lines.includes(longPath) && !lines.some((l) => l.length === 37 && !/\s/.test(l)),
     'writer: a token longer than a card line stays whole on its own line — no forced break');
   ok(ruleCard.text.split('\n').includes(rule), 'writer: a ⚙ rule candidate line is never wrapped');
-  ok(ruleCard.ruleDraft?.kind === 'never' && ruleCard.ruleDraft.literal === "from '@/" && ruleCard.ruleDraft.files[0] === 'admin/tests/**/*.test.ts',
+  ok(ruleCard.ruleDraft?.kind === 'never' && ruleCard.ruleDraft.literal === "from '@/" && ruleCard.ruleDraft.files[0] === 'web/tests/**/*.test.ts',
     'parseKlypix reads the rule candidate back as card.ruleDraft');
 
   const legacy = legacyWrap(`Canvas: 🛠️ Never edit ${longPath} by hand — the build writes it\n#canvas`);
@@ -94,11 +94,11 @@ const INVITE = 'admin/tests/networkInvite.test.ts';
 
 // ── 2. Rule specs ────────────────────────────────────────────────────────────
 {
-  const never = parseRuleSpec(`admin/tests/**/*.test.ts never "from '@/"`);
+  const never = parseRuleSpec(`web/tests/**/*.test.ts never "from '@/"`);
   const re = parseRuleSpec('src/**/*.ts never /console\\.log\\(/i');
   const must = parseRuleSpec('docs/**/*.md must "title:"');
   const listed = parseRuleSpec('app/pages/*.tsx listed-in src/routes.ts, src/nav.ts');
-  ok(never?.kind === 'never' && never.literal === "from '@/" && never.files.join() === 'admin/tests/**/*.test.ts', 'parseRuleSpec: never "<literal>"');
+  ok(never?.kind === 'never' && never.literal === "from '@/" && never.files.join() === 'web/tests/**/*.test.ts', 'parseRuleSpec: never "<literal>"');
   ok(re?.kind === 'never' && re.pattern === 'console\\.log\\(' && re.flags === 'i', 'parseRuleSpec: never /<regex>/flags');
   ok(must?.kind === 'must' && must.literal === 'title:', 'parseRuleSpec: must "<literal>"');
   ok(listed?.kind === 'listed-in' && listed.registry.join() === 'src/routes.ts,src/nav.ts', 'parseRuleSpec: listed-in <file>[,<file>]');
@@ -107,8 +107,8 @@ const INVITE = 'admin/tests/networkInvite.test.ts';
     'parseRuleSpec: prose, a word that is not a path and a URL are not rules');
   ok(parseRuleCandidate(`Lesson\n${RULE_CANDIDATE_PREFIX} scripts/*.ps1 keep-eol`)?.kind === 'keep-eol', 'parseRuleCandidate reads the ⚙ line of a card');
 
-  const tracked = [INVITE, 'app/pages/home.tsx', 'src/routes.ts', 'packages/web/src/api/client.ts', 'scripts/release.ps1'];
-  ok(checkRuleSpec(`admin/tests/**/*.test.ts never "from '@/"`, tracked).ok, 'checkRuleSpec: a glob that names tracked files passes');
+  const tracked = [CHECKOUT, 'app/pages/home.tsx', 'src/routes.ts', 'packages/web/src/api/client.ts', 'scripts/release.ps1'];
+  ok(checkRuleSpec(`web/tests/**/*.test.ts never "from '@/"`, tracked).ok, 'checkRuleSpec: a glob that names tracked files passes');
   ok(checkRuleSpec('*.test.ts never "only("', tracked).ok, 'checkRuleSpec: a glob without a slash matches file names');
   ok(checkRuleSpec('src/api/*.ts never "fetch("', tracked).ok, 'checkRuleSpec: a glob may be relative to a sub-package');
   const miss = checkRuleSpec('lib/legacy/**/*.js never "var "', tracked);
@@ -122,8 +122,8 @@ const INVITE = 'admin/tests/networkInvite.test.ts';
 
 // ── 3. The `rule:` suffix in the marker grammar ──────────────────────────────
 {
-  const p = parseMarkerSuffixText(`Admin tests import relatively rule: admin/tests/**/*.test.ts never "from '@/"`);
-  ok(p.rule === `admin/tests/**/*.test.ts never "from '@/"` && p.body === 'Admin tests import relatively', 'a rule: suffix is parsed off the body');
+  const p = parseMarkerSuffixText(`Web tests import relatively rule: web/tests/**/*.test.ts never "from '@/"`);
+  ok(p.rule === `web/tests/**/*.test.ts never "from '@/"` && p.body === 'Web tests import relatively', 'a rule: suffix is parsed off the body');
   ok(!parseMarkerSuffixText('Lint rule: never use var in new code').rule && !parseMarkerSuffixText('we adopted a new rule: never merge on Fridays').rule,
     'a prose "rule:" stays text');
   const both = parseMarkerSuffixText('Release scripts keep CRLF rule: scripts/*.ps1 keep-eol verify: npm test');
@@ -133,17 +133,17 @@ const INVITE = 'admin/tests/networkInvite.test.ts';
 // ── 4. lessonsForFiles ───────────────────────────────────────────────────────
 {
   const tiers = { cards: [
-    L('txt_folder', 'Admin: 🛠️ Everything in admin/tests/ runs in the root vitest — keep it fast.'),
-    L('txt_glob', 'Admin: 🛠️ Tests under admin/tests/*.test.ts must not reach the network.'),
-    L('txt_name', 'Admin: 🛠️ networkInvite.test.ts must mock the invite RPC.'),
-    L('txt_exact', `Admin: 🛠️ ${INVITE} must import relatively — the root vitest has no alias.`),
+    L('txt_folder', 'Web: 🛠️ Everything in web/tests/ runs in the root test runner — keep it fast.'),
+    L('txt_glob', 'Web: 🛠️ Tests under web/tests/*.test.ts must not reach the network.'),
+    L('txt_name', 'Web: 🛠️ checkoutForm.test.ts must mock the payment RPC.'),
+    L('txt_exact', `Web: 🛠️ ${CHECKOUT} must import relatively — the root test runner has no alias.`),
     L('txt_other', 'Billing: 🛠️ src/billing/charge.ts must round to cents.'),
   ] };
-  const r = lessonsForFiles(tiers, [INVITE]);
+  const r = lessonsForFiles(tiers, [CHECKOUT]);
   ok(r.map((x) => x.card.id).join() === 'txt_exact,txt_name,txt_glob,txt_folder' && r.map((x) => x.tier).join() === 'exact,name,glob,folder',
     `ranked exact > file name > glob > folder (${r.map((x) => x.tier).join(' > ')})`);
-  ok(r[0].file === INVITE && r[0].via === INVITE, 'a result names the declared file and the mention that matched it');
-  ok(lessonsForFiles(tiers, [INVITE], { limit: 2 }).length === 2, 'limit caps the list');
+  ok(r[0].file === CHECKOUT && r[0].via === CHECKOUT, 'a result names the declared file and the mention that matched it');
+  ok(lessonsForFiles(tiers, [CHECKOUT], { limit: 2 }).length === 2, 'limit caps the list');
   ok(lessonsForFiles({ cards: [L('txt_page', 'Web: 🛠️ page.tsx files must export metadata.')] }, ['app/settings/page.tsx']).length === 0,
     "a framework's stock file name (page.tsx) does not match by name alone");
   const twins = lessonsForFiles({ cards: [
@@ -160,19 +160,19 @@ const INVITE = 'admin/tests/networkInvite.test.ts';
     'a path a milestone mentions in passing ranks like a tag: below the lesson, at most one shown');
   const dump = L('txt_dump', `Status: changed ${Array.from({ length: 12 }, (_, i) => `src/mod${i}/file${i}.ts`).join(', ')}. Next step: avoid regressions.`);
   ok(lessonsForFiles({ cards: [dump] }, ['src/mod3/file3.ts']).length === 0, 'a status card that names more than ten paths is not a lesson about each');
-  const rc = lessonsForFiles({ cards: [L('txt_rc', `Admin: Admin tests import relatively\n${RULE_CANDIDATE_PREFIX} admin/tests/**/*.test.ts never "from '@/"`)] }, [INVITE]);
-  ok(rc[0]?.tier === 'glob' && rc[0].via === 'admin/tests/**/*.test.ts', 'a rule candidate is a lesson about the files its globs name');
+  const rc = lessonsForFiles({ cards: [L('txt_rc', `Web: Web tests import relatively\n${RULE_CANDIDATE_PREFIX} web/tests/**/*.test.ts never "from '@/"`)] }, [CHECKOUT]);
+  ok(rc[0]?.tier === 'glob' && rc[0].via === 'web/tests/**/*.test.ts', 'a rule candidate is a lesson about the files its globs name');
   const tags = lessonsForFiles({ cards: [
-    L('txt_tag_ship', 'Admin: 🏁 Invite flow shipped; the invite tests must stay green\n#admin #file-networkinvite-test'),
-    L('txt_tag_skill', 'Admin: 🛠️ Invite tests must reset the clock between cases\n#admin #file-networkinvite-test'),
-  ] }, [INVITE]);
+    L('txt_tag_ship', 'Web: 🏁 Checkout flow shipped; the checkout tests must stay green\n#web #file-checkoutform-test'),
+    L('txt_tag_skill', 'Web: 🛠️ Checkout tests must reset the clock between cases\n#web #file-checkoutform-test'),
+  ] }, [CHECKOUT]);
   ok(tags.length === 1 && tags[0].card.id === 'txt_tag_skill' && tags[0].tier === 'tag', 'a #file- tag counts on a 🛠️ lesson, not on a milestone');
   ok(lessonsForFiles({ cards: [
-    L('txt_q', `Admin: ❓ Should ${INVITE} mock the RPC? It must be decided.`),
-    L('txt_done', `Admin: ✅ ${INVITE} must import relatively — done`),
-    L('txt_arch', `Admin: 🛠️ ${INVITE} must import relatively`, { area: 'Archive' }),
-  ] }, [INVITE]).length === 0, 'an open question, a resolved card and an archived card are not lessons');
-  ok(lessonsForFiles({ cards: [L('txt_x', 'Payments: 🛠️ checkout must use the hosted page')] }, [INVITE]).length === 0, 'a lesson that names no file is never matched');
+    L('txt_q', `Web: ❓ Should ${CHECKOUT} mock the RPC? It must be decided.`),
+    L('txt_done', `Web: ✅ ${CHECKOUT} must import relatively — done`),
+    L('txt_arch', `Web: 🛠️ ${CHECKOUT} must import relatively`, { area: 'Archive' }),
+  ] }, [CHECKOUT]).length === 0, 'an open question, a resolved card and an archived card are not lessons');
+  ok(lessonsForFiles({ cards: [L('txt_x', 'Payments: 🛠️ checkout must use the hosted page')] }, [CHECKOUT]).length === 0, 'a lesson that names no file is never matched');
 }
 
 // ── 5. brain_sync capsule: "Lessons for your files" ──────────────────────────
@@ -181,17 +181,17 @@ const INVITE = 'admin/tests/networkInvite.test.ts';
   fs.mkdirSync(proj, { recursive: true });
   const brain = path.join(proj, 'brain.klypix');
   fs.writeFileSync(brain, await buildKlypixMap({ title: 'brain', areas: [
-    { title: 'Admin', cards: [{ text: `Admin: 🛠️ ${INVITE} must import relatively — the root vitest has no alias.` }] },
+    { title: 'Web', cards: [{ text: `Web: 🛠️ ${CHECKOUT} must import relatively — the root test runner has no alias.` }] },
     { title: 'Routes', cards: [{ text: `Routes: New pages are registered in the route table\n${RULE_CANDIDATE_PREFIX} app/pages/*.tsx listed-in src/routes.ts` }] },
     { title: 'Canvas', cards: [{ text: 'Canvas: 🛠️ Never call layout() inside a render loop.' }] },
     { title: 'Payments', cards: [{ text: 'Payments: Checkout uses the hosted page.' }] },
   ] }));
-  const res = await opBrainTaskContext({ vault: proj, canvas: brain, intent: 'fix the invite test imports and add a billing page', files: [INVITE, 'app/pages/billing.tsx'] });
+  const res = await opBrainTaskContext({ vault: proj, canvas: brain, intent: 'fix the checkout test imports and add a billing page', files: [CHECKOUT, 'app/pages/billing.tsx'] });
   const out = res.blocks.map((b) => b.text || '').join('\n');
   const lessons = res.context.fileLessons || [];
   ok(/### 📂 Lessons for your files \(2\)/.test(out) && out.indexOf('📂 Lessons for your files') < out.indexOf('🛠️ Standing rules'),
     'brain_sync shows "Lessons for your files" ahead of the standing rules and the hits');
-  ok(out.includes(`(for ${INVITE} · names \`${INVITE}\`)`), 'each lesson says which declared file it is for and what it names');
+  ok(out.includes(`(for ${CHECKOUT} · names \`${CHECKOUT}\`)`), 'each lesson says which declared file it is for and what it names');
   const exact = lessons.find((l) => l.match === 'exact');
   const route = lessons.find((l) => l.match === 'glob');
   ok(Boolean(exact) && Boolean(route) && route.ruleCandidate === 'app/pages/*.tsx listed-in src/routes.ts' && route.file === 'app/pages/billing.tsx',
@@ -220,7 +220,7 @@ const INVITE = 'admin/tests/networkInvite.test.ts';
 // ── 7. brain_rules: rule candidates first, prose routing ─────────────────────
 {
   const cards = [
-    L('txt_r1', `Admin: 🛠️ Admin tests import relatively\n${RULE_CANDIDATE_PREFIX} admin/tests/**/*.test.ts never "console.log("`, { ruleDraft: parseRuleSpec('admin/tests/**/*.test.ts never "console.log("') }),
+    L('txt_r1', `Web: 🛠️ Web tests import relatively\n${RULE_CANDIDATE_PREFIX} web/tests/**/*.test.ts never "console.log("`, { ruleDraft: parseRuleSpec('web/tests/**/*.test.ts never "console.log("') }),
     L('txt_r2', `Routes: 🛠️ New pages are registered\n${RULE_CANDIDATE_PREFIX} app/pages/*.tsx listed-in src/routes.ts`, { ruleDraft: parseRuleSpec('app/pages/*.tsx listed-in src/routes.ts') }),
     L('txt_r3', `Docs: 🛠️ Guides carry a title\n${RULE_CANDIDATE_PREFIX} docs/**/*.md must "title:"`, { ruleDraft: parseRuleSpec('docs/**/*.md must "title:"') }),
     L('txt_r4', `Build: 🛠️ Release scripts keep CRLF\n${RULE_CANDIDATE_PREFIX} scripts/*.ps1 keep-eol`, { ruleDraft: parseRuleSpec('scripts/*.ps1 keep-eol') }),
@@ -228,7 +228,7 @@ const INVITE = 'admin/tests/networkInvite.test.ts';
   ];
   const byCard = new Map(proposeFromCards(cards).proposals.map((p) => [p.card, p]));
   const r1 = byCard.get('txt_r1');
-  ok(r1?.route === 'rule' && r1.draft.kind === 'forbid-pattern' && r1.draft.pattern === 'console\\.log\\(' && r1.draft.files[0] === 'admin/tests/**/*.test.ts'
+  ok(r1?.route === 'rule' && r1.draft.kind === 'forbid-pattern' && r1.draft.pattern === 'console\\.log\\(' && r1.draft.files[0] === 'web/tests/**/*.test.ts'
     && /recorded rule-ready/.test(r1.reason), 'a never "…" candidate becomes a forbid-pattern draft with the literal escaped');
   const r2 = byCard.get('txt_r2');
   ok(r2?.route === 'rule' && r2.draft.kind === 'listed-in' && r2.draft.registry.join() === 'src/routes.ts' && r2.draft.needle === '{basename}', 'a listed-in candidate becomes a listed-in draft');
@@ -241,7 +241,7 @@ const INVITE = 'admin/tests/networkInvite.test.ts';
   const prose = proposeFromCards([
     L('txt_cut', cut),
     L('txt_decode', 'Perf: 🛠️ Never synchronously decode `atob(` on the UI thread — chunk it.'),
-    L('txt_mustnot', 'Admin: 🛠️ Admin tests must not import `@/lib/supabase` — the root vitest has no alias.'),
+    L('txt_mustnot', 'Web: 🛠️ Web tests must not import `@/lib/supabase` — the root test runner has no alias.'),
     L('txt_shell', 'Git: 🛠️ Never use `git push --force` on the shared checkout.'),
   ]).proposals;
   const by = new Map(prose.map((p) => [p.card, p]));
@@ -257,7 +257,7 @@ const INVITE = 'admin/tests/networkInvite.test.ts';
   const proj = path.join(TMP, 'note');
   fs.mkdirSync(proj, { recursive: true });
   git(proj, 'init', '-q');
-  for (const f of [INVITE, 'app/pages/home.tsx', 'src/routes.ts']) write(proj, f, 'export {};\n');
+  for (const f of [CHECKOUT, 'app/pages/home.tsx', 'src/routes.ts']) write(proj, f, 'export {};\n');
   git(proj, 'add', '-A');
   git(proj, 'commit', '-qm', 'fixture');
   const brain = path.join(proj, 'brain.klypix');
@@ -265,14 +265,14 @@ const INVITE = 'admin/tests/networkInvite.test.ts';
   const note = (args) => opBrainNote({ vault: proj, canvas: brain, via: 'test', ...args });
   const cards = async () => live((await parseKlypix(fs.readFileSync(brain))).struct);
 
-  const a = await note({ text: `Admin tests import relatively; the root vitest has no alias rule: admin/tests/**/*.test.ts never "from '@/"`, area: 'Admin' });
-  const admin = (await cards()).find((c) => /Admin tests import relatively/.test(flat(c.text)));
-  ok(!a.isError && Boolean(admin) && /🛠️/.test(admin.text) && admin.text.split('\n').includes(`${RULE_CANDIDATE_PREFIX} admin/tests/**/*.test.ts never "from '@/"`)
+  const a = await note({ text: `Web tests import relatively; the root test runner has no alias rule: web/tests/**/*.test.ts never "from '@/"`, area: 'Web' });
+  const admin = (await cards()).find((c) => /Web tests import relatively/.test(flat(c.text)));
+  ok(!a.isError && Boolean(admin) && /🛠️/.test(admin.text) && admin.text.split('\n').includes(`${RULE_CANDIDATE_PREFIX} web/tests/**/*.test.ts never "from '@/"`)
     && !/ rule: /.test(flat(admin.text)) && admin.ruleDraft?.kind === 'never',
   'brain_note: a rule: suffix at the end of the text lands as the ⚙ line of a 🛠️ lesson');
   const b = await note({ text: 'Guide pages carry a front-matter title rule: docs/guides/*.md must "title:"', area: 'Docs' });
   ok(b.isError && /Invalid rule: .*names no tracked file/.test(flat(b.blocks?.[0]?.text)), 'brain_note: a rule whose glob names no tracked file is refused, loudly');
-  const c = await note({ text: `Admin tests import relatively rule: admin/tests/**/*.test.ts never "from '@/"`, marker: '~', area: 'Admin' });
+  const c = await note({ text: `Web tests import relatively rule: web/tests/**/*.test.ts never "from '@/"`, marker: '~', area: 'Web' });
   ok(c.isError && /rule rides a new lesson card/.test(flat(c.blocks?.[0]?.text)), 'brain_note: a rule on a ~ update is refused');
   const d = await note({ text: 'New pages must be registered in the route table', rule: 'app/pages/*.tsx listed-in src/routes.ts', area: 'Routes' });
   const routes = (await cards()).find((c2) => /New pages must be registered/.test(flat(c2.text)));
@@ -288,7 +288,7 @@ const INVITE = 'admin/tests/networkInvite.test.ts';
   fs.mkdirSync(path.join(proj, '.claude'), { recursive: true });
   fs.mkdirSync(path.join(HOME, '.claude', 'project-brain'), { recursive: true });
   git(proj, 'init', '-q');
-  for (const f of [INVITE, 'app/pages/home.tsx', 'src/routes.ts', 'src/widgets/rangeSlider.ts', 'src/legacy/oldParser.ts']) write(proj, f, 'export {};\n');
+  for (const f of [CHECKOUT, 'app/pages/home.tsx', 'src/routes.ts', 'src/widgets/rangeSlider.ts', 'src/legacy/oldParser.ts']) write(proj, f, 'export {};\n');
   git(proj, 'add', '-A');
   git(proj, 'commit', '-qm', 'fixture');
   const brain = path.join(proj, 'brain.klypix');
@@ -304,7 +304,7 @@ const INVITE = 'admin/tests/networkInvite.test.ts';
   });
   const edit = (file) => ({ type: 'tool_use', id: `tu_${Math.random().toString(36).slice(2, 8)}`, name: 'Edit', input: { file_path: file, old_string: 'a', new_string: 'b' } });
   const markers = [
-    `🧠 BRAIN [Admin] +: Admin tests import relatively; the root vitest has no alias rule: admin/tests/**/*.test.ts never "from '@/"`,
+    `🧠 BRAIN [Web] +: Web tests import relatively; the root test runner has no alias rule: web/tests/**/*.test.ts never "from '@/"`,
     '🧠 BRAIN [Routes]: New pages are registered in the route table rule: app/pages/*.tsx listed-in src/routes.ts',
     '🧠 BRAIN [Docs] +: Guide pages carry a front-matter title rule: docs/guides/*.md must "title:"',
     '🧠 BRAIN [Widgets] ?: Should range sliders snap to whole steps rule: src/widgets/*.ts never "Math.round("',
@@ -312,8 +312,8 @@ const INVITE = 'admin/tests/networkInvite.test.ts';
   // The prompt hook records where this turn starts; the Stop hook tags a card
   // with the files edited after it.
   const tp = path.join(HOME, 't-recall.jsonl');
-  fs.writeFileSync(tp, `${JSON.stringify({ type: 'user', message: { role: 'user', content: 'tidy the admin tests and the routes' } })}\n`);
-  runHook(['--prompt'], { session_id: 'recall-e2e', prompt: 'tidy the admin tests and the routes', transcript_path: tp });
+  fs.writeFileSync(tp, `${JSON.stringify({ type: 'user', message: { role: 'user', content: 'tidy the web tests and the routes' } })}\n`);
+  runHook(['--prompt'], { session_id: 'recall-e2e', prompt: 'tidy the web tests and the routes', transcript_path: tp });
   fs.appendFileSync(tp, [
     { type: 'assistant', message: { role: 'assistant', content: [
       edit(path.join(proj, '.claude', 'worktrees', 'agent-1', 'src', 'widgets', 'rangeSlider.ts')),
@@ -329,8 +329,8 @@ const INVITE = 'admin/tests/networkInvite.test.ts';
   catch (e) { ok(false, `the Stop hook exits 0 (${e.status}: ${String(e.stderr || '').slice(0, 200)})`); }
   const { struct } = await parseKlypix(fs.readFileSync(brain));
   const find = (re) => live(struct).find((c) => re.test(flat(c.text)));
-  const admin = find(/^Admin: 🛠️ Admin tests import relatively; the root vitest has no alias/);
-  ok(Boolean(admin) && admin.text.split('\n').includes(`${RULE_CANDIDATE_PREFIX} admin/tests/**/*.test.ts never "from '@/"`) && admin.ruleDraft?.kind === 'never'
+  const admin = find(/^Web: 🛠️ Web tests import relatively; the root test runner has no alias/);
+  ok(Boolean(admin) && admin.text.split('\n').includes(`${RULE_CANDIDATE_PREFIX} web/tests/**/*.test.ts never "from '@/"`) && admin.ruleDraft?.kind === 'never'
     && !/alias rule:/.test(flat(admin.text)), 'hook: a + marker with rule: lands with its ⚙ rule candidate line, the suffix off the body');
   const routes = find(/^Routes: 🛠️ New pages are registered in the route table/);
   ok(routes?.ruleDraft?.kind === 'listed-in', 'hook: a plain decision with a valid rule: is recorded as a 🛠️ lesson');
@@ -345,7 +345,7 @@ const INVITE = 'admin/tests/networkInvite.test.ts';
     && /rule: not recorded on the 🧠 BRAIN \[Widgets\] \? marker/.test(prompt) && /rides a new lesson card/.test(prompt),
   'hook: the author is told, on the next prompt, which rule: was not recorded and why');
 
-  const tagLine = flat(admin?.text).slice(Math.max(0, flat(admin?.text).indexOf('#admin')));
+  const tagLine = flat(admin?.text).slice(Math.max(0, flat(admin?.text).indexOf('#web')));
   ok(/#file-rangeslider/.test(tagLine) && /#dir-widgets/.test(tagLine) && /#file-package/.test(tagLine),
     `hook: work inside a worktree is tagged as the path inside it (${tagLine})`);
   ok(!/#dir-agent-1|#dir-ci-cost|#file-notes|#dir-klypix-recall-scratch|#file-memory|#dir-memory|#file-commitmsg|#dir-tmp|#file-brain-capture-state/.test(tagLine),
@@ -354,13 +354,13 @@ const INVITE = 'admin/tests/networkInvite.test.ts';
   // A commit whose subject reads like a rule stays a commit card.
   write(proj, 'src/routes.ts', 'export const routes = [];\n');
   git(proj, 'add', '-A');
-  git(proj, 'commit', '-qm', 'fix(main): never scatter Electron main imports below the top of the file', '-m', 'Scattered imports hit a TDZ at startup and broke the overlay hotkey.');
+  git(proj, 'commit', '-qm', 'fix(config): never read the settings file before the loader finishes', '-m', 'Reading it early returned the defaults and dropped what the person had saved.');
   const tp2 = path.join(HOME, 't-recall-2.jsonl');
   fs.writeFileSync(tp2, `${JSON.stringify({ type: 'user', message: { role: 'user', content: 'commit it' } })}\n`);
   try { runHook(['--capture'], { session_id: 'recall-e2e-2', transcript_path: tp2 }); }
   catch (e) { ok(false, `the second Stop exits 0 (${e.status})`); }
   const after = live((await parseKlypix(fs.readFileSync(brain))).struct);
-  const commitCard = after.find((c) => /never scatter Electron main imports below the top of the file/.test(flat(c.text)));
+  const commitCard = after.find((c) => /never read the settings file before the loader finishes/.test(flat(c.text)));
   ok(Boolean(commitCard) && !/🛠/.test(commitCard.text), 'hook: a commit card is not re-glyphed 🛠️ when its subject reads like a rule');
 
   // SessionStart: the standing rules lead with the lesson naming a changed file.

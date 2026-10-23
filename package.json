@@ -35,7 +35,7 @@
     "overlap-warnings",
     "agent-collaboration"
   ],
-  "homepage": "https://klypix.com/developers",
+  "homepage": "https://klypix.com/klypix-mcp",
   "repository": {
     "type": "git",
     "url": "https://github.com/dahshanlabs/klypix-mcp"

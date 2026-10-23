@@ -1,106 +1,137 @@
-# klypix-mcp — shared project memory for Claude Code, Codex and Cursor
+<div align="center">
+
+# klypix-mcp
+
+### The shared project brain for your coding agents.
 
 **Every project gets a brain.**
 
-Shared project memory for **Claude Code, Codex, Cursor** and other MCP coding tools. One
-`brain.klypix` file, committed with your code, carries the project's decisions, corrections and open
-questions across sessions and between tools. Corrections supersede stale decisions; sessions declare
-the files they expect to touch and get warned about overlap: on this machine, and with
-[KLYPIX network](https://klypix.com/network) on both computers, with teammates' sessions on theirs. Versioned in Git. Served
-over MCP by a process on your machine. In the standalone setup, brain data stays in your files;
-your agent's provider can still receive what the agent reads. Integration depth differs by host — see
-[Supported hosts](#supported-hosts-and-their-integration-level).
-
-Klypix is a **portable project workspace with a shared brain**. This repository provides its
-local MCP server for shared project memory in coding tools. The **Apache-2.0 engine works without the KLYPIX
-desktop app or a KLYPIX account**. The optional
-[Windows workspace](https://klypix.com/developers) lets people inspect the same project brain
-beside their files. App-based sharing has its own cloud path; see [Security and permissions](#security-and-permissions).
-
-For the **Projects & Ideas** path — saved project materials in ChatGPT or Claude chat — follow
-[Save project materials and use them with your assistant](https://klypix.com/guides/connect-klypix-to-chatgpt-and-claude).
-That uses Klypix's separate hosted connection for the spaces you authorize. Installing this local
-MCP server does not set up that connection.
-
-[Install](#quick-start) · [Try your first decision](#your-first-decision-and-correction) ·
-[Supported hosts](#supported-hosts-and-their-integration-level) ·
-[Privacy](#security-and-permissions) · [Limits](#current-limitations) · [Uninstall](#uninstall)
-
-For a team walkthrough, read the [shared project memory setup guide](https://klypix.com/guides/shared-project-memory).
-Choosing an approach? Our [memory tools comparison](https://klypix.com/guides/shared-project-memory-tools)
-links each tool's official documentation and discloses that Klypix wrote it.
-
-![Two real MCP sessions on one project: Session B declares a file Session A already declared, and the server's exact-file-overlap warning fires; Session A then records a correction that supersedes its stale card](https://raw.githubusercontent.com/dahshanlabs/klypix-mcp/master/docs/demo/demo.gif)
-
-<sub>Real output, not a mockup: both panes run a real MCP client against this server
-([docs/demo/](docs/demo/) — the GIF is rendered by CI from a scripted tape against this server, not
-hand-recorded, and re-rendered when the server's responses change).</sub>
-
-**▶ Watch:** [For coding teams (40 s, with sound)](https://klypix.com/media/films/sessions-16x9-en.mp4) ·
-[The shared project brain (2 min 21 s)](https://klypix.com/developers#demo) ·
-[Full tour (4 min)](https://klypix.com/media/films/tour-16x9-en.mp4) ·
-[KLYPIX network](https://klypix.com/network)
-
-With **Node.js 20 or newer**, run this inside your project:
-
-```bash
-npx klypix-mcp install
-```
-
-It creates `brain.klypix` if the project has none, wires the editors it finds on this machine,
-registers the `.klypix` merge driver if this is a git repo, and exits only after a real MCP
-handshake has counted the tools that answered.
-
-Next, reconnect your coding host and [try your first decision and correction](#your-first-decision-and-correction).
-A successful trial means a fresh session finds your recorded decision and its reason, then finds
-the corrected decision as current. Check the returned source cards; a successful install alone
-does not prove that your host has loaded the tools or that a particular decision was retrieved.
-
-[![Claude Code](https://img.shields.io/badge/Claude_Code-5_lifecycle_hooks-475569?style=flat-square)](#supported-hosts-and-their-integration-level)
-[![Codex](https://img.shields.io/badge/Codex-native_MCP_%2B_presence-475569?style=flat-square)](#supported-hosts-and-their-integration-level)
-[![Cursor](https://img.shields.io/badge/Cursor-MCP_config_%2B_rules-475569?style=flat-square)](#supported-hosts-and-their-integration-level)
-[![Gemini CLI](https://img.shields.io/badge/Gemini_CLI-MCP_config_%2B_rules-475569?style=flat-square)](#supported-hosts-and-their-integration-level)
-
-<sub>Host badges name the **integration level**, not a flat "compatible" — the levels and what is
-actually tested are in [Supported hosts](#supported-hosts-and-their-integration-level).</sub>
-
-> **One project. Many agents. One current understanding.**
-
-Klypix does not launch, run, supervise, or replace your agents. It is not an agent runtime, a model
-router, a worktree manager, or a replacement for Git. It holds what the project currently believes.
-
-[![CI](https://img.shields.io/github/actions/workflow/status/dahshanlabs/klypix-mcp/ci.yml?branch=master&style=flat-square&label=CI)](https://github.com/dahshanlabs/klypix-mcp/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/klypix-mcp?style=flat-square)](https://www.npmjs.com/package/klypix-mcp)
+[![CI](https://img.shields.io/github/actions/workflow/status/dahshanlabs/klypix-mcp/ci.yml?branch=master&style=flat-square&label=CI)](https://github.com/dahshanlabs/klypix-mcp/actions/workflows/ci.yml)
 [![License](https://img.shields.io/github/license/dahshanlabs/klypix-mcp?style=flat-square)](LICENSE)
 [![Node](https://img.shields.io/node/v/klypix-mcp?style=flat-square)](package.json)
 [![MCP](https://img.shields.io/badge/MCP-server-475569?style=flat-square)](https://modelcontextprotocol.io)
 [![Glama score](https://glama.ai/mcp/servers/dahshanlabs/klypix-mcp/badges/score.svg)](https://glama.ai/mcp/servers/dahshanlabs/klypix-mcp)
-[![bench](https://img.shields.io/badge/npx_klypix--mcp_bench-10_writers_%C2%B7_0_lost-475569?style=flat-square)](BENCHMARKS.md)
 
-## New in 1.106: teammates on other computers
+</div>
 
-![KLYPIX network: agent sessions on two computers declare the same file, the project brain warns before either edits it, and a note from one session lands in the other](https://klypix.com/network/klypix-network.gif)
+Shared project memory for **Claude Code, Codex, Cursor** and other MCP coding tools. One
+`brain.klypix` file, committed with your code, holds the project's decisions, corrections and open
+questions. Supported agents read it at the start of a task and add to it as they work; how much of
+that happens on its own depends on the host. People can open the same file and correct it.
 
-With [KLYPIX network](https://klypix.com/network) installed on both computers (a small background
-program, `curl -fsSL https://klypix.com/network/install.sh | sh`, or `irm https://klypix.com/network/install.ps1 | iex`
-on Windows), `brain_sync` also lists agent sessions on your teammates' computers in the same
-project, with their intent and declared files, and gives the same exact-file overlap warning it gives
-for a session on this machine. `brain_message` reaches those sessions too (their ids start with
-`net:`); a broadcast goes to this machine's sessions and theirs.
+![Two sessions, Claude Code and Codex, on one PC and one brain.klypix. Both plan to change src/checkout/Checkout.tsx, and each gets a heads-up from KLYPIX. Nothing is blocked. The film ends on the KLYPIX mark and "Every project gets a brain."](https://raw.githubusercontent.com/dahshanlabs/klypix-mcp/master/docs/media/klypix-sessions.gif)
 
-Only the project key (a hash of the git remote), the one-line intent and repository-relative file
-paths leave the computer, plus the text of a note you send to a session there. There is no read
-receipt and no result reconciliation across computers. Without the program nothing changes; it is
-off in plugin mode and with `KLYPIX_NETWORK=0`.
+<sub>A 14-second cut of the sessions film from klypix.com.
+[Real terminal output](#60-seconds-two-agents-one-project) is further down.</sub>
 
-## See the shared project brain in action
+**▶ Watch:** [For coding teams (40 s, with sound)](https://klypix.com/media/films/sessions-16x9-en.mp4) ·
+[Correct it once (20 s)](https://klypix.com/media/films/correct-16x9-en.mp4) ·
+[Full tour (4 min)](https://klypix.com/media/films/tour-16x9-en.mp4) ·
+[KLYPIX network](https://klypix.com/network)
 
-[![Watch the 2 minute 21 second KLYPIX Brain product walkthrough](https://raw.githubusercontent.com/dahshanlabs/klypix-mcp/master/docs/assets/klypix-brain-showcase-readme.jpg)](https://klypix.com/developers#demo)
+## Install in three steps
 
-Watch how current decisions, corrections, evidence, and active work stay visible to people and
-carry forward into supported coding-agent sessions.
+You need **Node.js 20 or newer** (`node -v`).
 
-**[Watch the 2:21 showcase with sound](https://klypix.com/developers#demo)**
+1. **Run this inside your project:**
+
+   ```bash
+   npx klypix-mcp install
+   ```
+
+   It gives the project a `brain.klypix` if it has none, wires the editors it finds on this
+   machine, and checks that the tools answer before it exits.
+
+2. **Reopen your coding tool**, or reconnect its MCP server, and allow the KLYPIX tools if it asks.
+
+3. **Check it.** Run `npx klypix-mcp doctor`, then
+   [record your first decision and correction](#your-first-decision-and-correction) and ask for it
+   from a fresh session.
+
+## What you get
+
+- **Decisions that carry over.** The next session, in the same tool or another one, starts from
+  what the project already decided: on its own in Claude Code, and when the agent calls
+  `brain_sync` in other hosts. A correction replaces the old decision, and the old card stays as
+  history.
+- **A heads-up when work overlaps.** Each session says what it is doing and which files it expects
+  to touch. When two sessions name the same file, both are warned. KLYPIX warns; it never blocks an
+  edit. This works on one computer. With [KLYPIX network](https://klypix.com/network)
+  installed on both computers (klypix-mcp 1.106.0 or later), it also lists sessions in the same
+  project on a teammate's computer.
+- **Notes and handoffs between sessions.** An agent can leave a note for another session, even one
+  that has closed. The note arrives at that session's next KLYPIX action, so you are not the one
+  copying it across. When a session stops before its work is done, the next session on this
+  computer is shown what it was doing, and a handoff card in the brain carries the next steps
+  through Git.
+- **A git guard for a shared checkout (Claude Code).** When several sessions share one checkout, a
+  git command that would sweep another live session's uncommitted work into your commit is stopped.
+  A command that would throw work away saves a rescue copy first, then asks you. It covers git
+  commands run through Claude Code's tools, on one computer.
+- **A file you own.** The brain is one `.klypix` file in your repo: a plain ZIP, versioned with
+  Git. The engine is Apache-2.0, runs on your machine, and works without the KLYPIX app or an
+  account. Brain data stays in your files; your agent's model provider still receives what the
+  agent reads.
+
+## Hosts
+
+How deep the integration goes depends on the host. The [full table](#supported-hosts-and-their-integration-level)
+has the details.
+
+| Host | What it gets | Set up by |
+|---|---|---|
+| **Claude Code** | Six lifecycle hooks (1.105.0 and later): a brief at session start, context on each prompt, automatic capture at turn end, presence and the git guard | `install` |
+| **Codex** | Native MCP tools, presence and `brain_sync`; optional hooks with `--codex-hooks`. No automatic capture | `install` |
+| **Cursor, Cline, VS Code (Copilot / Continue), Gemini CLI, Antigravity** | MCP config and an always-on rules file. The agent calls `brain_sync` and `brain_note` itself | `install`, for the editors it finds, or `link` |
+| **Windsurf, Aider** | A rules file. Windsurf uses its own global MCP config; Aider uses the command line | `link` |
+| **Claude Desktop** | A one-time config entry | The KLYPIX app's Settings, or by hand |
+| **Claude, as a plugin** | One pinned version, keyword search, no hooks | [klypix-plugin](https://github.com/dahshanlabs/klypix-plugin) |
+
+klypix-mcp 1.106.0 has 26 MCP tools on Linux and macOS and 27 on Windows, where `show_in_klypix` is
+added. `npx klypix-mcp doctor` shows the count for your install.
+
+> **One project. Many agents. One current understanding.**
+
+KLYPIX does not launch, run, supervise or replace your agents. It is not an agent runtime, a model
+router, a worktree manager or a replacement for Git. It holds what the project currently believes.
+
+KLYPIX is a **portable project workspace with a shared brain**. This repository is its local MCP
+server. The optional [Windows workspace](https://klypix.com/developers) lets people inspect the same
+brain beside their files; app-based sharing has its own cloud path (see
+[Security and permissions](#security-and-permissions)). For the **Projects & Ideas** path, saved
+project materials in ChatGPT or Claude chat, follow
+[Save project materials and use them with your assistant](https://klypix.com/guides/connect-klypix-to-chatgpt-and-claude).
+That uses KLYPIX's separate hosted connection for the spaces you authorize; installing this local
+server does not set it up.
+
+**Guides:** [shared project memory setup](https://klypix.com/guides/shared-project-memory) ·
+[memory tools comparison](https://klypix.com/guides/shared-project-memory-tools) (it links each
+tool's official documentation and says that KLYPIX wrote it) · [klypix.com/klypix-mcp](https://klypix.com/klypix-mcp)
+
+---
+
+## Contents
+
+- **Start:** [The problem](#the-problem) · [60 seconds: two agents, one project](#60-seconds-two-agents-one-project) ·
+  [Quick start](#quick-start) · [Your first decision and correction](#your-first-decision-and-correction)
+- **[Reference](#reference):** [How the brain works](#how-the-brain-works) ·
+  [Supported hosts](#supported-hosts-and-their-integration-level) ·
+  [Running as a Claude plugin](#running-as-a-claude-plugin) · [Task briefing](#task-briefing) ·
+  [Capture and corrections](#capture-and-corrections) · [Presence and task intent](#presence-and-task-intent) ·
+  [Overlap warnings](#overlap-warnings) ·
+  [Teammates on other computers](#teammates-on-other-computers-klypix-network) ·
+  [Handoffs and messages](#handoffs-and-messages) · [Evidence-gated completion](#evidence-gated-completion) ·
+  [Human control in KLYPIX](#human-control-in-klypix) · [Measure it yourself](#measure-it-yourself) ·
+  [Git and concurrency](#git-and-concurrency) ·
+  [The git guard for a shared checkout](#whose-is-this-the-git-guard-for-a-shared-checkout) ·
+  [The command line](#the-command-line) · [The verbs](#the-verbs-26-and-27-on-windows) ·
+  [One file you can hold](#one-file-you-can-hold) · [Use it as a library](#use-it-as-a-library) ·
+  [A2A](#also-speaks-a2a-protocol-v030--experimental) ·
+  [Updates](#updates--the-propagation-contract) · [Security and permissions](#security-and-permissions) ·
+  [Current limitations](#current-limitations) · [Numbers and methodology](#numbers-and-methodology) ·
+  [Uninstall](#uninstall)
+- [Contributing](#contributing) · [Why this exists](#why-this-exists) · [Licence](#licence)
 
 ---
 
@@ -121,6 +152,12 @@ Your agents may run independently. Their project understanding should not.
 ---
 
 ## 60 seconds: two agents, one project
+
+![Two real MCP sessions on one project: Session B declares a file Session A already declared, and the server's exact-file-overlap warning fires; Session A then records a correction that supersedes its stale card](https://raw.githubusercontent.com/dahshanlabs/klypix-mcp/master/docs/demo/demo.gif)
+
+<sub>Real output, not a mockup: both panes run a real MCP client against this server
+([docs/demo/](docs/demo/) — the GIF is rendered by CI from a scripted tape against this server, not
+hand-recorded, and re-rendered when the server's responses change).</sub>
 
 Illustrative calls and responses: replace `/absolute/path/to/project` with the same project root
 in both sessions (for example, `C:/work/api` on Windows).
@@ -211,8 +248,8 @@ broken entry dies in ~100ms with `Connection closed` and is reported, not shippe
 
 What goes where:
 
-- **Machine-global, once** — the engine + runtime in `~/.claude/project-brain`, Claude Code's five
-  lifecycle hooks in `~/.claude/settings.json`, and the `~/.codex/AGENTS.md` guidance block. Claude
+- **Machine-global, once** — the engine + runtime in `~/.claude/project-brain`, Claude Code's six
+  lifecycle hooks (five before 1.105.0) in `~/.claude/settings.json`, and the `~/.codex/AGENTS.md` guidance block. Claude
   Code is therefore covered in every project on that machine that has a `./brain.klypix`.
 - **Per project** — MCP config and rules for Cursor, Codex, Cline, Windsurf, Copilot, Gemini CLI /
   Antigravity and Aider. Run `install` once inside each project.
@@ -319,12 +356,18 @@ trial does not plan source-code edits.
 
 For a team on different machines, follow the [Git sharing steps](https://klypix.com/guides/shared-project-memory#team)
 and install in each clone. Standalone live presence and file-overlap warnings stay local to one
-machine and OS user; with [KLYPIX network](#new-in-1106-teammates-on-other-computers) on each
-computer, they also cover teammates' sessions in the same project. Keep approved architecture records and stable conventions alongside the brain.
+machine and OS user; with [KLYPIX network](#teammates-on-other-computers-klypix-network) on each
+computer, they also cover teammates' sessions in the same project. Keep approved architecture
+records and stable conventions alongside the brain.
 
 ---
 
-## How the brain works
+## Reference
+
+Everything below is reference: how each part works, what it writes, and where it stops. The
+[contents](#contents) list above links to each section.
+
+### How the brain works
 
 The difference from a folder of notes is not the shape — it is that this memory is a mechanism,
 not a filing convention.
@@ -362,7 +405,7 @@ not a filing convention.
   ("Getting this brain ready for search by meaning: 900 of 3,670 cards so far, about 5 min left").
   After that, only new or edited cards are prepared.
 
-### Bounded semantic-memory runtime
+#### Bounded semantic-memory runtime
 
 Long-lived MCP and A2A workers use the bounded semantic-memory runtime by default. Models load only
 when semantic work is requested, native inference is serialized per process, embedding work is
@@ -386,7 +429,7 @@ excludes the owning IDE/chat application's RAM, redacts command-line secrets, an
 brain or terminates a process. Multiple processes under one host are reported as parallel sessions,
 not called duplicates without an authoritative logical-session receipt.
 
-### Project Map: current structure beside project understanding
+#### Project Map: current structure beside project understanding
 
 If the project contains a compatible NetworkX node-link `graph.json`, agents can ask for bounded
 code-structure evidence and current brain context in one read-only call:
@@ -421,16 +464,14 @@ workflow has `contents: read`, pins every action by commit SHA, pins `graphifyy=
 the graph contract, and uploads `graphify-out/` as a 14-day build artifact. This is opt-in CI code:
 the local MCP tool still never installs or launches Graphify.
 
----
-
-## Supported hosts and their integration level
+### Supported hosts and their integration level
 
 Levels are honest. Only the config-writing side is tested for the `link` hosts; their host-side
 behaviour is unverified.
 
 | Host | Level | Wired by | Brief into context | Decision capture | Live presence |
 |---|---|---|---|---|---|
-| **Claude Code** | Full automatic (5 lifecycle hooks) | `install` | Automatic at session start, task-ranked retrieval per prompt | **Automatic** at turn end | Yes |
+| **Claude Code** | Full automatic (6 lifecycle hooks since 1.105.0) | `install` | Automatic at session start, task-ranked retrieval per prompt | **Automatic** at turn end | Yes |
 | **Codex** | Native MCP + presence + Context Gateway; optional `--codex-hooks` | `install` | Via `brain_sync`; per-prompt injection only with `--codex-hooks` | **Explicit only** (`brain_note`) — never automatic | Yes |
 | **Cursor** | MCP config + always-on rules file | `link` | Model must call `brain_sync` | Model must call `brain_note` | For the MCP connection |
 | **Cline** | MCP config + always-on rules file | `link` | Model must call `brain_sync` | Model must call `brain_note` | For the MCP connection |
@@ -461,11 +502,10 @@ it lists the tools:
 }
 ```
 
----
+### Running as a Claude plugin
 
-## Running as a Claude plugin
-
-The KLYPIX Claude plugin starts this server as `npx -y klypix-mcp@1.93.0`: one exact version, never
+The KLYPIX Claude plugin starts this server as `npx -y klypix-mcp@<version>`, with the version its
+`.claude-plugin/plugin.json` names: one exact version, never
 a range or `latest`. It sets three variables: `KLYPIX_PLUGIN=1`,
 `KLYPIX_PLUGIN_DATA=${CLAUDE_PLUGIN_DATA}` and `KLYPIX_VAULT=${CLAUDE_PROJECT_DIR}`.
 `KLYPIX_PLUGIN=1` turns on **plugin mode**, which changes how the MCP server behaves and nothing
@@ -537,9 +577,7 @@ created in a project; and the presence lanes, write locks and restore points in
 `~/.claude/project-brain`. Other KLYPIX tools on this computer share that folder. If you use none,
 you can delete it.
 
----
-
-## Task briefing
+### Task briefing
 
 Every Claude Code session starts already knowing the project: a bounded brief of at most 2KB in
 context, with the full brief written to disk for when broad history or status work needs it.
@@ -553,7 +591,7 @@ so fresh relevant findings are not crowded out by older area vocabulary.
 Briefs are **not** injected automatically on Cursor, Cline, Copilot, Gemini CLI or Antigravity —
 there are no lifecycle hooks on those hosts.
 
-### The live projection — the file the agent obeys
+#### The live projection — the file the agent obeys
 
 The coordination bench showed that an agent trusts the instruction file it was launched with
 over anything a tool or hook tells it, and that each host reads a different surface. So the
@@ -580,7 +618,7 @@ Sections for projects not touched in a day are pruned from the Codex file, at mo
 kept, and `uninstall unlink` strips the block (deleting `CLAUDE.local.md` only when nothing else
 is in it). `brain_sync` remains the live source; the block tells the agent to call it.
 
-## Capture and corrections
+### Capture and corrections
 
 `brain_note` accepts structured supporting references and inert verification text:
 
@@ -646,7 +684,7 @@ only (explicit correction cues, opposite-polarity pairs), never mere topical sim
 means no contradiction signal was found — not verified consistency. A memory that cannot disagree
 with you is flattery.
 
-## Presence and task intent
+### Presence and task intent
 
 An active session means an authorized MCP connection or host lifecycle adapter that heartbeated
 within the TTL. A row in a recent-chat list is history, not presence.
@@ -662,7 +700,7 @@ Future hosts get baseline support merely by connecting the MCP server. A deeper 
 `peekMessages` and `receiveMessages`. The shared contract accepts `id`, `client`, `surface`,
 `model`, `branch`, `intent`, touched `files`, and adapter `channel`.
 
-## Overlap warnings
+### Overlap warnings
 
 `brain_sync` reports three kinds of overlap with other live sessions on the same brain:
 
@@ -681,7 +719,32 @@ Future hosts get baseline support merely by connecting the MCP server. A deeper 
 This warns. It does not prevent. Nothing blocks an edit. A session that never declared its files
 and was never observed editing is invisible to the file and folder checks.
 
-## Handoffs and messages
+### Teammates on other computers (KLYPIX network)
+
+![KLYPIX network: agent sessions on two computers declare the same file, the project brain warns before either edits it, and a note from one session lands in the other](https://klypix.com/network/klypix-network.gif)
+
+Presence, overlap warnings and notes are local to one computer by default. Since klypix-mcp
+1.106.0 they also reach a teammate's computer when [KLYPIX network](https://klypix.com/network), a
+small separate background program, is installed on both computers
+(`curl -fsSL https://klypix.com/network/install.sh | sh`, or
+`irm https://klypix.com/network/install.ps1 | iex` on Windows):
+
+- `brain_sync` also lists agent sessions in the same project on a teammate's computer, with their
+  one-line task and declared files, and gives the same exact-file overlap warning it gives for a
+  session on this machine.
+- `brain_message` reaches those sessions too. Their ids start with `net:`. A note to every session
+  goes to this machine's sessions and theirs.
+
+What leaves the computer: the project key (a hash of the git remote), the one-line task,
+repository-relative file paths, and the text of a note you send to a session there. Cards, files,
+diffs and screens do not travel this way; the brain itself still moves through Git. There is no
+read receipt and no result reconciliation across computers. The warnings are advisory, exactly as
+on one computer.
+
+Without the program nothing changes. It is off with `KLYPIX_NETWORK=0` and in plugin mode. No
+two-computer test run is published for it yet.
+
+### Handoffs and messages
 
 `brain_message` leaves one-time coordination notes for other sessions — live, idle, or recently
 closed. Address a session by id: a live session gets the note on its next action; a session
@@ -702,7 +765,7 @@ instead of silently looking delivered. The send-time audience is fixed, unresolv
 fail closed, the core lane is machine-local, a note to every session expires after 24 hours and a
 directed note after 7 days, and notes are never written into the brain.
 
-### Reopen on your OK
+#### Reopen on your OK
 
 A note to a session that has closed would otherwise wait until someone happens to open that
 session again. When the person wants it handled sooner, the sending agent calls `brain_reopen`, and
@@ -726,7 +789,7 @@ receives the waiting note at its first action and the sender sees the receipt as
   waiting for them; `npx klypix-mcp sessions reopen <id>` reopens one (`--quiet` lets it wait for
   you instead of starting on the note).
 
-### Session handoff — continue in the next session, with any agent
+#### Session handoff — continue in the next session, with any agent
 
 The case this exists for: a Claude Code session stops at its usage limit in the middle of a task,
 and the person opens Codex (or a fresh Claude Code) and says *continue*. Until 1.99.0 the only
@@ -782,7 +845,7 @@ fail the sync that triggered it.
 Durable decisions still go in the brain as cards — a handoff is the one card about *work in
 flight*, and it closes when the work lands.
 
-## Evidence-gated completion
+### Evidence-gated completion
 
 When a task publishes a quantified or otherwise machine-checkable claim, it can attach one or more
 versioned result manifests to `brain_sync { phase: "complete" }`. Each manifest binds the claim to a
@@ -799,7 +862,7 @@ Schema-v2 receipts can be converted into commit-bound publication evidence and i
 with `klypix-mcp/release-evidence`; legacy schema-v1 results remain usable for coordination but cannot
 authorize publication.
 
-## Human control in Klypix
+### Human control in Klypix
 
 > **Not a second brain. A shared one.**
 
@@ -819,7 +882,7 @@ The app is a separate, proprietary Windows product. The format, this server and 
 Apache-2.0 and work with no app installed. The app's interface is available in English and Arabic
 (some newer panels are still English-only).
 
-### KLYPIX canvases and your AI tool
+#### KLYPIX canvases and your AI tool
 
 Beyond project brains, the same connection reads and writes the KLYPIX canvases (spaces) saved on
 your PC. **Your AI tool reads what KLYPIX has already read, and the files a saved canvas holds:**
@@ -844,7 +907,7 @@ your PC. **Your AI tool reads what KLYPIX has already read, and the files a save
   again.
 - Text that comes back from cards, pages, reels and files is fenced as data, never instructions.
 
-### App mode: your AI tool uses KLYPIX while it is open
+#### App mode: your AI tool uses KLYPIX while it is open
 
 On Windows, while the KLYPIX app is open and **Settings → Project → AI tools on this PC** is on (it is
 on by default), the same connection reaches the running app. KLYPIX then runs its own code for the
@@ -899,7 +962,7 @@ prove they hold the token before a request is sent; klypix-mcp sends nothing to 
 prove itself. The token and the pipe name are never logged, returned to the AI tool or shown by
 `brain_doctor`. Any program running under your Windows account can read the token.
 
-### Reading what is inside cards
+#### Reading what is inside cards
 
 A canvas saved by KLYPIX keeps a copy of every file dropped on it. `read_card_contents` hands those
 files to your AI tool as they are, so it reads them with its own model and its own file tools —
@@ -937,10 +1000,11 @@ Limits, and why:
   it while it runs), so it cannot be handed over from the saved canvas; the answer says so.
 - Cards inside a box locked from AI tools are never read, copied or attached.
 
-## Measure it yourself
+### Measure it yourself
 
 Claims about a shared brain — "nothing is lost", "it stays fast" — are unfalsifiable until a
-stranger can re-run them, so the benchmark ships in the box:
+stranger can re-run them, so the benchmark ships in the box
+([![bench](https://img.shields.io/badge/npx_klypix--mcp_bench-10_writers_%C2%B7_0_lost-475569?style=flat-square)](BENCHMARKS.md)):
 
 ```bash
 npx klypix-mcp bench            # ~25s, or --quick for a smaller run
@@ -965,7 +1029,7 @@ channel, a human copy-paste, `AGENTS.md` kept tidy or appended, and KLYPIX over 
 is printed with its sample size and interval; tools it has not measured are listed as not measured.
 `--dry-run` costs nothing and proves the graders.
 
-## Git and concurrency
+### Git and concurrency
 
 One file in your repo, committed with your code — versioned, branchable, portable. So two
 developers already share one brain the way they share code: clone, branch, pull.
@@ -1020,7 +1084,7 @@ rename, so a crash mid-write leaves the previous good file intact. The lock is a
 sustained contention can still lose an update. That is a deliberate trade — dropping the markers
 was judged worse — but it is a real limit, not a guarantee.
 
-### Restore points
+#### Restore points
 
 Merging, tidying and gardening are built to keep every card nobody deleted (one deliberate exception: a
 card deleted permanently also leaves the other copies of the brain when they sync, an edited copy
@@ -1057,9 +1121,32 @@ that cannot be written is logged and skipped — it never blocks your save.
 Normal canvases deliberately get none of this. One human made every mark and saw every change; the
 brain is the file where that is not true.
 
----
+### Whose is this? The git guard for a shared checkout
 
-## The command line
+Since 1.105.0, when several AI sessions share one checkout, the Claude Code hooks check git
+commands before they run:
+
+- A command that would sweep another **live** session's uncommitted work into your commit
+  (`git add -A`, `git commit -a`, or naming its file) is stopped. The message names that session
+  and gives the narrow command for your own files.
+- A command that would throw work away (`git reset --hard`, `git checkout -- <file>`,
+  `git stash`, `git clean`) saves a rescue copy first (`refs/klypix/rescue/*`), then asks you.
+  With no person to ask (bypass mode), it is refused. Restore a copy with
+  `npx klypix-mcp rescue restore <id>`; `npx klypix-mcp rescue list` shows them.
+- `git status` says which changed files belong to another session.
+- A **stopped** session's leftovers are not blocked. The agent is told it may finish and commit
+  them if it is continuing that work.
+
+Modes: `KLYPIX_WHOSE=enforce` (the default), `shadow` (warn and log only) or `off`, or
+`{"mode": ...}` in `~/.claude/project-brain/whose.json`. Codex edits are recorded so the guard
+knows whose they are.
+
+What it is not: it guards git commands run through Claude Code's tools, on one computer. It does
+not guard edits to files or work in other tools, and it does not prevent conflicts. In the
+coordination bench, a one-line careful instruction also kept the other session's work safe in 5 of
+5 "clean up" runs, as KLYPIX did.
+
+### The command line
 
 The MCP verbs below are what agents call. These are what **you** call:
 
@@ -1077,10 +1164,10 @@ The MCP verbs below are what agents call. These are what **you** call:
 | `npx klypix-mcp diff [ref]` | Card-level brain diff against a git ref, as markdown |
 | `npx klypix-mcp pr-brief [ref]` | Brain cards referencing the files changed since a ref, as markdown |
 | `npx klypix-mcp garden-code` | Print the human approval code `brain_garden` requires |
+| `npx klypix-mcp rescue` | Rescue copies the git guard saved before a discard: `list`, `show <id>`, `restore <id> [paths…]`, `prune` |
+| `npx klypix-mcp sessions` | This project's closed sessions and the notes waiting for them; `sessions reopen <id>` reopens one |
 
----
-
-## The verbs: 26, and 27 on Windows
+### The verbs: 26, and 27 on Windows
 
 | Tool | What it does |
 |---|---|
@@ -1129,7 +1216,7 @@ card itself. `brain_garden`, `brain_reconcile` and `brain_connect` always propos
 apply.
 `npx klypix-mcp doctor` gives one verdict and exits non-zero on drift, so it doubles as a CI gate.
 
-## One file you can hold
+### One file you can hold
 
 The whole brain — layout, cards, arrows, and the actual bytes (images, PDFs, audio, video) — is a
 single `.klypix` file: a plain ZIP with `manifest.json`, `canvas.json`, one JSON file per card, and
@@ -1163,7 +1250,7 @@ npx klypix-read node_modules/klypix-mcp/examples/showcase-brain.klypix
 Both are text-and-arrows only — 14 cards, 4 arrows, no `assets/` entry — so they demonstrate the
 card / container / connection model, not the embedded-binaries half of the format.
 
-## Use it as a library
+### Use it as a library
 
 ```js
 import { parseKlypix, buildKlypix, appendToKlypix, structToMarkdown } from 'klypix-mcp';
@@ -1175,7 +1262,7 @@ echo '{ "title": "Plan", "cards": [{ "text": "kickoff" }] }' \
   | npx -p klypix-mcp klypix-write --out plan.klypix
 ```
 
-## Also speaks A2A protocol v0.3.0 — experimental
+### Also speaks A2A protocol v0.3.0 — experimental
 
 ```bash
 npx -p klypix-mcp klypix-a2a --vault ./canvases     # 127.0.0.1:41241
@@ -1191,7 +1278,7 @@ agent that returns text, KLYPIX returns the `.klypix` board itself as a multimod
 Treat this as a preview: the adversarial A2A smoke test runs in the default `npm test` chain, but
 the server has not been exercised against a third-party A2A client.
 
-## Updates — the propagation contract
+### Updates — the propagation contract
 
 The MCP entry point is a stable stdio supervisor that keeps the host-owned connection open while a
 replaceable worker runs the brain core. A staged update is hash-verified, initialized in parallel,
@@ -1258,7 +1345,7 @@ re-index after a model/cache upgrade; cache writes are model-keyed and atomic ac
 agent sessions. Lexical-only installs download nothing. Set `KLYPIX_SEMANTIC_WARM_ON_UPDATE=0` to
 keep lazy first-use indexing instead.
 
-## Security and permissions
+### Security and permissions
 
 - **Apache-2.0, source public** at [github.com/dahshanlabs/klypix-mcp](https://github.com/dahshanlabs/klypix-mcp).
 - **The brain engine makes no network calls and sends no telemetry.** All engine intelligence is
@@ -1286,7 +1373,7 @@ keep lazy first-use indexing instead.
   needed, passes only encrypted traffic. Not installed, `KLYPIX_NETWORK=0`, or plugin mode: nothing
   runs.
 - **`install` writes to your home directory:** `~/.claude/project-brain` (engine + runtime),
-  `~/.claude/settings.json` (five hooks — written even if Claude Code is not installed),
+  `~/.claude/settings.json` (six hooks since 1.105.0 — written even if Claude Code is not installed),
   `~/.codex/AGENTS.md` (guidance block), and with `--codex-hooks`, `~/.codex/hooks.json`. It also
   writes `<cwd>/.codex/config.toml` **inside the project** you run it in, and removes any KLYPIX
   entry from the global `~/.codex/config.toml`. **`link` writes 14 files inside the project** you
@@ -1309,7 +1396,7 @@ keep lazy first-use indexing instead.
   is closed or its AI-tools switch is off; the client proves the app holds the per-start token before
   it sends a request, and never logs or returns the token or the pipe name.
 
-## Current limitations
+### Current limitations
 
 Read this section before you build on any of it.
 
@@ -1358,7 +1445,7 @@ Read this section before you build on any of it.
   verified identity: any program running as you can read the bridge token.
 - **`canvas_view`'s MCP Apps UI has never been verified on a real Apps host.**
 
-## Numbers and methodology
+### Numbers and methodology
 
 Every number here is measured on our own project brain. Nothing below is published, benchmarked or
 independently validated.
@@ -1384,7 +1471,7 @@ independently validated.
   keywords at half weight:
   recall@5 19% → 24% (5 found, none lost), recall@10 25% → 31%. Without the line, ranking is
   unchanged byte for byte.
-- **Second brain.** The same ranker on a different project's brain (1,601 cards, 19 hand-written
+- **A second project's brain.** The same ranker on a different project's brain (1,601 cards, 19 hand-written
   paraphrases, first cross-brain run): recall@5 **42%** (CI 23–64), top-1 11%, MRR 0.25. Paraphrase
   recall transfers between brains; the ranker is not tuned to the brain it was built on. It is
   simply weak on paraphrase everywhere — the embedder's ceiling, documented in `rankForQuestion`.
@@ -1410,7 +1497,7 @@ independently validated.
 - **The eval harness is not in this repo.** It lives in the private KLYPIX desktop repository. The
   numbers above are ours to defend, not yours to reproduce from here — treat them accordingly.
 
-## Uninstall
+### Uninstall
 
 ```bash
 npx klypix-mcp uninstall --check          # preview machine-global removal — writes nothing
@@ -1429,6 +1516,8 @@ in it) and this project's section from the Codex global file; the machine-global
 every live section there.
 
 Your `brain.klypix` is yours — it is a plain ZIP and stays readable with or without this package.
+
+---
 
 ## Contributing
 

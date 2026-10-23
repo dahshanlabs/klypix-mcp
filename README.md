@@ -56,8 +56,8 @@ You need **Node.js 20 or newer** (`node -v`).
   `brain_sync` in other hosts. A correction replaces the old decision, and the old card stays as
   history.
 - **A heads-up when work overlaps.** Each session says what it is doing and which files it expects
-  to touch. When two sessions name the same file, both are warned. KLYPIX warns; it never blocks an
-  edit. This works on one computer. With [KLYPIX network](https://klypix.com/network)
+  to touch. When two sessions name the same file, both are warned. For overlapping work KLYPIX
+  warns; it never blocks an edit. This works on one computer. With [KLYPIX network](https://klypix.com/network)
   installed on both computers (klypix-mcp 1.106.0 or later), it also lists sessions in the same
   project on a teammate's computer.
 - **Notes and handoffs between sessions.** An agent can leave a note for another session, even one
@@ -69,6 +69,11 @@ You need **Node.js 20 or newer** (`node -v`).
   git command that would sweep another live session's uncommitted work into your commit is stopped.
   A command that would throw work away saves a rescue copy first, then asks you. It covers git
   commands run through Claude Code's tools, on one computer.
+- **Lessons that stop the repeat mistake.** A lesson the brain recorded can become a project rule
+  that a person approves: a check of the diff, with no AI at check time. Claude Code is stopped
+  before it writes a forbidden line, Codex is warned, and an opt-in git hook stops the commit for
+  any tool or person. Every exception is recorded in the brain. Rules check the diff; they do not
+  run your tests.
 - **A file you own.** The brain is one `.klypix` file in your repo: a plain ZIP, versioned with
   Git. The engine is Apache-2.0, runs on your machine, and works without the KLYPIX app or an
   account. Brain data stays in your files; your agent's model provider still receives what the
@@ -88,7 +93,7 @@ has the details.
 | **Claude Desktop** | A one-time config entry | The KLYPIX app's Settings, or by hand |
 | **Claude, as a plugin** | One pinned version, keyword search, no hooks | [klypix-plugin](https://github.com/dahshanlabs/klypix-plugin) |
 
-klypix-mcp 1.106.0 has 26 MCP tools on Linux and macOS and 27 on Windows, where `show_in_klypix` is
+klypix-mcp has 27 MCP tools on Linux and macOS and 28 on Windows, where `show_in_klypix` is
 added. `npx klypix-mcp doctor` shows the count for your install.
 
 > **One project. Many agents. One current understanding.**
@@ -118,14 +123,15 @@ tool's official documentation and says that KLYPIX wrote it) · [klypix.com/klyp
 - **[Reference](#reference):** [How the brain works](#how-the-brain-works) ·
   [Supported hosts](#supported-hosts-and-their-integration-level) ·
   [Running as a Claude plugin](#running-as-a-claude-plugin) · [Task briefing](#task-briefing) ·
-  [Capture and corrections](#capture-and-corrections) · [Presence and task intent](#presence-and-task-intent) ·
+  [Capture and corrections](#capture-and-corrections) · [Project rules](#project-rules-lessons-that-stop-the-repeat) ·
+  [Presence and task intent](#presence-and-task-intent) ·
   [Overlap warnings](#overlap-warnings) ·
   [Teammates on other computers](#teammates-on-other-computers-klypix-network) ·
   [Handoffs and messages](#handoffs-and-messages) · [Evidence-gated completion](#evidence-gated-completion) ·
   [Human control in KLYPIX](#human-control-in-klypix) · [Measure it yourself](#measure-it-yourself) ·
   [Git and concurrency](#git-and-concurrency) ·
   [The git guard for a shared checkout](#whose-is-this-the-git-guard-for-a-shared-checkout) ·
-  [The command line](#the-command-line) · [The verbs](#the-verbs-26-and-27-on-windows) ·
+  [The command line](#the-command-line) · [The verbs](#the-verbs-27-and-28-on-windows) ·
   [One file you can hold](#one-file-you-can-hold) · [Use it as a library](#use-it-as-a-library) ·
   [A2A](#also-speaks-a2a-protocol-v030--experimental) ·
   [Updates](#updates--the-propagation-contract) · [Security and permissions](#security-and-permissions) ·
@@ -561,9 +567,9 @@ on cards, and, on a call that needs the running app, the app's bridge token (abo
 
 | Where | What | Why |
 |---|---|---|
-| Your project | Only what a tool call asks for: `brain.klypix` (`brain_note` and the other brain tools), canvases (`create_canvas`, `add_to_canvas`), `klypix-map/graph.json` when `project_map_scan` is called, and `.klypix/claims/<owner>.json` when `brain_sync` is asked to publish a release claim. During a brain write it holds `.claude/brain-capture.lock`, creating the `.claude/` folder if the project has none. The lock file is deleted after the write; the folder stays. Creating a canvas briefly holds `.klypix-create.lock` in the folder. | The KLYPIX app and every other session that writes the brain use the same locks, so two writers never overwrite each other. |
+| Your project | Only what a tool call asks for: `brain.klypix` (`brain_note` and the other brain tools), canvases (`create_canvas`, `add_to_canvas`), `klypix-map/graph.json` when `project_map_scan` is called, `.klypix/claims/<owner>.json` when `brain_sync` is asked to publish a release claim, and `.klypix/rules.json` when `brain_rules` adds, approves or retires a rule. Only when you run `npx klypix-mcp check --install-hook`: a marked block in `.git/hooks/pre-commit`, `pre-push` and `post-commit`; `npx klypix-mcp rules allow` keeps its one-hour exception in `.git/klypix-rules-allow.json`. During a brain write it holds `.claude/brain-capture.lock`, creating the `.claude/` folder if the project has none. The lock file is deleted after the write; the folder stays. Creating a canvas briefly holds `.klypix-create.lock` in the folder. | The KLYPIX app and every other session that writes the brain use the same locks, so two writers never overwrite each other. |
 | The plugin's data folder (`KLYPIX_PLUGIN_DATA`) | Connection receipts (`.supervisors/`), the running-server heartbeat (`.running-servers.json`), the list of projects whose brains you used (`registry.json`, which `search_all_brains` reads), and the last version and git tag seen in each project (`ship-observations/`). Also `extracted/`: copies of the PDFs, Office and other files `read_card_contents` hands to your AI tool as a local path, taken from the canvas you asked about. | Only this server uses these files. If `KLYPIX_PLUGIN_DATA` is not set, or still contains a `${...}` that was never filled in, it uses `CLAUDE_PLUGIN_DATA`. If neither is usable, the files go in `~/.claude/project-brain`, except `extracted/`, which then goes in `<system temp>/klypix-mcp/extracted` (where it always goes outside plugin mode). |
-| `~/.claude/project-brain` (shared) | Presence lanes (`sessions/`), write locks (`locks/`), restore points (`history/`), and small records built from your brain: `.capture-gap.json`, and `enrichment/`, `provenance/`, `.brief-cache-*` and `.guards-*` when the tools that use them run. | Your other KLYPIX sessions on this computer (Claude Code, Codex, Cursor, the app) use the same files on purpose. Through them, a plugin session and a terminal session on the same project see each other, get warnings when they plan to edit the same files, and pass notes. Restore points are kept here so that `npx klypix-mcp brain-history` can still undo a brain write after you remove the plugin. |
+| `~/.claude/project-brain` (shared) | Presence lanes (`sessions/`), write locks (`locks/`), restore points (`history/`), and small records built from your brain: `.capture-gap.json`, and `enrichment/`, `provenance/`, `.brief-cache-*` and `.guards-*` when the tools that use them run. `rules/` counts how often each project rule fired, blocked or was overridden on this computer. | Your other KLYPIX sessions on this computer (Claude Code, Codex, Cursor, the app) use the same files on purpose. Through them, a plugin session and a terminal session on the same project see each other, get warnings when they plan to edit the same files, and pass notes. Restore points are kept here so that `npx klypix-mcp brain-history` can still undo a brain write after you remove the plugin. |
 
 **`brain_reopen`.** Sometimes a session leaves a note for another session that has already closed.
 An agent can then call `brain_reopen`, and KLYPIX asks you first: in chat with *Reopen* and *Not
@@ -683,6 +689,25 @@ approaches tried and reversed, flagged when a different agent wrote them. Eviden
 only (explicit correction cues, opposite-polarity pairs), never mere topical similarity. Silence
 means no contradiction signal was found — not verified consistency. A memory that cannot disagree
 with you is flattery.
+
+### Project rules: lessons that stop the repeat
+
+Some lessons can be checked in a diff: *every new route must also be in the route list*, *admin
+tests must not import `@/…`*, *this file's line endings must not change*. `brain_rules` turns those
+lessons into rules in `.klypix/rules.json`, each citing the card it came from. A person approves
+each rule with a code only they can print (`npx klypix-mcp rules code promote <ids>`). Until then
+the rule is a candidate and checks nothing.
+
+An active rule runs in three places. `brain_sync` names the rules for a session's files. Claude
+Code's edit hook denies a forbidden line before it is written; Codex is warned, because its hooks
+cannot deny. The opt-in git hooks (`npx klypix-mcp check --install-hook`) stop a failing commit or
+push, for any tool or person. A check is glob, regex and line-ending work over the diff: it takes
+milliseconds, runs offline and uses no model. Overrides, bypasses and false alarms are recorded in
+the brain, and `npx klypix-mcp rules` shows each rule's blocks, overrides and false alarms.
+
+How to write, approve and retire rules: [docs/brain-rules.md](docs/brain-rules.md). What a backtest
+over the last 30 days of two real repositories found, with the cost of the CI runs involved:
+[docs/brain-checks-proof.md](docs/brain-checks-proof.md).
 
 ### Presence and task intent
 
@@ -1164,10 +1189,12 @@ The MCP verbs below are what agents call. These are what **you** call:
 | `npx klypix-mcp diff [ref]` | Card-level brain diff against a git ref, as markdown |
 | `npx klypix-mcp pr-brief [ref]` | Brain cards referencing the files changed since a ref, as markdown |
 | `npx klypix-mcp garden-code` | Print the human approval code `brain_garden` requires |
+| `npx klypix-mcp check` | Run this project's rules (`.klypix/rules.json`) on the working tree, `--staged`, or `--base <ref>`; `--install-hook` wires the opt-in pre-commit, pre-push and post-commit hooks |
+| `npx klypix-mcp rules` | The person's side of project rules: per-rule counts and suggestions, `code promote\|retire <ids>` (the approval code), `allow <id> --reason` (one hour), `false-alarm <id> --reason` |
 | `npx klypix-mcp rescue` | Rescue copies the git guard saved before a discard: `list`, `show <id>`, `restore <id> [paths…]`, `prune` |
 | `npx klypix-mcp sessions` | This project's closed sessions and the notes waiting for them; `sessions reopen <id>` reopens one |
 
-### The verbs: 26, and 27 on Windows
+### The verbs: 27, and 28 on Windows
 
 | Tool | What it does |
 |---|---|
@@ -1178,6 +1205,7 @@ The MCP verbs below are what agents call. These are what **you** call:
 | `brain_insights` | Hubs, orphaned decisions, stale questions, area sizes |
 | `brain_lens` | Machine-readable freshness, provenance, activity, timeline, orrery and unresolved views; on a canvas open in KLYPIX (Windows), the first five come from KLYPIX's own lens code |
 | `brain_garden` | Maintenance pass — proposes first; consolidation cannot apply without an approval code the human generates. The separate `repair:"duplicate-partials"` pass is dry-run first and needs no code (it removes only exact repeats and archives nothing) |
+| `brain_rules` | Project rules made from the brain's lessons: `propose` routes each lesson to rule, instruction or note; `add` writes candidates to `.klypix/rules.json`; `promote` and `retire` need the person's approval code; `check` runs the rules on a diff; `status` shows blocks, overrides, false alarms and retirement suggestions. No AI at check time ([docs/brain-rules.md](docs/brain-rules.md)) |
 | `brain_doctor` | Self-diagnosis: version, core/enhanced host adapters, active sessions, tool count, projection drift |
 | `brain_message` | Session-to-session coordination notes — to a live session, or queued for one that is not running until it next starts — with a fixed send-time audience and per-recipient pending / offer / acknowledgement / consumption / failure receipts (a directed note is kept 7 days, a broadcast 24h; never written into the brain) |
 | `brain_message_receipt` | Explicitly record model-side consumption using the exact message id and per-recipient offer token; acknowledgement alone never consumes a note |
@@ -1199,7 +1227,7 @@ The MCP verbs below are what agents call. These are what **you** call:
 | `add_to_canvas` | Append cards/connections (positions preserved), bordered and readable on KLYPIX's dark and Paper themes; a card's `group` puts it in that titled box. On a canvas open in KLYPIX (Windows) the cards go to KLYPIX itself: live, attributed, one undo. When KLYPIX cannot take them it refuses (`OPEN_IN_APP`, `ACCESS_OFF`, `BLOCKED`), a box locked from AI tools (`SCOPE_LOCKED`) or a frozen box (`FROZEN`), and writes nothing; project brains are the exception to the first. Returns the new card ids |
 | `list_canvases` | List every `.klypix` in the vault |
 
-Exactly 26 on Linux and macOS and 27 on Windows, where `show_in_klypix` is registered; machine-verifiable with `npx klypix-mcp doctor`, whose TOOLS line applies the same rule and whose App bridge line says whether KLYPIX is running, with access on or off.
+Exactly 27 on Linux and macOS and 28 on Windows, where `show_in_klypix` is registered; machine-verifiable with `npx klypix-mcp doctor`, whose TOOLS line applies the same rule and whose App bridge line says whether KLYPIX is running, with access on or off.
 
 > **`canvas_view`:** no MCP Apps host has been observed rendering the UI resource yet — there is no
 > screenshot and no host-level test. Hosts without the extension get clean text, which is the path
@@ -1413,6 +1441,10 @@ Read this section before you build on any of it.
   `src/auth/token.ts` does not match a rename. Folder overlap is advisory. The merge test sees
   committed work only, needs git 2.38 or newer, and runs only for sessions on different local
   branches of the same repository.
+- **Project rules check the diff, not behaviour.** They see file names, added lines, line endings
+  and paths; they do not run code or tests. Codex is warned, not stopped, while it edits (the
+  commit hook stops the commit), and the commit hooks are opt-in per clone. The approval code and
+  the refusal inside agent shells prevent accidents; they do not stop a deliberate workaround.
 - **Overlap warnings are advisory.** Nothing is blocked. One severity string in the payload reads
   `blocking`; the mechanism is not.
 - **Codex has no automatic capture**, with or without `--codex-hooks`. The Codex hook never writes

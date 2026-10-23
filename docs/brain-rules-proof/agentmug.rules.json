@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "rules": [
+    {
+      "id": "frontend-routes-registered",
+      "status": "active",
+      "kind": "listed-in",
+      "severity": "block",
+      "why": "Every new App.tsx route must also be listed in frontend-fallback.ts, or a direct link to it returns 404.",
+      "fix": "Add \"{1}\" to PRIVATE_ROUTES (or PUBLIC_ROUTES) in {registry}.",
+      "source": { "card": "txt_w4fbw7m1" },
+      "files": ["artifacts/agentforge/src/App.tsx"],
+      "when": "added-lines",
+      "pattern": "<Route path=\"(/[^\"*:]*)\"",
+      "registry": ["artifacts/api-server/src/middlewares/frontend-fallback.ts"],
+      "needle": "\"{1}\""
+    },
+    {
+      "id": "runner-impacting-paths",
+      "status": "active",
+      "kind": "cloud-required",
+      "severity": "advise",
+      "why": "Runner-impacting changes fire the runner image build and the full desktop matrix (macOS and Windows), the expensive CI.",
+      "fix": "Keep fixes clean of these paths when you can; amend locally and push once.",
+      "source": { "card": "txt_k0y07qny" },
+      "files": ["artifacts/runtime/**", "artifacts/runner/**", "pnpm-lock.yaml", "pnpm-workspace.yaml", ".github/workflows/**"]
+    }
+  ]
+}

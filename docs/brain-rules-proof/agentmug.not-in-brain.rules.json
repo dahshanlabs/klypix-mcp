@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 1,
+  "rules": [
+    {
+      "id": "api-tests-enumerated",
+      "status": "active",
+      "kind": "listed-in",
+      "severity": "block",
+      "why": "api-server test files are enumerated in its package.json; a new test not listed there never runs in CI (lesson recorded only in a session memory note).",
+      "fix": "Add {relpath} to the matching test:* script in artifacts/api-server/package.json.",
+      "source": {
+        "card": "memory-marketplace-moderation-pr630"
+      },
+      "files": [
+        "artifacts/api-server/src/**/*.test.ts"
+      ],
+      "exclude": [
+        "**/*-postgres.test.ts"
+      ],
+      "when": "added-files",
+      "registry": [
+        "artifacts/api-server/package.json"
+      ],
+      "needle": "{relpath}",
+      "base": "artifacts/api-server"
+    },
+    {
+      "id": "managed-run-worker-eol",
+      "status": "active",
+      "kind": "preserve-eol",
+      "severity": "block",
+      "why": "managed-run-worker.ts is mixed CRLF/LF and a test pins one LF line; a Windows edit flattens it and CI fails (lesson recorded only in a session memory note).",
+      "fix": "Restore main's line endings in {file} line by line (keep CRLF only on inserted lines).",
+      "source": {
+        "card": "memory-mixed-eol-files-pinned-by-tests"
+      },
+      "files": [
+        "artifacts/api-server/src/lib/managed-run-worker.ts"
+      ]
+    },
+    {
+      "id": "postgres-tests-enumerated",
+      "status": "active",
+      "kind": "listed-in",
+      "severity": "block",
+      "why": "Postgres integration tests run only from the explicit list in .github/workflows/ci.yml; a new one not listed there never runs (lesson recorded only in a session memory note).",
+      "fix": "Add {relpath} to the matching postgres test step in .github/workflows/ci.yml.",
+      "source": {
+        "card": "memory-marketplace-moderation-pr630"
+      },
+      "files": [
+        "artifacts/api-server/src/**/*-postgres.test.ts"
+      ],
+      "when": "added-files",
+      "registry": [
+        ".github/workflows/ci.yml"
+      ],
+      "needle": "{relpath}",
+      "base": "artifacts/api-server"
+    }
+  ]
+}

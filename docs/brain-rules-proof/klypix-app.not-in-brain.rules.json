@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "rules": [
+    {
+      "id": "no-background-throttling-false",
+      "status": "active",
+      "kind": "forbid-pattern",
+      "severity": "block",
+      "why": "backgroundThrottling: false breaks on-screen insight visibility detection (CLAUDE.md hard constraint; not a brain card).",
+      "fix": "Remove backgroundThrottling: false.",
+      "source": { "card": "claude-md-hard-constraints" },
+      "files": ["electron/**/*.ts", "src/**/*.ts", "src/**/*.tsx"],
+      "pattern": "backgroundThrottling\\s*:\\s*false"
+    },
+    {
+      "id": "pdfjs-worker-mjs",
+      "status": "active",
+      "kind": "forbid-pattern",
+      "severity": "block",
+      "why": "pdfjs-dist 6 ships only build/pdf.worker.min.mjs; the .js worker path breaks PDF rendering (CLAUDE.md hard constraint; not a brain card).",
+      "fix": "Use pdfjs-dist/build/pdf.worker.min.mjs?url.",
+      "source": { "card": "claude-md-hard-constraints" },
+      "files": ["src/**/*.ts", "src/**/*.tsx"],
+      "pattern": "pdf\\.worker(?:\\.min)?\\.js\\?url"
+    },
+    {
+      "id": "no-window-prompt",
+      "status": "active",
+      "kind": "forbid-pattern",
+      "severity": "block",
+      "why": "window.prompt is disabled in the Electron renderer (CLAUDE.md hard constraint; not a brain card).",
+      "fix": "Use src/canvas/interaction/InlinePrompt.tsx for text input.",
+      "source": { "card": "claude-md-hard-constraints" },
+      "files": ["src/**/*.ts", "src/**/*.tsx"],
+      "pattern": "window\\.prompt\\("
+    }
+  ]
+}

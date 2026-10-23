@@ -1,0 +1,7 @@
+{
+  "_about": "Ground truth for the backtest: text a failed CI job log contains only when the mistake a rule targets broke the run. A rule with no entry is one whose mistake does not fail CI (a test that never runs, a file the installer never copies); it is judged by what reached the default branch instead.",
+  "frontend-routes-registered": ["Missing direct-link route"],
+  "managed-run-worker-eol": ["(?:not ok|✖)[^\\n]{0,40}P6 review N3"],
+  "admin-tests-relative-imports": ["Cannot find package '@/", "Failed to resolve import [\"']@/"],
+  "pdfjs-worker-mjs": ["pdfjs-dist/build/pdf\\.worker(?:\\.min)?\\.js(?![a-z])"]
+}

@@ -6298,6 +6298,37 @@ function emitWhose(r) {
     try { fs.writeSync(1, JSON.stringify(out)); } catch { /* stdout gone */ }
 }
 
+// Project rules (.klypix/rules.json, made from this brain's lessons — see
+// brain-rules.mjs). Fast path: one stat when the project has no rules file; the
+// engine is imported only for an Edit/Write/MultiEdit in a project that has one.
+// Never throws: a failure here must never break a tool call.
+const RULES_FILE_HERE = path.join(CWD, '.klypix', 'rules.json');
+async function rulesBeforeEdit() {
+    try {
+        const input = readHookInput();
+        const tool = String(input.tool_name || '');
+        if (!/^(Edit|Write|MultiEdit)$/.test(tool) || !fs.existsSync(RULES_FILE_HERE)) return null;
+        const lib = await import(new URL('./brain-rules.mjs', import.meta.url).href);
+        if (typeof lib.preToolUseDecision !== 'function') return null;
+        return lib.preToolUseDecision(CWD, tool, input.tool_input, { sessionId: String(input.session_id || ''), host: 'claude-code' });
+    } catch { return null; }
+}
+async function rulesAfterEdit() {
+    try {
+        const input = readHookInput();
+        const tool = String(input.tool_name || '');
+        if (!/^(Edit|Write|MultiEdit)$/.test(tool) || !fs.existsSync(RULES_FILE_HERE)) return;
+        const lib = await import(new URL('./brain-rules.mjs', import.meta.url).href);
+        if (typeof lib.postToolUseDecision !== 'function') return;
+        const r = lib.postToolUseDecision(CWD, tool, input.tool_input, { sessionId: String(input.session_id || ''), host: 'claude-code' });
+        if (!r) return;
+        const out = r.block
+            ? { decision: 'block', reason: r.block }
+            : { hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: r.context } };
+        try { fs.writeSync(1, JSON.stringify(out)); } catch { /* stdout gone */ }
+    } catch { /* never break a tool call */ }
+}
+
 // --end (SessionEnd, 1.105.0): the session is over — remove its live rows and
 // tombstone it through the engine's own endSession (the same call Codex's
 // SessionEnd makes), so peers stop reading a dead session as working. Walks up
@@ -6323,17 +6354,31 @@ async function main() {
     // --live (PostToolUse) is the cheapest mode: pure payload string-work + at most
     // one tiny locked append. It must NOT pay the lazy klypix-format import, so it
     // runs BEFORE everything else and returns. (Fires on Bash|PowerShell|Edit|Write.)
-    if (process.argv.includes('--live')) { liveCapture(); return; }
+    if (process.argv.includes('--live')) { await rulesAfterEdit(); liveCapture(); return; }
     // --guard (PreToolUse) is the second fast path: stat + sidecar read on the
     // common case; it lazy-imports the lib itself only when a compiled guard's
     // tool pattern could match this call. Runs before the unconditional import.
     if (process.argv.includes('--guard')) {
-        // A brain guard card's own decision wins; Whose context rides only when it said nothing.
-        let wrote = false;
+        // Order: a brain guard card's deny → a project rule's deny (.klypix/rules.json)
+        // → their merged context → Whose context only when both said nothing.
+        let guardOut = '';
         const orig = process.stdout.write.bind(process.stdout);
-        process.stdout.write = (...a) => { wrote = true; return orig(...a); };
+        process.stdout.write = (chunk) => { guardOut += String(chunk); return true; };
         try { await guardCheck(); } finally { process.stdout.write = orig; }
-        if (!wrote && whose) emitWhose(whose);
+        let guardPayload = null;
+        try { guardPayload = guardOut ? JSON.parse(guardOut) : null; } catch { guardPayload = null; }
+        if (guardOut && (!guardPayload || guardPayload.hookSpecificOutput?.permissionDecision === 'deny')) { orig(guardOut); return; }
+        const rules = await rulesBeforeEdit();
+        if (rules && rules.deny) {
+            orig(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: rules.deny } }));
+            return;
+        }
+        const contexts = [guardPayload?.hookSpecificOutput?.additionalContext, rules?.context].filter(Boolean);
+        if (contexts.length) {
+            orig(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', additionalContext: contexts.join('\n\n') } }));
+            return;
+        }
+        if (whose) emitWhose(whose);
         return;
     }
     const lib = await import('./klypix-format.mjs');    // lazy: only when a brain exists

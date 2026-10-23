@@ -349,7 +349,9 @@ const flatten = (code) => code
     // app bridge, which imports the protocol.
     // session-handoff (1.99.1): the worker's brain_sync imports CONTINUE_RE and
     // formatHandoffCards from it directly (1.99.0 only reached it via core).
-    .replace(/\.\.\/src\/(bench|brain-doctor|agent-presence|agent-rules|capture-gap|enrichment|finding-routing|mcp-presence|mcp-supervisor|mcp-auto-update|presence-relay|repo-state|semantic-memory|runtime-inspector|project-graph|git-capture-install|app-lease|app-tools|app-bridge-protocol|app-bridge-client|session-handoff)\.mjs/g, './$1.mjs')
+    // brain-rules (project rules): the worker's brain_rules tool and the
+    // dispatcher's `check` / `rules` verbs import it lazily.
+    .replace(/\.\.\/src\/(bench|brain-doctor|agent-presence|agent-rules|capture-gap|enrichment|finding-routing|mcp-presence|mcp-supervisor|mcp-auto-update|presence-relay|repo-state|semantic-memory|runtime-inspector|project-graph|git-capture-install|app-lease|app-tools|app-bridge-protocol|app-bridge-client|session-handoff|brain-rules)\.mjs/g, './$1.mjs')
     .replace(/klypix-worker\.mjs/g, 'klypix-mcp-worker.mjs')
     .replace(/const PKG_VERSION = \(\(\) => \{[\s\S]*?\}\)\(\);/, `const PKG_VERSION = '${VERSION}'; // baked at install (flat layout has no package.json)`);
 
@@ -495,7 +497,7 @@ try {
     // a newer klypix-format cannot. merge-brains and the driver ship here so
     // brain-history's restore merge, the KLYPIX core and the git driver all
     // find one engine in this directory.
-    for (const f of ['global-brain-hook.mjs', 'klypix-format.mjs', 'brain-graveyard.mjs', 'merge-brains.mjs', 'klypix-merge-driver.mjs', 'capture-gap.mjs', 'brain-semantic.mjs', 'semantic-memory.mjs', 'enrichment.mjs', 'provenance.mjs', 'brain-note.mjs', 'brain-evidence.mjs', 'brain-git-hook.mjs', 'git-capture-install.mjs', 'brain-history.mjs', 'app-lease.mjs', 'klypix-core.mjs', 'app-bridge-protocol.mjs', 'app-bridge-client.mjs', 'app-tools.mjs', 'card-files.mjs', 'brain-write-lock.mjs', 'agent-rules.mjs', 'brain-doctor.mjs', 'editor-detect.mjs', 'agent-presence.mjs', 'mcp-presence.mjs', 'repo-state.mjs', 'result-reconcile.mjs', 'finding-routing.mjs', 'presence-relay.mjs', 'network-bridge.mjs', 'mcp-supervisor.mjs', 'mcp-auto-update.mjs', 'runtime-inspector.mjs', 'project-graph.mjs', 'bench.mjs', 'codex-brain-hook.mjs', 'codex-hooks.mjs', 'session-handoff.mjs', 'live-projection.mjs', 'whose.mjs', 'whose-classify.mjs', 'whose-ledger.mjs', 'whose-rescue.mjs', 'canvas-view-app.html']) {
+    for (const f of ['global-brain-hook.mjs', 'klypix-format.mjs', 'brain-graveyard.mjs', 'merge-brains.mjs', 'klypix-merge-driver.mjs', 'capture-gap.mjs', 'brain-semantic.mjs', 'semantic-memory.mjs', 'enrichment.mjs', 'provenance.mjs', 'brain-note.mjs', 'brain-evidence.mjs', 'brain-git-hook.mjs', 'git-capture-install.mjs', 'brain-history.mjs', 'app-lease.mjs', 'klypix-core.mjs', 'app-bridge-protocol.mjs', 'app-bridge-client.mjs', 'app-tools.mjs', 'card-files.mjs', 'brain-write-lock.mjs', 'brain-rules.mjs', 'agent-rules.mjs', 'brain-doctor.mjs', 'editor-detect.mjs', 'agent-presence.mjs', 'mcp-presence.mjs', 'repo-state.mjs', 'result-reconcile.mjs', 'finding-routing.mjs', 'presence-relay.mjs', 'network-bridge.mjs', 'mcp-supervisor.mjs', 'mcp-auto-update.mjs', 'runtime-inspector.mjs', 'project-graph.mjs', 'bench.mjs', 'codex-brain-hook.mjs', 'codex-hooks.mjs', 'session-handoff.mjs', 'live-projection.mjs', 'whose.mjs', 'whose-classify.mjs', 'whose-ledger.mjs', 'whose-rescue.mjs', 'canvas-view-app.html']) {
         const s = path.join(SRC, f); if (exists(s)) staged.push({ dst: f, content: fs.readFileSync(s, 'utf8') });
     }
     for (const [src, dst] of [
@@ -572,7 +574,9 @@ try {
         // Guard cards (2026-08-24): pre-action lane. Fast path — reads only the
         // compiled guard sidecar; 'warn' injects context, 'block' denies with
         // the card's message. Absent guards = stat + one tiny read, then no-op.
-        ['PreToolUse', { matcher: 'Bash|PowerShell|Edit|Write', hooks: [{ type: 'command', command: brainCmd('--guard'), timeout: 10 }] }],
+        // Project rules (.klypix/rules.json) ride the same lane for edits: a
+        // forbidden line is denied before it is written (MultiEdit included).
+        ['PreToolUse', { matcher: 'Bash|PowerShell|Edit|Write|MultiEdit', hooks: [{ type: 'command', command: brainCmd('--guard'), timeout: 10 }] }],
         // Session end (1.105.0): a closed or cut-off Claude Code session leaves
         // the lane at once. Before this, only the 10-minute TTL removed it, so the
         // next session read a dead peer as "live" and refused to continue its

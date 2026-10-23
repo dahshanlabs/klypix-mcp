@@ -111,7 +111,7 @@
     "fractional-indexing": "^3.2.0",
     "jpeg-js": "^0.4.4",
     "jszip": "^3.10.1",
-    "zod": "^4.3.6"
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@huggingface/transformers": "^4.2.0"

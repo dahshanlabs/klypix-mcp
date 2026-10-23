@@ -645,7 +645,7 @@ const RENAME_RETRYABLE_CODES = new Set(['EPERM', 'EBUSY', 'EACCES']);
 const RENAME_BACKOFF_MS = [40, 120, 300, 700, 1500];
 
 // ── Marker suffix grammar ─── MIRROR BEGIN ──────────────────────────────────
-// ONE grammar for the optional `closes:` / `ev:` / `verify:` / `q:` suffixes on
+// ONE grammar for the optional `closes:` / `ev:` / `verify:` / `q:` / `rule:` suffixes on
 // a `🧠 BRAIN` marker line. This block is byte-identical in
 // global-brain-hook.mjs (which parses markers) and klypix-format.mjs (whose
 // parseVerifySuffix reads a `verify:` still sitting in card prose), and
@@ -677,7 +677,8 @@ const RENAME_BACKOFF_MS = [40, 120, 300, 700, 1500];
 //     no prose connectives outside quotes; `q:` a question (a question word,
 //     or a preposition + which/what, first; `?` or `؟` last); `closes:` any
 //     title — capture puts a `closes:` that names no live card back into the
-//     card text;
+//     card text; `rule:` a rule-ready lesson: repo globs, then `never "…"`,
+//     `never /re/`, `must "…"`, `listed-in <file>[,…]`, `keep-eol` or `costly`;
 //   • a dangling key at the very end ("shipped X ev:") is dropped; a repeated
 //     ev: joins its references.
 // A run whose FIRST segment breaks a rule is not a suffix run: parsing moves on
@@ -694,7 +695,7 @@ const RENAME_BACKOFF_MS = [40, 120, 300, 700, 1500];
 // ("The resolver now treats closes: targets as exact titles ev: src/x.mjs"
 // is still prose), and capture only lets an UNanchored one close a card it
 // names by title.
-const MARKER_SUFFIX_KEYS = ['closes', 'ev', 'verify', 'q'];
+const MARKER_SUFFIX_KEYS = ['closes', 'ev', 'verify', 'q', 'rule'];
 const MARKER_SUFFIX_KEY_RE = new RegExp(`(?<=\\s)(${MARKER_SUFFIX_KEYS.join('|')}|Closes):`, 'g');
 const MARKER_SUFFIX_OPEN_WORDS = new Set([
     'a', 'an', 'the', 'this', 'that', 'these', 'those', 'its', 'their', 'our', 'my', 'your', 'every', 'each', 'any', 'some', 'no', 'not',
@@ -731,6 +732,9 @@ const MARKER_SUFFIX_DIRECTION = /[\u200E\u200F\u061C\u202A-\u202E\u2066-\u2069]/
 const MARKER_SUFFIX_BOUNDARY = /[.!?;)\]✓✅…—–؛؟]$/u;
 const MARKER_SUFFIX_BARE_FILES = /^(?:Makefile|Dockerfile|Procfile|Gemfile|Rakefile|Jenkinsfile|Vagrantfile|Brewfile|Justfile|LICENSE|README|NOTICE|CHANGELOG|CODEOWNERS|AUTHORS|COPYING)$/;
 const MARKER_SUFFIX_WIKILINK = /^\[\[[^\][]+\]\][.,;!]?$/;
+// rule: <glob>[,<glob>] then one check. A glob is a path, a glob or a file
+// name (a slash, a *, or an extension); anything else is prose.
+const MARKER_SUFFIX_RULE = /^([^\s,]+(?:\s*,\s*[^\s,]+)*)\s+(never\s+(?:"[^"]+"|\/(?:\\.|[^/\\])+\/[a-z]*)|must\s+"[^"]+"|listed-in\s+[^\s,]+(?:\s*,\s*[^\s,]+)*|keep-eol|costly)$/;
 // Case matters only where it disambiguates: a single capital letter ("option
 // A") and the month "May" end a clause; any other Titlecase word counts as its
 // lowercase form, so "Always verify:" is as open as "always verify:".
@@ -762,9 +766,14 @@ function markerSuffixCommandOk(value) {
     if (/^[a-z][a-z0-9]*(?:-[a-z0-9]+)+$/.test(head)) return true;             // probe name: npm-version, gh-release
     return /^[a-z][\w.-]*$/.test(head) && /\s--?[A-Za-z]/.test(value);         // any tool given a --flag
 }
+function markerSuffixRuleOk(value) {
+    const m = MARKER_SUFFIX_RULE.exec(value);
+    return Boolean(m) && m[1].split(/\s*,\s*/).every((g) => /[/*]|\.[A-Za-z0-9]{1,6}$/.test(g) && !/^[a-z]+:\/\//i.test(g));
+}
 function markerSuffixValueOk(key, value) {
     if (!value) return false;
     if (key === 'closes') return true;
+    if (key === 'rule') return markerSuffixRuleOk(value);
     if (key === 'ev') {
         const items = value.split(/[,،]/).filter((item) => item.trim());
         return items.length > 0 && items.every(markerSuffixRefOk);
@@ -773,13 +782,13 @@ function markerSuffixValueOk(key, value) {
     const question = value.replace(MARKER_SUFFIX_INVISIBLE, '').replace(/^[`'"“‘(]+/, '').trim();
     return MARKER_SUFFIX_QUESTION_LEAD.test(question) && /[?？؟][`'"”’)]*$/.test(question);
 }
-// → { body, closes, ev, verify, q, kept, closesAnchored, bodyWithCloses }.
+// → { body, closes, ev, verify, q, rule, kept, closesAnchored, bodyWithCloses }.
 // Strings are '' when absent. `body` is the card text (with any `kept` segment
 // folded back in); `bodyWithCloses` is the same text with the closes: segment
 // left where it was written — what lands when the closes: acts on nothing.
 function parseMarkerSuffixText(line) {
     const text = String(line || '');
-    const none = { body: text.trim(), closes: '', ev: '', verify: '', q: '', kept: '', closesAnchored: false, bodyWithCloses: text.trim() };
+    const none = { body: text.trim(), closes: '', ev: '', verify: '', q: '', rule: '', kept: '', closesAnchored: false, bodyWithCloses: text.trim() };
     const keys = [];
     for (const m of text.matchAll(MARKER_SUFFIX_KEY_RE)) {
         const from = m.index + m[0].length;
@@ -798,7 +807,7 @@ function parseMarkerSuffixText(line) {
         const lastWord = /(\S+)$/.exec(body)[1];
         if (lastWord.endsWith(':') || markerSuffixWordIn(MARKER_SUFFIX_OPEN_WORDS, lastWord)) continue;
         if (markerSuffixWordIn(MARKER_SUFFIX_SOFT_WORDS, lastWord) && !(keys[start].key === 'ev' && markerSuffixValueOk('ev', valueOf(start)))) continue;
-        const found = { closes: '', ev: [], verify: '', q: '' };
+        const found = { closes: '', ev: [], verify: '', q: '', rule: '' };
         let closesSegment = '', failAt = -1, anchored = false;
         for (let k = start; k < keys.length; k++) {
             const { key } = keys[k];
@@ -819,6 +828,7 @@ function parseMarkerSuffixText(line) {
             ev: found.ev.join(', '),
             verify: found.verify,
             q: found.q.replace(MARKER_SUFFIX_DIRECTION, '').trim(),
+            rule: found.rule,
             kept,
             closesAnchored: Boolean(found.closes) && (keys[start].key !== 'closes' || MARKER_SUFFIX_WIKILINK.test(found.closes) || MARKER_SUFFIX_BOUNDARY.test(body)),
             bodyWithCloses: closesSegment ? [body, closesSegment, kept].filter(Boolean).join(' ') : cardBody,
@@ -1061,6 +1071,10 @@ export async function parseKlypix(buffer) {
             // Guard trigger (guard cards, 2026-08-24) — additive machine field;
             // exposed so compileGuards can read it off the parsed struct.
             ...(it.guard && typeof it.guard === 'object' ? { guard: it.guard } : {}),
+            // Rule-ready lesson (1.107): read off the card's visible
+            // `⚙ rule candidate:` line (the text is the store, so every writer,
+            // merge and app edit carries it). A candidate only — never active.
+            ...(it.type === 'text' && String(it.content || '').includes(RULE_CANDIDATE_PREFIX) ? (() => { const d = parseRuleCandidate(it.content); return d ? { ruleDraft: d } : {}; })() : {}),
             // Session handoff state (1.99.0) — additive machine field stamped by
             // brain_handoff (from / taken / done); the 🤝 line-1 glyph is the
             // prose twin every reader can see.
@@ -1924,26 +1938,271 @@ function brainCPL() { return Math.max(8, Math.floor((BRAIN_GEOM.CARD_W - 24) / (
 // cards show a long SINGLE line as-typed (no auto-wrap until you resize), so a
 // captured decision with no newlines runs off the box. Baking in line breaks
 // makes brain cards render as tidy multi-line blocks regardless of that.
+// The visible line a rule-ready lesson carries (the `rule:` marker suffix and
+// brain_note's `rule` field write it). It is a CANDIDATE only: nothing checks
+// it until brain_rules adds it and a person approves it.
+export const RULE_CANDIDATE_PREFIX = '⚙ rule candidate:';
+
+// A token longer than a line (a path, a URL) stays WHOLE on its own line: the
+// bordered card wraps it visually (pre-wrap + break-word), and cutting it with a
+// "\n" split real paths ("…/managed-\nrun-worker.ts") so no reader could match
+// them (1.107, after a two-brain study found cut paths in hundreds of cards).
+// A `⚙ rule candidate:` line is never wrapped: it is parsed back as one line.
 function wrapText(text, cpl = brainCPL()) {
     const out = [];
     for (const para of String(text ?? '').split('\n')) {
-        if (para.length <= cpl) { out.push(para); continue; }
+        if (para.length <= cpl || para.startsWith(RULE_CANDIDATE_PREFIX)) { out.push(para); continue; }
         let line = '';
         for (const tok of para.split(/(\s+)/)) {
             if (line && (line + tok).trimEnd().length > cpl) { out.push(line.trimEnd()); line = tok.replace(/^\s+/, ''); }
             else line += tok;
-            while (line.length > cpl) { out.push(line.slice(0, cpl)); line = line.slice(cpl); } // break an over-long word
         }
         if (line.trim()) out.push(line.trimEnd());
     }
     return out.join('\n');
 }
 
+// Cards written before 1.107 carry forced breaks: a line of exactly the card's
+// width with no whitespace, then the rest of the same token on the next line.
+// Readers that MATCH text or resolve paths rejoin them; the stored text is
+// left as written. A real 37-character word that happened to end a line is
+// joined to the next word too — harmless for matching, never written back —
+// but never to a tag line or a lifecycle line, which start a block of their own.
+const UNWRAP_BLOCK_START = /^(?:\s*(?:#[\p{L}\p{N}_-]+\s*)+$|✔|✅|↩|⤵|\(re-affirmed|\(~ amended|⚙ rule candidate:)/u;
+export function unwrapCardText(text, cpl = brainCPL()) {
+    const out = [];
+    let joinNext = false;
+    for (const line of String(text ?? '').split('\n')) {
+        if (joinNext && line && !/^\s/.test(line) && !UNWRAP_BLOCK_START.test(line)) out[out.length - 1] += line;
+        else out.push(line);
+        joinNext = line.length === cpl && !/\s/.test(line);
+    }
+    return out.join('\n');
+}
+
+// ── Lessons for the files a task touches (1.107) ────────────────────────────
+// brain_sync used to turn declared files into WORDS only, so a lesson naming
+// `admin/tests/network*.test.ts` ranked 58th for a session that declared
+// admin/tests/networkInvite.test.ts. This reads the paths a lesson names — a
+// full path, a bare file name, a glob or placeholder (`../src/<module>.mjs`,
+// `X.mjs`), a folder, the globs of its own `⚙ rule candidate:` line, its
+// #file-/#dir- tags — and ranks lessons by how closely they name a declared
+// file: exact path > file name > glob > folder (or a sibling file) > tag.
+// Pure: no fs, no git. Callers pass a Map as `cache` to keep per-card parsing
+// across calls.
+const LESSON_FILE_EXT = /\.(?:[cm]?[jt]sx?|json5?|ya?ml|mdx?|css|scss|less|html?|py|rs|go|java|kts?|swift|sh|ps1|bat|cmd|toml|lock|sql|xml|gradle|cs|cpp|cc|c|h|hpp|rb|php|vue|svelte|klypix|plist|txt|ini|cfg|conf|proto|graphql|prisma|nsh)$/i;
+const LESSON_GENERIC_DIRS = new Set(['src', 'app', 'lib', 'components', 'component', 'scripts', 'public', 'test', 'tests', 'electron', 'docs', 'bin', 'packages', 'admin', 'artifacts', 'api', 'server', 'client', 'web', 'tmp']);
+const LESSON_TIERS = { exact: 5, name: 4, glob: 3, folder: 2, tag: 1 };
+const LESSON_STOCK_NAMES = /^(?:page|layout|route|loading|error|template|default|index|mod|lib|__init__|types|utils|helpers|constants|styles|config)\.[a-z0-9]+$/i;
+const LESSON_SHAPED_RE = /\b(?:must|never|always|do not|don't|avoid|gotcha|otherwise)\b|WHY THIS MATTERS/i;
+const lessonSlug = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+const lessonRoot = (id) => String(id || '').replace(/(__agconf_[a-z0-9]+)+$/i, '');
+function lessonGlobRe(glob) {
+    const esc = (s) => s.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+    let re = '';
+    for (let i = 0; i < glob.length; i++) {
+        const ch = glob[i];
+        if (ch === '*') {
+            if (glob[i + 1] === '*') { re += '.*'; i++; if (glob[i + 1] === '/') i++; } else re += '[^/]*';
+        } else if (ch === '?') re += '[^/]';
+        else if (ch === '{' && glob.indexOf('}', i) > i) {
+            const j = glob.indexOf('}', i);
+            re += `(?:${glob.slice(i + 1, j).split(',').map(esc).join('|')})`;
+            i = j;
+        } else re += esc(ch);
+    }
+    try { return new RegExp(`^${re}$`, 'i'); } catch { return null; }
+}
+// One token of prose → a path mention, or null.
+function lessonPathOf(raw) {
+    let t = String(raw || '').replace(/^[`'"([]+/, '').replace(/[`'")\],;:!?]+$/, '').replace(/\.+$/, '');
+    if (!t || t.length > 200 || t.includes('://') || t.startsWith('@') || t.startsWith('#') || !/^[\w@.*{}<>\-/]+$/.test(t)) return null;
+    t = t.replace(/^(?:\.\.?\/)+/, '').replace(/\/+$/, '');
+    // Placeholders a lesson writes for "any module": <name>, X.mjs → *.
+    t = t.split('/').map((seg) => seg.replace(/<[^>]+>/g, '*').replace(/^[A-Z](\.[A-Za-z0-9]+)$/, '*$1')).join('/');
+    if (/[<>]/.test(t) || !/[A-Za-z]/.test(t)) return null;
+    const segs = t.split('/');
+    const glob = /[*?{]/.test(t);
+    if (!t.includes('/')) {
+        if (!LESSON_FILE_EXT.test(t)) return null;
+        return { kind: glob ? 'glob' : 'name', value: t.toLowerCase(), shown: t };
+    }
+    if (segs.some((s) => !s) || segs.every((s) => s.length < 3)) return null;
+    if (glob) return { kind: 'glob', value: t.toLowerCase(), shown: t };
+    return { kind: LESSON_FILE_EXT.test(t) ? 'path' : 'folder', value: t.toLowerCase(), shown: t };
+}
+function lessonEntry(card, cache) {
+    const key = `${card.id}|${String(card.text || '').length}|${card.editedAt || card.createdAt || 0}`;
+    if (cache && cache.has(key)) return cache.get(key);
+    const text = String(card.text || '');
+    let eligible = card.type !== 'container' && !/^archive$/i.test(card.area || '')
+        && !/❓/.test(text.slice(0, 80)) && !/^\s*(?:[^:\n]{1,40}:\s*)?(?:✅|↩)/.test(text);
+    const ruleLine = text.split('\n').find((l) => l.startsWith(RULE_CANDIDATE_PREFIX)) || '';
+    if (eligible) eligible = Boolean(ruleLine) || Boolean(card.guard) || isSkillCard(card) || LESSON_SHAPED_RE.test(text);
+    const flatText = unwrapCardText(text).replace(/\s+/g, ' ');
+    // A 🛠️ lesson is one that OPENS with the glyph ("Area: 🛠️ …"); a milestone
+    // that quotes a skill further down is still a milestone.
+    const strength = ruleLine || card.guard ? 3 : /🛠/.test(flatText.slice(0, 60)) ? 2 : 1;
+    const mentions = [];
+    if (eligible) {
+        const seen = new Set();
+        const add = (m, weak) => { if (m && !seen.has(`${m.kind}|${m.value}`)) { seen.add(`${m.kind}|${m.value}`); mentions.push({ ...m, weak }); } };
+        if (ruleLine) for (const g of ruleLine.slice(RULE_CANDIDATE_PREFIX.length).trim().split(/\s+/)[0].split(',')) add(lessonPathOf(g), false);
+        // A 🛠️ lesson (or a rule candidate) is a lesson about every path it
+        // names. Any other card — a milestone, a decision — is a lesson about
+        // the paths in its lesson: a sentence that states a constraint, or
+        // what follows "WHY THIS MATTERS" / "Gotcha". A path it mentions
+        // elsewhere still counts, but only as weakly as a tag.
+        const sentences = flatText.split(/(?<=[.!?])\s+(?=[A-Z0-9`"'(#])/);
+        let inClause = false;
+        for (const sentence of sentences) {
+            if (/WHY THIS MATTERS|\bGotcha\b/i.test(sentence)) inClause = true;
+            const weak = strength < 2 && !inClause && !LESSON_SHAPED_RE.test(sentence);
+            for (const tok of sentence.split(' ')) {
+                const tag = /^#(file|dir)-([a-z0-9-]{3,})$/.exec(tok);
+                if (tag) { if (strength >= 2) add({ kind: `tag-${tag[1]}`, value: tag[2], shown: tok }, false); }
+                else add(lessonPathOf(tok), weak);
+            }
+        }
+        // A non-lesson card that names more than ten paths is a status dump.
+        if (strength < 2 && mentions.length > 10) mentions.length = 0;
+    }
+    const entry = { eligible: eligible && mentions.length > 0, mentions, strength };
+    if (cache) { if (cache.size > 20000) cache.clear(); cache.set(key, entry); }
+    return entry;
+}
+function lessonMatch(m, file) {
+    const f = file.toLowerCase();
+    const segs = f.split('/');
+    const base = segs[segs.length - 1];
+    const dir = segs.slice(0, -1).join('/');
+    const suffixes = segs.map((_, i) => segs.slice(i).join('/'));
+    if (m.kind === 'path') {
+        if (f === m.value || f.endsWith(`/${m.value}`)) return 'exact';
+        const mdir = m.value.split('/').slice(0, -1).join('/');
+        if (mdir && !(LESSON_GENERIC_DIRS.has(mdir)) && (dir === mdir || dir.endsWith(`/${mdir}`))) return 'folder';
+        return null;
+    }
+    // A framework's stock file names (page.tsx, route.ts, index.js…) name
+    // dozens of files; matching on the name alone would be noise.
+    if (m.kind === 'name') return base === m.value && !LESSON_STOCK_NAMES.test(base) ? 'name' : null;
+    if (m.kind === 'glob') {
+        const re = lessonGlobRe(m.value);
+        if (!re) return null;
+        if (!m.value.includes('/')) return re.test(base) ? 'glob' : null;
+        return suffixes.some((s) => re.test(s)) ? 'glob' : null;
+    }
+    if (m.kind === 'folder') {
+        if (!m.value.includes('/') && LESSON_GENERIC_DIRS.has(m.value)) return null;
+        return f.startsWith(`${m.value}/`) || f.includes(`/${m.value}/`) ? 'folder' : null;
+    }
+    if (m.kind === 'tag-file') return lessonSlug(base.replace(/\.[a-z0-9]+$/i, '')) === m.value ? 'tag' : null;
+    if (m.kind === 'tag-dir') {
+        const parent = segs.length >= 2 ? segs[segs.length - 2] : '';
+        return parent && !LESSON_GENERIC_DIRS.has(parent) && lessonSlug(parent) === m.value ? 'tag' : null;
+    }
+    return null;
+}
+// → [{ card, tier, file, via }] best first, one per original card (merge twins fold).
+export function lessonsForFiles(struct, files, { limit = 4, skillsOnly = false, cache = null, exclude = null } = {}) {
+    const wanted = [...new Set((Array.isArray(files) ? files : []).map((f) => String(f || '').replace(/\\/g, '/').replace(/^\.\//, '').trim()).filter(Boolean))].slice(0, 50);
+    if (!wanted.length) return [];
+    const best = new Map();
+    for (const card of struct?.cards || []) {
+        if (!card?.id || (exclude && exclude.has(lessonRoot(card.id)))) continue;
+        if (skillsOnly && !isSkillCard(card)) continue;
+        const entry = lessonEntry(card, cache);
+        if (!entry.eligible) continue;
+        let top = null;
+        for (const m of entry.mentions) {
+            for (const file of wanted) {
+                const tier = lessonMatch(m, file);
+                if (!tier) continue;
+                const rank = m.weak ? LESSON_TIERS.tag : LESSON_TIERS[tier];
+                if (!top || rank > top.rank) top = { tier, rank, file, via: m.shown };
+            }
+            if (top && top.rank === LESSON_TIERS.exact) break;
+        }
+        if (!top) continue;
+        const root = lessonRoot(card.id);
+        const prev = best.get(root);
+        const score = top.rank * 10 + entry.strength;
+        if (!prev || score > prev.score || (score === prev.score && (card.createdAt || 0) > (prev.card.createdAt || 0))) best.set(root, { card, ...top, score, strength: entry.strength });
+    }
+    // At most one tag-level (or passing-mention) match: it fills a gap, it
+    // never crowds out a lesson that names the file.
+    let weakShown = 0;
+    return [...best.values()]
+        .sort((a, b) => b.score - a.score || (b.card.createdAt || 0) - (a.card.createdAt || 0))
+        .filter((r) => r.rank > LESSON_TIERS.tag || weakShown++ < 1)
+        .slice(0, Math.max(1, limit))
+        .map(({ card, tier, file, via }) => ({ card, tier, file, via }));
+}
+
+// A rule spec, as the `rule:` suffix and brain_note's `rule` field write it:
+// `<glob>[,<glob>] never "…" | never /re/flags | must "…" | listed-in <file>[,…]
+// | keep-eol | costly`. Same shape test as the marker grammar.
+export function parseRuleSpec(spec) {
+    const s = String(spec || '').trim();
+    const m = MARKER_SUFFIX_RULE.exec(s);
+    if (!m || !markerSuffixRuleOk(s)) return null;
+    const files = m[1].split(/\s*,\s*/).filter(Boolean);
+    const op = m[2];
+    let d = null;
+    if (/^never\s+"/.test(op)) d = { kind: 'never', literal: op.replace(/^never\s+"/, '').replace(/"$/, '') };
+    else if (/^never\s+\//.test(op)) {
+        const r = /^never\s+\/((?:\\.|[^/\\])+)\/([a-z]*)$/.exec(op);
+        if (r) d = { kind: 'never', pattern: r[1], flags: r[2] || '' };
+    } else if (/^must\s+"/.test(op)) d = { kind: 'must', literal: op.replace(/^must\s+"/, '').replace(/"$/, '') };
+    else if (/^listed-in\s+/.test(op)) d = { kind: 'listed-in', registry: op.replace(/^listed-in\s+/, '').split(/\s*,\s*/).filter(Boolean) };
+    else if (op === 'keep-eol') d = { kind: 'keep-eol' };
+    else if (op === 'costly') d = { kind: 'costly' };
+    return d ? { spec: s, files, ...d } : null;
+}
+export function parseRuleCandidate(text) {
+    const line = String(text || '').split('\n').find((l) => l.startsWith(RULE_CANDIDATE_PREFIX));
+    return line ? parseRuleSpec(line.slice(RULE_CANDIDATE_PREFIX.length)) : null;
+}
+// The repository check a rule spec must pass before it is recorded: its globs
+// name tracked files (a glob without a slash matches file names; one with a
+// slash may be relative to a sub-package), a /pattern/ compiles, a listed-in
+// file exists. With no file list (no git) only the shape and regex count.
+export function checkRuleSpec(spec, trackedFiles = null) {
+    const d = parseRuleSpec(spec);
+    if (!d) return { ok: false, reason: 'not a rule — write `<glob>[,<glob>]` then `never "…"`, `never /re/`, `must "…"`, `listed-in <file>`, `keep-eol` or `costly`' };
+    if (d.pattern !== undefined) {
+        try { new RegExp(d.pattern, d.flags); } catch (e) { return { ok: false, reason: `its /pattern/ does not compile (${String(e.message).slice(0, 80)})` }; }
+    }
+    if (Array.isArray(trackedFiles) && trackedFiles.length) {
+        const lower = trackedFiles.map((f) => String(f).replace(/\\/g, '/').toLowerCase());
+        const dirs = new Set();
+        for (const f of lower) { const p = f.split('/'); for (let i = 1; i < p.length; i++) dirs.add(p.slice(0, i).join('/')); }
+        const names = (g) => {
+            const v = String(g).toLowerCase().replace(/^(?:\.\.?\/)+/, '').replace(/\/+$/, '');
+            if (/[*?{]/.test(v)) {
+                const re = lessonGlobRe(v);
+                if (!re) return false;
+                return v.includes('/') ? lower.some((f) => f.split('/').some((_, i, a) => re.test(a.slice(i).join('/')))) : lower.some((f) => re.test(f.split('/').pop()));
+            }
+            return lower.includes(v) || dirs.has(v) || lower.some((f) => f.endsWith(`/${v}`) || f.split('/').pop() === v);
+        };
+        const missing = d.files.filter((g) => !names(g));
+        if (missing.length) return { ok: false, reason: `${missing.join(', ')} ${missing.length === 1 ? 'names' : 'name'} no tracked file in this repository` };
+        if (d.kind === 'listed-in') {
+            const miss = d.registry.filter((r) => !names(r));
+            if (miss.length) return { ok: false, reason: `the list file ${miss.join(', ')} is not tracked in this repository` };
+        }
+    }
+    return { ok: true, draft: d };
+}
+
 function measureCardH(text) {
-    // text is hard-wrapped to ≤CPL, so the \n-line count is the rendered line
-    // count. Match the bordered card (lineHeight 1.35*font + 8/8 vertical padding
-    // + border) and over-estimate slightly → small gaps, never overlap.
-    const lines = Math.max(1, String(text ?? '').split('\n').length);
+    // One rendered line per CPL characters of each \n-line (a whole long token
+    // wraps visually inside the box). Match the bordered card (lineHeight
+    // 1.35*font + 8/8 vertical padding + border) and over-estimate slightly →
+    // small gaps, never overlap.
+    const cpl = brainCPL();
+    const lines = Math.max(1, String(text ?? '').split('\n').reduce((n, l) => n + Math.max(1, Math.ceil(l.length / cpl)), 0));
     return Math.max(40, Math.ceil(lines * BRAIN_GEOM.FONT * 1.45) + 26);
 }
 // Container the next NEW area goes to the right of the rightmost item.
@@ -3410,7 +3669,7 @@ export function structToBrief(struct, { recentDays = 14, maxRecent = 40, maxMile
 // open questions + a pointer to the FULL brief file the hook writes alongside.
 // The pointer + marker legend are reserved OUT of the budget so they always fit.
 export const ULTRA_BUDGET_CHARS = 1_800;   // sibling of BUDGET_CHARS above — sized for the harness preview, not token cost
-export function structToUltraBrief(struct, { freshness = null, briefPath = '.claude/brain-brief.md', budgetChars = ULTRA_BUDGET_CHARS, summary = null } = {}) {
+export function structToUltraBrief(struct, { freshness = null, briefPath = '.claude/brain-brief.md', budgetChars = ULTRA_BUDGET_CHARS, summary = null, focusFiles = null } = {}) {
     const texts = struct.cards.filter(c => c.type !== 'container' && (c.text || '').trim());
     const isArchived = (c) => /^archive$/i.test(c.area || '');
     const isFocus = (c) => /(^|\s)focus\b/i.test(c.area || '');
@@ -3424,7 +3683,7 @@ export function structToUltraBrief(struct, { freshness = null, briefPath = '.cla
     const fr = (c) => (freshness && freshness[c.id]) ? freshness[c.id] + ' ' : '';
     const safeCut = (t, n) => { let s = t.slice(0, n); if (/[\uD800-\uDBFF]$/.test(s)) s = s.slice(0, -1); return s.trimEnd() + '…'; };
     // A card's newest (~ amended …) line leads its preview (amendmentFirst).
-    const head = (c, max = 150) => { const t = flat(amendmentFirst(c.text)); return t.length > max ? safeCut(t, max - 1) : t; };
+    const head = (c, max = 150) => { const t = flat(unwrapCardText(amendmentFirst(c.text))); return t.length > max ? safeCut(t, max - 1) : t; };
     const out = [];
     let used = 0;
     const push = (...ls) => { for (const l of ls) { out.push(l); used += l.length + 1; } };
@@ -3434,7 +3693,7 @@ export function structToUltraBrief(struct, { freshness = null, briefPath = '.cla
     const tail = [
         '',
         `📖 **Full brief: \`${briefPath}\`** — skills (${skills.length}), milestones, recent decisions, connections, self-heal detail. READ IT before planning non-trivial work.`,
-        '🧠 Capture: `🧠 BRAIN [Area]: <decision>` · `?` question · `!` milestone · `+` skill · `✓` resolve · `~` update · a "CORRECTION: …" decision supersedes its stale card across areas · line-end suffixes `closes:` / `ev:` / `q: <question?>` (full legend in the brief file).',
+        '🧠 Capture: `🧠 BRAIN [Area]: <decision>` · `?` question · `!` milestone · `+` skill · `✓` resolve · `~` update · a "CORRECTION: …" decision supersedes its stale card across areas · line-end suffixes `closes:` / `ev:` / `q: <question?>` / `rule: <glob> never "…"` (full legend in the brief file).',
     ];
     const budget = Math.max(400, budgetChars - tail.reduce((s, l) => s + l.length + 1, 0));
     push(`# ${struct.title} — brain (ultra brief)`);
@@ -3493,8 +3752,15 @@ export function structToUltraBrief(struct, { freshness = null, briefPath = '.cla
                 .reduce((s, l) => s + l.length + 1, 0)
             : 0;
         const pushIfFenced = (l) => (used + l.length + 1 > budget - reserve) ? false : (push(l), true);
-        if (pushIfFenced('') && pushIfFenced(`## 🛠️ Standing rules (${skills.length} — newest first; heed correction and review warnings)`)) {
-            const newest = skills.slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)).slice(0, 5);
+        // Lessons for the files this checkout is changing lead (1.107): the five
+        // newest of hundreds were rarely the ones that applied (a two-brain study
+        // found 2 of 88 checkable lessons in them). Newest fill the rest.
+        let forFiles = [];
+        try { forFiles = Array.isArray(focusFiles) && focusFiles.length ? lessonsForFiles(struct, focusFiles, { limit: 5, skillsOnly: true }).map((l) => l.card) : []; } catch { forFiles = []; }
+        const lead = new Set(forFiles.map((c) => c.id));
+        const order = forFiles.length ? 'for the files you are changing first, then newest' : 'newest first';
+        if (pushIfFenced('') && pushIfFenced(`## 🛠️ Standing rules (${skills.length} — ${order}; heed correction and review warnings)`)) {
+            const newest = [...forFiles, ...skills.filter((c) => !lead.has(c.id)).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))].slice(0, 5);
             let guidance = new Map();
             try { guidance = currentGuidanceFor(struct, newest); } catch { /* optional overlay */ }
             let shown = 0;

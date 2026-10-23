@@ -40,6 +40,7 @@ import {
   isPlanCard, planFulfillmentFor, PLAN_PAIR_SIM_BRAIN, isAgconfTwinId,
   readPendingShips, clearPendingShips, pendingShipCards, formatCaptureReceipts, parseVerifySuffix, amendmentFirst, rewriteCardById, handoffTitle,
   scopeLockedView, scopeLockLine, derivedReading, readManifestCheap, escapeInstructionLines,
+  lessonsForFiles, checkRuleSpec, RULE_CANDIDATE_PREFIX, parseMarkerSuffixText, unwrapCardText,
 } from './klypix-format.mjs';
 import {
   leaseVerdict, readEndpoint, pathHash, canvasWriteLockPath, tellUser, LEASE_SINCE_APP_VERSION,
@@ -572,6 +573,20 @@ export async function opSearchAllBrains({ vault, query, as_of, log = () => {} })
 // loads an embedding model or reranker: one MCP call should coordinate peers
 // AND provide enough current project memory to begin work without making every
 // Codex session read the full generated brief.
+// Per-card lesson parsing kept across calls (one map per brain file; the
+// worker is long-lived and brain_sync runs often). Keys include the card's
+// text length and edit stamp, so an edited card is re-read.
+const LESSON_CACHES = new Map();
+function lessonCacheFor(file) {
+  let cache = LESSON_CACHES.get(file);
+  if (!cache) {
+    if (LESSON_CACHES.size > 8) LESSON_CACHES.clear();
+    cache = new Map();
+    LESSON_CACHES.set(file, cache);
+  }
+  return cache;
+}
+
 export async function opBrainTaskContext({
   vault,
   canvas,
@@ -632,11 +647,24 @@ export async function opBrainTaskContext({
       && isUnresolvedOpenCard(hit.card)
       && Number(hit.card.createdAt || 0) >= recentOpenCutoff)
     .slice(0, 2);
+  // Lessons for the declared files (1.107): the lessons that NAME these files
+  // (a path, a file name, a glob, a folder, a rule candidate's globs) lead,
+  // ahead of the word-matched hits. Before this, declared files were turned
+  // into words only, and a lesson naming the very folder ranked 58th.
+  let fileLessons = [];
+  if (scopedFiles.length) {
+    try { fileLessons = lessonsForFiles(struct, scopedFiles, { limit: 4, cache: lessonCacheFor(t.file) }); }
+    catch { fileLessons = []; }
+  }
+  // A merge-engine conflict twin is the same card twice: one slot per original.
+  const rootOf = (id) => String(id || '').replace(/(__agconf_[a-z0-9]+)+$/i, '');
+  const shownRoots = new Set(fileLessons.map((lesson) => rootOf(lesson.card.id)));
   const hits = [];
   const hitIds = new Set();
   for (const hit of [...recentOpen, ...candidatePool]) {
-    if (!hit?.card?.id || hitIds.has(hit.card.id)) continue;
+    if (!hit?.card?.id || hitIds.has(hit.card.id) || shownRoots.has(rootOf(hit.card.id))) continue;
     hitIds.add(hit.card.id);
+    shownRoots.add(rootOf(hit.card.id));
     hits.push(hit);
     if (hits.length >= hitLimit) break;
   }
@@ -644,13 +672,18 @@ export async function opBrainTaskContext({
   const skillPool = struct.cards.filter((c) => c.type !== 'container'
     && !/^archive$/i.test(c.area || '') && isSkillCard(c));
   const scoreById = new Map(candidatePool.map((hit) => [hit.card.id, hit.score]));
-  const standing = skillPool
-    .filter((c) => !hitIds.has(c.id))
+  const standing = [];
+  for (const c of skillPool
+    .filter((card) => !hitIds.has(card.id))
     .sort((a, b) => (scoreById.get(b.id) || 0) - (scoreById.get(a.id) || 0)
-      || (b.createdAt || 0) - (a.createdAt || 0))
-    .slice(0, 3);
+      || (b.createdAt || 0) - (a.createdAt || 0))) {
+    if (shownRoots.has(rootOf(c.id))) continue;
+    shownRoots.add(rootOf(c.id));
+    standing.push(c);
+    if (standing.length >= 3) break;
+  }
   let overlays = new Map();
-  try { overlays = currentGuidanceFor(struct, [...hits.map((hit) => hit.card), ...standing]); }
+  try { overlays = currentGuidanceFor(struct, [...fileLessons.map((lesson) => lesson.card), ...hits.map((hit) => hit.card), ...standing]); }
   catch { /* context remains useful without overlays */ }
   // Plan→🏁 hints (2026-08-23): a recalled PLAN/PROPOSAL whose feature a newer
   // 🏁 appears to have shipped. Brain-wide (the ship card is usually renamed
@@ -699,7 +732,7 @@ export async function opBrainTaskContext({
       // Newest amendment first, as in the hook's previews: a thin ~ is appended
       // UNDER the claim it corrects, and 420 characters of a long card never
       // reached it (review 2026-09-18, third round).
-      text: clip(amendmentFirst(hit.card.text), 420),
+      text: clip(unwrapCardText(amendmentFirst(hit.card.text)), 420),
       score: Number(hit.score.toFixed(2)),
       correctedBy: correction ? clip(correction.text, 420) : null,
       ...(correction ? { correctedById: correction.id } : {}),
@@ -721,15 +754,21 @@ export async function opBrainTaskContext({
   const lines = [
     `## Compact task context (${entries.length} relevant brain card${entries.length === 1 ? '' : 's'} · lexical-fast)`,
   ];
+  if (fileLessons.length) {
+    lines.push(`### 📂 Lessons for your files (${fileLessons.length})`);
+    for (const lesson of fileLessons) {
+      lines.push(`- [${flat(lesson.card.area) || 'Notes'}] (for ${lesson.file} · names \`${lesson.via}\`) ${currentGuidancePrefix(overlays.get(lesson.card.id))}${clip(unwrapCardText(amendmentFirst(lesson.card.text)), 260)}`);
+    }
+  }
   if (standing.length) {
     lines.push(`### 🛠️ Standing rules (${skillPool.length} in the brain — heed correction and review warnings; full set in the brief)`);
     for (const c of standing) {
-      lines.push(`- [${flat(c.area) || 'Notes'}] ${currentGuidancePrefix(overlays.get(c.id))}${clip(c.text, 220)}`);
+      lines.push(`- [${flat(c.area) || 'Notes'}] ${currentGuidancePrefix(overlays.get(c.id))}${clip(unwrapCardText(c.text), 220)}`);
 
     }
   }
   if (!entries.length) {
-    lines.push('No high-confidence task-specific card matched. Continue from repository evidence; use brain_ask only if deeper project history is needed.');
+    if (!fileLessons.length) lines.push('No high-confidence task-specific card matched. Continue from repository evidence; use brain_ask only if deeper project history is needed.');
   } else {
     for (const entry of entries) {
       const guidanceStamp = entry.correctedBy
@@ -772,7 +811,18 @@ export async function opBrainTaskContext({
           };
         }),
       } : {}),
-      sufficient: entries.length > 0,
+      ...(fileLessons.length ? {
+        fileLessons: fileLessons.map((lesson) => ({
+          id: lesson.card.id,
+          area: flat(lesson.card.area) || 'Notes',
+          text: clip(unwrapCardText(amendmentFirst(lesson.card.text)), 420),
+          match: lesson.tier,
+          file: lesson.file,
+          via: lesson.via,
+          ...(lesson.card.ruleDraft ? { ruleCandidate: lesson.card.ruleDraft.spec } : {}),
+        })),
+      } : {}),
+      sufficient: entries.length > 0 || fileLessons.length > 0,
       durationMs,
       brain: path.basename(t.file),
     },
@@ -1919,6 +1969,29 @@ export async function opAddToCanvas({ vault, canvas, cards, connections, via }) 
   }, { brain: isBrain });
 }
 
+// The tracked files of a project, for checking a `rule` (checkRuleSpec). null
+// when the folder is not a git checkout — then only the shape is checked.
+function trackedFilesOf(root) {
+  try {
+    return execFileSync('git', ['-C', root, 'ls-files', '-z'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000, maxBuffer: 64 * 1024 * 1024 })
+      .split('\0').filter(Boolean);
+  } catch { return null; }
+}
+
+// brain_note's input schema is frozen (test/tool-schema-freeze.mjs), so a
+// rule-ready lesson rides its text as the marker grammar's `rule:` suffix —
+// the same words a 🧠 BRAIN marker uses. Only that segment leaves the text;
+// any other suffix on the line stays where it was.
+function takeRuleSuffix(noteText) {
+  const lines = String(noteText || '').replace(/\s+$/, '').split('\n');
+  const last = lines[lines.length - 1];
+  const { rule } = parseMarkerSuffixText(last);
+  if (!rule) return { text: noteText, rule: '' };
+  const esc = rule.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  lines[lines.length - 1] = last.replace(new RegExp(`\\s+rule:\\s*${esc}(?=\\s+(?:closes|ev|verify|q|Closes):|\\s*$)`), '');
+  return { text: lines.join('\n'), rule };
+}
+
 // brain_note — the DELIBERATE, marker-aware write every agent (not just the
 // Claude-Code Stop hook) can make on demand. Routes through the SAME captureInto-
 // Brain engine the hook uses, so supersede / resolve / close-link / dedup behave
@@ -1926,7 +1999,7 @@ export async function opAddToCanvas({ vault, canvas, cards, connections, via }) 
 // open file any agent reads AND writes": a hookless client (Cursor/Cline/Desktop)
 // can now record a decision, ask an open question, mark a milestone, resolve a card,
 // or correct one — with the full lifecycle, not just a flat append.
-export async function opBrainNote({ vault, canvas, text: noteText, area, marker = '', closes, via, evidence, verify, guard = null, enrichmentQuestion = '' }) {
+export async function opBrainNote({ vault, canvas, text: noteText, area, marker = '', closes, via, evidence, verify, guard = null, rule = '', enrichmentQuestion = '' }) {
   const t = brainTarget(vault, canvas);
   if (t.ambiguous) return ambiguousBrainErr(t.ambiguous);
   if (!t.file) return err(`No brain found — looked for ./brain.klypix in the project, then ${vault}. Pass canvas: "<name>".`);
@@ -1945,6 +2018,18 @@ export async function opBrainNote({ vault, canvas, text: noteText, area, marker 
     const v = validateGuard(guard);
     if (!v.ok) return err(`Invalid guard: ${v.reason}`);
     guardField = v.guard;
+  }
+  // Rule-ready lesson (1.107): the rule is checked against this checkout and
+  // lands as the card's visible `⚙ rule candidate:` line. FAIL-LOUD like a
+  // guard. A candidate only — brain_rules adds it, a person approves it.
+  let ruleSpec = String(rule || '').replace(/[\r\n]+/g, ' ').trim();
+  if (!ruleSpec) ({ text: noteText, rule: ruleSpec } = takeRuleSuffix(noteText));
+  if (ruleSpec) {
+    if (!['', '+', '!'].includes(marker)) return err("rule rides a new lesson card — a decision, a '+' skill or a '!' milestone — not ?, ✓ or ~.");
+    const v = checkRuleSpec(ruleSpec, trackedFilesOf(path.dirname(file)));
+    if (!v.ok) return err(`Invalid rule: ${v.reason}`);
+    if (marker === '') marker = '+';
+    noteText = `${String(noteText).trim()}\n${RULE_CANDIDATE_PREFIX} ${ruleSpec}`;
   }
   const metadata = prepareBrainEvidence({ projectRoot: path.dirname(file), evidence, verify, marker, text: noteText, deriveVerify: parseVerifySuffix });
   if (!metadata.ok) return err(`Invalid brain note metadata: ${metadata.error}`);

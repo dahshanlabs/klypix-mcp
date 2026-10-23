@@ -55,7 +55,7 @@ the skills below.
 |---|---|---|
 | `make_board` | Create a new `.klypix` from cards + connections | a `.klypix` **FilePart** + summary |
 | `remember` | Append cards/decisions to an existing canvas (positions preserved) | result summary; flat card appends also return a `.klypix` FilePart |
-| `learn_skill` | Capture a reusable how-to / gotcha as a 🛠 skill card — resurfaces every session | result summary |
+| `learn_skill` | Capture a reusable how-to / gotcha as a 🛠 skill card — kept until corrected; shown first to sessions that touch the files it names | result summary |
 | `recall` | Search card text/titles/`#tags` across the vault | matching cards (text) |
 | `read_canvas` | Read one canvas (cards, graph, `[[links]]`) + its images | markdown + image FileParts |
 | `list_canvases` | List canvases with counts | text |

@@ -132,7 +132,7 @@ function agentCard(publicUrl) {
     {
       id: 'learn_skill',
       name: 'Learn a reusable skill (how-to / gotcha)',
-      description: 'Record a 🛠️ SKILL — a reusable how-to, gotcha, or convention ("always dedup zKeys before REORDER") that should resurface every session and never age out, distinct from a one-time decision. Routes through the capture engine with the "+" marker. A delegating agent uses this to teach the shared brain how work is done here, so every future agent inherits it. Plain "remember" auto-promotes to a skill when the text reads as a general rule.',
+      description: 'Record a 🛠️ SKILL — a reusable how-to, gotcha, or convention ("always dedup zKeys before REORDER") that is kept until corrected and shown first to sessions that touch the files it names, distinct from a one-time decision. Routes through the capture engine with the "+" marker. A delegating agent uses this to teach the shared brain how work is done here, so every future agent inherits it. Plain "remember" auto-promotes to a skill when the text reads as a general rule.',
       tags: ['memory', 'skill', 'how-to', 'procedure', 'brain', 'learn'],
       examples: ['Learn this gotcha: never set backgroundThrottling false — it breaks visibility detection', 'Remember the convention: Electron main imports must stay at top'],
       inputModes: ['text/plain', 'application/json'],

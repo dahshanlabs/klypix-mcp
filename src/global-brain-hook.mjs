@@ -34,8 +34,10 @@ const BRAIN = path.resolve(CWD, 'brain.klypix');
 const STATE = path.resolve(CWD, '.claude', 'brain-capture-state.json');
 // 🧠 BRAIN [Area]: decision  ·  [Area] ?: open question  ·  [Area] !: milestone
 //                · [Area] +: 🛠️ SKILL — a reusable how-to / gotcha / convention
-//                  (resurfaces every session, never ages out; a plain decision that
-//                  reads as a general rule is auto-promoted to a skill too)
+//                  (kept until corrected; listed in every full brief and shown
+//                  first to sessions that touch the files it names; a plain
+//                  decision that reads as a general rule is auto-promoted too,
+//                  and a `rule: <glob> …` suffix makes it rule-ready)
 //                · [Area] ✓: resolves the matching existing card (archives it)
 //                · [Area] ~: updates the matching card IN PLACE (small corrections)
 // Optional trailing suffixes on a decision/milestone (either order, end of line,
@@ -124,7 +126,7 @@ function parseEvidence(s) {
     return prepared.ok ? prepared.evidence : refs; // legacy malformed refs remain unverified
 }
 // ── Marker suffix grammar ─── MIRROR BEGIN ──────────────────────────────────
-// ONE grammar for the optional `closes:` / `ev:` / `verify:` / `q:` suffixes on
+// ONE grammar for the optional `closes:` / `ev:` / `verify:` / `q:` / `rule:` suffixes on
 // a `🧠 BRAIN` marker line. This block is byte-identical in
 // global-brain-hook.mjs (which parses markers) and klypix-format.mjs (whose
 // parseVerifySuffix reads a `verify:` still sitting in card prose), and
@@ -156,7 +158,8 @@ function parseEvidence(s) {
 //     no prose connectives outside quotes; `q:` a question (a question word,
 //     or a preposition + which/what, first; `?` or `؟` last); `closes:` any
 //     title — capture puts a `closes:` that names no live card back into the
-//     card text;
+//     card text; `rule:` a rule-ready lesson: repo globs, then `never "…"`,
+//     `never /re/`, `must "…"`, `listed-in <file>[,…]`, `keep-eol` or `costly`;
 //   • a dangling key at the very end ("shipped X ev:") is dropped; a repeated
 //     ev: joins its references.
 // A run whose FIRST segment breaks a rule is not a suffix run: parsing moves on
@@ -173,7 +176,7 @@ function parseEvidence(s) {
 // ("The resolver now treats closes: targets as exact titles ev: src/x.mjs"
 // is still prose), and capture only lets an UNanchored one close a card it
 // names by title.
-const MARKER_SUFFIX_KEYS = ['closes', 'ev', 'verify', 'q'];
+const MARKER_SUFFIX_KEYS = ['closes', 'ev', 'verify', 'q', 'rule'];
 const MARKER_SUFFIX_KEY_RE = new RegExp(`(?<=\\s)(${MARKER_SUFFIX_KEYS.join('|')}|Closes):`, 'g');
 const MARKER_SUFFIX_OPEN_WORDS = new Set([
     'a', 'an', 'the', 'this', 'that', 'these', 'those', 'its', 'their', 'our', 'my', 'your', 'every', 'each', 'any', 'some', 'no', 'not',
@@ -210,6 +213,9 @@ const MARKER_SUFFIX_DIRECTION = /[\u200E\u200F\u061C\u202A-\u202E\u2066-\u2069]/
 const MARKER_SUFFIX_BOUNDARY = /[.!?;)\]✓✅…—–؛؟]$/u;
 const MARKER_SUFFIX_BARE_FILES = /^(?:Makefile|Dockerfile|Procfile|Gemfile|Rakefile|Jenkinsfile|Vagrantfile|Brewfile|Justfile|LICENSE|README|NOTICE|CHANGELOG|CODEOWNERS|AUTHORS|COPYING)$/;
 const MARKER_SUFFIX_WIKILINK = /^\[\[[^\][]+\]\][.,;!]?$/;
+// rule: <glob>[,<glob>] then one check. A glob is a path, a glob or a file
+// name (a slash, a *, or an extension); anything else is prose.
+const MARKER_SUFFIX_RULE = /^([^\s,]+(?:\s*,\s*[^\s,]+)*)\s+(never\s+(?:"[^"]+"|\/(?:\\.|[^/\\])+\/[a-z]*)|must\s+"[^"]+"|listed-in\s+[^\s,]+(?:\s*,\s*[^\s,]+)*|keep-eol|costly)$/;
 // Case matters only where it disambiguates: a single capital letter ("option
 // A") and the month "May" end a clause; any other Titlecase word counts as its
 // lowercase form, so "Always verify:" is as open as "always verify:".
@@ -241,9 +247,14 @@ function markerSuffixCommandOk(value) {
     if (/^[a-z][a-z0-9]*(?:-[a-z0-9]+)+$/.test(head)) return true;             // probe name: npm-version, gh-release
     return /^[a-z][\w.-]*$/.test(head) && /\s--?[A-Za-z]/.test(value);         // any tool given a --flag
 }
+function markerSuffixRuleOk(value) {
+    const m = MARKER_SUFFIX_RULE.exec(value);
+    return Boolean(m) && m[1].split(/\s*,\s*/).every((g) => /[/*]|\.[A-Za-z0-9]{1,6}$/.test(g) && !/^[a-z]+:\/\//i.test(g));
+}
 function markerSuffixValueOk(key, value) {
     if (!value) return false;
     if (key === 'closes') return true;
+    if (key === 'rule') return markerSuffixRuleOk(value);
     if (key === 'ev') {
         const items = value.split(/[,،]/).filter((item) => item.trim());
         return items.length > 0 && items.every(markerSuffixRefOk);
@@ -252,13 +263,13 @@ function markerSuffixValueOk(key, value) {
     const question = value.replace(MARKER_SUFFIX_INVISIBLE, '').replace(/^[`'"“‘(]+/, '').trim();
     return MARKER_SUFFIX_QUESTION_LEAD.test(question) && /[?？؟][`'"”’)]*$/.test(question);
 }
-// → { body, closes, ev, verify, q, kept, closesAnchored, bodyWithCloses }.
+// → { body, closes, ev, verify, q, rule, kept, closesAnchored, bodyWithCloses }.
 // Strings are '' when absent. `body` is the card text (with any `kept` segment
 // folded back in); `bodyWithCloses` is the same text with the closes: segment
 // left where it was written — what lands when the closes: acts on nothing.
 function parseMarkerSuffixText(line) {
     const text = String(line || '');
-    const none = { body: text.trim(), closes: '', ev: '', verify: '', q: '', kept: '', closesAnchored: false, bodyWithCloses: text.trim() };
+    const none = { body: text.trim(), closes: '', ev: '', verify: '', q: '', rule: '', kept: '', closesAnchored: false, bodyWithCloses: text.trim() };
     const keys = [];
     for (const m of text.matchAll(MARKER_SUFFIX_KEY_RE)) {
         const from = m.index + m[0].length;
@@ -277,7 +288,7 @@ function parseMarkerSuffixText(line) {
         const lastWord = /(\S+)$/.exec(body)[1];
         if (lastWord.endsWith(':') || markerSuffixWordIn(MARKER_SUFFIX_OPEN_WORDS, lastWord)) continue;
         if (markerSuffixWordIn(MARKER_SUFFIX_SOFT_WORDS, lastWord) && !(keys[start].key === 'ev' && markerSuffixValueOk('ev', valueOf(start)))) continue;
-        const found = { closes: '', ev: [], verify: '', q: '' };
+        const found = { closes: '', ev: [], verify: '', q: '', rule: '' };
         let closesSegment = '', failAt = -1, anchored = false;
         for (let k = start; k < keys.length; k++) {
             const { key } = keys[k];
@@ -298,6 +309,7 @@ function parseMarkerSuffixText(line) {
             ev: found.ev.join(', '),
             verify: found.verify,
             q: found.q.replace(MARKER_SUFFIX_DIRECTION, '').trim(),
+            rule: found.rule,
             kept,
             closesAnchored: Boolean(found.closes) && (keys[start].key !== 'closes' || MARKER_SUFFIX_WIKILINK.test(found.closes) || MARKER_SUFFIX_BOUNDARY.test(body)),
             bodyWithCloses: closesSegment ? [body, closesSegment, kept].filter(Boolean).join(' ') : cardBody,
@@ -324,6 +336,7 @@ function splitMarkerSuffixes(body) {
         evidence: parsed.ev ? parseEvidence(parsed.ev) : null,
         verify: parsed.verify.slice(0, 200),
         question: parsed.q.slice(0, 240),
+        rule: parsed.rule.slice(0, 300),
         kept: parsed.kept,
         bodyWithCloses: parsed.bodyWithCloses,
     };
@@ -2506,6 +2519,34 @@ function scanToolBlocks(entry, shellCmds, errorIds) {
     }
 }
 const slugify = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+// A file the agent touched only as scratch never describes a lesson: the OS
+// temp tree (session scratchpads), a tmp/temp folder, the user's ~/.claude and
+// ~/.codex (memory notes, hook installs), dependency and git internals, and
+// the project's own .claude state. Tagging them put #dir-scratchpad /
+// #dir-memory / #dir-tmp on cards (a two-brain study, 1.107), which then
+// matched nothing — or the wrong things. A git worktree (.worktrees/<name>/,
+// .claude/worktrees/<name>/) is project work: it is tagged as the path inside it.
+const normTagPath = (p) => String(p || '').replace(/\\/g, '/').toLowerCase();
+const WORKTREE_PREFIX = /^.*\/\.?worktrees\/[^/]+\//;
+const TAG_NOISE_ROOTS = (() => {
+    const roots = [];
+    for (const r of [os.tmpdir(), path.join(os.homedir(), '.claude'), path.join(os.homedir(), '.codex')]) {
+        try { roots.push(normTagPath(fs.realpathSync.native(r))); } catch { roots.push(normTagPath(path.resolve(r))); }
+    }
+    return roots;
+})();
+function isTagNoisePath(p) {
+    const abs = normTagPath(path.resolve(CWD, String(p || '')));
+    const cwd = normTagPath(path.resolve(CWD));
+    const inside = abs === cwd || abs.startsWith(`${cwd}/`);
+    const rel = inside ? abs.slice(cwd.length) : abs;   // the project's own location never counts
+    if (/\/(?:node_modules|\.git)\//.test(`${rel}/`)) return true;
+    if (WORKTREE_PREFIX.test(rel)) return false;
+    if (/\/(?:tmp|temp|\.tmp|scratchpad)\//.test(`${rel}/`)) return true;
+    if (inside) return rel.startsWith('/.claude/');
+    return TAG_NOISE_ROOTS.some((r) => abs === r || abs.startsWith(`${r}/`));
+}
+const tagPathOf = (p) => normTagPath(p).replace(WORKTREE_PREFIX, '');
 function fileTagsFor(p) {
     const parts = String(p).replace(/\\/g, '/').split('/').filter(Boolean);
     const base = parts[parts.length - 1] || '';
@@ -3564,9 +3605,21 @@ function captureReceiptsFooter(sid) {
     } catch { return ''; }
 }
 // One line for a suffix segment that went back into the card text.
+// Tracked files of this checkout, read once per run: a `rule:` suffix is
+// recorded only when its globs name real files (checkRuleSpec). null = no git.
+let RULE_TRACKED_FILES;
+function trackedFilesForRules() {
+    if (RULE_TRACKED_FILES !== undefined) return RULE_TRACKED_FILES;
+    try {
+        RULE_TRACKED_FILES = execSync('git ls-files -z', { cwd: CWD, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 4000, maxBuffer: 64 * 1024 * 1024 })
+            .split('\0').filter(Boolean);
+    } catch { RULE_TRACKED_FILES = null; }
+    return RULE_TRACKED_FILES;
+}
 function keptSuffixReceipt(area, type, kept) {
-    const key = (/^(closes|ev|verify|q):/.exec(kept) || [])[1] || '';
-    const rule = key === 'q' ? 'a q: needs a question word first and a ? (or ؟) last'
+    const key = (/^(closes|ev|verify|q|rule):/.exec(kept) || [])[1] || '';
+    const rule = key === 'rule' ? 'a rule: takes repo globs then never "…", never /re/, must "…", listed-in <file>, keep-eol or costly'
+        : key === 'q' ? 'a q: needs a question word first and a ? (or ؟) last'
         : key === 'ev' ? 'an ev: takes file paths, file:line or PR/issue numbers, comma-separated'
         : key === 'verify' ? 'a verify: takes a command (gh / npm / git …, a script path, or a tool given a --flag), no prose'
         : 'each suffix key appears once per marker';
@@ -3696,7 +3749,8 @@ async function capture(lib) {
                 recentPaths.push(rel);
                 while (recentPaths.length > 20) recentPaths.shift();
             }
-            for (const tag of fileTagsFor(p)) {
+            if (isTagNoisePath(p)) continue;
+            for (const tag of fileTagsFor(tagPathOf(p))) {
                 const i = recentTags.indexOf(tag); if (i >= 0) recentTags.splice(i, 1);
                 recentTags.push(tag);
             }
@@ -3815,6 +3869,20 @@ async function capture(lib) {
             const closesInert = type === '✓' || type === '~';
             const closes = closesInert ? '' : parsedSuffixes.closes;
             body = closesInert ? bodyWithCloses : parsedSuffixes.body; if (!body) continue;
+            // `rule:` (1.107): a rule-ready lesson becomes a visible
+            // `⚙ rule candidate:` line on a NEW lesson card — checked against
+            // this checkout first (globs name tracked files, a /re/ compiles).
+            // A candidate only: brain_rules adds it, a person approves it.
+            let ruleLine = '';
+            let ruleRefusal = '';
+            if (parsedSuffixes.rule) {
+                const verdict = !(type === '' || type === '+' || type === '!')
+                    ? { ok: false, reason: 'a rule: rides a new lesson card (a decision, + skill or ! milestone), not ✓, ~ or ?' }
+                    : typeof lib.checkRuleSpec === 'function' ? lib.checkRuleSpec(parsedSuffixes.rule, trackedFilesForRules())
+                        : { ok: false, reason: 'this brain engine predates rule: — update klypix-mcp' };
+                if (verdict.ok) ruleLine = `${lib.RULE_CANDIDATE_PREFIX || '⚙ rule candidate:'} ${parsedSuffixes.rule}`;
+                else ruleRefusal = verdict.reason;
+            }
             const preview = body.slice(0, 90);
             // EXAMPLE/doc guard — rejects marker-SYNTAX documentation (which
             // once polluted the brain) WITHOUT dropping real decisions. Three
@@ -3954,6 +4022,10 @@ async function capture(lib) {
                 ledger.push({ action: 'suffix-kept-as-text', area, preview, kept: keptSuffix.slice(0, 120) });
                 suffixReceipts.push({ key: sha(('kept|' + type + '|' + area + '|' + body).toLowerCase()), line: keptSuffixReceipt(area, type, keptSuffix) });
             }
+            if (ruleRefusal) {
+                ledger.push({ action: 'rule-not-recorded', area, preview, rule: parsedSuffixes.rule.slice(0, 120) });
+                suffixReceipts.push({ key: sha(('rule|' + type + '|' + area + '|' + body).toLowerCase()), line: `rule: not recorded on the 🧠 BRAIN [${area || '?'}]${type ? ` ${type}` : ''} marker ("${parsedSuffixes.rule.slice(0, 90)}") — ${ruleRefusal}. The lesson itself was captured.` });
+            }
             if (entryInGap && !repairStub) gapAuthored++;   // a repair is work an older hook already counted
             // ✓ resolves an EXISTING card (stamped ✅ + archived) — not a new card.
             // `rIdx` is this marker's position in the array handed to the engine,
@@ -3974,7 +4046,7 @@ async function capture(lib) {
             // decision whose text reads as a reusable RULE is AUTO-promoted to a
             // 🛠️ skill — skills emerge from the project flow, not only the explicit
             // + marker. (Guarded on lib.looksLikeSkill for stale-lib safety.)
-            const isSkill = type === '+' || (type === '' && typeof lib.looksLikeSkill === 'function' && lib.looksLikeSkill(body));
+            const isSkill = type === '+' || (type === '' && (Boolean(ruleLine) || (typeof lib.looksLikeSkill === 'function' && lib.looksLikeSkill(body))));
             const prefix = type === '?' ? '❓ ' : type === '!' ? '🏁 ' : isSkill ? '🛠️ ' : '';
             const borderColor = type === '?' ? 'rgba(245,166,35,0.8)' : type === '!' ? 'rgba(59,130,246,0.8)' : isSkill ? 'rgba(139,92,246,0.85)' : 'rgba(16,185,129,0.6)';
             // Tag line: the #area slug (existing) + up to the 4 most-recently-
@@ -3983,7 +4055,7 @@ async function capture(lib) {
             const areaTag = area ? `#${slugify(area)}` : '';
             const fileTags = recentTags.slice(-4).filter(t => t !== areaTag);
             const tagLine = [areaTag, ...fileTags].filter(Boolean).join(' ');
-            const cardText = (b) => (area ? `${area}: ${prefix}${b}` : `${prefix}${b}`) + (tagLine ? `\n${tagLine}` : '');
+            const cardText = (b) => (area ? `${area}: ${prefix}${b}` : `${prefix}${b}`) + (ruleLine ? `\n${ruleLine}` : '') + (tagLine ? `\n${tagLine}` : '');
             const card = cardText(body);
             // `closes:` is the one suffix whose value is free text, so the engine
             // also gets the card as written WITH it: when the close will not act,
@@ -4186,13 +4258,12 @@ async function capture(lib) {
     const prevCommit = readLastCommit();
     const { cards: commitCards, total: commitTotal, entries: commitEntries, newLastCommit } = await gatherCommitCards(prevCommit);
     for (const cc of commitCards) {
-        // Auto-skill from the flow: a rule-stating commit ("fix: imports must stay
-        // at top — TDZ") is a reusable gotcha, not a one-time event. Re-glyph it as a
-        // 🛠️ skill so it resurfaces forever. Feats (🏁 milestones) are left as-is.
-        if (typeof lib.looksLikeSkill === 'function' && !/🏁|🛠/.test(cc.text) && lib.looksLikeSkill(cc.text)) {
-            cc.text = cc.text.replace(/^(\s*[^:\n]{1,40}:\s*)/, '$1🛠️ ');
-            cc.borderColor = 'rgba(139,92,246,0.85)';
-        }
+        // A commit card stays what it is — a record of a fix or a feature. It
+        // used to be re-glyphed 🛠️ when its subject read like a rule, but a
+        // two-brain study (1.107) found those were fix stories, not rules (33
+        // of 34), and as 🛠️ they crowded real lessons out of the brief. A
+        // reusable lesson is recorded on purpose: a `+` marker, ideally with
+        // a `rule:` suffix.
         cards.push(cc);
         ledger.push({ action: /🛠/.test(cc.text) ? 'commit-skill' : 'commit', area: cc.area, preview: (cc.text.split('\n')[0] || '').slice(0, 90) });
     }
@@ -5966,10 +6037,10 @@ function staleOpenFooter(stale) {
 function legendFooter() {
     return '\n\n---\n'
         + '🧠 **Capture markers** — write these in your reply; the Stop hook harvests them into the brain (no separate log step). Use sparingly, for real decisions / milestones / discoveries:\n'
-        + '`🧠 BRAIN [Area]: decision` · `[Area] ?: open question` · `[Area] !: milestone` · `[Area] +: 🛠️ skill (reusable how-to / gotcha — resurfaces every session, never ages out)` · `[Area] ✓: resolves+archives the matching card` · `[Area] ~: updates it in place` · 🎯 in text = a goal (reads as open).\n'
+        + '`🧠 BRAIN [Area]: decision` · `[Area] ?: open question` · `[Area] !: milestone` · `[Area] +: 🛠️ skill (reusable how-to / gotcha — kept until corrected; shown first to sessions that touch the files it names)` · `[Area] ✓: resolves+archives the matching card` · `[Area] ~: updates it in place` · 🎯 in text = a goal (reads as open).\n'
         + 'Optional suffixes go at the END of the marker line, lowercase, written `key: value`: `closes: <card title / [[wikilink]]>` (resolve the strategy/question this fulfils — end the sentence first, or use a [[wikilink]]; a target that names no live card stays in the text) · `ev: <file[:line]>, PR#<n>` (anchor to code → auto drift-badge) · `verify: <command>` (the live probe for a fast-decay status claim) · `q: <how/what/why …?>` (the question this answers, as someone would ASK it — a question word first, `?` last; retrieval enrichment, sidecar only, never on the canvas). Anything else is plain text: "a Q: and A: layout", "the ev: field", `npm run verify:mcp` stay in the card. A `~` too short to replace its card is appended to it as a dated amendment — restate the full claim to replace it.\n'
         + '**Correcting a stale card:** include the word `CORRECTION` (or "was WRONG" / "OBSOLETE" — UPPERCASE; casing is the deliberate-signal, casual prose never fires it) in the decision — the capture then hunts the stale card across ALL areas at a lower match bar and supersedes it (archived + arrowed, with a receipt; restore from Archive if it grabbed the wrong one). A rephrased duplicate `?` merges into the existing open question instead of stacking a twin.\n'
-        + '**Verified-fix rule drafts:** when a session FIXES + VERIFIES something trap-shaped that landed as a one-off note, the Stop hook auto-DRAFTS a candidate 🛠️ rule (a per-project sidecar — never a brain card). Approve a real recurring trap with the `+` marker the nudge shows you and it becomes a standing rule that fires EVERY session (like the release-naming rule); ignore the rest and they age out. Draft-only, no blind auto-capture.\n'
+        + '**Verified-fix rule drafts:** when a session FIXES + VERIFIES something trap-shaped that landed as a one-off note, the Stop hook auto-DRAFTS a candidate 🛠️ rule (a per-project sidecar — never a brain card). Approve a real recurring trap with the `+` marker the nudge shows you and it becomes a standing rule: listed in every full brief, and shown first to sessions that touch the files it names (like the release-naming rule); ignore the rest and they age out. Draft-only, no blind auto-capture.\n'
         + '**Session brief:** the SessionStart hook prints a ≤2KB ultra brief and writes the FULL brief to `.claude/brain-brief.md` — read that file when planning non-trivial work.\n'
         + '**Routing:** capture project decisions / milestones / open questions / gotchas HERE, *at the moment you decide* — this brain is the shared, portable memory that survives context resets and the next agent reads.\n'
         + '⚠️ **Your own memory directory is NOT this brain.** Claude Code\'s `~/.claude/projects/<project>/memory/` (and any equivalent host store) is PRIVATE to this host: no other session, agent, or human can read it. Both feel like "saving"; only `brain.klypix` is shared. A host store is for *user* preferences — never leave project state only there. (2026-08-16 field report: a whole workstream, ending in a registered IANA media type, went to the private store and reached the brain only because a human happened to ask.)\n'
@@ -6176,7 +6247,14 @@ async function read(lib) {
         fs.writeFileSync(path.resolve(CWD, briefRel),
             `<!-- auto-generated by the brain hook at session start (${nowIso()}) — read it, don't edit it; regenerated next session. Presence/in-flight/session lines are a snapshot of that instant — query brain_sync or \`npx klypix-mcp doctor\` for live peers before reporting them. -->\n` + full, 'utf8');
     } catch { return emitFull(); }
-    const ultra = lib.structToUltraBrief(struct, { freshness, briefPath: briefRel, summary });
+    // The files this checkout is working on — uncommitted changes, then the
+    // last three commits — so the brief's standing rules lead with the lessons
+    // that name them (1.107). Best-effort: no git, no focus, newest first.
+    const focusFiles = [...new Set([
+        ...safeGit('status --porcelain=v1 -uall').split('\n').map((l) => l.slice(3).split(' -> ').pop().replace(/^"|"$/g, '').trim()),
+        ...safeGit('log -3 --name-only --format=').split('\n').map((l) => l.trim()),
+    ].filter((f) => f && !f.startsWith('.claude/') && f !== 'brain.klypix'))].slice(0, 50);
+    const ultra = lib.structToUltraBrief(struct, { freshness, briefPath: briefRel, summary, focusFiles });
     // Self-heal tiers compress to ONE line up here; the actionable detail (which
     // cards, which markers to emit) lives in the brief file.
     const heals = [];
@@ -6197,7 +6275,7 @@ async function read(lib) {
     // Rule-draft nudge (capture-coverage): a one-line count in the preview; the full
     // promote-markers live in the brief file (read-only here — no shown-mark).
     const pendingDrafts = livePendingDrafts(struct);
-    const draftLine = pendingDrafts.length ? `\n🛠️ ${pendingDrafts.length} draft rule(s) from verified fixes await approval — promote-markers in ${briefRel} (turn a recurring trap into a rule that fires every session).` : '';
+    const draftLine = pendingDrafts.length ? `\n🛠️ ${pendingDrafts.length} draft rule(s) from verified fixes await approval — promote-markers in ${briefRel} (turn a recurring trap into a standing rule).` : '';
     // 📨 messages are at-least-once: offered, acknowledged on a later action,
     // then replayed until explicit token-bound consumption. They go right after
     // the ultra brief, never after footers that could push them past a preview cut.

@@ -70,7 +70,7 @@ try {
   // ── G1 — prose is never a suffix ──────────────────────────────────────────
   const untouched = (label, body) => {
     const r = splitMarkerSuffixes(body);
-    ok(r.body === body && !r.closes && !r.evidence && !r.verify && !r.question && !r.kept,
+    ok(r.body === body && !r.closes && !r.evidence && !r.verify && !r.question && !r.rule && !r.kept,
       `G1 ${label} → whole body kept [${flat(r.body).slice(0, 60)}]`);
   };
   untouched('uppercase Q: mid-sentence', 'Support page gets a Q: and A: layout so pricing questions read as a FAQ');
@@ -104,6 +104,10 @@ try {
   untouched('"I verify:" (subject pronoun)', 'Stale cards get flagged; I verify: git log -1 before trusting them');
   untouched('an ev: value that is a phrase', 'Docs say to append ev: PR#12 to the line');
   untouched('an ev: value longer than a reference', 'Fix landed ev: CI run 35345269613 on the fix branch');
+  // 1.107: rule: is a key only when its value is repo globs and one check.
+  untouched('a prose "rule:" with no glob', 'Lint rule: never use var in new code');
+  untouched('"a new rule:" in a sentence', 'The team adopted a new rule: never merge on Fridays');
+  untouched('a rule: whose "glob" is a URL', 'Docs moved rule: https://example.com/docs never "draft"');
 
   // ── G2 — every documented form still parses ──────────────────────────────
   const en9 = splitMarkerSuffixes('Pan = dedicated hand tool in toolbar; Zoom = steppers in the status bar q: how do I move around the board and change magnification? closes: [[Canvas navigation]] ev: src/canvas/Toolbar.tsx');
@@ -128,6 +132,11 @@ try {
   ok(reordered.body === 'did x' && reordered.verify === 'gh release list; gh run list' && reordered.closes === 'Old q', 'G2 verify: before closes:, PS-safe ; chain kept');
   const selfHeal = splitMarkerSuffixes('Auth tokens rotate every 7 days in the session store ev: src/auth/session.ts:42');
   ok(selfHeal.body === 'Auth tokens rotate every 7 days in the session store' && selfHeal.evidence?.[0]?.ref === 'src/auth/session.ts:42', 'G2 the self-heal footer form (claim ev: file:line)');
+  const ruleSuffix = splitMarkerSuffixes(`Admin tests import relatively rule: admin/tests/**/*.test.ts never "from '@/" ev: admin/tests/setup.ts`);
+  ok(ruleSuffix.body === 'Admin tests import relatively' && ruleSuffix.rule === `admin/tests/**/*.test.ts never "from '@/"` && ruleSuffix.evidence?.[0]?.ref === 'admin/tests/setup.ts',
+    'G2 rule: (1.107) with another suffix after it');
+  const ruleListed = splitMarkerSuffixes('New pages are registered rule: app/pages/*.tsx, app/admin/*.tsx listed-in src/routes.ts');
+  ok(ruleListed.body === 'New pages are registered' && ruleListed.rule === 'app/pages/*.tsx, app/admin/*.tsx listed-in src/routes.ts', 'G2 rule: with two globs and listed-in');
   for (const ref of ['PR#123', 'PR 123', 'GH3', 'issue#3', '#3', '123']) {
     ok(splitMarkerSuffixes(`claim ev: ${ref}`).evidence?.[0]?.kind === 'pr', `G2 ev: shorthand ${ref} is still a PR reference`);
   }
@@ -392,16 +401,32 @@ try {
     'U1 cardAlreadySays is word-bounded ("port 51" is not in "port 5173") and reads a mid-word wrap');
   {
     // Review 2026-09-18 (F1/R1): an amendment that mixes ordinary words with a
-    // token longer than a card line (a path, a URL, a 40-char SHA) is stored
+    // token longer than a card line (a path, a URL, a 40-char SHA) was stored
     // with BOTH kinds of wrap break — reading every break as a space, or every
     // break as nothing, never rebuilt it, so the same thin ~ re-appended itself
-    // at every Stop and re-dated the card.
+    // at every Stop and re-dated the card. Since 1.107 the writer keeps such a
+    // token whole; cards written before still carry the forced break, so both
+    // stored shapes are checked — the legacy one built with the pre-1.107 wrap.
+    const legacyWrap = (text, cpl = 37) => {
+      const out = [];
+      for (const para of String(text).split('\n')) {
+        if (para.length <= cpl) { out.push(para); continue; }
+        let line = '';
+        for (const tok of para.split(/(\s+)/)) {
+          if (line && (line + tok).trimEnd().length > cpl) { out.push(line.trimEnd()); line = tok.replace(/^\s+/, ''); }
+          else line += tok;
+          while (line.length > cpl) { out.push(line.slice(0, cpl)); line = line.slice(cpl); }
+        }
+        if (line.trim()) out.push(line.trimEnd());
+      }
+      return out.join('\n');
+    };
     const cases = [
-      ['Dev', 'Dev: The dev server port is configured in vite.config.ts and electron waits on it before launching the overlay; strictPort stays true so a busy port fails loudly', 'Dev port now set in electron/config/devServerPortSettings.ts', 'now set in electron/config/devServerPortSettings'],
-      ['Store', 'Store: Stripe checkout plan is configured in the billing settings page with monthly and annual prices and a coupon field', 'Stripe checkout plan moved to https://p.io/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p', null],
-      ['Release', 'Release: Release installer builds are produced by the publish workflow on every tag and uploaded to the GitHub release with checksums', 'Release installer builds pinned at 3f9a1c2e4b5d6f708192a3b4c5d6e7f8091a2b3c', null],
+      ['Dev', 'Dev: The dev server port is configured in vite.config.ts and electron waits on it before launching the overlay; strictPort stays true so a busy port fails loudly', 'Dev port now set in electron/config/devServerPortSettings.ts', 'now set in electron/config/devServerPortSettings', 'electron/config/devServerPortSettings.ts'],
+      ['Store', 'Store: Stripe checkout plan is configured in the billing settings page with monthly and annual prices and a coupon field', 'Stripe checkout plan moved to https://p.io/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p', null, 'https://p.io/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p'],
+      ['Release', 'Release: Release installer builds are produced by the publish workflow on every tag and uploaded to the GitHub release with checksums', 'Release installer builds pinned at 3f9a1c2e4b5d6f708192a3b4c5d6e7f8091a2b3c', null, '3f9a1c2e4b5d6f708192a3b4c5d6e7f8091a2b3c'],
     ];
-    for (const [area, cardText, thin, headOfToken] of cases) {
+    for (const [area, cardText, thin, headOfToken, token] of cases) {
       let buf = await buildKlypixMap({ title: 'brain', areas: [{ title: area, cards: [{ text: cardText }] }] });
       const { struct: s0 } = await parseKlypix(buf);
       const { id, createdAt: born } = live(s0)[0];
@@ -413,12 +438,20 @@ try {
       const { struct } = await parseKlypix(buf);
       const card = struct.cards.find((c) => c.id === id);
       const lines = card.text.split('\n');
-      const mixed = lines.some((l) => l.length === 37 && !/\s/.test(l)) && lines.some((l) => /^\(~ amended/.test(l) && !l.includes(')'));
-      ok(mixed && amendments(card.text) === 1 && runs[0].updateAmended?.length === 1
+      ok(lines.some((l) => l.includes(token)) && amendments(card.text) === 1 && runs[0].updateAmended?.length === 1
         && runs.slice(1).every((s) => !s.updateAmended && s.updateUnchanged?.length === 1 && s.updated === 0),
-        `U1 a thin ~ carrying a long token (${area}) is appended ONCE over 3 captures, then "already says" (${amendments(card.text)} line(s))`);
+        `U1 a thin ~ carrying a long token (${area}) is appended ONCE over 3 captures with the token whole, then "already says" (${amendments(card.text)} line(s))`);
       ok(card.createdAt === born, `U1 …and the amendment never re-dates the claim it sits under (${area})`);
-      if (headOfToken) ok(!fmt.cardAlreadySays(card.text, headOfToken), `U1 …while the HEAD of a wrapped long token is not "said" (${area})`);
+      // The same card as a pre-1.107 writer stored it: the token cut at the width.
+      const legacyText = legacyWrap(`${cardText}\n(~ amended 2026-09-18: ${thin})`);
+      const legacyLines = legacyText.split('\n');
+      const mixed = legacyLines.some((l) => l.length === 37 && !/\s/.test(l)) && legacyLines.some((l) => /^\(~ amended/.test(l) && !l.includes(')'));
+      const lbuf = await buildKlypixMap({ title: 'brain', areas: [{ title: area, cards: [{ text: legacyText }] }] });
+      const { struct: l0 } = await parseKlypix(lbuf);
+      const lr = await captureIntoBrain(lbuf, { updates: [{ area, text: thin, createdVia: 'claude-code' }] });
+      ok(mixed && live(l0)[0].text === legacyText && !lr.stats.updateAmended && lr.stats.updateUnchanged?.length === 1 && lr.stats.updated === 0,
+        `U1 a legacy card whose amendment cut the token already says the same thin ~ (${area})`);
+      if (headOfToken) ok(!fmt.cardAlreadySays(legacyText, headOfToken), `U1 …while the HEAD of a cut long token is not "said" (${area})`);
     }
   }
   {

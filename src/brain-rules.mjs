@@ -1060,9 +1060,13 @@ function sentenceWindow(text, at) {
   return { from: starts[i], to: i + 2 < starts.length ? starts[i + 2] : text.length };
 }
 const ROUTES = [
-  { kind: 'listed-in', re: /must (?:also )?be (?:added|listed|registered|wired|enumerated)|(?:added|listed|registered|enumerated) (?:to|in) `[^`]+`|not (?:wired|listed|enumerated) (?:into|in)|enumerated in|copy lists?|or (?:CI|it) never runs/i },
+  { kind: 'listed-in', re: /must (?:also )?(?:\w+ly )?be (?:added|listed|registered|wired|enumerated)|(?:added|listed|registered|enumerated) (?:to|in) `[^`]+`|not (?:wired|listed|enumerated) (?:into|in)|enumerated in|copy lists?|or (?:CI|it) never runs/i },
   { kind: 'preserve-eol', re: /CRLF|line.endings?|\bEOL\b|mixed (?:CRLF|line)/i },
-  { kind: 'forbid-pattern', re: /never (?:use|set|import|call|write|add)\b|must not (?:use|import|call|set)|do not (?:use|import|set)|import (?:it |them )?relatively|has no `?@\/`? alias|is (?:banned|forbidden)/i },
+  // The code actions a lesson forbids, with an optional adverb (1.107:
+  // "Never synchronously decode…", "NEVER put…", "never @import…", "Never
+  // pass a Blob…", `never dir="auto"` were routed as instructions). A draft
+  // still needs a quoted code fragment next to the prohibition.
+  { kind: 'forbid-pattern', re: /\bnever (?:\w+ly )?(?:use|set|import|@import|call|write|add|put|pass|require|decode|combine|spawn|embed|dump|return|store|hardcode|inline|bundle)\b|\bnever (?=[`"'])|\bmust not (?:\w+ly )?(?:use|import|call|set|write|appear|contain|include|pass|put|add)\b|\b(?:do not|don't) (?:use|import|set|call|write|put|pass|add)\b|import (?:it |them )?relatively|has no `?@\/`? alias|is (?:banned|forbidden)/i },
   { kind: 'cloud-required', re: /runner-impacting|lockfile|pnpm-workspace|\.github\/workflows|supply.chain|full (?:cloud )?CI|full desktop matrix/i },
 ];
 
@@ -1120,6 +1124,43 @@ export function repoPathResolver(root, { ref = null } = {}) {
  * quoted code fragment next to the prohibition. Heuristic, transparent, and
  * never stored by itself.
  */
+const SHELLISH_FRAGMENT = /^(?:git|gh|npm|npx|pnpm|yarn|node|cd|curl|wget|printf|echo|openssl|ssh|docker|cargo|pwsh|powershell|bash|sh|cmd|make|python3?|pip)\b|:\/\/|^[\w.+-]+@[\w-]+\.[\w.]+$|^--?\w/i;
+
+// Cards written before 1.107 cut long tokens with a forced break: a line of
+// exactly the card width (37) with no whitespace, continued on the next line.
+// Rejoin those before whitespace is collapsed, or "…/managed-\nrun-worker.ts"
+// reads as two words. (Mirrors klypix-format.mjs unwrapCardText; this module
+// keeps its format import lazy, and proposeFromCards is synchronous.)
+const FORCED_BREAK_WIDTH = 37;
+const UNWRAP_BLOCK_START = /^(?:\s*(?:#[\p{L}\p{N}_-]+\s*)+$|✔|✅|↩|⤵|\(re-affirmed|\(~ amended|⚙ rule candidate:)/u;
+function rejoinForcedBreaks(text) {
+  const out = [];
+  let joinNext = false;
+  for (const line of String(text || '').split('\n')) {
+    if (joinNext && line && !/^\s/.test(line) && !UNWRAP_BLOCK_START.test(line)) out[out.length - 1] += line;
+    else out.push(line);
+    joinNext = line.length === FORCED_BREAK_WIDTH && !/\s/.test(line);
+  }
+  return out.join('\n');
+}
+
+// A lesson recorded rule-ready (the `rule:` marker suffix / brain_note's
+// `rule` field, read back by parseKlypix as card.ruleDraft) needs no routing:
+// its globs and its check were written by the agent at the moment of the fix.
+function draftFromRuleCandidate(id, d) {
+  const short = id.replace(/^txt_/, '').replace(/[^a-z0-9]/gi, '').slice(0, 8).toLowerCase();
+  const base = { why: '<the lesson in one line>', fix: '<how to fix a finding, in one line>', source: { card: id }, files: d.files.slice(0, 8) };
+  if (d.kind === 'never') {
+    return { id: `forbid-${short}`, kind: 'forbid-pattern', severity: 'warn', ...base,
+      pattern: d.pattern !== undefined ? d.pattern : d.literal.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
+      ...(d.flags ? { flags: d.flags } : {}) };
+  }
+  if (d.kind === 'listed-in') return { id: `listed-${short}`, kind: 'listed-in', severity: 'warn', ...base, when: 'added-files', registry: d.registry.slice(0, 8), needle: '{basename}' };
+  if (d.kind === 'keep-eol') return { id: `preserve-${short}`, kind: 'preserve-eol', severity: 'warn', ...base };
+  if (d.kind === 'costly') return { id: `cloud-${short}`, kind: 'cloud-required', severity: 'advise', ...base };
+  return null;   // `must "…"`: recorded, but no rule kind checks a required pattern yet
+}
+
 export function proposeFromCards(cards, { limit = 30, query = '', existing = [], pathResolver = null } = {}) {
   const q = String(query || '').toLowerCase();
   const usedCards = new Set(existing.map((r) => r.source?.card));
@@ -1131,7 +1172,20 @@ export function proposeFromCards(cards, { limit = 30, query = '', existing = [],
   for (const card of cards || []) {
     const id = String(card?.id || '');
     if (!id || id.includes('__agconf_') || card.area === 'Archive' || card.area === RULES_AREA) continue;
-    const text = String(card.text || '').replace(/\s+/g, ' ').trim();
+    const text = rejoinForcedBreaks(card.text).replace(/\s+/g, ' ').trim();
+    if (card.ruleDraft && typeof card.ruleDraft === 'object' && !usedCards.has(id)
+      && !/^(?:[^:]{1,40}:\s*)?(?:↩|✅|✓)/.test(text)) {
+      if (q && !text.toLowerCase().includes(q)) continue;
+      const draft = draftFromRuleCandidate(id, card.ruleDraft);
+      const route = draft ? 'rule' : 'instruction';
+      counts[route]++;
+      out.push({ card: id, area: card.area || null, excerpt: text.slice(0, 320), route,
+        reason: draft ? `recorded rule-ready with the lesson (${card.ruleDraft.spec}) — a diff can check it`
+          : `recorded as \`${card.ruleDraft.spec}\`; a required-pattern (must) check is not a rule kind yet — stays an instruction`,
+        codeTokens: [], draft });
+      if (out.length >= limit) break;
+      continue;
+    }
     // Open questions are not lessons; superseded and resolved cards are history.
     if (!text || /^↩︎ superseded|^✓|resolved/i.test(text.slice(0, 40)) || /❓/.test(text.slice(0, 60)) || !LESSON_RE.test(text)) continue;
     if (q && !text.toLowerCase().includes(q)) continue;
@@ -1155,7 +1209,9 @@ export function proposeFromCards(cards, { limit = 30, query = '', existing = [],
       reason = 'a rule in .klypix/rules.json already cites this lesson';
     } else if (kindHit && lessonShaped) {
       const near = paths.filter(inWin);
-      const nearFragments = fragments.filter(inWin);
+      // A shell command, a URL or an address is a process instruction, never a
+      // pattern a diff should forbid in source files.
+      const nearFragments = fragments.filter(inWin).filter((c) => !SHELLISH_FRAGMENT.test(c.t));
       // The value a forbid-pattern draft forbids: the code fragment right after the prohibition, else just before it.
       const pattern = kindHit.kind === 'forbid-pattern'
         ? (nearFragments.find((c) => c.at >= phraseAt && c.at - phraseAt <= 150) || [...nearFragments].reverse().find((c) => c.at < phraseAt && phraseAt - c.at <= 60))?.t

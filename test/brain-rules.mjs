@@ -104,14 +104,19 @@ ok(!R.addCandidates(P.dir, [{ ...RULES[0], id: 'ghost', source: { card: 'txt_doe
 write(P.dir, 'src/App.tsx', '<Route path="/a" />\n<Route path="/b" />\n');
 let res = R.runRules(R.activeRules(R.loadRulesDoc(P.dir)), R.gitDiffSource(P.dir, { mode: 'worktree' }));
 ok(res.length === 0, 'candidates enforce nothing (no active rules yet)');
+ok(R.loadRulesDoc(P.dir).rules.filter((r) => r.kind !== 'cloud-required').every((r) => r.severity === 'warn'), 'a candidate never blocks: a draft that asks for block is stored as warn');
 let refused = await R.promoteRules(P.dir, RULES.map((r) => r.id), 'deadbeef');
 ok(!refused.ok && refused.reason === 'code' && /rules code promote/.test(refused.message), 'promote without the human\'s code is refused and says how to get it');
-const review = R.lifecycleReview(P.dir, 'promote', RULES.map((r) => r.id));
-ok(review.ok && /^[0-9a-f]{8}$/.test(review.code), 'the human review yields an 8-character code for exactly these rules');
-const promoted = await R.promoteRules(P.dir, RULES.map((r) => r.id), review.code);
-ok(promoted.ok && promoted.promoted.length === 5 && promoted.mirrored, 'with the code, all five become active and are mirrored into the brain');
+const warnReview = R.lifecycleReview(P.dir, 'promote', RULES.map((r) => r.id));
+const review = R.lifecycleReview(P.dir, 'promote', RULES.map((r) => r.id), { block: true });
+ok(review.ok && /^[0-9a-f]{8}$/.test(review.code) && warnReview.code !== review.code, 'the human review yields an 8-character code for exactly these rules, and blocking is part of what it covers');
+refused = await R.promoteRules(P.dir, RULES.map((r) => r.id), warnReview.code, { block: true });
+ok(!refused.ok && refused.reason === 'code' && /--block/.test(refused.message), 'a code printed for warning rules cannot make them block');
+const promoted = await R.promoteRules(P.dir, RULES.map((r) => r.id), review.code, { block: true });
+ok(promoted.ok && promoted.promoted.length === 5 && promoted.mirrored, 'with the --block code, all five become active and are mirrored into the brain');
 const doc = R.loadRulesDoc(P.dir);
 ok(doc.rules.every((r) => r.status === 'active' && r.approvedAt && r.mirrorCard), 'each active rule records when it was approved and its mirror card');
+ok(doc.rules.filter((r) => r.kind !== 'cloud-required').every((r) => r.severity === 'block') && doc.rules.find((r) => r.kind === 'cloud-required').severity === 'advise', 'the person\'s --block choice makes them block; cloud-required stays advice');
 {
   const { struct } = await parseKlypix(fs.readFileSync(path.join(P.dir, 'brain.klypix')));
   const ruleCard = struct.cards.find((c) => c.id === doc.rules.find((r) => r.id === 'private-routes').mirrorCard);
@@ -334,6 +339,15 @@ tool = await R.brainRulesTool({ projectRoot: P.dir, action: 'check', includeCand
 ok(tool.structured.results.some((r) => r.id === 'no-console' && r.ruleStatus === 'candidate' && r.findings.length === 1), 'check include_candidates: what a candidate would catch, before anyone approves it');
 tool = await R.brainRulesTool({ projectRoot: P.dir, action: 'check' });
 ok(!tool.structured.results.some((r) => r.id === 'no-console'), 'a plain check ignores candidates');
+{
+  // Approved without --block, a rule warns: the commit hook prints it and the commit goes through.
+  tool = await R.brainRulesTool({ projectRoot: P.dir, action: 'promote', ids: ['no-console'], approve: R.lifecycleReview(P.dir, 'promote', ['no-console']).code });
+  ok(!tool.isError && R.loadRulesDoc(P.dir).rules.find((r) => r.id === 'no-console').severity === 'warn', 'promote without block: the rule is active and warns');
+  git(P.dir, 'add', 'src/log.ts');
+  const warned = spawnSync('git', ['commit', '-qm', 'log the token'], { cwd: P.dir, encoding: 'utf8' });
+  ok(warned.status === 0 && /⚠ WARNING — project rule `no-console`/.test(`${warned.stdout}${warned.stderr}`), 'a warning rule is printed at commit and never stops it');
+  ok(R.readEvents(P.dir).some((e) => e.rule === 'no-console' && e.event === 'fire' && e.layer === 'commit'), 'and the warning is counted as a fire');
+}
 tool = await R.brainRulesTool({ projectRoot: P.dir, action: 'add', rules: [{ id: 'x2', kind: 'forbid-pattern', why: 'w', fix: 'f', source: { card: cards.relative }, files: ['a'], pattern: 'b' }], pluginMode: true });
 ok(tool.isError && /plugin mode/.test(tool.blocks[0].text), 'plugin mode refuses to write .klypix/rules.json');
 tool = await R.brainRulesTool({ projectRoot: P.dir, action: 'propose', query: 'enumerated' });

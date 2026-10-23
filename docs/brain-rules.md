@@ -13,6 +13,8 @@ before the change reaches CI.
   runs at check time. It takes milliseconds, works offline and costs nothing.
 - **A person approves every rule.** A drafted rule is a *candidate* and checks nothing until a
   person approves it with a code only they can print.
+- **Warn by default.** An approved rule warns: when a session plans its files, while it edits, and
+  at commit. It never stops the work unless the person chose *block* when approving it.
 - **In the repository.** Rules live in `.klypix/rules.json`, so every change to a rule shows up in
   a pull request. When a rule is approved or retired, a visible card in the brain's **Rules** area
   links back to the lesson.
@@ -31,8 +33,9 @@ mistake early: when an agent is about to write it, and again before the commit.
 | `preserve-eol` | A change that rewrites a file's line endings, for example mixed CRLF/LF flattened to CRLF by a Windows editor | A test pins one LF line in a mixed file |
 | `cloud-required` | A change to paths that trigger the expensive CI (advice only) | Runner-impacting paths start the macOS and Windows matrix |
 
-Severity is `block` (stops the edit or the commit), `warn` (says so and lets it through) or
-`advise` (a note). `cloud-required` is always `advise`.
+Severity is `warn` unless the person approves the rule with `--block`: `warn` says so and lets the
+work through, `block` stops the edit or the commit, `advise` is a note. `cloud-required` is always
+`advise`, and a candidate is never `block`.
 
 Two real rules, from [`docs/brain-rules-proof/`](brain-rules-proof/):
 
@@ -41,7 +44,7 @@ Two real rules, from [`docs/brain-rules-proof/`](brain-rules-proof/):
   "id": "frontend-routes-registered",
   "status": "active",
   "kind": "listed-in",
-  "severity": "block",
+  "severity": "warn",
   "why": "Every new App.tsx route must also be listed in frontend-fallback.ts, or a direct link to it returns 404.",
   "fix": "Add \"{1}\" to PRIVATE_ROUTES (or PUBLIC_ROUTES) in {registry}.",
   "source": { "card": "txt_w4fbw7m1" },
@@ -58,7 +61,7 @@ Two real rules, from [`docs/brain-rules-proof/`](brain-rules-proof/):
   "id": "admin-tests-relative-imports",
   "status": "active",
   "kind": "forbid-pattern",
-  "severity": "block",
+  "severity": "warn",
   "why": "The root vitest config has no @/ alias for admin/, so an admin test importing @/… fails to load in the Windows ci job.",
   "fix": "Import with a relative path from admin/tests (../lib/…).",
   "source": { "card": "txt_nxj3c0nm" },
@@ -74,23 +77,25 @@ The same engine runs at three points.
 | When | Where | What happens |
 |---|---|---|
 | Planning | `brain_sync`, for the files a session declares or has touched | The session is told which rules apply to its files, with the fix and the lesson |
-| Editing | Claude Code's edit hook (Edit, Write, MultiEdit) | A `block` forbid-pattern line is **denied** before it is written. Other findings come back as context. A line-ending change is reported straight after the edit |
+| Editing | Claude Code's edit hook (Edit, Write, MultiEdit) | Findings come back to the agent as context, once per session. A `block` forbid-pattern line is **denied** before it is written. A line-ending change is reported straight after the edit |
 | Editing | Codex's hook | The same findings, as warnings. Codex's hook output cannot deny a tool call, so the commit hook is what stops it |
-| Committing | git `pre-commit` and `pre-push` hooks (opt-in) | A failing `block` rule stops the commit or push, for every tool and every person |
+| Committing | git `pre-commit` and `pre-push` hooks (opt-in) | Every finding is printed. A failing `block` rule stops the commit or push, for every tool and every person; a `warn` rule lets it through |
 | After a commit | git `post-commit` hook (opt-in) | A commit that landed while a `block` rule fails on it (`--no-verify`, or the hooks were off) is recorded as a bypass |
 
 At edit time a `listed-in` rule never denies the edit, because the registry change may be the next
 edit. The commit hook checks the finished change.
 
-What an agent reads when a rule stops it. This is the rule above, run on the commit that failed
+What an agent reads when a rule fires. This is the rule above, run on the commit that failed
 AgentMug's CI in PR #790 (from the [backtest](brain-checks-proof.md)):
 
 ```text
-✗ BLOCKED — project rule `frontend-routes-registered` (lesson txt_w4fbw7m1)
+⚠ WARNING — project rule `frontend-routes-registered` (lesson txt_w4fbw7m1)
   Found: artifacts/agentforge/src/App.tsx:522 adds `<Route path="/organization"`, but `"/organization"` is not in artifacts/api-server/src/middlewares/frontend-fallback.ts
   Why:   Every new App.tsx route must also be listed in frontend-fallback.ts, or a direct link to it returns 404.
   Fix:   Add "/organization" to PRIVATE_ROUTES (or PUBLIC_ROUTES) in artifacts/api-server/src/middlewares/frontend-fallback.ts.
 ```
+
+A rule approved with `--block` prints the same lines under `✗ BLOCKED`, and the commit stops.
 
 You can also run the check by hand, or as a step in CI:
 
@@ -126,10 +131,14 @@ rules file must not stop every commit.
    npx klypix-mcp rules code promote frontend-routes-registered
    ```
 
-   It prints each rule in full (files, pattern, registry, fix and the lesson it came from), then an
-   8-character code for exactly those rules, valid today. The person pastes the code into the
-   chat, and the agent calls `brain_rules` with `action: "promote"` and `approve: "<code>"`. Or the
-   person runs `npx klypix-mcp rules promote <ids> --code <code>` themselves. The rule becomes
+   It prints each rule in full (files, pattern, registry, fix and the lesson it came from), says
+   whether the rules will warn or block, then prints an 8-character code for exactly that, valid
+   today. Approved rules warn. To make them stop an edit or a commit, the person adds `--block`
+   (`npx klypix-mcp rules code promote <ids> --block`); the code covers that choice, so a code
+   printed for warning rules cannot make them block. The person pastes the code into the
+   chat, and the agent calls `brain_rules` with `action: "promote"` and `approve: "<code>"` (and
+   `block: true` after `--block`). Or the person runs `npx klypix-mcp rules promote <ids> --code
+   <code>` themselves, with `--block` if they chose it. The rule becomes
    `active`, records who approved it and when, and gets its card in the brain's Rules area, linked
    from the lesson.
 5. **Commit `.klypix/rules.json`.** The rule is now part of the repository and reaches every clone.
@@ -169,8 +178,8 @@ person's choice.
 npx klypix-mcp rules
 ```
 
-In a scratch repository with those two rules, after one blocked commit that was then pushed
-through with `--no-verify`:
+In a scratch repository with those two rules, the route rule approved with `--block`, after one
+blocked commit that was then pushed through with `--no-verify`:
 
 ```text
 .klypix/rules.json: 2 rule(s) · git hooks: installed

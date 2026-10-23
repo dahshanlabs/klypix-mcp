@@ -1542,7 +1542,7 @@ server.registerTool('brain_sync', {
 
 server.registerTool('brain_rules', {
   title: 'Project rules from the brain\'s lessons — enforced before CI, with no AI at check time',
-  description: 'Turns lessons this brain recorded ("every new route must also be in PRIVATE_ROUTES", "a new *.test.ts must be listed in package.json", "this file is mixed CRLF/LF") into DETERMINISTIC diff checks, versioned in the repo as .klypix/rules.json, each citing the card it came from. Enforced before the code reaches CI: brain_sync shows the rules for the files you declare; the Claude Code edit hook denies a forbidden line and adds context for the rest (Codex: warnings); an opt-in git pre-commit/pre-push hook blocks for every tool and person and records --no-verify bypasses. Actions: "propose" routes each lesson to rule / instruction / note and drafts the checkable ones; "add" writes completed drafts as CANDIDATES (inert); "promote" and "retire" need the human\'s 8-character approval code (`npx klypix-mcp rules code promote|retire <ids>` — never shown to you, never guess it; a rule that blocks you is lifted only by the human); "check" runs the rules on the working tree, the staged change, or a range (include_candidates:true tests candidates before approval); "status" lists rules with fires / blocks / overrides / false alarms and retirement suggestions; "false_alarm" records that a finding was wrong (it does not lift the rule). Kinds: listed-in, forbid-pattern, preserve-eol, cloud-required. Checks are string/glob/regex work over the diff — milliseconds, offline; the project\'s own tests stay with its CI.',
+  description: 'Turns lessons this brain recorded ("every new route must also be in PRIVATE_ROUTES", "a new *.test.ts must be listed in package.json", "this file is mixed CRLF/LF") into DETERMINISTIC diff checks, versioned in the repo as .klypix/rules.json, each citing the card it came from. Checked before the code reaches CI: brain_sync shows the rules for the files you declare; the edit hook (Claude Code; Codex gets the same) and an opt-in git pre-commit/pre-push hook report findings. Rules WARN by default; only a rule the human approved with --block stops an edit (Claude Code) or a commit, and a commit that skips a blocking rule (--no-verify) is recorded. Actions: "propose" routes each lesson to rule / instruction / note and drafts the checkable ones; "add" writes completed drafts as CANDIDATES (inert); "promote" and "retire" need the human\'s 8-character approval code (`npx klypix-mcp rules code promote|retire <ids>` — never shown to you, never guess it; a rule that blocks you is lifted only by the human); "check" runs the rules on the working tree, the staged change, or a range (include_candidates:true tests candidates before approval); "status" lists rules with fires / blocks / overrides / false alarms and retirement suggestions; "false_alarm" records that a finding was wrong (it does not lift the rule). Kinds: listed-in, forbid-pattern, preserve-eol, cloud-required. Checks are string/glob/regex work over the diff — milliseconds, offline; the project\'s own tests stay with its CI.',
   inputSchema: {
     action: z.enum(['propose', 'add', 'check', 'status', 'promote', 'retire', 'false_alarm']).describe('What to do. Default flow: propose → add → (human) promote; check any time; status for counts and suggestions.'),
     project: z.string().optional().describe('Absolute project root (the folder holding brain.klypix and .klypix/). Defaults to this session\'s project brain.'),
@@ -1557,14 +1557,15 @@ server.registerTool('brain_rules', {
     head: z.string().optional().describe('check: head ref for a range (default HEAD).'),
     files: z.array(z.string()).max(50).optional().describe('check: just list the rules these files fall under (no diff).'),
     include_candidates: z.boolean().optional().describe('check: also run candidate rules — to see what a rule would catch before the human approves it.'),
+    block: z.boolean().optional().describe('promote: true only when the human printed the code with --block, making these rules stop an edit or a commit instead of warning. Rules warn by default.'),
   },
-}, async ({ action, project, query, limit, rules, ids, approve, reason, mode, base, head, files, include_candidates }, extra) => {
+}, async ({ action, project, query, limit, rules, ids, approve, reason, mode, base, head, files, include_candidates, block }, extra) => {
   try {
     const { brainRulesTool } = await import('../src/brain-rules.mjs');
     const brainPath = project ? path.join(path.resolve(project), 'brain.klypix') : (mcpPresence.brainPath || path.join(mcpPresence.vault, 'brain.klypix'));
     return toContent(await brainRulesTool({
       projectRoot: path.dirname(brainPath), brainPath, action, query, limit, rules, ids, approve, reason, mode, base, head, files,
-      includeCandidates: include_candidates === true, pluginMode: PLUGIN_MODE, proposedBy: extra?.klypixClientName || '',
+      includeCandidates: include_candidates === true, block: block === true, pluginMode: PLUGIN_MODE, proposedBy: extra?.klypixClientName || '',
     }));
   } catch (error) {
     return toContent({ blocks: [{ kind: 'text', text: `brain_rules failed: ${error?.message || error}` }], isError: true });

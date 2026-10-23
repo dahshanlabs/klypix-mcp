@@ -14,7 +14,10 @@ to the repositories can re-run (see *Reproduce it* at the end).
   (2026-10-23, afternoon UTC).
 - **Rules:** the ones made from lessons in each repository's own brain, plus, in a separate set,
   lessons that were written down only in an agent's memory notes or in `CLAUDE.md` and never reached
-  the brain. Both sets are in [`docs/brain-rules-proof/`](brain-rules-proof/).
+  the brain. Both sets are in [`docs/brain-rules-proof/`](brain-rules-proof/). They are at the
+  default severity, `warn`: the backtest counts what a rule flags. Whether a flagged commit would
+  then have been stopped depends on the person approving the rule with `--block`, or on the agent
+  acting on the warning; a backtest cannot tell which.
 
 ## The short answer
 
@@ -24,7 +27,7 @@ to the repositories can re-run (see *Reproduce it* at the end).
 | Billable minutes / list price | 8,952 min / $69.57 | 9,556 min / $88.24 |
 | Pull requests with runs / cost per PR | 121 / $0.47 | 300 / $0.20 |
 | Failed CI attempts / what they cost | 111 / $20.25 | 46 / $4.51 |
-| Failed CI runs the rules would have stopped | **2** (PRs #790 and #776), before the push | **2** (master, PR #559), by stopping the PR that caused them (#549) |
+| Failed CI runs whose cause a rule flags before the push | **2** (PRs #790 and #776) | **2** (master, PR #559), flagged in the PR that caused them (#549) |
 | What those runs cost | **$0.22** (≤ $0.24 counting everything else that ran on those commits) | **$0.25**, plus **$0.26** for the fix PR (#564) |
 | Mistakes that passed the PR's own CI and that a rule flags | a line-ending flatten (#726) that later forced a rebase conflict resolved by hand | the same `@/` imports: #549 merged green because its Windows job runs only with a label |
 | False alarms | 14 findings in 3 PRs, all from one rule; one folder exclusion removes them | 1 finding (#470), from one rule |
@@ -96,7 +99,7 @@ had expired.
   at that commit:
 
   ```text
-  ✗ BLOCKED — project rule `frontend-routes-registered` (lesson txt_w4fbw7m1)
+  ⚠ WARNING — project rule `frontend-routes-registered` (lesson txt_w4fbw7m1)
     Found: artifacts/agentforge/src/App.tsx:522 adds `<Route path="/organization"`, but `"/organization"` is not in artifacts/api-server/src/middlewares/frontend-fallback.ts
     Why:   Every new App.tsx route must also be listed in frontend-fallback.ts, or a direct link to it returns 404.
     Fix:   Add "/organization" to PRIVATE_ROUTES (or PUBLIC_ROUTES) in artifacts/api-server/src/middlewares/frontend-fallback.ts.

@@ -5,7 +5,7 @@
       "id": "api-tests-enumerated",
       "status": "active",
       "kind": "listed-in",
-      "severity": "block",
+      "severity": "warn",
       "why": "api-server test files are enumerated in its package.json; a new test not listed there never runs in CI (lesson recorded only in a session memory note).",
       "fix": "Add {relpath} to the matching test:* script in artifacts/api-server/package.json.",
       "source": {
@@ -28,7 +28,7 @@
       "id": "managed-run-worker-eol",
       "status": "active",
       "kind": "preserve-eol",
-      "severity": "block",
+      "severity": "warn",
       "why": "managed-run-worker.ts is mixed CRLF/LF and a test pins one LF line; a Windows edit flattens it and CI fails (lesson recorded only in a session memory note).",
       "fix": "Restore main's line endings in {file} line by line (keep CRLF only on inserted lines).",
       "source": {
@@ -42,7 +42,7 @@
       "id": "postgres-tests-enumerated",
       "status": "active",
       "kind": "listed-in",
-      "severity": "block",
+      "severity": "warn",
       "why": "Postgres integration tests run only from the explicit list in .github/workflows/ci.yml; a new one not listed there never runs (lesson recorded only in a session memory note).",
       "fix": "Add {relpath} to the matching postgres test step in .github/workflows/ci.yml.",
       "source": {

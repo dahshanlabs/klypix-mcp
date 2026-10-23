@@ -69,11 +69,11 @@ You need **Node.js 20 or newer** (`node -v`).
   git command that would sweep another live session's uncommitted work into your commit is stopped.
   A command that would throw work away saves a rescue copy first, then asks you. It covers git
   commands run through Claude Code's tools, on one computer.
-- **Lessons that stop the repeat mistake.** A lesson the brain recorded can become a project rule
-  that a person approves: a check of the diff, with no AI at check time. Claude Code is stopped
-  before it writes a forbidden line, Codex is warned, and an opt-in git hook stops the commit for
-  any tool or person. Every exception is recorded in the brain. Rules check the diff; they do not
-  run your tests.
+- **Lessons that catch the repeat mistake.** A lesson the brain recorded can become a project rule
+  that a person approves: a check of the diff, with no AI at check time. A rule warns when a session
+  plans its files, while it edits and at commit. Only a rule the person approves as blocking stops
+  the work: Claude Code before it writes the forbidden line (Codex is warned), and an opt-in git
+  hook at commit, for any tool or person. Rules check the diff; they do not run your tests.
 - **A file you own.** The brain is one `.klypix` file in your repo: a plain ZIP, versioned with
   Git. The engine is Apache-2.0, runs on your machine, and works without the KLYPIX app or an
   account. Brain data stays in your files; your agent's model provider still receives what the
@@ -698,10 +698,12 @@ lessons into rules in `.klypix/rules.json`, each citing the card it came from. A
 each rule with a code only they can print (`npx klypix-mcp rules code promote <ids>`). Until then
 the rule is a candidate and checks nothing.
 
-An active rule runs in three places. `brain_sync` names the rules for a session's files. Claude
-Code's edit hook denies a forbidden line before it is written; Codex is warned, because its hooks
-cannot deny. The opt-in git hooks (`npx klypix-mcp check --install-hook`) stop a failing commit or
-push, for any tool or person. A check is glob, regex and line-ending work over the diff: it takes
+An active rule runs in three places: `brain_sync` names the rules for a session's files, the edit
+hook reports findings to Claude Code and Codex as they edit, and the opt-in git hooks
+(`npx klypix-mcp check --install-hook`) print them at commit and push. Rules warn by default. A
+rule the person approves with `--block` stops the commit or push for any tool or person, and stops
+Claude Code before it writes a forbidden line; Codex is only warned, because its hooks cannot
+deny. A check is glob, regex and line-ending work over the diff: it takes
 milliseconds, runs offline and uses no model. Overrides, bypasses and false alarms are recorded in
 the brain, and `npx klypix-mcp rules` shows each rule's blocks, overrides and false alarms.
 
@@ -1205,7 +1207,7 @@ The MCP verbs below are what agents call. These are what **you** call:
 | `brain_insights` | Hubs, orphaned decisions, stale questions, area sizes |
 | `brain_lens` | Machine-readable freshness, provenance, activity, timeline, orrery and unresolved views; on a canvas open in KLYPIX (Windows), the first five come from KLYPIX's own lens code |
 | `brain_garden` | Maintenance pass — proposes first; consolidation cannot apply without an approval code the human generates. The separate `repair:"duplicate-partials"` pass is dry-run first and needs no code (it removes only exact repeats and archives nothing) |
-| `brain_rules` | Project rules made from the brain's lessons: `propose` routes each lesson to rule, instruction or note; `add` writes candidates to `.klypix/rules.json`; `promote` and `retire` need the person's approval code; `check` runs the rules on a diff; `status` shows blocks, overrides, false alarms and retirement suggestions. No AI at check time ([docs/brain-rules.md](docs/brain-rules.md)) |
+| `brain_rules` | Project rules made from the brain's lessons: `propose` routes each lesson to rule, instruction or note; `add` writes candidates to `.klypix/rules.json`; `promote` and `retire` need the person's approval code, and a rule warns unless the person approved it with `--block`; `check` runs the rules on a diff; `status` shows blocks, overrides, false alarms and retirement suggestions. No AI at check time ([docs/brain-rules.md](docs/brain-rules.md)) |
 | `brain_doctor` | Self-diagnosis: version, core/enhanced host adapters, active sessions, tool count, projection drift |
 | `brain_message` | Session-to-session coordination notes — to a live session, or queued for one that is not running until it next starts — with a fixed send-time audience and per-recipient pending / offer / acknowledgement / consumption / failure receipts (a directed note is kept 7 days, a broadcast 24h; never written into the brain) |
 | `brain_message_receipt` | Explicitly record model-side consumption using the exact message id and per-recipient offer token; acknowledgement alone never consumes a note |
@@ -1442,9 +1444,10 @@ Read this section before you build on any of it.
   committed work only, needs git 2.38 or newer, and runs only for sessions on different local
   branches of the same repository.
 - **Project rules check the diff, not behaviour.** They see file names, added lines, line endings
-  and paths; they do not run code or tests. Codex is warned, not stopped, while it edits (the
-  commit hook stops the commit), and the commit hooks are opt-in per clone. The approval code and
-  the refusal inside agent shells prevent accidents; they do not stop a deliberate workaround.
+  and paths; they do not run code or tests. They warn unless the person approved them with
+  `--block`; Codex is warned, not stopped, while it edits, and the commit hooks are opt-in per
+  clone. The approval code and the refusal inside agent shells prevent accidents; they do not stop
+  a deliberate workaround.
 - **Overlap warnings are advisory.** Nothing is blocked. One severity string in the payload reads
   `blocking`; the mechanism is not.
 - **Codex has no automatic capture**, with or without `--codex-hooks`. The Codex hook never writes

@@ -5,7 +5,7 @@
       "id": "frontend-routes-registered",
       "status": "active",
       "kind": "listed-in",
-      "severity": "block",
+      "severity": "warn",
       "why": "Every new App.tsx route must also be listed in frontend-fallback.ts, or a direct link to it returns 404.",
       "fix": "Add \"{1}\" to PRIVATE_ROUTES (or PUBLIC_ROUTES) in {registry}.",
       "source": { "card": "txt_w4fbw7m1" },

@@ -134,7 +134,8 @@ export function validateRule(raw) {
   if (!STATUSES.includes(status)) errors.push(`status must be one of ${STATUSES.join(', ')}`);
   const kind = String(raw.kind || '');
   if (!RULE_KINDS.includes(kind)) errors.push(`kind must be one of ${RULE_KINDS.join(', ')}`);
-  const severity = String(raw.severity || (kind === 'cloud-required' ? 'advise' : 'block'));
+  // Warn unless a person chose block when approving the rule (promote --block).
+  const severity = String(raw.severity || (kind === 'cloud-required' ? 'advise' : 'warn'));
   if (!SEVERITIES.includes(severity)) errors.push(`severity must be one of ${SEVERITIES.join(', ')}`);
   const why = typeof raw.why === 'string' ? raw.why.trim() : '';
   if (!why || why.length > 300) errors.push('why is required: the lesson in one line (at most 300 characters)');
@@ -248,7 +249,9 @@ export function addCandidates(projectRoot, proposed, { cardExists = null, propos
   const errors = [];
   const added = [];
   for (const [i, raw] of list.entries()) {
-    const checked = validateRule({ ...raw, status: 'candidate', proposedAt: now.toISOString(), ...(proposedBy ? { proposedBy } : {}) });
+    // A candidate never blocks: whether a rule stops work is the person's choice at approval.
+    const severity = raw?.severity === 'block' ? 'warn' : raw?.severity;
+    const checked = validateRule({ ...raw, ...(severity ? { severity } : {}), status: 'candidate', proposedAt: now.toISOString(), ...(proposedBy ? { proposedBy } : {}) });
     if (!checked.ok) { errors.push(...checked.errors.map((e) => `rules[${i}]: ${e}`)); continue; }
     const prior = byId.get(checked.rule.id);
     if (prior && prior.status !== 'candidate') { errors.push(`rules[${i}]: ${checked.rule.id} is ${prior.status}; propose a new id and retire the old rule instead`); continue; }
@@ -270,8 +273,12 @@ function pick(doc, ids, statuses) {
   return { want, found, missing, wrong };
 }
 
-/** What the human reviews before approving: the rules and the code for exactly them. */
-export function lifecycleReview(projectRoot, action, ids, { now = new Date() } = {}) {
+/**
+ * What the human reviews before approving: the rules and the code for exactly
+ * them. `block` (promote only) is the person's choice to make the rules stop an
+ * edit or a commit instead of warning; it is part of what the code covers.
+ */
+export function lifecycleReview(projectRoot, action, ids, { now = new Date(), block = false } = {}) {
   const doc = loadRulesDoc(projectRoot);
   if (!doc.ok) return { ok: false, message: doc.errors.join('; ') };
   const statuses = action === 'promote' ? ['candidate'] : ['candidate', 'active'];
@@ -279,15 +286,16 @@ export function lifecycleReview(projectRoot, action, ids, { now = new Date() } =
   if (!found.length || missing.length || wrong.length) {
     return { ok: false, message: [missing.length ? `not found: ${missing.join(', ')}` : '', wrong.length ? `cannot ${action}: ${wrong.map((r) => `${r.id} is ${r.status}`).join(', ')}` : '', !found.length ? 'name at least one rule' : ''].filter(Boolean).join('; ') };
   }
-  return { ok: true, rules: found, code: lifecycleCode(action, found, now.toISOString().slice(0, 10)) };
+  const rules = action === 'promote' && block ? found.map((r) => (r.kind === 'cloud-required' ? r : { ...r, severity: 'block' })) : found;
+  return { ok: true, rules, code: lifecycleCode(action, rules, now.toISOString().slice(0, 10)) };
 }
 
 /** candidate → active, only with the human's code. Mirrors each rule into the brain. */
-export async function promoteRules(projectRoot, ids, code, { approvedBy = 'human (approval code)', now = new Date(), brainPath = null } = {}) {
-  const review = lifecycleReview(projectRoot, 'promote', ids, { now });
+export async function promoteRules(projectRoot, ids, code, { approvedBy = 'human (approval code)', now = new Date(), brainPath = null, block = false } = {}) {
+  const review = lifecycleReview(projectRoot, 'promote', ids, { now, block });
   if (!review.ok) return { ok: false, reason: 'invalid', message: review.message };
   if (String(code || '').trim() !== review.code) {
-    return { ok: false, reason: 'code', message: `Refused: activating a rule needs the human's approval code. Show the human the rule(s) and ask them to run \`npx klypix-mcp rules code promote ${review.rules.map((r) => r.id).join(' ')}\` in this project, then pass the 8-character code they paste. The code is tied to the exact rule text and to today; it is never shown to you.` };
+    return { ok: false, reason: 'code', message: `Refused: activating a rule needs the human's approval code. Show the human the rule(s) and ask them to run \`npx klypix-mcp rules code promote ${review.rules.map((r) => r.id).join(' ')}${block ? ' --block' : ''}\` in this project, then pass the 8-character code they paste. The code is tied to the exact rule text, to whether the rules block, and to today; it is never shown to you.` };
   }
   const doc = loadRulesDoc(projectRoot);
   const stamp = now.toISOString();
@@ -328,7 +336,7 @@ const sentence = (s) => { const t = String(s || '').trim(); return /[.!?]$/.test
 export function ruleCardText(rule) {
   const where = rule.kind === 'listed-in' ? `Checked: new ${rule.files.join(', ')} must appear in ${rule.registry.join(', ')}.`
     : `Files: ${rule.files.join(', ')}.`;
-  return `${RULES_AREA}: 📏 Rule \`${rule.id}\` is active (${rule.severity}, ${rule.kind}). Why: ${sentence(rule.why)} Fix: ${sentence(rule.fix)} ${where} Enforced when a session declares these files (brain_sync), on each edit (Claude Code blocks, Codex warns) and before commit (git hook). From lesson ${rule.source.card}; versioned in ${RULES_FILE}.`;
+  return `${RULES_AREA}: 📏 Rule \`${rule.id}\` is active (${rule.severity}, ${rule.kind}). Why: ${sentence(rule.why)} Fix: ${sentence(rule.fix)} ${where} ${rule.severity === 'block' ? 'Blocks: it stops an edit (Claude Code; Codex is warned) and a commit (git hook) until the change is fixed or a person allows it.' : 'Warns when a session declares these files (brain_sync), on each edit and at commit; it never stops the work.'} From lesson ${rule.source.card}; versioned in ${RULES_FILE}.`;
 }
 
 // ── brain writes (cards for lifecycle, overrides and false alarms) ──────────
@@ -1166,7 +1174,7 @@ export function proposeFromCards(cards, { limit = 30, query = '', existing = [],
         draft = {
           id: `${kindHit.kind.split('-')[0]}-${id.replace(/^txt_/, '').replace(/[^a-z0-9]/gi, '').slice(0, 8).toLowerCase()}`,
           kind: kindHit.kind,
-          severity: kindHit.kind === 'cloud-required' ? 'advise' : 'block',
+          severity: kindHit.kind === 'cloud-required' ? 'advise' : 'warn',
           why: '<the lesson in one line>',
           fix: '<how to fix a finding, in one line>',
           source: { card: id },
@@ -1412,7 +1420,9 @@ export async function runRulesCli(argv, { cwd = process.cwd(), env = process.env
 async function rulesCommand(repo, args, { stdout, stderr, env = process.env }) {
   const sub = args[0] || 'list';
   const flag = (f) => { const i = args.indexOf(f); return i >= 0 ? args[i + 1] : undefined; };
-  const positional = args.slice(1).filter((a, i, arr) => !a.startsWith('--') && !(i > 0 && arr[i - 1].startsWith('--')));
+  const VALUE_FLAGS = new Set(['--code', '--reason', '--file']);
+  const positional = args.slice(1).filter((a, i, arr) => !a.startsWith('--') && !(i > 0 && VALUE_FLAGS.has(arr[i - 1])));
+  const block = args.includes('--block');
   if (sub === 'code') {
     const action = positional[0];
     if (!['promote', 'retire'].includes(action)) { stderr('usage: klypix-mcp rules code promote|retire <rule-id>…\n'); return 2; }
@@ -1421,9 +1431,10 @@ async function rulesCommand(repo, args, { stdout, stderr, env = process.env }) {
       stderr(`\`rules code\` prints the approval code that makes rules active or retires them, so it is the person's to run in their own terminal; it does not run inside an agent's shell (${agent}). Show the person the rules, then ask them to run: npx klypix-mcp rules code ${action} ${positional.slice(1).join(' ')}\n`);
       return 1;
     }
-    const review = lifecycleReview(repo, action, positional.slice(1));
+    const review = lifecycleReview(repo, action, positional.slice(1), { block });
     if (!review.ok) { stderr(`${review.message}\n`); return 1; }
     stderr(`You are approving: ${action} ${review.rules.length} rule(s):\n`);
+    if (action === 'promote') stderr(block ? 'They will BLOCK: stop an edit (Claude Code) and a commit until the change is fixed or a person allows it.\n' : 'They will WARN: shown before and during the work and at commit, never stopping it. To make them block, run this again with --block.\n');
     for (const r of review.rules) stderr(`  ${r.id} (${r.kind}, ${r.severity}) — ${r.why}\n    fix: ${r.fix}\n    files: ${r.files.join(', ')}${r.registry ? ` → ${r.registry.join(', ')}` : ''}${r.pattern ? `\n    pattern: ${r.pattern}` : ''}\n    from lesson ${r.source.card}\n`);
     stderr('If that is what you want, paste this code into the chat (valid today, for exactly these rules):\n');
     stdout(`${review.code}\n`);
@@ -1433,7 +1444,7 @@ async function rulesCommand(repo, args, { stdout, stderr, env = process.env }) {
     const ids = positional; const code = flag('--code');
     if (!ids.length || !code) { stderr(`usage: klypix-mcp rules ${sub} <rule-id>… --code <code from \`rules code ${sub} …\`>${sub === 'retire' ? ' [--reason "<why>"]' : ''}
 `); return 2; }
-    const res = sub === 'promote' ? await promoteRules(repo, ids, code, { approvedBy: `${os.userInfo().username} (terminal)` }) : await retireRules(repo, ids, code, { reason: flag('--reason') || '' });
+    const res = sub === 'promote' ? await promoteRules(repo, ids, code, { approvedBy: `${os.userInfo().username} (terminal)`, block }) : await retireRules(repo, ids, code, { reason: flag('--reason') || '' });
     if (!res.ok) { stderr(`${res.message}
 `); return 1; }
     stdout(`${sub === 'promote' ? 'Active' : 'Retired'}: ${(res.promoted || res.retired).join(', ')}.${res.mirrored ? ' Mirrored into the brain.' : ` ${res.mirrorNote}`}
@@ -1488,7 +1499,7 @@ async function brainCards(brainPath) {
  * brain_rules: propose | add | check | status | promote | retire | false_alarm.
  * Returns { blocks, structured, isError } for the worker's toContent.
  */
-export async function brainRulesTool({ projectRoot, brainPath = null, action = 'status', query = '', limit = 30, rules = [], ids = [], approve = '', reason = '', mode = 'worktree', base = '', head = '', files = [], includeCandidates = false, pluginMode = false, proposedBy = '' } = {}) {
+export async function brainRulesTool({ projectRoot, brainPath = null, action = 'status', query = '', limit = 30, rules = [], ids = [], approve = '', reason = '', mode = 'worktree', base = '', head = '', files = [], includeCandidates = false, pluginMode = false, proposedBy = '', block = false } = {}) {
   const root = path.resolve(projectRoot);
   const brain = brainPath || path.join(root, 'brain.klypix');
   const writes = ['add', 'promote', 'retire'];
@@ -1524,13 +1535,14 @@ export async function brainRulesTool({ projectRoot, brainPath = null, action = '
       `Added ${res.added.length} candidate rule(s) to ${RULES_FILE}: ${res.added.join(', ')}. Candidates enforce nothing.`,
       'To activate them, show the human each rule (why, fix, files, registry/pattern) and ask them to run, in this project:',
       `  npx klypix-mcp rules code promote ${res.added.join(' ')}`,
-      'They will paste an 8-character code if they approve; then call brain_rules {action:"promote", ids:[…], approve:"<code>"}. Never guess the code.',
+      'Approved rules WARN. If the human wants them to stop an edit or a commit, they add --block to that command.',
+      'They will paste an 8-character code if they approve; then call brain_rules {action:"promote", ids:[…], approve:"<code>"} (with block:true if they used --block). Never guess the code.',
       `Commit ${RULES_FILE} so the rules travel with the repo and every change to them is reviewed in a PR.`,
     ].join('\n'), { ok: true, added: res.added, file: res.file });
   }
 
   if (action === 'promote' || action === 'retire') {
-    const res = action === 'promote' ? await promoteRules(root, ids, approve, { brainPath: brain }) : await retireRules(root, ids, approve, { reason, brainPath: brain });
+    const res = action === 'promote' ? await promoteRules(root, ids, approve, { brainPath: brain, block: block === true }) : await retireRules(root, ids, approve, { reason, brainPath: brain });
     if (!res.ok) return textResult(res.message, { ok: false, reason: res.reason }, true);
     const done = res.promoted || res.retired;
     const hookState = rulesHookStatus(root).state;

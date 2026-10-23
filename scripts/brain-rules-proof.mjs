@@ -25,8 +25,8 @@
 //   * ground truth: failed job logs of the --log-workflows workflows are
 //     searched for each rule's failure signature (signatures.json); every hit
 //     keeps its log line as evidence;
-//   * prevented: a failed CI run whose log carries the signature of a block
-//     rule that fires at the run's commit. Its cost counts every attempt;
+//   * prevented: a failed CI run whose log carries the signature of a rule
+//     (warn or block) that fires at the run's commit. Its cost counts every attempt;
 //   * silent rules (no signature: the mistake does not fail CI) are judged at
 //     each merged PR's last commit and against today's default branch;
 //   * --per-commit: every PR commit that touches a rule's files is also
@@ -379,7 +379,7 @@ for (const { run, job } of failedJobs) {
 for (const s of Object.values(failedSteps)) s.cost = round(s.cost);
 
 const preventable = prRuns.filter((run) => LOG_WORKFLOWS.has(run.name) && run.failedAttempts > 0
-  && Object.keys(run.hits || {}).some((id) => ruleById.get(id).severity === 'block' && firedAt(run, id)));
+  && Object.keys(run.hits || {}).some((id) => ruleById.get(id).severity !== 'advise' && firedAt(run, id)));
 const preventableShas = new Set(preventable.map((r) => r.head_sha));
 const sameCommitRuns = prRuns.filter((r) => preventableShas.has(r.head_sha));
 

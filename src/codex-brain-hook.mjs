@@ -338,6 +338,21 @@ function formatConflictWarning(conflicts, event, sessions = []) {
 // klypix-format predates guards degrades to silence, never a throw. This lane
 // only ever WARNS: block-severity guards are named as such so the model treats
 // them as a hard stop, but no mechanism here denies anything.
+// Project rules (.klypix/rules.json, made from this brain's lessons). Codex's
+// hook output cannot deny a tool call, so a block-severity finding is a warning
+// that says so; the git pre-commit hook is what stops the commit.
+async function ruleWarnings(projectDir, input, sessionId) {
+  try {
+    if (!fs.existsSync(path.join(projectDir, '.klypix', 'rules.json'))) return '';
+    const lib = await import(new URL('./brain-rules.mjs', import.meta.url).href);
+    if (typeof lib.preToolUseDecision !== 'function') return '';
+    const r = lib.preToolUseDecision(projectDir, toolName(input), toolInput(input), { sessionId, host: 'codex' });
+    if (!r) return '';
+    if (r.deny) return `${r.deny}\n(Codex cannot stop this edit — the git pre-commit hook will block the commit. Fix it now.)`;
+    return r.context || '';
+  } catch { return ''; }
+}
+
 async function guardWarnings(projectDir, brainPath, input, cwd) {
   try {
     if (typeof brainFormat.evaluateGuards !== 'function'
@@ -738,6 +753,7 @@ async function main() {
       // guard renders as a warning; a block-severity guard says it should be
       // treated as a hard stop, without claiming a mechanism this lane lacks.
       ...(event === 'PreToolUse' ? [await guardWarnings(projectDir, brainPath, input, cwd)] : []),
+      ...(event === 'PreToolUse' ? [await ruleWarnings(projectDir, input, sessionId)] : []),
       stampReceivedMessages(messages, Date.now(), undefined, sessionId),
     ], event);
     return;

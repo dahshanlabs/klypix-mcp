@@ -19,7 +19,7 @@ const PKG_VERSION = (() => {
   }
 })();
 
-const DIRECT = new Set(['install', 'link', 'doctor', 'runtime', 'conformance', 'garden-code', 'init', 'git-driver', 'git-hook', 'brain-history', 'brain-deleted', 'orphans', 'diff', 'pr-brief', 'uninstall', 'bench', 'sessions', 'rescue']);
+const DIRECT = new Set(['install', 'link', 'doctor', 'runtime', 'conformance', 'garden-code', 'init', 'git-driver', 'git-hook', 'brain-history', 'brain-deleted', 'orphans', 'diff', 'pr-brief', 'uninstall', 'bench', 'sessions', 'rescue', 'check', 'rules']);
 
 const USAGE = [
   `klypix-mcp ${PKG_VERSION} — shared project brain + MCP coordination server.`,
@@ -36,6 +36,11 @@ const USAGE = [
   '  bench [--quick] [--json] [--out F]  reproducible benchmark: concurrent-write safety, latency, soak, crash',
   '  init                                seed a starter ./brain.klypix + print an MCP config',
   '  garden-code [brain]                 print the human approval code for brain_garden',
+  '  check [--staged|--base B|--range A..B] [--strict] [--json]',
+  '                                      run this project\'s rules (.klypix/rules.json) on a diff — milliseconds, no install/tests',
+  '  check --install-hook|--remove-hook  opt-in git pre-commit/pre-push/post-commit hooks for those rules',
+  '  rules [list|code promote|retire <ids>|promote|retire <ids> --code C|allow <id> --reason R|false-alarm <id> --reason R]',
+  '                                      the human side of rules: approval codes, one-hour overrides, false alarms',
   '  uninstall [--check|--yes|unlink]    remove this install from the machine (--check inventories first; never deletes a .klypix)',
   '  git-driver [install|status] [repo]  register the card-level .klypix merge driver for a repo (zero-command teams)',
   '  git-hook [install|remove|status]    wire the agent-neutral commit-capture hook (any agent/branch/worktree → brain cards)',
@@ -78,6 +83,9 @@ if (verb === 'bench') {
   console.log(process.argv.includes('--json') ? JSON.stringify(report, null, 2) : markdown);
   const c = report.scenarios?.concurrentWriters;
   process.exit(c?.verdict === 'no-loss' ? 0 : 1);
+} else if (verb === 'check' || verb === 'rules') {
+  const { runRulesCli } = await import('../src/brain-rules.mjs');
+  process.exit(await runRulesCli(verb === 'rules' ? process.argv.slice(2) : process.argv.slice(3)));
 } else if (verb === 'runtime') {
   process.argv.splice(2, 1);
   await import('./klypix-runtime.mjs');

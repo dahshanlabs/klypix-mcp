@@ -42,6 +42,7 @@ import {
   upsertSession,
 } from './agent-presence.mjs';
 import { createNetworkBridge } from './network-bridge.mjs';
+import { formatRulesNotice, rulesForFiles } from './brain-rules.mjs';
 // ONE definition of the file key. Exact-overlap detection (here) and finding
 // ROUTING (there) must agree byte for byte — a file "owned" by a peer under one
 // normalizer and not the other is a route that silently never happens. The
@@ -3571,6 +3572,19 @@ export function createMcpPresence({
         releaseAdvisoryText = `KLYPIX release advisory: this checkout's package version ${repoState.packageVersion} is ahead of the last released tag ${repoState.latestReleaseTag.tag}${repoState.branch ? ` (branch ${repoState.branch})` : ''} and no release lease is declared. If a release is in preparation, declare it: brain_sync { releaseIntent: { version, ref } } takes the exclusive release lease and tells every peer.`;
       }
     }
+    // Project rules (brain-rules.mjs, .klypix/rules.json): the active rules this
+    // session's declared and observed files fall under, shown at plan time so
+    // the mistake is never made. Glob work plus at most one bounded read per
+    // EOL-protected file; any failure omits the block. Not counted as a "fire"
+    // (repeated syncs would inflate the per-rule counts).
+    let projectRules = [];
+    if (!completing) {
+      try {
+        const own = snapshot.self || {};
+        const scope = [...(Array.isArray(own.files) ? own.files : []), ...(Array.isArray(own.observedFiles) ? own.observedFiles : [])];
+        if (scope.length) projectRules = rulesForFiles(path.dirname(brainPath), scope).rules;
+      } catch { projectRules = []; }
+    }
     const durationMs = Math.max(0, Date.now() - syncStartedAt);
     const messagesText = formatReceivedMessages(report.messages, stamp, decay, sessionId);
     const structured = {
@@ -3597,6 +3611,8 @@ export function createMcpPresence({
       conflicts,
       // Additive (1.98.0): same-folder work with no shared file (advisory).
       ...(nearby.length ? { nearby } : {}),
+      // Additive: project rules for the files in this session's scope.
+      ...(projectRules.length ? { rules: projectRules } : {}),
       messages: report.messages.map((message) => {
         // Raw structured path gets the same decay verdict as the rendered
         // text: a consumer reading structured.messages directly must see the
@@ -3694,6 +3710,7 @@ export function createMcpPresence({
       messagesText,
       deliveryWarning,
       conflictText,
+      formatRulesNotice(projectRules),
       repoStateWarning,
       releaseAdvisoryText,
       workAtRiskText,

@@ -231,7 +231,7 @@ function runInstall(home, projectCwd, args = []) {
   fs.writeFileSync(path.join(proj, '.mcp.json'), JSON.stringify({ mcpServers: { 'klypix-canvas': { command: 'npx', args: ['-y', 'klypix-mcp', '--vault', '.'] } } }, null, 2));
   runInstall(home, proj);
   const bd = path.join(home, '.claude', 'project-brain');
-  for (const f of ['global-brain-hook.mjs', 'klypix-format.mjs', 'klypix-core.mjs', 'semantic-memory.mjs', 'brain-write-lock.mjs', 'app-lease.mjs', 'app-tools.mjs', 'app-bridge-protocol.mjs', 'app-bridge-client.mjs', 'klypix-mcp-server.mjs', 'klypix-mcp-worker.mjs', 'mcp-supervisor.mjs', 'mcp-auto-update.mjs', 'klypix-conformance.mjs', 'klypix-runtime.mjs', 'klypix-semantic-warm.mjs', 'runtime-inspector.mjs', 'agent-rules.mjs', 'brain-doctor.mjs', 'agent-presence.mjs', 'mcp-presence.mjs', 'repo-state.mjs', 'result-reconcile.mjs', 'presence-relay.mjs', 'network-bridge.mjs', 'codex-brain-hook.mjs', 'codex-hooks.mjs', 'session-handoff.mjs', 'whose.mjs', 'whose-classify.mjs', 'whose-ledger.mjs', 'whose-rescue.mjs']) {
+  for (const f of ['global-brain-hook.mjs', 'klypix-format.mjs', 'klypix-core.mjs', 'semantic-memory.mjs', 'brain-write-lock.mjs', 'brain-rules.mjs', 'app-lease.mjs', 'app-tools.mjs', 'app-bridge-protocol.mjs', 'app-bridge-client.mjs', 'klypix-mcp-server.mjs', 'klypix-mcp-worker.mjs', 'mcp-supervisor.mjs', 'mcp-auto-update.mjs', 'klypix-conformance.mjs', 'klypix-runtime.mjs', 'klypix-semantic-warm.mjs', 'runtime-inspector.mjs', 'agent-rules.mjs', 'brain-doctor.mjs', 'agent-presence.mjs', 'mcp-presence.mjs', 'repo-state.mjs', 'result-reconcile.mjs', 'presence-relay.mjs', 'network-bridge.mjs', 'codex-brain-hook.mjs', 'codex-hooks.mjs', 'session-handoff.mjs', 'whose.mjs', 'whose-classify.mjs', 'whose-ledger.mjs', 'whose-rescue.mjs']) {
     ok(fs.existsSync(path.join(bd, f)), `D: installed ${f}`);
   }
   ok(fs.existsSync(path.join(bd, 'node_modules', 'jszip')), 'D: runtime deps (jszip) copied');
@@ -305,7 +305,7 @@ function runInstall(home, projectCwd, args = []) {
   // settings.json wired 5 hooks (PreToolUse = guard cards, 2026-08-24)
   const settings = JSON.parse(fs.readFileSync(path.join(home, '.claude', 'settings.json'), 'utf8'));
   ok(['SessionStart', 'UserPromptSubmit', 'Stop', 'PostToolUse', 'PreToolUse'].every(e => Array.isArray(settings.hooks?.[e])), 'D: all 5 Claude Code hooks wired');
-  ok(settings.hooks.PreToolUse.some((g) => g.matcher === 'Bash|PowerShell|Edit|Write'
+  ok(settings.hooks.PreToolUse.some((g) => g.matcher === 'Bash|PowerShell|Edit|Write|MultiEdit'
     && g.hooks?.some((h) => h.command?.includes('--guard'))),
   'D: the PreToolUse entry runs the --guard fast path on shell + file tools');
   // Claude Code fires SessionStart with source "clear" on /clear. Leaving it

@@ -1840,6 +1840,43 @@ server.server.oninitialized = () => {
 };
 server.server.onclose = stopRuntimePresence;
 process.once('exit', stopRuntimePresence);
+// Published tool schemas are a compatibility contract: a running supervisor
+// compares them byte for byte before it hot-swaps a worker, and the frozen
+// snapshots in test/fixtures pin them. zod 4.6 writes a union of plain types as
+// `type: ["number","string"]` where every snapshot and every supervisor already
+// running knows `anyOf: [{type:"number"},{type:"string"}]` — the same meaning in
+// other bytes. Rewrite each type list back into anyOf, FIRST in its object as
+// zod 4.4 wrote it (before description), so a zod bump never drifts a frozen
+// schema.
+const isTypeList = (value) => Array.isArray(value) && value.length > 1 && value.every((t) => typeof t === 'string');
+function frozenSchemaShape(node) {
+  if (Array.isArray(node)) return node.map(frozenSchemaShape);
+  if (!node || typeof node !== 'object') return node;
+  const out = {};
+  if (isTypeList(node.type)) out.anyOf = node.type.map((type) => ({ type }));
+  for (const [key, value] of Object.entries(node)) {
+    if (key === 'type' && isTypeList(value)) continue;
+    out[key] = frozenSchemaShape(value);
+  }
+  return out;
+}
+const sdkListTools = server.server._requestHandlers?.get?.('tools/list');
+if (typeof sdkListTools === 'function') {
+  server.server._requestHandlers.set('tools/list', async (request, extra) => {
+    const result = await sdkListTools(request, extra);
+    if (!result || !Array.isArray(result.tools)) return result;
+    return {
+      ...result,
+      tools: result.tools.map((tool) => ({
+        ...tool,
+        ...(tool.inputSchema ? { inputSchema: frozenSchemaShape(tool.inputSchema) } : {}),
+        ...(tool.outputSchema ? { outputSchema: frozenSchemaShape(tool.outputSchema) } : {}),
+      })),
+    };
+  });
+} else {
+  log('tools/list schema shaping unavailable in this SDK; published schemas follow zod as-is');
+}
 await server.connect(transport);
 // Most sessions use brain_sync/presence and should not pay for a private model
 // they never query. Legacy mode restores the old eager lifecycle immediately.

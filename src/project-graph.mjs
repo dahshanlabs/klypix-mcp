@@ -378,7 +378,11 @@ function textContainsExactSourcePath(text, sourceFile) {
  */
 export function suggestProjectGraphBrainLinks(graphResult, brainContext, limit = 40) {
   if (graphResult?.status !== 'ready' || !Array.isArray(graphResult.nodes)) return [];
-  const hits = Array.isArray(brainContext?.hits) ? brainContext.hits : [];
+  // A lesson that names a declared file is shown under fileLessons, not hits.
+  const hits = [
+    ...(Array.isArray(brainContext?.fileLessons) ? brainContext.fileLessons : []),
+    ...(Array.isArray(brainContext?.hits) ? brainContext.hits : []),
+  ];
   const proposals = [];
   const seen = new Set();
   for (const node of graphResult.nodes) {

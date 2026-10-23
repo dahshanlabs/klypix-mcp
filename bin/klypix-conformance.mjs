@@ -134,7 +134,8 @@ try {
   metrics.startAttempts = { first: aStarted.attempt, second: bStarted.attempt };
   const aStructured = aStart.structuredContent || {};
   const bStructured = bStart.structuredContent || {};
-  checks.taskMemory = Array.isArray(aStructured.context?.hits) && aStructured.context.hits.length > 0;
+  checks.taskMemory = (Array.isArray(aStructured.context?.hits) && aStructured.context.hits.length > 0)
+    || (Array.isArray(aStructured.context?.fileLessons) && aStructured.context.fileLessons.length > 0);
   checks.truthfulTaskCount = bStructured.counts?.activeTasks === 2
     && bStructured.peers?.length === 1;
   checks.exactBlockingOverlap = bStructured.conflicts?.length === 1

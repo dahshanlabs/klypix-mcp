@@ -2,7 +2,7 @@
   "name": "klypix-mcp",
   "version": "1.106.0",
   "mcpName": "io.github.dahshanlabs/klypix-mcp",
-  "description": "Shared project memory for Claude Code, Codex and Cursor: decisions and corrections through MCP.",
+  "description": "Shared project memory for Claude Code, Codex and Cursor: decisions, corrections, overlap warnings.",
   "type": "module",
   "license": "Apache-2.0",
   "keywords": [
@@ -27,7 +27,13 @@
     "agent-memory",
     "local-first",
     "klypix",
-    "ai"
+    "ai",
+    "gemini-cli",
+    "ai-coding",
+    "team-memory",
+    "decision-log",
+    "overlap-warnings",
+    "agent-collaboration"
   ],
   "homepage": "https://klypix.com/developers",
   "repository": {

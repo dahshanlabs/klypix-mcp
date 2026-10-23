@@ -5,7 +5,8 @@
 Shared project memory for **Claude Code, Codex, Cursor** and other MCP coding tools. One
 `brain.klypix` file, committed with your code, carries the project's decisions, corrections and open
 questions across sessions and between tools. Corrections supersede stale decisions; sessions declare
-the files they expect to touch and get warned about same-machine overlap. Versioned in Git. Served
+the files they expect to touch and get warned about overlap: on this machine, and with
+[KLYPIX network](https://klypix.com/network) on both computers, with teammates' sessions on theirs. Versioned in Git. Served
 over MCP by a process on your machine. In the standalone setup, brain data stays in your files;
 your agent's provider can still receive what the agent reads. Integration depth differs by host — see
 [Supported hosts](#supported-hosts-and-their-integration-level).
@@ -29,11 +30,16 @@ For a team walkthrough, read the [shared project memory setup guide](https://kly
 Choosing an approach? Our [memory tools comparison](https://klypix.com/guides/shared-project-memory-tools)
 links each tool's official documentation and discloses that Klypix wrote it.
 
-![Two real MCP sessions on one project: Session B declares a file Session A already declared, and the server's exact-file-overlap warning fires; Session A then records a correction that supersedes its stale card](docs/demo/demo.gif)
+![Two real MCP sessions on one project: Session B declares a file Session A already declared, and the server's exact-file-overlap warning fires; Session A then records a correction that supersedes its stale card](https://raw.githubusercontent.com/dahshanlabs/klypix-mcp/master/docs/demo/demo.gif)
 
 <sub>Real output, not a mockup: both panes run a real MCP client against this server
 ([docs/demo/](docs/demo/) — the GIF is rendered by CI from a scripted tape against this server, not
 hand-recorded, and re-rendered when the server's responses change).</sub>
+
+**▶ Watch:** [For coding teams (40 s, with sound)](https://klypix.com/media/films/sessions-16x9-en.mp4) ·
+[The shared project brain (2 min 21 s)](https://klypix.com/developers#demo) ·
+[Full tour (4 min)](https://klypix.com/media/films/tour-16x9-en.mp4) ·
+[KLYPIX network](https://klypix.com/network)
 
 With **Node.js 20 or newer**, run this inside your project:
 
@@ -70,6 +76,22 @@ router, a worktree manager, or a replacement for Git. It holds what the project 
 [![MCP](https://img.shields.io/badge/MCP-server-475569?style=flat-square)](https://modelcontextprotocol.io)
 [![Glama score](https://glama.ai/mcp/servers/dahshanlabs/klypix-mcp/badges/score.svg)](https://glama.ai/mcp/servers/dahshanlabs/klypix-mcp)
 [![bench](https://img.shields.io/badge/npx_klypix--mcp_bench-10_writers_%C2%B7_0_lost-475569?style=flat-square)](BENCHMARKS.md)
+
+## New in 1.106: teammates on other computers
+
+![KLYPIX network: agent sessions on two computers declare the same file, the project brain warns before either edits it, and a note from one session lands in the other](https://klypix.com/network/klypix-network.gif)
+
+With [KLYPIX network](https://klypix.com/network) installed on both computers (a small background
+program, `curl -fsSL https://klypix.com/network/install.sh | sh`, or `irm https://klypix.com/network/install.ps1 | iex`
+on Windows), `brain_sync` also lists agent sessions on your teammates' computers in the same
+project, with their intent and declared files, and gives the same exact-file overlap warning it gives
+for a session on this machine. `brain_message` reaches those sessions too (their ids start with
+`net:`); a broadcast goes to this machine's sessions and theirs.
+
+Only the project key (a hash of the git remote), the one-line intent and repository-relative file
+paths leave the computer, plus the text of a note you send to a session there. There is no read
+receipt and no result reconciliation across computers. Without the program nothing changes; it is
+off in plugin mode and with `KLYPIX_NETWORK=0`.
 
 ## See the shared project brain in action
 
@@ -297,7 +319,8 @@ trial does not plan source-code edits.
 
 For a team on different machines, follow the [Git sharing steps](https://klypix.com/guides/shared-project-memory#team)
 and install in each clone. Standalone live presence and file-overlap warnings stay local to one
-machine and OS user. Keep approved architecture records and stable conventions alongside the brain.
+machine and OS user; with [KLYPIX network](#new-in-1106-teammates-on-other-computers) on each
+computer, they also cover teammates' sessions in the same project. Keep approved architecture records and stable conventions alongside the brain.
 
 ---
 
@@ -1256,6 +1279,12 @@ keep lazy first-use indexing instead.
   data, but a note relays whatever its sender typed (and automatic overlap alerts name the declared
   file paths involved). The scope is versioned: an older metadata-only grant does not authorize note
   text and must be granted again. No current consent, no frames.
+- **KLYPIX network is a separate, optional program.** When it is installed, `brain_sync` sends it
+  this session's project key (a hash of the git remote, never the path), its one-line intent and
+  repository-relative file paths, and `brain_message` sends the note text to a session on another
+  computer. Nothing else is sent. Traffic between computers is encrypted; a relay, when one is
+  needed, passes only encrypted traffic. Not installed, `KLYPIX_NETWORK=0`, or plugin mode: nothing
+  runs.
 - **`install` writes to your home directory:** `~/.claude/project-brain` (engine + runtime),
   `~/.claude/settings.json` (five hooks — written even if Claude Code is not installed),
   `~/.codex/AGENTS.md` (guidance block), and with `--codex-hooks`, `~/.codex/hooks.json`. It also
@@ -1284,13 +1313,15 @@ keep lazy first-use indexing instead.
 
 Read this section before you build on any of it.
 
-- **Coordination is machine-local and OS-user-local.** The presence lane is a file in your home
-  directory. Two developers on two machines do not see each other's sessions, peers, overlaps or
-  messages. This package ships the cross-machine presence *core* (`./presence-relay` — versioned
-  whitelisted presence metadata plus coordination-note text, a symmetric default-off consent gate,
-  loop prevention, stable message IDs and per-recipient-machine acknowledgement primitives), but no
-  transport: carrying frames between machines is the desktop app's job. With `klypix-mcp` alone,
-  coordination is machine-local.
+- **Coordination is machine-local and OS-user-local unless KLYPIX network is installed.** The
+  presence lane is a file in your home directory. With `klypix-mcp` alone, two developers on two
+  machines do not see each other's sessions, overlaps or messages. With
+  [KLYPIX network](https://klypix.com/network) on both computers (1.106.0+), they see each other's
+  sessions in the same project, with intent and declared files, get the exact-file overlap warning,
+  and can send notes; read receipts, result reconciliation and the merge test stay local. The
+  project match is by git remote (or folder name without one). This package also ships a
+  cross-machine presence *core* for the desktop app's cloud channel (`./presence-relay`, default-off
+  consent), which is a separate path.
 - **File overlap is exact-path.** A session needs declared files or observed edits to be checked;
   `src/auth/token.ts` does not match a rename. Folder overlap is advisory. The merge test sees
   committed work only, needs git 2.38 or newer, and runs only for sessions on different local

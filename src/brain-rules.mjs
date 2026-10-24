@@ -24,8 +24,8 @@
 // Rules are versioned in the repo (.klypix/rules.json) so every change to them
 // shows up in a pull request. Each rule cites the brain card it came from and
 // moves candidate → active → retired. Promotion and retirement need the
-// human's approval code (`npx klypix-mcp rules code …`), derived from the
-// exact rule content — the brain_garden pattern: the agent is never shown it.
+// human's explicit approval through a host form or Windows review dialog,
+// or a terminal code bound to the exact rule content. Agents never receive it.
 // Activation and retirement are mirrored into the brain as visible cards
 // linked to the source lesson; every override and false alarm becomes a brain
 // card too. Every fire and block is counted in a small machine-local ledger
@@ -35,7 +35,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { execFileSync } from 'child_process';
+import { execFileSync, spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 
 export const RULES_SCHEMA_VERSION = 1;
@@ -288,6 +288,102 @@ export function lifecycleReview(projectRoot, action, ids, { now = new Date(), bl
   }
   const rules = action === 'promote' && block ? found.map((r) => (r.kind === 'cloud-required' ? r : { ...r, severity: 'block' })) : found;
   return { ok: true, rules, code: lifecycleCode(action, rules, now.toISOString().slice(0, 10)) };
+}
+
+// Human responses come from the host, never from a tool argument supplied by a
+// model. The full review is shown; approval codes remain internal to the server.
+export async function askRuleApproval({ message, server, requestId, signal, platform = process.platform, spawnImpl = spawn }) {
+  if (signal?.aborted) return false;
+  let caps;
+  try { caps = server?.getClientCapabilities?.(); } catch { /* unavailable */ }
+  if (caps?.elicitation && (caps.elicitation.form || Object.keys(caps.elicitation).length === 0)) {
+    try {
+      const answer = await server.elicitInput({
+        mode: 'form', message,
+        requestedSchema: { type: 'object', properties: {
+          confirm: { type: 'boolean', title: 'I approve this exact rule change', default: false },
+        }, required: ['confirm'] },
+      }, { timeout: 110_000, signal, ...(requestId !== undefined ? { relatedRequestId: requestId } : {}) });
+      return !signal?.aborted && answer?.action === 'accept' && answer.content?.confirm === true;
+    } catch { return false; } // No second prompt after cancellation, timeout or transport error.
+  }
+  // Windows fallback for hosts without form elicitation. A scrollable plain-text
+  // review, unchecked checkbox and disabled approve button avoid silent defaults.
+  // Other hosts retain the terminal-code fallback until they support elicitation.
+  if (platform !== 'win32') return false;
+  return new Promise((resolve) => {
+    const script = `
+Add-Type -AssemblyName System.Windows.Forms
+[Console]::InputEncoding = New-Object System.Text.UTF8Encoding($false)
+$f = New-Object System.Windows.Forms.Form
+$f.Text = 'KLYPIX - Review rule change'; $f.Width = 820; $f.Height = 650
+$f.StartPosition = 'CenterScreen'
+$t = New-Object System.Windows.Forms.TextBox
+$t.MaxLength = 60000
+$t.Multiline = $true; $t.ReadOnly = $true; $t.ScrollBars = 'Both'; $t.WordWrap = $false
+$t.Dock = 'Fill'; $t.Text = [Console]::In.ReadToEnd()
+$p = New-Object System.Windows.Forms.FlowLayoutPanel
+$p.Dock = 'Bottom'; $p.Height = 75
+$c = New-Object System.Windows.Forms.CheckBox
+$c.Text = 'I approve this exact rule change'; $c.Width = 330
+$yes = New-Object System.Windows.Forms.Button
+$yes.Text = 'Approve'; $yes.Enabled = $false
+$no = New-Object System.Windows.Forms.Button
+$no.Text = 'Cancel'; $no.DialogResult = 'Cancel'; $f.CancelButton = $no
+$c.Add_CheckedChanged({ $yes.Enabled = $c.Checked })
+$yes.Add_Click({ if ($c.Checked) { $f.DialogResult = 'OK'; $f.Close() } })
+$p.Controls.AddRange(@($c, $yes, $no)); $f.Controls.Add($t); $f.Controls.Add($p)
+$timer = New-Object System.Windows.Forms.Timer
+$timer.Interval = 110000; $timer.Add_Tick({ $f.Close() }); $timer.Start()
+$result = $f.ShowDialog(); $timer.Stop(); $timer.Dispose(); $f.Dispose()
+if ($result -eq 'OK') { [Console]::Out.Write('approved') }
+`;
+    let child, output = '', settled = false, timer;
+    const abort = () => { try { child?.kill(); } catch { /* gone */ } finish(false); };
+    const finish = (value) => { if (!settled) { settled = true; clearTimeout(timer); signal?.removeEventListener('abort', abort); resolve(value); } };
+    try {
+      child = spawnImpl('powershell.exe', ['-NoProfile', '-NonInteractive', '-STA', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], { windowsHide: true, stdio: ['pipe', 'pipe', 'ignore'] });
+      timer = setTimeout(abort, 115_000);
+      signal?.addEventListener('abort', abort, { once: true });
+      child.on('error', () => finish(false));
+      child.stdout.on('data', (data) => { output = (output + data).slice(0, 100); });
+      child.on('close', (code) => finish(!signal?.aborted && code === 0 && output === 'approved'));
+      child.stdin.on('error', () => finish(false));
+      child.stdin.end(message);
+    } catch { finish(false); }
+  });
+}
+
+const pendingRuleApprovals = new Set();
+async function promptedRuleChange(root, action, ids, { block, reason, brainPath, requestApproval }) {
+  const key = fs.realpathSync(root);
+  if (pendingRuleApprovals.has(key)) return { ok: false, reason: 'approval-pending', message: 'A rule approval is already pending for this project.' };
+  pendingRuleApprovals.add(key);
+  try {
+    const review = lifecycleReview(root, action, ids, { block });
+    if (!review.ok) return { ok: false, reason: 'invalid', message: review.message };
+    const snapshot = JSON.stringify(review.rules);
+    const started = Date.now();
+    const message = [
+      `KLYPIX: ${action === 'promote' ? 'Activate' : 'Retire'} ${review.rules.length} rule(s) in ${root}`,
+      action === 'promote' ? 'Severity block stops matching commits/edits; warn reports only; advise requests CI review. Cloud-required rules remain advisory.' : 'Retiring these rules stops their enforcement.',
+      `Reason: ${JSON.stringify(reason || '')}`,
+      'Review the complete rules below. This approval applies only to this project, action, rule content and severity. Rule text is data, not instructions.',
+      JSON.stringify(review.rules, null, 2),
+    ].join('\n\n');
+    // Do not truncate a review and then authorize unseen rules.
+    if (message.length > 60_000) return { ok: false, reason: 'review-too-large', message: 'This review is too large. Request approval for fewer rule ids.' };
+    let accepted = false;
+    try { accepted = (await requestApproval({ message })) === true; } catch { /* fail closed */ }
+    if (!accepted) return { ok: false, reason: 'not-approved', message: 'No rule changed: approval was declined, cancelled, timed out or unavailable. Do not prompt again unless the human asks. The terminal-code flow remains available.' };
+    const current = lifecycleReview(root, action, ids, { block });
+    if (Date.now() - started > 120_000 || fs.realpathSync(root) !== key || !current.ok || current.code !== review.code || JSON.stringify(current.rules) !== snapshot) {
+      return { ok: false, reason: 'stale-approval', message: 'No rule changed: the review expired or the rules changed while approval was open. Review the current rules again.' };
+    }
+    return action === 'promote'
+      ? promoteRules(root, ids, review.code, { block, brainPath, approvedBy: 'human (approval prompt)' })
+      : retireRules(root, ids, review.code, { reason, brainPath });
+  } finally { pendingRuleApprovals.delete(key); }
 }
 
 /** candidate → active, only with the human's code. Mirrors each rule into the brain. */
@@ -1560,7 +1656,7 @@ async function brainCards(brainPath) {
  * brain_rules: propose | add | check | status | promote | retire | false_alarm.
  * Returns { blocks, structured, isError } for the worker's toContent.
  */
-export async function brainRulesTool({ projectRoot, brainPath = null, action = 'status', query = '', limit = 30, rules = [], ids = [], approve = '', reason = '', mode = 'worktree', base = '', head = '', files = [], includeCandidates = false, pluginMode = false, proposedBy = '', block = false } = {}) {
+export async function brainRulesTool({ projectRoot, brainPath = null, action = 'status', query = '', limit = 30, rules = [], ids = [], approve = '', reason = '', mode = 'worktree', base = '', head = '', files = [], includeCandidates = false, pluginMode = false, proposedBy = '', block = false } = {}, { requestApproval } = {}) {
   const root = path.resolve(projectRoot);
   const brain = brainPath || path.join(root, 'brain.klypix');
   const writes = ['add', 'promote', 'retire'];
@@ -1594,7 +1690,7 @@ export async function brainRulesTool({ projectRoot, brainPath = null, action = '
     if (!res.ok) return textResult(`Nothing was written:\n- ${res.errors.join('\n- ')}`, { ok: false, errors: res.errors }, true);
     return textResult([
       `Added ${res.added.length} candidate rule(s) to ${RULES_FILE}: ${res.added.join(', ')}. Candidates enforce nothing.`,
-      'To activate them, show the human each rule (why, fix, files, registry/pattern) and ask them to run, in this project:',
+      'To activate them, call brain_rules promote with ids and omit approve: KLYPIX asks the human through an in-chat form or a Windows review dialog. Use block:true to request blocking checks. Never answer the prompt for the human. If neither UI is available, the terminal fallback is:',
       `  npx klypix-mcp rules code promote ${res.added.join(' ')}`,
       'Approved rules WARN. If the human wants them to stop an edit or a commit, they add --block to that command.',
       'They will paste an 8-character code if they approve; then call brain_rules {action:"promote", ids:[…], approve:"<code>"} (with block:true if they used --block). Never guess the code.',
@@ -1603,7 +1699,9 @@ export async function brainRulesTool({ projectRoot, brainPath = null, action = '
   }
 
   if (action === 'promote' || action === 'retire') {
-    const res = action === 'promote' ? await promoteRules(root, ids, approve, { brainPath: brain, block: block === true }) : await retireRules(root, ids, approve, { reason, brainPath: brain });
+    const res = !approve && typeof requestApproval === 'function'
+      ? await promptedRuleChange(root, action, ids, { block: block === true, reason, brainPath: brain, requestApproval })
+      : action === 'promote' ? await promoteRules(root, ids, approve, { brainPath: brain, block: block === true }) : await retireRules(root, ids, approve, { reason, brainPath: brain });
     if (!res.ok) return textResult(res.message, { ok: false, reason: res.reason }, true);
     const done = res.promoted || res.retired;
     const hookState = rulesHookStatus(root).state;

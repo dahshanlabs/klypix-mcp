@@ -12,7 +12,7 @@ before the change reaches CI.
 - **Deterministic.** A check is file-name, glob, regex and line-ending work over the diff. No model
   runs at check time. It takes milliseconds, works offline and costs nothing.
 - **A person approves every rule.** A drafted rule is a *candidate* and checks nothing until a
-  person approves it with a code only they can print.
+  person explicitly approves the exact rules in a review prompt or through the terminal-code fallback.
 - **Warn by default.** An approved rule warns: when a session plans its files, while it edits, and
   at commit. It never stops the work unless the person chose *block* when approving it.
 - **In the repository.** Rules live in `.klypix/rules.json`, so every change to a rule shows up in
@@ -33,7 +33,7 @@ mistake early: when an agent is about to write it, and again before the commit.
 | `preserve-eol` | A change that rewrites a file's line endings, for example mixed CRLF/LF flattened to CRLF by a Windows editor | A test pins one LF line in a mixed file |
 | `cloud-required` | A change to paths that trigger the expensive CI (advice only) | Runner-impacting paths start the macOS and Windows matrix |
 
-Severity is `warn` unless the person approves the rule with `--block`: `warn` says so and lets the
+Severity is `warn` unless the person approves `block:true` (or `--block` in the terminal): `warn` says so and lets the
 work through, `block` stops the edit or the commit, `advise` is a note. `cloud-required` is always
 `advise`, and a candidate is never `block`.
 
@@ -132,7 +132,12 @@ rules file must not stop every commit.
    nothing yet. A rule must cite a card that exists in the brain.
 3. **Try it.** `brain_rules` with `action: "check"` and `include_candidates: true` shows what the
    candidate would catch on the current change, before anyone approves it.
-4. **Approve.** In their own terminal, the person runs:
+4. **Approve.** The agent calls `brain_rules` with `action:"promote"`, the exact
+   `ids`, and optional `block:true`, omitting `approve`. The person reviews and
+   confirms the MCP form or Windows dialog. The rules remain inactive if the
+   person declines, the request expires, or the reviewed rules change.
+
+   **Terminal fallback:** when the host cannot show a review, the person runs:
 
    ```bash
    npx klypix-mcp rules code promote routes-registered
@@ -247,3 +252,27 @@ in or a pattern that does not compile is refused.
 To see what a set of rules would have flagged on a repository's own history, before approving
 them, `scripts/brain-rules-proof.mjs` replays them over its pull requests and failed Actions logs
 and prices the runs involved. It reads only what `gh` can read and never writes to the checkout.
+
+
+### Approve without terminal commands
+
+Call `brain_rules` with `action:"promote"`, the exact `ids`, and `block:true`
+if these checks should block changes. Omit `approve`. KLYPIX opens a host MCP
+form showing the project, action, complete rules and resulting severity.
+Check the explicit approval checkbox and submit. On Windows hosts without
+form elicitation, a scrollable native review dialog provides the same choice.
+Cancel, closing the window, an unchecked box, timeout, transport failure or
+request cancellation leaves the rules unchanged. Agents must never answer
+this prompt for the person, or repeat it after a decline unless asked.
+
+Approval expires after two minutes and is refused if the selected rules change
+while the review is open. The prompt is bound to its project and exact rule
+content, including severity. Cloud-required rules remain advisory. Large batches
+that cannot be shown completely must be split; reviews are never truncated.
+`retire` uses the same approval flow and explains that enforcement will stop.
+The agent receives the result, never an approval code or reusable grant.
+
+Hosts without form elicitation on macOS/Linux retain the existing terminal-code
+fallback. Plugin mode still refuses all rule writes. This changes the approval
+interface, not the scope of the local checks: the project's test suite and CI
+remain necessary.

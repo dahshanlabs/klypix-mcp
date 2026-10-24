@@ -881,6 +881,22 @@ record and every list say the session wrote none. If the session resumes and com
 the drafted card is archived at the next pass. Three drafts per pass at most; a draft can never
 fail the sync that triggered it.
 
+**Conversation coverage.** A card and the automatic reply tail can miss a later request.
+Taking a card now checks its source conversation and reports `needs-review`, `reviewed`, or
+`unknown`. `brain_handoff {action:"review", id}` returns paginated Claude Code or Codex
+conversation turns, including user requests with no reply. Follow `nextCursor` with the returned
+`revision`; after reading every page, acknowledge the final `reviewToken` with a `summary` of
+completed and still-pending requests. Session-only takeovers use `review` with `session` to create
+a reviewable draft first. The first review covers the whole conversation, including requests
+that predate the card; changed source bytes invalidate the review and require another pass.
+The saved review is an agent attestation, not proof of task completion. It never closes work.
+Transcripts stay on this machine and are read only from the supported hosts' transcript folders.
+Missing, malformed, ambiguous, oversized, or unsupported sources report `unknown`; an attachment
+placeholder requires checking the original media. The reader is bounded to 128 MiB per transcript,
+16 MiB per JSONL record, 8 MiB of conversation text, and 12,000 discovery entries. A limit never
+silently drops turns or certifies coverage. Reconcile the card's Next list with the conversation
+and repository evidence before continuing.
+
 Durable decisions still go in the brain as cards — a handoff is the one card about *work in
 flight*, and it closes when the work lands.
 

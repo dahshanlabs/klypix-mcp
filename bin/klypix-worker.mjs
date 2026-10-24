@@ -1089,7 +1089,10 @@ server.registerTool('brain_handoff', {
     openWorldHint: false,
   },
   inputSchema: {
-    action: z.enum(['write', 'take', 'done', 'list']).optional().describe('write (default): record a handoff card. take: claim a handoff card (id) or unfinished work (session) before continuing it. done: mark it finished. list: every open handoff card and every unfinished session on this project.'),
+    action: z.enum(['write', 'take', 'done', 'list', 'review']).optional().describe('write: record a handoff. take: claim it and check conversation freshness. review: read source conversation pages, then acknowledge the final reviewToken with a summary of pending requests. done: mark finished. list: open handoffs and unfinished sessions.'),
+    cursor: z.number().int().min(0).optional().describe('review: nextCursor from the preceding page; omit to start.'),
+    revision: z.string().max(64).optional().describe('review: exact transcript revision from the preceding page.'),
+    reviewToken: z.string().max(64).optional().describe('review: acknowledge only AFTER reading every conversation page; supply the final token and a summary including outstanding requests. New source activity invalidates this token.'),
     project: z.string().optional().describe('Absolute project root containing brain.klypix. Defaults to this connection\'s project.'),
     canvas: z.string().optional().describe('Brain canvas filename/path. Defaults to the project brain ("brain").'),
     title: z.string().max(120).optional().describe('write: the work, in a few words ("Drive upload: the Place-it-now chooser").'),
@@ -1102,9 +1105,9 @@ server.registerTool('brain_handoff', {
     reason: z.enum(['context_limit', 'usage_limit', 'end_of_session', 'blocked', 'switching_tool', 'other']).optional().describe('write: why the work stops here.'),
     area: z.string().max(40).optional().describe('write: the brain area (titled box) the card goes into. Defaults to "Handoff".'),
     continues: z.string().max(64).optional().describe('write: the id of an earlier handoff card this one continues — it is closed as "continued by" this one.'),
-    id: z.string().max(64).optional().describe('take / done: the handoff card id (from brain_sync, the session-start brief, or list).'),
-    session: z.string().max(160).optional().describe('take / done: the session id (or a unique prefix of 8+ characters) from the unfinished-work list, when the work has no card.'),
-    summary: z.string().max(400).optional().describe('done: what was finished, in one or two sentences. take: an optional note.'),
+    id: z.string().max(64).optional().describe('take / done / review: the handoff card id (from brain_sync, the session-start brief, or list).'),
+    session: z.string().max(160).optional().describe('take / done / review: the session id (or a unique prefix of 8+ characters) from the unfinished-work list, when the work has no card. Review creates a reviewable draft if needed.'),
+    summary: z.string().max(400).optional().describe('done: what was finished. take: optional note. review acknowledgement: required account of completed and still-pending requests after reading all conversation pages.'),
   },
 }, async ({ action, project, canvas, ...rest }, extra) => {
   const identity = extra?.klypixRequestIdentity || {};
@@ -1456,6 +1459,7 @@ server.registerTool('brain_sync', {
           // record is announced as such — a lead to verify, not the session's words.
           drafted.length ? `🤝 KLYPIX drafted ${drafted.length} handoff card${drafted.length > 1 ? 's' : ''} just now from the record of a session that stopped without writing one: ${drafted.map((d) => `[${d.id}] “${d.title}”`).join('; ')}. A drafted card is a lead, not a verified state — confirm it with git before relying on it.` : '',
           formatHandoffCards(cards, { now, max: 5 }),
+          cards.length ? 'Saved handoffs are not verified conversation coverage. On takeover call brain_handoff review and check later/unanswered requests before trusting Next; missing transcripts mean UNKNOWN.' : '',
           formatUnfinishedWork(lane, { now, max: 4, ranked: wantsContinue && words.size > 0 }),
         ].filter(Boolean).join('\n\n');
         handoffData = {

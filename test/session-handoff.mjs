@@ -344,7 +344,7 @@ try {
     const names = (await a.listTools()).tools.map((t) => t.name);
     ok(names.includes('brain_handoff'), 'D1 brain_handoff is a registered MCP tool');
     const tool = (await a.listTools()).tools.find((t) => t.name === 'brain_handoff');
-    ok(tool.inputSchema.properties.action?.enum?.join(',') === 'write,take,done,list' && tool.annotations.destructiveHint === false, 'D2 the schema names the four actions and is non-destructive');
+    ok(tool.inputSchema.properties.action?.enum?.join(',') === 'write,take,done,list,review' && tool.annotations.destructiveHint === false, 'D2 the schema names the five actions including conversation review and is non-destructive');
     await a.callTool({ name: 'brain_sync', arguments: { project, intent: 'Drive upload chooser, step 2', files: ['admin/app/drive/page.tsx'], phase: 'start' } });
     const w = await a.callTool({ name: 'brain_handoff', arguments: { project, action: 'write', title: 'Drive upload chooser (MCP)', task: 'Finish the chooser.', next: ['dialog', 'tests'], files: ['admin/app/drive/page.tsx'], reason: 'context_limit' } });
     ok(!w.isError && w.structuredContent?.id && w.content[0].text.includes('✓ Handoff recorded'), 'D3 write over stdio records the card and returns its id');

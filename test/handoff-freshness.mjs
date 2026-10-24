@@ -6,6 +6,9 @@ import { handoffTranscript, inspectHandoffFreshness } from '../src/session-hando
 import { buildKlypixMap, parseKlypix } from '../src/klypix-format.mjs';
 import { opBrainHandoff } from '../src/klypix-core.mjs';
 import { upsertSession } from '../src/agent-presence.mjs';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { fileURLToPath } from 'node:url';
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-freshness-'));
 const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, CODEX_HOME: process.env.CODEX_HOME };
@@ -103,6 +106,16 @@ try {
   const { struct } = await parseKlypix(fs.readFileSync(brain));
   assert.equal(struct.cards.find(c => c.id === id).handoff.state, 'taken');
   assert.ok(struct.cards.find(c => c.id === id).handoff.review.summary.includes('pending'));
+  const client = new Client({ name: 'handoff-freshness-test', version: '1.0.0' });
+  const transport = new StdioClientTransport({ command: process.execPath, args: [fileURLToPath(new URL('../bin/klypix-worker.mjs', import.meta.url)), '--vault', project], env: { ...process.env, KLYPIX_AUTO_UPDATE: '0', KLYPIX_APP_TOOLS: 'off' }, stderr: 'pipe' });
+  try {
+    await client.connect(transport);
+    const tools = await client.listTools();
+    assert.ok(tools.tools.find(t => t.name === 'brain_handoff').inputSchema.properties.action.enum.includes('review'));
+    const result = await client.callTool({ name: 'brain_handoff', arguments: { action: 'review', id, project } });
+    assert.ok(!result.isError, JSON.stringify(result));
+    assert.ok(result.content.some(c => c.text?.includes('Conversation reviewed through')), 'review works through the real MCP protocol');
+  } finally { await client.close(); await transport.close(); }
   fs.unlinkSync(source);
   assert.equal((await opBrainHandoff({ vault: project, action: 'take', id, from: taker })).structured.freshness.status, 'unknown');
   console.log('PASS: source recovery, unanswered followups, full initial coverage, pagination, changed/missing evidence, Codex attachments, explicit review and stale acknowledgement rejection');

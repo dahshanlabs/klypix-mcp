@@ -898,6 +898,32 @@ placeholder requires checking the original media. The reader is bounded to 128 M
 silently drops turns or certifies coverage. Reconcile the card's Next list with the conversation
 and repository evidence before continuing.
 
+**Host coverage (development branch).** The shared handoff card works independently of the agent brand. Conversation recovery has separate coverage:
+
+| Source | Evidence available |
+| --- | --- |
+| Claude Code, Codex | Native local transcript readers |
+| Gemini CLI | Native legacy ConversationRecord JSON; JSONL mutation journals currently return UNKNOWN |
+| Antigravity, Cursor, Cline, Roo Code, Kilo Code, GitHub Copilot, Continue, Windsurf, OpenCode, custom MCP clients | Host-neutral capture through the same MCP action; no native history reader claimed |
+| CLI-only integrations such as Aider | Shared handoff cards; capture requires an MCP bridge calling this action |
+
+On a host without a native reader, preserve requests as they arrive with
+`brain_handoff {action:"capture", turns:[{id:"stable-turn-id", role:"user", at:1792860000000, text:"Observed request"}]}`.
+Use the actual known timestamp (milliseconds), stable ids for retries, and only text actually observed.
+Capture assistant replies too. Do not manufacture missing history or timestamps. The server binds
+capture to the connected session and project; callers cannot supply another session identity or a file path.
+Later sessions use the same `review` workflow. New captured turns invalidate prior review tokens.
+Repeated identical turns are deduplicated; conflicting reuse of an id is refused.
+
+Capture is an explicit agent/tool action, not automatic access to an IDE's private chat store.
+The result always identifies `captured-only` coverage and says full host history is UNKNOWN,
+even after review. It cannot recover a request that was never captured. Host-name regression
+fixtures verify the shared protocol, not end-to-end operation inside those applications.
+Captured text stays outside the brain in `~/.claude/project-brain/handoff-captures`, keyed by
+project and session. It is not synced with the card and has no automatic expiry; local removal
+makes coverage unavailable. Limits are 30 turns per call, 24,000 characters per turn and 8 MiB
+per journal. Gemini discovery has a 128 MiB aggregate read budget and rejects ambiguous sources.
+
 Durable decisions still go in the brain as cards — a handoff is the one card about *work in
 flight*, and it closes when the work lands.
 

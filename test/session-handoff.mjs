@@ -344,10 +344,14 @@ try {
     const names = (await a.listTools()).tools.map((t) => t.name);
     ok(names.includes('brain_handoff'), 'D1 brain_handoff is a registered MCP tool');
     const tool = (await a.listTools()).tools.find((t) => t.name === 'brain_handoff');
-    ok(tool.inputSchema.properties.action?.enum?.join(',') === 'write,take,done,list,review' && tool.annotations.destructiveHint === false, 'D2 the schema names the five actions including conversation review and is non-destructive');
+    ok(tool.inputSchema.properties.action?.enum?.join(',') === 'write,take,done,list,review,capture' && tool.annotations.destructiveHint === false, 'D2 the schema names the six actions including conversation review and capture and is non-destructive');
     await a.callTool({ name: 'brain_sync', arguments: { project, intent: 'Drive upload chooser, step 2', files: ['admin/app/drive/page.tsx'], phase: 'start' } });
+    const capture = await a.callTool({ name: 'brain_handoff', arguments: { project, action: 'capture', turns: [{ id: 'request-1', role: 'user', at: Date.now(), text: 'Also verify the last followup' }] } });
+    ok(!capture.isError && capture.structuredContent?.captured?.added === 1, 'D2a capture records observed turns over real MCP stdio');
     const w = await a.callTool({ name: 'brain_handoff', arguments: { project, action: 'write', title: 'Drive upload chooser (MCP)', task: 'Finish the chooser.', next: ['dialog', 'tests'], files: ['admin/app/drive/page.tsx'], reason: 'context_limit' } });
     ok(!w.isError && w.structuredContent?.id && w.content[0].text.includes('✓ Handoff recorded'), 'D3 write over stdio records the card and returns its id');
+    const review = await a.callTool({ name: 'brain_handoff', arguments: { project, action: 'review', id: w.structuredContent.id } });
+    ok(review.structuredContent?.freshness?.coverage === 'captured-only' && review.content[0].text.includes('UNKNOWN'), 'D3a stdio review finds captured evidence and retains unknown full coverage');
     const laneEntry = entryOf('mcp-session-aaaa-0001');
     ok(laneEntry?.work?.handoffCardId === w.structuredContent.id, 'D4 the writer\'s lane record points at its card');
     await a.close();

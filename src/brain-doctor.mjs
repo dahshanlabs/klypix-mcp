@@ -193,6 +193,10 @@ function inspectHooks(home) {
 // registration everywhere, so the count applies the worker's own rule.
 const APP_ONLY_TOOLS = new Set(['show_in_klypix']);
 const appToolsHere = (env = process.env) => process.platform === 'win32' || env.KLYPIX_APP_TOOLS === 'on';
+// prepare_video downloads and runs programs on the PC, so the worker does not
+// register it in plugin mode (KLYPIX_PLUGIN=1); the count applies that rule too.
+const NOT_IN_PLUGIN_MODE = new Set(['prepare_video']);
+const pluginModeHere = (env = process.env) => String(env.KLYPIX_PLUGIN ?? '').trim() === '1';
 function inspectTools(brainDir, pkgRoot) {
   // Prefer the DEPLOYED server (what this machine's brain actually exposes); fall back
   // to the running package's server file. Regex the registration list — no import, no
@@ -217,7 +221,9 @@ function inspectTools(brainDir, pkgRoot) {
     const deployed = f.startsWith(brainDir);
     const appTools = readText(deployed ? path.join(brainDir, 'app-tools.mjs') : path.join(pkgRoot, 'src', 'app-tools.mjs'));
     if (appTools && names.length) { re.lastIndex = 0; while ((mm = re.exec(appTools))) names.push(mm[1]); }
-    const uniqueNames = [...new Set(names)].filter(n => appToolsHere() || !APP_ONLY_TOOLS.has(n));
+    const uniqueNames = [...new Set(names)]
+      .filter(n => appToolsHere() || !APP_ONLY_TOOLS.has(n))
+      .filter(n => !pluginModeHere() || !NOT_IN_PLUGIN_MODE.has(n));
     if (uniqueNames.length) return { names: uniqueNames, count: uniqueNames.length, source: f.startsWith(brainDir) ? 'deployed' : 'package', hash: sha(uniqueNames.slice().sort().join(',')).slice(0, 8) };
   }
   return { names: [], count: 0, source: null, hash: null };

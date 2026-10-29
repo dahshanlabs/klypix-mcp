@@ -93,8 +93,9 @@ has the details.
 | **Claude Desktop** | A one-time config entry | The KLYPIX app's Settings, or by hand |
 | **Claude, as a plugin** | One pinned version, keyword search, no hooks | [klypix-plugin](https://github.com/dahshanlabs/klypix-plugin) |
 
-klypix-mcp has 27 MCP tools on Linux and macOS and 28 on Windows, where `show_in_klypix` is
-added. `npx klypix-mcp doctor` shows the count for your install.
+klypix-mcp has 28 MCP tools on Linux and macOS and 29 on Windows, where `show_in_klypix` is
+added (one fewer in plugin mode, which leaves out `prepare_video`). `npx klypix-mcp doctor` shows
+the count for your install.
 
 > **One project. Many agents. One current understanding.**
 
@@ -128,10 +129,10 @@ tool's official documentation and says that KLYPIX wrote it) · [klypix.com/klyp
   [Overlap warnings](#overlap-warnings) ·
   [Teammates on other computers](#teammates-on-other-computers-klypix-network) ·
   [Handoffs and messages](#handoffs-and-messages) · [Evidence-gated completion](#evidence-gated-completion) ·
-  [Human control in KLYPIX](#human-control-in-klypix) · [Measure it yourself](#measure-it-yourself) ·
+  [Human control in KLYPIX](#human-control-in-klypix) · [Prepare a video for your own AI](#prepare-a-video-for-your-own-ai) · [Measure it yourself](#measure-it-yourself) ·
   [Git and concurrency](#git-and-concurrency) ·
   [The git guard for a shared checkout](#whose-is-this-the-git-guard-for-a-shared-checkout) ·
-  [The command line](#the-command-line) · [The verbs](#the-verbs-27-and-28-on-windows) ·
+  [The command line](#the-command-line) · [The verbs](#the-verbs-28-and-29-on-windows) ·
   [One file you can hold](#one-file-you-can-hold) · [Use it as a library](#use-it-as-a-library) ·
   [A2A](#also-speaks-a2a-protocol-v030--experimental) ·
   [Updates](#updates--the-propagation-contract) · [Security and permissions](#security-and-permissions) ·
@@ -547,7 +548,8 @@ first is npx downloading the pinned package when the plugin starts the server. T
 tags, log) for coordination and release checks. Also `brain_reopen`, described at the end of this
 section. And on Windows, `show_in_klypix` with `bring_to_front: true` while KLYPIX is closed asks
 Windows to open that canvas file in KLYPIX (PowerShell `Start-Process`), at most once every 30
-seconds; it never does so while KLYPIX is running.
+seconds; it never does so while KLYPIX is running. `prepare_video`, which runs ffmpeg, yt-dlp and
+Whisper, is not registered at all in plugin mode, and refuses if it is ever called there.
 
 **The KLYPIX app, when it is running (local, not the network).** On Windows, a tool call that needs
 the KLYPIX app (*App mode*, under *Human control in Klypix*) talks to the app over a local named
@@ -1082,6 +1084,59 @@ Limits, and why:
   it while it runs), so it cannot be handed over from the saved canvas; the answer says so.
 - Cards inside a box locked from AI tools are never read, copied or attached.
 
+### Prepare a video for your own AI
+
+`prepare_video` turns a video into evidence your AI tool reads with **its own model and your own
+subscription** (Claude Code, Claude Cowork, Codex and other MCP hosts on your PC). KLYPIX makes no
+AI call for it, so it costs nothing in KLYPIX AI. Everything runs on your computer:
+
+1. **The video.** A local file needs nothing else. A public link on a known video platform
+   (YouTube, Vimeo, TikTok, Instagram, Facebook, X, Reddit, Loom, Twitch and a few others) is
+   downloaded with **your** yt-dlp, and only when the call passes `allow_download: true`. Your AI
+   tool should ask you first. You are responsible for following the platform's terms and the
+   creator's rights. Links to other sites, to local or internal addresses, or with a user name or
+   password are refused. For those, download the file yourself and pass its path.
+2. **Keyframes.** ffmpeg finds scene changes, and the frames are spread over the whole timeline:
+   the timeline is cut into equal parts and each part takes its nearest scene change, or its
+   middle when nothing changed there. 24 frames by default, at most 48, JPEG, at most 640 pixels
+   wide. A few come back inside the answer as images (8 by default, within a size budget that
+   keeps the answer under 1 MB); every frame is listed with its time and a local file path your AI
+   tool can open.
+3. **Transcript with timestamps.** The platform's own captions when yt-dlp finds them (the video's
+   original language first, then English, or the `language` you ask for). Otherwise local Whisper,
+   if one is installed. Otherwise the answer says there is no transcript and why. A long transcript
+   comes in parts (`transcript_chunk`), answered from the cache without preparing the video again.
+4. **Metadata.** Title, uploader and duration.
+
+The downloaded or decoded media is deleted before the call returns. Only the frames, the
+transcript and a small manifest are kept, in `<system temp>/klypix-video-prep/<id>/` (or
+`KLYPIX_VIDEO_CACHE`), and folders older than 7 days are removed on the next call. Calling again
+with the same video answers from that folder; `refresh: true` prepares it again.
+
+**What you need installed.** klypix-mcp never ships or installs any of these. It finds them on your
+`PATH`, and the answer says what is missing:
+
+| Program | Needed for | Install, for example |
+|---|---|---|
+| `ffmpeg` and `ffprobe` | Every video | `winget install ffmpeg`, `brew install ffmpeg`, `apt install ffmpeg` |
+| `yt-dlp` | Links only | `winget install yt-dlp`, `brew install yt-dlp`, `pip install yt-dlp`. Keep it current (`yt-dlp -U`): platforms often break older versions |
+| A Whisper CLI | A transcript when the video has no captions (optional) | `whisper-cli` from whisper.cpp with `KLYPIX_WHISPER_MODEL` set to a ggml model file; `whisper-ctranslate2` (faster-whisper); or `whisper` (openai-whisper), where `KLYPIX_WHISPER_MODEL` may name a model such as `small` |
+
+**Privacy.** Frames, transcript and metadata are made on your PC. The only network traffic is
+yt-dlp downloading a link you allowed, from that platform. KLYPIX servers are not involved. What
+your AI tool does with the frames and transcript is between you and your AI provider.
+
+**Safety.** Programs are started with an argument list, never through a shell; on Windows only
+`.exe` programs are run. yt-dlp runs with `--ignore-config` (so a config file cannot add commands),
+`--no-playlist`, a 2 GB size cap and `--` before the link. A link's host must not be, or resolve
+to, a loopback, private or link-local address. ffmpeg reads local files with
+`-protocol_whitelist file`. Every step has a time limit and stops when the request is cancelled.
+Transcripts and metadata are returned as data, never as instructions.
+
+**Not yet.** Reading a video by its KLYPIX space source id (fetching the original link from your
+KLYPIX account) needs a KLYPIX account sign-in in klypix-mcp, which it does not have. Today, pass
+the link or the file.
+
 ### Measure it yourself
 
 Claims about a shared brain — "nothing is lost", "it stays fast" — are unfalsifiable until a
@@ -1251,7 +1306,7 @@ The MCP verbs below are what agents call. These are what **you** call:
 | `npx klypix-mcp rescue` | Rescue copies the git guard saved before a discard: `list`, `show <id>`, `restore <id> [paths…]`, `prune` |
 | `npx klypix-mcp sessions` | This project's closed sessions and the notes waiting for them; `sessions reopen <id>` reopens one |
 
-### The verbs: 27, and 28 on Windows
+### The verbs: 28, and 29 on Windows
 
 | Tool | What it does |
 |---|---|
@@ -1283,8 +1338,9 @@ The MCP verbs below are what agents call. These are what **you** call:
 | `create_canvas` | New `.klypix` from cards + connections |
 | `add_to_canvas` | Append cards/connections (positions preserved), bordered and readable on KLYPIX's dark and Paper themes; a card's `group` puts it in that titled box. On a canvas open in KLYPIX (Windows) the cards go to KLYPIX itself: live, attributed, one undo. When KLYPIX cannot take them it refuses (`OPEN_IN_APP`, `ACCESS_OFF`, `BLOCKED`), a box locked from AI tools (`SCOPE_LOCKED`) or a frozen box (`FROZEN`), and writes nothing; project brains are the exception to the first. Returns the new card ids |
 | `list_canvases` | List every `.klypix` in the vault |
+| `prepare_video` | Keyframes (scene changes across the whole timeline, up to 48 JPEGs), a timestamped transcript (platform captions, else local Whisper, else an honest "none") and title, uploader and duration of a local video file or a public video link, made on this PC with the user's own ffmpeg, yt-dlp and Whisper, for the calling AI to analyse with its own model. Links are downloaded only with `allow_download: true`; the media is deleted after extraction. Not registered in plugin mode. See *Prepare a video for your own AI* |
 
-Exactly 27 on Linux and macOS and 28 on Windows, where `show_in_klypix` is registered; machine-verifiable with `npx klypix-mcp doctor`, whose TOOLS line applies the same rule and whose App bridge line says whether KLYPIX is running, with access on or off.
+Exactly 28 on Linux and macOS and 29 on Windows, where `show_in_klypix` is registered (one fewer in plugin mode, without `prepare_video`); machine-verifiable with `npx klypix-mcp doctor`, whose TOOLS line applies the same rule and whose App bridge line says whether KLYPIX is running, with access on or off.
 
 > **`canvas_view`:** no MCP Apps host has been observed rendering the UI resource yet — there is no
 > screenshot and no host-level test. Hosts without the extension get clean text, which is the path

@@ -1283,9 +1283,10 @@ const supervisorReceipt = (brainDir, name, state) => writeJson(path.join(brainDi
   ok(names.includes('klypix_status'), 'klypix_status is a registered MCP tool');
   ok(names.includes('read_card_contents'), 'read_card_contents is a registered MCP tool');
   // show_in_klypix (agent parity P1) is app-only: registered where a KLYPIX app
-  // can run — Windows, or KLYPIX_APP_TOOLS=on. 25 on the Ubuntu CI, 26 on Windows.
+  // can run — Windows, or KLYPIX_APP_TOOLS=on. 28 on the Ubuntu CI, 29 on Windows.
   const appToolsHere = process.platform === 'win32' || process.env.KLYPIX_APP_TOOLS === 'on';
-  const expectedTools = 27 + (appToolsHere ? 1 : 0);   // + brain_handoff (1.99.0), brain_rules (1.107.0)
+  const expectedTools = 28 + (appToolsHere ? 1 : 0);   // + brain_handoff (1.99.0), brain_rules (1.107.0), prepare_video
+  ok(names.includes('prepare_video'), 'prepare_video is a registered MCP tool (outside plugin mode)');
   ok(names.includes('show_in_klypix') === appToolsHere, `show_in_klypix is registered exactly where a KLYPIX app can run (${appToolsHere ? 'here' : 'not here'})`);
   ok(names.length === expectedTools, `tool manifest is ${expectedTools} verbs on ${process.platform} (got ${names.length})`);
   // Doctor's TOOLS line counts by a static scan; the app tools register from
@@ -1302,6 +1303,18 @@ const supervisorReceipt = (brainDir, name, state) => writeJson(path.join(brainDi
       && scanned.tools.names.includes('show_in_klypix') === appToolsHere,
     `doctor's static tool scan counts ${expectedTools} and includes the app tools this platform registers (got ${scanned.tools.count} from ${scanned.tools.source})`);
     ok(toolsLine.includes('klypix_status') && toolsLine.includes('read_card_contents'), 'doctor\'s TOOLS line lists klypix_status and read_card_contents');
+    // Plugin mode leaves prepare_video out; the static scan applies that rule too.
+    {
+      const prevPlugin = process.env.KLYPIX_PLUGIN;
+      process.env.KLYPIX_PLUGIN = '1';
+      try {
+        const pluginScan = inspect({ home: emptyHome, projectDir: vault, fmtLib: null });
+        ok(pluginScan.tools.count === expectedTools - 1 && !pluginScan.tools.names.includes('prepare_video'),
+          `doctor's scan in plugin mode leaves prepare_video out (${pluginScan.tools.count})`);
+      } finally {
+        if (prevPlugin === undefined) delete process.env.KLYPIX_PLUGIN; else process.env.KLYPIX_PLUGIN = prevPlugin;
+      }
+    }
     // The App bridge line: running, access, protocol — from endpoint.json only,
     // never the token or the pipe name.
     const prevBridge = process.env.KLYPIX_APP_BRIDGE_DIR;

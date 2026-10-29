@@ -48,9 +48,10 @@ const verdict = toolCompatibility(snapshot, current);
 ok(verdict.ok === true, `the supervisor's own compatibility check accepts this worker over 1.91.0 (removed: ${verdict.removed.join(', ') || 'none'}; changed: ${verdict.changed.join(', ') || 'none'})`);
 ok(verdict.added.includes('klypix_status') && verdict.added.includes('read_card_contents') && verdict.added.includes('brain_handoff') && verdict.added.includes('brain_rules'), 'klypix_status, read_card_contents, brain_handoff and brain_rules are the added tools');
 // show_in_klypix (P1) is app-only: registered where a KLYPIX app can run
-// (Windows, or KLYPIX_APP_TOOLS=on). 25 tools on the Ubuntu CI, 26 on Windows.
+// (Windows, or KLYPIX_APP_TOOLS=on). 28 tools on the Ubuntu CI, 29 on Windows.
 const appToolsHere = process.platform === 'win32' || env.KLYPIX_APP_TOOLS === 'on';
-const expectedAdded = appToolsHere ? 5 : 4;   // + brain_handoff (1.99.0), brain_rules (1.107.0)
+const expectedAdded = appToolsHere ? 6 : 5;   // + brain_handoff (1.99.0), brain_rules (1.107.0), prepare_video
+ok(verdict.added.includes('prepare_video'), 'prepare_video is added (outside plugin mode)');
 ok(verdict.added.includes('show_in_klypix') === appToolsHere, `show_in_klypix is added exactly where a KLYPIX app can run (${appToolsHere ? 'here' : 'not here'})`);
 ok(verdict.added.length === expectedAdded && current.length === 23 + expectedAdded, `exactly ${expectedAdded} tools were added — ${23 + expectedAdded} in all (got ${current.length}: +${verdict.added.join(', ')})`);
 // Stricter than the supervisor: not even a description inside an old schema moved.

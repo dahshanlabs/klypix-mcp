@@ -49,6 +49,7 @@ import { LIMITS, assetBytes, dataUrlImage, fitImage, imageSkipReason, locateAsse
 import { findProjectBrain, neutralizeMarkers, postPresenceMessage, resolveMessageTarget, readReleaseLease, listActiveSessions, listKnownSessions, sessionStatusLabel, stampSessionWork, listUnfinishedWork, formatUnfinishedWork, formatCheckoutLines, resumeCommandFor } from './agent-presence.mjs';
 import { normalizeHandoffInput, renderHandoffCard, handoffMachineField, parseHandoffCard, listOpenHandoffCards, formatHandoffCards, isHandoffLine1, HANDOFF_REASONS, clientWord as handoffClientWord, autoHandoffCandidates, draftHandoffFromWork, captureHandoffTurns, inspectHandoffFreshness, formatHandoffFreshness } from './session-handoff.mjs';
 import { collectRepoState, commitsInRange, makeContainmentProbe } from './repo-state.mjs';
+import { normalizeCrowdNote, lineagesFor, formatLineage, openObjections, formatObjections, withholdFilter, independentPass, isPeerOpinionOnTopic } from './crowd-safeguards.mjs';
 
 import { brainCaptureLockPath, vaultCreateLockPath, withAdvisoryWriteLock } from './brain-write-lock.mjs';
 // Plugin mode helpers (KLYPIX_PLUGIN=1). A namespace import: every bundle that
@@ -647,9 +648,10 @@ export async function opBrainTaskContext({
   files = [],
   k = 5,
   budgetChars = 2800,
+  cardFilter = null,
 }) {
   const startedAt = Date.now();
-  const task = String(intent || '').replace(/\s+/g, ' ').trim();
+  const task =String(intent || '').replace(/\s+/g, ' ').trim();
   const scopedFiles = (Array.isArray(files) ? files : [])
     .map((file) => String(file || '').replace(/\\/g, '/').trim())
     .filter(Boolean)
@@ -671,6 +673,8 @@ export async function opBrainTaskContext({
   let struct;
   try { ({ struct } = await parseKlypix(fs.readFileSync(t.file))); }
   catch (e) { return err(`Task context read failed: ${e.message}`); }
+  // Crowd safeguards: an open independent pass leaves peer opinions out.
+  if (typeof cardFilter === 'function') { try { struct.cards = struct.cards.filter(cardFilter); } catch { /* keep every card */ } }
 
   const generic = new Set(['src', 'app', 'lib', 'components', 'component', 'scripts', 'public', 'test', 'tests', 'electron']);
   const fileTerms = scopedFiles.flatMap((file) => {
@@ -897,7 +901,7 @@ async function questionVectors(pipe, file, cards) {
   return { vecs, stats, usable };
 }
 
-export async function opBrainAsk({ vault, canvas, question, as_of, k = 10, log = () => {} }) {
+export async function opBrainAsk({ vault, canvas, question, as_of, k = 10, log = () => {}, sessionId = null }) {
   // A last line `Also: <words>` is the caller's guess at the card's wording; it
   // joins the meaning query only (splitAskWords in klypix-format.mjs).
   const { question: q, words } = splitAskWords(question);
@@ -910,6 +914,13 @@ export async function opBrainAsk({ vault, canvas, question, as_of, k = 10, log =
   let struct;
   try { ({ struct } = await parseKlypix(fs.readFileSync(t.file))); } catch (e) { return err(`Read failed: ${e.message}`); }
   const stamp = brainStamp(t.file, struct, t.how);
+  // Independent first pass (crowd safeguards): while this session's pass is
+  // open, peer assessments/objections on its topic are left out of the answer.
+  let withheld = 0;
+  try {
+    const hold = sessionId ? withholdFilter(t.file, sessionId) : null;
+    if (hold) { const before = struct.cards.length; struct.cards = struct.cards.filter(hold); withheld = before - struct.cards.length; }
+  } catch { withheld = 0; }
   // Semantic blend (best-effort, time-bounded): embed the question + the brain's
   // cards on-device, hand rankForQuestion a Map<cardId, cosine>. A missing/warming
   // model degrades cleanly to pure lexical.
@@ -989,8 +1000,36 @@ export async function opBrainAsk({ vault, canvas, question, as_of, k = 10, log =
   const prepNotice = preparationNotice(t.file, prep, { usedMeaning: Boolean(semantic) });
   const noticeMd = prepNotice ? `> ${prepNotice}\n\n` : (fallbackNotice ? `> ${fallbackNotice}\n\n` : '');
   const evidenceCache = new Map();
-  const evidenceForCard = (card) => formatCardEvidence(inspectCardEvidence(card, { projectRoot: path.dirname(t.file), cache: evidenceCache }));
-  return { blocks: [text(stamp + noticeMd + statusMd + questionContextToMarkdown(q, result, { mode, as_of: timeTravel ? as_of : null, evidenceForCard }))] };
+  const evidenceStatusOf = (card) => { const s = inspectCardEvidence(card, { projectRoot: path.dirname(t.file), cache: evidenceCache }).sources.map((x) => x.status); return s.length ? s.join(', ') : null; };
+  // Evidence lineage (crowd safeguards): a claim repeated by several cards is
+  // shown once as one claim — its source, its restatements, its re-checks.
+  const lineageShown = new Set();
+  const evidenceForCard = (card) => {
+    const ev = formatCardEvidence(inspectCardEvidence(card, { projectRoot: path.dirname(t.file), cache: evidenceCache }));
+    let lin = '';
+    if (!timeTravel && !lineageShown.has(card.id)) {
+      try {
+        const [l] = lineagesFor(struct, [card], { evidenceStatus: evidenceStatusOf });
+        if (l) { for (const id of l.memberIds) lineageShown.add(id); lin = formatLineage(l); }
+      } catch { lin = ''; }
+    }
+    return [ev, lin].filter(Boolean).join('\n\n');
+  };
+  // Preserved dissent: open objections on the question's topic ride every
+  // answer (or, during an independent pass, only their withheld count).
+  let crowdMd = '';
+  if (!timeTravel) {
+    try {
+      const pass = sessionId ? independentPass(t.file, sessionId) : null;
+      if (pass && !pass.assessedAt) {
+        if (withheld) crowdMd = `\n\n🔒 Independent first pass open on "${pass.topic}": ${withheld} peer assessment/objection card${withheld === 1 ? '' : 's'} withheld until you submit your own with brain_review.`;
+      } else {
+        const obj = formatObjections(openObjections(struct, { topic: q }));
+        if (obj) crowdMd = `\n\n${obj}`;
+      }
+    } catch { crowdMd = ''; }
+  }
+  return { blocks: [text(stamp + noticeMd + statusMd + questionContextToMarkdown(q, result, { mode, as_of: timeTravel ? as_of : null, evidenceForCard }) + crowdMd)] };
 }
 
 // ── brain_challenge — the adversarial brain ───────────────────────────────────
@@ -2059,6 +2098,9 @@ export async function opBrainNote({ vault, canvas, text: noteText, area, marker 
   const file = t.file;
   if (!noteText || !String(noteText).trim()) return err('brain_note needs a non-empty text.');
   ({ marker, text: noteText } = liftLeadingMarker(marker, noteText));
+  // Crowd safeguards: "OBJECTION:" / "ASSESSMENT:" leads and trailing
+  // source: / restates: / rechecked: lines become visible card lines.
+  if (['', '!', '+'].includes(marker)) noteText = normalizeCrowdNote(noteText).text;
   if (looksLikeUnfilledDraft(noteText)) return err('Complete or discard the draft rationale before capturing it; the brain cannot record an unfilled WHY THIS MATTERS placeholder.');
   if (!['', '?', '!', '✓', '~', '+'].includes(marker)) return err(`Invalid marker "${marker}" — use: (none)=decision · ?=open question · !=milestone · +=skill (reusable how-to) · ✓=resolve a matching card · ~=update a matching card.`);
   // Guard cards (2026-08-24): a guard is authored on a '+' skill (or amended

@@ -51,8 +51,9 @@ ok(verdict.added.includes('klypix_status') && verdict.added.includes('read_card_
 // show_in_klypix (P1) is app-only: registered where a KLYPIX app can run
 // (Windows, or KLYPIX_APP_TOOLS=on). 28 tools on the Ubuntu CI, 29 on Windows.
 const appToolsHere = process.platform === 'win32' || env.KLYPIX_APP_TOOLS === 'on';
-const expectedAdded = appToolsHere ? 6 : 5;   // + brain_handoff (1.99.0), brain_rules (1.107.0), prepare_video
+const expectedAdded = appToolsHere ? 7 : 6;   // + brain_handoff (1.99.0), brain_rules (1.107.0), prepare_video, brain_review (crowd safeguards)
 ok(verdict.added.includes('prepare_video'), 'prepare_video is added (outside plugin mode)');
+ok(verdict.added.includes('brain_review'), 'brain_review is added (crowd safeguards: the opt-in independent first pass)');
 ok(verdict.added.includes('show_in_klypix') === appToolsHere, `show_in_klypix is added exactly where a KLYPIX app can run (${appToolsHere ? 'here' : 'not here'})`);
 ok(verdict.added.length === expectedAdded && current.length === 23 + expectedAdded, `exactly ${expectedAdded} tools were added — ${23 + expectedAdded} in all (got ${current.length}: +${verdict.added.join(', ')})`);
 // Stricter than the supervisor: not even a description inside an old schema

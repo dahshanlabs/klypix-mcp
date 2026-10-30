@@ -68,6 +68,8 @@ import * as autoUpdateModule from '../src/mcp-auto-update.mjs';
 // load cost) so a bundle whose klypix-format predates classifyDecay degrades
 // gracefully — a named import of a missing export would kill the whole server.
 import * as brainFormat from '../src/klypix-format.mjs';
+import * as crowd from '../src/crowd-safeguards.mjs';
+import * as crowdReview from '../src/crowd-review.mjs';
 
 // Real package version for the MCP handshake (was hardcoded '1.0.0', which
 // misled every client/version diagnosis — it could never reflect the true release).
@@ -529,7 +531,7 @@ server.registerTool('brain_ask', {
     as_of: z.string().optional().describe('Optional YYYY-MM-DD: answer as of that date (superseded cards count as live if they were current then).'),
     k: z.number().optional().describe('Max cards to surface for synthesis (default 10, capped 20).'),
   },
-}, async ({ question, canvas, as_of, k }) => toContent(await opBrainAsk({ vault: mcpPresence.vault, canvas: boundBrainCanvas(canvas), question, as_of, k, log })));
+}, async ({ question, canvas, as_of, k }, extra) => toContent(await opBrainAsk({ vault: mcpPresence.vault, canvas: boundBrainCanvas(canvas), question, as_of, k, log, sessionId: extra?.klypixRequestIdentity?.sessionId || mcpPresence.id })));
 
 server.registerTool('project_map_context', {
   title: 'Project Map context - current code structure plus brain decisions',
@@ -1292,6 +1294,23 @@ function subagentBrainSync({ agent, intent, files, phase, role, include_context,
   };
 }
 
+// Crowd safeguards (2026-10-30): the opt-in independent first pass.
+server.registerTool('brain_review', {
+  title: 'Independent first pass for a review or decision (withhold peer opinions until you record yours)',
+  description: 'Opt-in, for a review or a decision several sessions weigh in on. action "start" with a topic: from then on brain_sync and brain_ask leave out assessments and objections from OTHER sessions on that topic for this session (facts, decisions and evidence stay visible), so your first view is your own. action "submit" with your assessment: records it as a 🔎 ASSESSMENT card and shows you the withheld peer opinions. action "status" says whether a pass is open. LIMIT: KLYPIX only controls what KLYPIX returns; it cannot stop you from reading the brain file, notes or other sessions directly, so this records an independent first pass, it does not enforce one. Related, in brain_note: start the text with "OBJECTION:" to record an objection that stays open until a decision or evidence that links it (closes:) answers it; end it with lines "source: …", "restates: <earlier card>" or "rechecked: <what you checked>" to record where a claim came from.',
+  annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  inputSchema: {
+    action: z.enum(['start', 'submit', 'status']).describe('start a pass on a topic, submit your own assessment, or check status.'),
+    topic: z.string().max(300).optional().describe('On start: what you are reviewing or deciding, in a few words.'),
+    assessment: z.string().max(2000).optional().describe('On submit: your own assessment, formed before seeing peer opinions.'),
+    area: z.string().max(60).optional().describe('On submit: brain area for the assessment card (default "Review").'),
+    canvas: z.string().optional().describe('Brain canvas filename/path. Defaults to the project brain ("brain").'),
+  },
+}, async ({ action, topic, assessment, area, canvas }, extra) => toContent(await crowdReview.opBrainReview({
+  vault: mcpPresence.vault, canvas: boundBrainCanvas(canvas), action, topic, assessment, area,
+  sessionId: extra?.klypixRequestIdentity?.sessionId || mcpPresence.id, via: extra?.klypixClientName,
+})));
+
 server.registerTool('brain_sync', {
   title: 'KLYPIX Context Gateway — synchronize task, peers, conflicts, and relevant memory',
   description: 'APPROVAL-FREE task gateway over the authorized MCP connection. Call FIRST with a concise intent and expected files, again when scope changes, and with phase:"complete" before the final response. One bounded response returns compact task-relevant brain context, active TASK peers (idle connections hidden), one-time messages, structured exact-file conflicts, and late-arrival overlap alerts. A completion that supplies machine-checkable result manifests is fail-closed: invalid, conflicting, or incomparable evidence returns needs-reconciliation and retains task scope. `results` is ONLY for such manifests, never a summary of the work: with nothing machine-checkable to claim, complete without it. Works on any MCP host — it needs only the authorized MCP connection, so native lifecycle hooks are optional. LIMITS: blocking overlap is EXACT-PATH over the declared files of each session plus the edits its host observed; sessions on different branches are also test-merged with git merge-tree (committed work only); a same-folder overlap is an advisory notice; coordination/result reconciliation is machine-local and OS-user-local; a teammate on another computer appears only when KLYPIX network is installed on both computers (presence, intent, files and brain_message, no result reconciliation), and file overlap remains ADVISORY.',
@@ -1578,7 +1597,20 @@ server.registerTool('brain_sync', {
       files,
       k: 5,
       budgetChars: 2800,
+      cardFilter: crowd.withholdFilter(report.structured?.brain, extra?.klypixRequestIdentity?.sessionId || mcpPresence.id),
     });
+  }
+  // Crowd safeguards: lineage of restated claims, open objections, an open
+  // independent pass. Never fails a sync.
+  let crowdText = '';
+  let crowdData = null;
+  if (phase !== 'complete' && include_context !== false && report.structured?.brain && (intent || files?.length)) {
+    ({ text: crowdText, data: crowdData } = await crowdReview.crowdSyncText({
+      brainPath: report.structured.brain,
+      sessionId: extra?.klypixRequestIdentity?.sessionId || mcpPresence.id,
+      intent, files,
+      hitIds: (taskContext?.context?.hits || []).map((h) => h.id),
+    }));
   }
   const contextText = taskContext?.blocks
     ?.filter((block) => block.kind === 'text')
@@ -1701,6 +1733,7 @@ server.registerTool('brain_sync', {
     ...(harness ? { harness } : {}),
     ...(handoffData ? { handoffs: handoffData } : {}),
     ...(lockData ? { lockNotes: lockData } : {}),
+    ...(crowdData ? { crowd: crowdData } : {}),
   };
   const harnessText = harness?.failed
     ? `KLYPIX harness self-heal needs attention: ${harness.failed} project(s) remain partially aligned; brain_doctor has the exact files.`
@@ -1712,7 +1745,7 @@ server.registerTool('brain_sync', {
   return {
     content: [{
       type: 'text',
-      text: [childNote, report.text, harnessText, shipNotice, releaseReconcileText, captureGapText, lockText, handoffText, contextText, timingText].filter(Boolean).join('\n\n'),
+      text: [childNote, report.text, harnessText, shipNotice, releaseReconcileText, captureGapText, lockText, handoffText, contextText, crowdText, timingText].filter(Boolean).join('\n\n'),
     }],
     structuredContent: childNote ? { ...structuredContent, subagent: { status: 'not-recorded', note: childNote } } : structuredContent,
     ...(report.isError ? { isError: true } : {}),

@@ -7098,6 +7098,9 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                 // agents here — without this carve-out the advertised remedy
                 // was impossible and the unmatched ✓ minted a junk 🏁 fallback.
                 if (/🛠/.test(c.text) && !c.guard) continue;
+                // An objection is closed by evidence or a decision that LINKS it
+                // (closes:), never by a fuzzy ✓ that merely shares its words.
+                if (/⚖️?\s*OBJECTION/u.test(c.text)) continue;
                 // A ✓ closes opens/claims, never a pure milestone — without this
                 // a ✓ for a fulfilled claim could near-tie the very 🏁 that
                 // fulfilled it (item text ⊆ milestone) and archive the milestone
@@ -7651,7 +7654,8 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
         // to the new card is drawn in pass 2 (after the new ids exist), matched
         // back by remembering which old card each new card displaced.
         for (const card of cards) {
-            if (/❓|🎯|🏁|🛠/.test(card.text)) continue; // only plain decisions supersede (not questions/goals/milestones/skills)
+            // Objections and assessments (crowd safeguards) never supersede anything either.
+            if (/❓|🎯|🏁|🛠|⚖️?\s*OBJECTION|🔎\s*ASSESSMENT/u.test(card.text)) continue; // only plain decisions supersede (not questions/goals/milestones/skills)
             const nTok = tokenSet(card.text);
             const area = (card.area || '').toLowerCase();
             // A correction-cue note ("CORRECTION: … was WRONG") declares it
@@ -7665,6 +7669,10 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
             for (const c of liveTextCards()) {
                 if (!isCorrection && area && !sameAreaKey(c.area, area)) continue;
                 if (/🛠/.test(c.text)) continue; // never auto-archive a 🛠️ skill via a decision's supersede — skills are standing reference (correct with ~)
+                // Preserved dissent: an open objection is never outvoted by a later
+                // agreeing decision, and one session's assessment never replaces
+                // another's. Only an explicit closes: link or an id-addressed resolve ends one.
+                if (/⚖️?\s*OBJECTION|🔎\s*ASSESSMENT/u.test(c.text)) continue;
                 // cueMatch returns 0 unless it clears the widened bar (ratio OR
                 // absolute subject mass) — so for corrections, any non-zero fires.
                 const s = isCorrection ? cueMatch(nTokCmp, tokenSet(c.text), CORRECTION_SUPERSEDE_AT) : overlapScore(nTok, tokenSet(c.text));

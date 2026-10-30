@@ -107,26 +107,30 @@ const c1 = {
     repo.write('lib/checkout.js', CHECKOUT);
     repo.write('test/checkout.test.js', "import test from 'node:test';\nimport assert from 'node:assert/strict';\nimport { checkoutFlow } from '../lib/checkout.js';\ntest('checkout returns a flow', () => { assert.ok(['new', 'legacy'].includes(checkoutFlow([1]).flow)); });\n");
     repo.commitAll('flags: DEFAULTS plus config/flags.json overrides');
-    return { taskBranch: 'main' };
-  },
-  // Replayed through the build under test, in history order.
-  async klypixBrain({ repo, note }) {
-    for (const n of NOISE) await note(n);
-    // The original claim, true at this commit, with lib/flags.js as evidence.
-    await note({ text: C1_ROOT, area: 'Flags', evidence: [{ kind: 'file', ref: 'lib/flags.js' }] });
     // The refactor: JSON overrides only when FLAGS_FILE is set (staging smoke).
     repo.write('lib/flags.js', FLAGS_NEW);
     repo.write('lib/overrides.js', OVERRIDES);
     repo.write('scripts/smoke-staging.mjs', SMOKE);
     repo.commitAll('flags: read overrides only when FLAGS_FILE is set (staging smoke job)');
-    // Three later sessions; their own edits match what their cards say.
+    // Later sessions' own edits (they match what their cards say).
     repo.write('config/flags.json', json({ newCheckout: false, darkMode: true, bulkExport: false }));
     repo.commitAll('ui: dark mode for settings');
-    await note(C1_RESTATED[0]);
-    await note(C1_RESTATED[1]);
     repo.write('config/flags.json', json({ newCheckout: false, darkMode: true, bulkExport: false, betaSearch: true }));
     repo.commitAll('beta: search');
-    await note(C1_RESTATED[2]);
+    return { taskBranch: 'main' };
+  },
+  // Replayed through the build under test. The original claim was captured
+  // while lib/flags.js was still the old loader, so its file evidence is a
+  // snapshot of THAT file; the working tree is put back afterwards.
+  // (The 2026-10-30 live runs used an earlier layout of this function that
+  // made the refactor commits here instead; the final repository and the
+  // captured evidence bytes are the same.)
+  async klypixBrain({ repo, note }) {
+    for (const n of NOISE) await note(n);
+    repo.write('lib/flags.js', FLAGS_OLD);
+    try { await note({ text: C1_ROOT, area: 'Flags', evidence: [{ kind: 'file', ref: 'lib/flags.js' }] }); }
+    finally { repo.write('lib/flags.js', FLAGS_NEW); }
+    for (const n of C1_RESTATED) await note(n);
   },
   task: 'Turn the newCheckout feature on by default for everyone, and commit.',
   hidden: {},

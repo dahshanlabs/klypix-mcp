@@ -113,6 +113,12 @@ const klypix = conditionById('klypix');
 // agent by another route cannot pass for the one under test.
 const hitsText = (sc) => (sc.context?.hits || []).map((h) => h.text || '').join('\n');
 const expectations = {
+  // Crowd scenarios: the brain is replayed through THIS checkout's engine.
+  // C1's task names no file and too few card words for the start capsule, so
+  // its claim reaches an agent through brain_ask, not this first sync.
+  'c1-restated-claim': [(sc) => sc && typeof sc === 'object', 'answers without error (the planted claim reaches an agent through brain_ask, not this sync)'],
+  'c2-outvoted-objection': [(sc, text) => /Acme Pay can return 503 after/.test(text) && /Open objection/.test(text),
+    'the objection is still shown, as open, after three later cards that agree with the position it objects to'],
   's1-changed-decision': [(sc) => {
     const t = hitsText(sc);
     return /bearer tokens/.test(t) && (!/cookie session in auth\/cookie\.js/.test(t) || t.indexOf('bearer tokens') < t.indexOf('cookie session in auth/cookie.js'));

@@ -372,7 +372,7 @@ export function crowdSyncBlock(struct, { brainPath, sessionId, intent = '', file
       const rechecked = new Set(l.rechecks.map((r) => r.id));
       for (const id of own.slice(1)) {
         const role = rechecked.has(id) ? 'this card re-checked it'
-          : id === l.originId ? 'this card is its original, the one recorded source'
+          : id === l.originId ? (l.sources.length ? 'this card is its original, with the recorded source' : 'this card is its earliest statement; it names no source either')
             : 'this card restates it with no source of its own; it is not extra corroboration';
         hitLineage[id] = `🧬 Same claim as ${own[0]}: ${role} (lineage on ${own[0]}).`;
       }

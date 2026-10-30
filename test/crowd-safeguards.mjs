@@ -97,6 +97,13 @@ try {
   const none = await crowdSyncText({ brainPath: brain, sessionId: 's-lineage', intent: 'ship it', files: [], hitIds: [] });
   check(!none.data?.lineage && !Object.keys(none.hitLineage).length, 'no hits and no matching words or files: no lineage (bounded to what sync already returns)');
   check(C.SYNC_LINEAGE_MAX === 5, 'at most 5 claim lineages per brain_sync');
+  // A claim nobody sourced: its earliest card is not called "the recorded source".
+  const noSrc = { cards: [
+    { id: 'a1', area: 'Payments', text: 'Payments: chargeCard in lib/charge.js should retry transient 503 errors with backoff.', createdAt: 1 },
+    { id: 'a2', area: 'Ops', text: 'Ops: agreed, chargeCard in lib/charge.js should retry 503 errors with backoff.', createdAt: 2 },
+  ], connections: [] };
+  const ns = C.crowdSyncBlock(noSrc, { intent: 'x', hitCards: [noSrc.cards[1], noSrc.cards[0]] });
+  check(/no recorded source/.test(ns.hitLineage.a2 || '') && /earliest statement; it names no source/.test(ns.hitLineage.a1 || ''), 'an unsourced original is called the earliest statement, never the recorded source');
 
   // ── Preserved dissent ───────────────────────────────────────────────────
   const obj = await note({ text: 'Objection: do not cache /api/profile responses for an hour — profile edits would not show for up to an hour and support tickets will follow.', area: 'Caching' });

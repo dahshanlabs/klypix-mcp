@@ -1048,6 +1048,11 @@ export function upsertSession({
   client = 'unknown',
   surface = null,
   model = null,
+  // Where `model` came from (1.109.0): 'codex-hook' | 'session-start' |
+  // 'transcript' | … — written beside it with modelAt. Absent = unknown.
+  modelSource = null,
+  // Optional free-text role label (1.109.0). undefined keeps, '' clears.
+  role,
   permissionMode = null,
   branch = null,
   intent,
@@ -1193,6 +1198,14 @@ export function upsertSession({
       client: String(client || previous.client || 'unknown'),
       surface: surface ?? previous.surface ?? null,
       model: model ?? previous.model ?? null,
+      // ADDITIVE (1.109.0): the model's source and report time travel with it.
+      ...(model
+        ? { modelSource: String(modelSource || 'unknown').slice(0, 24), modelAt: now }
+        : (previous.modelSource ? { modelSource: previous.modelSource, modelAt: previous.modelAt || null } : {})),
+      // ADDITIVE (1.109.0): a declared role label; '' clears it.
+      ...(role !== undefined
+        ? (normalizeRole(role) ? { role: normalizeRole(role), roleAt: now } : {})
+        : (previous.role ? { role: previous.role, roleAt: previous.roleAt || null } : {})),
       permissionMode: permissionMode ?? previous.permissionMode ?? null,
       branch: branch ?? previous.branch ?? null,
       intent: nextIntent,
@@ -1265,6 +1278,7 @@ export function upsertSession({
         : (previous.hostStatus ? { hostStatus: previous.hostStatus, hostStatusAt: previous.hostStatusAt || null } : {})),
       lastSeen: now,
     };
+    if (role !== undefined && !normalizeRole(role)) { delete next.role; delete next.roleAt; }
     const kept = sessions.filter((session) => session.id !== id);
     kept.push(next);
     try {
@@ -3820,4 +3834,222 @@ export function formatReceivedMessages(messages, now = Date.now(), decay = {}, s
     if (info) lines.push(`  ${info.stampText}`);
   }
   return lines.join('\n');
+}
+
+// ── Small identity (1.109.0): subagent child ids, model stamp, role label ────
+// A session that spawns subagents used to record their work as its own. Where
+// the host reports a subagent (Claude Code: SubagentStart / SubagentStop and an
+// `agent_id` on tool events), the parent's lane row now carries one entry per
+// subagent, and the subagent is named `<parent 8>/sub-<6 hex>`. Hosts that do
+// not report subagents keep the parent's id, and nothing here invents one.
+// Every field is ADDITIVE: old rows, old readers and old brains are unchanged.
+export const SUBAGENTS_CAP = 12;
+// An ended subagent stays listed this long (so its files and markers keep a
+// name); one with no SubagentStop (host crash) is dropped this long after its
+// last heartbeat.
+export const SUBAGENT_ENDED_KEEP_MS = 30 * 60 * 1000;
+export const SUBAGENT_STALE_MS = 2 * 60 * 60 * 1000;
+export const ROLE_MAX = 40;
+const SUB_SHORT_RE = /^sub-[0-9a-f]{6}$/;
+const MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:@/[\]-]{0,79}$/;
+
+// The short child id is a hash of the host's agent id, so the hook (which sees
+// the agent id) and the MCP server (which only sees the short id the subagent
+// passes back) agree without sharing any state but the lane.
+export function subagentShortId(agentId) {
+  const raw = String(agentId ?? '').trim();
+  if (!raw) return '';
+  if (SUB_SHORT_RE.test(raw)) return raw;
+  return `sub-${crypto.createHash('sha1').update(raw).digest('hex').slice(0, 6)}`;
+}
+export function childIdentity(parentId, agentId) {
+  const short = subagentShortId(agentId);
+  const parent = String(parentId || '').trim().slice(0, 8);
+  return parent && short ? `${parent}/${short}` : '';
+}
+// "sub-ab12cd" or "7ff6f074/sub-ab12cd" → { short, parent }; anything else → null.
+export function parseChildRef(value) {
+  const text = String(value ?? '').trim().toLowerCase();
+  if (!text) return null;
+  const m = text.match(/^(?:([0-9a-z][0-9a-z._:-]{0,159})\/)?(sub-[0-9a-f]{6})$/);
+  return m ? { short: m[2], parent: m[1] || '' } : null;
+}
+
+// A role is a free-text label a session declares about itself ("reviewer").
+// It carries no history and no authority; it is folded for comparison only.
+export function normalizeRole(value) {
+  if (value === undefined || value === null) return '';
+  // '·' and '|' separate fields in the lines a role is printed on.
+  const text = neutralizeMarkers(String(value)).replace(/[\u0000-\u001f\u007f<>`·|]/g, ' ').replace(/\s+/g, ' ').trim();
+  return text.slice(0, ROLE_MAX).trim();
+}
+export const roleKey = (value) => normalizeRole(value).toLowerCase();
+export function rolesMatch(a, b) {
+  const ka = roleKey(a);
+  return Boolean(ka) && ka === roleKey(b);
+}
+
+// A model id as the host reported it, or null. '<synthetic>' (a transcript
+// entry Claude Code writes itself) is not a model.
+export function normalizeModel(value) {
+  const text = String(value ?? '').trim();
+  if (!text || text === '<synthetic>' || text.toLowerCase() === 'unknown' || !MODEL_RE.test(text)) return null;
+  return text;
+}
+
+function normalizeSubagentEntry(raw) {
+  if (!raw || typeof raw !== 'object' || !SUB_SHORT_RE.test(String(raw.id || ''))) return null;
+  const role = normalizeRole(raw.role);
+  const model = normalizeModel(raw.model);
+  return {
+    id: String(raw.id),
+    agentType: String(raw.agentType || '').replace(/[\u0000-\u001f]/g, ' ').trim().slice(0, 80) || null,
+    startedAt: Number(raw.startedAt) || 0,
+    lastSeen: Number(raw.lastSeen) || Number(raw.startedAt) || 0,
+    endedAt: Number(raw.endedAt) || null,
+    intent: String(raw.intent || '').replace(/\s+/g, ' ').trim().slice(0, 160),
+    ...(Number(raw.intentAt) ? { intentAt: Number(raw.intentAt) } : {}),
+    files: normalizeFiles(raw.files),
+    ...(role ? { role } : {}),
+    ...(model ? { model, modelSource: String(raw.modelSource || 'unknown').slice(0, 24) } : {}),
+    ...(typeof raw.transcript === 'string' && raw.transcript ? { transcript: raw.transcript.slice(0, 600) } : {}),
+  };
+}
+
+export function normalizeSubagents(list, now = Date.now()) {
+  const out = [];
+  for (const raw of Array.isArray(list) ? list : []) {
+    const entry = normalizeSubagentEntry(raw);
+    if (!entry) continue;
+    if (entry.endedAt && now - entry.endedAt > SUBAGENT_ENDED_KEEP_MS) continue;
+    if (!entry.endedAt && entry.lastSeen && now - entry.lastSeen > SUBAGENT_STALE_MS) continue;
+    const i = out.findIndex((e) => e.id === entry.id);
+    if (i >= 0) out.splice(i, 1);
+    out.push(entry);
+  }
+  return out.slice(-SUBAGENTS_CAP);
+}
+
+// patch: { id (short or host agent id), agentType, intent, files (replace),
+//          addFiles, role, model, modelSource, transcript, start, end }
+export function mergeSubagent(list, patch, now = Date.now()) {
+  const current = normalizeSubagents(list, now);
+  if (!patch || typeof patch !== 'object') return current;
+  const short = subagentShortId(patch.id);
+  if (!short) return current;
+  const prev = current.find((e) => e.id === short) || null;
+  const next = { ...(prev || { id: short, agentType: null, startedAt: now, endedAt: null, intent: '', files: [] }), lastSeen: now };
+  if (patch.start === true) next.endedAt = null;
+  if (patch.end === true) next.endedAt = now;
+  if (patch.agentType) next.agentType = String(patch.agentType).slice(0, 80);
+  if (patch.intent !== undefined) {
+    const intent = String(patch.intent || '').replace(/\s+/g, ' ').trim().slice(0, 160);
+    if (intent !== next.intent) { next.intent = intent; next.intentAt = now; }
+  }
+  if (patch.files !== undefined) next.files = normalizeFiles(patch.files);
+  if (Array.isArray(patch.addFiles)) {
+    const keys = new Set((next.files || []).map(scopeKey));
+    next.files = normalizeFiles([...(next.files || []), ...patch.addFiles.filter((f) => !keys.has(scopeKey(f)))]);
+  }
+  if (patch.role !== undefined) {
+    const role = normalizeRole(patch.role);
+    if (role) next.role = role; else delete next.role;
+  }
+  if (patch.model !== undefined) {
+    const model = normalizeModel(patch.model);
+    if (model) { next.model = model; next.modelSource = String(patch.modelSource || 'unknown').slice(0, 24); }
+  }
+  if (typeof patch.transcript === 'string' && patch.transcript) next.transcript = patch.transcript.slice(0, 600);
+  return normalizeSubagents([...current.filter((e) => e.id !== short), next], now);
+}
+
+export function liveSubagents(row, now = Date.now()) {
+  return normalizeSubagents(row?.subagents, now).filter((e) => !e.endedAt);
+}
+
+// Other LIVE subagents of the same parent that hold `file`: two helpers of one
+// session editing the same file. Exact path, case-folded.
+export function siblingSubagentsOnFile(row, short, file, now = Date.now()) {
+  const key = scopeKey(file);
+  if (!key) return [];
+  return liveSubagents(row, now).filter((e) => e.id !== short && (e.files || []).some((f) => scopeKey(f) === key));
+}
+
+// One line for presence: "subagents: 7ff6f074/sub-ab12cd (Explore, reviewer) a.js; …".
+export function formatSubagents(row, now = Date.now(), { max = 4 } = {}) {
+  const list = normalizeSubagents(row?.subagents, now);
+  if (!list.length) return '';
+  const parent = String(row?.logicalSessionId || row?.id || '').slice(0, 8);
+  const parts = list.slice(-max).map((e) => {
+    const labels = [e.agentType, e.role ? `role ${e.role}` : null, e.model ? `model ${e.model}` : null, e.endedAt ? 'finished' : null].filter(Boolean);
+    const scope = (e.files || []).slice(-3).join(', ');
+    return `${parent}/${e.id}${labels.length ? ` (${labels.join(', ')})` : ''}${e.intent ? ` "${e.intent.slice(0, 60)}"` : ''}${scope ? ` ${scope}` : ''}`;
+  });
+  return `subagent${list.length === 1 ? '' : 's'}: ${parts.join('; ')}${list.length > max ? ` (+${list.length - max} more)` : ''}`;
+}
+
+// Locked write of one subagent entry on its PARENT's row. `requireKnown`
+// refuses an id the host never reported (SubagentStart writes the entry; a
+// brain_sync from the subagent may only update a live one), so a model cannot
+// mint a child identity by typing one.
+export function upsertSubagent({ brainPath, parentId, patch, requireKnown = false, home, now = Date.now() }) {
+  if (!brainPath || !parentId || !patch || typeof patch !== 'object') return { ok: false, reason: 'invalid-subagent' };
+  const short = subagentShortId(patch.id);
+  if (!short) return { ok: false, reason: 'invalid-subagent' };
+  const laneFile = laneFileFor(brainPath, home);
+  const lockFile = laneFile + '.lock';
+  if (!acquireLock(lockFile)) return { ok: false, reason: 'lane-locked' };
+  try {
+    const laneRead = readMutableLane(laneFile);
+    if (!laneRead.ok) return { ok: false, reason: laneRead.reason };
+    const data = laneRead.data;
+    const sessions = pruneSessions(data.sessions, now);
+    const wanted = String(parentId).trim().toLowerCase();
+    const row = sessions.find((session) => sessionIdentityKeys(session).includes(wanted)) || null;
+    if (!row) return { ok: false, reason: 'parent-unknown' };
+    const known = normalizeSubagents(row.subagents, now).find((e) => e.id === short);
+    if (requireKnown && (!known || known.endedAt)) return { ok: false, reason: known ? 'subagent-finished' : 'subagent-unknown' };
+    row.subagents = mergeSubagent(row.subagents, { ...patch, id: short }, now);
+    fs.mkdirSync(path.dirname(laneFile), { recursive: true });
+    writeLaneFileAtomic(laneFile, JSON.stringify({ ...data, sessions }));
+    return {
+      ok: true,
+      row,
+      entry: row.subagents.find((e) => e.id === short) || null,
+      childId: `${String(row.logicalSessionId || row.id).slice(0, 8)}/${short}`,
+    };
+  } catch (error) {
+    return { ok: false, reason: writeFailureReason(error) };
+  } finally {
+    releaseLock(lockFile);
+  }
+}
+
+// What a captured card, a handoff or a presence row records about who made it.
+// `model` is the host's own report or 'unknown', never a guess.
+export function identityStamp({ session = '', agent = '', agentType = '', tool = '', model = null, role = '' } = {}) {
+  const m = normalizeModel(model);
+  const r = normalizeRole(role);
+  return {
+    session: String(session || '').slice(0, 160),
+    ...(agent ? { agent: String(agent).slice(0, 180) } : {}),
+    ...(agentType ? { agentType: String(agentType).slice(0, 80) } : {}),
+    tool: String(tool || 'unknown').slice(0, 40),
+    model: m || 'unknown',
+    ...(r ? { role: r } : {}),
+  };
+}
+
+// The model a session row may lend to a stamp written OUTSIDE the transcript
+// (an MCP brain_note or brain_handoff). Only a per-event host report counts:
+// Codex hooks send the model with every tool event. Claude Code reports it at
+// session start and in each transcript entry, but nothing tells the MCP
+// server about a /model switch between turns, so its row model is shown in
+// presence as "last reported" and never stamped on an MCP-written card.
+export const MODEL_PER_EVENT_SOURCES = new Set(['codex-hook']);
+export const MODEL_STAMP_FRESH_MS = 3 * 60 * 1000;
+export function stampableRowModel(row, now = Date.now()) {
+  if (!row || !MODEL_PER_EVENT_SOURCES.has(String(row.modelSource || ''))) return null;
+  if (!(Number(row.modelAt) > 0) || now - Number(row.modelAt) > MODEL_STAMP_FRESH_MS) return null;
+  return normalizeModel(row.model);
 }

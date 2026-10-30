@@ -15,6 +15,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { buildParityFixture } from './_parity-fixture.mjs';
 import { pathHash, APP_BRIDGE_PROTOCOL } from '../src/app-lease.mjs';
+import { withoutAllowedAdditions } from './_schema-additions.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, '..');
@@ -46,7 +47,7 @@ for (const [label, bin] of [['supervisor', 'klypix-mcp.mjs'], ['worker', 'klypix
     ok(names.length === expected && names.includes('klypix_status') && names.includes('read_card_contents') && names.includes('brain_rules') && names.includes('prepare_video') && names.includes('show_in_klypix') === (expected === 29),
       `[${label}] listTools shows ${expected} tools, the app tools included where they apply (got ${names.length})`);
     const byName = new Map(tools.map(t => [t.name, t]));
-    const drifted = snapshot.filter(t => JSON.stringify(byName.get(t.name)?.inputSchema) !== JSON.stringify(t.inputSchema)).map(t => t.name);
+    const drifted = snapshot.filter(t => JSON.stringify(withoutAllowedAdditions(t.name, byName.get(t.name)?.inputSchema)) !== JSON.stringify(t.inputSchema)).map(t => t.name);
     ok(drifted.length === 0, `[${label}] the 23 old input schemas equal the 1.91.0 snapshot (drifted: ${drifted.join(', ') || 'none'})`);
     ok(client.getInstructions()?.includes('comes from read_card_contents with the card ids read_canvas prints')
       && client.getInstructions()?.includes('a file name in read_canvas is never the end of what you can read')

@@ -18,6 +18,7 @@ import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { toolCompatibility } from '../src/mcp-supervisor.mjs';
+import { ALLOWED_NEW_PROPERTIES } from './_schema-additions.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, '..');
@@ -54,10 +55,28 @@ const expectedAdded = appToolsHere ? 6 : 5;   // + brain_handoff (1.99.0), brain
 ok(verdict.added.includes('prepare_video'), 'prepare_video is added (outside plugin mode)');
 ok(verdict.added.includes('show_in_klypix') === appToolsHere, `show_in_klypix is added exactly where a KLYPIX app can run (${appToolsHere ? 'here' : 'not here'})`);
 ok(verdict.added.length === expectedAdded && current.length === 23 + expectedAdded, `exactly ${expectedAdded} tools were added — ${23 + expectedAdded} in all (got ${current.length}: +${verdict.added.join(', ')})`);
-// Stricter than the supervisor: not even a description inside an old schema moved.
+// Stricter than the supervisor: not even a description inside an old schema
+// moved. The one allowed change is a NEW optional top-level property (the
+// policy stated below at 1.92.0), and each one must be named here, so an
+// accidental addition still fails. 1.109.0 adds brain_sync role / agent.
 const byName = new Map(current.map(t => [t.name, t]));
-const drifted = snapshot.filter(t => JSON.stringify(byName.get(t.name)?.inputSchema) !== JSON.stringify(t.inputSchema)).map(t => t.name);
-ok(drifted.length === 0, `every one of the 23 old input schemas is byte-identical to the snapshot (drifted: ${drifted.join(', ') || 'none'})`);
+const addedProps = {};
+const schemaDrifted = (old, cur, name) => {
+  if (!cur) return true;
+  const strip = (schema) => { const copy = { ...schema }; delete copy.properties; delete copy.required; return copy; };
+  if (JSON.stringify(strip(old)) !== JSON.stringify(strip(cur))) return true;
+  if (JSON.stringify(old.required || []) !== JSON.stringify(cur.required || [])) return true;
+  const oldProps = old.properties || {};
+  const curProps = cur.properties || {};
+  for (const key of Object.keys(oldProps)) if (JSON.stringify(oldProps[key]) !== JSON.stringify(curProps[key])) return true;
+  const added = Object.keys(curProps).filter((key) => !(key in oldProps));
+  if (added.length) addedProps[name] = added;
+  return added.some((key) => !(ALLOWED_NEW_PROPERTIES[name] || []).includes(key));
+};
+const drifted = snapshot.filter(t => schemaDrifted(t.inputSchema, byName.get(t.name)?.inputSchema, t.name)).map(t => t.name);
+ok(JSON.stringify(addedProps) === JSON.stringify(ALLOWED_NEW_PROPERTIES),
+  `the only new properties on old tools are the listed optional ones (got ${JSON.stringify(addedProps)})`);
+ok(drifted.length === 0, `every property of the 23 old input schemas is byte-identical to the snapshot (drifted: ${drifted.join(', ') || 'none'})`);
 const status = tools.find(t => t.name === 'klypix_status');
 const reader = tools.find(t => t.name === 'read_card_contents');
 ok(status?.annotations?.readOnlyHint === true && status?.annotations?.openWorldHint === false && Object.keys(status?.inputSchema?.properties || {}).length === 0,
@@ -77,7 +96,7 @@ ok(Array.isArray(snapshot192) && snapshot192.length === 25, `the 1.92.0 snapshot
 const verdict192 = toolCompatibility(snapshot192, current);
 ok(verdict192.ok === true && verdict192.removed.length === 0 && verdict192.changed.length === 0,
   `the supervisor accepts this worker over 1.92.0 (removed: ${verdict192.removed.join(', ') || 'none'}; changed: ${verdict192.changed.join(', ') || 'none'})`);
-const drifted192 = snapshot192.filter(t => JSON.stringify(byName.get(t.name)?.inputSchema) !== JSON.stringify(t.inputSchema)).map(t => t.name);
+const drifted192 = snapshot192.filter(t => schemaDrifted(t.inputSchema, byName.get(t.name)?.inputSchema, t.name)).map(t => t.name);
 ok(drifted192.length === 0, `every 1.92.0 input schema — klypix_status and read_card_contents included — is byte-identical (drifted: ${drifted192.join(', ') || 'none'})`);
 
 fs.rmSync(tmp, { recursive: true, force: true });

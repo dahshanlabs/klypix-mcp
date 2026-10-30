@@ -478,7 +478,7 @@ behaviour is unverified.
 
 | Host | Level | Wired by | Brief into context | Decision capture | Live presence |
 |---|---|---|---|---|---|
-| **Claude Code** | Full automatic (6 lifecycle hooks since 1.105.0) | `install` | Automatic at session start, task-ranked retrieval per prompt | **Automatic** at turn end | Yes |
+| **Claude Code** | Full automatic (8 lifecycle hooks since 1.109.0; subagents get child ids) | `install` | Automatic at session start, task-ranked retrieval per prompt | **Automatic** at turn end | Yes |
 | **Codex** | Native MCP + presence + Context Gateway; optional `--codex-hooks` | `install` | Via `brain_sync`; per-prompt injection only with `--codex-hooks` | **Explicit only** (`brain_note`) — never automatic | Yes |
 | **Cursor** | MCP config + always-on rules file | `link` | Model must call `brain_sync` | Model must call `brain_note` | For the MCP connection |
 | **Cline** | MCP config + always-on rules file | `link` | Model must call `brain_sync` | Model must call `brain_note` | For the MCP connection |
@@ -741,6 +741,48 @@ Future hosts get baseline support merely by connecting the MCP server. A deeper 
 `klypix-mcp/presence` and map lifecycle events onto `upsertSession`, `removeSession`,
 `peekMessages` and `receiveMessages`. The shared contract accepts `id`, `client`, `surface`,
 `model`, `branch`, `intent`, touched `files`, and adapter `channel`.
+
+### Who did what: subagents, model and role (1.109.0)
+
+Three small labels, each recorded only where the host reports it.
+
+**Subagents.** When Claude Code starts a subagent, its `SubagentStart` hook reports an `agent_id`
+and `agent_type`, and every tool call inside the subagent carries the same `agent_id`. KLYPIX
+records the subagent as a child of its session, named `<session>/sub-<6 hex>` (for example
+`7ff6f074/sub-1a2b3c`):
+
+- files it edits land on its child entry (and, as before, on the session's own files);
+- a subagent about to edit a file a sibling subagent of the same session already edited is warned
+  before the edit (a warning, not a lock);
+- `🧠 BRAIN` lines it writes are captured from its own transcript at the session's next turn end,
+  stamped with the child id, instead of being lost;
+- its `brain_sync` lands on the child entry when it passes `agent: "sub-1a2b3c"`. The id is handed
+  to the subagent when it starts. A subagent shares its session's MCP connection, and that
+  connection carries no subagent identity, so this one step depends on the subagent passing the
+  id. KLYPIX accepts only an id the hook recorded; any other id is ignored and the call is recorded
+  under the session, as before.
+
+Peers see a session's subagents under it in `brain_sync` and the presence footer. Codex and the
+other hosts do not report subagents to hooks or MCP, so their subagents' work stays under the parent
+session. `npx klypix-mcp doctor` says which applies on your machine.
+
+**Model.** A captured card records `capturedBy: { session, agent?, tool, model }`. The model is
+what the host wrote: the `model` of the transcript entry that holds the marker (Claude Code), or the
+model Codex sends with each hook event. When the host did not report it, the stamp says `unknown`.
+A card or handoff written through an MCP tool from Claude Code says `unknown`, because nothing tells
+the MCP server about a `/model` switch between turns. Presence shows the model each session last
+reported.
+
+**Role.** `brain_sync { role: "reviewer" }` puts a free-text label on the session for its lifetime.
+Peers see it, and `brain_handoff { action: "write", for: "reviewer", … }` addresses a handoff to
+it: a session that declares that role sees the card first, marked as addressed to its role. Every
+other session still sees it. A role is a label only. It carries no history, reputation or authority
+from earlier sessions, and nothing reserves the work. Persistent seats with inherited history were
+considered and deferred: a new session or model in an old seat would read earlier conclusions as
+its own.
+
+All three are optional additive fields. Older brains, lane rows and peers without them work as
+before.
 
 ### Overlap warnings
 

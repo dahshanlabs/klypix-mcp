@@ -135,6 +135,10 @@ const DOCTOR_VERSION = resolveDoctorVersion();
 
 const HOOK_MARK = 'global-brain-hook';
 const HOOK_EVENTS = ['SessionStart', 'UserPromptSubmit', 'Stop', 'PostToolUse', 'PreToolUse'];
+// Subagent identity (1.109.0) is reported separately and never flips the
+// verdict: an install from before it is valid, its subagents are simply
+// recorded under the parent session.
+const SUBAGENT_HOOK_EVENTS = ['SubagentStart', 'SubagentStop'];
 // Liveness windows imported from the canonical rule; literals are the LAST
 // RESORT for a bundle whose agent-presence predates the exports.
 const SESSION_FRESH_MS = Number(presenceLib?.SESSION_FRESH_MS) > 0
@@ -184,7 +188,8 @@ function inspectHooks(home) {
     .filter(g => Array.isArray(g?.hooks) && g.hooks.some(h => typeof h?.command === 'string' && h.command.includes(HOOK_MARK)));
   const coversClear = (g) => !g.matcher || String(g.matcher).split('|').map(x => x.trim()).some(x => x === 'clear' || x === '*');
   const sessionStartMissesClear = ours.length > 0 && !ours.some(coversClear);
-  return { settingsPresent: present, wired, missing, sessionStartMissesClear };
+  const subagentHooks = present && SUBAGENT_HOOK_EVENTS.every(wiredFor);
+  return { settingsPresent: present, wired, missing, sessionStartMissesClear, subagentHooks };
 }
 
 // ── TOOLS (discoverable manifest) layer ──────────────────────────────────────
@@ -1757,11 +1762,19 @@ export function render(r, opts = {}) {
   else if (r.hooks.missing.length === 1 && r.hooks.missing[0] === 'PreToolUse') L.push(`${hmark} ${c.bold}CLAUDE${c.rst}   capture path intact; ${c.yel}guard lane not wired yet${c.rst} — \`npx klypix-mcp install\` adds the PreToolUse hook (guard cards)`);
   else if (r.hooks.missing.length) L.push(`${hmark} ${c.bold}CLAUDE${c.rst}   half-wired — missing: ${c.yel}${r.hooks.missing.join(', ')}${c.rst}  ${c.dim}(liveness up, readiness no)${c.rst}`);
   else L.push(`${hmark} ${c.bold}CLAUDE${c.rst}   existing 5-hook capture path intact: ${r.hooks.wired.join(', ')}`);
+  if (r.hooks.settingsPresent) {
+    L.push(r.hooks.subagentHooks
+      ? `   ${c.dim}subagents: each subagent Claude Code reports gets a child id (<session>/sub-xxxxxx) for its files, markers and brain_sync${c.rst}`
+      : `   ${c.dim}subagents: recorded under the parent session — "npx klypix-mcp install" adds the SubagentStart / SubagentStop hooks that give each one a child id${c.rst}`);
+  }
   if (r.hooks.sessionStartMissesClear) L.push(`   ${c.dim}note: SessionStart is not wired for /clear — a cleared conversation starts without the brain brief; "npx klypix-mcp install" adds "clear" to its matcher${c.rst}`);
   const chmark = r.layers.codexHooks === 'warning' ? warn : ok;
   const smart = r.codexSmart?.globalInstructions
     ? 'approval-free Context Gateway active (task memory + clean peers + proactive/guaranteed alerts)'
     : 'approval-free brain_sync Context Gateway available through MCP';
+  // Codex (and every host other than Claude Code) does not report subagents
+  // to hooks or MCP, so there is nothing to tell them apart by.
+  const codexSubagents = `   ${c.dim}subagents: Codex does not report them, so their work is recorded under the parent session; other hosts likewise${c.rst}`;
   if (r.codexHooks.error) {
     L.push(`${chmark} ${c.bold}CODEX${c.rst}    automatic MCP presence + ${smart}; optional native-hook config unreadable: ${c.yel}${r.codexHooks.error}${c.rst}`);
   } else if (!r.codexHooks.installed) {
@@ -1772,6 +1785,7 @@ export function render(r, opts = {}) {
   } else {
     L.push(`${chmark} ${c.bold}CODEX${c.rst}    automatic MCP presence + ${smart} · native auto-context + pre-edit overlap warning active ${c.dim}(last observed ${r.codexHooks.lastExecutedAt})${c.rst}`);
   }
+  L.push(codexSubagents);
   // Commit-capture git hook — per-repo, informational (auto-installed at
   // session start where safe; foreign hooks are never edited automatically).
   if (r.gitCapture && r.gitCapture.state !== 'n/a') {

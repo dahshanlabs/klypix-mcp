@@ -30,7 +30,7 @@ import path from 'path';
 import os from 'os';
 import crypto from 'crypto';
 import { HANDOFF_RE, handoffTitle, isOpenHandoffCard } from './klypix-format.mjs';
-import { sessionWorkIsRecent } from './agent-presence.mjs';
+import { sessionWorkIsRecent, normalizeModel, normalizeRole, rolesMatch } from './agent-presence.mjs';
 export { sessionWorkIsRecent };
 
 // A host-neutral, append-only evidence journal. The caller supplies observed
@@ -326,6 +326,10 @@ export function normalizeHandoffInput(raw = {}) {
     // The tail of the session's last reply, verbatim (an auto-drafted card
     // carries it because it is the only "next" the session ever said).
     lastWords: safeText(flat(raw.lastWords)).slice(0, HANDOFF_LAST_WORDS_MAX),
+    // Optional addressee (1.109.0): a role label such as "reviewer". The card
+    // is offered first to a session that declares that role in brain_sync;
+    // every other session still sees it. No seat, no inherited history.
+    forRole: safeText(normalizeRole(raw.for ?? raw.forRole)),
   };
   return { ok: true, value };
 }
@@ -338,6 +342,11 @@ export function normalizeHandoffInput(raw = {}) {
 export function renderHandoffCard(value, { from = {}, at = Date.now(), repo = {}, resume = '', auto = null } = {}) {
   const lines = [`🤝 HANDOFF — ${value.title}`];
   const fromBits = [`${clientWord(from.client)} ${String(from.sessionId || '').slice(0, 8)}`.trim(), minuteIso(at)];
+  // 1.109.0: the writer's model (only when its host reported it) and role,
+  // and the role the card is addressed to. Older parsers skip unknown bits.
+  if (normalizeModel(from.model)) fromBits.push(`model ${normalizeModel(from.model)}`);
+  if (normalizeRole(from.role)) fromBits.push(`role ${safeText(normalizeRole(from.role))}`);
+  if (value.forRole) fromBits.push(`for ${value.forRole}`);
   if (repo.branch) fromBits.push(`branch ${repo.branch}${repo.head ? ` @ ${repo.head}` : ''}`);
   fromBits.push(`reason: ${HANDOFF_REASONS[value.reason] || HANDOFF_REASONS.other}`);
   lines.push(`From: ${fromBits.filter(Boolean).join(' · ')}`);
@@ -365,7 +374,16 @@ export function handoffMachineField(value, { from = {}, at = Date.now(), repo = 
     title: value.title,
     reason: value.reason,
     at,
-    from: { client: clientWord(from.client), sessionId: String(from.sessionId || '').slice(0, 160), ...(repo.branch ? { branch: repo.branch } : {}), ...(repo.head ? { head: repo.head } : {}) },
+    from: {
+      client: clientWord(from.client),
+      sessionId: String(from.sessionId || '').slice(0, 160),
+      ...(repo.branch ? { branch: repo.branch } : {}),
+      ...(repo.head ? { head: repo.head } : {}),
+      // 1.109.0 (additive): the host-reported model, or 'unknown'; the role.
+      model: normalizeModel(from.model) || 'unknown',
+      ...(normalizeRole(from.role) ? { role: normalizeRole(from.role) } : {}),
+    },
+    ...(value.forRole ? { for: value.forRole } : {}),
     taken: null,
     done: null,
     ...(continues ? { continues: String(continues).slice(0, 64) } : {}),
@@ -402,7 +420,8 @@ export function parseHandoffCard(card, { now = Date.now() } = {}) {
   const out = {
     id: card?.id || null,
     title: handoffTitle(card),
-    from: { client: '', sessionId: '' },
+    from: { client: '', sessionId: '', model: '', role: '' },
+    forRole: '',
     at: Number(card?.createdAt) || 0,
     reason: '',
     branch: '',
@@ -448,6 +467,12 @@ export function parseHandoffCard(card, { now = Date.now() } = {}) {
       if (b) { out.branch = b[1]; out.head = b[2] || ''; continue; }
       const r = bit.match(/^reason:\s*(.+)$/i);
       if (r) { out.reason = reasonKey(r[1]); continue; }
+      const md = bit.match(/^model\s+(\S+)$/i);
+      if (md) { out.from.model = normalizeModel(md[1]) || ''; continue; }
+      const rl = bit.match(/^role\s+(.+)$/i);
+      if (rl) { out.from.role = normalizeRole(rl[1]); continue; }
+      const fr = bit.match(/^for\s+(.+)$/i);
+      if (fr) { out.forRole = normalizeRole(fr[1]); continue; }
       const t = Date.parse(bit.replace(' UTC', 'Z').replace(' ', 'T'));
       if (Number.isFinite(t) && !out.at) out.at = t;
     }
@@ -509,7 +534,10 @@ export function parseHandoffCard(card, { now = Date.now() } = {}) {
       if (h.from.sessionId) out.from.sessionId = String(h.from.sessionId);
       if (h.from.branch) out.branch = String(h.from.branch);
       if (h.from.head) out.head = String(h.from.head);
+      if (typeof h.from.model === 'string') out.from.model = normalizeModel(h.from.model) || '';
+      if (typeof h.from.role === 'string') out.from.role = normalizeRole(h.from.role);
     }
+    if (typeof h.for === 'string') out.forRole = normalizeRole(h.for);
     if (h.taken && typeof h.taken === 'object' && h.taken.sessionId) out.taken = { client: flat(h.taken.client), sessionId: String(h.taken.sessionId), at: Number(h.taken.at) || null, note: flat(h.taken.note || '') };
     if (h.done && typeof h.done === 'object' && h.done.sessionId) out.finished = { client: flat(h.done.client), sessionId: String(h.done.sessionId), at: Number(h.done.at) || null, note: flat(h.done.summary || h.done.note || '') };
     if (h.continuedBy) out.continuedBy = String(h.continuedBy).slice(0, 64);
@@ -546,13 +574,19 @@ export const isHandoffLine1 = (text) => HANDOFF_RE.test(String(text || '').split
 // ── Format ───────────────────────────────────────────────────────────────────
 // `statusOf(sessionId)` → "working" / "idle 14m" / "closed" / "" (unknown), so a
 // taken handoff says whether its taker is still on it.
-export function formatHandoffCards(records, { now = Date.now(), max = 5, statusOf = () => '' } = {}) {
-  const items = Array.isArray(records) ? records : [];
-  if (!items.length) return '';
-  const lines = [`🤝 Handoff card${items.length > 1 ? 's' : ''} left in the brain by a session that stopped before the work was done (${items.length}, newest first):`];
+// `role` (1.109.0): the reading session's declared role. Cards addressed to
+// that role come first and say so; the rest keep their newest-first order.
+export function formatHandoffCards(records, { now = Date.now(), max = 5, statusOf = () => '', role = '' } = {}) {
+  const all = Array.isArray(records) ? records : [];
+  if (!all.length) return '';
+  const forMe = (h) => Boolean(h && h.forRole) && rolesMatch(h.forRole, role);
+  const items = [...all.filter(forMe), ...all.filter((h) => !forMe(h))];
+  const mine = items.filter(forMe).length;
+  const lines = [`🤝 Handoff card${items.length > 1 ? 's' : ''} left in the brain by a session that stopped before the work was done (${items.length}, ${mine ? `the ${mine} addressed to your role "${normalizeRole(role)}" first, then newest first` : 'newest first'}):`];
   for (const h of items.slice(0, max)) {
     const who = `${h.from.client || 'a session'} ${String(h.from.sessionId || '').slice(0, 8)}`.trim();
-    const head = [`- [${h.id}] “${h.title}” — ${h.auto ? 'drafted by KLYPIX from the record of' : 'left by'} ${who}${h.at ? ` ${agoWord(now - h.at)}` : ''}${h.reason ? ` (${HANDOFF_REASONS[h.reason] || h.reason})` : ''}${h.branch ? ` · branch ${h.branch}${h.head ? ` @ ${h.head}` : ''}` : ''}${h.auto ? ' · the session did not write it: verify its state with git first' : ''}`];
+    const writer = [h.from.model ? `model ${h.from.model}` : '', h.from.role ? `role ${h.from.role}` : ''].filter(Boolean).join(', ');
+    const head = [`- [${h.id}] “${h.title}” — ${h.auto ? 'drafted by KLYPIX from the record of' : 'left by'} ${who}${writer ? ` (${writer})` : ''}${h.at ? ` ${agoWord(now - h.at)}` : ''}${h.reason ? ` (${HANDOFF_REASONS[h.reason] || h.reason})` : ''}${h.forRole ? ` · for: ${h.forRole}${forMe(h) ? ' (your role)' : ''}` : ''}${h.branch ? ` · branch ${h.branch}${h.head ? ` @ ${h.head}` : ''}` : ''}${h.auto ? ' · the session did not write it: verify its state with git first' : ''}`];
     if (h.taken) {
       const st = statusOf(h.taken.sessionId) || 'not running';
       head.push(` · taken by ${h.taken.client || 'a session'} ${String(h.taken.sessionId).slice(0, 8)}${h.taken.at ? ` ${agoWord(now - h.taken.at)}` : ''} (${st})${st === 'working' ? ' — coordinate with brain_message before duplicating it' : ' — take it over if it stalled'}`);

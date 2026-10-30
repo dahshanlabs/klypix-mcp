@@ -2052,7 +2052,7 @@ function takeRuleSuffix(noteText) {
 // open file any agent reads AND writes": a hookless client (Cursor/Cline/Desktop)
 // can now record a decision, ask an open question, mark a milestone, resolve a card,
 // or correct one — with the full lifecycle, not just a flat append.
-export async function opBrainNote({ vault, canvas, text: noteText, area, marker = '', closes, via, evidence, verify, guard = null, rule = '', enrichmentQuestion = '' }) {
+export async function opBrainNote({ vault, canvas, text: noteText, area, marker = '', closes, via, evidence, verify, guard = null, rule = '', enrichmentQuestion = '', capturedBy = null }) {
   const t = brainTarget(vault, canvas);
   if (t.ambiguous) return ambiguousBrainErr(t.ambiguous);
   if (!t.file) return err(`No brain found — looked for ./brain.klypix in the project, then ${vault}. Pass canvas: "<name>".`);
@@ -2086,7 +2086,7 @@ export async function opBrainNote({ vault, canvas, text: noteText, area, marker 
   }
   const metadata = prepareBrainEvidence({ projectRoot: path.dirname(file), evidence, verify, marker, text: noteText, deriveVerify: parseVerifySuffix });
   if (!metadata.ok) return err(`Invalid brain note metadata: ${metadata.error}`);
-  const input = noteToCaptureInput({ text: noteText, area, marker, closes: closes || '', evidence: metadata.evidence, verify: metadata.verify, guard: guardField, createdVia: via || 'mcp' });
+  const input = noteToCaptureInput({ text: noteText, area, marker, closes: closes || '', evidence: metadata.evidence, verify: metadata.verify, guard: guardField, createdVia: via || 'mcp', capturedBy });
   // Deliver any queued out-of-session ship observations on THIS write. The
   // Claude Stop hook is not the only writer — an MCP-only or Codex-driven
   // project would otherwise queue observations that never drain (2026-07-29
@@ -2395,13 +2395,19 @@ const handoffStatusOf = (file) => {
 // the card is drafted by KLYPIX from a dead session's record on that session's
 // behalf (`from` = the dead session); `auto.by` is the session whose sync
 // noticed it. `autoDraft` (list): run the draft/reconcile pass first.
-export async function opBrainHandoff({ vault, canvas, action = 'write', from = {}, via, id, session, summary, note, cursor = 0, revision, reviewToken, continues, continuedBy, auto = null, autoDraft = true, ...fields }) {
+export async function opBrainHandoff({ vault, canvas, action = 'write', from = {}, via, id, session, summary, note, cursor = 0, revision, reviewToken, continues, continuedBy, auto = null, autoDraft = true, capturedBy = null, ...fields }) {
   const t = brainTarget(vault, canvas);
   if (t.ambiguous) return ambiguousBrainErr(t.ambiguous);
   if (!t.file) return err(`No brain found — looked for ./brain.klypix in the project, then ${vault}. Pass canvas: "<name>".`);
   const file = t.file;
   const projectDir = path.dirname(file);
-  const me = { sessionId: String(from.sessionId || '').slice(0, 160), client: String(from.client || via || 'unknown').slice(0, 40) };
+  const me = {
+    sessionId: String(from.sessionId || '').slice(0, 160),
+    client: String(from.client || via || 'unknown').slice(0, 40),
+    // 1.109.0 (additive): the writer's host-reported model and role label.
+    ...(typeof from.model === 'string' && from.model ? { model: from.model } : {}),
+    ...(typeof from.role === 'string' && from.role ? { role: from.role } : {}),
+  };
   const stamp = (ms) => { try { return new Date(ms).toISOString().slice(0, 16).replace('T', ' ') + ' UTC'; } catch { return ''; } };
   const reply = (textOut, extra = {}, isError = false) => ({ blocks: [text(textOut)], structured: { schemaVersion: 1, action, brain: file, ...extra }, ...(isError ? { isError: true } : {}) });
 
@@ -2477,7 +2483,7 @@ export async function opBrainHandoff({ vault, canvas, action = 'write', from = {
     const cards = listOpenHandoffCards(struct, { now });
     const lane = listUnfinishedWork({ brainPath: file, now, selfId: me.sessionId });
     const titles = new Map(cards.map((h) => [h.id, h.title]));
-    const blocks = [formatHandoffCards(cards, { now, statusOf: handoffStatusOf(file), max: 8 }), 'Handoff cards are saved summaries, not verified conversation coverage. On takeover use brain_handoff review to check the source conversation, including unanswered requests; unavailable evidence means UNKNOWN.', formatUnfinishedWork(lane, { now, max: 8, cardTitles: titles })].filter(Boolean);
+    const blocks = [formatHandoffCards(cards, { now, statusOf: handoffStatusOf(file), max: 8, role: me.role || '' }), 'Handoff cards are saved summaries, not verified conversation coverage. On takeover use brain_handoff review to check the source conversation, including unanswered requests; unavailable evidence means UNKNOWN.', formatUnfinishedWork(lane, { now, max: 8, cardTitles: titles })].filter(Boolean);
     if (drafted.length) blocks.unshift(`🤝 KLYPIX drafted ${drafted.length} handoff card${drafted.length > 1 ? 's' : ''} just now from the record of a session that stopped without writing one: ${drafted.map((d) => `[${d.id}] “${d.title}” (${handoffClientWord(d.client)} ${String(d.session).slice(0, 8)})`).join('; ')}. A drafted card is a lead, not a verified state — confirm it with git before relying on it.`);
     if (closed.length) blocks.push(`✓ KLYPIX archived ${closed.length} drafted handoff card${closed.length > 1 ? 's' : ''} whose session resumed and completed its task: ${closed.map((c) => c.id).join(', ')}.`);
     const out = blocks.length ? blocks.join('\n\n') : 'No handoff card is open in this brain and no other session left unfinished work on this project (sessions quiet for 10 minutes or closed, intent never completed, last 14 days).';
@@ -2506,6 +2512,7 @@ export async function opBrainHandoff({ vault, canvas, action = 'write', from = {
     }
     const noteResult = await opBrainNote({
       vault, canvas: file, text: body, area: value.area, marker: '?', via: via || me.client,
+      ...(capturedBy && !auto ? { capturedBy } : {}),
       evidence: evidence.length ? evidence : undefined,
       verify: value.verify || undefined,
       enrichmentQuestion: [`what was ${handoffClientWord(me.client)} session ${me.sessionId.slice(0, 8)} working on and where did it leave off?`, `how do I continue ${value.title}?`],

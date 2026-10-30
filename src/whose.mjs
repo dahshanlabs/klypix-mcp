@@ -236,12 +236,24 @@ export async function decide(input, { findProjectBrain, listActiveSessions, home
 
   if (!strongest) {
     const readOnly = risky.every((s) => s.tier === 'READ');
+    // 1.109 (continuity test 2026-10-30): this note said "another session's
+    // work — leave them alone" about files whose session had been KILLED 12
+    // minutes earlier, and the next session obeyed it and left the task
+    // undone. Only a LIVE owner's files are "leave alone"; a stopped owner's
+    // leftovers are unfinished work the next session may take. Unknown
+    // liveness (the lane could not be read) still counts as live.
+    const ownerIsLive = (o) => !liveKnown || (o.owners || []).some((w) => liveKeys.has(String(w.sid || '').toLowerCase()));
     const theirs = [...info.entries()].filter(([, o]) => o.cls === 'FOREIGN').map(([p, o]) => [p, { o }]);
+    const liveTheirs = theirs.filter(([, { o }]) => ownerIsLive(o));
+    const stoppedTheirs = theirs.filter(([, { o }]) => !ownerIsLive(o));
     if (readOnly && theirs.length) {
+      const parts = [];
+      if (liveTheirs.length) parts.push(`KLYPIX: some uncommitted files here are another session's work (that session is running) — leave them alone and commit only your own:\n${liveTheirs.slice(0, 12).map(ownerLine).join('\n')}`);
+      if (stoppedTheirs.length) parts.push(`KLYPIX: these uncommitted files were left by a session that has stopped (it is not running and holds no claim on them):\n${stoppedTheirs.slice(0, 12).map(ownerLine).join('\n')}\nIf you are continuing that session's work, they are yours to finish and commit. If not, leave them out of your commit.`);
       return {
         decision: 'context',
-        text: `KLYPIX: some uncommitted files here are another session's work — leave them alone and commit only your own:\n${theirs.slice(0, 12).map(ownerLine).join('\n')}${mineList.length ? `\nYours: ${mineList.slice(0, 12).join(', ')}` : ''}`,
-        log: { tier: 'READ', foreign: theirs.length },
+        text: `${parts.join('\n')}${mineList.length ? `\nYours: ${mineList.slice(0, 12).join(', ')}` : ''}`,
+        log: { tier: 'READ', foreign: liveTheirs.length, stopped: stoppedTheirs.length },
       };
     }
     return null;

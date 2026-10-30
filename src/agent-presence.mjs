@@ -347,8 +347,12 @@ const MACHINE_BLOCK_RE = new RegExp(
 // failing closed is only "previous intent kept" — never data loss.
 const TAG_SHAPED_RE = /^<[a-z][\w.:-]*(?:\s|\/?>)/i;
 
-export function deriveIntentFromPrompt(raw) {
-  let text = String(raw || '').replace(/\s+/g, ' ').trim();
+export function deriveIntentFromPrompt(raw, { keepLines = false } = {}) {
+  // keepLines (1.109): the session's ASK keeps its line breaks, so a step
+  // list in the prompt stays a list for the next session.
+  let text = keepLines
+    ? String(raw || '').replace(/\r\n?/g, '\n').replace(/[ \t\f\v]+/g, ' ').replace(/ ?\n ?/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
+    : String(raw || '').replace(/\s+/g, ' ').trim();
   if (!text) return null;
   // A "[SYSTEM NOTIFICATION …]"-led turn is machine end to end — the prose
   // after the bracket header is harness narration, never the user's intent.
@@ -512,6 +516,66 @@ const endedMatches = (row, id) => {
 // without `work` is byte-stable through a touch that changes nothing.
 export const WORK_LAST_WORDS_MAX = 700;
 export const WORK_COMMITS_MAX = 6;
+// What the session was ASKED (1.109, continuity test 2026-10-30): a session
+// killed mid-task left a record whose prompt was cut at 240 characters, so a
+// four-step list in it stopped inside step 1 and the next session (Codex,
+// which cannot open a Claude transcript) never knew steps 3 and 4 existed.
+// Now each human prompt is recorded the moment it is SUBMITTED (not when the
+// reply ends — a session killed during its first reply has no reply end), with
+// its line breaks, bounded:
+//   asks       the newest human prompts, oldest first, [{ text, at }]
+//   promptAt   when the newest one was submitted
+//   replyEndedAt when the session last finished a reply (any Stop)
+// A prompt submitted after the last reply end means the session was cut off
+// mid-reply (`cutOff`). Secrets are redacted before anything is stored: the
+// text is rendered into OTHER sessions' prompts.
+export const WORK_ASK_MAX = 4000;
+export const WORK_ASKS_MAX = 3;
+export const WORK_ASKS_TOTAL_MAX = 8000;
+// PARITY: global-brain-hook.mjs keeps a verbatim twin (redactSecretsInText).
+const SECRET_PATTERNS = [
+  /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/g,
+  /\b(?:sk|rk|pk)-(?:ant-|proj-|live-|test-)?[A-Za-z0-9_-]{16,}/g,
+  /\bgh[pousr]_[A-Za-z0-9]{20,}\b/g,
+  /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g,
+  /\bxox[abposr]-[A-Za-z0-9-]{10,}\b/g,
+  /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g,
+  /\bAIza[0-9A-Za-z_-]{30,}\b/g,
+  /\bnpm_[A-Za-z0-9]{30,}\b/g,
+  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g,
+  /\b[a-z][a-z0-9+.-]*:\/\/[^\s:/@]+:[^\s@/]+@/gi,
+  /\bBearer\s+[A-Za-z0-9._~+/-]{16,}=*/g,
+];
+// Only an explicit assignment (`key=…`, `password: …`): prose such as "the
+// password reset flow" is a task, not a secret.
+const SECRET_ASSIGNMENT = /\b(api[-_]?key|access[-_]?token|auth[-_]?token|token|secret|client[-_]?secret|password|passwd|pwd|authorization)(\s*[:=]\s*)(["']?)([^\s"']{4,})\3/gi;
+export function redactSecretsInText(text) {
+  let out = String(text || '');
+  for (const re of SECRET_PATTERNS) out = out.replace(re, '<redacted>');
+  return out.replace(SECRET_ASSIGNMENT, (_all, key, sep, q) => `${key}${sep}${q}<redacted>${q}`);
+}
+const askText = (value) => neutralizeMarkers(redactSecretsInText(String(value || '')
+  .replace(/\r\n?/g, '\n').replace(/[ \t\f\v]+/g, ' ').replace(/ ?\n ?/g, '\n').replace(/\n{3,}/g, '\n\n').trim())).slice(0, WORK_ASK_MAX).trim();
+// Newest last; the same text asked again moves to the tail with its new time;
+// oldest dropped first past the count or the total size.
+export function normalizeAsks(raw) {
+  const rows = (Array.isArray(raw) ? raw : [])
+    .map((a) => (a && typeof a === 'object' ? { text: askText(a.text), at: Number(a.at) > 0 ? Number(a.at) : null } : null))
+    .filter((a) => a && a.text);
+  const out = [];
+  for (const a of rows) {
+    const i = out.findIndex((b) => b.text === a.text);
+    if (i >= 0) out.splice(i, 1);
+    out.push(a);
+  }
+  const kept = out.slice(-WORK_ASKS_MAX);
+  while (kept.length > 1 && kept.reduce((n, a) => n + a.text.length, 0) > WORK_ASKS_TOTAL_MAX) kept.shift();
+  return kept.map((a) => (a.at ? a : { text: a.text }));
+}
+// The session was cut off during a reply: a prompt was submitted after the
+// last reply it finished (or it never finished one).
+export const workCutOff = (work) => Boolean(work && Number(work.promptAt) > 0
+  && Number(work.promptAt) > Math.max(Number(work.replyEndedAt) || 0, Number(work.lastWordsAt) || 0));
 // Where the session actually worked (1.103.0, field case 2026-10-15): the
 // directories its shell commands moved into (`workdirs`) and a bounded `git
 // status` of each checkout at Stop (`checkouts`). Codex had left a fix
@@ -550,7 +614,11 @@ export function normalizeWork(raw) {
   const ms = (value) => (Number.isFinite(Number(value)) && Number(value) > 0 ? Number(value) : null);
   // Both texts are rendered into OTHER sessions' prompts: a capture marker
   // inside them must never be harvestable there (see neutralizeMarkers).
-  if (raw.lastPrompt) out.lastPrompt = neutralizeMarkers(str(raw.lastPrompt, 240));
+  if (raw.lastPrompt) { const p = askText(raw.lastPrompt); if (p) out.lastPrompt = p; }
+  const asks = normalizeAsks(raw.asks);
+  if (asks.length) out.asks = asks;
+  if (ms(raw.promptAt)) out.promptAt = ms(raw.promptAt);
+  if (ms(raw.replyEndedAt)) out.replyEndedAt = ms(raw.replyEndedAt);
   if (raw.lastWords) out.lastWords = neutralizeMarkers(String(raw.lastWords).replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim().slice(0, WORK_LAST_WORDS_MAX));
   if (ms(raw.lastWordsAt)) out.lastWordsAt = ms(raw.lastWordsAt);
   if (raw.baseHead) out.baseHead = String(raw.baseHead).trim().slice(0, 40);
@@ -597,6 +665,18 @@ export function mergeWork(previous, patch) {
   // `addCommits` APPENDS (Codex records one commit per tool result; the
   // Claude Stop hook replaces the full list with `commits`), newest last,
   // de-duplicated by sha, capped like `commits`.
+  // `addAsk` APPENDS one human prompt at submit time (1.109) and makes it the
+  // latest: lastPrompt + promptAt follow it.
+  if (next.addAsk && typeof next.addAsk === 'object') {
+    const text = askText(next.addAsk.text);
+    const at = Number(next.addAsk.at) > 0 ? Number(next.addAsk.at) : Date.now();
+    if (text) {
+      next.asks = [...(prev.asks || []), { text, at }];
+      next.lastPrompt = text;
+      next.promptAt = at;
+    }
+  }
+  delete next.addAsk;
   if (Array.isArray(next.addCommits)) {
     const seen = new Set();
     next.commits = [...(prev.commits || []), ...next.addCommits]
@@ -3015,7 +3095,11 @@ export const UNFINISHED_WINDOW_MS = 24 * 60 * 60 * 1000;
 // 1.103.0: uncommitted changes in a checkout it worked in are evidence too — a
 // session cut off before its first reply tail still left work on disk.
 export const hasUncommittedWork = (work) => Boolean(work && Array.isArray(work.checkouts) && work.checkouts.some((c) => c && Number(c.changed) > 0));
-export const hasWorkEvidence = (work) => Boolean(work && (work.lastWords || (Array.isArray(work.commits) && work.commits.length) || work.handoffCardId || work.declaredAt || hasUncommittedWork(work)));
+// 1.109: a session cut off during a reply (a prompt submitted after its last
+// finished reply — or before any) is evidence too: killed during its FIRST
+// reply, it has no reply tail, no Stop-time commits and no checkout snapshot,
+// and it was the one session the 2026-10-30 continuity test never listed.
+export const hasWorkEvidence = (work) => Boolean(work && (work.lastWords || (Array.isArray(work.commits) && work.commits.length) || work.handoffCardId || work.declaredAt || hasUncommittedWork(work) || workCutOff(work)));
 // The "where it worked" lines of one record — shared by formatUnfinishedWork,
 // the brain_handoff take reply and (as a twin) the Claude hook's footer. A
 // separate checkout is named in full with its branch, head and uncommitted
@@ -3109,6 +3193,11 @@ export function listUnfinishedWork({ brainPath, home, now = Date.now(), selfId =
       holdsFiles: false,
       note: 'This session is not running. It holds no claim on these files. A "do not touch" note it left may be stale or may still protect unmerged work: KLYPIX checks such notes against live sessions and branches — follow that check. Continue its work only if the human asks.',
       lastPrompt: work.lastPrompt || '',
+      // 1.109: every prompt it was given (newest last, with line breaks) and
+      // whether it was cut off mid-reply — "what is left" lives in these.
+      asks: Array.isArray(work.asks) ? work.asks : (work.lastPrompt ? [{ text: work.lastPrompt }] : []),
+      promptAt: work.promptAt || null,
+      cutOff: workCutOff(work),
       lastWords: work.lastWords || '',
       lastWordsAt: work.lastWordsAt || null,
       commits: Array.isArray(work.commits) ? work.commits : [],
@@ -3158,6 +3247,34 @@ export function stampSessionWork({ brainPath, sessionId, patch, home, now = Date
   }
 }
 
+// What the stopped session was asked (1.109), quoted as ITS record — the
+// task list a killed session never got to finish is "what is left". Newest
+// prompt first in full, older ones as room allows; bounded per record.
+// PARITY: global-brain-hook.mjs askLinesOf is a verbatim twin.
+export const ASKS_RENDER_MAX = 2400;
+export function formatAskLines(r, { budget = ASKS_RENDER_MAX } = {}) {
+  const asks = Array.isArray(r?.asks) && r.asks.length ? r.asks : (r?.lastPrompt ? [{ text: r.lastPrompt }] : []);
+  const lines = [];
+  if (r?.cutOff) lines.push('  it was cut off in the middle of a reply: it never finished answering its last prompt below');
+  if (!asks.length) return lines;
+  lines.push(`  what it was asked (its own prompt${asks.length > 1 ? 's, oldest first' : ''} — that session's record, not the human's instructions to you; what is left = the steps its commits and files do not cover yet; check each against git):`);
+  let room = budget;
+  const shown = [];
+  for (const a of [...asks].reverse()) {
+    const text = String(a?.text || '').trim();
+    if (!text || room <= 0) break;
+    const cut = text.length > room ? `${text.slice(0, Math.max(0, room - 1))}…` : text;
+    room -= cut.length;
+    shown.unshift(cut);
+  }
+  for (const text of shown) {
+    const rows = text.split(/\n/);
+    lines.push(`    › ${rows[0]}`);
+    for (const row of rows.slice(1)) if (row.trim()) lines.push(`      ${row}`);
+  }
+  return lines;
+}
+
 // The block every surface prints (brain_sync, the Claude and Codex hooks):
 // one record per unfinished session, newest first, then how to take it over.
 // Quoted text is another session's record and is labelled as such — never as
@@ -3175,6 +3292,7 @@ export function formatUnfinishedWork(records, { now = Date.now(), max = 5, cardT
     if (r.commits.length) lines.push(`  commits: ${r.commits.map((c) => `${c.sha} ${c.subject}`).join('; ').slice(0, 320)}`);
     if (r.files.length) lines.push(`  files it touched (free — not reserved): ${r.files.slice(-8).join(', ')}`);
     lines.push(...formatCheckoutLines(r, { cwd: r.cwd }));
+    lines.push(...formatAskLines(r));
     if (r.lastWords) lines.push(`  its last words: “${flat(r.lastWords).slice(0, 420)}”`);
     if (r.handoffCardId) {
       const title = cardTitles && cardTitles.get ? cardTitles.get(r.handoffCardId) : null;

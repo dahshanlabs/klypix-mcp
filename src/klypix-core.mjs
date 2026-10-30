@@ -46,7 +46,7 @@ import {
   leaseVerdict, readEndpoint, pathHash, canvasWriteLockPath, tellUser, LEASE_SINCE_APP_VERSION,
 } from './app-lease.mjs';
 import { LIMITS, assetBytes, dataUrlImage, fitImage, imageSkipReason, locateAsset, mb } from './card-files.mjs';
-import { findProjectBrain, neutralizeMarkers, postPresenceMessage, resolveMessageTarget, readReleaseLease, listActiveSessions, listKnownSessions, sessionStatusLabel, stampSessionWork, listUnfinishedWork, formatUnfinishedWork, formatCheckoutLines, resumeCommandFor } from './agent-presence.mjs';
+import { findProjectBrain, neutralizeMarkers, postPresenceMessage, resolveMessageTarget, readReleaseLease, listActiveSessions, listKnownSessions, sessionStatusLabel, stampSessionWork, listUnfinishedWork, formatUnfinishedWork, formatCheckoutLines, formatAskLines, resumeCommandFor } from './agent-presence.mjs';
 import { normalizeHandoffInput, renderHandoffCard, handoffMachineField, parseHandoffCard, listOpenHandoffCards, formatHandoffCards, isHandoffLine1, HANDOFF_REASONS, clientWord as handoffClientWord, autoHandoffCandidates, draftHandoffFromWork, captureHandoffTurns, inspectHandoffFreshness, formatHandoffFreshness } from './session-handoff.mjs';
 import { collectRepoState, commitsInRange, makeContainmentProbe } from './repo-state.mjs';
 import { normalizeCrowdNote, lineagesFor, formatLineage, openObjections, formatObjections, withholdFilter, independentPass, isPeerOpinionOnTopic } from './crowd-safeguards.mjs';
@@ -2615,7 +2615,9 @@ export async function opBrainHandoff({ vault, canvas, action = 'write', from = {
       const rec = listUnfinishedWork({ brainPath: file, now, includeWorking: true }).find((x) => x.id === r.id) || null;
       if (action === 'take') {
         const where = rec ? formatCheckoutLines(rec, { cwd: rec.cwd }).map((l) => l.trim()).join('\n') : '';
-        return reply(`✓ Taken over: the work ${handoffClientWord(rec?.client)} ${String(r.id).slice(0, 8)} left (“${rec?.intent || ''}”) is now yours — every peer sees it as taken. Conversation coverage is UNVERIFIED: call brain_handoff {action:"review", session:"${r.id}"} before relying on this summary; the last reply can omit unanswered requests. Now call brain_sync with that intent and its files${rec?.files?.length ? ` (${rec.files.slice(-6).join(', ')})` : ''}; when it is finished, brain_handoff {action:"done", session:"${String(r.id).slice(0, 8)}"}.${where ? `\nWhere it worked: ${where}` : ''}${rec?.lastWords ? `\nIts last words: “${handoffFlat(rec.lastWords).slice(0, 600)}”` : ''}`, { session: r.id, record: rec });
+        // 1.109: what it was asked — the steps its commits do not cover are what is left.
+        const asked = rec ? formatAskLines(rec).map((l) => l.replace(/^ {2}/, '')).join('\n') : '';
+        return reply(`✓ Taken over: the work ${handoffClientWord(rec?.client)} ${String(r.id).slice(0, 8)} left (“${rec?.intent || ''}”) is now yours — every peer sees it as taken. Conversation coverage is UNVERIFIED: call brain_handoff {action:"review", session:"${r.id}"} before relying on this summary; the last reply can omit unanswered requests. Now call brain_sync with that intent and its files${rec?.files?.length ? ` (${rec.files.slice(-6).join(', ')})` : ''}; when it is finished, brain_handoff {action:"done", session:"${String(r.id).slice(0, 8)}"}.${where ? `\nWhere it worked: ${where}` : ''}${asked ? `\n${asked}` : ''}${rec?.lastWords ? `\nIts last words: “${handoffFlat(rec.lastWords).slice(0, 600)}”` : ''}`, { session: r.id, record: rec });
       }
       return reply(`✓ Marked done: the work ${String(r.id).slice(0, 8)} left no longer shows as unfinished.${extraNote ? ` Note kept: ${extraNote}` : ''}`, { session: r.id });
     }

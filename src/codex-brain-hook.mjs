@@ -513,10 +513,14 @@ async function projectLiveSafe({ projectDir, sessions, sessionId, lockNotes = ''
 // Unfinished-work patch for one Codex lifecycle event (session handoff). A
 // human prompt records what was asked; a Stop records the reply tail only if
 // the host put it in the payload. Null when the event carries nothing.
-function codexWorkPatch({ event, humanTurn, prompt, input }) {
+function codexWorkPatch({ event, humanTurn, prompt, input, rawPrompt }) {
   const patch = {};
-  if (humanTurn && prompt) patch.lastPrompt = String(prompt).slice(0, 240);
+  // 1.109: the ask is recorded at submit, with its line breaks (a step list
+  // stays a list) and bounded/redacted by the engine — was the first 240
+  // characters, which cut a task list inside step 1 (continuity test 2026-10-30).
+  if (humanTurn && prompt) patch.addAsk = { text: deriveIntentFromPrompt(rawPrompt, { keepLines: true }) || prompt, at: Date.now() };
   if (event === 'Stop') {
+    patch.replyEndedAt = Date.now();
     const words = input.last_assistant_message ?? input.lastAssistantMessage ?? input.assistant_message ?? '';
     const text = typeof words === 'string' ? words.trim() : '';
     if (text) { patch.lastWords = text.length > 700 ? '…' + text.slice(-699) : text; patch.lastWordsAt = Date.now(); }
@@ -610,7 +614,7 @@ async function main() {
     } catch { /* attribution is best-effort */ }
   }
   const files = humanTurn ? [] : undefined;
-  const workPatch = codexWorkPatch({ event, humanTurn, prompt, input }) || {};
+  const workPatch = codexWorkPatch({ event, humanTurn, prompt, input, rawPrompt }) || {};
   // Where it works (1.103.0): the directory a tool call ran in (Codex's exec
   // carries `workdir`; a command may `cd` or `git -C` elsewhere). Dynamic +
   // guarded so a stale bundle without the helper still records the rest.

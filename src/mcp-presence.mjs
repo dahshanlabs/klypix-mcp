@@ -40,6 +40,10 @@ import {
   switchMcpSessionIdentity,
   upsertRemoteSessions,
   upsertSession,
+  formatSubagents,
+  normalizeModel,
+  normalizeRole,
+  normalizeSubagents,
 } from './agent-presence.mjs';
 import { createNetworkBridge } from './network-bridge.mjs';
 import { formatRulesNotice, rulesForFiles } from './brain-rules.mjs';
@@ -987,6 +991,21 @@ const publicSession = (session, now) => {
     // sender knows whether a note lands on the next action or the next prompt.
     hostStatus: session?.hostStatus || null,
     statusLabel: sessionStatusLabel(session, now),
+    // ADDITIVE (1.109.0): optional role label, the model the host last
+    // reported (with its source), and the subagents the host reported.
+    role: normalizeRole(session?.role) || null,
+    model: normalizeModel(session?.model) || null,
+    modelSource: normalizeModel(session?.model) ? (session?.modelSource || 'unknown') : null,
+    subagents: normalizeSubagents(session?.subagents, now).map((e) => ({
+      id: `${String(session?.logicalSessionId || session?.id || '').slice(0, 8)}/${e.id}`,
+      agentType: e.agentType,
+      role: e.role || null,
+      model: e.model || null,
+      intent: e.intent || '',
+      files: e.files || [],
+      finished: Boolean(e.endedAt),
+    })),
+    subagentLine: formatSubagents(session, now),
   };
 };
 
@@ -1076,6 +1095,8 @@ export function formatTaskPresence(snapshot, now = Date.now()) {
     });
     const details = [
       peer.client,
+      peer.role ? `role ${peer.role}` : null,
+      peer.model ? `model ${peer.model}` : null,
       peer.statusLabel || null,
       peer.deliveryReachability && peer.deliveryReachability !== 'connected'
         ? `delivery ${peer.deliveryReachability}` : null,
@@ -1085,6 +1106,7 @@ export function formatTaskPresence(snapshot, now = Date.now()) {
     ].filter(Boolean);
     const shortId = shortestUniqueSessionPrefix(prefixRows, peer.id, 12) || String(peer.id).slice(0, 12);
     lines.push(`- ${shortId}: ${details.join(' | ')}`);
+    if (peer.subagentLine) lines.push(`  ${peer.subagentLine}`);
   }
   // v1.32.0 law: a truncated list must never render as a complete one.
   if (snapshot.peers.length > 8) lines.push(`- …and ${snapshot.peers.length - 8} more active task(s) not listed — brain_doctor shows all.`);
@@ -2135,6 +2157,7 @@ export function createMcpPresence({
     hostIdentityPrepared = false,
     clientInfoPrepared = null,
     branchPrepared,
+    role,
   } = {}) => {
     if (!brainPath) return { sessions: [], messages: [], notice: '', laneWriteOk: null, laneWriteSkippedReason: 'no-lane' };
     const stamp = now();
@@ -2165,6 +2188,7 @@ export function createMcpPresence({
       intentSource: intent !== undefined ? 'declared' : null,
       files,
       replaceFiles,
+      ...(role !== undefined ? { role } : {}),
       event,
       channel: 'mcp',
       cwd: path.dirname(brainPath),
@@ -2287,6 +2311,7 @@ export function createMcpPresence({
       hostIdentityPrepared: details.hostIdentityPrepared === true,
       clientInfoPrepared: details.clientInfoPrepared || null,
       branchPrepared: details.branchPrepared,
+      ...(typeof details.role === 'string' ? { role: details.role } : {}),
       // Forward the action identity (2026-08-14 review): without it, every
       // server instance's FIRST sync advanced delivery receipts with
       // actionId '' — records got no offered/acknowledgedActionId, breaking
@@ -2331,6 +2356,7 @@ export function createMcpPresence({
     actionId = '',
     preflight,
     requestIdentity,
+    role,
   } = {}) => {
     const syncStartedAt = Date.now();
     const nextPhase = ['start', 'checkpoint', 'complete'].includes(phase) ? phase : 'checkpoint';
@@ -2776,6 +2802,9 @@ export function createMcpPresence({
       hostIdentityPrepared: Boolean(resultBrainPath),
       clientInfoPrepared: preparedClientInfo,
       branchPrepared: preparedBranch,
+      // Optional role label (1.109.0): a session-level label, kept across
+      // phases until the session declares another one ('' clears it).
+      ...(typeof role === 'string' ? { role } : {}),
     };
     // Adopt the preflight's binding on BOTH arms, not just the start() arm.
     // A same-project re-sync takes touch(), which never reassigns — so the

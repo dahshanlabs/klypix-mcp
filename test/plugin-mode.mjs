@@ -35,6 +35,7 @@ import {
   autoUpdateEnabled, isPluginMode, machineStateDir, pluginDataDir, pluginShipObsPaths,
   reconcileRegisteredProjects, runAutoUpdateCheck, scrubUnexpandedEnv, spawnAutoUpdateHelper,
 } from '../src/mcp-auto-update.mjs';
+import { withoutAllowedAdditions } from './_schema-additions.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(HERE, '..');
@@ -259,7 +260,7 @@ try {
       ok(info?.name === 'klypix-canvas' && info?.version === PKG_VERSION, `plugin mode boots the package's own worker (serverInfo klypix-canvas v${info?.version})`);
       const { tools } = await client.listTools();
       const byName = new Map(tools.map((t) => [t.name, t]));
-      const drifted = snapshot.filter((t) => JSON.stringify(byName.get(t.name)?.inputSchema) !== JSON.stringify(t.inputSchema)).map((t) => t.name);
+      const drifted = snapshot.filter((t) => JSON.stringify(withoutAllowedAdditions(t.name, byName.get(t.name)?.inputSchema)) !== JSON.stringify(t.inputSchema)).map((t) => t.name);
       // show_in_klypix (P1) is app-only: Windows here (KLYPIX_APP_TOOLS is cleared by baseEnv).
       const expectedTools = process.platform === 'win32' ? 28 : 27;   // + brain_handoff (1.99.0), brain_rules (1.107.0)
       ok(!byName.has('prepare_video'), 'plugin mode does not register prepare_video (no downloads, no external programs)');

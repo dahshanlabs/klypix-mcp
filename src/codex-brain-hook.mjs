@@ -630,6 +630,9 @@ async function main() {
     client: 'codex',
     surface: input.surface || 'local',
     model: input.model || null,
+    // Codex sends the model with every hook event, so this report is current
+    // for the event; the source lets MCP-written stamps use it (1.109.0).
+    ...(input.model ? { modelSource: 'codex-hook' } : {}),
     permissionMode: input.permission_mode || input.permissionMode || null,
     branch: gitBranch(cwd),
     intent: prompt === undefined ? undefined : prompt,

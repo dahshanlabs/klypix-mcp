@@ -583,6 +583,12 @@ try {
         // next session read a dead peer as "live" and refused to continue its
         // work (round-4 continuity bench, 2026-10-20). Codex already had this.
         ['SessionEnd', { hooks: [{ type: 'command', command: brainCmd('--end'), timeout: 10 }] }],
+        // Subagent identity (1.109.0): Claude Code reports each subagent it
+        // starts and stops (agent_id / agent_type). The hook records it as a
+        // child of the session, so its files and markers keep their own name
+        // instead of merging into the parent's.
+        ['SubagentStart', { hooks: [{ type: 'command', command: brainCmd('--subagent-start'), timeout: 10 }] }],
+        ['SubagentStop', { hooks: [{ type: 'command', command: brainCmd('--subagent-stop'), timeout: 10 }] }],
     ];
     const stripOurs = (arr) => (Array.isArray(arr) ? arr : [])
         .map(g => (g && Array.isArray(g.hooks)) ? { ...g, hooks: g.hooks.filter(h => !(typeof h?.command === 'string' && h.command.includes(HOOK_MARK))) } : g)
@@ -658,7 +664,7 @@ try {
     //    leave the brain LIVE but not LEARNING — liveness ≠ readiness). Warn, don't fail.
     const verify = RUNTIME_ONLY ? null : (() => { try { return JSON.parse(fs.readFileSync(SETTINGS, 'utf8')); } catch { return null; } })();
     const wiredFor = (evt) => Array.isArray(verify?.hooks?.[evt]) && verify.hooks[evt].some(g => Array.isArray(g?.hooks) && g.hooks.some(h => typeof h?.command === 'string' && h.command.includes(HOOK_MARK)));
-    const notWired = ['SessionStart', 'UserPromptSubmit', 'Stop', 'PostToolUse', 'PreToolUse'].filter(e => !wiredFor(e));
+    const notWired = ['SessionStart', 'UserPromptSubmit', 'Stop', 'PostToolUse', 'PreToolUse', 'SubagentStart', 'SubagentStop'].filter(e => !wiredFor(e));
 
     releaseInstallLockSync(installLock);
     // Search by meaning: installed AFTER the brain itself is committed, so a
@@ -689,7 +695,7 @@ try {
     console.log(`✓ installed klypix brain v${VERSION} → ${BRAIN_DIR}  (${n} scripts, ${deps} dep packages)`);
     reportSemantic(semanticStep);
     if (RUNTIME_ONLY) console.log('✓ runtime-only update: host settings and project files were preserved');
-    else if (!notWired.length) console.log('✓ wired 6 hooks: SessionEnd (--end) · SessionStart · UserPromptSubmit (--prompt) · Stop (--capture) · PostToolUse (--live) · PreToolUse (--guard) → settings.json');
+    else if (!notWired.length) console.log('✓ wired 8 hooks: SessionEnd (--end) · SessionStart · UserPromptSubmit (--prompt) · Stop (--capture) · PostToolUse (--live) · PreToolUse (--guard) · SubagentStart / SubagentStop (--subagent-start / --subagent-stop) → settings.json');
     else console.error(`⚠ readiness: ${notWired.length} hook(s) did NOT take (${notWired.join(', ')}) — the brain will read but not capture/sync. Re-run \`npx klypix-mcp install --force\` or check ${SETTINGS}.`);
     console.log(`✓ MCP supervisor runs from the local bundle (node ${fwd(path.join(BRAIN_DIR, 'klypix-mcp-server.mjs'))}) — compatible core updates activate without restarting the host.`);
     if (migrated) console.log(`✓ migrated ${migrated.file} klypix-canvas server: ${migrated.from} → ${migrated.to} (backup: .mcp.json.klypix-bak). Reconnect (/mcp) or restart to pick it up.`);

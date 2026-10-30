@@ -1400,6 +1400,12 @@ function touchSession(sid, patch = {}) {
                 // Unfinished-work state (session handoff): merged only when this
                 // touch carries a patch; `...prev` keeps it verbatim otherwise.
                 ...(patch.work !== undefined ? (workMerge(prev.work, patch.work) ? { work: workMerge(prev.work, patch.work) } : {}) : {}),
+                // 1.109.0 (additive): the model the host last reported, with its
+                // source and time; `...prev` keeps it otherwise.
+                ...(patch.model ? { model: patch.model, modelSource: String(patch.modelSource || 'unknown').slice(0, 24), modelAt: now } : {}),
+                // 1.109.0 (additive): subagent entries, merged under THIS lock by
+                // the caller's merge function (agent-presence mergeSubagent).
+                ...(typeof patch.subagentMerge === 'function' ? (() => { try { return { subagents: patch.subagentMerge(prev.subagents, now) }; } catch { return {}; } })() : {}),
                 channels: Object.keys(channelSeen), channelSeen, channelOwners,
                 startedAt: prev.startedAt || now, lastSeen: now,
             };
@@ -1714,6 +1720,12 @@ function peerFooter(sid) {
         const bits = [];
         if (p.branch) bits.push(`branch \`${p.branch}\``);
         bits.push(`active ${ago(p.lastSeen)}`);
+        // 1.109.0: the optional role label, the model the host last reported,
+        // and how many subagents the host reported for it.
+        if (typeof p.role === 'string' && p.role.trim()) bits.push(`role ${p.role.trim().slice(0, 40)}`);
+        if (hookModel(p.model)) bits.push(`model ${hookModel(p.model)}`);
+        const subs = Array.isArray(p.subagents) ? p.subagents.filter(e => e && !e.endedAt && now - Number(e.lastSeen || 0) < 2 * 60 * 60 * 1000) : [];
+        if (subs.length) bits.push(`${subs.length} subagent${subs.length > 1 ? 's' : ''} (${subs.slice(-3).map(e => `${String(p.id).slice(0, 8)}/${e.id}${e.agentType ? ` ${e.agentType}` : ''}`).join(', ')})`);
         // "working" / "idle 14m": the difference between a peer that will see a
         // note on its next action and one that reads it at its next prompt.
         const status = statusLabelOf(p, now);
@@ -2908,15 +2920,26 @@ function observeFileScope(input, sid) {
         if (typeof fp !== 'string' || !fp) return;
         const rel = projRelPath(fp);
         if (!rel) return;
+        // 1.109.0: an edit made inside a subagent also lands on that subagent's
+        // child entry (Claude Code puts agent_id on its tool events).
+        const short = input.agent_id && HOOK_AP && typeof HOOK_AP.mergeSubagent === 'function' ? subagentShortOf(input.agent_id) : '';
+        let parentHas = false;
         try {
             const me = readSessions().find(s => s.id === sid);
-            if (me && Array.isArray(me.files) && me.files.includes(rel)) return;   // already recorded — skip the lock
+            parentHas = Boolean(me && Array.isArray(me.files) && me.files.includes(rel));
+            const childHas = Boolean(short && me && Array.isArray(me.subagents)
+                && me.subagents.some(e => e && e.id === short && Array.isArray(e.files) && e.files.includes(rel)));
+            if (parentHas && (!short || childHas)) return;   // already recorded — skip the lock
         } catch { /* pre-check is best-effort */ }
         // Not covered by any declared scope (a brain_sync declaration lands in
         // files[], which the pre-check above just cleared) → automatic scope
         // ADOPTION: the row gains the path as an OBSERVED file, distinct from a
         // declaration, while still joining files[] for pre-1.70 readers.
-        touchSession(sid, { addFiles: [rel], addObservedFiles: [rel], hostStatus: 'busy' });
+        touchSession(sid, {
+            ...(parentHas ? {} : { addFiles: [rel], addObservedFiles: [rel] }),
+            hostStatus: 'busy',
+            ...(short ? { subagentMerge: (prev, now) => HOOK_AP.mergeSubagent(prev, { id: short, agentType: input.agent_type || '', addFiles: [rel] }, now) } : {}),
+        });
     } catch { /* observation is best-effort */ }
 }
 
@@ -3660,6 +3683,11 @@ async function capture(lib) {
         lines = transcriptBuffer.toString('utf8').split('\n').filter(Boolean);
     } catch { return; }
     const scopeRow = readSessions().find(s => s.id === input.session_id) || {};
+    // 1.109.0: the transcripts of this session's finished subagents (recorded
+    // by the SubagentStop hook) are scanned after the main transcript, so their
+    // markers land with the subagent's child id instead of being lost (a
+    // subagent's text never reaches the parent's transcript as assistant text).
+    const subagentSources = subagentTranscriptSources(scopeRow, tp);
     // Unfinished-work state (session handoff, 1.99.0) — collected over the same
     // transcript walk, so a session that stops at a usage/context limit, a
     // closed window or a crash leaves the next session (any agent) its last
@@ -3667,6 +3695,7 @@ async function capture(lib) {
     // results ("[master abc1234] …"), never a branch range: 20 sessions share
     // one checkout here, and a range would credit peers' commits to this one.
     let lastAssistantWords = '';
+    let lastAssistantModel = null;   // 1.109.0: the model of the newest main-lane reply
     const ownCommitShas = [];
     const COMMIT_RESULT_RE = /\[[^\]\n]{1,80}\s([0-9a-f]{7,40})\]/g;
     const commitShasInEntry = (entry) => {
@@ -3771,9 +3800,23 @@ async function capture(lib) {
     const suffixReceipts = [];
     // Old-hook dedup keys already used for a stub repair in this capture.
     const legacyClaimed = new Set();
-    for (let transcriptIndex = 0; transcriptIndex < lines.length; transcriptIndex++) {
-        const ln = lines[transcriptIndex];
+    const scanLines = subagentSources.length ? lines.map(ln => [ln, null]) : null;
+    if (scanLines) for (const src of subagentSources) for (const ln of src.lines) scanLines.push([ln, src]);
+    const scanCount = scanLines ? scanLines.length : lines.length;
+    for (let transcriptIndex = 0; transcriptIndex < scanCount; transcriptIndex++) {
+        const ln = scanLines ? scanLines[transcriptIndex][0] : lines[transcriptIndex];
+        const sub = scanLines ? scanLines[transcriptIndex][1] : null;
         let e; try { e = JSON.parse(ln); } catch { continue; }
+        // The identity stamp for a card made from this entry: the session, the
+        // subagent when it is one, and the model THIS entry says produced it.
+        const entryStamp = () => captureStamp(sid, sub, e, scopeRow.role || '');
+        if (sub) {
+            // A subagent's entries contribute markers only. Its files are already
+            // on its own child entry (live observation), its prompt is the
+            // parent's delegation, and its replies are not the session's words.
+            const subText = textOf(e);
+            if (!subText.includes('🧠')) continue;
+        }
         // Stop scans the whole append-only transcript for still-uncaptured brain
         // markers, but scope attribution is generation-bounded. A completed task
         // contributes NO paths; an active task uses the latest human-prompt byte
@@ -3784,8 +3827,8 @@ async function capture(lib) {
                 ? transcriptIndex >= scopeLineStart
                 : (!hasScopeBoundary || (Number.isFinite(entryAt) && entryAt >= scopeStartedAt))
         );
-        if (entryInScope) noteFiles(filesInEntry(e));
-        const entryInGap = gapWindow && transcriptIndex >= gapWindow.start;
+        if (entryInScope && !sub) noteFiles(filesInEntry(e));
+        const entryInGap = !sub && gapWindow && transcriptIndex >= gapWindow.start;
         if (entryInGap) {
             const paths = filesInEntry(e).map(projRelPath).filter(Boolean);
             for (const p of paths) if (gapPaths.size < 100) gapPaths.add(p);
@@ -3797,9 +3840,9 @@ async function capture(lib) {
                 gapLatestArtifactAt = Number.isFinite(entryAt) ? Math.max(gapLatestArtifactAt, entryAt) : Infinity;
             }
         }
-        scanToolBlocks(e, shellCmds, errorIds);
+        if (!sub) scanToolBlocks(e, shellCmds, errorIds);
         const um = e?.message ?? e;
-        if (um?.role === 'user') {
+        if (um?.role === 'user' && !sub) {
             const rawUser = typeof um.content === 'string'
                 ? um.content
                 : Array.isArray(um.content) ? um.content.filter(part => part?.type === 'text' && typeof part.text === 'string').map(part => part.text).join('\n') : '';
@@ -3809,7 +3852,8 @@ async function capture(lib) {
         }
         const text = textOf(e);
         // The main lane's latest reply wins (a subagent's sidechain never does).
-        if (text && e?.isSidechain !== true) lastAssistantWords = text;
+        if (text && e?.isSidechain !== true && !sub) lastAssistantWords = text;
+        if (!sub && text) { const mm = hookModel((e?.message ?? e)?.model); if (mm) lastAssistantModel = mm; }
         if (!text.includes('🧠')) continue;
         for (const raw of text.split('\n')) {
             const trimmed = raw.trim();
@@ -4034,7 +4078,7 @@ async function capture(lib) {
             if (type === '✓') { resolutions.push({ area, text: body }); ledger.push({ action: 'resolve', area, preview, rIdx: resolutions.length - 1 }); continue; }
             // ~ updates the matching card in place (small corrections).
             if (type === '~') {
-                updates.push({ area, text: body, createdVia: 'claude-code', ...(evidence ? { evidence } : {}), ...(verify ? { verify } : {}) });
+                updates.push({ area, text: body, createdVia: 'claude-code', capturedBy: entryStamp(), ...(evidence ? { evidence } : {}), ...(verify ? { verify } : {}) });
                 if (markerQuestion) enrichmentPairs.push({ body, question: markerQuestion });
                 // `uIdx` maps this entry to the engine's per-update refusals, the
                 // way `rIdx` does for resolves (own markers lead the array).
@@ -4053,7 +4097,7 @@ async function capture(lib) {
             // touched #file-/#dir- tags so this decision is matchable by a later
             // git diff. Deduped against the area slug so it isn't repeated.
             const areaTag = area ? `#${slugify(area)}` : '';
-            const fileTags = recentTags.slice(-4).filter(t => t !== areaTag);
+            const fileTags = sub ? [] : recentTags.slice(-4).filter(t => t !== areaTag);
             const tagLine = [areaTag, ...fileTags].filter(Boolean).join(' ');
             const cardText = (b) => (area ? `${area}: ${prefix}${b}` : `${prefix}${b}`) + (ruleLine ? `\n${ruleLine}` : '') + (tagLine ? `\n${tagLine}` : '');
             const card = cardText(body);
@@ -4067,11 +4111,11 @@ async function capture(lib) {
                 // block above). A repair only fixes text: it carries no closes:
                 // (that close ran — or not — when the stub landed), so a prose
                 // closes: stays in the text and an anchored one is dropped.
-                cards.push({ text: cardText(closes && !closesAnchored ? bodyWithCloses : body), area, borderColor, repairStub, ...(evidence ? { evidence } : {}), ...(verify ? { verify } : {}) });
+                cards.push({ text: cardText(closes && !closesAnchored ? bodyWithCloses : body), area, borderColor, repairStub, capturedBy: entryStamp(), ...(evidence ? { evidence } : {}), ...(verify ? { verify } : {}) });
             } else {
-                cards.push({ text: card, area, borderColor, ...(closes ? { closes, closesFallbackText: cardText(bodyWithCloses), closesAnchored: closesAnchored === true } : {}), ...(evidence ? { evidence } : {}), ...(verify ? { verify } : {}) });
+                cards.push({ text: card, area, borderColor, capturedBy: entryStamp(), ...(closes ? { closes, closesFallbackText: cardText(bodyWithCloses), closesAnchored: closesAnchored === true } : {}), ...(evidence ? { evidence } : {}), ...(verify ? { verify } : {}) });
             }
-            if (lastUserPrompt) enrichmentPairs.push({ body, question: lastUserPrompt });
+            if (lastUserPrompt && !sub) enrichmentPairs.push({ body, question: lastUserPrompt });
             // The authored `q:` rides alongside the incidental prompt: the pattern
             // (what someone would ask) and the instance (what someone did type).
             if (markerQuestion) enrichmentPairs.push({ body, question: markerQuestion });
@@ -4248,6 +4292,8 @@ async function capture(lib) {
         } catch { /* best-effort: the record keeps its other fields */ }
         touchSession(input.session_id, {
             branch: gitBranch(), hostStatus: 'idle',
+            // 1.109.0: the model of the newest main-lane reply, as the transcript records it.
+            ...(lastAssistantModel ? { model: lastAssistantModel, modelSource: 'transcript' } : {}),
             ...(laneFiles.length ? { addFiles: laneFiles } : {}),
             ...(shipSummaries.length ? { ships: shipSummaries } : {}),
             ...(Object.keys(workPatch).length ? { work: workPatch } : {}),
@@ -4483,7 +4529,7 @@ async function capture(lib) {
                 });
             } catch { return list; /* parse failed → land unfiltered; the supersede pass copes */ }
         };
-        const toEngine = (c) => ({ text: c.text, color: '#e8e8ed', borderColor: c.borderColor, area: c.area, createdVia: c.createdVia || 'claude-code', ...(c.closes ? { closes: c.closes } : {}), ...(c.closes && typeof c.closesFallbackText === 'string' ? { closesFallbackText: c.closesFallbackText, closesAnchored: c.closesAnchored === true } : {}), ...(typeof c.repairStub === 'string' ? { repairStub: c.repairStub } : {}), ...(c.evidence ? { evidence: c.evidence } : {}), ...(c.verify ? { verify: c.verify } : {}) });
+        const toEngine = (c) => ({ text: c.text, color: '#e8e8ed', borderColor: c.borderColor, area: c.area, createdVia: c.createdVia || 'claude-code', ...(c.capturedBy ? { capturedBy: c.capturedBy } : {}), ...(c.closes ? { closes: c.closes } : {}), ...(c.closes && typeof c.closesFallbackText === 'string' ? { closesFallbackText: c.closesFallbackText, closesAnchored: c.closesAnchored === true } : {}), ...(typeof c.repairStub === 'string' ? { repairStub: c.repairStub } : {}), ...(c.evidence ? { evidence: c.evidence } : {}), ...(c.verify ? { verify: c.verify } : {}) });
         // → null when this subset has nothing left to land (every card was
         // already carded by the git hook), else the engine's result.
         const land = async (cs, rs, us) => {
@@ -6163,7 +6209,10 @@ async function read(lib) {
     update.spawned = maybeSelfUpdate(update.plan);
     // Register presence at session start so a peer already running sees this session
     // immediately. Files/ships come from live observation + Stop.
-    const laneTouch = touchSession(input.session_id, { branch: gitBranch(), hostStatus: 'idle' });
+    // 1.109.0: Claude Code may send the active model at SessionStart (it can
+    // omit it, e.g. after /clear). Recorded with its source; never guessed.
+    const startModel = hookModel(input.model);
+    const laneTouch = touchSession(input.session_id, { branch: gitBranch(), hostStatus: 'idle', ...(startModel ? { model: startModel, modelSource: 'session-start' } : {}) });
     const laneWarning = laneTouch?.ok === false && !['no-session-id', 'lane-lock-timeout'].includes(laneTouch.reason)
         ? laneFailureFooter(laneTouch.reason) : '';
     // One-line presence summary — session start is exactly when an agent decides
@@ -6407,6 +6456,155 @@ async function rulesAfterEdit() {
     } catch { /* never break a tool call */ }
 }
 
+// ── Small identity (1.109.0): subagents and the model stamp ──────────────────
+// Claude Code reports subagents to hooks: SubagentStart / SubagentStop carry
+// `agent_id` and `agent_type`, and a tool event inside a subagent carries the
+// same `agent_id` (code.claude.com/docs/en/hooks). The subagent shares the
+// parent's session_id and its MCP connection, and the MCP call carries no
+// subagent identity, so the hook is where a subagent can be told apart:
+//   SubagentStart  → a child entry on the parent's lane row, and the child id
+//                    handed to the subagent (it passes it to brain_sync);
+//   PostToolUse    → its edited files land on that child entry too;
+//   PreToolUse     → a warning when a sibling subagent already edited the file;
+//   SubagentStop   → the entry is closed and its transcript recorded, so the
+//                    parent's next Stop captures its 🧠 BRAIN lines under it.
+// The model comes only from what the host wrote: SessionStart's `model` and
+// each transcript entry's message.model. Anything else is "unknown".
+const HOOK_MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:@/[\]-]{0,79}$/;
+function hookModel(value) {
+    const text = String(value ?? '').trim();
+    return text && text !== '<synthetic>' && HOOK_MODEL_RE.test(text) ? text : null;
+}
+// Same formula as agent-presence subagentShortId (sha1, 6 hex), kept local so
+// the sync guard path needs no import.
+function subagentShortOf(agentId) {
+    const raw = String(agentId ?? '').trim();
+    return raw ? `sub-${crypto.createHash('sha1').update(raw).digest('hex').slice(0, 6)}` : '';
+}
+let HOOK_AP = null;   // agent-presence, loaded only when a subagent event needs it
+async function loadPresenceLib() {
+    if (HOOK_AP) return HOOK_AP;
+    try { HOOK_AP = await import(new URL('./agent-presence.mjs', import.meta.url).href); } catch { HOOK_AP = null; }
+    return HOOK_AP;
+}
+function captureStamp(sid, sub, entry, role = '') {
+    const session = String(sid || '');
+    const model = hookModel((entry?.message ?? entry)?.model);
+    const label = String((sub ? sub.role : role) || '').trim().slice(0, 40);
+    return {
+        session,
+        ...(sub ? { agent: `${session.slice(0, 8)}/${sub.short}`, ...(sub.agentType ? { agentType: sub.agentType } : {}) } : {}),
+        tool: 'claude-code',
+        model: model || 'unknown',
+        ...(label ? { role: label } : {}),
+    };
+}
+// Transcripts of this session's subagents that the SubagentStop hook recorded,
+// read only when they sit inside the parent's own transcript folder (the host
+// writes them under <dir>/<session id>/subagents/). Bounded to 8 MB per Stop.
+function subagentTranscriptSources(row, mainTranscript) {
+    const out = [];
+    const list = Array.isArray(row?.subagents) ? row.subagents : [];
+    if (!list.length || !mainTranscript) return out;
+    const mainDir = path.dirname(path.resolve(mainTranscript)).toLowerCase() + path.sep;
+    let budget = 8 * 1024 * 1024;
+    for (const e of list.slice(-12)) {
+        if (!e || typeof e.transcript !== 'string' || !/^sub-[0-9a-f]{6}$/.test(String(e.id || ''))) continue;
+        const file = path.resolve(e.transcript);
+        if (!file.toLowerCase().startsWith(mainDir)) continue;
+        try {
+            const st = fs.statSync(file);
+            if (!st.isFile() || st.size > budget) continue;
+            budget -= st.size;
+            out.push({ short: e.id, agentType: e.agentType || '', role: e.role || '', lines: fs.readFileSync(file, 'utf8').split('\n').filter(Boolean) });
+        } catch { /* unreadable transcript: its markers wait for the next Stop */ }
+    }
+    return out;
+}
+// The model of the newest assistant entry in a transcript's last 256 KB.
+function lastTranscriptModel(file) {
+    try {
+        const st = fs.statSync(file);
+        const len = Math.min(st.size, 256 * 1024);
+        const buf = Buffer.alloc(len);
+        const fd = fs.openSync(file, 'r');
+        try { fs.readSync(fd, buf, 0, len, st.size - len); } finally { fs.closeSync(fd); }
+        const lines = buf.toString('utf8').split('\n');
+        for (let i = lines.length - 1; i >= 0; i--) {
+            let e; try { e = JSON.parse(lines[i]); } catch { continue; }
+            const m = e?.message ?? e;
+            if (m?.role === 'assistant' && hookModel(m.model)) return hookModel(m.model);
+        }
+    } catch { /* no model known */ }
+    return null;
+}
+// --subagent-start (SubagentStart): the child entry, and the id for the subagent.
+async function subagentStartStep() {
+    try {
+        const input = readHookInput();
+        const sid = String(input.session_id || '');
+        const agentId = String(input.agent_id || '');
+        if (!sid || !agentId) return;
+        const ap = await loadPresenceLib();
+        if (!ap || typeof ap.mergeSubagent !== 'function') return;
+        const short = ap.subagentShortId(agentId);
+        const written = touchSession(sid, { subagentMerge: (prev, now) => ap.mergeSubagent(prev, { id: short, agentType: input.agent_type || '', start: true }, now) });
+        if (!written || written.ok === false) return;   // no entry, so no id to hand out
+        const child = `${sid.slice(0, 8)}/${short}`;
+        const context = `KLYPIX: this project keeps a shared record (brain.klypix). Your work here is recorded as subagent ${child} of session ${sid.slice(0, 8)}. `
+            + `If you call brain_sync, pass agent: "${short}" so your intent and files are recorded under that id instead of replacing the parent session's. `
+            + 'Files you edit, and BRAIN marker lines you write, are recorded under it automatically.';
+        fs.writeSync(1, JSON.stringify({ hookSpecificOutput: { hookEventName: 'SubagentStart', additionalContext: context } }));
+    } catch { /* never block a subagent */ }
+}
+// --subagent-stop (SubagentStop): close the entry and keep its transcript path.
+async function subagentStopStep() {
+    try {
+        const input = readHookInput();
+        const sid = String(input.session_id || '');
+        const agentId = String(input.agent_id || '');
+        if (!sid || !agentId) return;
+        const ap = await loadPresenceLib();
+        if (!ap || typeof ap.mergeSubagent !== 'function') return;
+        const transcript = typeof input.agent_transcript_path === 'string' && input.agent_transcript_path
+            ? path.resolve(input.agent_transcript_path.replace(/^~(?=$|[\\/])/, os.homedir())) : '';
+        const model = transcript ? lastTranscriptModel(transcript) : null;
+        touchSession(sid, {
+            subagentMerge: (prev, now) => ap.mergeSubagent(prev, {
+                id: ap.subagentShortId(agentId),
+                agentType: input.agent_type || '',
+                end: true,
+                ...(transcript ? { transcript } : {}),
+                ...(model ? { model, modelSource: 'transcript' } : {}),
+            }, now),
+        });
+    } catch { /* never block a subagent */ }
+}
+// PreToolUse inside a subagent: a sibling subagent of the same session already
+// edited this file. Context only (a warning, not a lock).
+function siblingOverlapContext() {
+    try {
+        const input = readHookInput();
+        const agentId = String(input.agent_id || '');
+        if (!agentId || !FILE_TOOLS.has(input.tool_name)) return '';
+        const ti = input.tool_input || {};
+        const fp = ti.file_path || ti.path || ti.notebook_path;
+        const rel = typeof fp === 'string' && fp ? projRelPath(fp) : '';
+        if (!rel) return '';
+        const sid = String(input.session_id || '');
+        const me = readSessions().find(s => s.id === sid);
+        if (!me || !Array.isArray(me.subagents)) return '';
+        const short = subagentShortOf(agentId);
+        const now = Date.now();
+        const key = rel.toLowerCase();
+        const sibs = me.subagents.filter(e => e && e.id !== short && !e.endedAt
+            && now - Number(e.lastSeen || 0) < 2 * 60 * 60 * 1000
+            && Array.isArray(e.files) && e.files.some(f => String(f).toLowerCase() === key));
+        if (!sibs.length) return '';
+        return `KLYPIX: another subagent of this session already edited ${rel}: ${sibs.map(e => `${sid.slice(0, 8)}/${e.id}${e.agentType ? ` (${e.agentType})` : ''}`).join(', ')}. Read its change before you overwrite it. This is a warning, not a lock.`;
+    } catch { return ''; }
+}
+
 // --end (SessionEnd, 1.105.0): the session is over — remove its live rows and
 // tombstone it through the engine's own endSession (the same call Codex's
 // SessionEnd makes), so peers stop reading a dead session as working. Walks up
@@ -6432,7 +6630,10 @@ async function main() {
     // --live (PostToolUse) is the cheapest mode: pure payload string-work + at most
     // one tiny locked append. It must NOT pay the lazy klypix-format import, so it
     // runs BEFORE everything else and returns. (Fires on Bash|PowerShell|Edit|Write.)
-    if (process.argv.includes('--live')) { await rulesAfterEdit(); liveCapture(); return; }
+    if (process.argv.includes('--live')) { if (readHookInput().agent_id) await loadPresenceLib(); await rulesAfterEdit(); liveCapture(); return; }
+    // 1.109.0: subagent lifecycle (Claude Code SubagentStart / SubagentStop).
+    if (process.argv.includes('--subagent-start')) { await subagentStartStep(); return; }
+    if (process.argv.includes('--subagent-stop')) { await subagentStopStep(); return; }
     // --guard (PreToolUse) is the second fast path: stat + sidecar read on the
     // common case; it lazy-imports the lib itself only when a compiled guard's
     // tool pattern could match this call. Runs before the unconditional import.
@@ -6451,7 +6652,7 @@ async function main() {
             orig(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: rules.deny } }));
             return;
         }
-        const contexts = [guardPayload?.hookSpecificOutput?.additionalContext, rules?.context].filter(Boolean);
+        const contexts = [guardPayload?.hookSpecificOutput?.additionalContext, rules?.context, siblingOverlapContext()].filter(Boolean);
         if (contexts.length) {
             orig(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', additionalContext: contexts.join('\n\n') } }));
             return;

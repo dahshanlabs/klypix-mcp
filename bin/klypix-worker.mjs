@@ -32,7 +32,7 @@ import {
 } from '../src/klypix-core.mjs';
 import { compareProjectGraphResults, projectGraphContextMarkdown, queryProjectGraph, suggestProjectGraphBrainLinks, scanNativeProjectMap, checkBrainDrift, brainDriftMarkdown } from '../src/project-graph.mjs';
 import { auditProject, compactAgentsBrief, linkProject, mcpServerEntry } from '../src/agent-rules.mjs';
-import { createMcpPresence, KLYPIX_MCP_INSTRUCTIONS, normalizeMcpClient } from '../src/mcp-presence.mjs';
+import { buildPresenceSnapshot, createMcpPresence, formatTaskPresence, KLYPIX_MCP_INSTRUCTIONS, normalizeMcpClient } from '../src/mcp-presence.mjs';
 import {
   buildReopenLaunch,
   consumeMessageReceipt,
@@ -46,6 +46,12 @@ import {
   REOPEN_NUDGE,
   formatUnfinishedWork,
   listUnfinishedWork,
+  identityStamp,
+  normalizeRole,
+  parseChildRef,
+  siblingSubagentsOnFile,
+  stampableRowModel,
+  upsertSubagent,
 } from '../src/agent-presence.mjs';
 import { collectRepoState, commitsInRange, makeContainmentProbe } from '../src/repo-state.mjs';
 import { CONTINUE_RE as HANDOFF_CONTINUE_RE, formatHandoffCards, readLockNotes, assessLockNote, formatLockNotes, lockNotesData, createLockNoteProbe } from '../src/session-handoff.mjs';
@@ -876,7 +882,7 @@ server.registerTool('brain_note', {
   // vocabulary for retrieval) AND the per-session capture receipt below. Since
   // 1.86 the authored `question` (the pattern) rides beside the declared intent
   // (the instance); the sidecar's quality gate decides what is worth keeping.
-  const result = await opBrainNote({ vault: mcpPresence.vault, canvas: boundBrainCanvas(canvas), text, area, marker: marker || '', closes, evidence, verify, guard, via: extra.klypixClientName, enrichmentQuestion: [question, mcpPresence.declaredIntent] });
+  const result = await opBrainNote({ vault: mcpPresence.vault, canvas: boundBrainCanvas(canvas), text, area, marker: marker || '', closes, evidence, verify, guard, via: extra.klypixClientName, enrichmentQuestion: [question, mcpPresence.declaredIntent], capturedBy: mcpIdentityStamp(extra) });
   // Per-session capture receipt — this is what stops the uncaptured-work nudge
   // from firing at a session that DID record its reasoning, just through MCP
   // rather than a 🧠 marker. The Stop hook and this server share one session-id
@@ -1141,14 +1147,17 @@ server.registerTool('brain_handoff', {
     id: z.string().max(64).optional().describe('take / done / review: the handoff card id (from brain_sync, the session-start brief, or list).'),
     session: z.string().max(160).optional().describe('take / done / review: the session id (or a unique prefix of 8+ characters) from the unfinished-work list, when the work has no card. Review creates a reviewable draft if needed.'),
     summary: z.string().max(400).optional().describe('done: what was finished. take: optional note. review acknowledgement: required account of completed and still-pending requests after reading all conversation pages.'),
+    for: z.string().max(40).optional().describe('write: optional role this handoff is addressed to, such as "reviewer". A session that declares that role in brain_sync sees it first; every other session still sees it. A label only: it does not reserve the work.'),
   },
 }, async ({ action, project, canvas, ...rest }, extra) => {
   const identity = extra?.klypixRequestIdentity || {};
+  const stamp = mcpIdentityStamp(extra);
   const result = await opBrainHandoff({
     vault: project ? path.resolve(project) : mcpPresence.vault,
     canvas: canvas || boundBrainCanvas(undefined),
     action: action || 'write',
-    from: { sessionId: identity.sessionId || mcpPresence.id, client: identity.clientInfo?.client || extra?.klypixClientName || 'unknown' },
+    from: { sessionId: identity.sessionId || mcpPresence.id, client: identity.clientInfo?.client || extra?.klypixClientName || 'unknown', model: stamp.model, role: stamp.role || '' },
+    capturedBy: stamp,
     via: extra?.klypixClientName,
     ...rest,
   });
@@ -1163,6 +1172,125 @@ server.registerTool('brain_handoff', {
   const out = toContent(result);
   return result.structured ? { ...out, structuredContent: result.structured } : out;
 });
+
+// ── Subagent brain_sync (1.109.0) ─────────────────────────────────────────────
+// A subagent shares its parent's MCP connection, and the connection carries no
+// subagent identity (Claude Code documents none for MCP calls). So the
+// subagent names itself with the child id KLYPIX's SubagentStart hook gave it,
+// and KLYPIX accepts that id only when the hook already recorded it on the
+// parent's lane row. Then intent, files and role land on the child entry and
+// the parent's own task scope is left alone. Anything unverifiable returns
+// { handled: false, note } and the ordinary sync records the call under the
+// parent session, as before this release.
+const BACKSLASH = String.fromCharCode(92);
+// This connection's own lane row (role, last reported model), or null.
+function boundSessionRow(extra) {
+  const sid = String(extra?.klypixRequestIdentity?.sessionId || mcpPresence.id || '').toLowerCase();
+  const brainPath = mcpPresence.brainPath;
+  if (!sid || !brainPath) return null;
+  try {
+    return listActiveSessions({ brainPath }).find((s) => [s.id, s.logicalSessionId].filter(Boolean).some((v) => String(v).toLowerCase() === sid)) || null;
+  } catch { return null; }
+}
+// Who wrote a card through MCP. The model is stamped only when the host
+// reported it with the event (see stampableRowModel); otherwise 'unknown'.
+function mcpIdentityStamp(extra) {
+  const row = boundSessionRow(extra);
+  return identityStamp({
+    session: extra?.klypixRequestIdentity?.sessionId || mcpPresence.id || '',
+    tool: extra?.klypixRequestIdentity?.clientInfo?.client || extra?.klypixClientName || 'unknown',
+    model: stampableRowModel(row),
+    role: row?.role || '',
+  });
+}
+function subagentBrainSync({ agent, intent, files, phase, role, include_context, extra }) {
+  const ref = parseChildRef(agent);
+  const parentId = String(extra?.klypixRequestIdentity?.sessionId || mcpPresence.id || '');
+  const brainPath = mcpPresence.brainPath;
+  const fallback = (why) => ({
+    handled: false,
+    note: `KLYPIX did not record this call under "${String(agent).slice(0, 60)}": ${why}. It is recorded under the parent session instead.`,
+  });
+  if (!ref) return fallback('that is not a subagent id KLYPIX gives out (they look like "sub-1a2b3c")');
+  if (!brainPath || !parentId) return fallback('the parent session has not called brain_sync for this project yet');
+  if (ref.parent && !parentId.toLowerCase().startsWith(ref.parent)) return fallback('it names a different parent session');
+  const nextPhase = ['start', 'checkpoint', 'complete'].includes(phase) ? phase : 'checkpoint';
+  const cleanFiles = (Array.isArray(files) ? files : [])
+    .map((f) => String(f || '').split(BACKSLASH).join('/').replace(/^[.][/]/, '').trim())
+    .filter(Boolean).slice(0, 20);
+  const patch = { id: ref.short };
+  if (nextPhase === 'complete') { patch.intent = ''; patch.files = []; }
+  else {
+    if (typeof intent === 'string' && intent.trim()) patch.intent = intent;
+    else if (nextPhase === 'start') patch.intent = '';
+    if (nextPhase === 'start') patch.files = cleanFiles;
+    else if (cleanFiles.length) patch.addFiles = cleanFiles;
+  }
+  if (typeof role === 'string') patch.role = role;
+  const written = upsertSubagent({ brainPath, parentId, patch, requireKnown: true });
+  if (!written.ok) {
+    const why = {
+      'subagent-unknown': 'the host did not report a subagent with that id in this session (only Claude Code reports subagents, through its SubagentStart hook)',
+      'subagent-finished': 'that subagent already finished',
+      'parent-unknown': 'the parent session has no live presence row',
+      'lane-locked': 'the presence lane was busy',
+    }[written.reason] || `the presence lane could not be updated (${written.reason})`;
+    return fallback(why);
+  }
+  const now = Date.now();
+  let sessions = [];
+  try { sessions = listActiveSessions({ brainPath, now }); } catch { sessions = []; }
+  const parentRow = written.row;
+  const childFiles = written.entry?.files || [];
+  const key = (f) => String(f || '').toLowerCase();
+  const childKeys = new Set(childFiles.map(key));
+  const conflicts = [];
+  for (const s of sessions) {
+    if (s.id === parentRow.id) continue;
+    const theirs = [...new Set([...(s.files || []), ...(s.observedFiles || [])])].filter((f) => childKeys.has(key(f)));
+    if (theirs.length) conflicts.push({ kind: 'peer', id: s.id, client: s.client || 'unknown', intent: s.intent || '', files: theirs });
+  }
+  for (const f of childFiles) {
+    for (const sib of siblingSubagentsOnFile(parentRow, ref.short, f, now)) {
+      const existing = conflicts.find((c) => c.kind === 'sibling' && c.id === sib.id);
+      if (existing) existing.files.push(f);
+      else conflicts.push({ kind: 'sibling', id: `${written.childId.split('/')[0]}/${sib.id}`, agentType: sib.agentType || null, intent: sib.intent || '', files: [f] });
+    }
+  }
+  const snapshot = buildPresenceSnapshot(sessions, parentRow.id, { now });
+  const entry = written.entry || {};
+  const head = nextPhase === 'complete'
+    ? `KLYPIX recorded subagent ${written.childId} as done with its task (session ${parentId.slice(0, 8)}'s own task is unchanged).`
+    : `KLYPIX recorded this under subagent ${written.childId} of session ${parentId.slice(0, 8)}${entry.agentType ? ` (${entry.agentType})` : ''}${entry.role ? `, role ${entry.role}` : ''}: ${entry.intent ? `"${entry.intent}"` : 'no intent declared'}${childFiles.length ? `; files ${childFiles.join(', ')}` : ''}. The parent session's own task is unchanged.`;
+  const conflictLines = conflicts.length
+    ? ['Overlaps on files this subagent declared (a warning, not a lock):', ...conflicts.map((c) => c.kind === 'sibling'
+      ? `- another subagent of the same session, ${c.id}${c.agentType ? ` (${c.agentType})` : ''}${c.intent ? ` "${c.intent.slice(0, 80)}"` : ''}: ${c.files.join(', ')}`
+      : `- session ${String(c.id).slice(0, 12)} (${c.client})${c.intent ? ` "${c.intent.slice(0, 80)}"` : ''}: ${c.files.join(', ')}`)]
+    : [];
+  const text = [head, ...conflictLines, include_context === false ? '' : formatTaskPresence(snapshot, now)].filter(Boolean).join('\n');
+  return {
+    handled: true,
+    result: {
+      content: [{ type: 'text', text }],
+      structuredContent: {
+        schemaVersion: 1,
+        status: conflicts.length ? 'overlap' : 'ok',
+        phase: nextPhase,
+        brain: brainPath,
+        subagent: {
+          id: written.childId,
+          parent: parentId,
+          agentType: entry.agentType || null,
+          role: entry.role || null,
+          intent: entry.intent || '',
+          files: childFiles,
+        },
+        conflicts,
+        peers: snapshot.peers,
+      },
+    },
+  };
+}
 
 server.registerTool('brain_sync', {
   title: 'KLYPIX Context Gateway — synchronize task, peers, conflicts, and relevant memory',
@@ -1195,9 +1323,22 @@ server.registerTool('brain_sync', {
       withdraw: z.union([z.array(z.string().max(40)).max(20), z.boolean()]).optional().describe('Shas to withdraw from this session\'s claim; [] or true withdraws the whole claim. Only the staking session (or its logical continuation) can withdraw.'),
       publish: z.boolean().optional().describe('Also write the claim as .klypix/claims/<owner>.json in the project (or delete that file when withdrawing). Commit it and the promise TRAVELS WITH THE REPO: every clone\'s release gate reads it, it is reviewable in PRs, and its history is auditable — team-wide claims over plain git, zero infrastructure.'),
     }).optional().describe('Stake a durable claim that specific commits ride the NEXT release — the promise "you\'ll see it in the next build" made machine-readable. Unlike presence rows (which age out ~10min after a session ends), a claim persists until fulfilled (the release ref contains the shas — auto-retired with a courtesy note), withdrawn, or expired (14d). A release that would drop claimed shas is REFUSED until they are acknowledged BY NAME, and acknowledging them away notifies the owner. Use exactly one of shas (stake/extend) or withdraw.'),
+    // 1.109.0 — small identity. Both ADDITIVE and optional: every earlier
+    // property above is unchanged, so the supervisor's hot swap accepts it.
+    role: z.string().max(40).optional().describe('Optional free-text label for this session, such as "reviewer". Peers see it, and a handoff addressed to that role (brain_handoff for) is offered first to a session that declares it. It is a label only: no history, reputation or authority comes with it, and it lasts for this session. An empty string clears it.'),
+    agent: z.string().max(200).optional().describe('Only for a subagent: the child id KLYPIX gave it when it started (for example "sub-1a2b3c"). Its intent and files are then recorded under that child id, under its parent session, instead of replacing what the parent declared. KLYPIX accepts only an id the host reported (Claude Code reports subagents); any other id is ignored and the call is recorded under the parent session.'),
   },
-}, async ({ project, intent, files, phase, include_context, results, releaseIntent, releaseClaim }, extra) => {
+}, async ({ project, intent, files, phase, include_context, results, releaseIntent, releaseClaim, role, agent }, extra) => {
   const totalStartedAt = Date.now();
+  // A subagent's sync (1.109.0): recorded on its own child entry, never over
+  // the parent's task scope. Falls through to the ordinary parent sync when
+  // the child id cannot be verified, and says so.
+  let childNote = '';
+  if (typeof agent === 'string' && agent.trim()) {
+    const child = subagentBrainSync({ agent, intent, files, phase, role, include_context, extra });
+    if (child.handled) return child.result;
+    childNote = child.note || '';
+  }
   const report = mcpPresence.sync({
     project,
     intent,
@@ -1206,6 +1347,7 @@ server.registerTool('brain_sync', {
     results,
     releaseIntent,
     releaseClaim,
+    ...(typeof role === 'string' ? { role } : {}),
     deliverMessages: include_context !== false,
     actionId: extra?.klypixRequestIdentity?.actionId || '',
     preflight: extra?.klypixBrainSyncPreflight,
@@ -1491,14 +1633,14 @@ server.registerTool('brain_sync', {
           // 1.103.0: a card KLYPIX drafted in THIS pass from a dead session's
           // record is announced as such — a lead to verify, not the session's words.
           drafted.length ? `🤝 KLYPIX drafted ${drafted.length} handoff card${drafted.length > 1 ? 's' : ''} just now from the record of a session that stopped without writing one: ${drafted.map((d) => `[${d.id}] “${d.title}”`).join('; ')}. A drafted card is a lead, not a verified state — confirm it with git before relying on it.` : '',
-          formatHandoffCards(cards, { now, max: 5 }),
+          formatHandoffCards(cards, { now, max: 5, role: typeof role === 'string' ? role : (boundSessionRow(extra)?.role || '') }),
           cards.length ? 'Saved handoffs are not verified conversation coverage. On takeover call brain_handoff review and check later/unanswered requests before trusting Next; missing transcripts mean UNKNOWN.' : '',
           formatUnfinishedWork(lane, { now, max: 4, ranked: wantsContinue && words.size > 0 }),
         ].filter(Boolean).join('\n\n');
         handoffData = {
           cards: cards.length,
           unfinished: lane.length,
-          handoffs: cards.map((c) => ({ id: c.id, title: c.title, from: c.from, at: c.at, reason: c.reason, state: c.state, next: c.next, files: c.files, auto: c.auto === true })),
+          handoffs: cards.map((c) => ({ id: c.id, title: c.title, from: c.from, at: c.at, reason: c.reason, state: c.state, next: c.next, files: c.files, auto: c.auto === true, ...(c.forRole ? { for: c.forRole } : {}) })),
           ...(Array.isArray(h?.structured?.autoDrafted) && h.structured.autoDrafted.length ? { autoDrafted: h.structured.autoDrafted } : {}),
           sessions: lane.slice(0, 4).map((r) => ({ id: r.id, client: r.client, intent: r.intent, state: r.state, working: false, holdsFiles: false, note: r.note, status: r.status, lastSeen: r.lastSeen, lastPrompt: r.lastPrompt || null, lastWords: r.lastWords || null, files: r.files, commits: r.commits, handoffCardId: r.handoffCardId, takenBy: r.takenBy })),
         };
@@ -1570,9 +1712,9 @@ server.registerTool('brain_sync', {
   return {
     content: [{
       type: 'text',
-      text: [report.text, harnessText, shipNotice, releaseReconcileText, captureGapText, lockText, handoffText, contextText, timingText].filter(Boolean).join('\n\n'),
+      text: [childNote, report.text, harnessText, shipNotice, releaseReconcileText, captureGapText, lockText, handoffText, contextText, timingText].filter(Boolean).join('\n\n'),
     }],
-    structuredContent,
+    structuredContent: childNote ? { ...structuredContent, subagent: { status: 'not-recorded', note: childNote } } : structuredContent,
     ...(report.isError ? { isError: true } : {}),
   };
 });

@@ -18,6 +18,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { toolCompatibility } from '../src/mcp-supervisor.mjs';
 import { startFakeApp, fakeStatus } from './_fake-app-bridge.mjs';
+import { withoutAllowedAdditions } from './_schema-additions.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, '..');
@@ -78,7 +79,7 @@ for (const [label, list] of [['KLYPIX_APP_TOOLS=on', upWorker], [process.platfor
   ok(v.ok === true && v.removed.length === 0 && v.changed.length === 0 && JSON.stringify([...v.added].sort()) === JSON.stringify(wantAdded),
     `[${label}] the supervisor's compatibility check accepts 1.92.0 → this worker (added: ${v.added.join(', ') || 'none'})`);
   const byName = new Map(list.map(t => [t.name, t]));
-  const drifted = snapshot192.filter(t => JSON.stringify(byName.get(t.name)?.inputSchema) !== JSON.stringify(t.inputSchema)).map(t => t.name);
+  const drifted = snapshot192.filter(t => JSON.stringify(withoutAllowedAdditions(t.name, byName.get(t.name)?.inputSchema)) !== JSON.stringify(t.inputSchema)).map(t => t.name);
   ok(drifted.length === 0, `[${label}] every 1.92.0 input schema is byte-identical (drifted: ${drifted.join(', ') || 'none'})`);
 }
 

@@ -40,6 +40,23 @@ export function resolveAuthor() {
 // Test seam: clears the per-process cache so env overrides can be exercised.
 export function __resetAuthorCache() { cachedAuthor = undefined; }
 const authorField = () => { const a = resolveAuthor(); return a ? { author: a } : {}; };
+// Who captured a card (1.109.0, additive, ignored by older readers): session,
+// optional subagent child id and type, the tool, the model the host reported
+// ('unknown' when it did not) and an optional role label. Client-written and
+// unverified, like createdVia: it labels a card and proves nothing.
+const CAPTURED_BY_KEYS = ['session', 'agent', 'agentType', 'tool', 'model', 'role'];
+export function capturedByValue(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    const out = {};
+    for (const k of CAPTURED_BY_KEYS) {
+        const v = raw[k];
+        if (typeof v === 'string' && v.trim()) out[k] = v.trim().slice(0, k === 'agent' || k === 'session' ? 180 : 80);
+    }
+    if (!out.session && !out.agent) return null;
+    if (!out.model) out.model = 'unknown';
+    return out;
+}
+const capturedByField = (c) => { const v = capturedByValue(c && c.capturedBy); return v ? { capturedBy: v } : {}; };
 
 // Valid fractional-indexing z-keys. Hand-rolled keys (e.g. 'a0000' / 'z00013')
 // are REJECTED by the fractional-indexing lib the KLYPIX app uses and crash it
@@ -1052,6 +1069,8 @@ export async function parseKlypix(buffer) {
             // git / gardener / …) — persisted by the capture paths, surfaced for
             // brain_challenge's "captured by another agent" twist + view badges.
             createdVia: it.createdVia ?? null,
+            // 1.109.0: session / subagent / tool / model / role, when recorded.
+            ...(capturedByValue(it.capturedBy) ? { capturedBy: capturedByValue(it.capturedBy) } : {}),
             // 'user' | 'agent' — the coarse authorship bit (brain_lens provenance).
             createdBy: it.createdBy ?? null,
             parentId: it.parentId ?? null,
@@ -1868,6 +1887,7 @@ export async function appendToKlypix(buffer, addition) {
         zip.file(`items/${shard(id)}/${id}.json`, JSON.stringify({
             type: 'text', locked: false, createdAt: now, createdBy: 'agent', ...authorField(),
             ...(c.createdVia ? { createdVia: String(c.createdVia) } : {}),
+            ...capturedByField(c),
             ...(c.guard && typeof c.guard === 'object' ? { guard: c.guard } : {}),
             content: String(c.text), fontSize: FONT,
             // A plain (unbordered) card renders at max-content width unless
@@ -2337,6 +2357,7 @@ export async function appendIntoContainers(buffer, addition) {
             // …and WHICH agent remembered this (claude-code / cursor /
             // cline / …) — both additive fields, ignored by older readers.
             ...(card.createdVia ? { createdVia: String(card.createdVia) } : {}),
+            ...capturedByField(card),
             // Evidence anchors (file:line / PR#) — additive, ignored by older readers.
             ...(Array.isArray(card.evidence) && card.evidence.length ? { evidence: card.evidence } : {}),
             // Live-probe command for a fast-decay claim — additive, ignored by older readers.
@@ -7274,6 +7295,7 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                     j.createdAt = now;
                     j.borderColor = 'rgba(16,185,129,0.6)';
                     if (u.createdVia) j.createdVia = String(u.createdVia);
+                    if (capturedByValue(u.capturedBy)) j.capturedBy = capturedByValue(u.capturedBy);
                     // Omission preserves metadata; explicit empties clear stale anchors.
                     // A cleared verify is PERSISTED as '' (1.86.1): deleting the
                     // field let the reader derive a probe from the card's prose
@@ -7301,7 +7323,7 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                 // a glyph-less guard card was silently consolidatable while
                 // still enforcing (review 2026-08-24). remove-sentinels add no
                 // glyph and no field: an unmatched disarm is inert by design.
-                cards.push({ text: (u.area ? `${u.area}: ` : '') + (u.guard && u.guard.remove !== true && !/🛠/.test(u.text) ? '🛠️ ' : '') + u.text + (u.area ? `\n#${u.area.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : ''), area: u.area, createdVia: u.createdVia, ...(Array.isArray(u.evidence) && u.evidence.length ? { evidence: u.evidence } : {}), ...(typeof u.verify === 'string' && u.verify.trim() ? { verify: u.verify.trim() } : {}), ...(u.guard && typeof u.guard === 'object' && u.guard.remove !== true ? { guard: u.guard } : {}) });
+                cards.push({ text: (u.area ? `${u.area}: ` : '') + (u.guard && u.guard.remove !== true && !/🛠/.test(u.text) ? '🛠️ ' : '') + u.text + (u.area ? `\n#${u.area.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : ''), area: u.area, createdVia: u.createdVia, ...capturedByField(u), ...(Array.isArray(u.evidence) && u.evidence.length ? { evidence: u.evidence } : {}), ...(typeof u.verify === 'string' && u.verify.trim() ? { verify: u.verify.trim() } : {}), ...(u.guard && typeof u.guard === 'object' && u.guard.remove !== true ? { guard: u.guard } : {}) });
             }
         } catch (error) {
             (stats.captureErrors ||= []).push({ kind: 'update', i: uIndex, ...describeFailed(u, 'text'), error: errText(error) });
@@ -7610,6 +7632,7 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                     j.content = String(card.text);
                     j.createdAt = now;
                     if (card.createdVia) j.createdVia = String(card.createdVia);
+                    if (capturedByValue(card.capturedBy)) j.capturedBy = capturedByValue(card.capturedBy);
                     if (Array.isArray(card.evidence) && card.evidence.length) j.evidence = card.evidence;
                     if (typeof card.verify === 'string' && card.verify.trim()) j.verify = card.verify.trim();
                     if (card.guard && typeof card.guard === 'object') j.guard = card.guard;
@@ -9723,18 +9746,19 @@ export function repairRawMarker(text) {
     return wrapText([lead, ...lines.slice(i)].join('\n'), cpl);
 }
 
-export function noteToCaptureInput({ text = '', area = '', marker = '', closes = '', evidence = null, verify = null, guard = null, createdVia = 'mcp' } = {}) {
+export function noteToCaptureInput({ text = '', area = '', marker = '', closes = '', evidence = null, verify = null, guard = null, createdVia = 'mcp', capturedBy = null } = {}) {
+    const by = capturedByField({ capturedBy });
     ({ marker, text } = liftLeadingMarker(marker, text));
     const body = String(text).trim();
     if (!body) return { cards: [], resolutions: [], updates: [] };
     const a = String(area || '').trim();
     if (marker === '✓') return { cards: [], resolutions: [{ area: a, text: body }], updates: [] };
-    if (marker === '~') return { cards: [], resolutions: [], updates: [{ area: a, text: body, createdVia, ...(Array.isArray(evidence) ? { evidence } : {}), ...(typeof verify === 'string' ? { verify } : {}), ...(guard ? { guard } : {}) }] };
+    if (marker === '~') return { cards: [], resolutions: [], updates: [{ area: a, text: body, createdVia, ...by, ...(Array.isArray(evidence) ? { evidence } : {}), ...(typeof verify === 'string' ? { verify } : {}), ...(guard ? { guard } : {}) }] };
     const prefix = marker === '?' ? '❓ ' : marker === '!' ? '🏁 ' : marker === '+' ? '🛠️ ' : '';
     const borderColor = marker === '?' ? 'rgba(245,166,35,0.8)' : marker === '!' ? 'rgba(59,130,246,0.8)' : marker === '+' ? 'rgba(139,92,246,0.85)' : 'rgba(16,185,129,0.6)';
     const tag = a ? `\n#${a.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : '';
     const cardText = (a ? `${a}: ${prefix}${body}` : `${prefix}${body}`) + tag;
-    return { cards: [{ text: cardText, area: a, color: '#e8e8ed', borderColor, createdVia, ...(closes ? { closes } : {}), ...(evidence ? { evidence } : {}), ...(verify ? { verify } : {}), ...(guard ? { guard } : {}) }], resolutions: [], updates: [] };
+    return { cards: [{ text: cardText, area: a, color: '#e8e8ed', borderColor, createdVia, ...by, ...(closes ? { closes } : {}), ...(evidence ? { evidence } : {}), ...(verify ? { verify } : {}), ...(guard ? { guard } : {}) }], resolutions: [], updates: [] };
 }
 
 /**

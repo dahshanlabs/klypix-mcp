@@ -20,7 +20,7 @@ delete process.env.KLYPIX_PLUGIN;
 const { buildKlypixMap, parseKlypix } = await import('../src/klypix-format.mjs');
 const { opBrainNote, opBrainAsk, opBrainTaskContext } = await import('../src/klypix-core.mjs');
 const C = await import('../src/crowd-safeguards.mjs');
-const { opBrainReview, crowdSyncText } = await import('../src/crowd-review.mjs');
+const { opBrainReview, crowdSyncText, withHitLineage } = await import('../src/crowd-review.mjs');
 
 let n = 0;
 const check = (cond, label) => { assert.ok(cond, label); n++; console.log(`✓ ${label}`); };
@@ -75,6 +75,36 @@ try {
   check(/🧬 Lineage:/.test(ask) && /re-checked against code\/evidence 1×/.test(ask), 'brain_ask shows the claim\'s lineage once');
   check((ask.match(/🧬 Lineage:/g) || []).length === 1, 'the lineage of one claim is printed once, not once per restating card');
 
+  // ── brain_sync: the lineage rides ON the context hits (structuredContent) ─
+  // Claude Code shows the model only structuredContent, so a line printed only
+  // in the text block never reached the agent (crowd bench round 1). Every
+  // restated claim among the hits brain_sync already returns gets its line,
+  // whatever the intent's wording and whether or not files were declared.
+  s = await read();
+  const claimIds = live(s).filter((c) => /tools\/release\.sh/.test(c.text)).map((c) => c.id);
+  const unrelated = await crowdSyncText({ brainPath: brain, sessionId: 's-lineage', intent: 'ship it', files: [], hitIds: claimIds });
+  const hl = unrelated.hitLineage;
+  check(claimIds.every((id) => typeof hl[id] === 'string'), `every hit of a restated claim carries a lineage entry with an unrelated intent and no files (${Object.keys(hl).length}/${claimIds.length})`);
+  check(/🧬 Lineage:/.test(hl[claimIds[0]]) && /Repetition is not corroboration/.test(hl[claimIds[0]]), 'the first hit of the claim carries the whole lineage line');
+  check(claimIds.slice(1).every((id) => /^🧬 Same claim as /.test(hl[id]) && hl[id].length < 200), 'the claim\'s other hits carry a short pointer, so the claim is said once');
+  check(Object.values(hl).filter((v) => /🧬 Lineage:/.test(v)).length === 1, 'one claim, one full lineage line across the hits');
+  check(/re-checked it/.test(Object.values(hl).join('\n')), 'the re-checking card is labelled as the re-check, not as a restatement');
+  check(unrelated.data?.lineage?.[0]?.line === hl[claimIds[0]], 'crowd.lineage[] carries the same line as data, for structured-only hosts');
+  const ctx = withHitLineage({ mode: 'x', hits: claimIds.map((id) => ({ id, area: 'A', text: 't', score: 1 })) }, hl);
+  check(ctx.hits.every((h) => h.lineage === hl[h.id]) && Object.keys(ctx.hits[0]).indexOf('lineage') === Object.keys(ctx.hits[0]).indexOf('text') + 1, 'withHitLineage puts the line on each hit right after its text');
+  const untouched = { mode: 'x', hits: [{ id: 'nope', text: 't' }] };
+  check(withHitLineage(untouched, {}) === untouched, 'no lineage: the context object is returned unchanged');
+  const none = await crowdSyncText({ brainPath: brain, sessionId: 's-lineage', intent: 'ship it', files: [], hitIds: [] });
+  check(!none.data?.lineage && !Object.keys(none.hitLineage).length, 'no hits and no matching words or files: no lineage (bounded to what sync already returns)');
+  check(C.SYNC_LINEAGE_MAX === 5, 'at most 5 claim lineages per brain_sync');
+  // A claim nobody sourced: its earliest card is not called "the recorded source".
+  const noSrc = { cards: [
+    { id: 'a1', area: 'Payments', text: 'Payments: chargeCard in lib/charge.js should retry transient 503 errors with backoff.', createdAt: 1 },
+    { id: 'a2', area: 'Ops', text: 'Ops: agreed, chargeCard in lib/charge.js should retry 503 errors with backoff.', createdAt: 2 },
+  ], connections: [] };
+  const ns = C.crowdSyncBlock(noSrc, { intent: 'x', hitCards: [noSrc.cards[1], noSrc.cards[0]] });
+  check(/no recorded source/.test(ns.hitLineage.a2 || '') && /earliest statement; it names no source/.test(ns.hitLineage.a1 || ''), 'an unsourced original is called the earliest statement, never the recorded source');
+
   // ── Preserved dissent ───────────────────────────────────────────────────
   const obj = await note({ text: 'Objection: do not cache /api/profile responses for an hour — profile edits would not show for up to an hour and support tickets will follow.', area: 'Caching' });
   check(!obj.isError, 'an objection is captured');
@@ -93,6 +123,7 @@ try {
   check(/⚖️ Open objection/.test(askObj), 'brain_ask carries the open objection');
   const sync = await crowdSyncText({ brainPath: brain, sessionId: 's-plain', intent: 'cache /api/profile responses', files: [] });
   check(/⚖️ Open objection/.test(sync.text) && sync.data?.objections?.length === 1, 'the brain_sync crowd block carries the open objection');
+  check(/closes:/.test(sync.data?.objectionsNote || ''), 'crowd.objectionsNote carries how to answer an objection, for structured-only hosts');
   // A decision that LINKS the objection closes it.
   const objTitle = stillOpen[0].text.replace(/^[^:\n]{1,40}:\s*/u, '').split('\n')[0].slice(0, 70);
   const closed = await note({ text: 'Profile responses: cache for 60 s and purge on edit, so edits show at once.', area: 'Caching', closes: objTitle, evidence: [{ kind: 'pr', ref: 'PR#12' }] });

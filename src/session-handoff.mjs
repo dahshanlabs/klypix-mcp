@@ -134,18 +134,47 @@ function geminiTranscript(sessionId, { home, maxBytes, maxEntries }) {
 // Read source conversations, not the lossy last-prompt/last-reply lane. Only
 // exact session filenames under the host's transcript root are eligible; never
 // follow a path supplied in a card. Unknown/partial evidence never means fresh.
-export function handoffTranscript(sessionId, client, { home = os.homedir(), maxBytes = 128 * 1024 * 1024, maxEntries = 12000 } = {}) {
+// Where Claude Code keeps transcripts: CLAUDE_CONFIG_DIR/projects when the
+// host sets it (only for the real home — a test's `home` stays isolated),
+// else <home>/.claude/projects.
+export function claudeProjectRoots(home = os.homedir(), env = process.env) {
+  const roots = [path.join(home, '.claude', 'projects')];
+  if (env.CLAUDE_CONFIG_DIR && path.resolve(home) === path.resolve(os.homedir())) roots.unshift(path.join(env.CLAUDE_CONFIG_DIR, 'projects'));
+  return [...new Set(roots.map((r) => path.resolve(r)))];
+}
+export function handoffTranscript(sessionId, client, { home = os.homedir(), maxBytes = 128 * 1024 * 1024, maxEntries = 12000, roots = null } = {}) {
   const unknown = reason => ({ status: 'unknown', reason, turns: [] });
   if (!/^[a-f0-9-]{16,64}$/i.test(sessionId || '')) return unknown('No supported exact session identity');
   if (/^gemini(?:[ -]cli)?$/i.test(client || '')) return geminiTranscript(sessionId, { home, maxBytes, maxEntries });
   const claude = /claude/i.test(client || '');
   if (!claude && !/codex/i.test(client || '')) return unknown('Transcript adapter unavailable for this host');
-  const root = claude ? path.join(home, '.claude', 'projects') : path.join(process.env.CODEX_HOME || path.join(home, '.codex'), 'sessions');
   const matches = [];
   let count = 0, incomplete = false;
+  // 1.109 (continuity test 2026-10-30: every review said "Transcript discovery
+  // incomplete", even on the PC holding the transcript). Claude names the
+  // file after the session id inside one folder per project, so each project
+  // folder is probed for that exact name — a busy ~/.claude/projects with tens
+  // of thousands of transcripts no longer runs out of entry budget — and a
+  // root that does not exist is "not on this machine", not "incomplete".
+  if (claude) {
+    for (const root of (Array.isArray(roots) && roots.length ? roots : claudeProjectRoots(home))) {
+      let dirs;
+      try { dirs = fs.readdirSync(root, { withFileTypes: true }); }
+      catch (e) { if (e?.code !== 'ENOENT' && e?.code !== 'ENOTDIR') incomplete = true; continue; }
+      for (const d of dirs) {
+        if (++count > maxEntries) { incomplete = true; break; }
+        if (!d.isDirectory() || d.isSymbolicLink()) continue;
+        const file = path.join(root, d.name, `${sessionId}.jsonl`);
+        try { if (fs.lstatSync(file).isFile()) matches.push(file); }
+        catch (e) { if (e?.code !== 'ENOENT' && e?.code !== 'ENOTDIR') incomplete = true; }
+      }
+    }
+    if (matches.length !== 1) return unknown(matches.length > 1 ? 'Ambiguous transcript identity' : incomplete ? 'Transcript discovery incomplete' : 'Transcript unavailable on this machine');
+  }
+  const root = claude ? null : path.join(process.env.CODEX_HOME || path.join(home, '.codex'), 'sessions');
   function walk(dir, depth) {
     let entries;
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { incomplete = true; return; }
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { if (!(dir === root && e?.code === 'ENOENT')) incomplete = true; return; }
     for (const entry of entries) {
       if (++count > maxEntries) { incomplete = true; return; }
       if (entry.isSymbolicLink()) continue;
@@ -155,8 +184,8 @@ export function handoffTranscript(sessionId, client, { home = os.homedir(), maxB
       if (count > maxEntries) return;
     }
   }
-  walk(root, claude ? 1 : 3);
-  if (incomplete || matches.length !== 1) return unknown(incomplete ? 'Transcript discovery incomplete' : matches.length ? 'Ambiguous transcript identity' : 'Transcript unavailable on this machine');
+  if (!claude) walk(root, 3);
+  if ((!claude && incomplete) || matches.length !== 1) return unknown(incomplete ? 'Transcript discovery incomplete' : matches.length ? 'Ambiguous transcript identity' : 'Transcript unavailable on this machine');
   const file = matches[0];
   try {
     const before = fs.lstatSync(file);
@@ -629,13 +658,33 @@ export function autoHandoffCandidates(records) {
   return (Array.isArray(records) ? records : []).filter((r) => r && typeof r === 'object'
     && flat(r.intent) && !MACHINE_INTENT_RE.test(flat(r.intent))
     && !r.handoffCardId && !r.takenBy
-    && ((Array.isArray(r.commits) && r.commits.length > 0) || (Array.isArray(r.files) && r.files.length > 0 && flat(r.lastWords)))
+    && ((Array.isArray(r.commits) && r.commits.length > 0)
+      // 1.109: a session cut off mid-reply has no reply tail; its files are the work.
+      || (Array.isArray(r.files) && r.files.length > 0 && (flat(r.lastWords) || r.cutOff === true)))
     && (r.state === 'ended' || Number(r.quietMs) >= AUTO_HANDOFF_QUIET_MS));
 }
 // The card's fields from one unfinished-work record. Honest by construction:
 // Done lists only what git proved (its own commits), Next tells the reader to
 // confirm the state before touching anything, and the session's last words
 // ride verbatim as the only "next" it ever said.
+// The steps a stopped session was asked for, from its recorded prompts
+// (oldest first): one per non-empty line, so "1. … 2. … 3. …" stays a list.
+// A one-line prompt is one step. Bounded by the card's own item limit.
+export function askSteps(record) {
+  const r = record && typeof record === 'object' ? record : {};
+  const asks = Array.isArray(r.asks) && r.asks.length ? r.asks : (r.lastPrompt ? [{ text: r.lastPrompt }] : []);
+  const out = [];
+  for (const a of asks) {
+    for (const line of String(a?.text || '').split(/\n+/)) {
+      // "1. step" → "(1) step": the card store hard-wraps, and a wrapped line
+      // that starts with "1." would parse as a new Next item.
+      let t = safeText(flat(line)).replace(/^(\d{1,3})[.)]\s+/, '($1) ').replace(/^[-•*]\s+/, '');
+      if (t.length > HANDOFF_LIMITS.item - 10) t = `${t.slice(0, HANDOFF_LIMITS.item - 11)}…`;
+      if (t && !out.includes(t)) out.push(t);
+    }
+  }
+  return out;
+}
 export function draftHandoffFromWork(record, { projectDir = '' } = {}) {
   const r = record && typeof record === 'object' ? record : {};
   const title = flat(r.intent).slice(0, HANDOFF_LIMITS.title);
@@ -643,11 +692,20 @@ export function draftHandoffFromWork(record, { projectDir = '' } = {}) {
   const commits = (Array.isArray(r.commits) ? r.commits : []).filter((c) => c && c.sha);
   const dir = flat(r.cwd || projectDir);
   const gitAt = dir ? `git -C "${dir}"` : 'git';
-  const task = `${title}${/[.!?]$/.test(title) ? '' : '.'} The session stopped without writing a handoff${r.lastPrompt ? `; its last prompt was “${flat(r.lastPrompt).slice(0, 200)}”` : ''}.`.slice(0, HANDOFF_LIMITS.task);
-  const next = [
-    `Confirm the state before changing anything${dir ? ` — in ${dir}` : ''}: git status, then git diff${files.length ? ' on the files below' : ''}${commits.length ? ' (its own commits are under Done)' : ''}.`,
-    'Read its last words below, then continue the task — or write a deliberate handoff (brain_handoff write, continues: this card) once the real state is known.',
-  ].map((s) => s.slice(0, HANDOFF_LIMITS.item));
+  // 1.109: what it was ASKED rides the card — the step list in its prompt is
+  // "what is left" once its own commits are subtracted (continuity test
+  // 2026-10-30: a 240-character prompt cut the list inside step 1, and the
+  // next Codex session asked the human what else was on it).
+  const steps = askSteps(r);
+  const cut = r.cutOff === true ? ' It was cut off in the middle of a reply.' : '';
+  const task = `${title}${/[.!?]$/.test(title) ? '' : '.'} The session stopped without writing a handoff.${cut}${steps.length ? ' Next lists the steps it was asked for; its own commits are under Done.' : ''}`.slice(0, HANDOFF_LIMITS.task);
+  const head = [`Confirm the state before changing anything${dir ? ` — in ${dir}` : ''}: git status, then git diff${files.length ? ' on the files below' : ''}${commits.length ? ' (its own commits are under Done)' : ''}.`];
+  const tail = ['Read its last words below, then continue the task — or write a deliberate handoff (brain_handoff write, continues: this card) once the real state is known.'];
+  const room = Math.max(0, HANDOFF_LIMITS.items - head.length - tail.length - 1);
+  const asked = steps.length
+    ? ['It was asked for the steps below (from its own prompts, oldest first). Do the ones its commits and files do not cover yet, in order:', ...steps.slice(0, room).map((st) => `asked — ${st}`)]
+    : [];
+  const next = [...head, ...asked, ...tail].map((s) => s.slice(0, HANDOFF_LIMITS.item));
   const verify = (files.length
     ? `${gitAt} status --porcelain -- ${files.slice(0, 6).join(' ')}`
     : `${gitAt} log --oneline -n 6`).slice(0, HANDOFF_LIMITS.verify);

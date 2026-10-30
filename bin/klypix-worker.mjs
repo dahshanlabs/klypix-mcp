@@ -1649,7 +1649,7 @@ server.registerTool('brain_sync', {
       const words = new Set(String(intent || '').toLowerCase().match(/[\p{L}\p{N}_-]{3,}/gu) || []);
       for (const w of ['continue', 'resume', 'what', 'was', 'were', 'doing', 'the', 'and', 'left', 'off', 'where', 'session', 'other', 'work', 'pick', 'carry', 'keep', 'going', 'finish', 'take', 'over', 'handoff', 'hand']) words.delete(w);
       const relevance = (r) => {
-        const hay = [r.client === 'claude-code' ? 'claude' : r.client, r.intent, r.lastPrompt, r.lastWords, ...(r.files || []), ...(r.commits || []).map((c) => c.subject)].join(' ').toLowerCase();
+        const hay = [r.client === 'claude-code' ? 'claude' : r.client, r.intent, r.lastPrompt, ...(Array.isArray(r.asks) ? r.asks.map((a) => a.text) : []), r.lastWords, ...(r.files || []), ...(r.commits || []).map((c) => c.subject)].join(' ').toLowerCase();
         let n = 0;
         for (const w of words) if (hay.includes(w)) n++;
         return n + (overlaps(r) ? 3 : 0);
@@ -1675,7 +1675,7 @@ server.registerTool('brain_sync', {
           unfinished: lane.length,
           handoffs: cards.map((c) => ({ id: c.id, title: c.title, from: c.from, at: c.at, reason: c.reason, state: c.state, next: c.next, files: c.files, auto: c.auto === true, ...(c.forRole ? { for: c.forRole } : {}) })),
           ...(Array.isArray(h?.structured?.autoDrafted) && h.structured.autoDrafted.length ? { autoDrafted: h.structured.autoDrafted } : {}),
-          sessions: lane.slice(0, 4).map((r) => ({ id: r.id, client: r.client, intent: r.intent, state: r.state, working: false, holdsFiles: false, note: r.note, status: r.status, lastSeen: r.lastSeen, lastPrompt: r.lastPrompt || null, lastWords: r.lastWords || null, files: r.files, commits: r.commits, handoffCardId: r.handoffCardId, takenBy: r.takenBy })),
+          sessions: lane.slice(0, 4).map((r) => ({ id: r.id, client: r.client, intent: r.intent, state: r.state, working: false, holdsFiles: false, note: r.note, status: r.status, lastSeen: r.lastSeen, lastPrompt: r.lastPrompt || null, asks: Array.isArray(r.asks) ? r.asks : [], cutOff: r.cutOff === true, lastWords: r.lastWords || null, files: r.files, commits: r.commits, handoffCardId: r.handoffCardId, takenBy: r.takenBy })),
         };
       }
     } catch { /* never fails a sync */ }

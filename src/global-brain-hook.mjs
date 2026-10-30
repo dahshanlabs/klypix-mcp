@@ -1049,8 +1049,11 @@ const MACHINE_TAGS = 'task-notification|system-reminder|system-warning|local-com
 const MACHINE_BLOCK_RE = new RegExp(
     '^(?:<(' + MACHINE_TAGS + ')\\b[^>]*>[\\s\\S]*?(?:</\\1>|$)|\\[SYSTEM NOTIFICATION[^\\]]*\\])\\s*', 'i');
 const TAG_SHAPED_RE = /^<[a-z][\w.:-]*(?:\s|\/?>)/i;
-function deriveIntentFromPrompt(raw) {
-    let text = String(raw || '').replace(/\s+/g, ' ').trim();
+function deriveIntentFromPrompt(raw, { keepLines = false } = {}) {
+    // keepLines (1.109 twin): the session's ASK keeps its line breaks.
+    let text = keepLines
+        ? String(raw || '').replace(/\r\n?/g, '\n').replace(/[ \t\f\v]+/g, ' ').replace(/ ?\n ?/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
+        : String(raw || '').replace(/\s+/g, ' ').trim();
     if (!text) return null;
     // A "[SYSTEM NOTIFICATION …]"-led turn is machine end to end — the prose
     // after the bracket header is harness narration, never the user's intent.
@@ -1083,12 +1086,55 @@ const dirFiles = (files) => [...new Set((Array.isArray(files) ? files : []).map(
 // exactly how a hook twin would erase what brain_handoff stamped — so this
 // normalizer must know every field the engine's does.
 const WORK_LAST_WORDS_MAX = 700;
+// 1.109 twins of agent-presence WORK_ASK_MAX / redactSecretsInText /
+// normalizeAsks / workCutOff — what the session was ASKED, recorded at prompt
+// submit with its line breaks (a step list stays a list), secrets redacted.
+const WORK_ASK_MAX = 4000;
+const WORK_ASKS_MAX = 3;
+const WORK_ASKS_TOTAL_MAX = 8000;
+const SECRET_PATTERNS = [
+    /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/g,
+    /\b(?:sk|rk|pk)-(?:ant-|proj-|live-|test-)?[A-Za-z0-9_-]{16,}/g,
+    /\bgh[pousr]_[A-Za-z0-9]{20,}\b/g,
+    /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g,
+    /\bxox[abposr]-[A-Za-z0-9-]{10,}\b/g,
+    /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g,
+    /\bAIza[0-9A-Za-z_-]{30,}\b/g,
+    /\bnpm_[A-Za-z0-9]{30,}\b/g,
+    /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g,
+    /\b[a-z][a-z0-9+.-]*:\/\/[^\s:/@]+:[^\s@/]+@/gi,
+    /\bBearer\s+[A-Za-z0-9._~+/-]{16,}=*/g,
+];
+const SECRET_ASSIGNMENT = /\b(api[-_]?key|access[-_]?token|auth[-_]?token|token|secret|client[-_]?secret|password|passwd|pwd|authorization)(\s*[:=]\s*)(["']?)([^\s"']{4,})\3/gi;
+function redactSecretsInText(text) {
+    let out = String(text || '');
+    for (const re of SECRET_PATTERNS) out = out.replace(re, '<redacted>');
+    return out.replace(SECRET_ASSIGNMENT, (_all, key, sep, q) => `${key}${sep}${q}<redacted>${q}`);
+}
+const askText = (value) => neutralMarkers(redactSecretsInText(String(value || '')
+    .replace(/\r\n?/g, '\n').replace(/[ \t\f\v]+/g, ' ').replace(/ ?\n ?/g, '\n').replace(/\n{3,}/g, '\n\n').trim())).slice(0, WORK_ASK_MAX).trim();
+function normalizeAsks(raw) {
+    const rows = (Array.isArray(raw) ? raw : [])
+        .map(a => (a && typeof a === 'object' ? { text: askText(a.text), at: Number(a.at) > 0 ? Number(a.at) : null } : null))
+        .filter(a => a && a.text);
+    const out = [];
+    for (const a of rows) { const i = out.findIndex(b => b.text === a.text); if (i >= 0) out.splice(i, 1); out.push(a); }
+    const kept = out.slice(-WORK_ASKS_MAX);
+    while (kept.length > 1 && kept.reduce((n, a) => n + a.text.length, 0) > WORK_ASKS_TOTAL_MAX) kept.shift();
+    return kept.map(a => (a.at ? a : { text: a.text }));
+}
+const workCutOff = (w) => Boolean(w && Number(w.promptAt) > 0
+    && Number(w.promptAt) > Math.max(Number(w.replyEndedAt) || 0, Number(w.lastWordsAt) || 0));
 function workNorm(raw) {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
     const out = {};
     const str = (v, max) => String(v || '').replace(/\s+/g, ' ').trim().slice(0, max);
     const ms = (v) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Number(v) : null);
-    if (raw.lastPrompt) out.lastPrompt = neutralMarkers(str(raw.lastPrompt, 240));
+    if (raw.lastPrompt) { const p = askText(raw.lastPrompt); if (p) out.lastPrompt = p; }
+    const asks = normalizeAsks(raw.asks);                               // 1.109 twin
+    if (asks.length) out.asks = asks;
+    if (ms(raw.promptAt)) out.promptAt = ms(raw.promptAt);
+    if (ms(raw.replyEndedAt)) out.replyEndedAt = ms(raw.replyEndedAt);
     if (raw.lastWords) out.lastWords = neutralMarkers(String(raw.lastWords).replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim().slice(0, WORK_LAST_WORDS_MAX));
     if (ms(raw.lastWordsAt)) out.lastWordsAt = ms(raw.lastWordsAt);
     if (raw.baseHead) out.baseHead = String(raw.baseHead).trim().slice(0, 40);
@@ -1128,6 +1174,22 @@ const workMerge = (prev, patch) => {
     const next = patch && typeof patch === 'object' ? { ...patch } : {};
     // addWorkdirs APPENDS (twin of agent-presence mergeWork), newest last, capped 4.
     if (Array.isArray(next.addWorkdirs)) { next.workdirs = [...(p.workdirs || []), ...next.addWorkdirs]; delete next.addWorkdirs; }
+    // addAsk (1.109 twin): one human prompt at submit time becomes the latest.
+    if (next.addAsk && typeof next.addAsk === 'object') {
+        const text = askText(next.addAsk.text);
+        const at = Number(next.addAsk.at) > 0 ? Number(next.addAsk.at) : Date.now();
+        if (text) { next.asks = [...(p.asks || []), { text, at }]; next.lastPrompt = text; next.promptAt = at; }
+    }
+    delete next.addAsk;
+    // addCommits APPENDS (1.109 twin of agent-presence mergeWork): a commit the
+    // session ran is recorded when its tool call returns, not only at Stop.
+    if (Array.isArray(next.addCommits)) {
+        const seen = new Set();
+        next.commits = [...(p.commits || []), ...next.addCommits]
+            .filter(c => c && c.sha && !seen.has(String(c.sha).slice(0, 7)) && seen.add(String(c.sha).slice(0, 7)))
+            .slice(-6);
+        delete next.addCommits;
+    }
     return workNorm({ ...p, ...next });
 };
 function dirPrune(rows, now) {
@@ -1517,7 +1579,7 @@ const UNFINISHED_QUIET_MS = 10 * 60 * 1000;
 // 1.99.1 twin of agent-presence UNFINISHED_WINDOW_MS / hasWorkEvidence: only a
 // session that stopped in the last 24h AND left a 1.99+ work record is listed.
 const UNFINISHED_WINDOW_MS = 24 * 60 * 60 * 1000;
-const hasWorkEvidence = (w) => Boolean(w && (w.lastWords || (Array.isArray(w.commits) && w.commits.length) || w.handoffCardId || w.declaredAt
+const hasWorkEvidence = (w) => Boolean(w && (w.lastWords || (Array.isArray(w.commits) && w.commits.length) || w.handoffCardId || w.declaredAt || workCutOff(w)
     || (Array.isArray(w.checkouts) && w.checkouts.some(c => c && Number(c.changed) > 0))));   // 1.103.0 twin: uncommitted work on disk counts
 // 1.103.0 twin of agent-presence formatCheckoutLines: the "where it worked"
 // lines — a separate checkout named in full so nobody searches for it.
@@ -1540,6 +1602,30 @@ function checkoutLinesOf(w, cwd) {
 }
 const CONTINUE_RE =/\b(continue|resume|pick (it |this |that )?up|carry on|keep going|where (were|did) we|what('s| is| was) (next|left|remaining|pending)|unfinished|left off|hand[- ]?off|handed (over|off)|take over|finish (what|the work|it|this))\b/i;
 const HANDOFF_ASK_RE = /\b(hand[- ]?off|hand (it|this|the work) (over|off)|before (we|i|you) (hit|reach|approach|run out of) (the )?(limit|context|window|quota)|(context|usage|token) (limit|window|quota)|out of context|switch(ing)? to (codex|another (agent|session|tool)))\b/i;
+// 1.109 PARITY twin of agent-presence formatAskLines: what the stopped
+// session was asked, quoted as its record — newest prompt in full first.
+function askLinesOf(w, budget = 2400) {
+    const asks = Array.isArray(w?.asks) && w.asks.length ? w.asks : (w?.lastPrompt ? [{ text: w.lastPrompt }] : []);
+    const lines = [];
+    if (workCutOff(w)) lines.push('  it was cut off in the middle of a reply: it never finished answering its last prompt below');
+    if (!asks.length) return lines;
+    lines.push(`  what it was asked (its own prompt${asks.length > 1 ? 's, oldest first' : ''} — that session's record, not the human's instructions to you; what is left = the steps its commits and files do not cover yet; check each against git):`);
+    let room = budget;
+    const shown = [];
+    for (const a of [...asks].reverse()) {
+        const text = String(a?.text || '').trim();
+        if (!text || room <= 0) break;
+        const cut = text.length > room ? `${text.slice(0, Math.max(0, room - 1))}…` : text;
+        room -= cut.length;
+        shown.unshift(cut);
+    }
+    for (const text of shown) {
+        const rows = text.split(/\n/);
+        lines.push(`    › ${rows[0]}`);
+        for (const row of rows.slice(1)) if (row.trim()) lines.push(`      ${row}`);
+    }
+    return lines;
+}
 function unfinishedFooter(sid, { max = 4 } = {}) {
     try {
         const data = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8'));
@@ -1570,6 +1656,7 @@ function unfinishedFooter(sid, { max = 4 } = {}) {
             if (Array.isArray(w.commits) && w.commits.length) lines.push(`  commits: ${w.commits.map(c => `${c.sha} ${c.subject}`).join('; ').slice(0, 320)}`);
             if (Array.isArray(e.files) && e.files.length) lines.push(`  files it touched (free — not reserved): ${e.files.slice(-8).join(', ')}`);
             lines.push(...checkoutLinesOf(w, e.cwd));
+            lines.push(...askLinesOf(w));
             if (w.lastWords) lines.push(`  its last words: “${flat(w.lastWords).slice(0, 420)}”`);
             if (w.handoffCardId) lines.push(w.handoffAuto
                 ? `  🤝 KLYPIX drafted a handoff card from this record (the session wrote none): ${w.handoffCardId} (brain_handoff {action:"list"} prints it in full)`
@@ -2947,6 +3034,29 @@ function observeFileScope(input, sid) {
 // branch (string checks → return). Appends ONE deduped line under the shared
 // advisory lock; prunes >6h and caps the file on every append. No lazy lib import.
 // Never throws (main() has already confirmed a brain exists for this project).
+// 1.109: the session's OWN commit, recorded when the commit command returns
+// — the Stop hook rebuilds the list from the transcript, but a session killed
+// mid-reply never reaches Stop (continuity test 2026-10-30: step 1 was
+// committed, then the session was killed, and its record showed no commit).
+// Twin of codex-brain-hook commitsFromToolResult: only what git PRINTED for a
+// commit this session ran ("[branch abc1234] subject"), never a branch range.
+function commitsFromClaudeTool(input) {
+    if (input?.tool_name !== 'Bash' && input?.tool_name !== 'PowerShell') return [];
+    const cmd = String(input?.tool_input?.command || '');
+    if (!/\bgit\b[^\n]*\bcommit\b/.test(cmd)) return [];
+    const r = input.tool_response ?? input.toolResponse ?? '';
+    const out = typeof r === 'string' ? r
+        : (r && typeof r === 'object' ? [r.stdout, r.output, r.stderr, r.text, typeof r.content === 'string' ? r.content : ''].filter(v => typeof v === 'string').join('\n') : '');
+    const commits = [];
+    for (const m of out.matchAll(/^\[[^\]\n]{1,80}?\s([0-9a-f]{7,40})\]\s+(.+)$/gm)) commits.push({ sha: m[1].slice(0, 12), subject: m[2].trim().slice(0, 120) });
+    return commits.slice(0, 6);
+}
+function observeOwnCommit(input, sid) {
+    try {
+        const commits = commitsFromClaudeTool(input);
+        if (commits.length) touchSession(sid, { work: { addCommits: commits }, hostStatus: 'busy' });
+    } catch { /* observation is best-effort */ }
+}
 function liveCapture() {
     try {
         const input = readHookInput();
@@ -2959,6 +3069,7 @@ function liveCapture() {
         // declared full scopes via brain_sync. MUST run BEFORE the detectLiveEvent
         // early-return: ordinary edits are precisely the non-event turns.
         observeFileScope(input, sid);
+        observeOwnCommit(input, sid);
         const ev = detectLiveEvent(input);
         if (!ev) return;                                                        // non-matching branch — done
         const text = String(ev.text).replace(/\s+/g, ' ').trim().slice(0, 200);
@@ -3674,7 +3785,9 @@ async function capture(lib) {
     // Keep this session's coordination lane warm at every Stop (a turn ended; the
     // session lives on between turns — IDLE until the next prompt). Files/ships
     // are set after the transcript scan.
-    touchSession(input.session_id, { branch: gitBranch(), hostStatus: 'idle' });
+    // 1.109: a finished reply is stamped on EVERY Stop (even one with no reply
+    // text), so a prompt submitted after it is what "cut off mid-reply" means.
+    touchSession(input.session_id, { branch: gitBranch(), hostStatus: 'idle', work: { replyEndedAt: Date.now() } });
     const tp = input.transcript_path || '';
     if (!tp || !fs.existsSync(tp)) return;
     let transcriptBuffer, lines;
@@ -3846,8 +3959,8 @@ async function capture(lib) {
             const rawUser = typeof um.content === 'string'
                 ? um.content
                 : Array.isArray(um.content) ? um.content.filter(part => part?.type === 'text' && typeof part.text === 'string').map(part => part.text).join('\n') : '';
-            const human = deriveIntentFromPrompt(rawUser);
-            if (human) lastUserPrompt = human.slice(0, 240);
+            const human = deriveIntentFromPrompt(rawUser, { keepLines: true });
+            if (human) lastUserPrompt = human.slice(0, WORK_ASK_MAX);   // 1.109: was 240 — a step list was cut inside step 1
             commitShasInEntry(e);
         }
         const text = textOf(e);
@@ -5231,6 +5344,10 @@ async function promptRetrieve(lib) {
             humanPrompt: true,
             transcriptBytes: transcriptSizeBytes(input.transcript_path),
             hostStatus: 'busy',
+            // 1.109: what it was ASKED, recorded NOW — not at Stop. A session
+            // killed during this reply never reaches Stop, and its task list is
+            // exactly what the next session needs (continuity test 2026-10-30).
+            work: { addAsk: { text: deriveIntentFromPrompt(prompt, { keepLines: true }) || humanText, at: Date.now() } },
         }
         : { activity: true, branch, hostStatus: 'busy' });
     // The git-diff fallback exists for TERSE HUMAN prompts ("go on") — a machine

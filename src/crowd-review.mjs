@@ -22,16 +22,40 @@ const evidenceStatusFor = (brainPath) => {
   };
 };
 
-/** brain_sync's crowd block: lineage of the context hits, open objections, an open pass. Never throws. */
+/**
+ * brain_sync's crowd block: lineage of the context hits, open objections, an
+ * open pass. `hitLineage` maps a context hit's id to the lineage line that
+ * rides ON that hit in structuredContent. Never throws.
+ */
 export async function crowdSyncText({ brainPath, sessionId, intent = '', files = [], hitIds = [] }) {
   try {
-    if (!brainPath || !fs.existsSync(brainPath)) return { text: '', data: null };
+    if (!brainPath || !fs.existsSync(brainPath)) return { text: '', data: null, hitLineage: {} };
     const { struct } = await parseKlypix(fs.readFileSync(brainPath));
-    const ids = new Set(hitIds);
-    const hitCards = struct.cards.filter((c) => ids.has(c.id));
+    const byId = new Map(struct.cards.map((c) => [c.id, c]));
+    // In the order the task context ranked them.
+    const hitCards = [...new Set(hitIds)].map((id) => byId.get(id)).filter(Boolean);
     const out = crowdSyncBlock(struct, { brainPath, sessionId, intent, files, hitCards, evidenceStatus: evidenceStatusFor(brainPath) });
-    return { text: out.text, data: Object.keys(out.data).length ? out.data : null };
-  } catch { return { text: '', data: null }; }
+    return { text: out.text, data: Object.keys(out.data).length ? out.data : null, hitLineage: out.hitLineage || {} };
+  } catch { return { text: '', data: null, hitLineage: {} }; }
+}
+
+// Crowd safeguards: a restated claim's lineage line rides ON the context hit
+// it belongs to (right after its text). Hosts that show the model only
+// structuredContent (Claude Code) never see the text block, so a line printed
+// only there never reached the agent (crowd bench round 1, 2026-10-30).
+export function withHitLineage(context, hitLineage) {
+  if (!context || !Array.isArray(context.hits) || !hitLineage || !Object.keys(hitLineage).length) return context;
+  return {
+    ...context,
+    hits: context.hits.map((h) => {
+      const line = h && hitLineage[h.id];
+      if (!line) return h;
+      const out = {};
+      for (const [k, v] of Object.entries(h)) { out[k] = v; if (k === 'text') out.lineage = line; }
+      if (!('lineage' in out)) out.lineage = line;
+      return out;
+    }),
+  };
 }
 
 export async function opBrainReview({ vault, canvas, action = 'status', topic = '', assessment = '', area = '', sessionId, via }) {

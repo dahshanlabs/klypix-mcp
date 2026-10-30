@@ -1604,8 +1604,9 @@ server.registerTool('brain_sync', {
   // independent pass. Never fails a sync.
   let crowdText = '';
   let crowdData = null;
+  let crowdHitLineage = {};
   if (phase !== 'complete' && include_context !== false && report.structured?.brain && (intent || files?.length)) {
-    ({ text: crowdText, data: crowdData } = await crowdReview.crowdSyncText({
+    ({ text: crowdText, data: crowdData, hitLineage: crowdHitLineage = {} } = await crowdReview.crowdSyncText({
       brainPath: report.structured.brain,
       sessionId: extra?.klypixRequestIdentity?.sessionId || mcpPresence.id,
       intent, files,
@@ -1718,7 +1719,7 @@ server.registerTool('brain_sync', {
       status: 'idle',
       phase: phase || 'checkpoint',
     }),
-    context: taskContext?.context || {
+    context: crowdReview.withHitLineage(taskContext?.context, crowdHitLineage) || {
       mode: 'not-requested',
       hits: [],
       sufficient: false,

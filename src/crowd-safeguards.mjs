@@ -328,6 +328,9 @@ export function withholdFilter(brainPath, sessionId) {
 }
 export const INDEPENDENT_LIMIT = 'KLYPIX withholds these only from what KLYPIX itself returns (brain_sync, brain_ask, brain_review). It cannot stop an agent from reading the brain file, git history, notes files or other sessions directly, so this records an independent first pass; it does not enforce one.';
 
+/** At most this many claim lineages per brain_sync (one line per restated claim). */
+export const SYNC_LINEAGE_MAX = 5;
+
 /** The text block brain_sync adds: lineage of relevant restated claims, open objections, an open independent pass. */
 export function crowdSyncBlock(struct, { brainPath, sessionId, intent = '', files = [], hitCards = [], evidenceStatus = null } = {}) {
   const parts = []; const data = {};
@@ -349,16 +352,43 @@ export function crowdSyncBlock(struct, { brainPath, sessionId, intent = '', file
   })());
   const seenIds = new Set();
   const candidates = [...hitCards, ...related].filter((c) => c && !seenIds.has(c.id) && seenIds.add(c.id) && (!filter || filter(c)));
-  const lin = lineagesFor(visible, candidates, { evidenceStatus }).slice(0, 3);
-  if (lin.length) { parts.push(lin.map(formatLineage).join('\n')); data.lineage = lin.map(({ memberIds, ...l }) => l); }
+  // Every restated claim among the task-context hits gets its lineage, hits
+  // first (lineagesFor keeps candidate order), at most SYNC_LINEAGE_MAX.
+  const lin = lineagesFor(visible, candidates, { evidenceStatus }).slice(0, SYNC_LINEAGE_MAX);
+  const hitLineage = {};
+  if (lin.length) {
+    const lines = lin.map(formatLineage);
+    parts.push(lines.join('\n'));
+    data.lineage = lin.map(({ memberIds, ...l }, i) => ({ ...l, line: lines[i] }));
+    // Per hit, for hosts that show the model only structuredContent (Claude
+    // Code does, and drops the text block): the first hit of a claim carries
+    // the whole line, the claim's other hits a short pointer to it.
+    const hitIds = hitCards.map((c) => c.id);
+    lin.forEach((l, i) => {
+      const members = new Set(l.memberIds);
+      const own = hitIds.filter((id) => members.has(id));
+      if (!own.length) return;
+      hitLineage[own[0]] = lines[i];
+      const rechecked = new Set(l.rechecks.map((r) => r.id));
+      for (const id of own.slice(1)) {
+        const role = rechecked.has(id) ? 'this card re-checked it'
+          : id === l.originId ? 'this card is its original, the one recorded source'
+            : 'this card restates it with no source of its own; it is not extra corroboration';
+        hitLineage[id] = `🧬 Same claim as ${own[0]}: ${role} (lineage on ${own[0]}).`;
+      }
+    });
+  }
   const all = openObjections(struct, { topic: intent, files });
   if (withholding) {
     const held = struct.cards.filter((c) => isLiveText(c) && isPeerOpinionOnTopic(c, pass.topic));
     parts.push(`🔒 Independent first pass open on "${pass.topic}": ${held.length} peer assessment/objection card${held.length === 1 ? '' : 's'} on this topic ${held.length === 1 ? 'is' : 'are'} withheld until you record your own with brain_review {action:"submit"}. Facts and decisions stay visible. ${INDEPENDENT_LIMIT}`);
     data.independent = { topic: pass.topic, withheld: held.length };
   } else if (all.length) {
-    parts.push(formatObjections(all));
+    const block = formatObjections(all);
+    parts.push(block);
     data.objections = all;
+    // The rule line, so a host that shows only structuredContent gets it too.
+    data.objectionsNote = block.split('\n').pop();
   }
-  return { text: parts.join('\n\n'), data };
+  return { text: parts.join('\n\n'), data, hitLineage };
 }

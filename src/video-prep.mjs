@@ -401,6 +401,10 @@ export async function prepareVideo(args = {}, deps = {}) {
   const language = /^[A-Za-z]{2,3}(-[A-Za-z0-9]{1,8})?$/.test(String(args.language || '')) ? String(args.language) : '';
   const signal = d.signal;
 
+  // A relative path is wrong on any PC: refuse it before asking for ffmpeg.
+  const looksLikeUrl = /^[a-z][a-z0-9+.-]*:\/\//i.test(source) && !/^[a-z]:[\\/]/i.test(source);
+  if (!looksLikeUrl && !path.isAbsolute(source)) return fail('Pass an ABSOLUTE path to the video file (or a public video link).', { reason: 'relative_path' });
+
   const ffmpeg = d.find('ffmpeg');
   const ffprobe = d.find('ffprobe');
   if (!ffmpeg || !ffprobe) {

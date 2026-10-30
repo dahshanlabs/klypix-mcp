@@ -203,10 +203,30 @@ const klypix = {
     // The dated history the notes file carries, as cards — a stale line goes
     // to Archive with its edge instead, so it is never duplicated.
     const history = (scenario.history || []).filter((line) => !staleTexts.has(line)).map((line) => ({ text: line.replace(/^- /, '') }));
+    if (typeof scenario.klypixBrain === 'function') {
+      // Crowd scenarios (scenarios-crowd.mjs): the brain is what the BUILD
+      // UNDER TEST makes of a history of brain_note calls, replayed through
+      // that build's own capture engine (supersede, resolve, its own text
+      // handling), with every KLYPIX file of the replay in the run's home.
+      fs.writeFileSync(brainPath, await buildKlypixMap({ title: 'brain', kind: 'brain', areas: [{ title: 'Project', cards: [{ text: 'Project brain started.' }] }] }));
+      const core = await import(pathToFileURL(path.join(path.dirname(klypixBin || KLYPIX_BIN), '..', 'src', 'klypix-core.mjs')).href);
+      const saved = { HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, KLYPIX_BRAIN_DIR: process.env.KLYPIX_BRAIN_DIR };
+      Object.assign(process.env, { HOME: home, USERPROFILE: home, KLYPIX_BRAIN_DIR: path.join(home, '.claude', 'project-brain') });
+      try {
+        const note = async (args) => {
+          const r = await core.opBrainNote({ vault: repo.dir, canvas: brainPath, via: 'claude-code', ...args });
+          if (r?.isError) throw new Error(`brain_note failed: ${r.blocks?.[0]?.text}`);
+          return r;
+        };
+        await scenario.klypixBrain({ repo, brainPath, note });
+      } finally {
+        for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+      }
+    }
     const areas = [{ title: 'Project', cards: written.length ? written.map((f) => ({ text: f.text })) : [{ text: 'Project brain started.' }] }];
     if (history.length) areas.push({ title: 'Log', cards: history });
     if (stale.length) areas.push({ title: 'Archive', cards: stale.map((f) => ({ text: `↩︎ superseded ${new Date().toISOString().slice(0, 10)}\n${f.staleLine.replace(/^- /, '')}` })) });
-    let buf = await buildKlypixMap({ title: 'brain', kind: 'brain', areas });
+    let buf = typeof scenario.klypixBrain === 'function' ? fs.readFileSync(brainPath) : await buildKlypixMap({ title: 'brain', kind: 'brain', areas });
     const edges = [];
     if (stale.length) {
       const { struct } = await parseKlypix(buf);

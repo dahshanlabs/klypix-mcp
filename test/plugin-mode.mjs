@@ -262,7 +262,7 @@ try {
       const byName = new Map(tools.map((t) => [t.name, t]));
       const drifted = snapshot.filter((t) => JSON.stringify(withoutAllowedAdditions(t.name, byName.get(t.name)?.inputSchema)) !== JSON.stringify(t.inputSchema)).map((t) => t.name);
       // show_in_klypix (P1) is app-only: Windows here (KLYPIX_APP_TOOLS is cleared by baseEnv).
-      const expectedTools = process.platform === 'win32' ? 28 : 27;   // + brain_handoff (1.99.0), brain_rules (1.107.0)
+      const expectedTools = process.platform === 'win32' ? 29 : 28;   // + brain_handoff (1.99.0), brain_rules (1.107.0), brain_review (crowd safeguards)
       ok(!byName.has('prepare_video'), 'plugin mode does not register prepare_video (no downloads, no external programs)');
       ok(tools.length === expectedTools && drifted.length === 0 && !byName.has('stub_only'),
         `stdio handshake on bin/klypix-mcp.mjs: ${expectedTools} tools, the 23 old schemas equal the 1.91.0 snapshot (drifted: ${drifted.join(', ') || 'none'})`);

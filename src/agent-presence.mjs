@@ -113,8 +113,50 @@ export function isProcessAlive(pid) {
   }
 }
 
+// ── Quick restart (round-4 fix, continuity test 2026-10-30) ─────────────────
+// The grace above made a session killed with its process tree (taskkill /T,
+// a crash, a closed terminal) read as LIVE for 90 s (Claude, host-declared
+// pid) or for the full TTL (Codex, guessed pid only). A new session started
+// 30 s after the kill saw a running peer, was told to leave its files alone,
+// and stood down. The rule below needs no grace because it does not trust one
+// pid: a row is stopped at once only when EVERY process that could still be
+// that session is provably gone on this machine —
+//   · the host itself: the host-declared pid (CLAUDE_PID / KLYPIX_HOST_PID),
+//     and/or `hostTreePid`, the process that launched KLYPIX's MCP supervisor
+//     (the host, or a wrapper the host keeps alive), recorded by the worker;
+//   · KLYPIX's own long-lived writer for the row: the MCP channel owner (an
+//     exact self-recorded pid, written on every heartbeat), on a fresh channel;
+//   · the row's hostPid whatever its source.
+// At least one host pid and the MCP owner are required, so a wrongly-declared
+// host pid (the case the grace guards) can never sweep a session whose MCP
+// worker is still running, and a row with only a lifecycle hook (no MCP
+// owner) or only guessed pids from an older build keeps today's rules.
+// "Cannot say" from any probe (null) keeps the row: a false "stopped" frees a
+// live session's files, which is worse than a false "live".
+// PARITY: global-brain-hook.mjs keeps a verbatim twin (isDeadHostTreeRow).
+export const DEAD_TREE_SETTLE_MS = 5 * 1000;
+const pidOf = (value) => { const n = Number(value); return Number.isInteger(n) && n > 0 ? n : null; };
+export function isDeadHostTreeRow(session, now = Date.now(), probe = isProcessAlive) {
+  if (!session || (session.via === 'cloud' || session.via === 'network')) return false;
+  if (!session.machine || String(session.machine) !== String(MACHINE_ID)) return false;
+  if (now - Number(session.lastSeen || 0) < DEAD_TREE_SETTLE_MS) return false;
+  const host = [];
+  if (String(session.hostPidSource || '') === 'env' && pidOf(session.hostPid)) host.push(pidOf(session.hostPid));
+  if (pidOf(session.hostTreePid)) host.push(pidOf(session.hostTreePid));
+  if (!host.length) return false;
+  const seen = session.channelSeen && typeof session.channelSeen === 'object' && !Array.isArray(session.channelSeen)
+    ? Number(session.channelSeen.mcp) : NaN;
+  if (!Number.isFinite(seen) || now - seen >= MCP_SESSION_FRESH_MS) return false;
+  const owner = pidOf(session.channelOwners && typeof session.channelOwners === 'object' ? session.channelOwners.mcp : null);
+  if (!owner) return false;
+  const pids = [...new Set([...host, owner, pidOf(session.hostPid)].filter(Boolean))];
+  if (pids.length < 2) return false;
+  return pids.every((pid) => probe(pid) === false);
+}
+
 export function isDeadHostRow(session, now = Date.now(), probe = isProcessAlive) {
   if (!session || (session.via === 'cloud' || session.via === 'network')) return false;
+  if (isDeadHostTreeRow(session, now, probe)) return true;
   if (String(session.hostPidSource || '') !== 'env') return false;
   if (!session.machine || String(session.machine) !== String(MACHINE_ID)) return false;
   if (now - Number(session.lastSeen || 0) < DEAD_HOST_GRACE_MS) return false;
@@ -649,6 +691,12 @@ export function normalizeWork(raw) {
   // 1.103.0: the card at handoffCardId was DRAFTED BY KLYPIX from this record
   // (the session never wrote one) — every renderer says so.
   if (raw.handoffAuto === true) out.handoffAuto = true;
+  // Round-4 fix: a hookless Codex session records no prompt; its asks (and
+  // last words) are recovered from its own rollout file once it has stopped.
+  // `asksSource` says so; `rolloutTriedAt` keeps a missing rollout from
+  // being searched for again on every listing.
+  if (raw.asksSource === 'codex-rollout') out.asksSource = 'codex-rollout';
+  if (ms(raw.rolloutTriedAt)) out.rolloutTriedAt = ms(raw.rolloutTriedAt);
   return Object.keys(out).length ? out : null;
 }
 export function mergeWork(previous, patch) {
@@ -1155,6 +1203,10 @@ export function upsertSession({
   cwd = null,
   hostPid = null,
   hostPidSource = null,
+  // The process that launched KLYPIX's MCP supervisor (round-4 fix): the host
+  // or a wrapper it keeps alive. Read only by isDeadHostTreeRow, together with
+  // the MCP owner; never identity.
+  hostTreePid = null,
   logicalSessionId = null,
   identitySource = null,
   aliases,
@@ -1314,6 +1366,7 @@ export function upsertSession({
       // Host-process correlation is diagnostic topology only. A desktop parent
       // can own many chats, so hostPid must never imply identity or deduping.
       hostPid: Number(hostPid) || previous.hostPid || null,
+      hostTreePid: pidOf(hostTreePid) || pidOf(previous.hostTreePid) || null,
       // Provenance of the pid decides what it may be used for: 'env' (declared
       // by the host itself, safe to liveness-probe) vs 'ppid' (a best-effort
       // parent guess, correlation only). ADDITIVE — absent means unknown, and
@@ -2100,6 +2153,7 @@ export function rotateEndedSessionIdentity({
   cwd = null,
   hostPid = null,
   hostPidSource = null,
+  hostTreePid = null,
   identitySource = 'mcp-request',
   home,
   now = Date.now(),
@@ -2158,6 +2212,7 @@ export function rotateEndedSessionIdentity({
       deliveryReachability: sessionDeliveryReachability({ channels: Object.keys(channelSeen), transport }),
       cwd: cwd ? path.resolve(cwd) : (existing?.cwd || path.dirname(brainPath)),
       hostPid: Number(hostPid) || existing?.hostPid || null,
+      hostTreePid: pidOf(hostTreePid) || pidOf(existing?.hostTreePid) || null,
       hostPidSource: (Number(hostPid) && hostPidSource) ? String(hostPidSource).slice(0, 16)
         : existing?.hostPidSource || null,
       logicalSessionId: toKey,
@@ -2204,6 +2259,7 @@ export function switchMcpSessionIdentity({
   cwd = null,
   hostPid = null,
   hostPidSource = null,
+  hostTreePid = null,
   identitySource = 'mcp-request',
   home,
   now = Date.now(),
@@ -2302,6 +2358,7 @@ export function switchMcpSessionIdentity({
       deliveryReachability: sessionDeliveryReachability({ channels: Object.keys(channelSeen), transport }),
       cwd: cwd ? path.resolve(cwd) : (existing?.cwd || path.dirname(brainPath)),
       hostPid: Number(hostPid) || existing?.hostPid || null,
+      hostTreePid: pidOf(hostTreePid) || pidOf(existing?.hostTreePid) || null,
       hostPidSource: (Number(hostPid) && hostPidSource) ? String(hostPidSource).slice(0, 16)
         : existing?.hostPidSource || null,
       logicalSessionId: toKey,
@@ -3196,6 +3253,8 @@ export function listUnfinishedWork({ brainPath, home, now = Date.now(), selfId =
       // 1.109: every prompt it was given (newest last, with line breaks) and
       // whether it was cut off mid-reply — "what is left" lives in these.
       asks: Array.isArray(work.asks) ? work.asks : (work.lastPrompt ? [{ text: work.lastPrompt }] : []),
+      asksSource: work.asksSource || null,
+      rolloutTriedAt: work.rolloutTriedAt || null,
       promptAt: work.promptAt || null,
       cutOff: workCutOff(work),
       lastWords: work.lastWords || '',

@@ -930,6 +930,9 @@ class Supervisor {
           // probes a guessed pid (see agent-presence.mjs isDeadHostRow).
           hostPid: this.parentPid,
           hostPidSource: 'ppid',
+          // Round-4 fix: who launched this supervisor — read by the lane's
+          // isDeadHostTreeRow only together with this supervisor's own pid.
+          hostTreePid: this.parentPid,
         });
         // Hibernation intentionally has no model-context consumer. Peek only:
         // a best-effort UI warning may wake the human, but the durable note stays
@@ -1178,6 +1181,10 @@ class Supervisor {
         ...process.env,
         KLYPIX_MCP_SUPERVISED: '1',
         KLYPIX_MCP_SUPERVISOR_PID: String(process.pid),
+        // Round-4 fix: the worker's own ppid is this supervisor, so it is told
+        // who launched the supervisor (the host, or its wrapper) for the lane's
+        // quick-restart liveness rule.
+        ...(this.parentPid && this.parentPid > 1 ? { KLYPIX_MCP_HOST_TREE_PID: String(this.parentPid) } : {}),
         KLYPIX_MCP_CONNECTION_ID: this.connectionId,
         // Pin the session id across a hibernation wake (KLYPIX_SESSION_ID wins
         // resolveMcpSessionId's precedence chain) so the woken worker adopts the

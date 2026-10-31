@@ -913,8 +913,32 @@ const isProcessAlive = (pid) => {
         return null;   // unrecognized error — "cannot say", never "dead" (TTL rules)
     }
 };
+// Quick restart (round-4 fix) — VERBATIM twin of agent-presence.mjs
+// isDeadHostTreeRow: stopped at once, with no grace, only when every process
+// that could still be the session is provably gone on this machine (a host pid
+// — declared, or the recorded hostTreePid — AND the fresh MCP channel's owner,
+// AND hostPid whatever its source). "Cannot say" keeps the row.
+const DEAD_TREE_SETTLE_MS = 5 * 1000;
+const pidOfRow = (v) => { const n = Number(v); return Number.isInteger(n) && n > 0 ? n : null; };
+const isDeadHostTreeRow = (s, now) => {
+    if (!s || (s.via === 'cloud' || s.via === 'network')) return false;
+    if (!s.machine || String(s.machine) !== MACHINE_ID) return false;
+    if (now - Number(s.lastSeen || 0) < DEAD_TREE_SETTLE_MS) return false;
+    const host = [];
+    if (String(s.hostPidSource || '') === 'env' && pidOfRow(s.hostPid)) host.push(pidOfRow(s.hostPid));
+    if (pidOfRow(s.hostTreePid)) host.push(pidOfRow(s.hostTreePid));
+    if (!host.length) return false;
+    const seen = s.channelSeen && typeof s.channelSeen === 'object' && !Array.isArray(s.channelSeen) ? Number(s.channelSeen.mcp) : NaN;
+    if (!Number.isFinite(seen) || now - seen >= MCP_SESSION_FRESH_MS) return false;
+    const owner = pidOfRow(s.channelOwners && typeof s.channelOwners === 'object' ? s.channelOwners.mcp : null);
+    if (!owner) return false;
+    const pids = [...new Set([...host, owner, pidOfRow(s.hostPid)].filter(Boolean))];
+    if (pids.length < 2) return false;
+    return pids.every(p => isProcessAlive(p) === false);
+};
 const isDeadHostRow = (s, now) => {
     if (!s || (s.via === 'cloud' || s.via === 'network')) return false;
+    if (isDeadHostTreeRow(s, now)) return true;
     if (String(s.hostPidSource || '') !== 'env') return false;
     if (!s.machine || String(s.machine) !== MACHINE_ID) return false;
     if (now - Number(s.lastSeen || 0) < DEAD_HOST_GRACE_MS) return false;
@@ -1672,6 +1696,17 @@ function unfinishedFooter(sid, { max = 4 } = {}) {
         return '\n\n' + lines.join('\n');
     } catch { return ''; }
 }
+// Round-4 fix: a stopped hookless Codex session records no prompt; its newest
+// prompts (and last words) are read from its own rollout file and stored in
+// the lane under the same redaction and size rules, before the footer below
+// reads the record. Same code as brain_sync (session-handoff.mjs); dynamic so
+// a stale flat deployment no-ops; never throws.
+async function recoverCodexAsks(sid) {
+    try {
+        const lib = await import(new URL('./session-handoff.mjs', import.meta.url).href);
+        if (typeof lib.recoverCodexRolloutRecords === 'function') lib.recoverCodexRolloutRecords({ brainPath: BRAIN, selfId: sid || '' });
+    } catch { /* courtesy */ }
+}
 // 📌 Lock notes (1.102.0, bench S5/S5b): a "do not touch" / hands-off / WIP
 // line in this project's AGENTS.md / CLAUDE.md, checked against the lane's
 // live sessions, local branches and uncommitted changes — at session start,
@@ -1704,8 +1739,10 @@ async function lockNotesFooter(sid, { budgetMs } = {}) {
 // Live projection (1.104.0, bench rounds 2–3): write the machine-local half of
 // the brain's state — who is live on this PC and what they hold, the work a
 // stopped session left, the evidence beside every keep-off note — into the
-// files the hosts load by themselves and never commit (CLAUDE.local.md and the
-// Codex global instructions file), at session start and at every Stop. The
+// project file Claude Code loads by itself and never commits (CLAUDE.local.md;
+// never the machine-wide Codex global file — round-4 fix: a project's section
+// there was read by Codex sessions in other projects), at session start and at
+// every Stop. The
 // inputs are the SAME strings this hook prints, so the file and the context
 // cannot disagree. Dynamic import so a stale flat deployment no-ops; never throws.
 async function writeLiveProjection(sid, { lockText = null, unfinishedText = null, budgetMs } = {}) {
@@ -5361,7 +5398,9 @@ async function promptRetrieve(lib) {
     // ⏸️ unfinished work (session handoff): only on a continue-shaped human
     // prompt — SessionStart already printed it once; 🤝 the deliberate-handoff
     // hint when the human asks for one or says the limit is near.
-    const unfinished = humanText !== null && CONTINUE_RE.test(humanText) ? unfinishedFooter(sid) : '';
+    const wantsUnfinished = humanText !== null && CONTINUE_RE.test(humanText);
+    if (wantsUnfinished) await recoverCodexAsks(sid);
+    const unfinished = wantsUnfinished ? unfinishedFooter(sid) : '';
     const handoffHint = humanText !== null ? handoffAskHint(humanText) : '';
     // ── Unified recall (1.87) — the bench-measured two-lane policy ──────────
     // Ported line-for-line from the 2026-09-28 "unified balanced" bench winner
@@ -6453,6 +6492,7 @@ async function read(lib) {
     // The full brief keeps its order.
     const messages = messageFooter(input.session_id || '', input.transcript_path, lib);
     const lockLine = await lockNotesFooter(input.session_id);
+    await recoverCodexAsks(input.session_id);
     const unfinishedLine = unfinishedFooter(input.session_id);
     const out = ultra + messages + lockLine + versionLine + presenceLine + shipObsLine + gitHookNotice + laneWarning + healLine + draftLine
         + receiptLine
@@ -6460,8 +6500,8 @@ async function read(lib) {
         + unfinishedLine
         + selfCheckFooter() + doctorFooter();
     process.stdout.write(out);
-    // The same lock / unfinished strings go into CLAUDE.local.md and the Codex
-    // global file for the NEXT session of any host (live projection).
+    // The same lock / unfinished strings go into CLAUDE.local.md for the NEXT
+    // session (live projection; never into a machine-wide global file).
     await writeLiveProjection(input.session_id, { lockText: lockLine, unfinishedText: unfinishedLine });
     // Heartbeat: prove the brief actually injected (and how big) so a dead or
     // stale live-copy of the hook stops being a silent no-op.

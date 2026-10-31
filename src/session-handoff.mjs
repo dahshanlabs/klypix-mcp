@@ -30,7 +30,7 @@ import path from 'path';
 import os from 'os';
 import crypto from 'crypto';
 import { HANDOFF_RE, handoffTitle, isOpenHandoffCard } from './klypix-format.mjs';
-import { sessionWorkIsRecent, normalizeModel, normalizeRole, rolesMatch } from './agent-presence.mjs';
+import { sessionWorkIsRecent, normalizeModel, normalizeRole, rolesMatch, listUnfinishedWork, stampSessionWork, normalizeAsks, redactSecretsInText, neutralizeMarkers } from './agent-presence.mjs';
 export { sessionWorkIsRecent };
 
 // A host-neutral, append-only evidence journal. The caller supplies observed
@@ -244,6 +244,87 @@ export function handoffTranscript(sessionId, client, { home = os.homedir(), maxB
     if (malformed || !turns.length) return { ...unknown(malformed ? 'Transcript has malformed or undated records' : 'No supported conversation turns found'), file };
     return { status: 'available', file, revision: digest.digest('hex'), turns, through: turns.reduce((latest, t) => Math.max(latest, t.at), 0) };
   } catch { return unknown('Transcript could not be read'); }
+}
+
+// ── A hookless Codex session's record, from its own rollout (round-4 fix) ──
+// Continuity test round 3 (2026-10-30): a Codex session with no lifecycle
+// hooks records only what it declared through brain_sync — an intent and
+// files — so when it stopped, the automatic unfinished-work block, the take
+// reply and the drafted card had no task list (Claude sessions that skipped
+// brain_handoff review renumbered the steps from the intent and git). Codex
+// writes every conversation to a rollout file under CODEX_HOME/sessions,
+// named after the thread id the lane stores. Once such a session has
+// stopped, its newest prompts are read from that file and stored in the lane
+// under the SAME rules as a hook-recorded prompt (normalizeAsks: newest 3,
+// 4,000 characters each, 8,000 total, line breaks kept, secrets redacted,
+// capture markers neutralized); its last assistant message becomes its last
+// words when it has none. The file is found by exact name only (the same
+// bounded walk as brain_handoff review), read with a smaller byte bound, and
+// a miss is not retried for ROLLOUT_RETRY_MS. Nothing is read for a session
+// that is still live, or that already has recorded prompts.
+export const ROLLOUT_READ_MAX_BYTES = 32 * 1024 * 1024;
+export const ROLLOUT_RETRY_MS = 10 * 60 * 1000;
+export const ROLLOUT_LAST_WORDS_MAX = 600;
+// Codex injects framework text as role "user": one message whose parts are
+// <recommended_plugins>…, "# AGENTS.md instructions for …<INSTRUCTIONS>…" and
+// <environment_context>… (Codex 0.153, round-4 evidence). The transcript
+// reader joins a message's parts, so each injected block is removed wherever
+// it starts a line; what is left (often nothing) is the human's prompt. Only
+// framework-shaped tags: an underscore name, INSTRUCTIONS, or "permissions
+// instructions" — never an HTML-like tag a person might type.
+const INJECTED_BLOCK_RES = [
+  /^# AGENTS\.md instructions for [^\n]*\n+<INSTRUCTIONS>[\s\S]*?<\/INSTRUCTIONS>[ \t]*\n?/gm,
+  /^<([a-z][a-z0-9]*_[a-z0-9_]+)(?:\s[^>\n]*)?>[\s\S]*?<\/\1>[ \t]*\n?/gm,
+  /^<(INSTRUCTIONS|permissions instructions)>[\s\S]*?<\/\1>[ \t]*\n?/gm,
+];
+export function stripInjectedCodexText(text) {
+  let out = String(text || '');
+  for (const re of INJECTED_BLOCK_RES) out = out.replace(re, '');
+  return out.trim();
+}
+export function codexRolloutWork(sessionId, { home = os.homedir(), transcript = handoffTranscript } = {}) {
+  let t;
+  try { t = transcript(sessionId, 'codex', { home, maxBytes: ROLLOUT_READ_MAX_BYTES, maxEntries: 6000 }); }
+  catch { return { status: 'unavailable', reason: 'Transcript could not be read' }; }
+  if (!t || t.status !== 'available') return { status: 'unavailable', reason: t?.reason || 'Transcript unavailable' };
+  const turns = (Array.isArray(t.turns) ? t.turns : [])
+    .map((x) => (x && x.role === 'user' ? { ...x, text: stripInjectedCodexText(x.text) } : x))
+    .filter((x) => x && String(x.text || '').trim());
+  const asks = normalizeAsks(turns.filter((x) => x.role === 'user').map((x) => ({ text: x.text, at: x.at })));
+  const last = [...turns].reverse().find((x) => x.role === 'assistant');
+  let lastWords = '';
+  if (last) {
+    const text = neutralizeMarkers(redactSecretsInText(String(last.text))).replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
+    lastWords = text.length > ROLLOUT_LAST_WORDS_MAX ? `…${text.slice(-(ROLLOUT_LAST_WORDS_MAX - 1))}` : text;
+  }
+  return { status: 'available', asks, lastWords, lastWordsAt: last?.at || null, file: t.file };
+}
+/** Stamp recovered asks onto stopped hookless Codex records. Sync, bounded, never throws. */
+export function recoverCodexRolloutRecords({ brainPath, home, codexUserHome = os.homedir(), now = Date.now(), selfId = '', sessionId = null, includeWorking = false, max = 3, transcript = handoffTranscript } = {}) {
+  const out = [];
+  if (!brainPath) return out;
+  let list = [];
+  try { list = listUnfinishedWork({ brainPath, home, now, selfId, includeWorking }); } catch { return out; }
+  const want = sessionId ? String(sessionId).toLowerCase() : '';
+  const targets = list.filter((r) => /codex/i.test(String(r.client || ''))
+    && !(Array.isArray(r.asks) && r.asks.length)
+    && (!want || String(r.id).toLowerCase() === want || (want.length >= 8 && String(r.id).toLowerCase().startsWith(want)))
+    && !(Number(r.rolloutTriedAt) > 0 && now - Number(r.rolloutTriedAt) < ROLLOUT_RETRY_MS));
+  for (const r of targets.slice(0, max)) {
+    const got = codexRolloutWork(r.id, { home: codexUserHome, transcript });
+    const patch = { rolloutTriedAt: now };
+    if (got.status === 'available' && got.asks.length) {
+      patch.asks = got.asks;
+      patch.lastPrompt = got.asks[got.asks.length - 1].text;
+      patch.asksSource = 'codex-rollout';
+      if (!r.lastWords && got.lastWords) { patch.lastWords = got.lastWords; if (got.lastWordsAt) patch.lastWordsAt = got.lastWordsAt; }
+    }
+    try {
+      const s = stampSessionWork({ brainPath, sessionId: r.id, patch, home, now });
+      out.push({ id: r.id, recovered: Boolean(patch.asks), asks: patch.asks ? patch.asks.length : 0, stamped: s.ok === true, reason: got.status === 'available' ? null : got.reason });
+    } catch { /* a courtesy: the record still lists without it */ }
+  }
+  return out;
 }
 
 export function inspectHandoffFreshness(h, { cursor = 0, revision, project, transcript = handoffTranscript(h.from?.sessionId, h.from?.client) } = {}) {

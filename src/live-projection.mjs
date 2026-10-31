@@ -11,20 +11,29 @@
 // LIVE half — which sessions are on this PC right now and what files they
 // hold, what work a stopped session left, and the evidence beside every
 // keep-off note — reached the agent only through hook output and brain_sync,
-// never through a file. This module writes that half into the two files the
-// hosts load by themselves and never commit:
+// never through a file. This module writes that half into the one
+// project-scoped file a host loads by itself and never commits:
 //
 //   • `CLAUDE.local.md` at the project root — Claude Code loads it beside
 //     CLAUDE.md ("personal project-specific preferences; add to .gitignore");
 //     its HTML comments are stripped before injection, so the markers cost
 //     nothing. KLYPIX keeps it out of git through `.git/info/exclude` (local
 //     to this clone, never a committed file).
-//   • the Codex global instructions file — `~/.codex/AGENTS.override.md` when
-//     the person has one, else `~/.codex/AGENTS.md`, the file klypix-mcp
-//     already manages. Codex loads the global file first, then one file per
-//     directory from the project root down, so a project-level override would
-//     HIDE the project's AGENTS.md: never written. One section per project,
-//     keyed by the project's path, pruned when stale.
+//
+// NOT the Codex global instructions file (round-4 fix, continuity test
+// 2026-10-30). 1.104–1.109 also wrote one section per project into
+// `~/.codex/AGENTS.md` (or AGENTS.override.md). That file is MACHINE-WIDE:
+// every Codex session in every project loads all of it, so a section written
+// for project A was read by Codex sessions in project B, and two of three
+// such sessions first tried to take project A's stopped session. Codex has
+// no project-scoped, uncommitted instruction file (a project-level
+// AGENTS.override.md would hide the project's AGENTS.md), so Codex gets the
+// live half where it is already project-scoped: brain_sync and, when
+// installed, the Codex hooks' output for its own cwd. Every write now REMOVES
+// the live sections earlier versions left in the global file
+// (cleanCodexGlobalLive); nothing project-specific is written there again.
+// The same rule holds for every other global, non-project instruction file
+// (~/.claude/CLAUDE.md, ~/.gemini/GEMINI.md, …): no live state, ever.
 //
 // CONTRACT. Snapshot semantics, said in the text: written at session start and
 // stop, not live, not shared, brain_sync is the live source. Bounded (budget
@@ -218,30 +227,48 @@ export function pruneLiveSections(raw, { keep = null, now = Date.now(), staleMs 
   return { text: next, dropped: drop.size };
 }
 
-export function writeCodexGlobal(projectDir, body, { now = Date.now(), home = os.homedir(), file = null } = {}) {
-  const root = path.resolve(projectDir);
-  const target = file || codexGlobalInstructionFile(home);
-  try {
-    const key = liveKey(root);
-    let raw = '';
-    try { raw = fs.readFileSync(target, 'utf8'); } catch { /* fresh */ }
-    const pruned = pruneLiveSections(raw, { keep: key, now });
-    const block = wrapLiveBlock(key, body, { at: now, projectDir: root });
-    const next = upsertLiveBlock(pruned.text, key, block);
-    if (stable(next) === stable(raw)) return { path: target, action: 'unchanged', dropped: pruned.dropped };
-    atomicWrite(target, next);
-    return { path: target, action: raw ? 'updated' : 'created', dropped: pruned.dropped };
-  } catch (e) {
-    return { path: target, action: 'failed', error: e?.message || String(e) };
+/**
+ * Remove every live section from the Codex global instruction files (both
+ * AGENTS.override.md and AGENTS.md: a person may add or drop an override at
+ * any time). Only the klypix-live blocks go; the person's text and the static
+ * klypix-codex managed block stay byte-for-byte. Never throws.
+ */
+export function cleanCodexGlobalLive({ home = os.homedir(), files = null } = {}) {
+  const dir = path.join(process.env.CODEX_HOME || path.join(home, '.codex'));
+  const targets = Array.isArray(files) && files.length ? files : [path.join(dir, 'AGENTS.override.md'), path.join(dir, 'AGENTS.md')];
+  const out = { action: 'unchanged', removed: 0, paths: [] };
+  for (const f of targets) {
+    try {
+      const raw = fs.readFileSync(f, 'utf8');
+      const n = listLiveSections(raw).length;
+      if (!n) continue;
+      atomicWrite(f, stripLiveBlocks(raw));
+      out.removed += n; out.paths.push(f); out.action = 'cleaned';
+    } catch (e) {
+      if (e?.code !== 'ENOENT') { out.action = out.action === 'cleaned' ? 'cleaned' : 'failed'; out.error = e?.message || String(e); }
+    }
   }
+  return out;
 }
 
-/** Both files, never throws. The caller supplies what the hook already computed. */
+/**
+ * Deprecated (round-4 fix): the Codex global file is machine-wide, so a
+ * project's live block there leaks into every other project. Kept as an
+ * export for callers built against 1.104–1.109; it never writes a block and
+ * only cleans up what those versions left.
+ */
+export function writeCodexGlobal(_projectDir, _body, { home = os.homedir(), file = null } = {}) {
+  const res = cleanCodexGlobalLive({ home, files: file ? [file] : null });
+  return { path: file || codexGlobalInstructionFile(home), action: res.action === 'cleaned' ? 'cleaned' : (res.action === 'failed' ? 'failed' : 'not-written'), removed: res.removed, ...(res.error ? { error: res.error } : {}) };
+}
+
+/** The project-scoped file, never throws. The caller supplies what the hook already computed. */
 export function projectLive({ projectDir, now = Date.now(), home = os.homedir(), version = '', peers = [], unfinishedText = '', lockNotesText = '', claudeFile = null, codexFile = null } = {}) {
   const body = renderLiveProjection({ projectDir, now, version, peers, unfinishedText, lockNotesText });
   return {
     claude: writeClaudeLocal(projectDir, body, { now, file: claudeFile }),
-    codex: writeCodexGlobal(projectDir, body, { now, home, file: codexFile }),
+    // Never a project's block in the machine-wide Codex file; leftovers removed.
+    codex: writeCodexGlobal(projectDir, body, { home, file: codexFile }),
     bytes: Buffer.byteLength(body),
   };
 }

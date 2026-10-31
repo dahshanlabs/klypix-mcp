@@ -47,7 +47,7 @@ import {
 } from './app-lease.mjs';
 import { LIMITS, assetBytes, dataUrlImage, fitImage, imageSkipReason, locateAsset, mb } from './card-files.mjs';
 import { findProjectBrain, neutralizeMarkers, postPresenceMessage, resolveMessageTarget, readReleaseLease, listActiveSessions, listKnownSessions, sessionStatusLabel, stampSessionWork, listUnfinishedWork, formatUnfinishedWork, formatCheckoutLines, formatAskLines, resumeCommandFor } from './agent-presence.mjs';
-import { normalizeHandoffInput, renderHandoffCard, handoffMachineField, parseHandoffCard, listOpenHandoffCards, formatHandoffCards, isHandoffLine1, HANDOFF_REASONS, clientWord as handoffClientWord, autoHandoffCandidates, draftHandoffFromWork, captureHandoffTurns, inspectHandoffFreshness, formatHandoffFreshness } from './session-handoff.mjs';
+import { normalizeHandoffInput, renderHandoffCard, handoffMachineField, parseHandoffCard, listOpenHandoffCards, formatHandoffCards, isHandoffLine1, HANDOFF_REASONS, clientWord as handoffClientWord, autoHandoffCandidates, draftHandoffFromWork, captureHandoffTurns, inspectHandoffFreshness, formatHandoffFreshness, recoverCodexRolloutRecords } from './session-handoff.mjs';
 import { collectRepoState, commitsInRange, makeContainmentProbe } from './repo-state.mjs';
 import { normalizeCrowdNote, lineagesFor, formatLineage, openObjections, formatObjections, withholdFilter, independentPass, isPeerOpinionOnTopic } from './crowd-safeguards.mjs';
 
@@ -2513,6 +2513,9 @@ export async function opBrainHandoff({ vault, canvas, action = 'write', from = {
     // is archived. Both are courtesies: neither can fail the list.
     let drafted = [];
     let closed = [];
+    // Round-4 fix: a stopped hookless Codex session's prompts come from its
+    // rollout BEFORE the list, the draft and the block read the record.
+    try { recoverCodexRolloutRecords({ brainPath: file, now, selfId: me.sessionId }); } catch { /* courtesy */ }
     if (autoDraft) { try { drafted = await autoDraftHandoffs({ vault, canvas: file, from: me, now }); } catch { drafted = []; } }
     let struct = null;
     try { ({ struct } = await parseKlypix(fs.readFileSync(file))); } catch (e) { return err(`brain_handoff list failed: ${e.message}`); }
@@ -2600,6 +2603,7 @@ export async function opBrainHandoff({ vault, canvas, action = 'write', from = {
     const stampLine = `${verb}: ${handoffClientWord(me.client)} ${me.sessionId.slice(0, 8)} · ${stamp(now)}${extraNote ? ` · ${extraNote}` : ''}`;
     // ── a lane record (automatic layer) ──
     if (!id && session) {
+      if (action === 'take') { try { recoverCodexRolloutRecords({ brainPath: file, now, sessionId: String(session), includeWorking: true, max: 1 }); } catch { /* courtesy */ } }
       const patch = action === 'take'
         ? { takenBy: { id: me.sessionId, client: me.client, at: now } }
         : { doneAt: now, doneBy: me.sessionId };

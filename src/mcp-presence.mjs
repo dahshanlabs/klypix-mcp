@@ -1335,6 +1335,14 @@ function clearResultClaimPending({ brainPath, sessionId, home }) {
 
 // The host-pid this server belongs to (Claude Code exports CLAUDE_PID to every
 // child process). Used for the hostmap rotation below and for twin recognition.
+export function resolveHostTreePid(env = process.env, ppid = process.ppid) {
+  if (String(env?.KLYPIX_MCP_SUPERVISED || '') === '1') {
+    const pid = Number(env?.KLYPIX_MCP_HOST_TREE_PID || 0);
+    return Number.isInteger(pid) && pid > 1 ? pid : null;
+  }
+  return Number.isInteger(ppid) && ppid > 1 ? ppid : null;
+}
+
 export function resolveHostPid(env = process.env) {
   const pid = Number(env?.CLAUDE_PID || env?.KLYPIX_HOST_PID || 0);
   return Number.isFinite(pid) && pid > 0 ? pid : null;
@@ -1470,9 +1478,24 @@ export function createMcpPresence({
   // safe to liveness-probe; a 'ppid' guess may be a transient wrapper, so the
   // dead-host sweep never probes it — correlation only. The hostmap path keeps
   // using ONLY the env pid (a guessed pid must never adopt a hostmap identity).
-  const laneHostPid = hostPid
-    || (Number.isInteger(process.ppid) && process.ppid > 0 ? process.ppid : null);
-  const laneHostPidSource = hostPid ? 'env' : (laneHostPid ? 'ppid' : null);
+  // Quick restart (round-4 fix): the process that launched KLYPIX's MCP
+  // supervisor — the host itself, or a wrapper the host keeps alive. A
+  // supervised worker is told it by its supervisor (its own ppid is the
+  // supervisor); an unsupervised one has it as its ppid. Read only by the
+  // lane's isDeadHostTreeRow, beside the MCP owner pid; never identity.
+  const laneHostTreePid = resolveHostTreePid(env);
+  // An env host pid that is NOT the process that launched this MCP server was
+  // inherited from further up (round-4 field case: Claude Code launched from
+  // a shell that already carried another Claude's CLAUDE_PID — Claude sets its
+  // own pid for its hooks but its MCP servers inherit the outer one). Writing
+  // it as host-declared would pin the row to a process that outlives the
+  // session, so the worker leaves the row's host pid to the lifecycle hook
+  // (which Claude gives the right one). A wrapper launch (cmd / npx) also
+  // differs; it loses nothing, because the hook writes the real pid.
+  const envHostPidTrusted = Boolean(hostPid) && (!laneHostTreePid || Number(hostPid) === Number(laneHostTreePid));
+  const laneHostPid = envHostPidTrusted ? hostPid
+    : (hostPid ? null : (Number.isInteger(process.ppid) && process.ppid > 0 ? process.ppid : null));
+  const laneHostPidSource = envHostPidTrusted ? 'env' : (laneHostPid ? 'ppid' : null);
   const effectiveInboxPollMs = Number(env?.KLYPIX_MCP_INBOX_POLL_MS)
     || Number(inboxPollMs)
     || MCP_INBOX_POLL_MS;
@@ -1906,6 +1929,7 @@ export function createMcpPresence({
           cwd: path.dirname(brainPath),
           hostPid: laneHostPid,
           hostPidSource: laneHostPidSource,
+          hostTreePid: laneHostTreePid,
           home,
           now: stamp,
           expectedPid: process.pid,
@@ -1958,6 +1982,7 @@ export function createMcpPresence({
             cwd: path.dirname(brainPath),
             hostPid: laneHostPid,
             hostPidSource: laneHostPidSource,
+            hostTreePid: laneHostTreePid,
             home,
             now: stamp,
             expectedPid: process.pid,
@@ -2194,6 +2219,7 @@ export function createMcpPresence({
       cwd: path.dirname(brainPath),
       hostPid: laneHostPid,
       hostPidSource: laneHostPidSource,
+      hostTreePid: laneHostTreePid,
       logicalSessionId,
       identitySource,
       home,

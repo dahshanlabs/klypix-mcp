@@ -37,7 +37,7 @@ delete process.env.CODEX_HOME;
 
 const { buildKlypixMap } = await import('../src/klypix-format.mjs');
 const { laneFileFor, listUnfinishedWork, formatUnfinishedWork, normalizeWork, WORK_ASK_MAX } = await import('../src/agent-presence.mjs');
-const { codexRolloutWork, recoverCodexRolloutRecords, handoffTranscript, ROLLOUT_RETRY_MS, autoHandoffCandidates } = await import('../src/session-handoff.mjs');
+const { codexRolloutWork, stripInjectedCodexText, recoverCodexRolloutRecords, handoffTranscript, ROLLOUT_RETRY_MS, autoHandoffCandidates } = await import('../src/session-handoff.mjs');
 const { opBrainHandoff } = await import('../src/klypix-core.mjs');
 
 let checks = 0;
@@ -67,6 +67,13 @@ const rollout = [
   msg(0, 'developer', '<permissions instructions>sandbox</permissions instructions>'),
   msg(0.1, 'user', '<recommended_plugins>\nHere is a list of plugins…\n</recommended_plugins>'),
   msg(0.2, 'user', '# AGENTS.md instructions for E:/x/project\n\n<INSTRUCTIONS>…</INSTRUCTIONS>'),
+  // Codex 0.153's real shape (round-4 evidence): ONE user message of three
+  // injected parts, which the transcript reader joins into one turn.
+  JSON.stringify({ timestamp: iso(0.3), type: 'response_item', payload: { type: 'message', role: 'user', content: [
+    { type: 'input_text', text: '<recommended_plugins>\nHere is a list of plugins that are available but not installed.\n- Dropbox\n</recommended_plugins>' },
+    { type: 'input_text', text: '# AGENTS.md instructions for E:\\x\\project\n\n<INSTRUCTIONS>\n<!-- klypix-codex:start -->\n## KLYPIX project brains\n<!-- klypix-codex:end -->\n</INSTRUCTIONS>' },
+    { type: 'input_text', text: '<environment_context>\n  <cwd>E:\\x\\project</cwd>\n</environment_context>' },
+  ] } }),
   msg(1, 'user', TASK),
   JSON.stringify({ timestamp: iso(1), type: 'event_msg', payload: { type: 'user_message', message: TASK } }),
   msg(2, 'assistant', 'I’ll check the project context, implement and test the MIME allowlist, then commit step 1.'),
@@ -104,7 +111,8 @@ try {
   ok(/\n3\. Add DELETE \/files\/:id/.test(a0) && /\n4\. Update CHANGELOG\.md/.test(a0) && direct.asks[1].text === TURN2, 'R1 the step list keeps its line breaks, oldest prompt first, the terse follow-up last', direct.asks);
   ok(!a0.includes('sk-ant-api03') && /api_key=<redacted>/.test(a0), 'R1 a key in the prompt is redacted (the #119 rule)', a0);
   ok(!/🧠 BRAIN/.test(a0), 'R1 a capture marker inside the prompt is neutralized', a0);
-  ok(!direct.asks.some((a) => /recommended_plugins|AGENTS\.md instructions|permissions instructions/.test(a.text)), 'R1 injected framework turns are not counted as prompts', direct.asks);
+  ok(!direct.asks.some((a) => /recommended_plugins|AGENTS\.md instructions|permissions instructions|environment_context|INSTRUCTIONS/.test(a.text)), 'R1 injected framework turns — also one message of several injected parts — are not counted as prompts', direct.asks);
+  ok(stripInjectedCodexText('<div>keep this</div>\nand this') === '<div>keep this</div>\nand this', 'R1 an HTML-like tag a person typed is not stripped');
   ok(/Starting step 2/.test(direct.lastWords) && direct.lastWordsAt === Date.parse(iso(11)), 'R1 its last assistant message becomes its last words', direct);
 
   // ── R2: the block, take and the drafted card ─────────────────────────────

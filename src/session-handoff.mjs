@@ -265,15 +265,31 @@ export function handoffTranscript(sessionId, client, { home = os.homedir(), maxB
 export const ROLLOUT_READ_MAX_BYTES = 32 * 1024 * 1024;
 export const ROLLOUT_RETRY_MS = 10 * 60 * 1000;
 export const ROLLOUT_LAST_WORDS_MAX = 600;
-// Codex injects framework turns as role "user" (<recommended_plugins>,
-// <user_instructions>, …): a turn that is one tagged block is not a prompt.
-const INJECTED_TURN_RE = /^<([a-z][a-z0-9_-]*)(?:\s[^>]*)?>[\s\S]*<\/\1>\s*$/i;
+// Codex injects framework text as role "user": one message whose parts are
+// <recommended_plugins>…, "# AGENTS.md instructions for …<INSTRUCTIONS>…" and
+// <environment_context>… (Codex 0.153, round-4 evidence). The transcript
+// reader joins a message's parts, so each injected block is removed wherever
+// it starts a line; what is left (often nothing) is the human's prompt. Only
+// framework-shaped tags: an underscore name, INSTRUCTIONS, or "permissions
+// instructions" — never an HTML-like tag a person might type.
+const INJECTED_BLOCK_RES = [
+  /^# AGENTS\.md instructions for [^\n]*\n+<INSTRUCTIONS>[\s\S]*?<\/INSTRUCTIONS>[ \t]*\n?/gm,
+  /^<([a-z][a-z0-9]*_[a-z0-9_]+)(?:\s[^>\n]*)?>[\s\S]*?<\/\1>[ \t]*\n?/gm,
+  /^<(INSTRUCTIONS|permissions instructions)>[\s\S]*?<\/\1>[ \t]*\n?/gm,
+];
+export function stripInjectedCodexText(text) {
+  let out = String(text || '');
+  for (const re of INJECTED_BLOCK_RES) out = out.replace(re, '');
+  return out.trim();
+}
 export function codexRolloutWork(sessionId, { home = os.homedir(), transcript = handoffTranscript } = {}) {
   let t;
   try { t = transcript(sessionId, 'codex', { home, maxBytes: ROLLOUT_READ_MAX_BYTES, maxEntries: 6000 }); }
   catch { return { status: 'unavailable', reason: 'Transcript could not be read' }; }
   if (!t || t.status !== 'available') return { status: 'unavailable', reason: t?.reason || 'Transcript unavailable' };
-  const turns = (Array.isArray(t.turns) ? t.turns : []).filter((x) => x && String(x.text || '').trim() && !INJECTED_TURN_RE.test(String(x.text).trim()));
+  const turns = (Array.isArray(t.turns) ? t.turns : [])
+    .map((x) => (x && x.role === 'user' ? { ...x, text: stripInjectedCodexText(x.text) } : x))
+    .filter((x) => x && String(x.text || '').trim());
   const asks = normalizeAsks(turns.filter((x) => x.role === 'user').map((x) => ({ text: x.text, at: x.at })));
   const last = [...turns].reverse().find((x) => x.role === 'assistant');
   let lastWords = '';

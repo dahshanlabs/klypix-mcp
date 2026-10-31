@@ -9,17 +9,20 @@
 //      evidence survives the budget first; "nothing live" is said, not omitted.
 //   B. FILES — CLAUDE.local.md gets the block (replaced in place, appended to a
 //      person's own content, never duplicated), the clone excludes it from git
-//      through .git/info/exclude (never a committed file), and the Codex global
-//      file gets one section per project — AGENTS.override.md when it exists,
-//      else AGENTS.md — with stale or surplus projects' sections pruned.
+//      through .git/info/exclude (never a committed file). The machine-wide
+//      Codex global file (AGENTS.override.md / AGENTS.md) gets NO project's
+//      block (round-4 fix: it leaked into Codex sessions in other projects);
+//      sections earlier versions left there are removed, the person's text and
+//      the static managed block are kept byte for byte.
 //   C. QUIET — the same content is not rewritten (the time stamp alone never
 //      causes a write); a different content is.
 //   D. SURFACES — the Claude SessionStart and Stop hooks and the Codex
-//      SessionStart and Stop hooks all write both files, and what they write
-//      is what they printed (the 📌 verdict, the peer).
-//   E. REMOVAL — unlink strips the project's block from both files, deletes
-//      CLAUDE.local.md only when nothing else is in it, and leaves other
-//      projects' sections in the Codex file alone.
+//      SessionStart and Stop hooks all write CLAUDE.local.md, and what they
+//      write is what they printed (the 📌 verdict, the peer); none writes the
+//      Codex global file.
+//   E. REMOVAL — unlink strips the project's block (and any leftover section
+//      in the Codex file), deletes CLAUDE.local.md only when nothing else is
+//      in it, and leaves other projects' leftovers alone.
 //
 // Run:  node test/live-projection.mjs        (exit 0 = pass, 1 = fail)
 import assert from 'node:assert/strict';
@@ -98,15 +101,16 @@ try {
     const codexFile = path.join(home, '.codex', 'AGENTS.md');
     const t0 = 1760000000000;
     const first = projectLive({ projectDir: r.dir, now: t0, home, peers: [{ id: 'peer0001-aaaa', client: 'claude-code', intent: 'Docs' }], lockNotesText: '📌 x\n  → lib/ledger.js: NO WORK FOUND', unfinishedText: '' });
-    ok(first.claude.action === 'created' && first.codex.action === 'created' && hasLiveBlock(read(path.join(r.dir, 'CLAUDE.local.md')), r.dir) && hasLiveBlock(read(codexFile), r.dir), 'B1 both files are created with this project\'s block');
+    ok(first.claude.action === 'created' && first.codex.action === 'not-written' && hasLiveBlock(read(path.join(r.dir, 'CLAUDE.local.md')), r.dir) && !hasLiveBlock(read(codexFile) || '', r.dir), 'B1 CLAUDE.local.md is created with this project\'s block; the machine-wide Codex file is not written');
     ok(['excluded', 'already-excluded', 'already-ignored'].includes(first.claude.excluded) && read(path.join(r.dir, '.git', 'info', 'exclude')).includes('CLAUDE.local.md'), 'B2 the clone excludes CLAUDE.local.md through .git/info/exclude');
     ok(!r.git(['status', '--porcelain']).split('\n').some((l) => l.includes('CLAUDE.local.md')), 'B3 git status does not list it');
     ok(ensureLocalExcluded(r.dir) === 'already-ignored' || ensureLocalExcluded(r.dir) === 'already-excluded', 'B4 a second exclude is a no-op');
-    const stampA = read(codexFile).match(/ at=([^ ]+)/)[1];
+    const localFile = path.join(r.dir, 'CLAUDE.local.md');
+    const stampA = read(localFile).match(/ at=([^ ]+)/)[1];
     const again = projectLive({ projectDir: r.dir, now: t0 + 600000, home, peers: [{ id: 'peer0001-aaaa', client: 'claude-code', intent: 'Docs' }], lockNotesText: '📌 x\n  → lib/ledger.js: NO WORK FOUND', unfinishedText: '' });
-    ok(again.claude.action === 'unchanged' && again.codex.action === 'unchanged' && read(codexFile).match(/ at=([^ ]+)/)[1] === stampA, 'C1 the same content ten minutes later is not rewritten — the stamp alone never causes a write');
+    ok(again.claude.action === 'unchanged' && read(localFile).match(/ at=([^ ]+)/)[1] === stampA, 'C1 the same content ten minutes later is not rewritten — the stamp alone never causes a write');
     const changed = projectLive({ projectDir: r.dir, now: t0 + 600000, home, peers: [], lockNotesText: '📌 x\n  → lib/ledger.js: IN USE — live session Codex 01234567', unfinishedText: '' });
-    ok(changed.claude.action === 'updated' && changed.codex.action === 'updated' && read(codexFile).includes('IN USE') && !read(codexFile).includes('NO WORK FOUND'), 'C2 a changed verdict rewrites both files in place');
+    ok(changed.claude.action === 'updated' && read(localFile).includes('IN USE') && !read(localFile).includes('NO WORK FOUND'), 'C2 a changed verdict rewrites the file in place');
     // A person's own CLAUDE.local.md keeps its content.
     const r2 = makeRepo('own-local');
     r2.write('CLAUDE.local.md', '# My sandbox\n- staging URL: http://localhost:9999\n');
@@ -114,24 +118,29 @@ try {
     projectLive({ projectDir: r2.dir, now: t0, home });
     const own = read(path.join(r2.dir, 'CLAUDE.local.md'));
     ok(own.startsWith('# My sandbox\n- staging URL: http://localhost:9999\n') && hasLiveBlock(own, r2.dir), 'B5 a person\'s own CLAUDE.local.md keeps its lines; the block is added after them');
-    // The Codex global file holds one section per project, pruned when stale or surplus.
-    const sections = listLiveSections(read(codexFile));
-    ok(sections.length === 2 && sections.every((s) => s.project) && new Set(sections.map((s) => s.key)).size === 2, 'B6 the Codex global file carries one section per project, each naming its path');
-    const stale = wrapLiveBlock('0000000000000001', 'old', { at: t0 - 2 * 24 * 3600 * 1000, projectDir: path.join(root, 'gone') });
-    fs.writeFileSync(codexFile, read(codexFile) + '\n' + stale + '\n');
-    projectLive({ projectDir: r.dir, now: t0 + 700000, home, peers: [{ id: 'x1', client: 'codex' }] });
-    ok(!read(codexFile).includes('key=0000000000000001') && listLiveSections(read(codexFile)).length === 2, 'B7 a section older than a day from another project is pruned on the next write');
-    let crowded = read(codexFile);
+    // Round-4 fix: the machine-wide Codex file never carries a project's block.
+    // What 1.104–1.109 left there (one section per project) is removed on the
+    // next write; the person's text and the static managed block stay.
+    const personal = '# my codex rules\n- prefer pnpm\n\n<!-- klypix-codex:start (managed by klypix-mcp) -->\n## KLYPIX project brains\ncall brain_sync\n<!-- klypix-codex:end -->\n';
+    const leftovers = [r.dir, r2.dir, path.join(root, 'gone')].map((d, i) => wrapLiveBlock(liveKey(d), `old ${i}`, { at: t0 - i * 1000, projectDir: d })).join('\n\n');
+    fs.writeFileSync(codexFile, personal + '\n' + leftovers + '\n');
+    ok(listLiveSections(read(codexFile)).length === 3, 'B6 setup: a global file as 1.104–1.109 left it (three projects\' sections)');
+    const cleaned = projectLive({ projectDir: r.dir, now: t0 + 700000, home, peers: [{ id: 'x1', client: 'codex' }] });
+    ok(cleaned.codex.action === 'cleaned' && cleaned.codex.removed === 3 && listLiveSections(read(codexFile)).length === 0, 'B6 the next write removes every project\'s section from the machine-wide file, not only its own');
+    ok(read(codexFile) === personal, 'B7 the person\'s text and the static klypix-codex block are kept byte for byte');
+    ok(projectLive({ projectDir: r.dir, now: t0 + 800000, home }).codex.action === 'not-written' && read(codexFile) === personal, 'B7 a later write leaves the cleaned file untouched');
+    let crowded = '';
     for (let i = 2; i < 12; i++) crowded += '\n' + wrapLiveBlock(`00000000000000${String(i).padStart(2, '0')}`, `p${i}`, { at: t0 + i * 1000, projectDir: path.join(root, `p${i}`) }) + '\n';
-    const pruned = pruneLiveSections(crowded, { keep: liveKey(r.dir), now: t0 + 800000 });
+    const pruned = pruneLiveSections(crowded, { keep: null, now: t0 + 800000 });
     const left = listLiveSections(pruned.text);
-    ok(left.length === 8 && left.some((s) => s.key === liveKey(r.dir)) && !left.some((s) => s.key === '0000000000000002'), 'B8 beyond the cap the oldest other sections go first; the writing project always stays');
+    ok(left.length === 8 && !left.some((s) => s.key === '0000000000000002'), 'B8 (pure helper, kept for callers) beyond the cap the oldest sections go first');
     // AGENTS.override.md wins when the person has one (Codex loads only that file globally).
     const override = path.join(home, '.codex', 'AGENTS.override.md');
     fs.writeFileSync(override, '# my codex rules\n');
     ok(codexGlobalInstructionFile(home) === override, 'B9 with an override file present, that is the Codex global file');
+    fs.writeFileSync(override, '# my codex rules\n\n' + wrapLiveBlock(liveKey(r.dir), 'left by 1.109', { at: t0, projectDir: r.dir }) + '\n');
     const w = writeCodexGlobal(r.dir, 'ov', { now: t0, home });
-    ok(w.path === override && hasLiveBlock(read(override), r.dir) && read(override).startsWith('# my codex rules\n'), 'B10 the section goes into the override file, after the person\'s rules');
+    ok(w.path === override && w.action === 'cleaned' && !hasLiveBlock(read(override), r.dir) && read(override).startsWith('# my codex rules'), 'B10 the deprecated writer never adds a section to the override file; it removes the one an older version left');
     fs.unlinkSync(override);
     // A failed write is an action word, never a throw.
     const bad = writeClaudeLocal(r.dir, 'body', { file: path.join(r.dir, 'no-such-dir', 'x', 'CLAUDE.local.md') + path.sep });
@@ -156,7 +165,7 @@ try {
     ok(start.includes('lib/ledger.js: NO WORK FOUND'), 'D0 the Claude SessionStart hook printed the 📌 verdict (precondition)');
     const localText = read(local);
     ok(localText && hasLiveBlock(localText, r.dir) && localText.includes('lib/ledger.js: NO WORK FOUND') && localText.includes('Codex peer-liv') && localText.includes('lib/invoice.js'), 'D1 Claude SessionStart wrote CLAUDE.local.md with the same verdict and the live peer');
-    ok(read(codexFile) && hasLiveBlock(read(codexFile), r.dir) && read(codexFile).includes('lib/ledger.js: NO WORK FOUND'), 'D2 …and the Codex global file');
+    ok(!hasLiveBlock(read(codexFile) || '', r.dir) && !(read(codexFile) || '').includes('lib/ledger.js'), 'D2 …and nothing of it reaches the machine-wide Codex file');
     ok(!r.git(['status', '--porcelain']).split('\n').some((l) => l.includes('CLAUDE.local.md')), 'D3 the clone does not show CLAUDE.local.md as untracked');
     // Stop: the hook's --capture path refreshes it too (no transcript needed for the projection).
     fs.unlinkSync(local);
@@ -165,11 +174,11 @@ try {
     // Codex hooks.
     const workerEnv = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(CLAUDE|CODEX|KLYPIX)/.test(k)));
     fs.unlinkSync(local);
-    fs.unlinkSync(codexFile);
+    try { fs.unlinkSync(codexFile); } catch { /* never written */ }
     const cx = execFileSync(process.execPath, [CODEX_HOOK], { cwd: r.dir, env: { ...workerEnv, HOME: home, USERPROFILE: home }, encoding: 'utf8', input: JSON.stringify({ cwd: r.dir, session_id: 'live-codex-0002', hook_event_name: 'SessionStart' }) });
     const cxText = (() => { try { const o = JSON.parse(cx || '{}'); return o.hookSpecificOutput?.additionalContext || o.systemMessage || ''; } catch { return ''; } })();
     ok(cxText.includes('lib/ledger.js: NO WORK FOUND'), 'D5 the Codex SessionStart hook printed the 📌 verdict (precondition)');
-    ok(hasLiveBlock(read(local) || '', r.dir) && read(local).includes('lib/ledger.js: NO WORK FOUND') && hasLiveBlock(read(codexFile) || '', r.dir), 'D6 Codex SessionStart wrote both files with the same verdict');
+    ok(hasLiveBlock(read(local) || '', r.dir) && read(local).includes('lib/ledger.js: NO WORK FOUND') && !hasLiveBlock(read(codexFile) || '', r.dir), 'D6 Codex SessionStart wrote CLAUDE.local.md with the same verdict, and not the machine-wide Codex file');
     fs.unlinkSync(local);
     execFileSync(process.execPath, [CODEX_HOOK], { cwd: r.dir, env: { ...workerEnv, HOME: home, USERPROFILE: home }, encoding: 'utf8', input: JSON.stringify({ cwd: r.dir, session_id: 'live-codex-0002', hook_event_name: 'Stop', last_assistant_message: 'Done for now.' }) });
     ok(hasLiveBlock(read(local) || '', r.dir), 'D7 the Codex Stop hook writes it again');
@@ -186,6 +195,8 @@ try {
     const codexFile = path.join(home, '.codex', 'AGENTS.md');
     projectLive({ projectDir: r.dir, now: Date.now(), home });
     projectLive({ projectDir: other.dir, now: Date.now(), home });
+    // Leftovers an older version wrote into the Codex file, for both projects.
+    fs.writeFileSync(codexFile, [r.dir, other.dir].map((d) => wrapLiveBlock(liveKey(d), 'old', { at: Date.now(), projectDir: d })).join('\n\n') + '\n');
     const res = removeLiveProjection(r.dir, { home });
     ok(res.claude === 'file-removed' && !fs.existsSync(path.join(r.dir, 'CLAUDE.local.md')), 'E1 unlink deletes CLAUDE.local.md when the block was all it held');
     ok(res.codex === 'section-removed' && !hasLiveBlock(read(codexFile), r.dir) && hasLiveBlock(read(codexFile), other.dir), 'E2 …and strips only this project\'s section from the Codex file');
@@ -196,6 +207,7 @@ try {
     // The uninstaller's project plan knows the block. The uninstaller resolves
     // the Codex home itself (CODEX_HOME, else ~/.codex), so point it at ours.
     projectLive({ projectDir: r.dir, now: Date.now(), home });
+    fs.writeFileSync(codexFile, wrapLiveBlock(liveKey(r.dir), 'old', { at: Date.now(), projectDir: r.dir }) + '\n');
     const plan = planUnlink(r.dir);
     const item = plan.items.find((i) => i.rel === 'CLAUDE.local.md');
     ok(item && item.kind === 'live-block' && item.action === 'strip-block', 'E4 planUnlink lists the live block as a strip, never a blind delete');

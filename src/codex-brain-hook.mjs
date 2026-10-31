@@ -22,6 +22,7 @@ import {
 } from './agent-presence.mjs';
 import { recordCodexHookExecution } from './codex-hooks.mjs';
 import { opBrainTaskContext } from './klypix-core.mjs';
+import { recoverCodexRolloutRecords } from './session-handoff.mjs';
 // Namespace import (already in-process via the klypix-core chain, so zero added
 // load cost) so a bundle whose klypix-format predates classifyDecay degrades
 // gracefully — a named import of a missing export would kill the whole hook.
@@ -465,6 +466,8 @@ const CONTINUE_PROMPT_RE = /\b(continue|resume|pick (it |this |that )?up|carry o
 const HANDOFF_ASK_PROMPT_RE = /\b(hand[- ]?off|hand (it|this|the work) (over|off)|before (we|i|you) (hit|reach|approach|run out of) (the )?(limit|context|window|quota)|(context|usage|token|rate) (limit|window|quota)|out of context|switch(ing)? to (claude|another (agent|session|tool)))\b/i;
 const CODEX_HANDOFF_HINT = '🤝 KLYPIX: to hand this session\'s work to the next one (any agent — Claude Code or Codex), call brain_handoff with the task, what is done, what is next, the files and how to verify; the next session on this project sees it at its first brain_sync and takes it with {action:"take"}. Your last reply and commits are recorded automatically at each turn end regardless — but a deliberate handoff says what you know. Never make the human paste a summary into the next session.';
 function unfinishedWorkBlock(brainPath, sessionId) {
+  // Round-4 fix: a stopped hookless Codex session's prompts, from its rollout.
+  try { recoverCodexRolloutRecords({ brainPath, selfId: sessionId }); } catch { /* courtesy */ }
   try {
     return formatUnfinishedWork(listUnfinishedWork({ brainPath, selfId: sessionId }));
   } catch {
@@ -495,8 +498,9 @@ async function lockNotesBlock(projectDir, brainPath, sessionId, sessions, { budg
 }
 
 // Live projection (1.104.0): the same presence / unfinished / keep-off strings
-// this hook emits, written into CLAUDE.local.md and the Codex global
-// instructions file for the NEXT session of any host (session start and Stop).
+// this hook emits, written into CLAUDE.local.md for the NEXT session (session
+// start and Stop). Never into the machine-wide Codex global file (round-4 fix:
+// a project's section there leaked into Codex sessions in other projects).
 // Dynamic import so a stale deployment no-ops; never throws.
 async function projectLiveSafe({ projectDir, sessions, sessionId, lockNotes = '', unfinished = '' }) {
   try {

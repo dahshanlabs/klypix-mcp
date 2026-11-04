@@ -873,6 +873,38 @@ receives the waiting note at its first action and the sender sees the receipt as
   waiting for them; `npx klypix-mcp sessions reopen <id>` reopens one (`--quiet` lets it wait for
   you instead of starting on the note).
 
+#### Assign work without copying prompts
+
+When the person asks Claude to give Codex a task (or the reverse), the sender saves
+the assignment before replying, even if it will keep working on something else:
+
+```js
+brain_handoff({
+  action: "write", reason: "assignment", for: "Codex",
+  project: "/absolute/project", title: "Check the pronunciation evidence",
+  task: "Verify the examples against public audio.",
+  instructions: "The complete brief, including constraints, output paths and acceptance criteria.",
+  next: ["Read the brief.", "Verify and report the evidence."],
+  files: ["outputs/evidence.md"], verify: "Every verified example has a source and timestamp."
+})
+```
+
+`instructions` is required for an assignment and preserves Unicode and newlines,
+up to 24,000 characters; larger input is refused rather than truncated. The tool
+returns the saved card's ID. The sender can notify a known same-project session
+with `brain_message` and that ID. Saving a card or sending a note does not launch
+or wake an agent.
+
+The recipient calls `brain_sync` with the same project root. Cards addressed to
+its client or declared role appear first. It can use `brain_handoff {action:"list",
+for:"Codex"}`, then `{action:"read", id}` to retrieve the full brief and
+`{action:"take", id}` to claim it. Completion uses `{action:"done", id}`.
+These actions affect only the assignment, leaving the sender's separate work
+active. A visible edit to the saved Instructions section must be reconciled with
+the exact brief before it can be read or taken; it is never silently ignored.
+Replace an assignment with another assignment using `continues` and notify its
+recipient of the new ID.
+
 #### Session handoff — continue in the next session, with any agent
 
 The case this exists for: a Claude Code session stops at its usage limit in the middle of a task,

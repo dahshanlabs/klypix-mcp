@@ -47,7 +47,7 @@ import {
 } from './app-lease.mjs';
 import { LIMITS, assetBytes, dataUrlImage, fitImage, imageSkipReason, locateAsset, mb } from './card-files.mjs';
 import { findProjectBrain, neutralizeMarkers, postPresenceMessage, resolveMessageTarget, readReleaseLease, listActiveSessions, listKnownSessions, sessionStatusLabel, stampSessionWork, listUnfinishedWork, formatUnfinishedWork, formatCheckoutLines, formatAskLines, resumeCommandFor } from './agent-presence.mjs';
-import { normalizeHandoffInput, renderHandoffCard, handoffMachineField, parseHandoffCard, listOpenHandoffCards, formatHandoffCards, isHandoffLine1, HANDOFF_REASONS, clientWord as handoffClientWord, autoHandoffCandidates, draftHandoffFromWork, captureHandoffTurns, inspectHandoffFreshness, formatHandoffFreshness, recoverCodexRolloutRecords } from './session-handoff.mjs';
+import { normalizeHandoffInput, renderHandoffCard, handoffMachineField, parseHandoffCard, assignmentInstructionsDigest, listOpenHandoffCards, formatHandoffCards, isHandoffLine1, HANDOFF_REASONS, clientWord as handoffClientWord, autoHandoffCandidates, draftHandoffFromWork, captureHandoffTurns, inspectHandoffFreshness, formatHandoffFreshness, recoverCodexRolloutRecords } from './session-handoff.mjs';
 import { collectRepoState, commitsInRange, makeContainmentProbe } from './repo-state.mjs';
 import { normalizeCrowdNote, lineagesFor, formatLineage, openObjections, formatObjections, withholdFilter, independentPass, isPeerOpinionOnTopic } from './crowd-safeguards.mjs';
 
@@ -2091,7 +2091,7 @@ function takeRuleSuffix(noteText) {
 // open file any agent reads AND writes": a hookless client (Cursor/Cline/Desktop)
 // can now record a decision, ask an open question, mark a milestone, resolve a card,
 // or correct one — with the full lifecycle, not just a flat append.
-export async function opBrainNote({ vault, canvas, text: noteText, area, marker = '', closes, via, evidence, verify, guard = null, rule = '', enrichmentQuestion = '', capturedBy = null }) {
+export async function opBrainNote({ vault, canvas, text: noteText, area, marker = '', closes, via, evidence, verify, guard = null, rule = '', enrichmentQuestion = '', capturedBy = null, captureIds = false }) {
   const t = brainTarget(vault, canvas);
   if (t.ambiguous) return ambiguousBrainErr(t.ambiguous);
   if (!t.file) return err(`No brain found — looked for ./brain.klypix in the project, then ${vault}. Pass canvas: "<name>".`);
@@ -2153,8 +2153,13 @@ export async function opBrainNote({ vault, canvas, text: noteText, area, marker 
     }
   }
   try {
-    const res = await captureIntoBrain(fs.readFileSync(file), input);
+    const before = fs.readFileSync(file);
+    const previousIds = captureIds ? new Set((await parseKlypix(before)).struct.cards.map(c => c.id)) : null;
+    const res = await captureIntoBrain(before, input);
     let out = res.buffer; try { out = (await tidyBrain(res.buffer)).buffer; } catch { /* keep append result if tidy fails */ }
+    // Resolve creation identity while holding the same lock as the capture.
+    // A later title-based search can select a concurrent writer's card.
+    const createdCardIds = previousIds ? (await parseKlypix(out)).struct.cards.filter(c => c.type !== 'container' && !previousIds.has(c.id)).map(c => c.id) : null;
     await atomicWrite(file, out);
     if (pendingShips.length) clearPendingShips(projectDir, shipQueue);   // durable now — safe to consume
     // Question enrichment (1.77): the caller session's declared intent is the
@@ -2224,7 +2229,7 @@ export async function opBrainNote({ vault, canvas, text: noteText, area, marker 
     try {
       if (guardField || fs.existsSync(guardSidecarPathFor(file))) await ensureGuardSidecar(file);
     } catch { /* best-effort — the hook's currency check is the backstop */ }
-    return { blocks: [text(`✓ brain_note → ${path.basename(file)} (via ${t.how}) · ${bits.join(' · ')}. It appears in the brain if it is open in KLYPIX (inside OneDrive or Dropbox, when you next open it).${corr}${rc}`)] };
+    return { blocks: [text(`✓ brain_note → ${path.basename(file)} (via ${t.how}) · ${bits.join(' · ')}. It appears in the brain if it is open in KLYPIX (inside OneDrive or Dropbox, when you next open it).${corr}${rc}`)], ...(createdCardIds ? { structured: { createdCardIds } } : {}) };
   } catch (e) {
     return err(`brain_note failed (brain unchanged): ${e.message}`);
   }
@@ -2453,6 +2458,32 @@ export async function opBrainHandoff({ vault, canvas, action = 'write', from = {
   const stamp = (ms) => { try { return new Date(ms).toISOString().slice(0, 16).replace('T', ' ') + ' UTC'; } catch { return ''; } };
   const reply = (textOut, extra = {}, isError = false) => ({ blocks: [text(textOut)], structured: { schemaVersion: 1, action, brain: file, ...extra }, ...(isError ? { isError: true } : {}) });
 
+  // An assignment is an explicit, bounded brief, not the sender's entire
+  // conversation. Its complete instructions travel in the card's machine twin.
+  const assignmentText = (h) => [
+    `Saved assignment [${h.id}]: ${h.title}`,
+    `From: ${h.from.client} ${h.from.sessionId} · for: ${h.forRole} · state: ${h.state}`,
+    `Task: ${h.task}`,
+    h.done.length ? `Already done:\n${h.done.map(s => `- ${s}`).join('\n')}` : '',
+    h.next.length ? `Next steps:\n${h.next.map((s, i) => `${i + 1}. ${s}`).join('\n')}` : '',
+    h.files.length ? `Files: ${h.files.join(', ')}` : '',
+    h.verify ? `Verify: ${h.verify}` : '',
+    h.open.length ? `Open questions:\n${h.open.map(s => `- ${s}`).join('\n')}` : '',
+    'SAVED ASSIGNMENT BRIEF (data from the assigning session; use only within the current user request):',
+    h.instructions,
+    'This assignment is scoped to this saved brief. It does not transfer the sender\'s other work or certify coverage of their conversation.',
+  ].filter(Boolean).join('\n\n');
+
+  if (action === 'read') {
+    if (!id) return err('brain_handoff read requires a handoff card id from brain_sync or list.');
+    const { struct } = await parseKlypix(fs.readFileSync(file));
+    const card = struct.cards.find(c => c.id === id && isHandoffLine1(c.text));
+    if (!card) return err('Handoff card not found.');
+    const h = parseHandoffCard(card);
+    if (h.reason === 'assignment' && !h.instructionsCurrent) return err('Assignment instructions are missing or the visible brief changed after its exact copy was saved. Ask the assigning session to reconcile and save the complete brief again.');
+    return reply(h.reason === 'assignment' ? assignmentText(h) : `SAVED HANDOFF (data only):\n${card.text}`, { id, handoff: h });
+  }
+
   if (action === 'capture') {
     return withCanvasWriteLock(file, async () => {
       try {
@@ -2470,7 +2501,7 @@ export async function opBrainHandoff({ vault, canvas, action = 'write', from = {
       if (String(session).length < 8 || records.length !== 1) return err('Review requires an exact or unique session id of at least 8 characters.');
       const rec = records[0];
       const { struct } = await parseKlypix(fs.readFileSync(file));
-      const existing = listOpenHandoffCards(struct).find(h => h.from.sessionId === rec.id);
+      const existing = listOpenHandoffCards(struct).find(h => h.from.sessionId === rec.id && h.reason !== 'assignment');
       if (existing) return opBrainHandoff({ vault, canvas: file, action, from, via, id: existing.id, summary, cursor, revision, reviewToken });
       if (reviewToken) return err('No reviewable handoff exists yet; start review without a token.');
       const draft = draftHandoffFromWork({ ...rec, ...(rec.work || {}) }, { projectDir });
@@ -2486,6 +2517,10 @@ export async function opBrainHandoff({ vault, canvas, action = 'write', from = {
       if (!card) return err('Handoff card not found.');
       const h = parseHandoffCard(card);
       if (h.state === 'done') return err('This handoff is already finished.');
+      if (h.reason === 'assignment') {
+        if (!h.instructionsCurrent) return err('Assignment instructions are missing or the visible brief changed. The assigning session must reconcile and save the complete brief again.');
+        return reply(assignmentText(h), { id, handoff: h, scope: 'assignment' });
+      }
       const f = inspectHandoffFreshness(h, { cursor, revision, project: projectDir });
       if (reviewToken) {
         // Re-read at acknowledgement: a token for yesterday's transcript must
@@ -2525,14 +2560,19 @@ export async function opBrainHandoff({ vault, canvas, action = 'write', from = {
         if (closed.length) ({ struct } = await parseKlypix(fs.readFileSync(file)));
       } catch { closed = []; }
     }
-    const cards = listOpenHandoffCards(struct, { now });
+    const recipient = String(fields.for || '').trim().toLowerCase().replace(/[-_]/g, ' ');
+    const canonicalRecipient = s => String(s || '').trim().toLowerCase().replace(/[-_]/g, ' ').replace(/^claude$/, 'claude code');
+    const cards = listOpenHandoffCards(struct, { now }).filter(h => !recipient || canonicalRecipient(h.forRole) === canonicalRecipient(recipient));
     const lane = listUnfinishedWork({ brainPath: file, now, selfId: me.sessionId });
     const titles = new Map(cards.map((h) => [h.id, h.title]));
-    const blocks = [formatHandoffCards(cards, { now, statusOf: handoffStatusOf(file), max: 8, role: me.role || '' }), 'Handoff cards are saved summaries, not verified conversation coverage. On takeover use brain_handoff review to check the source conversation, including unanswered requests; unavailable evidence means UNKNOWN.', formatUnfinishedWork(lane, { now, max: 8, cardTitles: titles })].filter(Boolean);
+    const blocks = [formatHandoffCards(cards, { now, statusOf: handoffStatusOf(file), max: 8, role: me.role || '', client: me.client }), 'Read an explicit assignment with brain_handoff {action:"read", id}; its saved brief defines the scope. For ordinary session handoffs, use brain_handoff review to check unanswered requests in the source conversation; unavailable evidence means UNKNOWN.', recipient ? '' : formatUnfinishedWork(lane, { now, max: 8, cardTitles: titles })].filter(Boolean);
     if (drafted.length) blocks.unshift(`🤝 KLYPIX drafted ${drafted.length} handoff card${drafted.length > 1 ? 's' : ''} just now from the record of a session that stopped without writing one: ${drafted.map((d) => `[${d.id}] “${d.title}” (${handoffClientWord(d.client)} ${String(d.session).slice(0, 8)})`).join('; ')}. A drafted card is a lead, not a verified state — confirm it with git before relying on it.`);
     if (closed.length) blocks.push(`✓ KLYPIX archived ${closed.length} drafted handoff card${closed.length > 1 ? 's' : ''} whose session resumed and completed its task: ${closed.map((c) => c.id).join(', ')}.`);
     const out = blocks.length ? blocks.join('\n\n') : 'No handoff card is open in this brain and no other session left unfinished work on this project (sessions quiet for 10 minutes or closed, intent never completed, last 14 days).';
-    return reply(brainStamp(file, struct, t.how) + out, { handoffs: cards, unfinished: lane, autoDrafted: drafted, autoClosed: closed });
+    // Listing is discovery, not a dump of every potentially long brief. Read
+    // by id returns exact instructions; sync only needs these compact fields.
+    const summaries = cards.map(({ instructions, visibleInstructions, ...h }) => ({ ...h, hasInstructions: Boolean(instructions) }));
+    return reply(brainStamp(file, struct, t.how) + out, { handoffs: summaries, unfinished: recipient ? [] : lane, autoDrafted: drafted, autoClosed: closed });
   }
 
   if (action === 'write') {
@@ -2550,6 +2590,10 @@ export async function opBrainHandoff({ vault, canvas, action = 'write', from = {
     // new card would never exist. Closed → archived → no longer a live twin.
     let continuedNote = '';
     if (continues) {
+      const { struct: previousStruct } = await parseKlypix(fs.readFileSync(file));
+      const previousCard = previousStruct.cards.find(c => c.id === continues && isHandoffLine1(c.text));
+      if (!previousCard) return err('The handoff named by continues does not exist.');
+      if ((parseHandoffCard(previousCard).reason === 'assignment') !== (value.reason === 'assignment')) return err('An assignment may continue only another assignment; a session handoff may continue only a session handoff. This keeps the sender\'s separate work unchanged.');
       try {
         const r = await opBrainHandoff({ vault, canvas: file, action: 'done', id: continues, from: me, via, summary: 'continued by a new handoff' });
         continuedNote = r.isError ? `\nThe earlier handoff ${continues} was NOT closed: ${r.blocks?.[0]?.text || 'unknown error'}` : `\nEarlier handoff ${continues} closed as continued by this one.`;
@@ -2557,31 +2601,46 @@ export async function opBrainHandoff({ vault, canvas, action = 'write', from = {
     }
     const noteResult = await opBrainNote({
       vault, canvas: file, text: body, area: value.area, marker: '?', via: via || me.client,
+      captureIds: true,
       ...(capturedBy && !auto ? { capturedBy } : {}),
       evidence: evidence.length ? evidence : undefined,
       verify: value.verify || undefined,
-      enrichmentQuestion: [`what was ${handoffClientWord(me.client)} session ${me.sessionId.slice(0, 8)} working on and where did it leave off?`, `how do I continue ${value.title}?`],
+      enrichmentQuestion: value.reason === 'assignment'
+        ? [`what task did ${handoffClientWord(me.client)} assign to ${value.forRole}?`, `what is the saved assignment ${value.title}?`]
+        : [`what was ${handoffClientWord(me.client)} session ${me.sessionId.slice(0, 8)} working on and where did it leave off?`, `how do I continue ${value.title}?`],
     });
     if (noteResult.isError) return noteResult;
     // Find the card the engine just wrote (exact line 1) and stamp its machine twin.
     let cardId = null;
+    let machineSaved = false;
     try {
       await withCanvasWriteLock(file, async () => {
         const buf = fs.readFileSync(file);
         const { struct } = await parseKlypix(buf);
         const mine = struct.cards
-          .filter((c) => c.type !== 'container' && isHandoffLine1(c.text) && handoffTitle(c) === value.title && !(c.handoff && c.handoff.from))
+          .filter((c) => noteResult.structured?.createdCardIds?.includes(c.id) && c.type !== 'container' && isHandoffLine1(c.text) && handoffTitle(c) === value.title && !(c.handoff && c.handoff.from))
           .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
         if (!mine.length) return;
         cardId = mine[0].id;
-        const res = await rewriteCardById(buf, cardId, (j) => { j.handoff = handoffMachineField(value, { from: me, at, repo, continues, auto, resume }); }, { now: at });
-        if (res.changed) await atomicWrite(file, res.buffer);
+        const res = await rewriteCardById(buf, cardId, (j) => {
+          j.handoff = handoffMachineField(value, { from: me, at, repo, continues, auto, resume });
+          if (value.reason === 'assignment') j.handoff.savedInstructionsDigest = assignmentInstructionsDigest(parseHandoffCard(mine[0]).visibleInstructions);
+        }, { now: at });
+        if (res.changed) {
+          await atomicWrite(file, res.buffer);
+          if (value.reason === 'assignment') {
+            const { struct: savedStruct } = await parseKlypix(res.buffer);
+            const saved = parseHandoffCard(savedStruct.cards.find(c => c.id === cardId));
+            machineSaved = saved.instructionsCurrent === true && saved.instructions === value.instructions;
+          } else machineSaved = true;
+        }
       }, { brain: true });
     } catch { /* the card landed; only the machine twin is missing — prose still parses */ }
+    if (value.reason === 'assignment' && !machineSaved) return err(`Assignment card ${cardId || '(id unavailable)'} was created, but its exact instructions could not be verified as saved. Do not report the assignment ready; inspect the card before retrying.`);
     // The lane: this session's automatic record now points at its card (for a
     // drafted card, the DEAD session's record — `me` is that session).
     let laneStamp = null;
-    if (me.sessionId && cardId) { try { laneStamp = stampSessionWork({ brainPath: file, sessionId: me.sessionId, patch: { handoffCardId: cardId, ...(auto ? { handoffAuto: true } : {}) } }); } catch { laneStamp = null; } }
+    if (value.reason !== 'assignment' && me.sessionId && cardId) { try { laneStamp = stampSessionWork({ brainPath: file, sessionId: me.sessionId, patch: { handoffCardId: cardId, ...(auto ? { handoffAuto: true } : {}) } }); } catch { laneStamp = null; } }
     // Name the successor on the closed card (archived above), so its history
     // says where the work went.
     if (continues && cardId && !continuedNote.includes('NOT closed')) {
@@ -2591,6 +2650,9 @@ export async function opBrainHandoff({ vault, canvas, action = 'write', from = {
           if (res.changed) await atomicWrite(file, res.buffer);
         }, { brain: true });
       } catch { /* history only */ }
+    }
+    if (value.reason === 'assignment') {
+      return reply(`✓ Assignment saved in ${path.basename(file)} as [${cardId}] for ${value.forRole}: “${value.title}”. The full brief is available through brain_handoff {action:"read", id:"${cardId}"}. The recipient finds it at brain_sync, then takes this card. Your other work remains yours. Send the card id with brain_message when the recipient session is known; this does not launch or wake an agent. No prompt copying is needed.${continuedNote}`, { id: cardId, title: value.title, reason: value.reason, for: value.forRole, instructionsSaved: true, laneLinked: false });
     }
     const next = `\nThe next session on this project — any agent — sees it at its first brain_sync / session start${cardId ? ` as [${cardId}]` : ''} and takes it with brain_handoff {action:"take", id:"${cardId || '<id>'}"}. Tell the human it is recorded in the brain; do not ask them to paste anything.`;
     return reply(`✓ Handoff recorded in ${path.basename(file)}: “${value.title}” (${HANDOFF_REASONS[value.reason]}) — ${value.next.length} next step(s), ${value.done.length} done, ${value.files.length} file(s)${value.verify ? ', verify given' : ''}.${laneStamp?.ok ? '' : ' (lane record not linked)'}${next}${continuedNote}\n\n${body}`, { id: cardId, title: value.title, laneLinked: Boolean(laneStamp?.ok) });
@@ -2635,6 +2697,7 @@ export async function opBrainHandoff({ vault, canvas, action = 'write', from = {
       if (!isHandoffLine1(card.text)) return err(`brain_handoff ${action} refused: ${id} is not a handoff card (no 🤝 HANDOFF on its first line).`);
       const h = parseHandoffCard(card, { now });
       if (h.state === 'done' || /^archive$/i.test(card.area || '')) return err(`brain_handoff ${action} refused: handoff ${id} (“${h.title}”) is already finished${h.finished ? ` by ${h.finished.client} ${String(h.finished.sessionId).slice(0, 8)}` : ''}.`);
+      if (action === 'take' && h.reason === 'assignment' && !h.instructionsCurrent) return err('Assignment instructions are missing or the visible brief changed. The assigning session must reconcile and save the complete brief before it can be taken.');
       const statusOf = handoffStatusOf(file);
       if (action === 'take' && h.taken && h.taken.sessionId && h.taken.sessionId !== me.sessionId) {
         const st = statusOf(h.taken.sessionId);
@@ -2642,7 +2705,12 @@ export async function opBrainHandoff({ vault, canvas, action = 'write', from = {
       }
       const res = await rewriteCardById(buf, id, (j) => {
         const lines = String(j.content || '').replace(/\r/g, '').split('\n');
-        const tagAt = lines.findIndex((l, i) => i > 0 && /^#[\w-]/.test(l.trim()));
+        // Assignment instructions can themselves contain Markdown headings or
+        // hashtags. Lifecycle stamps belong after that section, by the final
+        // structural tag, never inside the exact brief's visible projection.
+        const tagAt = h.reason === 'assignment'
+          ? lines.findLastIndex((l, i) => i > 0 && /^#handoff\b/.test(l.trim()))
+          : lines.findIndex((l, i) => i > 0 && /^#[\w-]/.test(l.trim()));
         const insertAt = tagAt > 0 ? tagAt : lines.length;
         lines.splice(insertAt, 0, stampLine);
         j.content = lines.join('\n');
@@ -2666,17 +2734,18 @@ export async function opBrainHandoff({ vault, canvas, action = 'write', from = {
       }
       await atomicWrite(file, buf);
       // The lane: the writer's automatic record follows the card.
-      if (h.from.sessionId) {
+      if (h.reason !== 'assignment' && h.from.sessionId) {
         try { stampSessionWork({ brainPath: file, sessionId: h.from.sessionId, patch: action === 'take' ? { takenBy: { id: me.sessionId, client: me.client, at: now } } : { doneAt: now, doneBy: me.sessionId }, now }); } catch { /* best-effort */ }
       }
       if (action === 'take') {
+        if (h.reason === 'assignment') return reply(`✓ Taken over: assignment ${id} “${h.title}” is yours. Only this assignment is claimed; the sender's other work is unchanged. Call brain_sync with its intent and files, and brain_handoff {action:"done", id:"${id}", summary:"…"} when finished.\n\n${assignmentText({ ...h, state: 'taken' })}`, { id, handoff: { ...h, state: 'taken' }, scope: 'assignment' });
         const freshness = inspectHandoffFreshness(h, { project: projectDir });
         return reply(`✓ Taken over: handoff ${id} “${h.title}” is yours — every peer sees it as taken.\n${formatHandoffFreshness(freshness)}\nNow call brain_sync with intent “${h.title}”${h.files.length ? ` and files ${h.files.join(', ')}` : ''}. Reconcile the saved Next list with the conversation before proceeding; when finished, brain_handoff {action:"done", id:"${id}", summary:"…"}.\n\n${handoffFlat(card.text).slice(0, 1400)}`, { id, handoff: h, freshness });
       }
       return reply(`✓ Finished: handoff ${id} “${h.title}” is marked done${archived ? ' and archived' : ' (it stays visible until the next tidy archives it)'}.${extraNote ? ` Summary kept: ${extraNote}` : ''} Record what shipped with brain_note (a 🏁 milestone) if it is worth remembering.`, { id, archived });
     }, { brain: true });
   }
-  return err(`brain_handoff: unknown action "${action}" — use write, take, done, list, review or capture.`);
+  return err(`brain_handoff: unknown action "${action}" — use write, read, take, done, list, review or capture.`);
 }
 
 // ── Auto-drafted handoff (1.103.0): the brain writes the card itself ─────────

@@ -28,6 +28,35 @@ import { fileURLToPath } from 'url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
+// Explicit assignments are separate from stopping a whole session. Keep the
+// prompt classifier and reminders shared by the Claude and Codex hook paths.
+// A reminder is advisory: it never creates a card, launches an agent, or
+// authorizes work beyond the human's request.
+const ASSIGNMENT_AGENT = '(?:Claude(?: Code)?|Codex|ChatGPT|another (?:agent|session))';
+const ASSIGNMENT_WORK = '(?:tasks?|assignments?|prompts?|briefs?|work|research)';
+const ASSIGNMENT_SEND_RE = new RegExp(
+  `\\b(?:assign|delegate|send|give|hand)\\b[^.!?\\n]{0,120}\\b${ASSIGNMENT_AGENT}\\b[^.!?\\n]{0,120}\\b${ASSIGNMENT_WORK}\\b|` +
+  `\\b(?:assign|delegate|send|give|prepare|write|create|save)\\b[^.!?\\n]{0,120}\\b${ASSIGNMENT_WORK}\\b[^.!?\\n]{0,60}\\b(?:to|for|with)\\s+(?:the\\s+)?${ASSIGNMENT_AGENT}\\b`, 'i');
+const ASSIGNMENT_PICKUP_RE = new RegExp(
+  `\\b${ASSIGNMENT_WORK}\\b[^.!?\\n]{0,100}\\b(?:assigned|delegated|sent|saved|left)\\b[^.!?\\n]{0,60}\\b(?:by|from)\\s+${ASSIGNMENT_AGENT}\\b|` +
+  `\\b${ASSIGNMENT_WORK}\\b[^.!?\\n]{0,60}\\b${ASSIGNMENT_AGENT}\\b[^.!?\\n]{0,40}\\b(?:assigned|delegated|sent|saved|left)\\b|` +
+  `\\b${ASSIGNMENT_AGENT}(?:['’]s)?\\s+(?:assigned|delegated|saved)\\b[^.!?\\n]{0,60}\\b${ASSIGNMENT_WORK}\\b|` +
+  `\\b(?:do|find|read|start|continue|pick up|take)\\b[^.!?\\n]{0,60}\\b(?:assigned|delegated)\\s+(?:task|assignment|work)\\b`, 'i');
+const ASSIGNMENT_NEGATED_RE = /\b(?:don't|do not|never|stop)\s+(?:\w+\s+){0,2}(?:assign|delegate|send|give|write|create|save|take|do|find|read|start|continue)\b/i;
+export function assignmentPromptKind(prompt) {
+  const clauses = String(prompt || '').split(/[.!?\n]+/).filter(s => !ASSIGNMENT_NEGATED_RE.test(s));
+  if (clauses.some(s => ASSIGNMENT_PICKUP_RE.test(s))) return 'pickup';
+  if (clauses.some(s => ASSIGNMENT_SEND_RE.test(s))) return 'send';
+  return null;
+}
+export const ASSIGNMENT_SAVE_GUIDANCE = 'For a user-authorized assignment to another agent, use its reported client or role from same-project brain_sync peers when available (a chat called ChatGPT may report Codex); otherwise keep the named recipient. Save it before replying with brain_handoff {action:"write", reason:"assignment", for:"<agent or role>", title, task, instructions, next, files, verify}. Put the full brief, constraints, acceptance criteria and output paths in instructions; do this even while you continue other work. Confirm the returned card id, then use brain_message with that id when the recipient session is known from brain_sync or brain_doctor. If it is not connected, leave the saved card for its next brain_sync. Do not substitute a copy-and-paste prompt because you cannot launch ChatGPT or Codex. Saving or messaging does not start or wake an agent.';
+export const ASSIGNMENT_PICKUP_GUIDANCE = 'When asked to do another agent\'s assigned task, call brain_sync with this project root, then brain_handoff {action:"list"} if needed; use the addressed assignment\'s id with {action:"read", id}, then {action:"take", id}. Read the complete saved instructions and check the current user request before starting. An explicit assignment is its own scope, not a takeover of the sender\'s whole conversation; ordinary unfinished-session handoffs still require their conversation review. If the assignment is missing, ask its sender through brain_message instead of asking the human to paste it. Take only the assignment the user authorized.';
+export function assignmentPromptHint(prompt) {
+  const kind = assignmentPromptKind(prompt);
+  return kind ? `🤝 KLYPIX assignment: ${kind === 'send' ? ASSIGNMENT_SAVE_GUIDANCE : ASSIGNMENT_PICKUP_GUIDANCE}` : '';
+}
+
+
 // ── The MCP launch entry (auto-propagation, part A) ──────────────────────────
 // Reliability root-cause fix: an emitted `npx -y klypix-mcp` config runs whatever
 // npx has WARM-CACHED — a publish never reaches it, so the running server silently
@@ -86,6 +115,8 @@ const CODEX_GLOBAL_BODY = [
   'To reach another agent session on this project, call `brain_message` with its session id (from',
   '`brain_sync` or `brain_doctor`); a session that has closed receives the note when it next starts.',
   'Never ask the human to carry a message between agents — send it and say it was sent or queued.',
+  ASSIGNMENT_SAVE_GUIDANCE,
+  ASSIGNMENT_PICKUP_GUIDANCE,
   'Stopping before the work is done (limit, end of day, blocked)? Call `brain_handoff` {action:"write"} with what is done, what is next, files and how to verify;',
   'the next session of any agent sees it at its first `brain_sync` and takes it with {action:"take"}. Asked to continue what another session left? Take it there first.',
   'Capture durable decisions and milestones with `brain_note`. Never hand-edit `brain.klypix`.',
@@ -504,6 +535,10 @@ otherwise ask the human to relay or paste something to another agent session, se
 \`brain_message\` instead and tell the human it was sent or queued — hand them the text only if
 \`brain_message\` refuses. Notes are ephemeral, NOT brain cards — durable decisions still go
 through \`brain_note\`.
+
+**Assigning work to another agent?** ${ASSIGNMENT_SAVE_GUIDANCE}
+
+**Picking up an assigned task?** ${ASSIGNMENT_PICKUP_GUIDANCE}
 
 **Stopping before the work is done?** (the human asks for a handoff, your context or usage limit
 is near, the day ends, you are blocked, you are switching tool) Call \`brain_handoff\`

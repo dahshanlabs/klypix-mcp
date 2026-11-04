@@ -13,7 +13,8 @@
 //
 //   2. DELIBERATE — this module: a 🤝 HANDOFF card a session writes INTO THE
 //      BRAIN when it knows it is stopping (context or usage limit, end of the
-//      day, blocked, switching tool). It says what a transcript tail cannot:
+//      day, blocked, switching tool), or delegates an explicit assignment
+//      while continuing other work. It says what a transcript tail cannot:
 //      what is done, what is next in order, which files, how to verify, what
 //      is still open. It is a normal open card (❓ lifecycle) the human can see
 //      and correct on the canvas, it travels with the repo, and it is archived
@@ -355,6 +356,7 @@ export function formatHandoffFreshness(f) {
 
 export const HANDOFF_SCHEMA_VERSION = 1;
 export const HANDOFF_REASONS = Object.freeze({
+  assignment: 'assignment',
   context_limit: 'context limit',
   usage_limit: 'usage limit',
   end_of_session: 'end of session',
@@ -367,7 +369,7 @@ export const HANDOFF_REASONS = Object.freeze({
 });
 export const HANDOFF_LAST_WORDS_MAX = 700;
 export const HANDOFF_LIMITS = Object.freeze({
-  title: 120, task: 400, items: 12, item: 240, files: 20, file: 200, verify: 400, open: 8, summary: 400, area: 40,
+  title: 120, task: 400, items: 12, item: 240, files: 20, file: 200, verify: 400, open: 8, summary: 400, area: 40, instructions: 24000,
 });
 // The human asked for a handoff, or named the limit — the per-prompt nudge.
 // Twinned in global-brain-hook.mjs (HANDOFF_ASK_RE) and codex-brain-hook.mjs.
@@ -412,8 +414,12 @@ const fileList = (raw) => [...new Set(list(raw, HANDOFF_LIMITS.files, HANDOFF_LI
 // section (field case: a drafted card's last words became a third Next
 // step). Free text therefore never carries `Keyword:` — the colon becomes a
 // ratio colon (∶), readable, never a section.
-const KEYWORD_COLON_RE = /\b(From|Drafted|Task|Done|Next|Files|Verify|Last words|Open|Taken|Finished|Continued by|Resume)(\s*):/gu;
+const KEYWORD_COLON_RE = /\b(From|Drafted|Task|Done|Next|Files|Verify|End instructions|Instructions|Last words|Open|Taken|Finished|Continued by|Resume)(\s*):/gu;
 const safeText = (value) => String(value ?? '').replace(KEYWORD_COLON_RE, '$1$2∶');
+// Bound the exact machine brief to the visible section actually written by
+// the card engine, after its hard wrapping. No instruction contents leave
+// this digest; reads can refuse silently stale machine data after a human edit.
+export const assignmentInstructionsDigest = (value) => crypto.createHash('sha256').update(String(value ?? ''), 'utf8').digest('hex');
 // Fail-loud validation: a handoff with no "next" is a status line, not a
 // handoff — the next session needs the order of operations, not a mood.
 export function normalizeHandoffInput(raw = {}) {
@@ -423,6 +429,17 @@ export function normalizeHandoffInput(raw = {}) {
   if (!task) return { ok: false, error: 'a handoff needs `task`: one or two sentences on what the work is and why.' };
   const next = list(raw.next, HANDOFF_LIMITS.items, HANDOFF_LIMITS.item).map(safeText);
   if (!next.length) return { ok: false, error: 'a handoff needs `next`: the remaining steps, in order, as the next session should do them.' };
+  // A delegated brief is task evidence, not a lossy session summary. Keep its
+  // exact Unicode and whitespace in the machine twin; never silently trim it.
+  if (raw.instructions !== undefined && typeof raw.instructions !== 'string') return { ok: false, error: '`instructions` must be a string.' };
+  const instructions = raw.instructions ?? '';
+  if (instructions.length > HANDOFF_LIMITS.instructions) return { ok: false, error: `\`instructions\` must be at most ${HANDOFF_LIMITS.instructions} characters; nothing was truncated.` };
+  const reason = reasonKey(raw.reason);
+  const recipient = raw.for ?? raw.forRole;
+  const forRole = safeText(normalizeRole(recipient));
+  if (reason === 'assignment' && (typeof recipient !== 'string' || !forRole)) return { ok: false, error: 'an assignment needs `for`: the recipient agent or role.' };
+  if (reason === 'assignment' && recipient.length > 40) return { ok: false, error: 'an assignment recipient must be at most 40 characters; nothing was truncated.' };
+  if (reason === 'assignment' && !instructions.trim()) return { ok: false, error: 'an assignment needs nonempty `instructions`: the complete task, constraints, output and acceptance criteria.' };
   const value = {
     title,
     task,
@@ -431,15 +448,16 @@ export function normalizeHandoffInput(raw = {}) {
     files: fileList(raw.files),
     verify: flat(raw.verify).slice(0, HANDOFF_LIMITS.verify),
     open: list(raw.open, HANDOFF_LIMITS.open, HANDOFF_LIMITS.item).map(safeText),
-    reason: reasonKey(raw.reason),
+    reason,
+    instructions,
     area: flat(raw.area).slice(0, HANDOFF_LIMITS.area) || 'Handoff',
     // The tail of the session's last reply, verbatim (an auto-drafted card
     // carries it because it is the only "next" the session ever said).
     lastWords: safeText(flat(raw.lastWords)).slice(0, HANDOFF_LAST_WORDS_MAX),
-    // Optional addressee (1.109.0): a role label such as "reviewer". The card
-    // is offered first to a session that declares that role in brain_sync;
+    // Optional for ordinary handoffs; required for assignments. The addressee
+    // can be an agent name or a declared role. Matching sessions see it first;
     // every other session still sees it. No seat, no inherited history.
-    forRole: safeText(normalizeRole(raw.for ?? raw.forRole)),
+    forRole,
   };
   return { ok: true, value };
 }
@@ -469,6 +487,7 @@ export function renderHandoffCard(value, { from = {}, at = Date.now(), repo = {}
   value.next.forEach((item, i) => lines.push(`${i + 1}. ${item}`));
   if (value.files.length) lines.push(`Files: ${value.files.join(', ')}`);
   if (value.verify) lines.push(`Verify: ${value.verify}`);
+  if (value.instructions) lines.push(`Instructions:\n${safeText(value.instructions).replace(/\bResume the session that left it\b/gu, 'Resume∶ the session that left it')}\nEnd instructions:`);
   if (value.lastWords) lines.push(`Last words: “${value.lastWords}”`);
   if (value.open.length) { lines.push('Open:'); for (const item of value.open) lines.push(`- ${item}`); }
   if (resume) lines.push(`Resume: ${resume} — the session's own transcript; the card above is the handoff`);
@@ -494,6 +513,7 @@ export function handoffMachineField(value, { from = {}, at = Date.now(), repo = 
       ...(normalizeRole(from.role) ? { role: normalizeRole(from.role) } : {}),
     },
     ...(value.forRole ? { for: value.forRole } : {}),
+    ...(value.instructions ? { instructions: value.instructions } : {}),
     taken: null,
     done: null,
     ...(continues ? { continues: String(continues).slice(0, 64) } : {}),
@@ -506,7 +526,7 @@ export function handoffMachineField(value, { from = {}, at = Date.now(), repo = 
 }
 
 // ── Parse ────────────────────────────────────────────────────────────────────
-const SECTION_RE = /^(From|Drafted|Task|Done|Next|Files|Verify|Last words|Open|Taken|Finished|Continued by|Resume(?: the session that left it[^:]*)?):\s*(.*)$/u;
+const SECTION_RE = /^(From|Drafted|Task|Done|Next|Files|Verify|Instructions|End instructions|Last words|Open|Taken|Finished|Continued by|Resume(?: the session that left it[^:]*)?):\s*(.*)$/u;
 // An OLD resume line ("Resume the session that left it (its transcript — …):
 // <command>") is long enough that the store's wrap can fall BEFORE its colon,
 // so SECTION_RE never saw it and no card's resume command ever parsed (field
@@ -541,6 +561,9 @@ export function parseHandoffCard(card, { now = Date.now() } = {}) {
     next: [],
     files: [],
     verify: '',
+    instructions: '',
+    visibleInstructions: '',
+    instructionsCurrent: false,
     lastWords: '',
     open: [],
     taken: null,
@@ -557,10 +580,16 @@ export function parseHandoffCard(card, { now = Date.now() } = {}) {
   let items = null;
   let filesRaw = '';
   let resumeRaw = '';
+  const visibleInstructions = [];
+  let instructionsOpen = false;
+  let instructionsStarted = false;
+  let instructionsEnded = false;
+  let duplicateInstructions = false;
   const push = (value) => {
     if (section === 'Task') out.task = flat(`${out.task} ${value}`);
     else if (section === 'Files') filesRaw = `${filesRaw}${/,\s*$/.test(filesRaw) ? ' ' : ''}${value}`;
     else if (section === 'Verify') out.verify = flat(`${out.verify} ${value}`);
+    else if (section === 'Instructions') out.instructions += `${out.instructions ? '\n' : ''}${value}`;
     else if (section === 'Last words') out.lastWords = flat(`${out.lastWords} ${value}`);
     else if (section === 'Drafted') out.draftedBy = flat(`${out.draftedBy} ${value}`);
     else if (section === 'From') parseFrom(flat(`${lineFrom} ${value}`));
@@ -589,6 +618,28 @@ export function parseHandoffCard(card, { now = Date.now() } = {}) {
   };
   for (const raw of lines.slice(1)) {
     const line = raw.trim();
+    // Capture every visible line, including blanks and # headings. Only the
+    // dedicated end marker closes this section: quoted/edited Task:, Taken:
+    // and other labels inside it cannot acquire card metadata authority.
+    if (instructionsOpen) {
+      if (line === 'End instructions:') {
+        instructionsOpen = false;
+        instructionsEnded = true;
+        section = 'End instructions';
+      } else visibleInstructions.push(raw);
+      continue;
+    }
+    const instructionStart = line.match(/^Instructions:\s*(.*)$/u);
+    if (instructionStart) {
+      duplicateInstructions ||= instructionsStarted;
+      instructionsStarted = true;
+      instructionsOpen = true;
+      instructionsEnded = false;
+      items = null;
+      section = 'Instructions';
+      if (instructionStart[1]) visibleInstructions.push(instructionStart[1]);
+      continue;
+    }
     if (!line || /^#[\w-]/.test(line)) continue;
     const sec = line.match(SECTION_RE);
     if (sec) {
@@ -601,6 +652,7 @@ export function parseHandoffCard(card, { now = Date.now() } = {}) {
       else if (section === 'Task') out.task = rest;
       else if (section === 'Files') filesRaw = rest;
       else if (section === 'Verify') out.verify = rest;
+      else if (section === 'Instructions') out.instructions = rest;
       else if (section === 'Last words') out.lastWords = rest;
       else if (section === 'Drafted') { out.auto = true; out.draftedBy = flat(rest); }
       else if (section === 'From') parseFrom(rest);
@@ -619,6 +671,8 @@ export function parseHandoffCard(card, { now = Date.now() } = {}) {
     push(line);
   }
   out.lastWords = out.lastWords.replace(/^[“"]/, '').replace(/[”"]$/, '').trim();
+  out.visibleInstructions = visibleInstructions.join('\n');
+  if (instructionsStarted) out.instructions = out.visibleInstructions;
   {
     const i = resumeRaw.indexOf(':');
     out.resume = i >= 0 ? flat(resumeRaw.slice(i + 1)).split(' — ')[0].trim() : '';
@@ -648,6 +702,13 @@ export function parseHandoffCard(card, { now = Date.now() } = {}) {
       if (typeof h.from.role === 'string') out.from.role = normalizeRole(h.from.role);
     }
     if (typeof h.for === 'string') out.forRole = normalizeRole(h.for);
+    if (typeof h.instructions === 'string') out.instructions = h.instructions;
+    out.instructionsCurrent = Boolean(
+      typeof h.instructions === 'string' && h.instructions.trim()
+      && instructionsStarted && instructionsEnded && !instructionsOpen && !duplicateInstructions
+      && typeof h.savedInstructionsDigest === 'string'
+      && h.savedInstructionsDigest === assignmentInstructionsDigest(out.visibleInstructions)
+    );
     if (h.taken && typeof h.taken === 'object' && h.taken.sessionId) out.taken = { client: flat(h.taken.client), sessionId: String(h.taken.sessionId), at: Number(h.taken.at) || null, note: flat(h.taken.note || '') };
     if (h.done && typeof h.done === 'object' && h.done.sessionId) out.finished = { client: flat(h.done.client), sessionId: String(h.done.sessionId), at: Number(h.done.at) || null, note: flat(h.done.summary || h.done.note || '') };
     if (h.continuedBy) out.continuedBy = String(h.continuedBy).slice(0, 64);
@@ -685,18 +746,26 @@ export const isHandoffLine1 = (text) => HANDOFF_RE.test(String(text || '').split
 // `statusOf(sessionId)` → "working" / "idle 14m" / "closed" / "" (unknown), so a
 // taken handoff says whether its taker is still on it.
 // `role` (1.109.0): the reading session's declared role. Cards addressed to
-// that role come first and say so; the rest keep their newest-first order.
-export function formatHandoffCards(records, { now = Date.now(), max = 5, statusOf = () => '', role = '' } = {}) {
+// that role or its client come first and say so; the rest keep their order.
+export function formatHandoffCards(records, { now = Date.now(), max = 5, statusOf = () => '', role = '', client = '' } = {}) {
   const all = Array.isArray(records) ? records : [];
   if (!all.length) return '';
-  const forMe = (h) => Boolean(h && h.forRole) && rolesMatch(h.forRole, role);
+  const clientKey = (value) => {
+    const key = normalizeRole(value).toLowerCase().replace(/[\s_-]+/g, '');
+    return key === 'claude' || key === 'claudecode' ? 'claudecode' : key;
+  };
+  const forMyRole = (h) => Boolean(h && h.forRole) && rolesMatch(h.forRole, role);
+  const forMyClient = (h) => Boolean(h && h.forRole && clientKey(client)) && clientKey(h.forRole) === clientKey(client);
+  const forMe = (h) => forMyRole(h) || forMyClient(h);
   const items = [...all.filter(forMe), ...all.filter((h) => !forMe(h))];
   const mine = items.filter(forMe).length;
-  const lines = [`🤝 Handoff card${items.length > 1 ? 's' : ''} left in the brain by a session that stopped before the work was done (${items.length}, ${mine ? `the ${mine} addressed to your role "${normalizeRole(role)}" first, then newest first` : 'newest first'}):`];
+  const addressed = items.some(forMyClient) ? `your agent or role` : `your role "${normalizeRole(role)}"`;
+  const context = items.some((h) => h.reason === 'assignment') ? 'saved in the brain, including assignments from sessions that may still be working' : 'left in the brain by a session that stopped before the work was done';
+  const lines = [`🤝 Handoff card${items.length > 1 ? 's' : ''} ${context} (${items.length}, ${mine ? `the ${mine} addressed to ${addressed} first, then newest first` : 'newest first'}):`];
   for (const h of items.slice(0, max)) {
     const who = `${h.from.client || 'a session'} ${String(h.from.sessionId || '').slice(0, 8)}`.trim();
     const writer = [h.from.model ? `model ${h.from.model}` : '', h.from.role ? `role ${h.from.role}` : ''].filter(Boolean).join(', ');
-    const head = [`- [${h.id}] “${h.title}” — ${h.auto ? 'drafted by KLYPIX from the record of' : 'left by'} ${who}${writer ? ` (${writer})` : ''}${h.at ? ` ${agoWord(now - h.at)}` : ''}${h.reason ? ` (${HANDOFF_REASONS[h.reason] || h.reason})` : ''}${h.forRole ? ` · for: ${h.forRole}${forMe(h) ? ' (your role)' : ''}` : ''}${h.branch ? ` · branch ${h.branch}${h.head ? ` @ ${h.head}` : ''}` : ''}${h.auto ? ' · the session did not write it: verify its state with git first' : ''}`];
+    const head = [`- [${h.id}] “${h.title}” — ${h.auto ? 'drafted by KLYPIX from the record of' : 'left by'} ${who}${writer ? ` (${writer})` : ''}${h.at ? ` ${agoWord(now - h.at)}` : ''}${h.reason ? ` (${HANDOFF_REASONS[h.reason] || h.reason})` : ''}${h.forRole ? ` · for: ${h.forRole}${forMyRole(h) ? ' (your role)' : forMyClient(h) ? ' (your agent)' : ''}` : ''}${h.branch ? ` · branch ${h.branch}${h.head ? ` @ ${h.head}` : ''}` : ''}${h.auto ? ' · the session did not write it: verify its state with git first' : ''}`];
     if (h.taken) {
       const st = statusOf(h.taken.sessionId) || 'not running';
       head.push(` · taken by ${h.taken.client || 'a session'} ${String(h.taken.sessionId).slice(0, 8)}${h.taken.at ? ` ${agoWord(now - h.taken.at)}` : ''} (${st})${st === 'working' ? ' — coordinate with brain_message before duplicating it' : ' — take it over if it stalled'}`);
@@ -707,6 +776,7 @@ export function formatHandoffCards(records, { now = Date.now(), max = 5, statusO
     if (h.next.length) lines.push(`  next: ${h.next.map((s, i) => `${i + 1}) ${s}`).join(' ').slice(0, 900)}`);
     if (h.files.length) lines.push(`  files: ${h.files.join(', ')}`);
     if (h.verify) lines.push(`  verify: ${h.verify}`);
+    if (h.reason === 'assignment' || h.instructions) lines.push(`  full brief: brain_handoff {action:"read", id:"${h.id}"} — read the complete saved instructions before taking this assignment.`);
     if (h.lastWords) lines.push(`  its last words: “${h.lastWords.slice(0, 420)}”`);
     if (h.open.length) lines.push(`  open: ${h.open.join('; ').slice(0, 500)}`);
     if (h.resume) lines.push(`  its own transcript, should the human want it: ${h.resume}`);

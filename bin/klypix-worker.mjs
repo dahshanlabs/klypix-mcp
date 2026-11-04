@@ -1121,15 +1121,15 @@ server.registerTool('brain_reopen', {
 // verb's `write` puts a 🤝 HANDOFF card into the brain — what is done, what is
 // next, files, how to verify — which the next session takes over by id.
 server.registerTool('brain_handoff', {
-  title: 'Hand unfinished work to the next session — or take over what another session left',
-  description: 'The session handoff. On hosts without native transcript access, call {action:"capture", turns:[{id,role,at,text}]} as user requests and replies arrive, before writing a handoff. Capture only observed text with stable ids and known timestamps; never reconstruct missing history. Captured evidence is local and does not establish full conversation coverage. Call {action:"write"} when you are stopping before the work is done — the human asked for a handoff, your context or usage limit is near, the day ends, you are blocked or switching tool — with the task, what is done, what is NEXT in order, the files and how to verify: it becomes a 🤝 card in the project brain that the human can see and correct, and the next session on this project (any agent — Codex, Claude Code, Cursor) sees it at its first brain_sync / session start. Call {action:"take", id} (a card) or {action:"take", session} (unfinished work a session left without a card — KLYPIX records every session\'s last reply, files and commits automatically) before continuing it, so peers see it is taken; {action:"done"} when it is finished (the card is archived); {action:"list"} shows every open handoff and every unfinished session. Never ask the human to paste a summary into the next session — write a handoff. Machine-local for the automatic layer; the card travels with the brain.',
+  title: 'Save an assignment or hand unfinished work to another session',
+  description: 'Save delegated work immediately with {action:"write", reason:"assignment", for:"Codex", instructions:"<complete brief>", title, task, next, files, verify}, even while continuing your own work. Use the actual recipient client or role. Verify the returned card id, then notify a known recipient with brain_message; saving does not wake or launch agents. When asked for an assigned task, brain_sync the same project, list/read the addressed card and take it; never ask the human to copy the prompt. Assignments preserve the sender\'s separate task and use their saved brief, not the entire sender conversation. The session handoff. On hosts without native transcript access, call {action:"capture", turns:[{id,role,at,text}]} as user requests and replies arrive, before writing a handoff. Capture only observed text with stable ids and known timestamps; never reconstruct missing history. Captured evidence is local and does not establish full conversation coverage. Call {action:"write"} when you are stopping before the work is done — the human asked for a handoff, your context or usage limit is near, the day ends, you are blocked or switching tool — with the task, what is done, what is NEXT in order, the files and how to verify: it becomes a 🤝 card in the project brain that the human can see and correct, and the next session on this project (any agent — Codex, Claude Code, Cursor) sees it at its first brain_sync / session start. Call {action:"take", id} (a card) or {action:"take", session} (unfinished work a session left without a card — KLYPIX records every session\'s last reply, files and commits automatically) before continuing it, so peers see it is taken; {action:"done"} when it is finished (the card is archived); {action:"list"} shows every open handoff and every unfinished session. Never ask the human to paste a summary into the next session — write a handoff. Machine-local for the automatic layer; the card travels with the brain.',
   annotations: {
     destructiveHint: false,
     idempotentHint: false,
     openWorldHint: false,
   },
   inputSchema: {
-    action: z.enum(['write', 'take', 'done', 'list', 'review', 'capture']).optional().describe('capture: preserve observed user/assistant turns for this connected session on any MCP host; never marks full history covered. write: record a handoff. take: claim it and check conversation freshness. review: read source conversation pages, then acknowledge the final reviewToken with a summary of pending requests. done: mark finished. list: open handoffs and unfinished sessions.'),
+    action: z.enum(['write', 'read', 'take', 'done', 'list', 'review', 'capture']).optional().describe('write: save an assignment or session handoff. read: retrieve its complete saved brief by id. take/done: claim or finish that card. For ordinary session handoffs, review checks the source conversation; explicit assignments use their saved instructions. list: open cards, optionally filtered by for. capture: preserve observed turns without claiming full history coverage.'),
     turns: z.array(z.object({ id: z.string().min(1).max(160), role: z.enum(['user', 'assistant']), at: z.number().int().positive().max(8640000000000000), text: z.string().min(1).max(24000) })).min(1).max(30).optional().describe('capture: observed turns only, stable ids for retries and original timestamps in milliseconds. Never invent missing history. Stored locally outside the brain; full coverage remains unknown.'),
     cursor: z.number().int().min(0).optional().describe('review: nextCursor from the preceding page; omit to start.'),
     revision: z.string().max(64).optional().describe('review: exact transcript revision from the preceding page.'),
@@ -1138,25 +1138,28 @@ server.registerTool('brain_handoff', {
     canvas: z.string().optional().describe('Brain canvas filename/path. Defaults to the project brain ("brain").'),
     title: z.string().max(120).optional().describe('write: the work, in a few words ("Drive upload: the Place-it-now chooser").'),
     task: z.string().max(400).optional().describe('write: one or two sentences — what the work is and why.'),
+    instructions: z.string().min(1).max(24000).optional().describe('write with reason assignment: the complete brief, including requirements, constraints, output paths and acceptance criteria. Required for assignments; preserves Unicode and newlines exactly. read/take returns it in full.'),
     done: z.array(z.string().max(240)).max(12).optional().describe('write: what is already finished (so it is not redone).'),
     next: z.array(z.string().max(240)).max(12).optional().describe('write: the remaining steps IN ORDER, as the next session should do them. Required.'),
     files: z.array(z.string().max(200)).max(20).optional().describe('write: project-relative files the work touches (recorded as evidence anchors).'),
     verify: z.string().max(400).optional().describe('write: how to check the state — a command or a visible result.'),
     open: z.array(z.string().max(240)).max(8).optional().describe('write: questions still open, or decisions the human has to make.'),
-    reason: z.enum(['context_limit', 'usage_limit', 'end_of_session', 'blocked', 'switching_tool', 'other']).optional().describe('write: why the work stops here.'),
+    reason: z.enum(['context_limit', 'usage_limit', 'end_of_session', 'blocked', 'switching_tool', 'other', 'assignment']).optional().describe('write: assignment delegates only the saved brief while the sender may continue other work; the other reasons hand off the session\'s unfinished work.'),
     area: z.string().max(40).optional().describe('write: the brain area (titled box) the card goes into. Defaults to "Handoff".'),
     continues: z.string().max(64).optional().describe('write: the id of an earlier handoff card this one continues — it is closed as "continued by" this one.'),
-    id: z.string().max(64).optional().describe('take / done / review: the handoff card id (from brain_sync, the session-start brief, or list).'),
+    id: z.string().max(64).optional().describe('read / take / done / review: the handoff card id from brain_sync or list.'),
     session: z.string().max(160).optional().describe('take / done / review: the session id (or a unique prefix of 8+ characters) from the unfinished-work list, when the work has no card. Review creates a reviewable draft if needed.'),
     summary: z.string().max(400).optional().describe('done: what was finished. take: optional note. review acknowledgement: required account of completed and still-pending requests after reading all conversation pages.'),
-    for: z.string().max(40).optional().describe('write: optional role this handoff is addressed to, such as "reviewer". A session that declares that role in brain_sync sees it first; every other session still sees it. A label only: it does not reserve the work.'),
+    for: z.string().max(40).optional().describe('write: recipient client or role, such as Codex, Claude Code or reviewer; required for assignment. Matching clients or roles see it first. list: filter to that recipient. A hint, not authorization, a reservation or an agent launcher.'),
   },
 }, async ({ action, project, canvas, ...rest }, extra) => {
   const identity = extra?.klypixRequestIdentity || {};
   const stamp = mcpIdentityStamp(extra);
   const result = await opBrainHandoff({
     vault: project ? path.resolve(project) : mcpPresence.vault,
-    canvas: canvas || boundBrainCanvas(undefined),
+    // An explicitly named project must not inherit a different connection's
+    // absolute brain path. Resolve its own brain even when already bound.
+    canvas: canvas || (project ? path.join(path.resolve(project), 'brain.klypix') : boundBrainCanvas(undefined)),
     action: action || 'write',
     from: { sessionId: identity.sessionId || mcpPresence.id, client: identity.clientInfo?.client || extra?.klypixClientName || 'unknown', model: stamp.model, role: stamp.role || '' },
     capturedBy: stamp,
@@ -1666,8 +1669,8 @@ server.registerTool('brain_sync', {
           // 1.103.0: a card KLYPIX drafted in THIS pass from a dead session's
           // record is announced as such — a lead to verify, not the session's words.
           drafted.length ? `🤝 KLYPIX drafted ${drafted.length} handoff card${drafted.length > 1 ? 's' : ''} just now from the record of a session that stopped without writing one: ${drafted.map((d) => `[${d.id}] “${d.title}”`).join('; ')}. A drafted card is a lead, not a verified state — confirm it with git before relying on it.` : '',
-          formatHandoffCards(cards, { now, max: 5, role: typeof role === 'string' ? role : (boundSessionRow(extra)?.role || '') }),
-          cards.length ? 'Saved handoffs are not verified conversation coverage. On takeover call brain_handoff review and check later/unanswered requests before trusting Next; missing transcripts mean UNKNOWN.' : '',
+          formatHandoffCards(cards, { now, max: 5, role: typeof role === 'string' ? role : (boundSessionRow(extra)?.role || ''), client: report.structured?.self?.client || extra?.klypixRequestIdentity?.clientInfo?.client || extra?.klypixClientName || '' }),
+          cards.length ? 'For an explicit assignment, read its complete saved brief with brain_handoff {action:"read", id}, then take that card. For ordinary session handoffs, review the source conversation for later/unanswered requests; missing transcripts mean UNKNOWN.' : '',
           formatUnfinishedWork(lane, { now, max: 4, ranked: wantsContinue && words.size > 0 }),
         ].filter(Boolean).join('\n\n');
         handoffData = {

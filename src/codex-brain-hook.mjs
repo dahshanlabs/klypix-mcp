@@ -21,6 +21,7 @@ import {
   upsertSession,
 } from './agent-presence.mjs';
 import { recordCodexHookExecution } from './codex-hooks.mjs';
+import { assignmentPromptHint } from './agent-rules.mjs';
 import { opBrainTaskContext } from './klypix-core.mjs';
 import { recoverCodexRolloutRecords } from './session-handoff.mjs';
 // Namespace import (already in-process via the klypix-core chain, so zero added
@@ -743,6 +744,7 @@ async function main() {
     // A STRONG status question is answered from computed state and REPLACES
     // card retrieval (never additive) — the Claude hook's `freshHits = []`.
     const statusMd = await statusDigestContext({ brainPath, sessionId, prompt, sessions, cwd });
+    const assignmentHint = assignmentPromptHint(prompt);
     const context = statusMd ?? await compactTaskContext(projectDir, prompt,
       [...new Set([...(me?.files || []), ...(me?.observedFiles || [])])]);
     emitSystemMessage([
@@ -752,7 +754,7 @@ async function main() {
       // Only on a continue-shaped human prompt — SessionStart printed it once.
       ...(prompt && CONTINUE_PROMPT_RE.test(prompt) ? [unfinishedWorkBlock(brainPath, sessionId)] : []),
       // The human asked for a handoff or named the limit (Codex has one too).
-      ...(prompt && HANDOFF_ASK_PROMPT_RE.test(prompt) ? [CODEX_HANDOFF_HINT] : []),
+      ...(assignmentHint ? [assignmentHint] : prompt && HANDOFF_ASK_PROMPT_RE.test(prompt) ? [CODEX_HANDOFF_HINT] : []),
     ], event);
     return;
   }

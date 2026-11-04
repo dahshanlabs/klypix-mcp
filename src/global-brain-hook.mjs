@@ -22,6 +22,7 @@
 // klypix-format.mjs (+ a node_modules with jszip) where it actually runs.
 
 import { inspectCardEvidence, prepareBrainEvidence } from './brain-evidence.mjs';
+import { assignmentPromptHint } from './agent-rules.mjs';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -5401,7 +5402,8 @@ async function promptRetrieve(lib) {
     const wantsUnfinished = humanText !== null && CONTINUE_RE.test(humanText);
     if (wantsUnfinished) await recoverCodexAsks(sid);
     const unfinished = wantsUnfinished ? unfinishedFooter(sid) : '';
-    const handoffHint = humanText !== null ? handoffAskHint(humanText) : '';
+    const assignmentHint = humanText !== null ? assignmentPromptHint(humanText) : '';
+    const handoffHint = !assignmentHint && humanText !== null ? handoffAskHint(humanText) : '';
     // ── Unified recall (1.87) — the bench-measured two-lane policy ──────────
     // Ported line-for-line from the 2026-09-28 "unified balanced" bench winner
     // (dev/held-out split of real founder prompts; parity-proven against the
@@ -5571,7 +5573,7 @@ async function promptRetrieve(lib) {
     // What this session's last markers ACTUALLY did, when that differs from
     // what they say (1.86.1) — not gated on struct: it is about the markers.
     const capReceipts = captureReceiptsFooter(sid);
-    if (!repeats.length && !freshHits.length && !peers && !inflight && !messages && !drafts && !findings && !statusMd && !capReceipts) return; // nothing → zero output, zero added context
+    if (!repeats.length && !freshHits.length && !peers && !inflight && !messages && !drafts && !findings && !statusMd && !capReceipts && !unfinished && !handoffHint && !assignmentHint) return; // nothing → zero output, zero added context
     const flat = (s) => String(s || '').replace(/\s+/g, ' ').trim();
     const day = (ts) => ts ? new Date(ts).toISOString().slice(0, 10) : '';
     // A card's newest (~ amended …) line leads its preview (1.86.1): a thin ~ is
@@ -5703,6 +5705,7 @@ async function promptRetrieve(lib) {
     if (peers) parts.push(peers.replace(/^\n+/, '')); // live-session presence footer (its own block)
     if (messages) parts.push(messages.replace(/^\n+/, '')); // 📨 inbound deliberate peer notes
     if (unfinished) parts.push(unfinished.replace(/^\n+/, '')); // ⏸️ unfinished work other sessions left (continue-shaped prompt)
+    if (assignmentHint) parts.push(assignmentHint); // explicit task, not whole-session continuation
     if (handoffHint) parts.push(handoffHint.replace(/^\n+/, '')); // 🤝 the human asked for a handoff / named the limit
     process.stdout.write(parts.join('\n\n') + '\n'); // UserPromptSubmit injects stdout as context
 }

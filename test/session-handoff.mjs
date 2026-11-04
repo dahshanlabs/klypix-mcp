@@ -344,7 +344,7 @@ try {
     const names = (await a.listTools()).tools.map((t) => t.name);
     ok(names.includes('brain_handoff'), 'D1 brain_handoff is a registered MCP tool');
     const tool = (await a.listTools()).tools.find((t) => t.name === 'brain_handoff');
-    ok(tool.inputSchema.properties.action?.enum?.join(',') === 'write,take,done,list,review,capture' && tool.annotations.destructiveHint === false, 'D2 the schema names the six actions including conversation review and capture and is non-destructive');
+    ok(tool.inputSchema.properties.action?.enum?.join(',') === 'write,read,take,done,list,review,capture' && tool.annotations.destructiveHint === false, 'D2 the schema names direct read plus the existing handoff actions and is non-destructive');
     await a.callTool({ name: 'brain_sync', arguments: { project, intent: 'Drive upload chooser, step 2', files: ['admin/app/drive/page.tsx'], phase: 'start' } });
     const capture = await a.callTool({ name: 'brain_handoff', arguments: { project, action: 'capture', turns: [{ id: 'request-1', role: 'user', at: Date.now(), text: 'Also verify the last followup' }] } });
     ok(!capture.isError && capture.structuredContent?.captured?.added === 1, 'D2a capture records observed turns over real MCP stdio');

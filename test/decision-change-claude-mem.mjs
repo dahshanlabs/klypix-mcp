@@ -6,7 +6,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { BudgetLedger } from '../bench/decision-change/ledger.mjs';
 import { createObserverBudgetBroker, observerWrapperSource, isolatedEnvironment,
-  observerReservationUsd, OBSERVER_MODEL, claudeMemSettings, prepareClaudeMem } from '../bench/decision-change/claude-mem.mjs';
+  observerReservationUsd, OBSERVER_MODEL, claudeMemSettings, prepareClaudeMem, seedDefaultEmbeddingCache } from '../bench/decision-change/claude-mem.mjs';
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-cmem-adapter-test-'));
 let index = 0;
@@ -34,6 +34,17 @@ async function runWrapper({ body, limit = 10, armBudget = 5, model = OBSERVER_MO
 }
 
 try {
+  const depHome = path.join(root, 'dependencies'), profileHome = path.join(root, 'profile');
+  const suffix = '.cache/chroma/onnx_models/all-MiniLM-L6-v2/onnx';
+  fs.mkdirSync(path.join(depHome, suffix), { recursive: true });
+  assert.equal(seedDefaultEmbeddingCache(profileHome, depHome).seeded, false);
+  for (const name of ['config.json', 'model.onnx', 'special_tokens_map.json', 'tokenizer_config.json', 'tokenizer.json', 'vocab.txt']) fs.writeFileSync(path.join(depHome, suffix, name), `synthetic ${name}`);
+  fs.writeFileSync(path.join(depHome, suffix, 'claude-mem.db'), 'must not copy');
+  const seeded = seedDefaultEmbeddingCache(profileHome, depHome);
+  assert.equal(seeded.seeded, true);
+  assert.equal(Object.keys(seeded.assets).length, 6);
+  assert.equal(fs.existsSync(path.join(profileHome, suffix, 'claude-mem.db')), false, 'Only the six pretrained assets may cross trial profiles');
+  assert.throws(() => seedDefaultEmbeddingCache(profileHome, depHome), /exist/i, 'Never overwrite an existing profile cache');
   assert.equal(observerReservationUsd(0.5), 1.96);
   assert.equal(observerReservationUsd(0.5, 'sonnet'), 6.31);
   const settings = claudeMemSettings({ dataDir: root, observerProfile: root, workerPort: 1234, observerExecutable: 'fixture' });

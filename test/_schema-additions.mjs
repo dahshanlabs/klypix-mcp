@@ -3,7 +3,9 @@
 // optional top-level fields only" — test/tool-schema-freeze.mjs). Each is
 // named here, so an accidental addition still fails every freeze check.
 export const ALLOWED_NEW_PROPERTIES = Object.freeze({
-  brain_sync: Object.freeze(['role', 'agent']),   // 1.109.0 small identity
+  // Decision-change review reports add one optional field; older callers do
+  // not need it. Keep every existing property frozen (including descriptions).
+  brain_sync: Object.freeze(['decision_reviews', 'role', 'agent']), // role / agent: 1.109.0
 });
 
 // The schema as an older snapshot would see it: the listed additions removed

@@ -31,6 +31,25 @@ export const OBSERVER_ENVELOPES = Object.freeze({
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const roundUp = n => Math.ceil((n - 1e-9) * 100) / 100;
 const positive = (n, name) => { if (!Number.isFinite(n) || n <= 0) throw new Error(`${name} must be positive`); return n; };
+const DEFAULT_EMBEDDING_ASSETS = ['config.json', 'model.onnx', 'special_tokens_map.json', 'tokenizer_config.json', 'tokenizer.json', 'vocab.txt'];
+
+// Seed only the vendor's default pretrained files. Never copy a Chroma index,
+// collection, database, observation, or session between benchmark profiles.
+export function seedDefaultEmbeddingCache(home, dependencyHome) {
+  const suffix = '.cache/chroma/onnx_models/all-MiniLM-L6-v2/onnx';
+  const source = path.join(dependencyHome, suffix), target = path.join(home, suffix);
+  if (path.resolve(source) === path.resolve(target)) return { seeded: false, reason: 'Same dependency and profile home' };
+  if (!DEFAULT_EMBEDDING_ASSETS.every(name => {
+    try { return fs.lstatSync(path.join(source, name)).isFile(); } catch { return false; }
+  })) return { seeded: false, reason: 'Default model cache absent or incomplete; native download remains enabled' };
+  fs.mkdirSync(target, { recursive: true, mode: 0o700 });
+  const assets = {};
+  for (const name of DEFAULT_EMBEDDING_ASSETS) {
+    fs.copyFileSync(path.join(source, name), path.join(target, name), fs.constants.COPYFILE_EXCL);
+    assets[name] = createHash('sha256').update(fs.readFileSync(path.join(target, name))).digest('hex');
+  }
+  return { seeded: true, model: 'all-MiniLM-L6-v2', assets };
+}
 
 export function observerReservationUsd(processCapUsd, model = OBSERVER_MODEL) {
   const envelope = OBSERVER_ENVELOPES[OBSERVER_MODEL_ALIASES[model] || model];
@@ -287,6 +306,7 @@ export async function prepareClaudeMem({ repoDir, home, ledger, observerBudgetUs
   fs.copyFileSync(path.join(pluginRoot, '.claude-plugin/plugin.json'), path.join(skillPlugin, '.claude-plugin/plugin.json'));
   fs.cpSync(path.join(pluginRoot, 'skills'), path.join(skillPlugin, 'skills'), { recursive: true });
   const isolatedEnv = isolatedEnvironment(home, env, dependencyHome);
+  metadata.defaultEmbeddingCache = seedDefaultEmbeddingCache(home, dependencyHome);
   const port = await freePort();
   broker = await createObserverBudgetBroker({ ledger, totalBudgetUsd: observerBudgetUsd, processCapUsd, enabled: false });
   const wrapperJs = path.join(binDir, 'observer-wrapper.js');

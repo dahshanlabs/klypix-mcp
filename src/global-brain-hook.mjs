@@ -23,6 +23,7 @@
 
 import { inspectCardEvidence, prepareBrainEvidence } from './brain-evidence.mjs';
 import { assignmentPromptHint } from './agent-rules.mjs';
+import { decisionChangesAtBoundary } from './decision-watch-boundary.mjs';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -6856,7 +6857,25 @@ async function main() {
             orig(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: rules.deny } }));
             return;
         }
+        let decisionContext = '';
+        // Exact native session identity only. A parent's capsule was not served
+        // to its subagent, and a PID/branch-correlated peer is not this task.
+        const hookInput = readHookInput();
+        if (hookInput.session_id && !hookInput.agent_id) {
+            const lane = readSharedLaneChecked();
+            const session = lane.ok && Array.isArray(lane.data?.sessions)
+                ? lane.data.sessions.find(s => s.id === hookInput.session_id) : null;
+            decisionContext = (await decisionChangesAtBoundary({
+                brainPath: BRAIN, sessionId: hookInput.session_id, session,
+            })).text;
+        }
         const contexts = [guardPayload?.hookSpecificOutput?.additionalContext, rules?.context, siblingOverlapContext()].filter(Boolean);
+        if (decisionContext) {
+            // A new decision notice must not hide the ownership advisory that
+            // would otherwise be emitted by the existing fallback below.
+            if (!contexts.length && whose?.text) contexts.push(whose.text);
+            contexts.push(decisionContext);
+        }
         if (contexts.length) {
             orig(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', additionalContext: contexts.join('\n\n') } }));
             return;

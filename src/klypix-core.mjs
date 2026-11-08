@@ -22,6 +22,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { execFileSync } from 'child_process';
 import { prepareBrainEvidence, inspectCardEvidence, formatCardEvidence } from './brain-evidence.mjs';
+import { decisionWatchSnapshots } from './decision-watch.mjs';
 import { looksLikeUnfilledDraft } from './capture-gap.mjs';
 import { z } from 'zod';
 import {
@@ -671,7 +672,7 @@ export async function opBrainTaskContext({
     };
   }
   let struct;
-  try { ({ struct } = await parseKlypix(fs.readFileSync(t.file))); }
+  try { ({ struct } = scopeLockedView(await parseKlypix(fs.readFileSync(t.file)))); }
   catch (e) { return err(`Task context read failed: ${e.message}`); }
   // Crowd safeguards: an open independent pass leaves peer opinions out.
   if (typeof cardFilter === 'function') { try { struct.cards = struct.cards.filter(cardFilter); } catch { /* keep every card */ } }
@@ -856,6 +857,13 @@ export async function opBrainTaskContext({
   const durationMs = Math.max(0, Date.now() - startedAt);
   return {
     blocks: [text(lines.join('\n').slice(0, maxChars))],
+    // Internal snapshots for the worker, from the SAME parse as the supplied
+    // structured capsule. All three lists below are returned even when the
+    // prose budget cuts a line. Correction text is supplied too, so watch its
+    // exact card as well; no query-dependent inference is used by the watcher.
+    decisionWatch: decisionWatchSnapshots([
+      ...hits.map(h => h.card), ...standing, ...fileLessons.map(l => l.card),
+    ].map(card => overlays.get(card.id)?.correction?.by || card)),
     context: {
       mode: 'lexical-fast',
       hits: entries,
@@ -876,6 +884,10 @@ export async function opBrainTaskContext({
           match: lesson.tier,
           file: lesson.file,
           via: lesson.via,
+          ...(overlays.get(lesson.card.id)?.correction ? {
+            correctedBy: clip(overlays.get(lesson.card.id).correction.by.text, 420),
+            correctedById: overlays.get(lesson.card.id).correction.by.id,
+          } : {}),
           ...(lesson.card.ruleDraft ? { ruleCandidate: lesson.card.ruleDraft.spec } : {}),
         })),
       } : {}),

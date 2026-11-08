@@ -1042,6 +1042,9 @@ const publicSession = (session, now) => {
     : {};
   return {
     id: String(session?.id || ''),
+    logicalSessionId: session?.logicalSessionId || null,
+    scopeGeneration: Number(session?.scopeGeneration || 0),
+    scopeStartedAt: Number(session?.scopeStartedAt || 0),
     client: session?.client || 'unknown',
     surface: session?.surface || null,
     branch: session?.branch || null,

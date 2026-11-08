@@ -70,6 +70,7 @@ import * as autoUpdateModule from '../src/mcp-auto-update.mjs';
 import * as brainFormat from '../src/klypix-format.mjs';
 import * as crowd from '../src/crowd-safeguards.mjs';
 import * as crowdReview from '../src/crowd-review.mjs';
+import { syncDecisionWatch, formatDecisionChanges } from '../src/decision-watch.mjs';
 import { resolveToolProfile, toolAllowed, toolProfileLabel, toolProfileInstructions, TOOLS_ENV } from '../src/tool-profile.mjs';
 
 // Real package version for the MCP handshake (was hardcoded '1.0.0', which
@@ -1342,7 +1343,7 @@ server.registerTool('brain_review', {
 
 server.registerTool('brain_sync', {
   title: 'KLYPIX Context Gateway — synchronize task, peers, conflicts, and relevant memory',
-  description: 'APPROVAL-FREE task gateway over the authorized MCP connection. Call FIRST with a concise intent and expected files, again when scope changes, and with phase:"complete" before the final response. One bounded response returns compact task-relevant brain context, active TASK peers (idle connections hidden), one-time messages, structured exact-file conflicts, and late-arrival overlap alerts. A completion that supplies machine-checkable result manifests is fail-closed: invalid, conflicting, or incomparable evidence returns needs-reconciliation and retains task scope. `results` is ONLY for such manifests, never a summary of the work: with nothing machine-checkable to claim, complete without it. Works on any MCP host — it needs only the authorized MCP connection, so native lifecycle hooks are optional. LIMITS: blocking overlap is EXACT-PATH over the declared files of each session plus the edits its host observed; sessions on different branches are also test-merged with git merge-tree (committed work only); a same-folder overlap is an advisory notice; coordination/result reconciliation is machine-local and OS-user-local; a teammate on another computer appears only when KLYPIX network is installed on both computers (presence, intent, files and brain_message, no result reconciliation), and file overlap remains ADVISORY.',
+  description: 'APPROVAL-FREE task gateway over the authorized MCP connection. Call FIRST with a concise intent and expected files, again when scope changes, and with phase:"complete" before the final response. One bounded response returns compact task-relevant brain context, active TASK peers (idle connections hidden), one-time messages, structured exact-file conflicts, and late-arrival overlap alerts. Cards supplied by this task capsule are automatically watched: a later brain_sync checkpoint/complete reports substantive same-card changes and explicit supersession. Pending decision reviews are reported on completion without retaining active file scope. Existing Claude guard hooks and optional trusted Codex hooks can also offer advisory alerts at supported tool boundaries; they do not cancel an already-selected tool call. Without hooks, checks run at brain_sync. Review outcomes are agent-reported, not proof of adoption. A completion that supplies machine-checkable result manifests is fail-closed: invalid, conflicting, or incomparable evidence returns needs-reconciliation and retains task scope. `results` is ONLY for such manifests, never a summary of the work: with nothing machine-checkable to claim, complete without it. Works on any MCP host — it needs only the authorized MCP connection, so native lifecycle hooks are optional. LIMITS: blocking overlap is EXACT-PATH over the declared files of each session plus the edits its host observed; sessions on different branches are also test-merged with git merge-tree (committed work only); a same-folder overlap is an advisory notice; coordination/result reconciliation is machine-local and OS-user-local; a teammate on another computer appears only when KLYPIX network is installed on both computers (presence, intent, files and brain_message, no result reconciliation), and file overlap remains ADVISORY.',
   annotations: {
     destructiveHint: false,
     idempotentHint: true,
@@ -1352,8 +1353,9 @@ server.registerTool('brain_sync', {
     project: z.string().optional().describe('Nonempty absolute current project root that directly contains brain.klypix or brain.any. Supply it on phase "start" so routing stays correct even when the MCP host launches from its own install directory.'),
     intent: z.string().max(160).optional().describe('One sentence describing the current task. Supply for start/checkpoint; completion clears it.'),
     files: z.array(z.string()).max(20).optional().describe('Project-relative files you expect to touch or have touched. Exact overlaps with peers are flagged.'),
-    phase: z.enum(['start', 'checkpoint', 'complete']).optional().describe('start replaces prior task scope; checkpoint merges changed scope; complete clears task intent/files. Default: checkpoint.'),
-    include_context: z.boolean().optional().describe('Include fast task-relevant brain cards and offer queued coordination notes in the same response. Defaults true; false also defers note delivery so internal supervisor probes cannot consume model-visible messages.'),
+    phase: z.enum(['start', 'checkpoint', 'complete']).optional().describe('start replaces prior task scope; checkpoint merges changed scope; complete clears task intent/files. Default: checkpoint. Cards supplied by this task capsule are watched automatically; later checkpoint/complete reports same-card changes and explicit supersession. Pending decision reviews remain visible at completion but do not retain file reservations. Also checked at supported already-configured native hook boundaries; alerts are advisory and do not cancel a selected tool.'),
+    include_context: z.boolean().optional().describe('Include fast task-relevant brain cards and offer queued coordination notes in the same response. Defaults true; false also defers note delivery so internal supervisor probes cannot consume model-visible messages. Completion still checks decisions already supplied to this task.'),
+    decision_reviews: z.unknown().optional().describe('Optional reports after reviewing a decision-change warning: [{change_id,revision,outcome:"adapted"|"not-applicable"|"blocked",note:"what you checked"}]. Use the exact previously offered change and current revision. These are agent-reported dispositions, not independent proof. Omission never means adoption; completion still releases task scope.'),
     // Deliberately permissive at the MCP/Zod boundary. The authoritative,
     // versioned fail-closed validator lives in result-reconcile.mjs and must see
     // malformed/unknown nested fields so it can persist the evidence-required
@@ -1376,7 +1378,7 @@ server.registerTool('brain_sync', {
     role: z.string().max(40).optional().describe('Optional free-text label for this session, such as "reviewer". Peers see it, and a handoff addressed to that role (brain_handoff for) is offered first to a session that declares it. It is a label only: no history, reputation or authority comes with it, and it lasts for this session. An empty string clears it.'),
     agent: z.string().max(200).optional().describe('Only for a subagent: the child id KLYPIX gave it when it started (for example "sub-1a2b3c"). Its intent and files are then recorded under that child id, under its parent session, instead of replacing what the parent declared. KLYPIX accepts only an id the host reported (Claude Code reports subagents); any other id is ignored and the call is recorded under the parent session.'),
   },
-}, async ({ project, intent, files, phase, include_context, results, releaseIntent, releaseClaim, role, agent }, extra) => {
+}, async ({ project, intent, files, phase, include_context, results, releaseIntent, releaseClaim, role, agent, decision_reviews }, extra) => {
   const totalStartedAt = Date.now();
   // A subagent's sync (1.109.0): recorded on its own child entry, never over
   // the parent's task scope. Falls through to the ordinary parent sync when
@@ -1741,6 +1743,23 @@ server.registerTool('brain_sync', {
       }
     } catch { /* never fails a sync */ }
   }
+  // Compare only cards this task was actually supplied, even when completion
+  // requests no retrieval. Presence has already handled scope release: pending
+  // decision reviews are visible work to report, never a permanent file lock.
+  let decisionChanges = null;
+  if ((include_context !== false || phase === 'complete') && report.structured?.brain && !report.isError) {
+    if (mcpPresence.verifyCurrentProjectBinding()) {
+      const self = report.structured.self || {};
+      decisionChanges = await syncDecisionWatch({
+        brainPath: report.structured.brain,
+        sessionId: self.logicalSessionId || self.id,
+        taskGeneration: self.scopeGeneration, taskStartedAt: self.scopeStartedAt,
+        phase, served: taskContext?.decisionWatch || [], reviews: decision_reviews,
+        stateDir: MACHINE_STATE_DIR, scopeReleased: report.structured.status === 'complete',
+      });
+    } else decisionChanges = { status: 'unknown', reason: 'project-binding-changed', scopeReleased: report.structured.status === 'complete' };
+  }
+  const decisionChangeText = formatDecisionChanges(decisionChanges, { completing: phase === 'complete' });
   const totalMs = Math.max(0, Date.now() - totalStartedAt);
   const structuredContent = {
     ...(report.structured || {
@@ -1764,6 +1783,7 @@ server.registerTool('brain_sync', {
     ...(handoffData ? { handoffs: handoffData } : {}),
     ...(lockData ? { lockNotes: lockData } : {}),
     ...(crowdData ? { crowd: crowdData } : {}),
+    ...(decisionChanges ? { decisionChanges } : {}),
   };
   const harnessText = harness?.failed
     ? `KLYPIX harness self-heal needs attention: ${harness.failed} project(s) remain partially aligned; brain_doctor has the exact files.`
@@ -1775,7 +1795,7 @@ server.registerTool('brain_sync', {
   return {
     content: [{
       type: 'text',
-      text: [childNote, report.text, harnessText, shipNotice, releaseReconcileText, captureGapText, lockText, handoffText, contextText, crowdText, timingText].filter(Boolean).join('\n\n'),
+      text: [childNote, report.text, decisionChangeText, harnessText, shipNotice, releaseReconcileText, captureGapText, lockText, handoffText, contextText, crowdText, timingText].filter(Boolean).join('\n\n'),
     }],
     structuredContent: childNote ? { ...structuredContent, subagent: { status: 'not-recorded', note: childNote } } : structuredContent,
     ...(report.isError ? { isError: true } : {}),

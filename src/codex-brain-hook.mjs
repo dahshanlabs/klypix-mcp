@@ -22,6 +22,7 @@ import {
 } from './agent-presence.mjs';
 import { recordCodexHookExecution } from './codex-hooks.mjs';
 import { assignmentPromptHint } from './agent-rules.mjs';
+import { decisionChangesAtBoundary } from './decision-watch-boundary.mjs';
 import { opBrainTaskContext } from './klypix-core.mjs';
 import { recoverCodexRolloutRecords } from './session-handoff.mjs';
 // Namespace import (already in-process via the klypix-core chain, so zero added
@@ -759,6 +760,9 @@ async function main() {
     return;
   }
   if (event === 'PreToolUse' || event === 'PostToolUse') {
+    const decisionContext = (await decisionChangesAtBoundary({
+      brainPath, sessionId, session: sessions.find(session => session.id === sessionId),
+    })).text;
     emitSystemMessage([
       formatConflictWarning(conflicts, event, sessions),
       // Guard cards, advisory tier (2026-08-24): this host cannot deny a tool
@@ -768,6 +772,7 @@ async function main() {
       ...(event === 'PreToolUse' ? [await guardWarnings(projectDir, brainPath, input, cwd)] : []),
       ...(event === 'PreToolUse' ? [await ruleWarnings(projectDir, input, sessionId)] : []),
       stampReceivedMessages(messages, Date.now(), undefined, sessionId),
+      decisionContext,
     ], event);
     return;
   }

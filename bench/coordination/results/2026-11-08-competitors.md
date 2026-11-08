@@ -34,7 +34,7 @@ AGENTS.md / CLAUDE.md by hand, the generous upper bar; "none" = nobody wrote any
 | S5b "Hands off" note whose work is finished (held out) | 0/4 | 4/4 | 4/4 | 0/4 | 0/4 | Same as S5: KLYPIX and notes kept beat none, Concord and Agent Mail |
 | S5c Same note, still valid _(harm check)_ | 4/4 | n/a | 4/4 | 4/4 | 4/4 | Tie: no channel caused harm |
 | S6 A decision made while the agent is working | 0/4 | 3/4 | 4/4 | 0/4 | 0/4 | KLYPIX beats none, Concord and Agent Mail. Notes kept ties everyone. Concord's record + prompt and Agent Mail's mail both landed (read back), but no live push was enabled in these configurations: after their first write the Agent Mail agents never re-read their inbox, and the Concord agents looked only at their own message or task, never again at the other session's task, where the decision was recorded (all 8 transcripts checked) |
-| S9 Continue the work a stopped session left | 0/4 | 4/4 | 4/4 | 0/4 | 0/4 | KLYPIX and notes kept beat none, Concord and Agent Mail. **Structural:** the stopped session wrote nothing, and neither Concord nor Agent Mail records a session's last prompt or reply, so the plan is nowhere in them (they carry only the claim or the expired lease) |
+| S9 Continue the work a stopped session left | 0/4 | 4/4 | 4/4 | 0/4 | 0/4 | KLYPIX and notes kept beat none, Concord and Agent Mail. The tested Concord/Agent Mail stores contained no stopped-session prompt or reply; only a claim or expired lease remained |
 | S10 A live session that has written nothing | 1/4 | 4/4 | 3/4 | 4/4 | 4/4 | Tie: every interval overlaps. All three channels showed the live peer on lib/tax.js |
 
 **Codex (n = 3 per cell; S1, S3, S9, S10; KLYPIX, Concord, Agent Mail only)**
@@ -43,7 +43,7 @@ AGENTS.md / CLAUDE.md by hand, the generous upper bar; "none" = nobody wrote any
 |---|---|---|---|---|
 | S1 A decision changed today | 3/3 | 0/3 | 2/3 | none (KLYPIX vs Concord is 44–100% vs 0–56%, which overlap) |
 | S3 A note left by a session that has ended | 3/3 | 0/3 | 3/3 | none |
-| S9 Continue the work a stopped session left | 3/3 | 0/3 | 0/3 | none (structural for Concord and Agent Mail, as above) |
+| S9 Continue the work a stopped session left | 3/3 | 0/3 | 0/3 | none (the tested Concord/Agent Mail stores contained no stopped-session prompt or reply, as above) |
 | S10 A live session that has written nothing | 0/3 | 0/3 | 0/3 | none: all three fail |
 
 Under Codex, Concord's agent called `start_work` / `finish_work` and never `inspect_work` in S1 and

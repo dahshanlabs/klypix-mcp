@@ -35,7 +35,9 @@ export function shuffleInPlace(list, seed) {
 
 /** Why a (scenario, condition) cell is not run, or null. */
 export function notApplicableReason(scenario, condition, agent = null) {
-  if (agent && typeof condition.notApplicableFor === 'function') { const why = condition.notApplicableFor(agent); if (why) return why; }
+  // A condition may refuse an agent (klypix-installed on Codex) or a scenario it
+  // has no faithful shape for (Concord on a six-month log).
+  if (typeof condition.notApplicableFor === 'function') { const why = condition.notApplicableFor(agent, scenario); if (why) return why; }
   if (scenario.notApplicable?.[condition.id]) return scenario.notApplicable[condition.id];
   if (condition.id === 'agents-md-appended') return appendedNotApplicable(scenario);
   return null;
@@ -157,6 +159,8 @@ export async function runOne({ scenario, condition, agent, run, timeoutMs, keep 
       invalid: isInvalidReason(error), costUsd: res.costUsd ?? null, tokens: res.tokens ?? null, turns: res.turns ?? null,
       durationMs: res.durationMs ?? (Date.now() - started), timedOut: !!res.timedOut,
       ...(isKlypixCondition(condition) && klypixServer ? { klypixServer } : {}),
+      // A third-party channel names the build it measured the same way (Concord: its package version).
+      ...(prep.channelServer ? { channelServer: prep.channelServer } : {}),
       ...(isKlypixCondition(condition) ? { actorListed: prep.actorListed ?? null, semantic: prep.semantic ?? false } : {}),
       ...(hookRuns ? { hookRuns } : {}),
       ...(g.named != null ? { named: g.named, namedSentence: g.namedSentence ?? null } : {}),
@@ -215,6 +219,7 @@ async function main() {
   const total = scenarios.length * runnable.length * agents.length * runs;
   console.log(`${dry ? 'DRY RUN (oracle, no model calls)' : 'LIVE RUN'}: ${scenarios.length} scenario(s) × ${runnable.length} condition(s) × ${agents.length} agent(s) × ${runs} run(s) = ${total} run(s)`);
   if (runnable.some(isKlypixCondition)) console.log(`KLYPIX server: ${klypixServer.version ?? '?'} @ ${klypixServer.commit ?? 'no git'}${klypixServer.dirty ? ' (modified)' : ''} — ${klypixServer.bin}`);
+  for (const c of runnable.filter((x) => typeof x.serverInfo === 'function')) { const info = c.serverInfo(); console.log(`${c.id} server: ${info.version ?? '?'} (pinned ${info.pinned ?? '?'}) — ${info.dir ?? ''}`); }
   // KLYPIX as installed includes search by meaning: a live run needs the
   // prepared copy, proven to load before any model is called, and checked
   // unchanged afterwards (a missing model would be downloaded INTO it).
@@ -242,8 +247,10 @@ async function main() {
   plan.forEach((p, order) => { p.order = order; });
   const experiment = {
     schema: 1,
-    harness: sourceFingerprint(path.dirname(fileURLToPath(import.meta.url)), ['run.mjs', 'report.mjs', 'agents.mjs', 'conditions.mjs', 'scenarios.mjs', 'scenarios-round3.mjs', 'lib']),
+    harness: sourceFingerprint(path.dirname(fileURLToPath(import.meta.url)), ['run.mjs', 'report.mjs', 'agents.mjs', 'conditions.mjs', 'conditions-concord.mjs', 'conditions-agent-mail.mjs', 'scenarios.mjs', 'scenarios-round3.mjs', 'lib']),
     server: runnable.some(isKlypixCondition) ? { ...klypixServer, source: sourceFingerprint(path.dirname(path.dirname(klypixServer.bin)), ['src', 'bin', 'package.json', 'package-lock.json']) } : null,
+    // Third-party channel servers (Concord: version and install dir), so rows cannot be pooled across versions.
+    channels: Object.fromEntries(runnable.filter((c) => typeof c.serverInfo === 'function').map((c) => [c.id, c.serverInfo()])),
     agents: agents.map(a => ({ id: a.id, cli: versions[a.id], options: agentOptionsFor(a) })),
     codexGlobalRules: agents.some(a => a.id === 'codex') ? codexGlobalRulesFingerprint() : null,
     scenarios: scenarios.map(s => s.id), conditions: runnable.map(c => c.id), runs, timeoutMs,

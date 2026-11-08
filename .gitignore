@@ -7,3 +7,5 @@ node_modules/
 klypix-map/
 .demo-repo/
 test/.mutants-*/
+# third-party channel servers installed for bench/coordination (pinned, local; see its README)
+bench/coordination/.vendor/

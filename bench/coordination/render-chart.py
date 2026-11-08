@@ -75,15 +75,45 @@ def wrap_label(text, width=22):
     return "\n".join(lines[:3])
 
 
-def build(summary, out_gif=None, out_png=None, frames=36, hold=30):
-    conds = summary["conditions"]
-    scen = summary["scenarios"]
+SHORT = {"none": "No shared channel", "agents-md-kept": "Notes file, kept tidy", "klypix": "KLYPIX",
+         "concord": "Concord MCP", "agent-mail": "MCP Agent Mail"}
+
+
+def short_version(v):
+    v = str(v or "")
+    for tok in v.replace("@", " ").split():
+        if tok[:1].isdigit() and "." in tok:
+            return tok
+    return ""
+
+
+AGENT_LABELS = {"claude": "Claude Code", "codex": "Codex"}
+
+
+def for_agent(summary, agent):
+    """Keep one agent's cells (a summary can pool Claude and Codex rows)."""
+    scen = []
+    for s in summary["scenarios"]:
+        cells = [c for c in s["cells"] if c.get("agent") in (None, agent)]
+        if cells:
+            scen.append({**s, "cells": cells})
+    keys = {c["condition"] for s in scen for c in s["cells"]}
+    conds = [c for c in summary["conditions"] if c["key"] in keys]
+    return conds, scen
+
+
+def build(summary, out_gif=None, out_png=None, frames=36, hold=30, agent=None):
+    agents = summary.get("agents") or []
+    agent = agent or (agents[0] if agents and isinstance(agents[0], str) else None)
+    conds, scen = for_agent(summary, agent) if agent else (summary["conditions"], summary["scenarios"])
     colours = colour_for(conds)
     ncond, nscen = len(conds), len(scen)
-    small = sum(1 for s in scen for c in s["cells"] if 0 < (c.get("n") or 0) < 5)
+    ns = [c.get("n") or 0 for s in scen for c in s["cells"] if (c.get("n") or 0) > 0]
+    small = sum(1 for n in ns if n < 5)
+    lo_n, hi_n = (min(ns), max(ns)) if ns else (0, 0)
 
-    fig_w = max(10.0, 1.9 * nscen + 2.0)
-    fig, ax = plt.subplots(figsize=(fig_w, 6.2), dpi=100)
+    fig_w = max(10.0, 1.55 * nscen + 2.0)
+    fig, ax = plt.subplots(figsize=(fig_w, 6.6), dpi=100)
     fig.patch.set_facecolor(BG)
     ax.set_facecolor(BG)
 
@@ -124,9 +154,8 @@ def build(summary, out_gif=None, out_png=None, frames=36, hold=30):
     ax.yaxis.grid(True, color=GRID, lw=0.8, zorder=0)
 
     date = str(summary.get("generatedAt", ""))[:10]
-    runs = summary.get("runs")
-    agents = ", ".join(a.get("label") or a.get("key") or str(a) if isinstance(a, dict) else str(a)
-                       for a in summary.get("agents") or [])
+    runs = sum((c.get("n") or 0) + (c.get("invalid") or 0) for s in scen for c in s["cells"]) or summary.get("runs")
+    agents = AGENT_LABELS.get(agent, agent) if agent else ", ".join(str(a) for a in agents)
     fig.text(0.04, 0.95, "Does the agent act on what another session knew?", color=INK, fontsize=15,
              fontweight="bold", ha="left")
     sub = f"Real agents, hidden tests, no LLM judge · {date}"
@@ -137,22 +166,28 @@ def build(summary, out_gif=None, out_png=None, frames=36, hold=30):
     fig.text(0.04, 0.905, sub, color=MUTED, fontsize=9.5, ha="left")
 
     handles = [plt.Rectangle((0, 0), 1, 1, color=colours[c["key"]]) for c in conds]
-    names = [f"{c['label']} {c['version']}" if c.get("version") and c["version"] != "—" else c["label"]
-             for c in conds]
-    leg = ax.legend(handles, names, loc="upper right", ncol=min(ncond, 5), frameon=False, fontsize=9,
-                    bbox_to_anchor=(1.0, 1.10))
+    names = []
+    for c in conds:
+        nm = SHORT.get(c["key"], c["label"].split(" (")[0])
+        ver = short_version(c.get("version"))
+        names.append(f"{nm} {ver}" if ver else nm)
+    leg = ax.legend(handles, names, loc="lower left", ncol=min(ncond, 5), frameon=False, fontsize=10,
+                    bbox_to_anchor=(0.0, 1.0), handlelength=1.2, columnspacing=1.6)
     for t in leg.get_texts():
         t.set_color(INK)
 
     foot = "Bar = pass rate · line = 95% interval · every row is published, including the ones KLYPIX loses"
-    if small:
-        foot = f"⚠ {small} cell{'s' if small != 1 else ''} with fewer than 5 runs: a pilot, not a ranking.   " + foot
-    fig.text(0.04, 0.05, foot, color=MUTED if not small else "#f5c451", fontsize=8.5, ha="left")
+    if small and lo_n <= 2:
+        foot = f"⚠ {small} cell{'s' if small != 1 else ''} with fewer than 3 runs: a pilot, not a ranking.   " + foot
+    elif small:
+        per = f"{lo_n}" if lo_n == hi_n else f"{lo_n}–{hi_n}"
+        foot = f"{per} runs per cell, so intervals are wide: a difference counts only where the lines do not overlap.   " + foot
+    fig.text(0.04, 0.05, foot, color=MUTED if not (small and lo_n <= 2) else "#f5c451", fontsize=8.5, ha="left")
     nm = summary.get("notMeasured") or []
     if nm:
         fig.text(0.04, 0.012, "Not measured: " + ", ".join(x["name"].split(" (")[0] for x in nm),
                  color=MUTED, fontsize=8, ha="left", va="bottom")
-    fig.subplots_adjust(left=0.06, right=0.98, top=0.84, bottom=0.2)
+    fig.subplots_adjust(left=0.05, right=0.99, top=0.80, bottom=0.2)
 
     def ease(t):
         return 1 - (1 - t) ** 3
@@ -185,6 +220,7 @@ def main():
     ap.add_argument("summary", nargs="?")
     ap.add_argument("-o", "--out", default=None)
     ap.add_argument("--png", default=None)
+    ap.add_argument("--agent", default=None, help="claude or codex (default: the first agent in the file)")
     a = ap.parse_args()
     path = a.summary or newest_summary()
     if not path or not os.path.exists(path):
@@ -196,7 +232,7 @@ def main():
         print(f"render-chart: {path}: {e}", file=sys.stderr)
         sys.exit(2)
     out = a.out if (a.out or a.png) else os.path.join(HERE, "..", "..", "docs", "demo", "bench-chart.gif")
-    build(summary, out_gif=out, out_png=a.png)
+    build(summary, out_gif=out, out_png=a.png, agent=a.agent)
     print(f"render-chart: {path} -> {out or ''} {a.png or ''}".strip())
 
 

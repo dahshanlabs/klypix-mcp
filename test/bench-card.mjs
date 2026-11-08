@@ -34,7 +34,7 @@ const PILOT_SUMMARY = path.join(ROOT, 'bench', 'coordination', 'results', '2026-
 // The colour checks below need colour on; a NO_COLOR in the caller's shell
 // (common in agent hosts) must not turn them into false failures.
 delete process.env.NO_COLOR;
-const { buildCard, renderCard, newestSummary } = await import('../bench/coordination/render-card.mjs');
+const { buildCard, renderCard, newestSummary, shortName } = await import('../bench/coordination/render-card.mjs');
 
 let failures = 0;
 const ok = (cond, label) => { console.log(`${cond ? '✓' : '✗'} ${label}`); if (!cond) failures++; };
@@ -57,7 +57,7 @@ const pct = (x) => (x == null ? '—' : `${Math.round(x * 100)}`);
   const labelW0 = Math.min(46, Math.max(24, 100 - fixture.conditions.length * 13 - 1));
   const heads = (head.slice(labelW0).match(/.{1,13}/g) || []).map((t) => t.trim());
   const clip = (t, w) => (t.length <= w ? t : `${t.slice(0, w - 1)}…`);
-  ok(JSON.stringify(heads) === JSON.stringify(fixture.conditions.map((c) => clip(c.label, 12))), `C1: column heads are the file's labels in order, clipped to the column (${heads.join(' | ')})`);
+  ok(JSON.stringify(heads) === JSON.stringify(fixture.conditions.map((c) => clip(shortName(c), 12))), `C1: column heads are the conditions' short names in file order, clipped to the column (${heads.join(' | ')})`);
 
   // Every scenario: line 1 = pass/n per column, line 2 = lo–hi% per column.
   const plain = buildCard(fixture, { width: 100 }).map(([p]) => p);
@@ -125,7 +125,14 @@ const pct = (x) => (x == null ? '—' : `${Math.round(x * 100)}`);
   fs.writeFileSync(bad, '{"generatedAt":"x"}');
   const res2 = run([RENDER, bad]);
   ok(res2.status === 2 && res2.stdout === '' && /missing "conditions"/.test(res2.stderr), 'C3: malformed file → exit 2, empty stdout, names the missing key');
-  ok(newestSummary() === PILOT_SUMMARY, `C3: with no argument the newest *.summary.json in results/ is picked (${path.basename(newestSummary() || '')})`);
+  {
+    // Newest by the file's own generatedAt, not by name or mtime.
+    const at = (p) => String(JSON.parse(fs.readFileSync(p, 'utf8')).generatedAt || '');
+    const dir = path.dirname(PILOT_SUMMARY);
+    const all = fs.readdirSync(dir).filter((n) => n.endsWith('.summary.json')).map((n) => path.join(dir, n));
+    const latest = all.sort((a, b) => at(a).localeCompare(at(b)) || a.localeCompare(b)).at(-1);
+    ok(newestSummary() === latest, `C3: with no argument the summary with the latest generatedAt is picked (${path.basename(newestSummary() || '')})`);
+  }
   const res3 = run([RENDER, '--no-delay']);
   ok(res3.status === 0 && strip(res3.stdout).startsWith('KLYPIX coordination bench · real agents, hidden tests · 2026-11-08'), 'C3: no argument renders that newest file');
   ok(newestSummary(path.join(sandbox, 'empty')) === null, 'C3: an empty results folder yields null, not a throw');

@@ -39,7 +39,15 @@ GREYS = ["#4b5563", "#6b7280", "#9ca3af", "#cbd5e1", "#374151"]
 
 
 def newest_summary():
-    files = sorted(glob.glob(os.path.join(RESULTS, "*.summary.json")), key=os.path.getmtime)
+    def at(p):
+        try:
+            with open(p, encoding="utf-8") as f:
+                return str(json.load(f).get("generatedAt") or "")
+        except Exception:
+            return ""
+    # Newest = the latest generatedAt inside the file; a checkout gives every
+    # file the same mtime, and names do not sort by date.
+    files = sorted(glob.glob(os.path.join(RESULTS, "*.summary.json")), key=lambda p: (at(p), p))
     return files[-1] if files else None
 
 

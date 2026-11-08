@@ -38,6 +38,10 @@ const sleep = (ms) => (ms > 0 ? new Promise((r) => setTimeout(r, ms)) : Promise.
 export function newestSummary(dir = RESULTS_DIR) {
   let names = [];
   try { names = fs.readdirSync(dir).filter((f) => f.endsWith('.summary.json')).sort(); } catch { names = []; }
+  // Newest = the latest generatedAt inside the file (file names and mtimes do
+  // not order results: a checkout stamps every file with the same time).
+  const at = (n) => { try { return String(JSON.parse(fs.readFileSync(path.join(dir, n), 'utf8')).generatedAt || ''); } catch { return ''; } };
+  names.sort((a, b) => at(a).localeCompare(at(b)) || a.localeCompare(b));
   return names.length ? path.join(dir, names.at(-1)) : null;
 }
 
@@ -91,6 +95,23 @@ export function shortReason(reason) {
   return first.length > 60 ? `${first.slice(0, 59).trimEnd()}…` : first;
 }
 
+const SHORT = { none: 'No channel', 'agents-md-kept': 'Notes file', klypix: 'KLYPIX', concord: 'Concord', 'agent-mail': 'Agent Mail' };
+export const shortName = (c) => SHORT[c.key] || String(c.label || c.key).split(' (')[0];
+export const shortVersion = (v) => (String(v || '').replace(/@/g, ' ').split(/\s+/).find((t) => /^\d+\.\d/.test(t)) || '');
+
+const AGENT_LABELS = { claude: 'Claude Code', codex: 'Codex' };
+
+// A summary can pool several agents' cells; a card shows one agent.
+export function forAgent(summary, agent) {
+  const agents = summary.agents || [];
+  const key = agent || (typeof agents[0] === 'string' ? agents[0] : null);
+  if (!key) return summary;
+  const scenarios = (summary.scenarios || []).map((s) => ({ ...s, cells: (s.cells || []).filter((c) => c.agent == null || c.agent === key) })).filter((s) => s.cells.length);
+  const keys = new Set(scenarios.flatMap((s) => s.cells.map((c) => c.condition)));
+  const runs = scenarios.reduce((n, s) => n + s.cells.reduce((m, c) => m + (c.n || 0) + (c.invalid || 0), 0), 0);
+  return { ...summary, scenarios, conditions: (summary.conditions || []).filter((c) => keys.has(c.key)), agents: [{ label: AGENT_LABELS[key] || key }], runs };
+}
+
 export function buildCard(summary, { width = WIDTH } = {}) {
   const lines = [];
   const push = (plain, painted = plain) => lines.push([plain, painted]);
@@ -111,9 +132,9 @@ export function buildCard(summary, { width = WIDTH } = {}) {
   let head = padEnd('', labelW); let headP = head;
   let vers = padEnd('', labelW); let versP = vers;
   for (const c of conds) {
-    const l = padEnd(clip(c.label, colW - 1), colW);
+    const l = padEnd(clip(shortName(c), colW - 1), colW);
     head += l; headP += bold(l);
-    const v = padEnd(clip(c.version || '—', colW - 1), colW);
+    const v = padEnd(clip(shortVersion(c.version) || '—', colW - 1), colW);
     vers += v; versP += dim(v);
   }
   push(head.trimEnd(), headP);
@@ -172,8 +193,8 @@ export async function renderCard(summary, { out = (s) => process.stdout.write(`$
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const file = argv.find((a, i) => !a.startsWith('--') && argv[i - 1] !== '--width') || newestSummary();
+  const file = argv.find((a, i) => !a.startsWith('--') && argv[i - 1] !== '--width' && argv[i - 1] !== '--agent') || newestSummary();
   let summary;
-  try { summary = loadSummary(file); } catch (e) { console.error(`render-card: ${e.message}`); process.exit(2); }
+  try { summary = forAgent(loadSummary(file), opt('agent', null)); } catch (e) { console.error(`render-card: ${e.message}`); process.exit(2); }
   await renderCard(summary);
 }

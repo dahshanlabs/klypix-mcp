@@ -31,6 +31,9 @@ const FIXTURE = path.join(ROOT, 'test', 'fixtures', 'bench-card.summary.json');
 const PILOT_JSONL = path.join(ROOT, 'bench', 'coordination', 'results', '2026-11-08-concord-pilot.jsonl');
 const PILOT_SUMMARY = path.join(ROOT, 'bench', 'coordination', 'results', '2026-11-08-concord-pilot.summary.json');
 
+// The colour checks below need colour on; a NO_COLOR in the caller's shell
+// (common in agent hosts) must not turn them into false failures.
+delete process.env.NO_COLOR;
 const { buildCard, renderCard, newestSummary } = await import('../bench/coordination/render-card.mjs');
 
 let failures = 0;

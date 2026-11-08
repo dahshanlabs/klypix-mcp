@@ -84,6 +84,13 @@ function bar(p, width) {
 }
 
 /** Build the card as [plainLine, paintedLine] pairs; the test reads the plain side. */
+// The card is a picture: one short clause per not-measured entry. The full
+// reason lives in the results file and the bench README.
+export function shortReason(reason) {
+  const first = String(reason || '').split(/[;(]| — /)[0].trim().replace(/[.,:]$/, '');
+  return first.length > 60 ? `${first.slice(0, 59).trimEnd()}…` : first;
+}
+
 export function buildCard(summary, { width = WIDTH } = {}) {
   const lines = [];
   const push = (plain, painted = plain) => lines.push([plain, painted]);
@@ -143,12 +150,12 @@ export function buildCard(summary, { width = WIDTH } = {}) {
   }
   push('');
   if (small) {
-    const c = `⚠ ${small} cell${small === 1 ? '' : 's'} with n < 5: a pilot proves the harness ran, it ranks nothing — one run's interval spans most of 0–100%`;
+    const c = `⚠ ${small} cell${small === 1 ? '' : 's'} with n < 5: a pilot, not a ranking`;
     for (const w of wrap(c, width)) push(w, paint('33', w));
   }
   const nm = summary.notMeasured || [];
   if (nm.length) {
-    for (const x of nm) for (const w of wrap(`Not measured · ${x.name} — ${x.reason}`, width)) push(w, dim(w));
+    for (const x of nm) { const t = `Not measured · ${x.name} — ${shortReason(x.reason)}`; for (const w of wrap(t, width)) push(w, dim(w)); }
   }
   const last = 'every row, including the ones we lose · bench/coordination/results/';
   push(last, dim(last));

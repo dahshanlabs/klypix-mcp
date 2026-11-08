@@ -19,14 +19,15 @@
 
 Output docs/demo/bench.gif
 
-Set FontSize 17
-Set Width 1100
-Set Height 780
+Set FontSize 16
+Set Width 1240
+Set Height 820
 Set Padding 14
 Set Theme "Catppuccin Mocha"
 
-# 100 columns is the card's design width; no line is printed wider.
-Type `node bench/coordination/render-card.mjs`
+# The renderer wraps at 96 columns; at 1240 px and 16 pt the terminal is wider
+# than that, so nothing wraps a second time and the title stays on screen.
+Type `node bench/coordination/render-card.mjs --width 96`
 Sleep 600ms
 Enter
 

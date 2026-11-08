@@ -25,9 +25,9 @@ Set Height 820
 Set Padding 14
 Set Theme "Catppuccin Mocha"
 
-# The renderer wraps at 96 columns; at 1240 px and 16 pt the terminal is wider
+# The renderer wraps at 112 columns (five columns plus full scenario names); at 1240 px and 16 pt the terminal is ~117 wide
 # than that, so nothing wraps a second time and the title stays on screen.
-Type `node bench/coordination/render-card.mjs --width 96`
+Type `node bench/coordination/render-card.mjs --width 112`
 Sleep 600ms
 Enter
 

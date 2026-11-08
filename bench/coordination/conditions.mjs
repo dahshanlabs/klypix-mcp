@@ -538,12 +538,14 @@ const klypixInstalled = {
 
 // Planned conditions: listed with the reason they are not run yet, so a
 // report can never imply they were measured.
-// Third-party channels live in their own modules: `conditions-concord.mjs`
-// (runnable when the pinned Concord install is present) and
-// `conditions-agent-mail.mjs` (runnable:false until its adapter is verified).
+// Third-party channels live in their own modules: `conditions-concord.mjs` and
+// `conditions-agent-mail.mjs`, each runnable only when its pinned install is
+// present on the machine.
 const planned = [
   { id: 'claude-messaging', label: 'Claude Code cross-session messaging', reason: 'needs two LIVE Claude sessions; cannot reach a closed session or another vendor, so S3/S4 do not apply by design' },
   { id: 'openmemory', label: 'Memory tool (OpenMemory MCP)', reason: 'third-party server not installed here; adapter must be verified against a pinned version before any result is published' },
+  { id: 'clash', label: 'Clash (Claude Code hook)', reason: 'a Claude Code hook that detects cross-worktree conflicts and keeps no memory, so only the overlapping-work scenarios (S2, S10) could apply, and no adapter exists' },
+  { id: 'agent-mcp', label: 'Agent-MCP', reason: 'no adapter exists; nothing is measured until one is verified against a pinned version' },
 ].map((p) => ({ ...p, runnable: false }));
 
 export const CONDITIONS = [none, relay, agentsMdKept, agentsMdAppended, klypix, klypixInstalled, concord, agentMail, ...planned];

@@ -1,0 +1,58 @@
+{
+  "schema": 1,
+  "purpose": "Setup only; no comparative score",
+  "sourceReceiptSha256": "e009acc137f63c78bbd2f3067de8f62a87387e9e11d528221742134f2a256e29",
+  "at": "2026-11-08T21:49:36.862Z",
+  "modelCredentialsPresent": false,
+  "modelCalls": 0,
+  "saved": [
+    {
+      "content": [
+        {
+          "type": "text",
+          "text": "Saved memory #2: Field report. Project: _benchmark_setup_proof_final_."
+        }
+      ]
+    },
+    {
+      "content": [
+        {
+          "type": "text",
+          "text": "Saved memory #3: Developer guide. Project: _benchmark_setup_proof_final_."
+        }
+      ]
+    }
+  ],
+  "search": {
+    "content": [
+      {
+        "type": "text",
+        "text": "Found 1 result(s) matching \"Which entry describes wildlife?\" (1 obs, 0 sessions, 0 prompts)\n\n### Nov 9, 2026\n\n**General**\n| ID | Time | T | Title | Read |\n|----|------|---|-------|------|\n| #2 | 12:49 AM | ○ | Field report | ~22 |\n"
+      }
+    ]
+  },
+  "deepStatus": {
+    "status": "healthy",
+    "connected": true,
+    "timestamp": "2026-11-08T21:50:17.791Z",
+    "details": "chroma-mcp semantic search round-trip succeeded",
+    "deep": true,
+    "probe": {
+      "ok": true,
+      "stage": "done",
+      "queryLatencyMs": 280
+    }
+  },
+  "health": {
+    "status": "ok",
+    "version": "15.12.0",
+    "initialized": true,
+    "mcpReady": true,
+    "dependencies": {
+      "degraded": false,
+      "statuses": []
+    }
+  },
+  "passed": true,
+  "stopped": true
+}

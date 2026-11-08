@@ -20,6 +20,8 @@ The [third-experiment amendment](2026-11-09-typed-denial-amendment.md) attempted
 typed native denial recognition. Its [result](2026-11-09-native-audit-v2-result.md)
 retains one more interrupted attempt and 29 unstarted cells. Across all three
 experiments, five attempts and $0.06817953 are preserved; no winner is established.
+The [fourth amendment](2026-11-09-final-reconciliation-amendment.md) removes the
+live-journal dependency and requires final typed reconciliation before scoring.
 
 ## Conditions and setup requirements
 

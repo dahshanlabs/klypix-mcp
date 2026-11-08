@@ -1,0 +1,744 @@
+{
+  "schema": 4,
+  "recordedAt": "2026-11-08T22:42:41.958Z",
+  "kind": "fourth-experiment-pre-run-freeze",
+  "experimentOrdinal": 4,
+  "measurementTransport": "native-audit-v3",
+  "sourceCommit": "7a0fd6026c293996e7762268d69ae9591c21d0f0",
+  "sourceTree": "f2bd0d40b75dbd3e6b1895bdfb2402a52fe37519",
+  "sourceClean": true,
+  "releasedCommit": "918329342562a2273b5e1877054d89096320eba2",
+  "priorExperimentSourceCommits": [
+    "6788b78b867efa59a896144adcd1cddae5eb9c04",
+    "fa306f0bda28e8026491729e373a93a78db2f8f9",
+    "86699a5b2de41823d1ae303e67966dde404bd50d"
+  ],
+  "priorProtocolCommit": "41e6f2217ed66d878d576c9432f536da159b4352",
+  "changesSinceThirdExperiment": [
+    "bench/decision-change/agent.mjs",
+    "bench/decision-change/passive-audit.mjs",
+    "bench/decision-change/run.mjs",
+    "bench/decision-change/test-passive-audit.mjs"
+  ],
+  "protocolCommit": "41e6f2217ed66d878d576c9432f536da159b4352",
+  "protocolAmendmentFile": "docs/benchmarks/2026-11-09-final-reconciliation-amendment.md",
+  "protocolAmendmentPending": true,
+  "newExperimentModelCalls": 0,
+  "priorDiagnostics": {
+    "docs/benchmarks/2026-11-09-interrupted-run.md": {
+      "sha256": "24bcb454adbac3d0d88edc2106e74ec9785030d4e0e8dea14b1151354d75d384"
+    },
+    "docs/benchmarks/2026-11-09-interrupted-run.json": {
+      "sha256": "1edc7b9660ea8f6e39778a92b3d975a947359e88f9df10193698dc1aa8f98807"
+    },
+    "docs/benchmarks/2026-11-09-native-audit-v1-result.md": {
+      "sha256": "24c909eb157c8c7463b09fd3d9cc648d2dfc0e8a87e3999b9fe128673d0ed7b5"
+    },
+    "docs/benchmarks/2026-11-09-native-audit-v1-result.json": {
+      "sha256": "5410fa3056f9bb3a564df4068672b5ba8e2eab337dc3a0d862ef5c7f66f16182"
+    },
+    "docs/benchmarks/2026-11-09-native-audit-v2-result.md": {
+      "sha256": "39f24805034cc3e42c191b76f7a237f46504b5a442b26a763c2101779f12aa3f"
+    },
+    "docs/benchmarks/2026-11-09-native-audit-v2-result.json": {
+      "sha256": "4656d015573de136799de923b90e0ac342ff147a749b452bc64a86ef1b9a3e38"
+    }
+  },
+  "priorExperimentPlanSha256": "fbc5bc686eb2824e69878a92aedf2afa69b147667e4d550ce71f68a9ba1feef9",
+  "priorExperiments": [
+    {
+      "ordinal": 1,
+      "label": "original-stdout-diagnostic",
+      "attempted": 2,
+      "notStarted": 28,
+      "apiEquivalentUsd": 0.03482057,
+      "chargedAgainstBudgetUsd": 0.06,
+      "publishedReportFile": "docs/benchmarks/2026-11-09-interrupted-run.json",
+      "publishedReportSha256": "1edc7b9660ea8f6e39778a92b3d975a947359e88f9df10193698dc1aa8f98807",
+      "comparisonEligible": false
+    },
+    {
+      "ordinal": 2,
+      "label": "second-native-audit-v1",
+      "attempted": 2,
+      "notStarted": 28,
+      "apiEquivalentUsd": 0.02421613,
+      "chargedAgainstBudgetUsd": 0.05,
+      "publishedReportFile": "docs/benchmarks/2026-11-09-native-audit-v1-result.json",
+      "publishedReportSha256": "5410fa3056f9bb3a564df4068672b5ba8e2eab337dc3a0d862ef5c7f66f16182",
+      "comparisonEligible": false,
+      "retainedOutcomes": [
+        {
+          "runId": "unchanged-control-notes-notification-r1-9d1b6f27",
+          "condition": "notes-notification",
+          "scenario": "unchanged-control",
+          "originalCategory": "pass",
+          "originalSuccess": true
+        },
+        {
+          "runId": "corrected-decision-klypix-improved-r1-3f15c10f",
+          "condition": "klypix-improved",
+          "scenario": "corrected-decision",
+          "originalCategory": "setup-not-measured",
+          "originalSuccess": false
+        }
+      ]
+    },
+    {
+      "ordinal": 3,
+      "label": "third-native-audit-v2",
+      "attempted": 1,
+      "notStarted": 29,
+      "apiEquivalentUsd": 0.00914283,
+      "chargedAgainstBudgetUsd": 0.03,
+      "publishedReportFile": "docs/benchmarks/2026-11-09-native-audit-v2-result.json",
+      "publishedReportSha256": "4656d015573de136799de923b90e0ac342ff147a749b452bc64a86ef1b9a3e38",
+      "comparisonEligible": false,
+      "retainedOutcomes": [
+        {
+          "runId": "unchanged-control-notes-notification-r1-276714b2",
+          "condition": "notes-notification",
+          "scenario": "unchanged-control",
+          "originalCategory": "setup-not-measured",
+          "originalSuccess": false
+        }
+      ]
+    }
+  ],
+  "baselineSharedLedger": {
+    "sha256": "7bc35b9346cdf2b4957ce29e094d6d5d072f225d16a1c9669fac0c88fdb9af2e",
+    "byteLength": 8914,
+    "budgetLimitUsd": 50,
+    "knownApiEquivalentUsd": 0.06817953,
+    "chargedAgainstBudgetUsd": 0.14,
+    "remainingConservativeBudgetUsd": 49.86,
+    "outstandingReservedUsd": 0,
+    "allReservationsSettledAndKnown": true,
+    "halted": false,
+    "reservationCountIncludingZeroCostAdministrativeHold": 16,
+    "reservations": [
+      {
+        "id": "unchanged-control-notes-notification-r1-8603721e-producer-initial",
+        "kind": "agent:producer-initial",
+        "status": "settle",
+        "actualUsd": 0.004885779999999999,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "unchanged-control-notes-notification-r1-8603721e-consumer",
+        "kind": "agent:consumer",
+        "status": "settle",
+        "actualUsd": 0.00239884,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "unchanged-control-notes-notification-r1-8603721e-producer-update",
+        "kind": "agent:producer-update",
+        "status": "settle",
+        "actualUsd": 0,
+        "actualCents": 0,
+        "maxCents": 196
+      },
+      {
+        "id": "corrected-decision-klypix-improved-r1-397aa6dc-producer-initial",
+        "kind": "agent:producer-initial",
+        "status": "settle",
+        "actualUsd": 0.00476251,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "corrected-decision-klypix-improved-r1-397aa6dc-consumer",
+        "kind": "agent:consumer",
+        "status": "settle",
+        "actualUsd": 0.0139032,
+        "actualCents": 2,
+        "maxCents": 196
+      },
+      {
+        "id": "corrected-decision-klypix-improved-r1-397aa6dc-producer-update",
+        "kind": "agent:producer-update",
+        "status": "settle",
+        "actualUsd": 0.008870240000000001,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "administrative-hold-exposure-audit-20261109",
+        "kind": "administrative-hold",
+        "status": "settle",
+        "actualUsd": 0,
+        "actualCents": 0,
+        "maxCents": 4800
+      },
+      {
+        "id": "unchanged-control-notes-notification-r1-9d1b6f27-producer-initial",
+        "kind": "agent:producer-initial",
+        "status": "settle",
+        "actualUsd": 0.00270397,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "unchanged-control-notes-notification-r1-9d1b6f27-consumer",
+        "kind": "agent:consumer",
+        "status": "settle",
+        "actualUsd": 0.0051306699999999995,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "unchanged-control-notes-notification-r1-9d1b6f27-producer-update",
+        "kind": "agent:producer-update",
+        "status": "settle",
+        "actualUsd": 0.0032992900000000007,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "corrected-decision-klypix-improved-r1-3f15c10f-producer-initial",
+        "kind": "agent:producer-initial",
+        "status": "settle",
+        "actualUsd": 0.00539824,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "corrected-decision-klypix-improved-r1-3f15c10f-consumer",
+        "kind": "agent:consumer",
+        "status": "settle",
+        "actualUsd": 0.00768396,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "corrected-decision-klypix-improved-r1-3f15c10f-producer-update",
+        "kind": "agent:producer-update",
+        "status": "settle",
+        "actualUsd": 0,
+        "actualCents": 0,
+        "maxCents": 196
+      },
+      {
+        "id": "unchanged-control-notes-notification-r1-276714b2-producer-initial",
+        "kind": "agent:producer-initial",
+        "status": "settle",
+        "actualUsd": 0.00278069,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "unchanged-control-notes-notification-r1-276714b2-consumer",
+        "kind": "agent:consumer",
+        "status": "settle",
+        "actualUsd": 0.00276601,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "unchanged-control-notes-notification-r1-276714b2-producer-update",
+        "kind": "agent:producer-update",
+        "status": "settle",
+        "actualUsd": 0.00359613,
+        "actualCents": 1,
+        "maxCents": 196
+      }
+    ],
+    "administrativeHold": "Prior $48 hold launched no model, settled at $0, and remains in the append-only ledger. It is not spending.",
+    "accountingBasis": "CLI-reported API-equivalent cost; actual subscription invoice unknown",
+    "oneGlobalBudgetContinues": true
+  },
+  "observation": {
+    "delivery": "Common passive PostToolBatch observer records exact serialized model-bound tool results",
+    "codeSnapshots": "Common passive PostToolUse and PostToolUseFailure observer records contemporaneous invoice file revisions",
+    "typedNonexecution": "After CLI exit only: exact final stdout session, assistant tool ID/name/input and serialized result binding plus is_error=true and typed user-rejected/reject-config metadata can resolve a pending missing completion as failed and not executed. No journal is read inside a hook.",
+    "livePending": "Unmatched native batches remain pending and are excluded from positive exposure and rework. Checkpoint continuation requires separately paired prior policy or valid native context. No final score is eligible before complete reconciliation.",
+    "proofPrivacy": "Only small matched final stdout provenance is retained; no thinking or unrelated messages are exported.",
+    "permissionPolicyChanged": false,
+    "unknownMissingCompletionsFailClosed": true,
+    "allConditionsIdentical": true,
+    "addsModelGuidance": false,
+    "changesVendorMemoryWorkflow": false,
+    "artifactLocation": "Fresh task-owned system temporary storage; final export occurs after execution"
+  },
+  "unchangedTaskAndLimitFiles": {
+    "bench/decision-change/scenarios.mjs": {
+      "originalGitBlob": "7ea39757fe35dd1697aa4a68efadc02b446de625",
+      "currentGitBlob": "7ea39757fe35dd1697aa4a68efadc02b446de625",
+      "unchanged": true
+    },
+    "bench/decision-change/personal-scenario.mjs": {
+      "originalGitBlob": "7e41bf801ee71274c0b98772f816a39d418ea76a",
+      "currentGitBlob": "7e41bf801ee71274c0b98772f816a39d418ea76a",
+      "unchanged": true
+    },
+    "bench/decision-change/pilot-limits.json": {
+      "originalGitBlob": "5aff18e336266768bf033d36567401256ab8978b",
+      "currentGitBlob": "5aff18e336266768bf033d36567401256ab8978b",
+      "unchanged": true
+    }
+  },
+  "changedFileCount": 35,
+  "sourceFiles": {
+    "bench/decision-change/adapters.mjs": {
+      "rawSha256": "fbe95b4b03e6441200e7bbd74a9f4d90e621850ab72805f3fba04d602b05d28d",
+      "lfNormalizedSha256": "cfd0867898416648cb7924a59ee535933a9c046a76a19f99f527787d38d96f29",
+      "gitBlob": "4fae6a6b724e3673bc6ba7fdcab1de83a3a7cd04"
+    },
+    "bench/decision-change/agent.mjs": {
+      "rawSha256": "1525e88bd390a5af3e3a477a78e5a2033b06727245d2c60561095e8371187725",
+      "lfNormalizedSha256": "a9837199df07e32ca94bd2e28db5c68e8e6d7e3f11eca151a3874aad92518b9d",
+      "gitBlob": "58e265cc5583184c03a302cd71cb85a1d787f05a"
+    },
+    "bench/decision-change/claude-mem.mjs": {
+      "rawSha256": "1277f76571221172672413deef77c8e1990daa2d87aed7e295b8d2d1bf177dfe",
+      "lfNormalizedSha256": "40496920e12e6468cb8fd94743626a055c66d46660ff5d257c66c712aeb9a12d",
+      "gitBlob": "804d7f26b1eee78119e5e8ff9be6bc07bd3d33e4"
+    },
+    "bench/decision-change/gate.mjs": {
+      "rawSha256": "b150b2988161ba110f1adfbac2e57af9a4cd661b416a4126349a631fe4d7fc6c",
+      "lfNormalizedSha256": "3c1e382faccb376c4b971694af87207d9ca6b4d349d5d8b971235d207e1e009e",
+      "gitBlob": "1ee72c9f9403aac85a4bf13a4a310e6cf0794dd0"
+    },
+    "bench/decision-change/isolation.mjs": {
+      "rawSha256": "d9fd3b5a4f8b2ff74a0ec10ed9c9f149c69caa21855f23da0fbd05c9b0679e97",
+      "lfNormalizedSha256": "140ef9afab8d6986a5b85c84406b2eb5836029a0213f208cff34858c5da927c0",
+      "gitBlob": "dc8f12e75c9f5f8549b88f671922b4c316b83e91"
+    },
+    "bench/decision-change/ledger.mjs": {
+      "rawSha256": "4b69ef977c4cc3bcef2f212a8f6db90eb76a6512a95f20b4233f968e3ffda61c",
+      "lfNormalizedSha256": "5b49f2837bde7760dcff5fd305215ac96ffc4e0477e0886aadfa26bc111eb229",
+      "gitBlob": "25e7f8bea3e0bc483d7844ff88b235ba1e18e997"
+    },
+    "bench/decision-change/metrics.mjs": {
+      "rawSha256": "43226be03f4c2022c5c44beabb2dbd61e51d5c98bb1f0a2624f68c8a65dd1be3",
+      "lfNormalizedSha256": "90de9355a1fb40fc634e99732c93b17ee981ff9432435b235b4ef205de922d9a",
+      "gitBlob": "8266003c14bd331a8926c42dc7caaf120afe52e1"
+    },
+    "bench/decision-change/native-hooks.mjs": {
+      "rawSha256": "a4a26cc16b9fe19ba17177e86cd7ce1446605a526578ff569168529cbb03dd3f",
+      "lfNormalizedSha256": "0960fee2adc70acf02890d8105feafa1c785db665ffd6f81bc7d4bd7e7a9bdf2",
+      "gitBlob": "c81626822c57ab84d0350911fe9115bcb8c3a2ad"
+    },
+    "bench/decision-change/notes-notify-hook.mjs": {
+      "rawSha256": "21371875c1ee847df36b5638e24a05b3008216b304556e018041f9e1f8eccfa8",
+      "lfNormalizedSha256": "5835c58c1635a55faed1e39bdba31fdcf34ec999584641d00910c8a59d4dd8e4",
+      "gitBlob": "f4f8f3b6873b6b86c6e8f0dfe23191872f034727"
+    },
+    "bench/decision-change/outcomes.mjs": {
+      "rawSha256": "cb62f16356fcb351a6f3256f1d2dd49457d0cfe8c7dca23a2216f0e17991bfcd",
+      "lfNormalizedSha256": "c8aced7e4473fa392b761b1ca76bdb904a2978ae4d73c4c3f542d28adc05588f",
+      "gitBlob": "18532757b8fa0bcf920061f09cb2f59a905dbbdb"
+    },
+    "bench/decision-change/passive-audit.mjs": {
+      "rawSha256": "4af6b28f1c27ba4b5f34c6ae030f6e7bfa069f6535fe63c2a84bd2cca57aeb9d",
+      "lfNormalizedSha256": "4af6b28f1c27ba4b5f34c6ae030f6e7bfa069f6535fe63c2a84bd2cca57aeb9d",
+      "gitBlob": "3f8461130cea50b498d0895fc28297588aaac3a5"
+    },
+    "bench/decision-change/personal-run.mjs": {
+      "rawSha256": "09791253f449914466e9886576053bacf554b366f6385d28766c4a25a7404b66",
+      "lfNormalizedSha256": "baf9fd554b121a8c9fe48b73e1eb70396d9500a95d52ba3806f8fe5ad4647541",
+      "gitBlob": "922a69fb62846077a8324b5c6994576b627cacba"
+    },
+    "bench/decision-change/personal-scenario.mjs": {
+      "rawSha256": "20fc553f206a92481677e58fd208dab2b2227dbb2cb891903948963930f1073c",
+      "lfNormalizedSha256": "392848283b2fbd9d3a7e267ab41554227a1e39c092970571f2e6a29b1b2c4245",
+      "gitBlob": "7e41bf801ee71274c0b98772f816a39d418ea76a"
+    },
+    "bench/decision-change/pilot-limits.json": {
+      "rawSha256": "0891bc1cadf5f13904b0752723521dc69b38b5bce91656f2082b6a4e8f1ef04a",
+      "lfNormalizedSha256": "92779b75879898db9cf639527a2b57f09c651f33d15be7582378498d60ac54b8",
+      "gitBlob": "5aff18e336266768bf033d36567401256ab8978b"
+    },
+    "bench/decision-change/run.mjs": {
+      "rawSha256": "6d9c009a1928468cd0bfa4e3ada7e190ee2a39ec08d19798d1118440a4dec072",
+      "lfNormalizedSha256": "a6bffe60e4a6e81979b55beedb4041720259f3443ffa94984a02ce6a046237af",
+      "gitBlob": "5d294cbd3ccf7e79eaa5e00d037c1eff57e7db04"
+    },
+    "bench/decision-change/scenarios.mjs": {
+      "rawSha256": "68b62ba7a6161edd716580fef001b3d61046129b944588a669e9ce07a0056567",
+      "lfNormalizedSha256": "6be4f2d6efdfa37b606d068fac9887f85fa25fa08d7de5f3b9044e483cac6f02",
+      "gitBlob": "7ea39757fe35dd1697aa4a68efadc02b446de625"
+    },
+    "bench/decision-change/self-test.mjs": {
+      "rawSha256": "dbc2f073681bf9d32d129e4390a78359a251818018fff9bc0cf5166247490c16",
+      "lfNormalizedSha256": "07919ec7eca68a77da143388199c191fb4a25b36f2469218e213c891e477db77",
+      "gitBlob": "70b50faf1158089f2ff8c6d74f8be00eca784b5e"
+    },
+    "bench/decision-change/test-passive-audit.mjs": {
+      "rawSha256": "d6e44c6b27008d5812e8900dcee419c3cbcb1ecf6731b684f88d95b8fb4e5858",
+      "lfNormalizedSha256": "d6e44c6b27008d5812e8900dcee419c3cbcb1ecf6731b684f88d95b8fb4e5858",
+      "gitBlob": "2e98a0be9256f6f88915048eeea891591ef0dfd2"
+    },
+    "bin/klypix-install.mjs": {
+      "rawSha256": "b0e2a8d5f635131995667b021d9557a311b145a01b91bf0042496803e55ba6ea",
+      "lfNormalizedSha256": "02ea527dbe39efd50dc23d97ceb9003c7d6398bddf80a97f50dceac595a0ee0e",
+      "gitBlob": "d51837d5d18d1762a011507c9a000e247975068e"
+    },
+    "bin/klypix-worker.mjs": {
+      "rawSha256": "d79d3b83cce72de4259e5a30fed79a3679012133a1c705fabe6660906676b8a3",
+      "lfNormalizedSha256": "ca49cecd0f142ab1241750decb5e7bfb5c3b346660cb4289fddebba579d6907d",
+      "gitBlob": "017d7b45b5bbc84a3991861ac1e84a00e0a37eda"
+    },
+    "docs/claude-mem-setup-audit-2026-11-08.md": {
+      "rawSha256": "0069c66ce95a49365f1dafd6c0ed3d3237dd265ab3ba5e431862ff475baf940b",
+      "lfNormalizedSha256": "e0eb4b8e0955b71a720e4d431902154498e5c73a1713fbebcb282a711e325dd8",
+      "gitBlob": "c66f9deed97b98e027d9e91b7433a3eddc99cd06"
+    },
+    "docs/decision-change-benchmark.md": {
+      "rawSha256": "5f50ebe52cde875c7685cf745510597dac8cc8f720f85bf9275846167ae9bb99",
+      "lfNormalizedSha256": "726a510062c6d08727d2e59b1a2a569290868b28d2bc55e5f609c9fa453de66f",
+      "gitBlob": "0700e6a191a2f8b7ee470362fc812d3081169576"
+    },
+    "docs/decision-watch.md": {
+      "rawSha256": "a46c08f2e0266fb72946712505db1886ea8a74824283b8bee6eb2e4a98649717",
+      "lfNormalizedSha256": "9a34888b21c79f3bbee5bbcb28275b63b70e7b5a6447974de9d517b92260d9b1",
+      "gitBlob": "acfc06ee4ebe00e18bf92971424663ab874f7ae7"
+    },
+    "docs/differentiation-review-2026-11-08.md": {
+      "rawSha256": "3b0476c5102a61dcd428f5a4e05b270da8c468a719fd2e950d1a869a108abf71",
+      "lfNormalizedSha256": "51df915409206176ea55ef5eaff5f21112f38111d7c85a4b971f359cb45a843f",
+      "gitBlob": "9c9046fa6f5d02a16826ab312698bcff652a8e8e"
+    },
+    "package.json": {
+      "rawSha256": "51cbf783238efb69b3400a28fdadd1d374ca6746e039f3cba94e1820b39e048c",
+      "lfNormalizedSha256": "108190e660e3bf4ed29c250cf266bdd1cf8dc771a422bf70fa4f77979e1d7d1a",
+      "gitBlob": "469aa0315441a8d5f123597108a02090df2532bf"
+    },
+    "src/codex-brain-hook.mjs": {
+      "rawSha256": "5e3f0826313510b7a6fdc868cf1cc90d284652434560dc6597ffe4b4f8495ba1",
+      "lfNormalizedSha256": "c3459068f871795f313ec7a1a25333e5ac10e77fb8cc6a4692a1d5062ab0a14c",
+      "gitBlob": "4867fe208f1f32442b3d053ce16a9f89331a84b5"
+    },
+    "src/decision-watch-boundary.mjs": {
+      "rawSha256": "1b7d494c13e27b4477585108144e51eaf973a9f3cc37b8844f4ba5d8a5a321eb",
+      "lfNormalizedSha256": "b8f54d77259a71f18d79939e54e473d2e2db8a7da509823a334c2201a851cf0d",
+      "gitBlob": "b64c8ce5382b7eb3a4b3cc6ad271dbfe25dbe4b9"
+    },
+    "src/decision-watch.mjs": {
+      "rawSha256": "02afd613356c05edb23fdee16d51ff22c2c649b75e7a359d7bf5a7963e791c91",
+      "lfNormalizedSha256": "0bc07c380632b58bb37e3ff3f7527ad33f72207bcc1a259658b58d20ddf20645",
+      "gitBlob": "ca1aa6c80e26025a57d31971c2d808124a8daab3"
+    },
+    "src/global-brain-hook.mjs": {
+      "rawSha256": "73c044aa7d2d12563dc9af17914f9d8c6339157f9a9467553f048c63db60dc2a",
+      "lfNormalizedSha256": "8514f0dddad4b8f12167f8ac0432868eb82175f781e1c22396e805cf0cd7803a",
+      "gitBlob": "ef356a15b52cad85fb429209e4ae5466510b07d3"
+    },
+    "src/klypix-core.mjs": {
+      "rawSha256": "7013efd8097d1783394740162d2b20206ed209ceaa288fc7f79fba77511d1fc1",
+      "lfNormalizedSha256": "e2ac2a25b64aca230e3bc0abedc5456b5763ce7812e8880d289e32123b4dddbf",
+      "gitBlob": "30ab0c215089fbd511e28b8c99c72403cee6d6c0"
+    },
+    "src/mcp-presence.mjs": {
+      "rawSha256": "7adfdfb412f5e7f7b2d08396139af8a9ef0b092fa672dffd2f8fe623a881151e",
+      "lfNormalizedSha256": "048dc8f91f905cb49b8582421ef2e1dbf83a4a8b94d38caeb96c495542035fe4",
+      "gitBlob": "f0cf1cde6b635bfba8fe3d981b6644f7f17f2b1b"
+    },
+    "test/_schema-additions.mjs": {
+      "rawSha256": "a7cbbb501765557c36136d66d0522558171121adda26bbea7c5940806d2a974a",
+      "lfNormalizedSha256": "5f16fd814fd31aadf1d1222d4465e8c1155fd3207e8857c0ad7a4fb89fc6e03a",
+      "gitBlob": "b05a8ae7993595f2e3dc2912e33b199eaca1cddc"
+    },
+    "test/decision-change-claude-mem.mjs": {
+      "rawSha256": "2a5234b2406dfb24b6e22ea3b4831a9fde47fc0e7cdf670f83dff6d0ef68e9b6",
+      "lfNormalizedSha256": "728469b0bbd25a109b5698e1534873d14e18547c02e80f44b28d2a8908906cfe",
+      "gitBlob": "62e4d9d9b62b82294f65caeeec2a396176911d93"
+    },
+    "test/decision-watch-hooks.mjs": {
+      "rawSha256": "89be4e41711003afdf09e7857c79d5e6e87193208d4d6ad12d6a7f1abd6be6aa",
+      "lfNormalizedSha256": "b27ee4e0e878839c67245ac27c618370d844a854cfd6259053fa6303d158e5a7",
+      "gitBlob": "fc3af4476f327b6e11c7b3b17dbc315e09866c33"
+    },
+    "test/decision-watch.mjs": {
+      "rawSha256": "88b6a912339414b000610f363946690cd09eafb27cca1e36dee36cbc853e9432",
+      "lfNormalizedSha256": "632db27fa25153d66d8b537246ad4506682b26a1f1224855f9cce5cdb31a9182",
+      "gitBlob": "58a9932ae803bd517c9da847a8b0fc8524838f5f"
+    }
+  },
+  "sourceFilesAggregateSha256": "5e61f324d0adce907980eec6d86b2bb345241726f69a594785f05bc440c1bf13",
+  "lineEndingNote": "Raw SHA-256 binds working bytes; LF-normalized SHA-256 explains CRLF checkout differences; git object IDs bind committed source. Earlier artifacts are preserved.",
+  "foregroundLimits": {
+    "model": "claude-haiku-5-5",
+    "effort": "medium",
+    "stageBudgetUsd": 0.5,
+    "maxContextTokens": 1000000,
+    "maxOutputTokens": 128000,
+    "requestOutputLimitTokens": 4096,
+    "inputWorstUsdPerMillion": 1,
+    "outputUsdPerMillion": 2.5,
+    "geographyMultiplier": 1.1,
+    "priceSource": "https://platform.claude.com/docs/en/about-claude/pricing",
+    "limitsSource": "https://platform.claude.com/docs/en/models/overview",
+    "verifiedAt": "2026-11-08",
+    "accountingBasis": "CLI-reported API-equivalent estimates; actual subscription invoice unknown",
+    "reservationNote": "$0.50 process budget plus $1.452 worst extra call (full context and output; expensive cache write; geographic multiplier), rounded up to $1.96. The envelope does not rely on the smaller output environment setting."
+  },
+  "observer": {
+    "product": "claude-mem",
+    "version": "15.12.0",
+    "provider": "claude",
+    "defaultModel": "haiku",
+    "smartTier": "sonnet",
+    "aliases": {
+      "haiku": "claude-haiku-5-5",
+      "sonnet": "claude-sonnet-5-5"
+    },
+    "processCapUsd": 0.5,
+    "trialObserverEnvelopeUsd": 12.62,
+    "sharedGlobalLedger": true
+  },
+  "cli": {
+    "readiness": "verified-static-no-model-calls",
+    "version": "2.1.319 (Claude Code)",
+    "sha256": "2e055732c9d03d22700d9046251a8370b673607bfcc9e4d16a1b0e8fb1345cbd",
+    "packageIntegrity": "sha512-wncPKSYL/zvjs84k7wZEj+IGQx/LjqQNhgnQhzDEibP0yAVBguAs4p8nBfFAEDbDdUc4Z2co+OaKZV1t02xINA==",
+    "packageTarball": "https://registry.npmjs.org/@anthropic-ai/claude-code-win32-x64/-/claude-code-win32-x64-2.1.319.tgz",
+    "sourceEvidenceSha256": "0bd080f6086a40e26d97d3be8991127cfd943a5968940738562159b8c57ef9e7",
+    "pricingRecognition": {
+      "models": [
+        "claude-haiku-5-5",
+        "claude-sonnet-5-5"
+      ],
+      "haikuUsdPerMillion": {
+        "input": 0.1,
+        "output": 0.5,
+        "cacheWrite5m": 0.125,
+        "cacheWrite1h": 0.2,
+        "cacheRead": 0.01,
+        "longPromptAboveTokens": 100000,
+        "longPrompt": {
+          "input": 0.5,
+          "output": 2.5,
+          "cacheWrite5m": 0.625,
+          "cacheWrite1h": 1,
+          "cacheRead": 0.05
+        }
+      },
+      "sonnetUsdPerMillion": {
+        "input": 2,
+        "output": 10,
+        "cacheWrite5m": 2.5,
+        "cacheWrite1h": 4,
+        "cacheRead": 0.1
+      },
+      "modelConfigSource": "https://code.claude.com/docs/en/model-config",
+      "pricingSource": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "verifiedFrom": "Published native executable bundled model catalog and tariff functions"
+    },
+    "budgetEnforcement": {
+      "guard": "limit !== undefined && !(spentThisProcess < limit)",
+      "spentThisProcess": "totalCostUSD - restoredCostUSD",
+      "mainLoopBreak": "budget_exhausted",
+      "resultSubtype": "error_max_budget_usd",
+      "nanFailsClosed": true,
+      "unknownModelPricing": "Default model tariff fallback with unknown marker; never automatically zero",
+      "scope": "Static verification only; no model/API invocation",
+      "managedPricing": "Trusted organization/embedding-host pricing can override list estimates; no local managed file or OS registry policy detected"
+    }
+  },
+  "protocol": "early-boundary-v2",
+  "seed": "decision-change-pilot-20261108",
+  "conditions": [
+    "klypix-released",
+    "klypix-improved",
+    "notes-native",
+    "notes-notification",
+    "claude-mem"
+  ],
+  "correctedRepetitions": 3,
+  "earlyTrials": 25,
+  "personalReplays": 5,
+  "sessionsPerPersonalReplay": 7,
+  "correlatedQuestionsPerReplay": 8,
+  "plan": [
+    {
+      "block": "early-change",
+      "case": "unchanged-control",
+      "condition": "notes-notification",
+      "repetition": 1
+    },
+    {
+      "block": "early-change",
+      "case": "corrected-decision",
+      "condition": "klypix-improved",
+      "repetition": 1
+    },
+    {
+      "block": "personal-longitudinal",
+      "case": null,
+      "condition": "notes-native",
+      "repetition": 1
+    },
+    {
+      "block": "early-change",
+      "case": "unrelated-control",
+      "condition": "claude-mem",
+      "repetition": 1
+    },
+    {
+      "block": "early-change",
+      "case": "unchanged-control",
+      "condition": "klypix-improved",
+      "repetition": 1
+    },
+    {
+      "block": "early-change",
+      "case": "corrected-decision",
+      "condition": "notes-native",
+      "repetition": 1
+    },
+    {
+      "block": "personal-longitudinal",
+      "case": null,
+      "condition": "claude-mem",
+      "repetition": 1
+    },
+    {
+      "block": "early-change",
+      "case": "unrelated-control",
+      "condition": "klypix-released",
+      "repetition": 1
+    },
+    {
+      "block": "early-change",
+      "case": "unchanged-control",
+      "condition": "notes-native",
+      "repetition": 1
+    },
+    {
+      "block": "early-change",
+      "case": "corrected-decision",
+      "condition": "claude-mem",
+      "repetition": 1
+    },
+    {
+      "block": "personal-longitudinal",
+      "case": null,
+      "condition": "klypix-released",
+      "repetition": 1
+    },
+    {
+      "block": "early-change",
+      "case": "unrelated-control",
+      "condition": "notes-notification",
+      "repetition": 1
+    },
+    {
+      "block": "early-change",
+      "case": "unchanged-control",
+      "condition": "claude-mem",
+      "repetition": 1
+    },
+    {
+      "block": "early-change",
+      "case": "corrected-decision",
+      "condition": "klypix-released",
+      "repetition": 1
+    },
+    {
+      "block": "personal-longitudinal",
+      "case": null,
+      "condition": "notes-notification",
+      "repetition": 1
+    },
+    {
+      "block": "early-change",
+      "case": "unrelated-control",
+      "condition": "klypix-improved",
+      "repetition": 1
+    },
+    {
+      "block": "early-change",
+      "case": "unchanged-control",
+      "condition": "klypix-released",
+      "repetition": 1
+    },
+    {
+      "block": "early-change",
+      "case": "corrected-decision",
+      "condition": "notes-notification",
+      "repetition": 1
+    },
+    {
+      "block": "personal-longitudinal",
+      "case": null,
+      "condition": "klypix-improved",
+      "repetition": 1
+    },
+    {
+      "block": "early-change",
+      "case": "unrelated-control",
+      "condition": "notes-native",
+      "repetition": 1
+    },
+    {
+      "block": "early-change",
+      "case": "corrected-decision",
+      "condition": "klypix-improved",
+      "repetition": 2
+    },
+    {
+      "block": "early-change",
+      "case": "corrected-decision",
+      "condition": "notes-native",
+      "repetition": 2
+    },
+    {
+      "block": "early-change",
+      "case": "corrected-decision",
+      "condition": "claude-mem",
+      "repetition": 2
+    },
+    {
+      "block": "early-change",
+      "case": "corrected-decision",
+      "condition": "klypix-released",
+      "repetition": 2
+    },
+    {
+      "block": "early-change",
+      "case": "corrected-decision",
+      "condition": "notes-notification",
+      "repetition": 2
+    },
+    {
+      "block": "early-change",
+      "case": "corrected-decision",
+      "condition": "notes-native",
+      "repetition": 3
+    },
+    {
+      "block": "early-change",
+      "case": "corrected-decision",
+      "condition": "claude-mem",
+      "repetition": 3
+    },
+    {
+      "block": "early-change",
+      "case": "corrected-decision",
+      "condition": "klypix-released",
+      "repetition": 3
+    },
+    {
+      "block": "early-change",
+      "case": "corrected-decision",
+      "condition": "notes-notification",
+      "repetition": 3
+    },
+    {
+      "block": "early-change",
+      "case": "corrected-decision",
+      "condition": "klypix-improved",
+      "repetition": 3
+    }
+  ],
+  "passMarks": {
+    "earlyFunctional": "All 3 corrected repetitions and both controls pass current-policy/untouched-shipping checks; no spurious invoice-change warning in controls",
+    "personal": "At least 7 of 8 source-supported answers, zero unsupported claims, all seven sessions completed; one replay per condition",
+    "continuation": "At least 30% fewer stale-policy-correct code revisions than strongest notes control, no final-accuracy regression, at most 10% higher total model cost; complete matched data required; zero baseline rework means no demonstrated advantage"
+  },
+  "claims": "Fourth experiment is unexecuted. All three earlier experiments and their five original attempts remain published with original outcomes and costs, not replaced or pooled into the fourth comparison. No comparative winner, statistical significance, or cross-tool claim."
+}

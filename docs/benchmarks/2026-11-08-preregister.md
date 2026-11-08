@@ -12,8 +12,10 @@ attempts and $0.03482057 in API-equivalent cost; 28 cells did not start. These
 pass marks remain unchanged. No comparison winner or continuation pass is claimed.
 
 The [second-experiment amendment](2026-11-09-native-observation-amendment.md)
-replaces the observational transport identically for all arms, preserves the
-original attempts and spending, and fixes the source before further model calls.
+replaced the observational transport identically for all arms. Its
+[published result](2026-11-09-native-audit-v1-result.md) retains one notes-control
+pass and a KLYPIX attempt interrupted by misclassified permission denials, with
+28 cells unstarted. Combined spending is $0.05903670; there is still no winner.
 
 ## Conditions and setup requirements
 

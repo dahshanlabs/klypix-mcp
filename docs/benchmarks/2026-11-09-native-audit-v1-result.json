@@ -1,0 +1,105 @@
+{
+  "schema": 1,
+  "kind": "second-experiment-interruption-audit",
+  "sourceCommit": "fa306f0bda28e8026491729e373a93a78db2f8f9",
+  "protocolCommit": "ef80f2a6bd58c3b702621ffad32e13ab25d7beb6",
+  "measurementTransport": "native-audit-v1",
+  "planned": 30,
+  "attempted": 2,
+  "notStarted": 28,
+  "stopReason": "Instrumentation review required",
+  "firstAttemptsPreserved": true,
+  "reruns": 0,
+  "comparisonVerdict": "inconclusive-no-winner",
+  "results": [
+    {
+      "runId": "unchanged-control-notes-notification-r1-9d1b6f27",
+      "condition": "notes-notification",
+      "scenario": "unchanged-control",
+      "originalCategory": "pass",
+      "originalSuccess": true,
+      "failure": null,
+      "apiEquivalentUsd": 0.01113393
+    },
+    {
+      "runId": "corrected-decision-klypix-improved-r1-3f15c10f",
+      "condition": "klypix-improved",
+      "scenario": "corrected-decision",
+      "originalCategory": "setup-not-measured",
+      "originalSuccess": false,
+      "failure": "native-telemetry-invalid",
+      "apiEquivalentUsd": 0.0130822
+    }
+  ],
+  "observations": {
+    "notesControl": "Passed unchanged-policy and preserved-shipping checks with successful Read delivery captured in a completed native batch before the checkpoint; all telemetry checks passed.",
+    "prototype": "Brain-sync retrieval has a valid completion and batch; the checkpoint stopped before policy update because two host-rejected Bash calls lacked per-tool completion hooks.",
+    "cause": "Native host pre-execution permission rejection emits a model-visible failed result and a batch, but no per-tool completion hook. The audit handled schema-validation rejection only and therefore stopped for an instrumentation review.",
+    "permissionPolicyChanged": false,
+    "rejectedResults": [
+      {
+        "toolUseId": "toolu_018Z27cEXyqigDUcQ1vLfYqs",
+        "isError": true,
+        "content": "This command uses shell operators that require approval for safety",
+        "metadata": [
+          {
+            "id": "toolu_018Z27cEXyqigDUcQ1vLfYqs",
+            "non_execution_kind": "user-rejected",
+            "permission_decision": {
+              "decision": "reject",
+              "source": "config"
+            }
+          }
+        ]
+      },
+      {
+        "toolUseId": "toolu_01FraCk1vSPf2izsxMMcaj5B",
+        "isError": true,
+        "content": "This command requires approval",
+        "metadata": [
+          {
+            "id": "toolu_01FraCk1vSPf2izsxMMcaj5B",
+            "non_execution_kind": "user-rejected",
+            "permission_decision": {
+              "decision": "reject",
+              "source": "config"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "cost": {
+    "priorPublishedDiagnosticsApiEquivalentUsd": 0.03482057,
+    "priorConservativeChargeUsd": 0.06,
+    "baselineLedgerSha256": "8ba27137670dc687a344d978fe3d4cc8129ebf6f41a1e29119870724d01f9e63",
+    "priorReservationIds": [
+      "administrative-hold-exposure-audit-20261109",
+      "corrected-decision-klypix-improved-r1-397aa6dc-consumer",
+      "corrected-decision-klypix-improved-r1-397aa6dc-producer-initial",
+      "corrected-decision-klypix-improved-r1-397aa6dc-producer-update",
+      "unchanged-control-notes-notification-r1-8603721e-consumer",
+      "unchanged-control-notes-notification-r1-8603721e-producer-initial",
+      "unchanged-control-notes-notification-r1-8603721e-producer-update"
+    ],
+    "priorAdministrativeHoldPaidUsd": 0,
+    "newKnownApiEquivalentUsd": 0.02421613,
+    "globalKnownApiEquivalentUsd": 0.0590367,
+    "globalApiEquivalentUsd": 0.0590367,
+    "globalChargedAgainstBudgetUsd": 0.11,
+    "globalOutstandingReservedUsd": 0,
+    "globalBudgetLimitUsd": 50,
+    "globalHalted": false,
+    "newUnattributedReservations": 0,
+    "matchedConditionCostsExcludePriorDiagnostics": true,
+    "capIncludesBothExperiments": true,
+    "subscriptionInvoiceCost": "unknown"
+  },
+  "inputHashes": {
+    "experiment": "46ae32dd719591acd1d338bb604e91806cd98d07411e31a6e99f7a07635d4c36",
+    "resultsJsonl": "e496aa851991614038d91b93130b6c44d15a0f14f9c6b4b00621e7baa23fefff",
+    "runSummary": "2c5261ada456cd5eea9885524a83da4ae3f2211ac3abccdcd47edbf9979ab155",
+    "ledger": "9756b993cb3ba85614d1865bb6ea575763d673d88c7f99e48581285f7cf4d765",
+    "prototypeConsumer": "1a690c21e6af20eafe13fc34705b1443f20169549dd892bbd80d8870b1412150"
+  }
+}

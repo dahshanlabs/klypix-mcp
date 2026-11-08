@@ -75,6 +75,89 @@ fs.writeFileSync(path.join(missing.dir, 'broken.event.json'), '{');
 assert.throws(() => missing.read(), 'corrupt telemetry is never silently skipped');
 assert.throws(() => readPassiveAudit(audit.dir, { sessionId: 'someone-else' }), 'session scoping applies when reading preserved records');
 
+// Native acceptEdits/config rejections skip both per-tool completion hooks.
+// Only the same session's exact typed journal result can explain that absence.
+const journalRoot = path.join(home, '.claude', 'projects', 'fixture-project');
+fs.mkdirSync(journalRoot, { recursive: true });
+let denialNumber = 0;
+function denialFixture(mutate = () => {}) {
+  const sessionId = `denial-${++denialNumber}`;
+  const target = preparePassiveAudit({ home, repoDir, sessionId });
+  const call = { tool_name: 'Bash', tool_use_id: 'denied-command', tool_input: { command: 'fixture denied command' },
+    tool_response: 'Arbitrary display text is not the denial proof.' };
+  const assistant = { type: 'assistant', sessionId, cwd: repoDir, isSidechain: false, uuid: 'assistant-id',
+    message: { content: [{ type: 'tool_use', id: call.tool_use_id, name: call.tool_name, input: call.tool_input },
+      { type: 'thinking', thinking: 'PRIVATE_THINKING_MUST_NOT_BE_COPIED' }] } };
+  const result = { type: 'user', sessionId, cwd: repoDir, isSidechain: false, uuid: 'result-id', sourceToolAssistantUUID: assistant.uuid,
+    toolDenialKind: 'user-rejected', permissionDecision: { decision: 'reject', source: 'config', reasonCode: 'fixture-only' },
+    message: { content: [{ type: 'tool_result', tool_use_id: call.tool_use_id, is_error: true, content: call.tool_response }] } };
+  const fixture = { target, call, assistant, result, journal: path.join(journalRoot, `${sessionId}.jsonl`) };
+  mutate(fixture);
+  fs.writeFileSync(fixture.journal, [assistant, result].map(row => JSON.stringify(row)).join('\n') + '\n');
+  return fixture;
+}
+const invokeDenial = fixture => invoke('PostToolBatch', { tool_calls: [fixture.call], transcript_path: fixture.journal }, fixture.target);
+const denied = denialFixture();
+success(invokeDenial(denied));
+const deniedAudit = denied.target.read({ final: true });
+assert.equal(deniedAudit.ok, true);
+assert.equal(deniedAudit.responses[0].notExecuted, true);
+assert.equal(deniedAudit.responses[0].isError, true);
+assert.equal(deniedAudit.records.some(record => record.snapshot), false, 'a rejected command has no execution snapshot');
+assert.equal(JSON.stringify(deniedAudit).includes('PRIVATE_THINKING'), false, 'only matched typed provenance is retained');
+assert.equal(deniedAudit.records[0].calls[0].nativeDenial.source, 'native-session-journal');
+for (const [label, mutate] of [
+  ['foreign session', f => { f.result.sessionId = 'foreign'; }],
+  ['foreign assistant session', f => { f.assistant.sessionId = 'foreign'; }],
+  ['foreign tool', f => { f.assistant.message.content[0].name = 'Read'; }],
+  ['foreign tool ID', f => { f.result.message.content[0].tool_use_id = 'other-tool'; }],
+  ['foreign cwd', f => { f.result.cwd = home; }],
+  ['foreign assistant cwd', f => { f.assistant.cwd = home; }],
+  ['different result body', f => { f.result.message.content[0].content += ' changed'; }],
+  ['successful result', f => { f.result.message.content[0].is_error = false; }],
+  ['accepted permission', f => { f.result.permissionDecision.decision = 'accept'; }],
+  ['different decision source', f => { f.result.permissionDecision.source = 'unverified'; }],
+  ['missing typed denial', f => { delete f.result.toolDenialKind; }],
+  ['different input', f => { f.assistant.message.content[0].input = { command: 'different' }; }],
+  ['unlinked assistant', f => { f.result.sourceToolAssistantUUID = 'unlinked'; }],
+  ['subagent result', f => { f.result.isSidechain = true; }],
+]) {
+  const fixture = denialFixture(mutate); success(invokeDenial(fixture));
+  assert.equal(fixture.target.read({ final: true }).ok, false, `${label} cannot excuse missing completion`);
+}
+const missingJournal = denialFixture();
+missingJournal.journal = path.join(journalRoot, 'missing.jsonl');
+assert.equal(invokeDenial(missingJournal).status, 1);
+assert.equal(missingJournal.target.read().ok, false, 'missing native journal fails closed');
+const outsideJournal = denialFixture(f => { f.journal = path.join(root, `${f.target.sessionId}.jsonl`); });
+assert.equal(invokeDenial(outsideJournal).status, 1);
+assert.equal(outsideJournal.target.read().ok, false, 'journal must remain under isolated Claude home');
+const borrowed = denialFixture();
+const successfulCall = { ...readCall, tool_use_id: 'known-success-with-missing-hook' };
+success(invoke('PostToolBatch', { tool_calls: [borrowed.call, successfulCall], transcript_path: borrowed.journal }, borrowed.target));
+assert.equal(borrowed.target.read().ok, false, 'a known success without completion cannot borrow another call\'s rejection');
+const conflict = denialFixture();
+success(invokeDenial(conflict));
+success(invoke('PostToolUse', { ...conflict.call, tool_response: { stdout: 'ran' } }, conflict.target));
+assert.equal(conflict.target.read().ok, false, 'conflicting completed and rejected evidence is never accepted');
+const normal = denialFixture();
+success(invoke('PostToolUse', { ...normal.call, tool_response: { stdout: 'ran' } }, normal.target));
+normal.journal = path.join(journalRoot, 'does-not-exist.jsonl');
+success(invokeDenial(normal));
+assert.equal(normal.target.read({ final: true }).ok, true, 'normal completed tools never depend on reading a journal');
+const trailing = denialFixture();
+fs.appendFileSync(trailing.journal, '{"unfinished":"unrelated');
+success(invokeDenial(trailing));
+assert.equal(trailing.target.read().ok, true, 'an unrelated incomplete append cannot invalidate complete denial proof');
+const incomplete = denialFixture();
+fs.writeFileSync(incomplete.journal, `${JSON.stringify(incomplete.assistant)}\n${JSON.stringify(incomplete.result)}`);
+success(invokeDenial(incomplete));
+assert.equal(incomplete.target.read().ok, false, 'an unterminated needed record cannot prove denial even if JSON parses');
+const malformed = denialFixture();
+fs.appendFileSync(malformed.journal, '{"malformed":\n');
+assert.equal(invokeDenial(malformed).status, 1);
+assert.equal(malformed.target.read().ok, false, 'malformed completed journal records are never silently skipped');
+
 // Fake executable only: exercises the real stage callback/settlement path
 // without any model, authentication, external service, or live ledger.
 if (process.platform === 'win32') {

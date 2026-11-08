@@ -233,7 +233,8 @@ try {
   assert.equal(gradeFixture(repo, CASES[1], shippingHash).success, false, 'unnecessary policy reversal fails harm control');
   fs.writeFileSync(path.join(repo, 'lib/shipping.mjs'), 'export const shippingCents=()=>0;');
   assert.equal(gradeFixture(repo, CASES[0], shippingHash).success, false, 'unrelated edits fail harm check');
-  console.log('decision-change self-test: budget, isolation, exposure, native hook parity, generic notes notice, observational rework and harm graders passed (zero model calls)');
+  await import('./test-passive-audit.mjs');
+  console.log('decision-change self-test: budget, isolation, exposure, native hook parity, passive native audit, generic notes notice, observational rework and harm graders passed (zero model calls)');
 } finally {
   const target = fs.realpathSync(root);
   assert.ok(path.basename(target).startsWith('decision-change-self-test-'));

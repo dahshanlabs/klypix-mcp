@@ -4,6 +4,7 @@ import os from 'node:os';
 import { spawn, spawnSync } from 'node:child_process';
 import { resolveCli, parseClaudeResult, claudeAllowedTools } from '../coordination/agents.mjs';
 import { freshEnvironment } from './isolation.mjs';
+import { preparePassiveAudit } from './passive-audit.mjs';
 
 export const normalized = text => String(text || '').replace(/\s+/g, ' ').trim();
 
@@ -98,10 +99,12 @@ export function isNormalMemoryRetrieval(response) {
 }
 
 export async function runClaudeStage({ approved, id, role, repoDir, home, prompt, sessionId,
-  config = {}, ledger, limits, transcriptDir, timeoutMs = 300_000, onEvent = null, preReserved = false }) {
+  config = {}, ledger, limits, transcriptDir, timeoutMs = 300_000, onEvent = null, onAuditReady = null, preReserved = false }) {
   if (approved !== true) throw new Error('First paid run requires root budget review; no model call started');
   const cli = resolveCli('claude');
   if (!cli) throw new Error('Claude CLI unavailable');
+  const audit = preparePassiveAudit({ home, repoDir, sessionId, settings: config.settings });
+  onAuditReady?.(audit);
   const maximum = reservationUsd(limits);
   if (preReserved) {
     const prior = ledger.snapshot().reservations.find(r => r.id === id);
@@ -114,7 +117,7 @@ export async function runClaudeStage({ approved, id, role, repoDir, home, prompt
   const mcpFile = path.join(transcriptDir, `${id}.mcp.json`);
   fs.writeFileSync(mcpFile, JSON.stringify({ mcpServers }, null, 2));
   const settingsFile = path.join(transcriptDir, `${id}.settings.json`);
-  if (config.settings) fs.writeFileSync(settingsFile, JSON.stringify(config.settings, null, 2));
+  fs.writeFileSync(settingsFile, JSON.stringify(audit.settings, null, 2));
   const stdoutFile = path.join(transcriptDir, `${id}.out.jsonl`);
   const stderrFile = path.join(transcriptDir, `${id}.err.txt`);
   const args = [...cli.prefix, '-p', '--output-format', 'stream-json', '--verbose',
@@ -122,7 +125,7 @@ export async function runClaudeStage({ approved, id, role, repoDir, home, prompt
     '--model', limits.model, '--effort', limits.effort || 'medium', '--max-budget-usd', String(limits.stageBudgetUsd),
     '--permission-mode', 'acceptEdits', '--allowedTools', claudeAllowedTools(mcpServers).join(','),
     '--disallowedTools', 'Agent,Task,WebSearch,WebFetch',
-    ...(config.settings ? ['--settings', settingsFile] : []), ...(config.claudeArgs || [])];
+    '--settings', settingsFile, ...(config.claudeArgs || [])];
   const env = { ...freshEnvironment(home),
     ...config.env, CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(limits.requestOutputLimitTokens || 4096), MCP_TIMEOUT: '120000',
     MCP_TOOL_TIMEOUT: '330000',
@@ -130,25 +133,35 @@ export async function runClaudeStage({ approved, id, role, repoDir, home, prompt
     BENCH_DECISION_ROLE: role,
     GIT_CONFIG_GLOBAL: path.join(home, 'empty.gitconfig'), GIT_CONFIG_NOSYSTEM: '1' };
   const started = Date.now(); let stdout = ''; let stderr = ''; let pending = ''; let timedOut = false;
+  const telemetryErrors = [];
+  const observedResults = new Set();
   const result = await new Promise(resolve => {
     const child = spawn(cli.command, args, { cwd: repoDir, env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
     const kill = () => {
-      timedOut = true;
       if (process.platform === 'win32') spawnSync('taskkill', ['/T', '/F', '/PID', String(child.pid)], { windowsHide: true, stdio: 'ignore' });
       else child.kill('SIGKILL');
     };
-    const timer = setTimeout(kill, timeoutMs);
+    const timer = setTimeout(() => { timedOut = true; kill(); }, timeoutMs);
+    const observeLine = line => {
+      if (!line.trim()) return;
+      let event;
+      try { event = JSON.parse(line); }
+      catch (error) { telemetryErrors.push(`Malformed stream JSON: ${error.message}`); return; }
+      for (const block of event?.message?.content || []) if (block.type === 'tool_result') observedResults.add(block.tool_use_id);
+      try { if (!telemetryErrors.length) onEvent?.(event); }
+      catch (error) { telemetryErrors.push(`Event observer failed: ${error.message}`); }
+    };
     child.stdout.on('data', chunk => {
       const text = chunk.toString(); stdout += text; fs.appendFileSync(stdoutFile, text); pending += text;
       let newline;
       while ((newline = pending.indexOf('\n')) >= 0) {
         const line = pending.slice(0, newline); pending = pending.slice(newline + 1);
-        try { const event = JSON.parse(line); onEvent?.(event); } catch { /* malformed event retained raw */ }
+        observeLine(line);
       }
     });
     child.stderr.on('data', chunk => { const text = chunk.toString(); stderr += text; fs.appendFileSync(stderrFile, text); });
     child.on('error', error => { clearTimeout(timer); resolve({ code: null, error: error.message }); });
-    child.on('close', code => { clearTimeout(timer); resolve({ code }); });
+    child.on('close', code => { clearTimeout(timer); if (pending.trim()) observeLine(pending); resolve({ code }); });
     child.stdin.end(prompt);
   });
   const parsed = parseClaudeResult(stdout);
@@ -158,8 +171,19 @@ export async function runClaudeStage({ approved, id, role, repoDir, home, prompt
     usage: { tokens: parsed.tokens, model: parsed.model, role } });
   else ledger.unknown(id, { reason: 'Claude did not report total_cost_usd; full reservation consumed, further spending halted' });
   if (unpricedModel) ledger.halt(`Unpriced side model appeared: ${parsed.model}`);
-  return { ...parsed, ok: result.code === 0 && !timedOut && !parsed.resultError && !unpricedModel,
+  let nativeAudit;
+  try {
+    nativeAudit = audit.read({ final: true });
+    telemetryErrors.push(...nativeAudit.errors.map(error => error.error));
+    const audited = new Set(nativeAudit.responses.map(response => response.toolUseId));
+    for (const toolUseId of observedResults) if (!audited.has(toolUseId)) telemetryErrors.push(`Tool result lacks completed native batch audit: ${toolUseId}`);
+  } catch (error) { telemetryErrors.push(`Native audit could not be read: ${error.message}`); }
+  const auditDirectory = path.join(transcriptDir, `${id}.native-audit`);
+  try { fs.cpSync(audit.dir, auditDirectory, { recursive: true, errorOnExist: true, force: false }); }
+  catch (error) { telemetryErrors.push(`Native audit could not be preserved: ${error.message}`); }
+  return { ...parsed, ok: result.code === 0 && !timedOut && !parsed.resultError && !unpricedModel && telemetryErrors.length === 0,
     budgetLimited: /max_budget|budget[_ -](?:usd|limit|exceeded)/i.test(parsed.resultError || ''),
     exitCode: result.code, timedOut, durationMs: Date.now() - started,
-    stdoutFile, stderrFile, error: result.error || parsed.resultError || (unpricedModel ? 'Unpriced side model appeared; review required before more paid work' : null), unpricedModel };
+    stdoutFile, stderrFile, auditDirectory, sessionId, telemetryErrors,
+    error: result.error || parsed.resultError || telemetryErrors[0] || (unpricedModel ? 'Unpriced side model appeared; review required before more paid work' : null), unpricedModel };
 }

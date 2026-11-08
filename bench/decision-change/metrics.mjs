@@ -11,6 +11,7 @@ const isDecisionNotice = text => /(?:## Decision changes: PENDING REVIEW|Decisio
 
 export function createTelemetry({ repoDir }) {
   const calls = new Map(); const revisions = []; const responses = [];
+  const auditCompletions = new Set(), auditResponses = new Set();
   let lastHash;
   function snapshot(meta = {}) {
     try {
@@ -23,6 +24,23 @@ export function createTelemetry({ repoDir }) {
   }
   snapshot({ kind: 'initial' });
   return { revisions, responses, snapshot,
+    observeAudit(audit) {
+      if (!audit.ok) throw new Error(`Native telemetry failed: ${audit.errors.map(error => error.error).join('; ')}`);
+      for (const record of audit.records) {
+        if (record.event === 'PostToolBatch' || auditCompletions.has(record.toolUseId)) continue;
+        auditCompletions.add(record.toolUseId);
+        const state = record.snapshot;
+        if (!state || state.error) {
+          revisions.push({ at: record.at, error: state?.error || 'Missing native source snapshot', kind: 'completed-tool', toolUseId: record.toolUseId });
+        } else if (state.hash !== lastHash) {
+          lastHash = state.hash;
+          revisions.push({ at: record.at, ...state, kind: 'completed-tool', toolUseId: record.toolUseId, tool: record.tool });
+        }
+      }
+      for (const response of audit.responses) if (!auditResponses.has(response.toolUseId)) {
+        auditResponses.add(response.toolUseId); responses.push(response);
+      }
+    },
     observe(event) {
       for (const block of event?.message?.content || []) {
         if (block.type === 'tool_use') calls.set(block.id, { tool: block.name, input: block.input, at: Date.now() });

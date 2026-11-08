@@ -6,9 +6,10 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { BudgetLedger, costBetween } from './ledger.mjs';
-import { inspectClaude, prepareClaudeHome, reservationUsd, runClaudeStage, evidenceTracker, isNormalMemoryRetrieval } from './agent.mjs';
+import { inspectClaude, prepareClaudeHome, reservationUsd, runClaudeStage, isNormalMemoryRetrieval } from './agent.mjs';
+import { MEASUREMENT_TRANSPORT } from './passive-audit.mjs';
 import { prepareCondition } from './adapters.mjs';
-import { CASES, INITIAL_POLICY, matchesInitialPolicy, initialPrompt, consumerPrompt, createFixture, gradeFixture, fileHash } from './scenarios.mjs';
+import { CASES, matchesInitialPolicy, initialPrompt, consumerPrompt, createFixture, gradeFixture, fileHash } from './scenarios.mjs';
 import { createTelemetry, notificationMetrics, gradeRevisions } from './metrics.mjs';
 import { runPersonalReplay } from './personal-run.mjs';
 import { applyFlushOutcome, finalizeOutcome } from './outcomes.mjs';
@@ -25,13 +26,12 @@ export async function runWorkflow({ conditionId, scenario, runId, outDir, ledger
   const artifacts = path.join(outDir, runId); fs.mkdirSync(artifacts, { recursive: true });
   let homeEnv; let originalCode; let shippingHash; let telemetry;
   const gatePath = path.join(scratch, 'checkpoint');
-  const tracker = evidenceTracker(INITIAL_POLICY, { matches: matchesInitialPolicy });
   const sessionIds = {};
   const row = { runId, condition: conditionId, scenario: scenario.id,
-    block: 'early-change', protocol, budgetBefore: ledger.snapshot(),
+    block: 'early-change', protocol, measurementTransport: MEASUREMENT_TRANSPORT, budgetBefore: ledger.snapshot(),
     scope: 'same-host active-session change; controlled barrier; developer-authored fixture',
     startedAt: new Date().toISOString(), stages: [], firstAttempt: true, success: false };
-  let adapter; let consumerPromise; let consumerFinished = false;
+  let adapter; let consumerPromise; let consumerFinished = false; let consumerAudit;
   const preReservedRoles = new Set(); const startedRoles = new Set();
   const stage = async (role, prompt, config = {}) => {
     const sessionId = sessionIds[role] = crypto.randomUUID();
@@ -41,8 +41,9 @@ export async function runWorkflow({ conditionId, scenario, runId, outDir, ledger
         env: { ...homeEnv, ...adapter.agentConfig?.env, ...config.env } },
       ledger, limits, transcriptDir: artifacts, timeoutMs: role === 'consumer' ? timeoutMs : 120_000,
       preReserved: preReservedRoles.has(role),
-      onEvent: role === 'consumer' ? event => { tracker.observe(event); telemetry?.observe(event); } : null });
+      onAuditReady: role === 'consumer' ? audit => { consumerAudit = audit; } : null });
     row.stages.push({ role, ...result });
+    if (result.telemetryErrors?.length) row.notMeasured = 'Native telemetry or stream observation failed; preserve attempt and cost';
     return result;
   };
   try {
@@ -92,12 +93,26 @@ export async function runWorkflow({ conditionId, scenario, runId, outDir, ledger
       return row;
     }
     row.checkpoint = JSON.parse(fs.readFileSync(`${gatePath}.arrived`, 'utf8'));
-    // Evidence is a tool result actually delivered to the running consumer,
-    // not the producer's claim, a memory read by the harness, or an MCP call count.
+    // Only a completed prior batch can have reached the model that requested
+    // this checkpoint. A Read in the checkpoint's own batch does not qualify,
+    // even if its stdout tool_result or PostToolUse audit is already visible.
+    const priorAudit = consumerAudit.read({ before: row.checkpoint.at });
+    if (!priorAudit.ok) {
+      row.failure = 'native-telemetry-invalid'; row.notMeasured = 'Native audit failed before checkpoint';
+      row.telemetryErrors = priorAudit.errors;
+      fs.writeFileSync(`${gatePath}.abort`, 'abort'); await consumerPromise; return row;
+    }
+    telemetry.observeAudit(priorAudit);
     const hookEvidence = await adapter.exposureEvidence?.({ sessionId: sessionIds.consumer }) || [];
-    row.initialEvidence = [...tracker.evidence, ...hookEvidence.filter(item => matchesInitialPolicy(item.text || item.stdout || ''))];
+    const priorContext = hookEvidence.filter(item => {
+      const at = typeof item.at === 'number' ? item.at : Date.parse(item.at);
+      return at <= row.checkpoint.at && (['SessionStart', 'UserPromptSubmit'].includes(item.hookEvent)
+        || priorAudit.latestBatchAt !== null && at <= priorAudit.latestBatchAt);
+    });
+    row.initialEvidence = [...priorAudit.responses.filter(item => !item.isError && matchesInitialPolicy(item.text)),
+      ...priorContext.filter(item => matchesInitialPolicy(item.text || item.stdout || ''))];
     if (!row.initialEvidence.length) {
-      row.initialRetrievalResponses = tracker.responses.filter(isNormalMemoryRetrieval);
+      row.initialRetrievalResponses = priorAudit.responses.filter(isNormalMemoryRetrieval);
       if (row.initialRetrievalResponses.length) {
         row.failure = 'initial-policy-not-retrieved';
         row.causalUpdateMeasurement = 'Not reached: actual memory retrieval did not deliver the required initial policy';
@@ -131,6 +146,7 @@ export async function runWorkflow({ conditionId, scenario, runId, outDir, ledger
     row.policyChangeFinishedAt = new Date().toISOString();
     fs.writeFileSync(`${gatePath}.release`, 'continue');
     const consumer = await consumerPromise;
+    telemetry.observeAudit(consumerAudit.read({ final: true }));
     telemetry.snapshot({ kind: 'final-after-consumer' });
     row.nativeHookEvidence = await adapter.exposureEvidence?.({ sessionId: sessionIds.consumer }) || [];
     row.notifications = notificationMetrics({ responses: telemetry.responses, hookEvidence: row.nativeHookEvidence,
@@ -148,6 +164,10 @@ export async function runWorkflow({ conditionId, scenario, runId, outDir, ledger
     return row;
   } catch (error) {
     row.failure = row.stages.length ? 'execution-error' : 'setup-error'; row.error = String(error.stack || error);
+    if (/audit|telemetry/i.test(error.message)) {
+      row.notMeasured = 'Native telemetry failed; preserve attempt and cost';
+      (row.telemetryErrors ||= []).push({ error: error.message });
+    }
     if (!row.stages.length) row.notMeasured = 'Setup failed before a completed model stage; preserve any incurred cost and diagnostics';
     if (consumerPromise && !consumerFinished) {
       fs.writeFileSync(`${gatePath}.abort`, 'abort');
@@ -211,6 +231,20 @@ export function buildPlan({ conditions, cases = CASES, correctedRepetitions = 3,
   return plan;
 }
 
+export async function runPlanRows(plan, { ledger, reserveFor, execute, onResult = () => {} }) {
+  let attempted = 0, stopReason = null;
+  for (const entry of plan) {
+    if (ledger.remaining() < reserveFor(entry)) { stopReason = 'Insufficient aggregate reserve for next workflow'; break; }
+    const row = await execute(entry);
+    await onResult(row, entry); attempted++;
+    if (row.telemetryErrors?.length || row.stages?.some(stage => stage.telemetryErrors?.length)
+      || row.failure === 'native-telemetry-invalid') { stopReason = 'Instrumentation review required'; break; }
+    if (ledger.snapshot().halted) { stopReason = 'Budget accounting requires review'; break; }
+    if (row.cleanupError) { stopReason = 'Isolated profile cleanup requires review'; break; }
+  }
+  return { attempted, stopReason };
+}
+
 async function main() {
   const args = process.argv.slice(2);
   const opt = (name, fallback = null) => { const at = args.indexOf(`--${name}`); return at < 0 ? fallback : args[at + 1]; };
@@ -253,8 +287,14 @@ async function main() {
   if (!blocks.length || blocks.some(block => !['early-change', 'personal-longitudinal'].includes(block))) throw new Error('Unknown experiment block');
   const plan = buildPlan({ conditions, cases, correctedRepetitions, seed, blocks });
   const planned = plan.map(p => ({ block: p.block, case: p.scenario?.id || null, condition: p.conditionId, repetition: p.repetition }));
-  writeJson(path.join(outDir, 'experiment.json'), { schema: 2, protocol, protocolRevision,
-    noPriorUsageInLedger: ledger.snapshot().reservations.length === 0,
+  const budgetAtStart = ledger.snapshot(), ledgerBaselineBytes = fs.readFileSync(path.resolve(ledgerPath));
+  const ledgerBaseline = { sha256: crypto.createHash('sha256').update(ledgerBaselineBytes).digest('hex'),
+    byteLength: ledgerBaselineBytes.length, reservationIds: budgetAtStart.reservations.map(record => record.id),
+    knownApiEquivalentUsd: budgetAtStart.reservations.filter(record => record.status === 'settle').reduce((sum, record) => sum + record.actualUsd, 0),
+    chargedAgainstBudgetUsd: budgetAtStart.spentCents / 100 };
+  writeJson(path.join(outDir, 'experiment.json'), { schema: 2, protocol, protocolRevision, measurementTransport: MEASUREMENT_TRANSPORT,
+    noPriorUsageInLedger: budgetAtStart.reservations.length === 0,
+    budgetAtStart, ledgerBaseline,
     limits, reservePerStage, ledger: path.resolve(ledgerPath),
     conditions, blocks, cases: cases.map(s => s.id), correctedRepetitions, seed, plan: planned,
     passMarks: { earlyFunctional: 'All 3 corrected repetitions and both controls pass current-policy/untouched-shipping checks; no spurious invoice-change warning in controls',
@@ -263,22 +303,19 @@ async function main() {
     releasedRoot, improvedRoot: ROOT, integration: 'same-host controlled active-session update; no cross-tool ranking claim',
     budgetBasis: 'CLI API-equivalent estimates including observer; actual subscription invoice unknown',
     nativeSessionPersistence: true, sourceHashes: Object.fromEntries(fs.readdirSync(HERE).filter(f => f.endsWith('.mjs')).map(f => [f, fileHash(path.join(HERE, f))])) });
-  let attempted = 0; let stopReason = null;
-  for (const { block, scenario, conditionId, repetition } of plan) {
-    // Consumer and producer-update run concurrently; both reservations must
-    // fit, plus the adapter's own independently reserved observer envelope.
-    if (ledger.remaining() < reservePerStage * (block === 'early-change' ? 2 : 1)) { stopReason = 'Insufficient aggregate reserve for next workflow'; break; }
+  const { attempted, stopReason } = await runPlanRows(plan, { ledger,
+    reserveFor: ({ block }) => reservePerStage * (block === 'early-change' ? 2 : 1),
+    execute: async ({ block, scenario, conditionId, repetition }) => {
     const runId = `${scenario?.id || block}-${conditionId}-r${repetition}-${crypto.randomUUID().slice(0, 8)}`;
     const common = { conditionId, scenario, runId, outDir, ledger, limits, approved: true,
       releasedRoot, improvedRoot: ROOT, credentialFile, claudeMem, protocol };
     const row = block === 'early-change' ? await runWorkflow(common) : await runPersonalReplay(common);
     row.repetition = repetition;
+    return row;
+    }, onResult: (row, { conditionId, scenario, block }) => {
     fs.appendFileSync(output, `${JSON.stringify(row)}\n`);
-    attempted++;
     console.log(`${conditionId} / ${scenario?.id || block}: ${row.notMeasured ? 'NOT MEASURED' : row.success ? 'PASS' : 'FAIL'}${row.failure ? ` (${row.failure})` : ''}; reserved + settled $${((50 - ledger.remaining())).toFixed(2)} API-equivalent`);
-    if (ledger.snapshot().halted) { stopReason = 'Budget accounting requires review'; break; }
-    if (row.cleanupError) { stopReason = 'Isolated profile cleanup requires review'; break; }
-  }
+    } });
   writeJson(path.join(outDir, 'run-summary.json'), { attempted, planned: plan.length, stopReason,
     notStarted: planned.slice(attempted).map(item => ({ ...item, outcomeCategory: 'not-started', reason: stopReason })), budget: ledger.snapshot() });
   if (stopReason) console.log(`Stopped: ${stopReason}. Remaining planned rows are recorded as not started.`);

@@ -2,7 +2,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { prepareClaudeHome, reservationUsd, runClaudeStage, evidenceTracker } from './agent.mjs';
+import { prepareClaudeHome, reservationUsd, runClaudeStage } from './agent.mjs';
+import { MEASUREMENT_TRANSPORT, readPassiveAudit } from './passive-audit.mjs';
 import { prepareCondition } from './adapters.mjs';
 import { createFixture, fileHash } from './scenarios.mjs';
 import { PERSONAL_SESSIONS, personalCapturePrompt, personalRecallPrompt, gradePersonalRecall } from './personal-scenario.mjs';
@@ -14,10 +15,9 @@ export async function runPersonalReplay({ conditionId, runId, outDir, ledger, li
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-decision-change-personal-'));
   const home = path.join(scratch, 'home'), repoDir = path.join(scratch, 'repo');
   const artifacts = path.join(outDir, runId); fs.mkdirSync(artifacts, { recursive: true });
-  const row = { runId, block: 'personal-longitudinal-v1', condition: conditionId, protocol,
+  const row = { runId, block: 'personal-longitudinal-v1', condition: conditionId, protocol, measurementTransport: MEASUREMENT_TRANSPORT,
     scope: 'One persistent isolated project/profile; six chronological capture sessions plus final recall; simulated days with real timestamps',
     startedAt: new Date().toISOString(), budgetBefore: ledger.snapshot(), stages: [], firstAttempt: true, success: false };
-  const tracker = evidenceTracker('', { matches: () => true });
   let adapter; let recallSession;
   try {
     const env = prepareClaudeHome(home, { credentialFile });
@@ -38,9 +38,9 @@ export async function runPersonalReplay({ conditionId, runId, outDir, ledger, li
       if (role === 'personal-recall') recallSession = sessionId;
       const result = await runClaudeStage({ approved, id: `${runId}-${role}`, role, repoDir, home, prompt, sessionId,
         config: { ...adapter.agentConfig, env: { ...env, ...adapter.agentConfig?.env } }, ledger, limits,
-        transcriptDir: artifacts, timeoutMs: 180_000,
-        onEvent: role === 'personal-recall' ? event => tracker.observe(event) : null });
+        transcriptDir: artifacts, timeoutMs: 180_000 });
       row.stages.push({ role, ...result });
+      if (result.telemetryErrors?.length) row.notMeasured = 'Native telemetry or stream observation failed; preserve attempt and cost';
       if (!result.ok) { row.failure = `${role}-failed`; break; }
       const flush = await adapter.flush({ deadlineMs: 120_000 });
       applyFlushOutcome(row, flush, role);
@@ -48,7 +48,9 @@ export async function runPersonalReplay({ conditionId, runId, outDir, ledger, li
       if (fileHash(path.join(repoDir, 'lib/invoice.mjs')) !== codeHash) { row.failure = 'implementation-edited-during-memory-replay'; break; }
       if (role === 'personal-recall') {
         const native = await adapter.exposureEvidence?.({ sessionId }) || [];
-        row.recallEvidence = [...tracker.evidence, ...native];
+        const audit = readPassiveAudit(result.auditDirectory, { sessionId, final: true });
+        if (!audit.ok) throw new Error('Native recall audit failed');
+        row.recallEvidence = [...audit.responses.filter(response => !response.isError), ...native];
         row.grade = gradePersonalRecall(result.finalMessage, row.recallEvidence);
         row.success = row.grade.pass;
         row.failure = row.success ? null : 'recall-current-history-or-support-failed';
@@ -56,6 +58,10 @@ export async function runPersonalReplay({ conditionId, runId, outDir, ledger, li
     }
   } catch (error) {
     row.failure = row.stages.length ? 'execution-error' : 'setup-error'; row.error = String(error.stack || error);
+    if (/audit|telemetry/i.test(error.message)) {
+      row.notMeasured = 'Native telemetry failed; preserve attempt and cost';
+      (row.telemetryErrors ||= []).push({ error: error.message });
+    }
     if (!row.stages.length) row.notMeasured = 'Setup failed before a completed model stage; preserve costs and diagnostics';
   } finally {
     try { applyFlushOutcome(row, await adapter?.flush?.({ deadlineMs: 30_000 }), 'final'); }

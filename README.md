@@ -18,8 +18,9 @@
 
 <sub>Real Claude Code sessions, hidden tests, no LLM judge, 8 Nov 2026. Drawn by CI from
 [the results file](bench/coordination/results/2026-11-08-competitors.md); every row is published,
-including the one KLYPIX loses. Four runs per cell, so only bars whose lines do not overlap are
-differences.</sub>
+including the one KLYPIX loses. Four runs per cell; the report does not establish a general
+ranking. Concord's live-delivery plugin was not enabled in this run. See the
+[comparison scope and configuration limits](docs/comparison.md).</sub>
 
 One `brain.klypix` file, committed with your code, holds what the project decided, what was
 corrected, and what is still open. Claude Code, Codex, Cursor and other MCP coding tools read it

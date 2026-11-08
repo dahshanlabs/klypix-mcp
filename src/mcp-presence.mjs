@@ -976,6 +976,63 @@ export function findMergeConflicts(sessions, selfId, {
   return out;
 }
 
+// Completion releases a live reservation, not the commits it produced. Recheck
+// known peer branches separately from active overlap, including peers that have
+// stopped since this task saw them. This is bounded, local, committed-work-only
+// evidence; a missing ref or failed probe must never become a clean verdict.
+export function completionIntegrationReport({
+  repoDir, branch, peers, truncated = false, budgetMs = 2000,
+  clock = () => Date.now(), mergeTree = mergeTreeConflicts,
+} = {}) {
+  if (!peers?.length && !truncated) return null;
+  const started = clock();
+  const checks = [];
+  for (const peer of peers || []) {
+    let result = null;
+    const budgetExceeded = clock() - started > budgetMs;
+    if (!budgetExceeded) {
+      try { result = mergeTree(repoDir, branch, peer.branch); } catch { /* unknown */ }
+    }
+    // The active-overlap probe filters generated/managed paths as noise. A
+    // conflict only in those paths is still not proof of integration.
+    const filteredConflicts = result?.noiseOnly === true;
+    const status = !result || filteredConflicts ? 'unknown' : (result.clean ? 'clear' : 'conflict');
+    checks.push({
+      id: peer.id, client: peer.client, branch: peer.branch, intent: peer.intent || '',
+      status,
+      files: result?.files?.slice(0, 12) || [],
+      refs: {
+        mine: result ? `${branch}@${String(result.shaA || '').slice(0, 7)}` : (branch || null),
+        theirs: result ? `${peer.branch}@${String(result.shaB || '').slice(0, 7)}` : peer.branch,
+      },
+      ...(filteredConflicts ? { reason: 'excluded-generated-conflicts' }
+        : (!result ? { reason: budgetExceeded ? 'probe-budget-exhausted' : 'refs-or-merge-check-unavailable' } : {})),
+    });
+  }
+  return {
+    status: checks.some((check) => check.status === 'conflict') ? 'conflict'
+      : (truncated || checks.some((check) => check.status === 'unknown') ? 'unknown' : 'clear'),
+    committedOnly: true, scope: 'known-local-peer-branches', truncated, checks,
+  };
+}
+
+function formatCompletionIntegration(report) {
+  if (!report) return '';
+  const pending = report.checks.filter((check) => check.status !== 'clear');
+  return [
+    'KLYPIX completion integration check (known local peer branches; committed work only):',
+    ...report.checks.map((check) => check.status === 'conflict'
+      ? `- Unresolved merge conflict: ${check.refs.mine} vs ${check.refs.theirs}: ${check.files.join(', ')}`
+      : check.status === 'unknown'
+        ? `- Integration unknown: ${check.refs.mine || 'current branch unavailable'} vs ${check.refs.theirs} (${check.reason}).${check.reason === 'excluded-generated-conflicts' ? ' Git found conflicts in managed paths excluded from the overlap report; inspect and resolve them before integrating.' : ''}`
+        : `- No merge conflict in the checked commits: ${check.refs.mine} vs ${check.refs.theirs}.`),
+    report.truncated ? 'Additional peer branches exceeded the bounded check; their integration is unknown.' : '',
+    pending.length || report.truncated
+      ? 'In your final reply, name each unresolved file/branch (or unavailable check) and the next integration step. Say whether ownership or merge order was agreed; a message sent is not agreement. Do not present a clean working tree or passing tests as resolved integration.'
+      : 'This checks text merges only, not behavior or uncommitted work.',
+  ].filter(Boolean).join('\n');
+}
+
 const publicSession = (session, now) => {
   const transport = session?.transport && typeof session.transport === 'object'
     ? Object.fromEntries(Object.entries(session.transport).slice(0, 4).map(([channel, value]) => [
@@ -1405,6 +1462,19 @@ function gitBranch(cwd) {
   }
 }
 
+function gitCommonDir(cwd) {
+  if (!cwd) return null;
+  try {
+    const common = execFileSync('git', ['rev-parse', '--git-common-dir'], {
+      cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 1200, windowsHide: true,
+    }).trim();
+    return common ? canonicalPathKey(fs.realpathSync.native(path.resolve(cwd, common))) : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * The branch THIS SESSION is actually on — the neutral-vendor fix.
  *
@@ -1419,8 +1489,9 @@ function gitBranch(cwd) {
  * workspace the user opened for every host that sets it — Cursor, Cline,
  * Windsurf, VS Code, Codex, Kimi, OpenCode, and anything else that speaks MCP,
  * with no hook and no host-specific code. A host that launches from its own
- * install directory simply yields no branch there, and the vault answer stands
- * exactly as before: strictly more signal, never less.
+ * install directory or a different repository cannot supply this project's
+ * branch. Only the same git common directory (including linked worktrees) can
+ * override the vault's branch; an unknown identity falls back to the vault.
  *
  * Deliberately NOT written into the presence row's `cwd`. That field is
  * session IDENTITY, and the overlap matcher normalizes declared file paths
@@ -1431,8 +1502,11 @@ const hostCwdBranch = (vaultDir) => {
   let hostCwd = null;
   try { hostCwd = process.cwd(); } catch { hostCwd = null; }
   if (hostCwd && path.resolve(hostCwd) !== path.resolve(vaultDir || '')) {
-    const fromHost = gitBranch(hostCwd);
-    if (fromHost) return fromHost;
+    const vaultCommon = gitCommonDir(vaultDir);
+    if (vaultCommon && vaultCommon === gitCommonDir(hostCwd)) {
+      const fromHost = gitBranch(hostCwd);
+      if (fromHost) return fromHost;
+    }
   }
   return gitBranch(vaultDir);
 };
@@ -1529,6 +1603,31 @@ export function createMcpPresence({
   const sentTexts = new Set();
   const notifiedConflicts = new Set();
   const announcedMessageIds = new Set();
+  // Worker-local evidence for this task only, never a new reservation or a
+  // persistent workflow. Retain branch names so an ended peer can still leave
+  // an unresolved integration; always re-read refs before reporting it.
+  let integrationTaskKey = '';
+  const integrationPeers = new Map();
+  let integrationPeersTruncated = false;
+  const resetIntegrationPeers = () => {
+    integrationPeers.clear();
+    integrationPeersTruncated = false;
+  };
+  const rememberIntegrationPeers = (sessions, own) => {
+    if (!own || !compact(own.branch) || !isTaskSession(own)) return;
+    for (const peer of sessions || []) {
+      if (!peer || peer.id === own.id || isSuspectedTwin(peer, own)
+        || !isTaskSession(peer) || !compact(peer.branch) || peer.branch === own.branch
+        || (peer.machine && own.machine && peer.machine !== own.machine)) continue;
+      if (!integrationPeers.has(peer.branch) && integrationPeers.size >= 6) {
+        integrationPeersTruncated = true;
+        continue;
+      }
+      integrationPeers.set(peer.branch, {
+        id: peer.id, client: peer.client, branch: peer.branch, intent: peer.intent || '',
+      });
+    }
+  };
   // Public preflight objects are capabilities, never the authority itself.
   // All trusted fields live only in these private WeakMaps so property mutation,
   // cloning, or replay cannot redirect a later sync.
@@ -2662,6 +2761,9 @@ export function createMcpPresence({
     } else if (!taskStartedAt && !completing) {
       taskStartedAt = now();
     }
+    const nextIntegrationTaskKey = `${resultBrainPath || ''}\0${sessionId}`;
+    if (nextPhase === 'start' || integrationTaskKey !== nextIntegrationTaskKey) resetIntegrationPeers();
+    integrationTaskKey = nextIntegrationTaskKey;
     if (nextPhase === 'checkpoint') checkpointSinceTaskStart = true;
     const hasDefinedResults = results !== undefined;
     const resultsAreEvidenceShaped = hasDefinedResults && isEvidenceShapedResults(results);
@@ -2673,10 +2775,9 @@ export function createMcpPresence({
     // or completion can mutate it. Schema-v2 evidence must prove the scope the
     // session actually declared; accepting a caller-supplied scope would let a
     // result manifest self-attest to different files or a different intent.
-    const activeCompletionScope = completing && resultBrainPath
-      ? listActiveSessions({ brainPath: resultBrainPath, home, now: now() })
-        .find((session) => session.id === sessionId)
-      : null;
+    const activeCompletionSessions = completing && resultBrainPath
+      ? listActiveSessions({ brainPath: resultBrainPath, home, now: now() }) : [];
+    const activeCompletionScope = activeCompletionSessions.find((session) => session.id === sessionId) || null;
 
     if (nextPhase === 'start') {
       if (!resultBrainPath) resultClaimsPending = false;
@@ -2810,6 +2911,14 @@ export function createMcpPresence({
         && (compact(activeCompletionScope.intent) || (activeCompletionScope.files || []).length));
     const clearCompletionScope = completing && !completionBlocked && !completionDeferred;
     const priorCompletionScope = clearCompletionScope ? activeCompletionScope : null;
+    let completionIntegration = null;
+    if (clearCompletionScope && priorCompletionScope && isTaskSession(priorCompletionScope)) {
+      rememberIntegrationPeers(activeCompletionSessions, { ...priorCompletionScope, branch: preparedBranch });
+      completionIntegration = completionIntegrationReport({
+        repoDir: path.dirname(resultBrainPath), branch: preparedBranch,
+        peers: [...integrationPeers.values()], truncated: integrationPeersTruncated,
+      });
+    }
     const shouldDeliverMessages = deliverMessages !== false && include_context !== false;
     const details = {
       event: clearCompletionScope
@@ -2942,9 +3051,10 @@ export function createMcpPresence({
 
     const stamp = now();
     const exactConflicts = findPresenceConflicts(report.sessions, sessionId);
-    // 1.98.0 tiers (see findNearbyWork / findMergeConflicts). Both are skipped
-    // on completion — a finished task has nothing left to collide with.
+    // Live overlap ends with the task. Its committed branch integration is
+    // reported separately from the scope captured before completion above.
     const mergeConflicts = completing ? [] : findMergeConflicts(report.sessions, sessionId, { repoDir: path.dirname(brainPath) });
+    if (!completing) rememberIntegrationPeers(report.sessions, report.sessions.find((row) => row.id === sessionId));
     const nearby = completing ? [] : findNearbyWork(report.sessions, sessionId, {
       excludePeerIds: new Set([...exactConflicts, ...mergeConflicts].map((c) => c.id)),
     });
@@ -3001,7 +3111,9 @@ export function createMcpPresence({
             ? 'The earlier peer was automatically queued an exact-once overlap alert; coordinate ownership before editing.'
             : 'Coordinate ownership before editing the overlapping files.',
         ].join('\n')
-        : 'No exact file overlap is currently reported by another synchronized task.',
+        : clearCompletionScope && !completionBlocked
+          ? 'Active task scope released. This does not establish that its commits integrate with other branches.'
+          : 'No exact file overlap is currently reported by another synchronized task.',
       mergeConflicts.length
         ? [
           'KLYPIX merge-conflict warning (git merge-tree, committed work only — your branches would conflict even though no declared file overlaps):',
@@ -3681,6 +3793,7 @@ export function createMcpPresence({
       },
       peers: snapshot.peers,
       conflicts,
+      ...(completionIntegration ? { completionIntegration } : {}),
       // Additive (1.98.0): same-folder work with no shared file (advisory).
       ...(nearby.length ? { nearby } : {}),
       // Additive: project rules for the files in this session's scope.
@@ -3782,6 +3895,7 @@ export function createMcpPresence({
       messagesText,
       deliveryWarning,
       conflictText,
+      formatCompletionIntegration(completionIntegration),
       formatRulesNotice(projectRules),
       repoStateWarning,
       releaseAdvisoryText,
@@ -3789,6 +3903,7 @@ export function createMcpPresence({
       // The one-line footer every peer sees while any release lease is active.
       releaseFooterLine,
     ].filter(Boolean).join('\n\n');
+    if (clearCompletionScope && !completionBlocked) resetIntegrationPeers();
     return {
       ...report,
       snapshot,

@@ -4982,7 +4982,7 @@ async function capture(lib) {
     // Receipt for correction-driven (cross-area / low-bar) supersedes — the
     // confirmation channel: say WHAT was archived and how to undo a wrong grab.
     if (Array.isArray(stats.corrections) && stats.corrections.length) {
-        process.stderr.write(`[brain] correction supersede: ${stats.corrections.map(c => `"${c.old}" (${c.overlap})`).join('; ')} — archived + arrowed; restore from Archive or ~ update if wrong\n`);
+        process.stderr.write(`[brain] correction supersede: ${stats.corrections.map(c => `"${c.old}" (${c.overlap})`).join('; ')} — archived + arrowed; restore from Archive if wrong (~ does not restore archived cards)\n`);
     }
     // A `closes:` target the engine judged too generic archived NOTHING. It used
     // to archive an arbitrary match silently, so this receipt is the difference
@@ -4996,14 +4996,14 @@ async function capture(lib) {
     // replaced, and a closes: that named no live card — say so, and how to
     // finish the job.
     if (typeof lib.formatCaptureReceipts === 'function') {
-        for (const line of lib.formatCaptureReceipts({ closedCards: stats.closedCards, updateAmended, closesKept: stats.closesKept, stubRepairs: stats.stubRepairs, stubRepairMissing: stats.stubRepairMissing, captureErrors: stats.captureErrors }, { maxEach: 3 })) process.stderr.write(`[brain] ${line}\n`);
+        for (const line of lib.formatCaptureReceipts({ correctionRefused: stats.correctionRefused, closedCards: stats.closedCards, updateAmended, closesKept: stats.closesKept, stubRepairs: stats.stubRepairs, stubRepairMissing: stats.stubRepairMissing, captureErrors: stats.captureErrors }, { maxEach: 3 })) process.stderr.write(`[brain] ${line}\n`);
         // …and the MODEL has to hear the ones that need a re-emit: a Stop
         // hook's exit-0 stderr never reaches it, so these go to a sidecar the
         // next prompt prints once (captureReceiptsFooter). That includes a
         // note folded into an existing card as a stub repair, one NOT re-added
         // because an older hook captured it, and a marker the engine could
         // not apply (third review: those went to stderr only).
-        const forModel = lib.formatCaptureReceipts({ updateAmended, closesKept: stats.closesKept, closeRefused: stats.closeRefused, stubRepairs: stats.stubRepairs, stubRepairMissing: stats.stubRepairMissing, captureErrors: stats.captureErrors }, { maxEach: 3 });
+        const forModel = lib.formatCaptureReceipts({ correctionRefused: stats.correctionRefused, updateAmended, closesKept: stats.closesKept, closeRefused: stats.closeRefused, stubRepairs: stats.stubRepairs, stubRepairMissing: stats.stubRepairMissing, captureErrors: stats.captureErrors }, { maxEach: 3 });
         if (forModel.length) recordCaptureReceipts(sid, forModel.map(line => ({ key: sha('capture|' + line), line })));
     }
     // A capture that had to land around a failing batch (see doCapture).

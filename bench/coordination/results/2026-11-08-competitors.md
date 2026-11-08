@@ -1,5 +1,13 @@
 # Competitors run — 2026-11-08 (KLYPIX vs Concord vs MCP Agent Mail)
 
+> **Configuration interpretation:** these results describe the pinned setups below, not
+> every installation of each product. In particular, Concord's plugin/live host delivery
+> was not enabled. Concord documents live delivery integrations, so an S6 failure here
+> does not establish that the product cannot push messages. S9 describes continuation
+> from an unrecorded prompt in these setups, not a ranking against session-memory tools
+> such as claude-mem or Entire, which were not run. Raw results and grades are unchanged.
+> See the [comparison scope](../../../docs/comparison.md) for the broader evaluation set.
+
 > **Read this first.** Claude Code ran at **n = 4 per cell, not the planned 5**: at the measured
 > $0.51 per run, the fifth pass (~$22) would have taken the run past its ~$100 budget, so it was
 > stopped after pass 4 ($88.99 spent). The bench's own report marks every n < 5 cell as "not a
@@ -25,8 +33,8 @@ AGENTS.md / CLAUDE.md by hand, the generous upper bar; "none" = nobody wrote any
 | S5 A WIP note that outlived its session | 0/4 | 4/4 | 4/4 | 0/4 | 0/4 | KLYPIX and notes kept beat none, Concord and Agent Mail. Concord (stale claim) and Agent Mail (expired lease) both showed the session was gone; the agents still obeyed the dead note |
 | S5b "Hands off" note whose work is finished (held out) | 0/4 | 4/4 | 4/4 | 0/4 | 0/4 | Same as S5: KLYPIX and notes kept beat none, Concord and Agent Mail |
 | S5c Same note, still valid _(harm check)_ | 4/4 | n/a | 4/4 | 4/4 | 4/4 | Tie: no channel caused harm |
-| S6 A decision made while the agent is working | 0/4 | 3/4 | 4/4 | 0/4 | 0/4 | KLYPIX beats none, Concord and Agent Mail. Notes kept ties everyone. Concord's record + prompt and Agent Mail's mail both landed (read back), but neither product pushes: after their first write the Agent Mail agents never re-read their inbox, and the Concord agents looked only at their own message or task, never again at the other session's task, where the decision was recorded (all 8 transcripts checked) |
-| S9 Continue the work a stopped session left | 0/4 | 4/4 | 4/4 | 0/4 | 0/4 | KLYPIX and notes kept beat none, Concord and Agent Mail. **Structural:** the stopped session wrote nothing, and neither Concord nor Agent Mail records a session's last prompt or reply, so the plan is nowhere in them (they carry only the claim or the expired lease) |
+| S6 A decision made while the agent is working | 0/4 | 3/4 | 4/4 | 0/4 | 0/4 | KLYPIX beats none, Concord and Agent Mail. Notes kept ties everyone. Concord's record + prompt and Agent Mail's mail both landed (read back), but no live push was enabled in these configurations: after their first write the Agent Mail agents never re-read their inbox, and the Concord agents looked only at their own message or task, never again at the other session's task, where the decision was recorded (all 8 transcripts checked) |
+| S9 Continue the work a stopped session left | 0/4 | 4/4 | 4/4 | 0/4 | 0/4 | KLYPIX and notes kept beat none, Concord and Agent Mail. The tested Concord/Agent Mail stores contained no stopped-session prompt or reply; only a claim or expired lease remained |
 | S10 A live session that has written nothing | 1/4 | 4/4 | 3/4 | 4/4 | 4/4 | Tie: every interval overlaps. All three channels showed the live peer on lib/tax.js |
 
 **Codex (n = 3 per cell; S1, S3, S9, S10; KLYPIX, Concord, Agent Mail only)**
@@ -35,7 +43,7 @@ AGENTS.md / CLAUDE.md by hand, the generous upper bar; "none" = nobody wrote any
 |---|---|---|---|---|
 | S1 A decision changed today | 3/3 | 0/3 | 2/3 | none (KLYPIX vs Concord is 44–100% vs 0–56%, which overlap) |
 | S3 A note left by a session that has ended | 3/3 | 0/3 | 3/3 | none |
-| S9 Continue the work a stopped session left | 3/3 | 0/3 | 0/3 | none (structural for Concord and Agent Mail, as above) |
+| S9 Continue the work a stopped session left | 3/3 | 0/3 | 0/3 | none (the tested Concord/Agent Mail stores contained no stopped-session prompt or reply, as above) |
 | S10 A live session that has written nothing | 0/3 | 0/3 | 0/3 | none: all three fail |
 
 Under Codex, Concord's agent called `start_work` / `finish_work` and never `inspect_work` in S1 and
@@ -82,8 +90,8 @@ S3, so it never saw the other session's task; Agent Mail's agent read its inbox 
 - **Concord** is configured as in the 2026-11-08 pilot (see the README): a finished session's task is
   left review-ready, a stopped session's claim goes stale under Concord's own presence rules, the
   live prompt has no endpoint without Concord's plugin and Concord's first tool result says so.
-- **S9 cannot be passed by Concord or Agent Mail**: neither records what a stopped session last said
-  or was asked. That is a property of the products, measured as a fail, not an adapter gap.
+- **S9 had no stopped-session prompt or reply in the tested Concord or Agent Mail stores.**
+  That is a limitation of these configurations; session-memory alternatives were not run.
 - **S5 / S5b**: the knowledge is an absence (nobody holds the file any more). Concord flags the claim
   as stale, Agent Mail shows the lease expired; KLYPIX's empty lane and its stopped-session evidence
   are what beat the dead note here (klypix-mcp 1.112.0; round 3's older build lost S5 0/5).

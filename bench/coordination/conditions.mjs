@@ -44,6 +44,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { buildKlypixMap, addBrainConnections, parseKlypix, appendIntoContainers } from '../../src/klypix-format.mjs';
 import { laneFileFor, listActiveSessions, listUnfinishedWork, postPresenceMessage, stampSessionWork, upsertSession } from '../../src/agent-presence.mjs';
 import { linkProject } from '../../src/agent-rules.mjs';
+import { concord } from './conditions-concord.mjs';
+import { agentMail } from './conditions-agent-mail.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 export const KLYPIX_BIN = path.join(ROOT, 'bin', 'klypix-mcp.mjs');
@@ -182,6 +184,7 @@ const klypix = {
   id: 'klypix',
   label: 'KLYPIX (MCP server + AGENTS.md rules, no hooks)',
   runnable: true,
+  mcp: true,
   async prepare({ repo, scenario, agent = null, sessionIds, benchHome = null, klypixBin = null, plugin = true, pinSession = true }) {
     const brainPath = path.join(repo.dir, 'brain.klypix');
     // The lane, the project registry and every other KLYPIX file of this run
@@ -446,6 +449,7 @@ const klypixInstalled = {
   id: 'klypix-installed',
   label: 'KLYPIX as installed (server + hooks + search by meaning; Claude Code)',
   runnable: true,
+  mcp: true,
   notApplicableFor: (agent) => (agent?.id === 'codex'
     ? "Codex reads hooks only from the user's own CODEX_HOME; running them would run the user's installed KLYPIX — not measured"
     : null),
@@ -534,13 +538,14 @@ const klypixInstalled = {
 
 // Planned conditions: listed with the reason they are not run yet, so a
 // report can never imply they were measured.
+// Third-party channels live in their own modules: `conditions-concord.mjs`
+// (runnable when the pinned Concord install is present) and
+// `conditions-agent-mail.mjs` (runnable:false until its adapter is verified).
 const planned = [
   { id: 'claude-messaging', label: 'Claude Code cross-session messaging', reason: 'needs two LIVE Claude sessions; cannot reach a closed session or another vendor, so S3/S4 do not apply by design' },
-  { id: 'agent-mail', label: 'MCP Agent Mail', reason: 'third-party server not installed here; adapter must be verified against a pinned version before any result is published' },
-  { id: 'concord', label: 'Concord MCP', reason: 'third-party server not installed here; adapter must be verified against a pinned version before any result is published' },
   { id: 'openmemory', label: 'Memory tool (OpenMemory MCP)', reason: 'third-party server not installed here; adapter must be verified against a pinned version before any result is published' },
 ].map((p) => ({ ...p, runnable: false }));
 
-export const CONDITIONS = [none, relay, agentsMdKept, agentsMdAppended, klypix, klypixInstalled, ...planned];
+export const CONDITIONS = [none, relay, agentsMdKept, agentsMdAppended, klypix, klypixInstalled, concord, agentMail, ...planned];
 export const isKlypixCondition = (c) => String(c?.id ?? c ?? '').startsWith('klypix');
 export const conditionById = (id) => CONDITIONS.find((c) => c.id === id) || null;

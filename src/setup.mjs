@@ -183,7 +183,9 @@ export async function runSetup(opts = {}) {
   // 3) Project config for those hosts only — plus anything the project already
   // carries, so a one-editor developer keeps their team's files current.
   const projectOwned = MCP_FILES.filter((rel) => isProjectOwnedMcp(path.join(root, rel)));
-  const linked = linkProject(root, { editors: detected.present.keys(), exclude: projectOwned });
+  // opts.tools: the KLYPIX_TOOLS policy for the MCP entries (install passes it;
+  // see src/tool-profile.mjs). Omitted, every entry keeps the env it has.
+  const linked = linkProject(root, { editors: detected.present.keys(), exclude: projectOwned, tools: opts.tools || null });
   report.editors.skippedTargets = linked.skipped;
   report.wrote = [...linked.rules, ...linked.mcp]
     .filter((t) => t.status !== 'error' && t.action !== 'skipped')
@@ -269,8 +271,10 @@ export function renderBrief(report) {
   }
 
   for (const v of report.verified || []) {
+    // v.tools is the entry's KLYPIX_TOOLS (the profile the editor will launch);
+    // the count is what that profile really served over the handshake.
     L.push(v.ok
-      ? `  verified  ✓ ${v.toolCount} tools reachable via ${v.file} (${v.ms}ms)`
+      ? `  verified  ✓ ${v.toolCount} tools reachable via ${v.file} (${v.tools ? `KLYPIX_TOOLS=${v.tools} · ` : ''}${v.ms}ms)`
       : `  verified  ✗ ${v.file} — ${v.why}`);
   }
 

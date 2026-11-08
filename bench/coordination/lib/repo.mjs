@@ -24,7 +24,8 @@ export function makeRepo(prefix = 'klypix-cobench-') {
   // A condition that changed nothing must leave no trace: an empty "other
   // session touched the notes" commit is a cue the agent could read.
   const commitIfChanged = (message) => { git('add', '-A'); if (!git('status', '--porcelain')) return null; git('commit', '-q', '-m', message); return git('rev-parse', 'HEAD'); };
-  const remove = () => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ } };
+  // A condition server's child may still be exiting (Windows: EBUSY on its database); retry briefly.
+  const remove = () => { try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); } catch { /* best effort */ } };
   return { dir, git, write, read, commitAll, commitIfChanged, remove };
 }
 

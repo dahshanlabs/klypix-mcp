@@ -19,6 +19,22 @@ const PKG_VERSION = (() => {
   }
 })();
 
+// `check` is two commands behind one verb: flags only (`--staged`, `--base B`,
+// `--install-hook`, …) runs the project rules; one or more named files asks
+// whether a LIVE session is working on them (bin/klypix-check.mjs). The value
+// flags of the rules check are skipped so `check --base origin/main` is never
+// read as `check <file>`.
+const RULES_VALUE_FLAGS = new Set(['--base', '--head', '--range', '--hook', '--project']);
+const namesFiles = (argv) => {
+  for (let i = 0; i < argv.length; i++) {
+    const token = argv[i];
+    if (RULES_VALUE_FLAGS.has(token)) { i++; continue; }
+    if (token === '--') return argv.length > i + 1;
+    if (!token.startsWith('-')) return true;
+  }
+  return false;
+};
+
 const DIRECT = new Set(['install', 'link', 'doctor', 'runtime', 'conformance', 'garden-code', 'init', 'git-driver', 'git-hook', 'brain-history', 'brain-deleted', 'orphans', 'diff', 'pr-brief', 'uninstall', 'bench', 'sessions', 'rescue', 'check', 'rules']);
 
 const USAGE = [
@@ -27,6 +43,8 @@ const USAGE = [
   'Verbs:',
   '  install [--force] [--codex-hooks]   set up everything: machine engine + Claude hooks, then THIS project —',
   '          [--no-project] [--json]     brain, config for the editors you actually have, merge driver, verified',
+  '          [--tools core|all|a,b,c]    which MCP tools the entries it writes register (KLYPIX_TOOLS): a NEW entry',
+  '                                      gets `core` (6 tools) by default; an existing entry keeps its setting (none = all)',
   '  link [dir] [--check]                project this project\'s 14 managed agent config files (--check audits, writes nothing, exits 1 on drift)',
   '  doctor [--npm] [--all] [--json]     read-only self-check; exits 1 on drift',
   '  sessions [--json]                   closed agent sessions of this project and the notes waiting for them',
@@ -39,6 +57,8 @@ const USAGE = [
   '  check [--staged|--base B|--range A..B] [--strict] [--json]',
   '                                      run this project\'s rules (.klypix/rules.json) on a diff — milliseconds, no install/tests',
   '  check --install-hook|--remove-hook  opt-in git pre-commit/pre-push/post-commit hooks for those rules',
+  '  check [--json] [--quiet] <files...> is another LIVE session working on these files right now? exit 0 clear,',
+  '                                      1 overlap (a heads-up, not a lock), 2 cannot answer — for hooks and CI; read-only',
   '  rules [list|code promote|retire <ids>|promote|retire <ids> --code C|allow <id> --reason R|false-alarm <id> --reason R]',
   '                                      the human side of rules: approval codes, one-hour overrides, false alarms',
   '  uninstall [--check|--yes|unlink]    remove this install from the machine (--check inventories first; never deletes a .klypix)',
@@ -83,6 +103,20 @@ if (verb === 'bench') {
   console.log(process.argv.includes('--json') ? JSON.stringify(report, null, 2) : markdown);
   const c = report.scenarios?.concurrentWriters;
   process.exit(c?.verdict === 'no-loss' ? 0 : 1);
+} else if (verb === 'check' && namesFiles(process.argv.slice(3))) {
+  // `check <files...>` is the live-overlap answer (bin/klypix-check.mjs);
+  // `check` with flags only stays the rules check below. Same sub-bin contract
+  // as runVerb: splice the verb so the bin sees the standalone argv shape.
+  process.argv.splice(2, 1);
+  try {
+    await import('./klypix-check.mjs');
+  } catch (error) {
+    // The flattened ~/.claude/project-brain bundle stages this dispatcher but
+    // not the check bin (see runVerb in klypix-worker.mjs for the same case).
+    if (error?.code !== 'ERR_MODULE_NOT_FOUND' || !String(error?.message || '').includes('klypix-check.mjs')) throw error;
+    console.error('klypix: `check <files>` is not available in this installed bundle — run `npx klypix-mcp check <files>` from the npm package instead.');
+    process.exit(2);
+  }
 } else if (verb === 'check' || verb === 'rules') {
   const { runRulesCli } = await import('../src/brain-rules.mjs');
   process.exit(await runRulesCli(verb === 'rules' ? process.argv.slice(2) : process.argv.slice(3)));

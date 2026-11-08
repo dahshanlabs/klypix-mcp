@@ -34,6 +34,11 @@ process.env.KLYPIX_AUTO_UPDATE = '0';
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const { SCENARIOS } = await import('../bench/coordination/scenarios.mjs');
 const { CONDITIONS, conditionById, KLYPIX_BIN, klypixServerInfo } = await import('../bench/coordination/conditions.mjs');
+const { concordInstall, concordEnv, actorTaskId, CONCORD_PINNED_VERSION } = await import('../bench/coordination/conditions-concord.mjs');
+const { agentMail, agentMailPlan, agentMailStatus } = await import('../bench/coordination/conditions-agent-mail.mjs');
+// Concord runs only where its pinned install is present (KLYPIX_BENCH_CONCORD_DIR); elsewhere it is listed as not measured.
+const concordOn = concordInstall().ok;
+console.log(concordOn ? `(Concord ${CONCORD_PINNED_VERSION} found at ${concordInstall().dir}: its condition is exercised)` : `(Concord not installed: ${concordInstall().reason})`);
 const { oracle, composePrompt, codexMcpOverrides, resolveCli, cleanAgentEnv, claudeAllowedTools, parseClaudeResult, parseCodexEvents, codexChannelUp, codexGitWritable, MCP_STARTUP_TIMEOUT_SEC, CHANNEL_DOWN, classifyChunk } = await import('../bench/coordination/agents.mjs');
 const { runOne, notApplicableReason, validityError, isInvalidReason, FACT_NOT_FIRED, FACT_TOO_LATE, FACT_NOT_DELIVERED, HARNESS_ERROR } = await import('../bench/coordination/run.mjs');
 const { summarize, toMarkdown } = await import('../bench/coordination/report.mjs');
@@ -76,7 +81,12 @@ for (const s of SCENARIOS.filter(applies)) {
 
 // ── B2: dry run over every runnable condition ───────────────────────────────
 const runnable = CONDITIONS.filter((c) => c.runnable);
-ok(runnable.map((c) => c.id).join(',') === 'none,relay,agents-md-kept,agents-md-appended,klypix,klypix-installed', 'B2: six conditions are runnable on any machine');
+ok(runnable.map((c) => c.id).join(',') === `none,relay,agents-md-kept,agents-md-appended,klypix,klypix-installed${concordOn ? ',concord' : ''}`,
+  `B2: six conditions are runnable on any machine${concordOn ? ', plus Concord where its pinned install is present' : ''}; Agent Mail never (its adapter is unverified)`);
+ok(agentMail.runnable === false && /not been verified/.test(agentMail.reason) && /register_agent, file_reservation_paths, send_message, fetch_inbox/.test(agentMail.reason),
+  'B2: Agent Mail is runnable:false and its reason names the unverified adapter, not a missing feature');
+ok(!concordInstall({}).ok && /not installed/.test(concordInstall({}).reason) && !concordInstall({ KLYPIX_BENCH_CONCORD_DIR: os.tmpdir() }).ok,
+  'B2: with no install dir Concord is not runnable, with the reason (never silently skipped)');
 ok(CONDITIONS.filter((c) => !c.runnable).every((c) => c.reason && c.reason.length > 20), 'B2: every planned condition says why it is not measured');
 // Which channel can carry each scenario's knowledge — stated up front, so a
 // broken channel cannot pass as "nothing delivered, fail expected". The
@@ -547,6 +557,137 @@ ok(/\| 2\/3 \| —/.test(naMd) && /\| Handled \|/.test(naMd), 'B4: the "handled"
   } finally {
     repo.remove();
     try { fs.rmSync(benchHome, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); } catch { /* */ }
+  }
+}
+
+// ── B7: Concord MCP (third-party channel) ───────────────────────────────────
+{
+  const concord = conditionById('concord');
+  const s1 = SCENARIOS.find((s) => s.id === 's1-changed-decision');
+  const s7 = SCENARIOS.find((s) => s.id === 's7-decision-buried-in-history');
+  const s9s = SCENARIOS.find((s) => s.id === 's9s-continue-stopped-session-summary');
+  const c1 = SCENARIOS.find((s) => s.id === 'c1-restated-claim');
+  ok(/task-scoped context/.test(notApplicableReason(s7, concord) || '') && /identical to S9/.test(notApplicableReason(s9s, concord) || '')
+    && /capture engine/.test(notApplicableReason(c1, concord) || '') && notApplicableReason(s1, concord) === null,
+  'B7: Concord is n/a, with the reason, for the six-month log, the S9 summary twin and the crowd brains — and runs everywhere else');
+  const env = concordEnv('H:/run-home', 'R:/repo', 'claude-code:abcd1234');
+  ok(env.CONCORD_TELEMETRY_DISABLED === '1' && env.DO_NOT_TRACK === '1' && env.CONCORD_NO_UPDATE_CHECK === '1' && env.HOME === 'H:/run-home' && env.USERPROFILE === 'H:/run-home'
+    && env.CONCORD_REPO_ROOT === 'R:/repo' && env.CONCORD_ALLOWED_ROOTS === 'R:/repo' && env.CONCORD_AGENT_ID === 'claude-code:abcd1234'
+    && [env.CLAUDE_CONFIG_DIR, env.CODEX_HOME, env.APPDATA, env.LOCALAPPDATA, env.XDG_CONFIG_HOME, env.XDG_CACHE_HOME].every((p) => p.startsWith(path.join('H:/run-home', ''))),
+  'B7: every Concord process of a run gets the run\'s home, no telemetry, no update check, this repo only, and an operator-named identity');
+  // Report rendering: Concord cells and the Agent Mail status.
+  const concordRows = [
+    { scenario: 's7-decision-buried-in-history', condition: 'concord', agent: 'claude', run: 1, notApplicable: 'Concord keeps task-scoped context, not a dated project log', success: false, staleAction: false, experimentId: 'x' },
+    { scenario: 's1-changed-decision', condition: 'concord', agent: 'claude', run: 1, success: true, staleAction: false, mcpCalls: { start_work: 1, inspect_work: 2 }, channelServer: { name: 'concord', version: '0.20.0' }, experimentId: 'x' },
+    { scenario: 's1-changed-decision', condition: 'klypix', agent: 'claude', run: 1, success: true, staleAction: false, mcpCalls: { brain_sync: 1 }, klypixServer: { version: '1.111.0', commit: 'abc1234' }, experimentId: 'x' },
+  ];
+  const concordMd = toMarkdown(summarize(concordRows), concordRows);
+  ok(/\| Concord MCP 0\.20\.0 [^|]*\| — \| n\/a: Concord keeps task-scoped context/.test(concordMd), 'B7: a Concord cell a scenario cannot apply to prints as n/a with its reason, under the condition\'s own name');
+  ok(/Channel servers — /.test(concordMd) && /klypix: klypix-mcp 1\.111\.0 @ abc1234/.test(concordMd) && /concord: concord 0\.20\.0/.test(concordMd), 'B7: the report names the build of every channel server its rows measured');
+  ok(/\| Concord MCP 0\.20\.0 [^|]*\| 1 \| 100% \(21%–100%\) \| 0\/1 \| 0\.0 \| 1\/1 \|/.test(concordMd), 'B7: a Concord row shows n, its wide single-run interval, and whether the agent consulted the server');
+  const fiveRuns = Array.from({ length: 5 }, (_, i) => ({ scenario: 's1-changed-decision', condition: 'concord', agent: 'claude', run: i + 1, success: true, staleAction: false, experimentId: 'y' }));
+  ok(/Pilot-sized cells — not a ranking/.test(concordMd) && !/Pilot-sized cells/.test(toMarkdown(summarize(fiveRuns), fiveRuns)), 'B7: cells with n < 5 carry the "not a ranking" caveat; a five-run cell does not');
+  ok(/## Not measured/.test(concordMd) && /MCP Agent Mail \(Rust rewrite, pinned 0\.3\.40\)/.test(concordMd) && /has not been verified against the running server/.test(concordMd),
+    'B7: Agent Mail is listed as not measured with its precise status');
+  const plan = agentMailPlan(SCENARIOS.find((s) => s.id === 's2-overlapping-work'), { repoDir: '/r' });
+  ok(plan.some((c) => c.tool === 'file_reservation_paths' && c.args.paths.includes('lib/price.js')) && plan.some((c) => c.tool === 'send_message' && c.unsettled),
+    'B7: the Agent Mail skeleton plans a file reservation for the live peer and marks the note\'s recipient as unsettled (never guessed)');
+  ok(/skeleton/.test(agentMailStatus({}, 'win32').reason) && /Windows x64 release asset exists/.test(agentMailStatus({}, 'win32').reason), 'B7: the Agent Mail status says what exists for this platform and what is unverified');
+
+  if (concordOn) {
+    // Through the wire: the agent's own Concord server, started exactly as the
+    // bench starts it, shows what the other session recorded through Concord's tools.
+    const connectAs = async (server, repo) => {
+      const c = new Client({ name: 'cobench-agent', version: '1.0.0' }, { capabilities: {} });
+      await c.connect(new StdioClientTransport({ command: server.command, args: server.args, cwd: repo.dir, stderr: 'pipe', env: { ...process.env, ...server.env } }));
+      const call = async (name, args) => { const r = await c.callTool({ name, arguments: args }); return { isError: !!r.isError, sc: r.structuredContent || {}, text: (r.content || []).map((x) => x.text || '').join('\n') }; };
+      return { call, close: () => c.close().catch(() => {}) };
+    };
+    const cases = {
+      's1-changed-decision': { files: ['server/routes.js'], check: async (call, prep) => {
+        const start = await call('start_work', { task_id: 'TASK-agent', title: 'Add logout', kind: 'claude-code', expected_files: ['server/routes.js'] });
+        const ws = await call('inspect_work', {});
+        const ctx = await call('inspect_work', { task_id: prep.concord.taskId });
+        return !start.isError && start.sc.agent_id === prep.concord.agentId && (start.sc.overlaps || []).length === 0
+          && (ws.sc.active || []).some((t) => t.taskId === prep.concord.taskId) && (ctx.sc.updates || []).some((u) => /bearer tokens/.test(u.content) && u.kind === 'decision');
+      }, what: 'the agent is who the bench named it; the other session\'s task is active in the workspace and its decision is in that task\'s updates' },
+      's2-overlapping-work': { check: async (call, prep) => {
+        const start = await call('start_work', { task_id: 'TASK-agent', title: 'Cap discounts', kind: 'claude-code', expected_files: ['lib/price.js'] });
+        const ws = await call('inspect_work', {});
+        return !start.isError && (start.sc.overlaps || []).some((o) => o.task_id === prep.concord.taskId && o.reasons.some((r) => /lib\/price\.js/.test(r)))
+          && (ws.sc.presence || []).some((p) => p.agentId === prep.concord.actorId && p.liveness === 'live') && (ws.sc.active || []).some((t) => t.taskId === prep.concord.taskId && t.branch === 'a/currency');
+      }, what: 'claiming lib/price.js reports the overlap with the live peer, who is on the roster with branch a/currency' },
+      's3-note-from-closed-session': { check: async (call, prep) => {
+        const ws = await call('inspect_work', {});
+        const ctx = await call('inspect_work', { task_id: prep.concord.taskId });
+        return (ws.sc.review_ready || []).some((t) => t.taskId === prep.concord.taskId) && (ctx.sc.updates || []).some((u) => /backfill:emails/.test(u.content))
+          && /backfill:emails/.test(JSON.stringify(ctx.sc.latest_handoff || {}));
+      }, what: 'the ended session\'s task is review-ready in the workspace; its finding is in the task\'s updates and its handoff evidence' },
+      's5-stale-wip-note': { check: async (call, prep) => {
+        const ws = await call('inspect_work', {});
+        const stale = (ws.sc.stale_claims || []).find((c) => c.taskId === prep.concord.taskId);
+        const ctx = await call('inspect_work', { task_id: prep.concord.taskId });
+        return !(ws.sc.presence || []).some((p) => p.agentId === prep.concord.actorId) && !!stale && stale.reason === 'agent-away' && stale.ageSeconds > 2 * 86_400 - 3600
+          && (ctx.sc.updates || []).length === 0 && (repo5.read('AGENTS.md') || '').includes('do not touch');
+      }, what: 'session Q is off the roster and Concord itself flags its claim as stale (agent away two days); no note carries the WIP words; the dead line stays in the notes file' },
+      's9-continue-stopped-session': { check: async (call, prep) => {
+        const ws = await call('inspect_work', {});
+        const ctx = await call('inspect_work', { task_id: prep.concord.taskId });
+        return (ws.sc.stale_claims || []).some((c) => c.taskId === prep.concord.taskId) && ctx.sc.task?.title === 'Add cursor pagination to listUsers'
+          && (ctx.sc.task?.expectedFiles || []).includes('lib/cursor.js') && (ctx.sc.updates || []).length === 0 && !/default limit 20/.test(JSON.stringify(ctx.sc));
+      }, what: 'the stopped session left a stale claim titled with its intent and its files — no last words, no plan (Concord records neither)' },
+      's10-live-peer-wrote-nothing': { check: async (call, prep) => {
+        const start = await call('start_work', { task_id: 'TASK-agent', title: 'Raise tax rate', kind: 'claude-code', expected_files: ['lib/tax.js'] });
+        return !start.isError && (start.sc.overlaps || []).some((o) => o.task_id === prep.concord.taskId && o.reasons.some((r) => /lib\/tax\.js/.test(r)));
+      }, what: 'declaring lib/tax.js reports the overlap with the live session that wrote nothing' },
+    };
+    let repo5 = null;
+    for (const [id, tc] of Object.entries(cases)) {
+      const s = SCENARIOS.find((x) => x.id === id);
+      const repo = makeRepo('klypix-cobench-b7-');
+      if (id === 's5-stale-wip-note') repo5 = repo;
+      const benchHome = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-cobench-b7home-'));
+      let prep = null; let session = null;
+      try {
+        s.build(repo);
+        prep = await concord.prepare({ repo, scenario: s, agent: oracle, sessionIds: { agent: `bench-agent-${id.slice(0, 3)}` }, benchHome });
+        const server = prep.mcpServers.concord;
+        ok(prep.delivered.length === s.facts.length && prep.channelServer?.version === CONCORD_PINNED_VERSION, `B7 ${id}: the condition reads every fact back from Concord's own view and names the server version`);
+        ok(server.env.HOME === benchHome && server.env.CONCORD_TELEMETRY_DISABLED === '1' && server.env.CONCORD_REPO_ROOT === repo.dir && server.args[0].endsWith(path.join('dist', 'index.js')),
+          `B7 ${id}: the agent's Concord server runs from the pinned install, in the run's home, telemetry off, against this repo`);
+        ok(!fs.existsSync(path.join(repo.dir, '.mcp.json')) && ['CLAUDE.md', 'AGENTS.md'].every((f) => /<!-- concord:start -->[\s\S]*start_work[\s\S]*<!-- concord:end -->/.test(repo.read(f) || ''))
+          && fs.existsSync(path.join(repo.dir, '.concord', 'concord.db')) && repo.git('status', '--porcelain') === '' && fs.existsSync(path.join(benchHome, '.concord', 'config.json')),
+        `B7 ${id}: the repo carries Concord's instruction blocks and its self-ignored .concord/ store, but no MCP config pointing at a global install`);
+        session = await connectAs(server, repo);
+        ok(await tc.check(session.call, prep), `B7 ${id}: through the agent's own server — ${tc.what}`);
+        if (id === 's1-changed-decision') {
+          // Mid-task delivery (S6's mechanism) on a live agent session: the record lands; the prompt's fate is recorded, not assumed.
+          const s6 = SCENARIOS.find((x) => x.id === 's6-fact-arrives-mid-task');
+          const repo6 = makeRepo('klypix-cobench-b7s6-');
+          const home6 = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-cobench-b7home6-'));
+          let prep6 = null; let live = null;
+          try {
+            s6.build(repo6);
+            prep6 = await concord.prepare({ repo: repo6, scenario: s6, agent: oracle, sessionIds: { agent: 'bench-agent-s6' }, benchHome: home6 });
+            live = await connectAs(prep6.mcpServers.concord, repo6);
+            await live.call('start_work', { task_id: 'TASK-agent', title: 'Implement formatInvoice', kind: 'claude-code', expected_files: ['lib/invoice.js'] });
+            const out = await concord.later({ repo: repo6, scenario: s6, sessionIds: { agent: 'bench-agent-s6' }, benchHome: home6, prep: prep6 });
+            const ctx = await live.call('inspect_work', { task_id: prep6.concord.taskId });
+            ok(out.delivered.length === 1 && typeof out.notePosted === 'boolean' && (ctx.sc.updates || []).some((u) => /MINOR units/.test(u.content)),
+              `B7 s6: the mid-task decision is recorded on the other session's task (read back by the agent's server); whether the live prompt went out is recorded (${out.notePosted})`);
+          } catch (err) { ok(false, `B7 s6: ${String(err?.message || err).split('\n')[0]}`); }
+          finally { await live?.close(); prep6?.cleanup?.(); repo6.remove(); try { fs.rmSync(home6, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); } catch { /* */ } }
+        }
+      } catch (err) {
+        ok(false, `B7 ${id}: ${String(err?.message || err).split('\n')[0]}`);
+      } finally {
+        await session?.close();
+        prep?.cleanup?.();
+        repo.remove();
+        try { fs.rmSync(benchHome, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); } catch { /* */ }
+      }
+    }
+    ok(!fs.existsSync(path.join(sandbox, '.concord')) || !fs.existsSync(path.join(sandbox, '.concord', 'global.db')), 'B7: no Concord run wrote a machine-wide store into the (sandboxed) user home');
   }
 }
 

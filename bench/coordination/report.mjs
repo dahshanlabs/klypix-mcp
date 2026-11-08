@@ -75,17 +75,27 @@ export function toMarkdown(cells, rows = []) {
     const models = [...new Set(mine.flatMap((c) => c.models))];
     out.push(`## Agent: ${agent}`, '');
     if (versions.length || models.length) out.push(`${versions.length ? `CLI: ${versions.join(', ')}` : ''}${versions.length && models.length ? ' · ' : ''}${models.length ? `model: ${models.join(', ')}` : ''}`, '');
+    // Which build of each channel server the rows measured (KLYPIX: version @ commit; Concord: package version).
+    const servers = new Map();
+    for (const r of rows.filter((x) => x.agent === agent && !x.notApplicable)) {
+      if (r.klypixServer?.version) servers.set(r.condition, `${r.condition}: klypix-mcp ${r.klypixServer.version}${r.klypixServer.commit ? ` @ ${r.klypixServer.commit}` : ''}`);
+      if (r.channelServer?.version) servers.set(r.condition, `${r.condition}: ${r.channelServer.name} ${r.channelServer.version}`);
+    }
+    if (servers.size) out.push(`Channel servers — ${[...servers.values()].join(' · ')}`, '');
     if (agent === 'oracle') out.push('> **Dry run — not a result.** The scripted oracle answers correctly whenever the facts were delivered. These rows prove the graders and the delivery, never how an agent behaves.', '');
-    out.push( '| Scenario | Condition | n | Success (95% CI) | Acted on stale info | Human relays / task | Agent consulted KLYPIX | Handled | Median cost | Median min |', '|---|---|---|---|---|---|---|---|---|---|');
+    out.push( '| Scenario | Condition | n | Success (95% CI) | Acted on stale info | Human relays / task | Agent consulted channel (MCP) | Handled | Median cost | Median min |', '|---|---|---|---|---|---|---|---|---|---|');
     for (const s of SCENARIOS) {
       for (const c of CONDITIONS) {
         const cell = cells.find((x) => x.agent === agent && x.scenario === s.id && x.condition === c.id);
         if (!cell) continue;
         if (cell.notApplicable) { out.push(`| ${s.title} | ${c.label} | — | n/a: ${cell.notApplicable} | — | — | — | — | — | — |`); continue; }
-        out.push(`| ${s.title}${s.role ? ` _(${s.role})_` : ''} | ${c.label} | ${cell.n}${cell.invalidRuns ? ` (+${cell.invalidRuns} invalid)` : ''} | ${pct(cell.success.p)} (${pct(cell.success.low)}–${pct(cell.success.high)}) | ${cell.staleActions.k}/${cell.staleActions.n ?? cell.n}${cell.errors ? ` (+${cell.errors} err)` : ''} | ${cell.relaysPerTask.toFixed(1)} | ${String(c.id).startsWith('klypix') ? `${cell.consulted}/${cell.n}` : '—'} | ${cell.handledKnown ? `${cell.handled}/${cell.handledKnown}` : '—'} | ${cell.medianCostUsd == null ? '—' : `$${cell.medianCostUsd.toFixed(2)}`} | ${cell.medianMinutes == null ? '—' : cell.medianMinutes.toFixed(1)} |`);
+        out.push(`| ${s.title}${s.role ? ` _(${s.role})_` : ''} | ${c.label} | ${cell.n}${cell.invalidRuns ? ` (+${cell.invalidRuns} invalid)` : ''} | ${pct(cell.success.p)} (${pct(cell.success.low)}–${pct(cell.success.high)}) | ${cell.staleActions.k}/${cell.staleActions.n ?? cell.n}${cell.errors ? ` (+${cell.errors} err)` : ''} | ${cell.relaysPerTask.toFixed(1)} | ${c.mcp ? `${cell.consulted}/${cell.n}` : '—'} | ${cell.handledKnown ? `${cell.handled}/${cell.handledKnown}` : '—'} | ${cell.medianCostUsd == null ? '—' : `$${cell.medianCostUsd.toFixed(2)}`} | ${cell.medianMinutes == null ? '—' : cell.medianMinutes.toFixed(1)} |`);
       }
     }
     out.push('');
+    // A pilot proves the harness ran a cell; it ranks nothing.
+    const small = cells.filter((c) => c.agent === agent && !c.notApplicable && c.n > 0 && c.n < 5);
+    if (small.length) out.push(`> **Pilot-sized cells — not a ranking.** ${small.length} cell(s) above have n < 5 (${[...new Set(small.map((c) => `n=${c.n}`))].join(', ')}). They show that the harness ran each cell end to end, never how the conditions compare; a single run's interval spans most of 0–100%. Publish none of them as a ranking.`, '');
     // Both directions, every measured condition: a KLYPIX loss is listed as
     // plainly as a win. A cell that was not run (n/a, or n = 0) has no
     // interval and is never compared.

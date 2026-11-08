@@ -25,6 +25,7 @@ import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
+import { entryEnvWithTools } from './tool-profile.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
@@ -80,7 +81,11 @@ export const LOCAL_BUNDLE_EVAL = [
   "require('os').homedir(),'.claude','project-brain','klypix-mcp-server.mjs')).href)",
 ].join('');
 
-export function mcpServerEntry({ vault = '.', withType = false, home } = {}) {
+// `env` (1.112.0): string-valued variables the entry passes to the server —
+// KLYPIX_TOOLS (the tool profile, src/tool-profile.mjs) is the one install
+// writes. Omitted when empty, so an entry without env is byte-identical to
+// what every earlier version wrote.
+export function mcpServerEntry({ vault = '.', withType = false, home, env } = {}) {
   let base;
   try {
     const local = localBundleServer(home);
@@ -89,7 +94,33 @@ export function mcpServerEntry({ vault = '.', withType = false, home } = {}) {
     }
   } catch { /* no local bundle yet → bootstrap via npx below */ }
   if (!base) base = { command: 'npx', args: ['-y', 'klypix-mcp', '--vault', vault] };
+  const vars = env && typeof env === 'object' && !Array.isArray(env)
+    ? Object.fromEntries(Object.entries(env).filter(([, v]) => typeof v === 'string'))
+    : {};
+  if (Object.keys(vars).length) base.env = vars;
   return withType ? { type: 'stdio', ...base } : base;
+}
+
+// The env of the klypix-canvas entry in a project MCP config (JSON `mcpServers` /
+// `servers`, or the Codex TOML) — `{}` when it has none, null when there is no
+// entry. What doctor reads to say which tool profile a host will launch.
+export function readMcpEntryEnv(file) {
+  if (!exists(file)) return null;
+  if (/\.toml$/i.test(file)) {
+    const parsed = safeReadCodexConfig(file);
+    if (!parsed.ok) return null;
+    const name = Object.keys(parsed.servers).find((k) => /klypix/i.test(k));
+    return name ? { ...(parsed.servers[name].env || {}) } : null;
+  }
+  let cfg;
+  // An editor on Windows may save the file with a UTF-8 BOM, which JSON.parse refuses.
+  try { cfg = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^﻿/, '') || '{}'); } catch { return null; }
+  const bag = cfg?.mcpServers && typeof cfg.mcpServers === 'object' ? cfg.mcpServers
+    : cfg?.servers && typeof cfg.servers === 'object' ? cfg.servers : null;
+  const entry = bag?.['klypix-canvas'];
+  if (!entry || typeof entry !== 'object') return null;
+  const env = entry.env && typeof entry.env === 'object' && !Array.isArray(entry.env) ? entry.env : {};
+  return Object.fromEntries(Object.entries(env).filter(([, v]) => typeof v === 'string'));
 }
 
 // Codex uses TOML rather than the JSON MCP shape used by the other clients.
@@ -115,6 +146,8 @@ const CODEX_GLOBAL_BODY = [
   'To reach another agent session on this project, call `brain_message` with its session id (from',
   '`brain_sync` or `brain_doctor`); a session that has closed receives the note when it next starts.',
   'Never ask the human to carry a message between agents — send it and say it was sent or queued.',
+  'If a tool named here is not available, the install uses the `core` tool profile (brain_sync, brain_note, brain_ask,',
+  'brain_message, brain_handoff, brain_rules); ask for `npx klypix-mcp install --tools all`.',
   ASSIGNMENT_SAVE_GUIDANCE,
   ASSIGNMENT_PICKUP_GUIDANCE,
   'Stopping before the work is done (limit, end of day, blocked)? Call `brain_handoff` {action:"write"} with what is done, what is next, files and how to verify;',
@@ -270,9 +303,37 @@ export function safeReadCodexConfig(configPath) {
     const cwd = cwdLine ? parseTomlStringValue(cwdLine[1]) : null;
     const launchesKlypix = /(?:klypix-mcp-server\.mjs|(?:^|["'\s,])klypix-mcp(?:["'\s,]|$))/i.test(block)
       && !!command && /(?:^|[\\/])(node|node\.exe|npx|npx\.cmd|cmd|cmd\.exe)$/i.test(command);
-    servers[name] = { command, cwd, launchesKlypix, raw: block };
+    // The server's env: Codex accepts an inline table on the server itself
+    // (`env = { KLYPIX_TOOLS = "core" }`, what KLYPIX writes) or a nested
+    // `[mcp_servers.<name>.env]` table (what a person may write by hand).
+    const inlineEnv = block.match(/^[ \t]*env[ \t]*=[ \t]*\{(.*)\}[ \t]*(?:#.*)?$/m);
+    const env = inlineEnv ? parseTomlInlineEnv(inlineEnv[1]) : {};
+    servers[name] = { command, cwd, launchesKlypix, raw: block, env };
+  }
+  for (const table of scanned.tables) {
+    if (table.array || table.parts[0] !== 'mcp_servers' || table.parts.length !== 3 || table.parts[2] !== 'env') continue;
+    const server = servers[String(table.parts[1])];
+    if (!server) continue;
+    for (const line of raw.slice(table.start, table.end).split(/\r?\n/).slice(1)) {
+      const kv = line.match(/^[ \t]*([A-Za-z_][A-Za-z0-9_]*)[ \t]*=[ \t]*(.+)$/);
+      if (!kv) continue;
+      const value = parseTomlStringValue(kv[2]);
+      if (value != null) server.env[kv[1]] = value;
+    }
   }
   return { ok: true, raw, servers, tables: scanned.tables };
+}
+
+// `KEY = "value", OTHER = 'v'` → { KEY: 'value', OTHER: 'v' } (string values only).
+function parseTomlInlineEnv(inner) {
+  const env = {};
+  const re = /([A-Za-z_][A-Za-z0-9_]*)[ \t]*=[ \t]*("(?:\\.|[^"\\])*"|'[^']*')/g;
+  let m;
+  while ((m = re.exec(inner))) {
+    const value = parseTomlStringValue(m[2]);
+    if (value != null) env[m[1]] = value;
+  }
+  return env;
 }
 
 function renderCodexMcpTable(name, entry, cwd) {
@@ -283,6 +344,11 @@ function renderCodexMcpTable(name, entry, cwd) {
     `args = [${args}]`,
   ];
   if (cwd) lines.push(`cwd = ${tomlString(cwd)}`);
+  // The server's env (KLYPIX_TOOLS, the tool profile) as a TOML inline table on
+  // the server, so the whole entry stays one table KLYPIX owns and replaces.
+  const envPairs = Object.entries(entry?.env || {})
+    .filter(([key, value]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(key) && typeof value === 'string');
+  if (envPairs.length) lines.push(`env = { ${envPairs.map(([key, value]) => `${key} = ${tomlString(value)}`).join(', ')} }`);
   // A cold npx bootstrap can exceed Codex's 10 second default; local installs
   // start immediately, but the larger timeout is harmless and makes first use reliable.
   lines.push('startup_timeout_sec = 120');
@@ -308,14 +374,19 @@ function writeCodexConfig(configPath, raw, next) {
   }
 }
 
-export function connectCodexMcpServer({ configPath, name = 'klypix-canvas', entry, cwd } = {}) {
+// `tools` ({ value, onlyNew }) is the KLYPIX_TOOLS policy (src/tool-profile.mjs
+// entryEnvWithTools): the table keeps the env it already has; a new table gets
+// `value`; `onlyNew: false` writes `value` into an existing table too.
+export function connectCodexMcpServer({ configPath, name = 'klypix-canvas', entry, cwd, tools = null } = {}) {
   const parsed = safeReadCodexConfig(configPath);
   if (!parsed.ok) return { ok: false, error: parsed.error };
   const existingNames = Object.keys(parsed.servers).filter(k => /klypix/i.test(k));
   const chosen = existingNames[0] || name;
+  const prior = existingNames.length ? parsed.servers[chosen] : null;
+  const env = entryEnvWithTools({ ...(prior?.env || {}), ...(entry?.env || {}) }, tools, !prior);
   const owned = (parsed.tables || []).filter(t => t.parts[0] === 'mcp_servers' && t.parts.length >= 2 && /klypix/i.test(String(t.parts[1])));
   const eol = eolOf(parsed.raw);
-  const block = renderCodexMcpTable(chosen, entry, cwd).replace(/\n/g, eol);
+  const block = renderCodexMcpTable(chosen, { ...entry, env }, cwd).replace(/\n/g, eol);
   let next = parsed.raw;
   if (owned.length) {
     const firstStart = owned[0].start;
@@ -503,6 +574,8 @@ survives across sessions, agents, and context resets.
 - do NOT automatically read the full \`.claude/brain-brief.md\`; open it only when \`brain_sync\`
   says its compact context is insufficient or the task asks for broad project history/status.
 - with the \`klypix-canvas\` MCP server: to **answer a question** from the brain ("what did we decide about X?", "where did Y land?"), call \`brain_ask\` — it ranks the whole brain, includes superseded history, and surfaces the current truth for any corrected card. Use \`search_canvases\` for a raw keyword lookup, \`read_canvas\` (canvas: \`"brain"\`) for the whole thing, or \`brain_insights\` for the load-bearing cards.
+- if a tool named here is not available, the install uses the \`core\` tool profile (brain_sync, brain_note,
+  brain_ask, brain_message, brain_handoff, brain_rules); ask for \`npx klypix-mcp install --tools all\`.
 - or via CLI: \`npx -y -p klypix-mcp klypix-read brain.klypix\`
 
 **When you make a real decision, finding, or milestone — capture it HERE** so it persists for the next session/agent:
@@ -702,21 +775,28 @@ function writeDedicated(file, frontmatter, version) {
 
 // Project-level MCP config: add the klypix-canvas server, preserving any sibling servers.
 // wrapKey differs by tool: Cursor/Claude use "mcpServers"; VS Code uses "servers".
-function mergeMcpJson(file, wrapKey, withType, projectDir) {
+// `tools` ({ value, onlyNew } | null): the KLYPIX_TOOLS policy. The entry keeps
+// the env it already has — a re-link (brain_sync, the updater, `link`) never
+// changes a person's tool profile; `install` passes { value: 'core', onlyNew:
+// true } so only an entry it CREATES gets the core profile, and `install --tools
+// X` passes { value: X, onlyNew: false }.
+function mergeMcpJson(file, wrapKey, withType, projectDir, tools = null) {
   // Prefer the installed local bundle (no npx warm-cache staleness); npx only as a
   // first-run bootstrap. Migrating an existing npx entry → local is exactly the
   // desync fix, so a re-link (or the self-update install) heals stale configs.
   // These files are natively project-scoped and commonly committed. Keep their
   // vault portable; brain_sync's explicit `project` field is the second routing
   // guard if a host nevertheless launches from an unexpected directory.
-  const entry = mcpServerEntry({ vault: '.', withType });
   let cfg = {};
   if (exists(file)) {
     const raw = fs.readFileSync(file, 'utf8');
     if (raw.trim()) { try { cfg = JSON.parse(raw); } catch { return { action: 'skipped', why: 'invalid JSON — left untouched' }; } }
   }
   if (!cfg[wrapKey] || typeof cfg[wrapKey] !== 'object' || Array.isArray(cfg[wrapKey])) cfg[wrapKey] = {};
-  const before = JSON.stringify(cfg[wrapKey]['klypix-canvas']);
+  const prior = cfg[wrapKey]['klypix-canvas'];
+  const env = entryEnvWithTools(prior && typeof prior === 'object' ? prior.env : undefined, tools, !prior);
+  const entry = mcpServerEntry({ vault: '.', withType, env });
+  const before = JSON.stringify(prior);
   cfg[wrapKey]['klypix-canvas'] = entry;
   if (JSON.stringify(cfg[wrapKey]['klypix-canvas']) === before) return { action: 'unchanged' };
   atomicWrite(file, JSON.stringify(cfg, null, 2) + '\n');
@@ -809,18 +889,26 @@ function targetJustified(target, editors, anyEditor) {
 
 const relFile = (projectDir, abs) => path.relative(projectDir, abs).replace(/\\/g, '/');
 
+/** The project MCP config files KLYPIX projects, as `{ tool, file }` (absolute). */
+export function projectMcpConfigFiles(projectDir) {
+  return targets(projectDir).mcp.map((m) => ({ tool: m.tool, file: m.file }));
+}
+
 /**
  * Wire a project so EVERY agent tool reads + captures its brain automatically — or,
  * with { check:true }, AUDIT the projection without touching disk.
  * @param {string} projectDir absolute project root (holds ./brain.klypix)
- * @param {{ version?: string, check?: boolean, editors?: Set<string>|string[] }} [opts]
+ * @param {{ version?: string, check?: boolean, editors?: Set<string>|string[], tools?: { value: string, onlyNew?: boolean }|null }} [opts]
  *   editors — when supplied, project only what a detected host actually reads
  *   (plus files the project already carries). Omit for the legacy write-all.
+ *   tools — the KLYPIX_TOOLS policy for the MCP entries (see mergeMcpJson);
+ *   omitted, every entry keeps the env it has.
  * @returns {{ rules, mcp, hasBrain, version, check, skipped: Array }}
  */
 export function linkProject(projectDir, opts = {}) {
   const version = opts.version || resolveVersion();
   const check = !!opts.check;
+  const tools = opts.tools && opts.tools.value ? opts.tools : null;
   const t = targets(projectDir);
   const hasBrain = exists(path.join(projectDir, 'brain.klypix')) || exists(path.join(projectDir, 'brain.any'));
 
@@ -891,11 +979,11 @@ export function linkProject(projectDir, opts = {}) {
           };
         }
         const boundEntry = mcpServerEntry({ vault: boundProject });
-        const res = connectCodexMcpServer({ configPath: m.file, entry: boundEntry, cwd: boundProject });
+        const res = connectCodexMcpServer({ configPath: m.file, entry: boundEntry, cwd: boundProject, tools });
         return res.ok ? { tool: m.tool, file, ...res } : { tool: m.tool, file, action: 'skipped', why: res.error };
       }
       if (check) return { tool: m.tool, file, ...classifyMcp(m.file, m.wrapKey, projectDir) };
-      return { tool: m.tool, file, ...mergeMcpJson(m.file, m.wrapKey, m.withType, projectDir) };
+      return { tool: m.tool, file, ...mergeMcpJson(m.file, m.wrapKey, m.withType, projectDir, tools) };
     } catch (error) {
       return { tool: m.tool, file, action: 'skipped', status: 'error', why: error?.message || String(error) };
     }

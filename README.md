@@ -66,6 +66,7 @@ environment. A comma list such as `KLYPIX_TOOLS=brain_sync,brain_note` also work
 - **A heads-up when work overlaps.** Each session says what it is doing and which files it expects
   to touch. When two sessions name the same file, both are told. Since 1.112.0 this covers every
   git worktree of one repository, not only one folder. KLYPIX warns; it never blocks an edit.
+  [See it across two worktrees](docs/demo/demo-worktrees.gif) (real output, rendered by CI).
 - **Notes and handoffs between sessions.** An agent can leave a note for another session, even one
   that has closed. When a session stops before its work is done, the next one is shown what it was
   doing, and a handoff card carries the next steps through git.

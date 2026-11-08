@@ -57,6 +57,103 @@ const canonicalPath = (value) => {
   catch { return path.resolve(value); }
 };
 const PINNED_LANE_IDENTITIES = new Map();
+
+// ── Linked git worktrees share one lane (1.112.0) ────────────────────────────
+// A linked worktree (`git worktree add`) has its own checked-out brain.klypix at
+// its own path, so two worktrees of one repository hashed to two lane files and
+// never saw each other: no peer list, no file-overlap heads-up, no messages
+// between them. The lane identity now follows git's own pointer — the
+// worktree's `.git` is a FILE naming `<common>/worktrees/<name>`, whose
+// `commondir` names the primary checkout's `.git` — to
+// `<primary root>/<same relative path>/<same brain name>`, which is exactly the
+// identity a session in the primary checkout computes for itself.
+//
+// Rules: never throws (any doubt → the path unchanged). No git at all, the
+// primary checkout (`.git` is a directory), a submodule (`.git` file whose
+// gitdir has no worktrees/ segment) and a bare repository (common dir not named
+// `.git`) are all unchanged. The brain may sit below the worktree root
+// (monorepo): the same relative path is kept under the primary root.
+//
+// The answer is cached per identity for the life of the process: laneFileFor
+// runs on every lane touch, and a pinned identity (pinLaneIdentity, which
+// guards against a lexical project junction being retargeted between
+// validation and hashing) must keep mapping to the same lane even if the
+// worktree's `.git` pointer were edited later — the second filesystem read
+// happens once, at the first lookup, never again.
+// PARITY: global-brain-hook.mjs worktreeLaneCanon is the hook's synchronous twin.
+const WORKTREE_LANE_IDENTITIES = new Map();
+const GIT_COMMON_DIR_TIMEOUT_MS = 1500;
+const GIT_POINTER_FILE_MAX_BYTES = 4096;
+const hasWorktreesSegment = (value) => /(^|\/)worktrees\/[^/]+\/?$/.test(normBrainPath(value));
+
+const gitCommonDirViaGit = (dir) => {
+  try {
+    const out = childProcess.execFileSync('git', ['rev-parse', '--git-common-dir'], {
+      cwd: dir,
+      encoding: 'utf8',
+      timeout: GIT_COMMON_DIR_TIMEOUT_MS,
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'ignore'],
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0' },
+    });
+    const trimmed = String(out || '').trim();
+    return trimmed ? path.resolve(dir, trimmed) : null;
+  } catch {
+    return null;
+  }
+};
+
+// Walks up from `startDir` to the nearest `.git` entry. Returns
+// { worktreeRoot, primaryRoot } only for a LINKED worktree of a non-bare
+// repository; null in every other case (the caller leaves the path unchanged).
+function linkedWorktreePrimaryRoot(startDir) {
+  let dir = path.resolve(startDir);
+  for (;;) {
+    const dotGit = path.join(dir, '.git');
+    let stat = null;
+    try { stat = fs.statSync(dotGit); } catch { stat = null; }
+    if (stat) {
+      if (!stat.isFile() || stat.size > GIT_POINTER_FILE_MAX_BYTES) return null;
+      const pointer = /^gitdir:\s*(.+?)\s*$/m.exec(fs.readFileSync(dotGit, 'utf8'));
+      if (!pointer) return null;
+      const gitdir = path.resolve(dir, pointer[1]);
+      if (!hasWorktreesSegment(gitdir)) return null;
+      let common = null;
+      try {
+        const rel = fs.readFileSync(path.join(gitdir, 'commondir'), 'utf8').trim();
+        common = rel ? path.resolve(gitdir, rel) : null;
+      } catch {
+        common = gitCommonDirViaGit(dir);
+      }
+      if (!common || path.basename(common).toLowerCase() !== '.git') return null;
+      const primaryRoot = path.dirname(common);
+      if (!fs.statSync(primaryRoot).isDirectory()) return null;
+      return { worktreeRoot: dir, primaryRoot };
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+}
+
+export function worktreeLaneIdentity(identityPath) {
+  const identity = path.resolve(identityPath);
+  const cacheKey = normBrainPath(identity);
+  const cached = WORKTREE_LANE_IDENTITIES.get(cacheKey);
+  if (cached) return cached;
+  let mapped = identity;
+  try {
+    const linked = linkedWorktreePrimaryRoot(path.dirname(identity));
+    if (linked) {
+      const rel = path.relative(linked.worktreeRoot, path.dirname(identity));
+      mapped = canonicalPath(path.join(linked.primaryRoot, rel, path.basename(identity)));
+    }
+  } catch {
+    mapped = identity;
+  }
+  WORKTREE_LANE_IDENTITIES.set(cacheKey, mapped);
+  return mapped;
+}
 const sleepSync = (ms) => {
   try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); }
   catch { /* best effort */ }
@@ -275,7 +372,11 @@ export function laneFileFor(brainPath, home = os.homedir(), stableIdentityPath =
   const identity = stableIdentityPath
     ? path.resolve(stableIdentityPath)
     : (PINNED_LANE_IDENTITIES.get(pinKey) || canonicalPath(brainPath));
-  const key = sha16(normBrainPath(identity));
+  // Whatever identity won (stable, pinned or canonical), a brain inside a
+  // linked git worktree keys the lane the primary checkout uses, so the
+  // worktrees of one repository share peers, overlap heads-ups and messages.
+  // The mapping is cached per identity, so a pin stays as fixed as before.
+  const key = sha16(normBrainPath(worktreeLaneIdentity(identity)));
   return path.join(home, '.claude', 'project-brain', 'sessions', `${key}.json`);
 }
 

@@ -689,7 +689,51 @@ const SESSIONS_DIR = path.join(os.homedir(), '.claude', 'project-brain', 'sessio
 // server that resolved the SAME brain via a differently-cased cwd / KLYPIX_BRAIN
 // lands in the SAME lane file — klypix-core.mjs laneFileFor mirrors this exactly.
 const laneCanon = (p) => { try { return fs.realpathSync.native(p); } catch { return path.resolve(p); } };
-const SESSIONS_FILE = path.join(SESSIONS_DIR, `${sha(normBrainPath(laneCanon(BRAIN)))}.json`); // one lane-file per PROJECT (shared by its concurrent sessions)
+// PARITY: agent-presence.mjs worktreeLaneIdentity (1.112.0) — a brain inside a
+// LINKED git worktree (`.git` is a FILE naming <common>/worktrees/<name>) keys
+// its lane by the PRIMARY checkout's brain path, so the sessions in every
+// worktree of one repository share one lane: peers, the file-overlap heads-up
+// and messages. Same rules as the engine: never throws (any doubt → the path
+// unchanged); no git, the primary checkout itself, a submodule pointer and a
+// bare repository are all unchanged; a brain below the worktree root keeps its
+// relative path under the primary root. Synchronous on purpose — SESSIONS_FILE
+// is a module-load constant and the engine import is lazy.
+const worktreeLaneCanon = (brain) => {
+    try {
+        let dir = path.dirname(brain);
+        for (;;) {
+            const dotGit = path.join(dir, '.git');
+            let st = null;
+            try { st = fs.statSync(dotGit); } catch { st = null; }
+            if (st) {
+                if (!st.isFile() || st.size > 4096) return brain;
+                const pointer = /^gitdir:\s*(.+?)\s*$/m.exec(fs.readFileSync(dotGit, 'utf8'));
+                if (!pointer) return brain;
+                const gitdir = path.resolve(dir, pointer[1]);
+                if (!/(^|\/)worktrees\/[^/]+\/?$/.test(normBrainPath(gitdir))) return brain;
+                let common = null;
+                try {
+                    const rel = fs.readFileSync(path.join(gitdir, 'commondir'), 'utf8').trim();
+                    common = rel ? path.resolve(gitdir, rel) : null;
+                } catch {
+                    const out = execFileSync('git', ['rev-parse', '--git-common-dir'], {
+                        cwd: dir, encoding: 'utf8', timeout: 1500, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'],
+                        env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0' },
+                    }).trim();
+                    common = out ? path.resolve(dir, out) : null;
+                }
+                if (!common || path.basename(common).toLowerCase() !== '.git') return brain;
+                const primaryRoot = path.dirname(common);
+                if (!fs.statSync(primaryRoot).isDirectory()) return brain;
+                return laneCanon(path.join(primaryRoot, path.relative(dir, path.dirname(brain)), path.basename(brain)));
+            }
+            const parent = path.dirname(dir);
+            if (parent === dir) return brain;
+            dir = parent;
+        }
+    } catch { return brain; }
+};
+const SESSIONS_FILE = path.join(SESSIONS_DIR, `${sha(normBrainPath(worktreeLaneCanon(laneCanon(BRAIN))))}.json`); // one lane-file per PROJECT (shared by its concurrent sessions, across its git worktrees)
 const SESSIONS_LOCK = SESSIONS_FILE + '.lock';
 // ENOENT means first use. Parse/permission failures do not: a writer that
 // treats either as an empty lane can erase every peer row and message. Keep the

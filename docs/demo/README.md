@@ -49,6 +49,30 @@ the split itself is Session B arriving. B's overlap warning lands, then A's
 correction fires at ~15s so it lands after the warning is on screen. If you
 retune the pacing, keep B after A and the note after B.
 
+## The worktrees tape — `demo-worktrees.tape`
+
+A second recording of the same real server, with the two sessions in **two
+linked git worktrees of one repository**: Session A in the primary checkout
+(`.demo-repo`, branch `main`), Session B in
+`.demo-repo/.worktrees/rate-limits` (branch `feat/rate-limiting`). Both declare
+`src/auth/token.ts` through `brain_sync`, and B's pane receives the genuine
+exact-file-overlap heads-up, naming the peer as working `(in another worktree)`.
+Every linked worktree of a repository resolves to the one lane its primary
+checkout uses (`agent-presence.mjs` `worktreeLaneIdentity` follows git's
+`commondir`), so the peer list, the heads-up and messages span the worktrees.
+No pane changes: B is simply started with `--repo` pointing at the worktree.
+
+```bash
+node docs/demo/setup-worktrees.mjs          # seeds .demo-repo AND adds the worktree
+vhs docs/demo/demo-worktrees.tape           # writes docs/demo/demo-worktrees.gif
+```
+
+In CI the *Render README demo GIF* workflow takes a `tape` input
+(`demo.tape`, the default, or `demo-worktrees.tape`); it seeds with the matching
+setup script, renders `docs/demo/<tape name>.gif` and uploads it as the
+`<tape name>-gif` artifact. The committed `demo.gif` is untouched by a
+worktrees render.
+
 **Playback is sped up 1.4× by the workflow's ffmpeg step** — a timelapse of a
 real run, disclosed here on purpose: every frame is genuine output; only the
 dead air between server responses is compressed. The pane driver word-wraps

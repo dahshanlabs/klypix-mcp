@@ -748,15 +748,23 @@ export function findPresenceConflicts(sessions, selfId, { projectRoot } = {}) {
     // completedIdleSession gate: a finished task's leftover observations are
     // not a live overlap claim (see the helper above findPresenceConflicts).
     const observed = liveObservedFiles(session);
+    // Since 1.112.0 the lane also holds sessions from OTHER linked git
+    // worktrees of this repository, each with its own checkout root. Declared
+    // files are always checkout-relative (validateExactFileScope), but a path a
+    // host OBSERVED is absolute under that session's own cwd — so it is made
+    // relative against that cwd first, then against ours, and the keys of two
+    // checkouts of one repository compare as the same file.
+    const sessionRoot = session?.cwd || root;
+    const keyOf = (file) => normalizeFileKey(normalizeFileKey(file, sessionRoot), root);
     const observedKeys = new Set(observed
-      .map((file) => normalizeFileKey(file, root))
+      .map(keyOf)
       .filter(Boolean));
     const entries = new Map();
     for (const file of [
       ...(Array.isArray(session?.files) ? session.files : []),
       ...observed,
     ]) {
-      const key = normalizeFileKey(file, root);
+      const key = keyOf(file);
       if (!key || entries.has(key)) continue;
       entries.set(key, {
         display: String(file || '').replace(/\\/g, '/'),
@@ -2965,6 +2973,7 @@ export function createMcpPresence({
           text: isMerge
             ? `Automatic KLYPIX merge-conflict alert: ${selfLabel}${planLabel}. A test merge of its branch ${peer.refs?.mine || ''} with yours ${peer.refs?.theirs || ''} conflicts in: ${peer.files.join(', ')} (committed work only; no declared file overlaps). Coordinate before either of you merges.`
             : `Automatic KLYPIX overlap alert: ${selfLabel}${planLabel}`
+              + `${peer.sameWorktree === false ? ' in another git worktree of this repository' : ''}`
               + ` and reports the same file(s): ${annotated.files.join(', ')}${annotated.legend}. Coordinate before editing.`,
           dedupeKey: `${isMerge ? 'merge-overlap' : 'overlap'}|${sessionId}|${peer.id}|${taskStartedAt}|${filesKey}`,
           home,
@@ -2982,7 +2991,11 @@ export function createMcpPresence({
           'KLYPIX exact file-overlap warning:',
           ...exactConflicts.map((peer) => {
             const annotated = annotateConflictFiles(peer);
-            return `- ${peerLabel(peer)}: ${annotated.files.join(', ')}${annotated.legend}`;
+            // Lane rows record cwd = that session's checkout root, so a false
+            // sameWorktree means the peer works in another linked git worktree
+            // of this repository (one lane spans them since 1.112.0).
+            const where = peer.sameWorktree === false ? ' (in another worktree)' : '';
+            return `- ${peerLabel(peer)}${where}: ${annotated.files.join(', ')}${annotated.legend}`;
           }),
           exactAlerted
             ? 'The earlier peer was automatically queued an exact-once overlap alert; coordinate ownership before editing.'

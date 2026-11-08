@@ -6,7 +6,7 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 
-export const MEASUREMENT_TRANSPORT = 'native-audit-v2';
+export const MEASUREMENT_TRANSPORT = 'native-audit-v3';
 const EVENTS = ['PostToolUse', 'PostToolUseFailure', 'PostToolBatch'];
 const textOf = value => typeof value === 'string' ? value
   : Array.isArray(value) ? value.filter(item => item?.type === 'text').map(item => item.text || '').join('\n') : '';
@@ -18,7 +18,7 @@ export function preparePassiveAudit({ home, repoDir, sessionId, settings = {} })
   const dir = path.join(home, 'passive-tool-audit', sessionId);
   fs.mkdirSync(dir, { recursive: true });
   const configFile = path.join(dir, 'config.json');
-  const config = { version: 1, dir, home: fs.realpathSync(home), repoDir: fs.realpathSync(repoDir), sessionId };
+  const config = { version: 1, dir, repoDir: fs.realpathSync(repoDir), sessionId };
   fs.writeFileSync(configFile, JSON.stringify(config), { flag: 'wx' });
   const hooks = { ...(settings.hooks || {}) };
   for (const event of EVENTS) hooks[event] = [...(hooks[event] || []), {
@@ -26,72 +26,62 @@ export function preparePassiveAudit({ home, repoDir, sessionId, settings = {} })
     hooks: [{ type: 'command', command: process.execPath, args: [fileURLToPath(import.meta.url), configFile], timeout: 15 }],
   }];
   return { dir, configFile, sessionId, settings: { ...settings, hooks },
-    read: options => readPassiveAudit(dir, { sessionId, ...options }) };
+    read: options => readPassiveAudit(dir, { sessionId, ...options }),
+    reconcileAfterClose: stdout => reconcilePassiveAudit(dir, { sessionId, stdout }) };
 }
 
-function scopedNativeDenials(config, event) {
-  // The batch hook omits execution status. Native 2.1.319 writes its typed
-  // rejection record before this synchronous hook runs. Read only this fresh
-  // session's host-provided journal; never infer nonexecution from error text.
-  const completed = new Set();
-  for (const name of fs.readdirSync(config.dir).filter(name => name.endsWith('.event.json'))) {
-    const record = JSON.parse(fs.readFileSync(path.join(config.dir, name), 'utf8'));
-    if (record.sessionId !== config.sessionId || record.version !== 1 || !EVENTS.includes(record.event)) throw new Error('Invalid preceding native audit record');
-    if (record.event !== 'PostToolBatch') completed.add(record.toolUseId);
+const contentHash = content => crypto.createHash('sha256').update(JSON.stringify(content)).digest('hex');
+
+// Called only after the CLI closes and stdout has drained. This stream is
+// never a source of causal exposure: it can only prove that an otherwise
+// unmatched native batch result represents a command that did not execute.
+export function reconcilePassiveAudit(dir, { sessionId, stdout }) {
+  const audit = readPassiveAudit(dir, { sessionId, useReconciliation: false });
+  if (!audit.ok) throw new Error('Cannot reconcile structurally invalid native audit');
+  const events = stdout.split('\n').filter(line => line.trim()).map(line => JSON.parse(line));
+  const proofs = [];
+  for (const call of audit.pending) {
+    const uses = [], results = [];
+    for (const event of events) {
+      if (!Array.isArray(event.message?.content)) continue;
+      for (const block of event.message.content) {
+        if (event.type === 'assistant' && block.type === 'tool_use' && block.id === call.toolUseId) uses.push({ event, block });
+        if (event.type === 'user' && block.type === 'tool_result' && block.tool_use_id === call.toolUseId) results.push({ event, block });
+      }
+    }
+    if (uses.length !== 1 || results.length !== 1) continue;
+    const use = uses[0], result = results[0];
+    if (use.event.session_id !== sessionId || result.event.session_id !== sessionId
+      || use.event.parent_tool_use_id !== null || result.event.parent_tool_use_id !== null
+      || use.block.name !== call.tool || !isDeepStrictEqual(use.block.input, call.input)
+      || result.block.is_error !== true || !isDeepStrictEqual(result.block.content, call.content)) continue;
+    const metadata = (result.event.tool_result_meta || []).filter(item => item.id === call.toolUseId);
+    if (metadata.length !== 1 || metadata[0].non_execution_kind !== 'user-rejected'
+      || metadata[0].permission_decision?.decision !== 'reject' || metadata[0].permission_decision?.source !== 'config') continue;
+    proofs.push({ source: 'closed-native-cli-stream', sessionId, toolUseId: call.toolUseId,
+      tool: call.tool, input: call.input, resultUuid: result.event.uuid, assistantUuid: use.event.uuid,
+      isError: true, kind: metadata[0].non_execution_kind,
+      permissionDecision: { decision: 'reject', source: 'config' }, contentSha256: contentHash(call.content) });
   }
-  const callsNeedingProof = event.tool_calls.filter(call => !completed.has(call.tool_use_id));
-  if (!callsNeedingProof.length || !event.transcript_path) return new Map();
-  const journal = fs.realpathSync(event.transcript_path);
-  const journalRoot = fs.realpathSync(path.join(config.home, '.claude', 'projects'));
-  const relative = path.relative(journalRoot, journal);
-  if (!relative || relative.startsWith(`..${path.sep}`) || relative === '..' || path.isAbsolute(relative)
-    || path.basename(journal) !== `${config.sessionId}.jsonl`) throw new Error('Native audit journal is outside the isolated session');
-  if (fs.statSync(journal).size > 32 * 1024 * 1024) throw new Error('Native audit journal exceeds 32 MiB');
-  const text = fs.readFileSync(journal, 'utf8');
-  // A concurrent append can leave an unfinished tail. Only newline-completed
-  // records can prove a denial; malformed completed records still fail closed.
-  const rows = text.slice(0, text.lastIndexOf('\n') + 1).split('\n').filter(line => line.trim()).map(line => JSON.parse(line));
-  const denials = new Map();
-  for (const call of callsNeedingProof) {
-    const matches = rows.flatMap(row => row.type === 'user' && Array.isArray(row.message?.content)
-      ? row.message.content.filter(block => block.type === 'tool_result' && block.tool_use_id === call.tool_use_id)
-        .map(block => ({ row, block })) : []);
-    // A missing/mismatched record cannot excuse a missing completion. The
-    // reader below still fails closed if the normal per-tool hook is absent.
-    if (matches.length !== 1) continue;
-    const { row, block } = matches[0];
-    if (row.sessionId !== config.sessionId || !row.cwd || !samePath(row.cwd, config.repoDir)
-      || row.isSidechain !== false || block.is_error !== true || !isDeepStrictEqual(block.content, call.tool_response)
-      || row.toolDenialKind !== 'user-rejected' || row.permissionDecision?.decision !== 'reject'
-      || row.permissionDecision?.source !== 'config') continue;
-    const assistants = rows.filter(candidate => candidate.type === 'assistant' && candidate.uuid === row.sourceToolAssistantUUID);
-    if (assistants.length !== 1) continue;
-    const assistant = assistants[0];
-    if (assistant.sessionId !== config.sessionId || !assistant.cwd || !samePath(assistant.cwd, config.repoDir)
-      || assistant.isSidechain !== false) continue;
-    const uses = (assistant.message?.content || []).filter(item => item.type === 'tool_use' && item.id === call.tool_use_id);
-    if (uses.length !== 1 || uses[0].name !== call.tool_name || !isDeepStrictEqual(uses[0].input, call.tool_input || {})) continue;
-    // Preserve only matched typed provenance, not the journal, thinking, or
-    // unrelated messages. The body already exists in the native batch record.
-    denials.set(call.tool_use_id, { source: 'native-session-journal', sessionId: row.sessionId,
-      toolUseId: call.tool_use_id, tool: call.tool_name, input: call.tool_input || {},
-      resultUuid: row.uuid, assistantUuid: assistant.uuid, cwd: config.repoDir,
-      isError: true, kind: row.toolDenialKind,
-      permissionDecision: { decision: 'reject', source: 'config' },
-      contentSha256: crypto.createHash('sha256').update(JSON.stringify(call.tool_response)).digest('hex') });
-  }
-  return denials;
+  const receipt = { version: 1, measurementTransport: MEASUREMENT_TRANSPORT, sessionId,
+    source: 'closed-native-cli-stream', stdoutSha256: crypto.createHash('sha256').update(stdout).digest('hex'),
+    checkedToolUseIds: audit.pending.map(call => call.toolUseId), proofs,
+    unresolvedToolUseIds: audit.pending.filter(call => !proofs.some(proof => proof.toolUseId === call.toolUseId)).map(call => call.toolUseId) };
+  const temporary = path.join(dir, 'reconciliation.tmp'), target = path.join(dir, 'reconciliation.json');
+  fs.writeFileSync(temporary, JSON.stringify(receipt), { flag: 'wx', mode: 0o600 });
+  if (fs.existsSync(target)) throw new Error('Native audit was already reconciled');
+  fs.renameSync(temporary, target);
+  return receipt;
 }
 
-function isVerifiedNativeDenial(call, record) {
-  const proof = call.nativeDenial;
-  return proof?.source === 'native-session-journal' && proof.sessionId === record.sessionId
+function isVerifiedNativeDenial(proof, call, record) {
+  return proof?.source === 'closed-native-cli-stream' && proof.sessionId === record.sessionId
     && proof.toolUseId === call.toolUseId && proof.tool === call.tool && isDeepStrictEqual(proof.input, call.input)
     && typeof proof.resultUuid === 'string' && proof.resultUuid.length > 0
     && typeof proof.assistantUuid === 'string' && proof.assistantUuid.length > 0
-    && typeof proof.cwd === 'string' && proof.isError === true && proof.kind === 'user-rejected'
+    && proof.isError === true && proof.kind === 'user-rejected'
     && proof.permissionDecision?.decision === 'reject' && proof.permissionDecision?.source === 'config'
-    && proof.contentSha256 === crypto.createHash('sha256').update(JSON.stringify(call.content)).digest('hex');
+    && proof.contentSha256 === contentHash(call.content);
 }
 
 export function recordPassiveAudit(config, event) {
@@ -102,13 +92,11 @@ export function recordPassiveAudit(config, event) {
   const record = { version: 1, sessionId: config.sessionId, event: event.hook_event_name, startedAt };
   if (event.hook_event_name === 'PostToolBatch') {
     if (!Array.isArray(event.tool_calls)) throw new Error('Missing native tool batch');
-    const denials = scopedNativeDenials(config, event);
     record.calls = event.tool_calls.map(call => {
       if (!call.tool_use_id || !call.tool_name || !('tool_response' in call)
         || !(typeof call.tool_response === 'string' || Array.isArray(call.tool_response))) throw new Error('Malformed serialized native tool response');
       return { toolUseId: call.tool_use_id, tool: call.tool_name, input: call.tool_input || {},
-        content: call.tool_response, isError: call.is_error === true,
-        ...(denials.has(call.tool_use_id) ? { nativeDenial: denials.get(call.tool_use_id) } : {}) };
+        content: call.tool_response, isError: call.is_error === true };
     });
   } else {
     if (!event.tool_use_id || !event.tool_name) throw new Error('Missing native tool identity');
@@ -129,8 +117,19 @@ export function recordPassiveAudit(config, event) {
   return record;
 }
 
-export function readPassiveAudit(dir, { sessionId, before = Infinity, final = false } = {}) {
-  const records = [], errors = [];
+export function readPassiveAudit(dir, { sessionId, before = Infinity, final = false, useReconciliation = true } = {}) {
+  const records = [], errors = [], pending = [];
+  const proofById = new Map(), receiptFile = path.join(dir, 'reconciliation.json');
+  if (useReconciliation && fs.existsSync(receiptFile)) {
+    const receipt = JSON.parse(fs.readFileSync(receiptFile, 'utf8'));
+    if (receipt.version !== 1 || receipt.measurementTransport !== MEASUREMENT_TRANSPORT || receipt.sessionId !== sessionId
+      || receipt.source !== 'closed-native-cli-stream' || !/^[a-f0-9]{64}$/.test(receipt.stdoutSha256)
+      || !Array.isArray(receipt.proofs)) throw new Error('Invalid native reconciliation receipt');
+    for (const proof of receipt.proofs) {
+      if (proofById.has(proof.toolUseId)) throw new Error('Duplicate native reconciliation proof');
+      proofById.set(proof.toolUseId, proof);
+    }
+  }
   for (const name of fs.readdirSync(dir)) {
     if (name.endsWith('.error.json')) { errors.push(JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8'))); continue; }
     if (final && name.endsWith('.tmp')) errors.push({ error: 'Incomplete native audit record' });
@@ -151,7 +150,9 @@ export function readPassiveAudit(dir, { sessionId, before = Infinity, final = fa
       if (batched.has(call.toolUseId)) errors.push({ error: 'Duplicate batched tool result', toolUseId: call.toolUseId });
       batched.add(call.toolUseId);
       const completion = completions.get(call.toolUseId);
-      if (isVerifiedNativeDenial(call, record)) {
+      const proof = proofById.get(call.toolUseId);
+      if (proof && !isVerifiedNativeDenial(proof, call, record)) errors.push({ error: 'Mismatched native reconciliation proof', toolUseId: call.toolUseId });
+      if (isVerifiedNativeDenial(proof, call, record)) {
         if (completion) errors.push({ error: 'Native denial conflicts with a completed-tool audit', toolUseId: call.toolUseId });
         responses.push({ tool: call.tool, input: call.input, toolUseId: call.toolUseId, text: textOf(call.content),
           isError: true, notExecuted: true, at: record.at, channel: 'native-tool-batch' }); continue;
@@ -166,7 +167,12 @@ export function readPassiveAudit(dir, { sessionId, before = Infinity, final = fa
         responses.push({ tool: call.tool, input: call.input, toolUseId: call.toolUseId, text: call.content,
           isError: true, notExecuted: true, at: record.at, channel: 'native-tool-batch' }); continue;
       }
-      if (!completion || completion.tool !== call.tool || completion.at > record.at) {
+      if (!completion) {
+        pending.push({ ...call, at: record.at, status: 'pending-execution-evidence' });
+        if (final) errors.push({ error: 'Unresolved native batch result lacks completion or typed nonexecution proof', toolUseId: call.toolUseId });
+        continue;
+      }
+      if (completion.tool !== call.tool || completion.at > record.at) {
         errors.push({ error: 'Batch lacks a preceding matching completed-tool audit', toolUseId: call.toolUseId }); continue;
       }
       responses.push({ tool: call.tool, input: call.input, toolUseId: call.toolUseId, text: textOf(call.content),
@@ -174,7 +180,8 @@ export function readPassiveAudit(dir, { sessionId, before = Infinity, final = fa
     }
   }
   if (final) for (const id of completions.keys()) if (!batched.has(id)) errors.push({ error: 'Completed tool has no final batch audit', toolUseId: id });
-  return { records, responses, errors, ok: errors.length === 0,
+  for (const id of proofById.keys()) if (!batched.has(id)) errors.push({ error: 'Native reconciliation proof lacks matching batch', toolUseId: id });
+  return { records, responses, pending, errors, ok: errors.length === 0, finalized: final && errors.length === 0 && pending.length === 0,
     latestBatchAt: records.filter(r => r.event === 'PostToolBatch').at(-1)?.at ?? null };
 }
 

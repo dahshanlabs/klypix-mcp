@@ -97,6 +97,7 @@ export async function runWorkflow({ conditionId, scenario, runId, outDir, ledger
     // this checkpoint. A Read in the checkpoint's own batch does not qualify,
     // even if its stdout tool_result or PostToolUse audit is already visible.
     const priorAudit = consumerAudit.read({ before: row.checkpoint.at });
+    row.pendingNativeResultsAtCheckpoint = priorAudit.pending.map(call => ({ toolUseId: call.toolUseId, tool: call.tool }));
     if (!priorAudit.ok) {
       row.failure = 'native-telemetry-invalid'; row.notMeasured = 'Native audit failed before checkpoint';
       row.telemetryErrors = priorAudit.errors;
@@ -146,7 +147,9 @@ export async function runWorkflow({ conditionId, scenario, runId, outDir, ledger
     row.policyChangeFinishedAt = new Date().toISOString();
     fs.writeFileSync(`${gatePath}.release`, 'continue');
     const consumer = await consumerPromise;
-    telemetry.observeAudit(consumerAudit.read({ final: true }));
+    const finalAudit = consumerAudit.read({ final: true });
+    if (!consumer.nativeAuditFinalized || !finalAudit.finalized) throw new Error('Native audit must be fully reconciled before scoring');
+    telemetry.observeAudit(finalAudit);
     telemetry.snapshot({ kind: 'final-after-consumer' });
     row.nativeHookEvidence = await adapter.exposureEvidence?.({ sessionId: sessionIds.consumer }) || [];
     row.notifications = notificationMetrics({ responses: telemetry.responses, hookEvidence: row.nativeHookEvidence,

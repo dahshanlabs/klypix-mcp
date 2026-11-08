@@ -173,6 +173,9 @@ export async function runClaudeStage({ approved, id, role, repoDir, home, prompt
   if (unpricedModel) ledger.halt(`Unpriced side model appeared: ${parsed.model}`);
   let nativeAudit;
   try {
+    // child.close follows stdout drain. Delayed transport can now explain a
+    // pending native batch denial, never establish earlier model exposure.
+    audit.reconcileAfterClose(stdout);
     nativeAudit = audit.read({ final: true });
     telemetryErrors.push(...nativeAudit.errors.map(error => error.error));
     const audited = new Set(nativeAudit.responses.map(response => response.toolUseId));
@@ -185,5 +188,7 @@ export async function runClaudeStage({ approved, id, role, repoDir, home, prompt
     budgetLimited: /max_budget|budget[_ -](?:usd|limit|exceeded)/i.test(parsed.resultError || ''),
     exitCode: result.code, timedOut, durationMs: Date.now() - started,
     stdoutFile, stderrFile, auditDirectory, sessionId, telemetryErrors,
+    nativeAuditFinalized: nativeAudit?.finalized === true,
+    pendingNativeResults: nativeAudit?.pending?.map(call => ({ toolUseId: call.toolUseId, tool: call.tool })) || [],
     error: result.error || parsed.resultError || telemetryErrors[0] || (unpricedModel ? 'Unpriced side model appeared; review required before more paid work' : null), unpricedModel };
 }

@@ -1,0 +1,155 @@
+{
+  "schema": 1,
+  "kind": "third-experiment-interruption-audit",
+  "sourceCommit": "86699a5b2de41823d1ae303e67966dde404bd50d",
+  "protocolCommit": "aff4814a0634c9df1fd2903fedbe67122b0b6f4f",
+  "measurementTransport": "native-audit-v2",
+  "planned": 30,
+  "attempted": 1,
+  "notStarted": 29,
+  "stopReason": "Instrumentation review required",
+  "firstAttemptsPreserved": true,
+  "reruns": 0,
+  "comparisonVerdict": "inconclusive-no-winner",
+  "results": [
+    {
+      "runId": "unchanged-control-notes-notification-r1-276714b2",
+      "condition": "notes-notification",
+      "scenario": "unchanged-control",
+      "originalCategory": "setup-not-measured",
+      "originalSuccess": false,
+      "failure": "producer-update-or-product-capture-failed",
+      "apiEquivalentUsd": 0.00914283
+    }
+  ],
+  "observations": {
+    "initialExposure": "The consumer read the initial policy and reached the checkpoint with valid native delivery evidence.",
+    "interruption": "The producer update completed model execution, but the observer could not explain a missing completion hook for a host-rejected Bash call. The checkpoint aborted and the runner stopped before the second row.",
+    "causeScope": "The final stdout contains typed nonexecution metadata; the matching native batch has no retained typed-denial proof. The specific live journal lookup or binding failure has not been established by this report.",
+    "deniedTool": {
+      "toolUseId": "toolu_01QwbpVpjWQy5YQiFC1E4M5s",
+      "tool": "Bash",
+      "isError": true,
+      "nonExecutionKind": "user-rejected",
+      "permissionDecision": {
+        "decision": "reject",
+        "source": "config"
+      },
+      "serializedResultMatchesBatch": true,
+      "typedDenialProofRetained": false,
+      "displayedReason": "The command contains multiple operations, one of which requires approval."
+    },
+    "permissionPolicyChanged": false,
+    "noProductOutcomeInferred": true
+  },
+  "priorExperiments": [
+    {
+      "label": "original-stdout-diagnostic",
+      "sourceCommit": "6788b78b867efa59a896144adcd1cddae5eb9c04",
+      "protocolCommit": "d238536627c480abea4c320219e1aa0287aac36c",
+      "publishedReportSha256": "1edc7b9660ea8f6e39778a92b3d975a947359e88f9df10193698dc1aa8f98807",
+      "attempted": 2,
+      "notStarted": 28,
+      "knownApiEquivalentUsd": 0.03482057,
+      "chargedAgainstBudgetUsd": 0.06,
+      "administrativeHoldPaidUsd": 0,
+      "attempts": [
+        {
+          "experiment": "original-stdout-diagnostic",
+          "id": "unchanged-control-notes-notification-r1-8603721e",
+          "condition": "notes-notification",
+          "scenario": "unchanged-control",
+          "firstAttempt": true,
+          "originalCategory": "exposure-unverified",
+          "originalSuccess": false,
+          "pooledIntoCurrentComparison": false,
+          "knownApiEquivalentUsd": 0.0072846199999999995
+        },
+        {
+          "experiment": "original-stdout-diagnostic",
+          "id": "corrected-decision-klypix-improved-r1-397aa6dc",
+          "condition": "klypix-improved",
+          "scenario": "corrected-decision",
+          "firstAttempt": true,
+          "originalCategory": "accounting-ineligible",
+          "originalSuccess": false,
+          "pooledIntoCurrentComparison": false,
+          "knownApiEquivalentUsd": 0.02753595
+        }
+      ]
+    },
+    {
+      "label": "second-native-audit-v1",
+      "sourceCommit": "fa306f0bda28e8026491729e373a93a78db2f8f9",
+      "protocolCommit": "ef80f2a6bd58c3b702621ffad32e13ab25d7beb6",
+      "publishedReportSha256": "5410fa3056f9bb3a564df4068672b5ba8e2eab337dc3a0d862ef5c7f66f16182",
+      "attempted": 2,
+      "notStarted": 28,
+      "knownApiEquivalentUsd": 0.02421613,
+      "chargedAgainstBudgetUsd": 0.05,
+      "attempts": [
+        {
+          "experiment": "second-native-audit-v1",
+          "id": "unchanged-control-notes-notification-r1-9d1b6f27",
+          "condition": "notes-notification",
+          "scenario": "unchanged-control",
+          "firstAttempt": true,
+          "originalCategory": "pass",
+          "originalSuccess": true,
+          "pooledIntoCurrentComparison": false,
+          "knownApiEquivalentUsd": 0.01113393
+        },
+        {
+          "experiment": "second-native-audit-v1",
+          "id": "corrected-decision-klypix-improved-r1-3f15c10f",
+          "condition": "klypix-improved",
+          "scenario": "corrected-decision",
+          "firstAttempt": true,
+          "originalCategory": "setup-not-measured",
+          "originalSuccess": false,
+          "pooledIntoCurrentComparison": false,
+          "knownApiEquivalentUsd": 0.0130822
+        }
+      ]
+    }
+  ],
+  "cost": {
+    "priorPublishedExperimentsApiEquivalentUsd": 0.0590367,
+    "priorConservativeChargeUsd": 0.11,
+    "baselineLedgerSha256": "9756b993cb3ba85614d1865bb6ea575763d673d88c7f99e48581285f7cf4d765",
+    "priorReservationIds": [
+      "administrative-hold-exposure-audit-20261109",
+      "corrected-decision-klypix-improved-r1-397aa6dc-consumer",
+      "corrected-decision-klypix-improved-r1-397aa6dc-producer-initial",
+      "corrected-decision-klypix-improved-r1-397aa6dc-producer-update",
+      "corrected-decision-klypix-improved-r1-3f15c10f-consumer",
+      "corrected-decision-klypix-improved-r1-3f15c10f-producer-initial",
+      "corrected-decision-klypix-improved-r1-3f15c10f-producer-update",
+      "unchanged-control-notes-notification-r1-8603721e-consumer",
+      "unchanged-control-notes-notification-r1-8603721e-producer-initial",
+      "unchanged-control-notes-notification-r1-8603721e-producer-update",
+      "unchanged-control-notes-notification-r1-9d1b6f27-consumer",
+      "unchanged-control-notes-notification-r1-9d1b6f27-producer-initial",
+      "unchanged-control-notes-notification-r1-9d1b6f27-producer-update"
+    ],
+    "priorAdministrativeHoldPaidUsd": 0,
+    "newKnownApiEquivalentUsd": 0.00914283,
+    "globalKnownApiEquivalentUsd": 0.06817953,
+    "globalApiEquivalentUsd": 0.06817953,
+    "globalChargedAgainstBudgetUsd": 0.14,
+    "globalOutstandingReservedUsd": 0,
+    "globalBudgetLimitUsd": 50,
+    "globalHalted": false,
+    "newUnattributedReservations": 0,
+    "matchedConditionCostsExcludeBothPriorExperiments": true,
+    "capIncludesAllThreeExperiments": true,
+    "subscriptionInvoiceCost": "unknown"
+  },
+  "inputHashes": {
+    "experiment": "32226fbf083b858543b1ed86676f488908539c89c2e08478628983ba7155d495",
+    "resultsJsonl": "c93cee3994c149ee635fa0b2e9378f6dce7d66fc211df9632e911091ab034bd1",
+    "runSummary": "5987c5b838d0c5c7309eef8aa8a2d5d5d94f3ebd0bf2414b2f200dc207159006",
+    "ledger": "7bc35b9346cdf2b4957ce29e094d6d5d072f225d16a1c9669fac0c88fdb9af2e",
+    "producerUpdate": "59b729963fe2d3324b98dccd30788c5b9acfe4fc4e3f9f63824b89db1d5341b4"
+  }
+}

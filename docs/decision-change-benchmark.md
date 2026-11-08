@@ -2,7 +2,7 @@
 
 This developer-authored, same-computer pilot measures a specific correctness problem: an agent reads an accepted project decision, that decision changes during its work, and its code should follow the current decision. A separate personal-memory block gives automatic memory a case suited to its purpose. This is not a general memory ranking, cross-vendor benchmark or two-computer team test.
 
-**Execution record:** the [first run](benchmarks/2026-11-09-interrupted-run.md) and [second run](benchmarks/2026-11-09-native-audit-v1-result.md) are published with all attempts retained. One notes control passed; measurement failures interrupted both matrices, so there is no comparative winner. The [typed-denial amendment](benchmarks/2026-11-09-typed-denial-amendment.md) repairs observation without changing the tasks, permissions or pass marks below. Publish all attempts, including ties, KLYPIX losses and budget stops.
+**Execution record:** the [first run](benchmarks/2026-11-09-interrupted-run.md), [second run](benchmarks/2026-11-09-native-audit-v1-result.md) and [third run](benchmarks/2026-11-09-native-audit-v2-result.md) are published with all five attempts retained. One notes control passed; measurement failures interrupted the matrices, so there is no comparative winner. The tasks, permissions and pass marks below remain unchanged. Publish all attempts, including ties, KLYPIX losses and budget stops.
 
 ## Conditions and planned blocks
 

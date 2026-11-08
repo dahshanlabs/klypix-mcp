@@ -16,8 +16,10 @@ replaced the observational transport identically for all arms. Its
 [published result](2026-11-09-native-audit-v1-result.md) retains one notes-control
 pass and a KLYPIX attempt interrupted by misclassified permission denials, with
 28 cells unstarted. Combined spending is $0.05903670; there is still no winner.
-The [third-experiment amendment](2026-11-09-typed-denial-amendment.md) recognizes
-exact typed native denials under the same permissions and preserves both records.
+The [third-experiment amendment](2026-11-09-typed-denial-amendment.md) attempted
+typed native denial recognition. Its [result](2026-11-09-native-audit-v2-result.md)
+retains one more interrupted attempt and 29 unstarted cells. Across all three
+experiments, five attempts and $0.06817953 are preserved; no winner is established.
 
 ## Conditions and setup requirements
 

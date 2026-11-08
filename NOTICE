@@ -1,6 +1,7 @@
 klypix-mcp
 Copyright 2026 Abdullah Aldahshan — Dahshan Labs
 
-This product is licensed under the Apache License, Version 2.0 (see LICENSE).
-Prior published versions (<= 1.28.0) were released under the MIT License and
-remain available under those terms.
+This product is licensed under the MIT License (see LICENSE) from version
+1.112.0 on. Versions 1.29.0 through 1.111.0 were released under the Apache
+License, Version 2.0, and versions up to 1.28.0 under the MIT License; each
+published version remains available under the terms it was released with.

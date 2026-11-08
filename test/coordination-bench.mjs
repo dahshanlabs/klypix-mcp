@@ -35,11 +35,18 @@ const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const { SCENARIOS } = await import('../bench/coordination/scenarios.mjs');
 const { CONDITIONS, conditionById, KLYPIX_BIN, klypixServerInfo } = await import('../bench/coordination/conditions.mjs');
 const { concordInstall, concordEnv, actorTaskId, CONCORD_PINNED_VERSION } = await import('../bench/coordination/conditions-concord.mjs');
-const { agentMail, agentMailPlan, agentMailStatus } = await import('../bench/coordination/conditions-agent-mail.mjs');
+const { agentMail, agentMailInstall, agentMailEnv, AGENT_MAIL_PINNED_VERSION, AGENT_MAIL_SEAT, AGENT_MAIL_ACTOR, AGENT_MAIL_DIR_ENV, AGENT_MAIL_SEAT_LINE, leaseReason } = await import('../bench/coordination/conditions-agent-mail.mjs');
 // Concord runs only where its pinned install is present (KLYPIX_BENCH_CONCORD_DIR); elsewhere it is listed as not measured.
 const concordOn = concordInstall().ok;
 console.log(concordOn ? `(Concord ${CONCORD_PINNED_VERSION} found at ${concordInstall().dir}: its condition is exercised)` : `(Concord not installed: ${concordInstall().reason})`);
-const { oracle, composePrompt, codexMcpOverrides, resolveCli, cleanAgentEnv, claudeAllowedTools, parseClaudeResult, parseCodexEvents, codexChannelUp, codexGitWritable, MCP_STARTUP_TIMEOUT_SEC, CHANNEL_DOWN, classifyChunk } = await import('../bench/coordination/agents.mjs');
+// Agent Mail likewise (KLYPIX_BENCH_AGENT_MAIL_DIR names the folder holding the pinned `am` binary).
+const mailOn = agentMailInstall().ok;
+console.log(mailOn ? `(Agent Mail ${AGENT_MAIL_PINNED_VERSION} found at ${agentMailInstall().dir}: its condition is exercised)` : `(Agent Mail not installed: ${agentMailInstall().reason})`);
+// The Agent Mail dry run is limited to the scenarios the published matrix uses: a
+// stopped session's lease is waited out for real (60 s each), so every scenario
+// would add minutes to the self-test without proving more.
+const MAIL_DRY = new Set(['s1', 's2', 's3', 's5', 's6', 's9', 's10']);
+const { oracle, composePrompt, codexMcpOverrides, resolveCli, cleanAgentEnv, agentProcessEnv, claudeAllowedTools, parseClaudeResult, parseCodexEvents, codexChannelUp, codexGitWritable, MCP_STARTUP_TIMEOUT_SEC, CHANNEL_DOWN, classifyChunk } = await import('../bench/coordination/agents.mjs');
 const { runOne, notApplicableReason, validityError, isInvalidReason, FACT_NOT_FIRED, FACT_TOO_LATE, FACT_NOT_DELIVERED, HARNESS_ERROR } = await import('../bench/coordination/run.mjs');
 const { summarize, toMarkdown } = await import('../bench/coordination/report.mjs');
 const { makeRepo, runNodeTests, runNodeProbe } = await import('../bench/coordination/lib/repo.mjs');
@@ -81,10 +88,11 @@ for (const s of SCENARIOS.filter(applies)) {
 
 // ── B2: dry run over every runnable condition ───────────────────────────────
 const runnable = CONDITIONS.filter((c) => c.runnable);
-ok(runnable.map((c) => c.id).join(',') === `none,relay,agents-md-kept,agents-md-appended,klypix,klypix-installed${concordOn ? ',concord' : ''}`,
-  `B2: six conditions are runnable on any machine${concordOn ? ', plus Concord where its pinned install is present' : ''}; Agent Mail never (its adapter is unverified)`);
-ok(agentMail.runnable === false && /not been verified/.test(agentMail.reason) && /register_agent, file_reservation_paths, send_message, fetch_inbox/.test(agentMail.reason),
-  'B2: Agent Mail is runnable:false and its reason names the unverified adapter, not a missing feature');
+ok(runnable.map((c) => c.id).join(',') === `none,relay,agents-md-kept,agents-md-appended,klypix,klypix-installed${concordOn ? ',concord' : ''}${mailOn ? ',agent-mail' : ''}`,
+  `B2: six conditions are runnable on any machine${concordOn ? ', plus Concord' : ''}${mailOn ? ', plus Agent Mail' : ''} where the pinned install is present`);
+ok(!agentMailInstall({}).ok && agentMailInstall({}).reason.includes(AGENT_MAIL_DIR_ENV) && !agentMailInstall({ [AGENT_MAIL_DIR_ENV]: os.tmpdir() }).ok && /no Agent Mail binary/.test(agentMailInstall({ [AGENT_MAIL_DIR_ENV]: os.tmpdir() }).reason),
+  'B2: with no install dir Agent Mail is not runnable, with the reason naming the env var (never silently skipped)');
+ok(mailOn ? agentMail.reason === null : /verified against 0\.3\.40 only/.test(agentMail.reason), 'B2: Agent Mail\'s reason is null when runnable and names the pinned version otherwise');
 ok(!concordInstall({}).ok && /not installed/.test(concordInstall({}).reason) && !concordInstall({ KLYPIX_BENCH_CONCORD_DIR: os.tmpdir() }).ok,
   'B2: with no install dir Concord is not runnable, with the reason (never silently skipped)');
 ok(CONDITIONS.filter((c) => !c.runnable).every((c) => c.reason && c.reason.length > 20), 'B2: every planned condition says why it is not measured');
@@ -97,6 +105,7 @@ const rows = [];
 for (const s of SCENARIOS.filter(applies)) {
   for (const c of runnable) {
     if (notApplicableReason(s, c)) continue;
+    if (c.id === 'agent-mail' && !MAIL_DRY.has(s.id.split('-')[0])) continue;
     const r = await runOne({ scenario: s, condition: c, agent: oracle, run: 1, timeoutMs: 60_000 });
     rows.push(r);
     const expectPass = expectDelivered(s, c);
@@ -350,7 +359,8 @@ const synthetic = [
 const md = toMarkdown(summarize(synthetic));
 ok(/A decision changed today: KLYPIX ahead of none — 95% vs 15%/.test(md) && !/A note left by a session that has ended: KLYPIX/.test(md),
   'B4: the report calls the 20-run gap a difference and does not claim a difference for the 3-run gap');
-ok(/## Not measured/.test(md) && /MCP Agent Mail/.test(md), 'B4: the report lists the tools it did not measure, with the reason');
+ok(/## Not measured/.test(md) && /OpenMemory/.test(md) && (mailOn ? !/MCP Agent Mail/.test(md.split('## Not measured')[1]) : /MCP Agent Mail/.test(md)),
+  'B4: the report lists the tools it did not measure, with the reason (Agent Mail only where its install is absent)');
 const naMd = toMarkdown(summarize([
   { scenario: 's6-fact-arrives-mid-task', condition: 'relay', agent: 'claude', run: 1, notApplicable: 'a paste at start cannot carry it', success: false, staleAction: false },
   { scenario: 's2-overlapping-work', condition: 'klypix', agent: 'claude', run: 1, success: false, staleAction: true, handled: true },
@@ -478,6 +488,10 @@ ok(/\| 2\/3 \| —/.test(naMd) && /\| Handled \|/.test(naMd), 'B4: the "handled"
   const env = cleanAgentEnv({ PATH: 'p', CLAUDECODE: '1', CLAUDE_CODE_ENTRYPOINT: 'cli', KLYPIX_SESSION_ID: 'parent', ELECTRON_RUN_AS_NODE: '1', ANTHROPIC_API_KEY: 'k', OPENAI_API_KEY: 'o' });
   ok(env.PATH === 'p' && env.ANTHROPIC_API_KEY === 'k' && env.OPENAI_API_KEY === 'o' && !('CLAUDECODE' in env) && !('CLAUDE_CODE_ENTRYPOINT' in env) && !('KLYPIX_SESSION_ID' in env) && !('ELECTRON_RUN_AS_NODE' in env),
     'B5: the agent starts clean — no parent Claude session, KLYPIX id or Electron flag leaks in (credentials stay)');
+  const ape = agentProcessEnv({ PATH: 'p', HOME: 'S:/sandbox', USERPROFILE: 'S:/sandbox', KLYPIX_BENCH_AGENT_PROFILE: 'C:/Users/me', KLYPIX_BRAIN_DIR: 'S:/sandbox/b' });
+  const apeNone = agentProcessEnv({ PATH: 'p', HOME: 'S:/sandbox', USERPROFILE: 'S:/sandbox' });
+  ok(ape.HOME === 'C:/Users/me' && ape.USERPROFILE === 'C:/Users/me' && !('KLYPIX_BENCH_AGENT_PROFILE' in ape) && !('KLYPIX_BRAIN_DIR' in ape) && apeNone.HOME === 'S:/sandbox',
+    'B5: a sandboxed bench hands the agent CLI (only) the profile that holds its login; no KLYPIX_* name reaches it');
   ok(claudeAllowedTools({ 'klypix-canvas': {} }).includes('mcp__klypix-canvas') && !claudeAllowedTools({}).some((t) => t.startsWith('mcp__')),
     'B5: Claude may use every tool of the condition\'s server, and no MCP tool otherwise');
   ok(['Bash(git *)', 'PowerShell(git *)', 'PowerShell(node *)', 'PowerShell(npm test*)'].every((t) => claudeAllowedTools({}).includes(t)),
@@ -587,12 +601,8 @@ ok(/\| 2\/3 \| —/.test(naMd) && /\| Handled \|/.test(naMd), 'B4: the "handled"
   ok(/\| Concord MCP 0\.20\.0 [^|]*\| 1 \| 100% \(21%–100%\) \| 0\/1 \| 0\.0 \| 1\/1 \|/.test(concordMd), 'B7: a Concord row shows n, its wide single-run interval, and whether the agent consulted the server');
   const fiveRuns = Array.from({ length: 5 }, (_, i) => ({ scenario: 's1-changed-decision', condition: 'concord', agent: 'claude', run: i + 1, success: true, staleAction: false, experimentId: 'y' }));
   ok(/Pilot-sized cells — not a ranking/.test(concordMd) && !/Pilot-sized cells/.test(toMarkdown(summarize(fiveRuns), fiveRuns)), 'B7: cells with n < 5 carry the "not a ranking" caveat; a five-run cell does not');
-  ok(/## Not measured/.test(concordMd) && /MCP Agent Mail \(Rust rewrite, pinned 0\.3\.40\)/.test(concordMd) && /has not been verified against the running server/.test(concordMd),
-    'B7: Agent Mail is listed as not measured with its precise status');
-  const plan = agentMailPlan(SCENARIOS.find((s) => s.id === 's2-overlapping-work'), { repoDir: '/r' });
-  ok(plan.some((c) => c.tool === 'file_reservation_paths' && c.args.paths.includes('lib/price.js')) && plan.some((c) => c.tool === 'send_message' && c.unsettled),
-    'B7: the Agent Mail skeleton plans a file reservation for the live peer and marks the note\'s recipient as unsettled (never guessed)');
-  ok(/skeleton/.test(agentMailStatus({}, 'win32').reason) && /Windows x64 release asset exists/.test(agentMailStatus({}, 'win32').reason), 'B7: the Agent Mail status says what exists for this platform and what is unverified');
+  ok(mailOn ? !/MCP Agent Mail/.test(concordMd.split('## Not measured')[1] || '') : (/## Not measured/.test(concordMd) && /MCP Agent Mail 0\.3\.40/.test(concordMd) && /verified against 0\.3\.40 only/.test(concordMd)),
+    `B7: Agent Mail is ${mailOn ? 'not listed as unmeasured (its install is present)' : 'listed as not measured with its precise status'}`);
 
   if (concordOn) {
     // Through the wire: the agent's own Concord server, started exactly as the
@@ -688,6 +698,144 @@ ok(/\| 2\/3 \| —/.test(naMd) && /\| Handled \|/.test(naMd), 'B4: the "handled"
       }
     }
     ok(!fs.existsSync(path.join(sandbox, '.concord')) || !fs.existsSync(path.join(sandbox, '.concord', 'global.db')), 'B7: no Concord run wrote a machine-wide store into the (sandboxed) user home');
+  }
+}
+
+// ── B8: MCP Agent Mail (third-party channel) ────────────────────────────────
+{
+  const s1 = SCENARIOS.find((s) => s.id === 's1-changed-decision');
+  const s7 = SCENARIOS.find((s) => s.id === 's7-decision-buried-in-history');
+  const s9s = SCENARIOS.find((s) => s.id === 's9s-continue-stopped-session-summary');
+  const c1 = SCENARIOS.find((s) => s.id === 'c1-restated-claim');
+  ok(/dated project log/.test(notApplicableReason(s7, agentMail) || '') && /identical to S9/.test(notApplicableReason(s9s, agentMail) || '')
+    && /capture engine/.test(notApplicableReason(c1, agentMail) || '') && notApplicableReason(s1, agentMail) === null,
+  'B8: Agent Mail is n/a, with the reason, for the six-month log, the S9 summary twin and the crowd brains — and runs everywhere else');
+  const env = agentMailEnv('H:/run-home', 'H:/run-home/am');
+  ok(env.HOME === 'H:/run-home' && env.USERPROFILE === 'H:/run-home' && env.STORAGE_ROOT === 'H:/run-home/am' && env.TUI_ENABLED === 'false'
+    && [env.APPDATA, env.LOCALAPPDATA, env.XDG_CONFIG_HOME, env.XDG_CACHE_HOME, env.XDG_DATA_HOME].every((p) => p.startsWith(path.join('H:/run-home', ''))),
+  'B8: every Agent Mail process of a run gets the run\'s home, its store inside it, and no TUI');
+  ok(/BlueLake/.test(AGENT_MAIL_SEAT_LINE) && /register_agent/.test(AGENT_MAIL_SEAT_LINE) && /fetch_inbox/.test(AGENT_MAIL_SEAT_LINE) && AGENT_MAIL_SEAT === 'BlueLake' && AGENT_MAIL_ACTOR === 'GreenCastle',
+    'B8: the bench\'s one addition to Agent Mail\'s blurb names the seat mailbox and how to register as it');
+  const urlOverrides = codexMcpOverrides({ 'agent-mail': { type: 'http', url: 'http://127.0.0.1:1234/mcp/' } });
+  ok(urlOverrides.includes('mcp_servers.agent-mail.url="http://127.0.0.1:1234/mcp/"') && !urlOverrides.some((a) => /agent-mail\.(command|args)=/.test(a)) && urlOverrides.includes('mcp_servers.agent-mail.default_tools_approval_mode="approve"'),
+    'B8: Codex reaches a URL server by url (no command), with the same approval and timeout as a stdio server');
+  ok(leaseReason({ intent: 'Switch tax to per-line rounding in lib/tax.js', branch: 'a/per-line-tax' }) === 'Switch tax to per-line rounding in lib/tax.js (branch a/per-line-tax)' && leaseReason({ intent: 'Rewrite lib/report.js' }) === 'Rewrite lib/report.js',
+    'B8: a lease\'s reason is the session\'s intent, and its branch when it has one');
+  const mailRows = [
+    { scenario: 's1-changed-decision', condition: 'agent-mail', agent: 'claude', run: 1, success: true, staleAction: false, mcpCalls: { register_agent: 1, fetch_inbox: 2 }, channelServer: { name: 'agent-mail', version: '0.3.40' }, experimentId: 'z' },
+    { scenario: 's7-decision-buried-in-history', condition: 'agent-mail', agent: 'claude', run: 1, notApplicable: 'Agent Mail keeps mail threads and leases, not a dated project log', success: false, staleAction: false, experimentId: 'z' },
+  ];
+  const mailMd = toMarkdown(summarize(mailRows), mailRows);
+  ok(/agent-mail: agent-mail 0\.3\.40/.test(mailMd) && /\| MCP Agent Mail 0\.3\.40 [^|]*\| 1 \| 100% \(21%–100%\) \| 0\/1 \| 0\.0 \| 1\/1 \|/.test(mailMd) && /\| MCP Agent Mail 0\.3\.40 [^|]*\| — \| n\/a: Agent Mail keeps mail threads/.test(mailMd),
+    'B8: an Agent Mail row names the server version, shows n, its interval and whether the agent consulted the server; an n/a cell prints its reason');
+
+  if (mailOn) {
+    // Through the wire: the agent's own HTTP client of the run's server, exactly
+    // as the bench configures the agent, shows what the other session left.
+    const { Client: HttpClient } = await import('@modelcontextprotocol/sdk/client/index.js');
+    const { StreamableHTTPClientTransport } = await import('@modelcontextprotocol/sdk/client/streamableHttp.js');
+    const connectAs = async (server) => {
+      const c = new HttpClient({ name: 'cobench-agent', version: '1.0.0' }, { capabilities: {} });
+      await c.connect(new StreamableHTTPClientTransport(new URL(server.url)));
+      const call = async (name, args) => { const r = await c.callTool({ name, arguments: args }); const text = (r.content || []).map((x) => x.text || '').join('\n'); let value; try { value = JSON.parse(text); } catch { value = text; } return { isError: !!r.isError, value, text }; };
+      const read = async (uri) => { const r = await c.readResource({ uri }); const text = (r.contents || []).map((x) => x.text || '').join('\n'); try { return JSON.parse(text); } catch { return text; } };
+      return { call, read, close: () => c.close().catch(() => {}) };
+    };
+    const bodies = (inbox) => (Array.isArray(inbox) ? inbox : []).map((m) => `${m.subject || ''} ${m.body_md || ''}`);
+    const register = (call, repo) => call('register_agent', { project_key: repo.dir, name: AGENT_MAIL_SEAT, program: 'claude-code', model: 'opus' });
+    const cases = {
+      's1-changed-decision': { check: async (call, read, repo, prep) => {
+        const reg = await register(call, repo);
+        const inbox = await call('fetch_inbox', { project_key: repo.dir, agent_name: AGENT_MAIL_SEAT, include_bodies: true });
+        return !reg.isError && reg.value?.name === AGENT_MAIL_SEAT && bodies(inbox.value).some((b) => /bearer tokens/.test(b) ) && (inbox.value || []).some((m) => m.from === AGENT_MAIL_ACTOR && /bearer tokens/.test(m.body_md || ''))
+          && (repo.read('AGENTS.md') || '').includes('cookie session in auth/cookie.js') && prep.agentMail.slug;
+      }, what: 'registering as the seat gives the agent the mailbox the other session wrote to; the decision is in it, from GreenCastle; the stale cookie line stays in the notes' },
+      's2-overlapping-work': { check: async (call, read, repo, prep) => {
+        await register(call, repo);
+        const conflicts = await call('check_file_reservation_conflicts', { project_key: repo.dir, agent_name: AGENT_MAIL_SEAT, paths: ['lib/price.js'] });
+        const claim = await call('file_reservation_paths', { project_key: repo.dir, agent_name: AGENT_MAIL_SEAT, paths: ['lib/price.js'], exclusive: true, ttl_seconds: 600 });
+        const inbox = await call('fetch_inbox', { project_key: repo.dir, agent_name: AGENT_MAIL_SEAT, include_bodies: true });
+        const agents = await call('list_agents', { project_key: repo.dir });
+        const leases = await read(`resource://file_reservations/${prep.agentMail.slug}?active_only=true`);
+        return conflicts.value?.conflict_free === false && (conflicts.value.conflicts || []).some((c) => c.path === 'lib/price.js' && c.holders.some((h) => h.agent === AGENT_MAIL_ACTOR && h.exclusive))
+          && (claim.value?.granted || []).length === 0 && (claim.value?.conflicts || []).length > 0
+          && bodies(inbox.value).some((b) => /git merge a\/currency/.test(b))
+          && (agents.value || []).some((a) => a.name === AGENT_MAIL_ACTOR && /currency support/.test(a.task_description || ''))
+          && (Array.isArray(leases) ? leases : []).some((l) => l.agent === AGENT_MAIL_ACTOR && l.path_pattern === 'lib/price.js' && /branch a\/currency/.test(l.reason || ''));
+      }, what: 'checking or claiming lib/price.js reports the live peer\'s exclusive lease (reason names branch a/currency); its note is in the inbox; the peer is listed with its intent' },
+      's3-note-from-closed-session': { check: async (call, read, repo) => {
+        await register(call, repo);
+        const inbox = await call('fetch_inbox', { project_key: repo.dir, agent_name: AGENT_MAIL_SEAT, include_bodies: true });
+        return bodies(inbox.value).some((b) => /backfill:emails/.test(b) && /migrate:002/.test(b));
+      }, what: 'the ended session\'s finding is in the seat\'s inbox' },
+      's10-live-peer-wrote-nothing': { check: async (call, read, repo) => {
+        await register(call, repo);
+        const conflicts = await call('check_file_reservation_conflicts', { project_key: repo.dir, agent_name: AGENT_MAIL_SEAT, paths: ['lib/tax.js'] });
+        const inbox = await call('fetch_inbox', { project_key: repo.dir, agent_name: AGENT_MAIL_SEAT, include_bodies: true });
+        return conflicts.value?.conflict_free === false && (conflicts.value.conflicts || []).some((c) => c.holders.some((h) => h.agent === AGENT_MAIL_ACTOR))
+          && !bodies(inbox.value).some((b) => /tax/i.test(b));
+      }, what: 'declaring lib/tax.js reports the live session\'s lease, though it wrote no mail' },
+      's5-stale-wip-note': { check: async (call, read, repo, prep) => {
+        await register(call, repo);
+        const conflicts = await call('check_file_reservation_conflicts', { project_key: repo.dir, agent_name: AGENT_MAIL_SEAT, paths: ['lib/report.js'] });
+        const leases = await read(`resource://file_reservations/${prep.agentMail.slug}?active_only=false`);
+        const inbox = await call('fetch_inbox', { project_key: repo.dir, agent_name: AGENT_MAIL_SEAT, include_bodies: true });
+        const expired = (Array.isArray(leases) ? leases : []).find((l) => l.agent === AGENT_MAIL_ACTOR && l.path_pattern === 'lib/report.js');
+        return conflicts.value?.conflict_free === true && !!expired && Date.parse(expired.expires_ts) < Date.now() && prep.agentMail.waitedForExpiryMs > 0 && prep.agentMail.endedActorAgeDistorted === true
+          && !bodies(inbox.value).some((b) => /do not touch/i.test(b)) && (repo.read('AGENTS.md') || '').includes('do not touch');
+      }, what: 'session Q\'s lease on lib/report.js has expired by Agent Mail\'s own ttl (the paths are clear, the lease is listed as past); no mail carries the WIP words; the dead line stays in the notes file; the row records the age distortion' },
+    };
+    for (const [id, tc] of Object.entries(cases)) {
+      const s = SCENARIOS.find((x) => x.id === id);
+      const repo = makeRepo('klypix-cobench-b8-');
+      const benchHome = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-cobench-b8home-'));
+      let prep = null; let session = null;
+      try {
+        s.build(repo);
+        prep = await agentMail.prepare({ repo, scenario: s, agent: { id: 'claude' }, sessionIds: { agent: `bench-agent-${id.slice(0, 3)}` }, benchHome });
+        const server = prep.mcpServers['agent-mail'];
+        ok(prep.delivered.length === s.facts.length && prep.channelServer?.version === AGENT_MAIL_PINNED_VERSION, `B8 ${id}: the condition reads every fact back through Agent Mail's own server and names the server version`);
+        ok(server.type === 'http' && /^http:\/\/127\.0\.0\.1:\d+\/mcp\/$/.test(server.url) && prep.agentMail.url === server.url && fs.existsSync(path.join(benchHome, 'am', 'storage.sqlite3')),
+          `B8 ${id}: the agent reaches the run's own serve-http over loopback HTTP; the store lives in the run's home`);
+        ok(!fs.existsSync(path.join(repo.dir, '.mcp.json')) && ['AGENTS.md', 'CLAUDE.md'].every((f) => /<!-- am:blurb -->[\s\S]*register_agent[\s\S]*<!-- am:blurb:end -->/.test(repo.read(f) || '') && (repo.read(f) || '').includes(AGENT_MAIL_SEAT_LINE.trim()))
+          && repo.git('status', '--porcelain') === '',
+        `B8 ${id}: the repo carries Agent Mail's own blurb and the bench's seat line in both instruction files, committed, and no MCP config`);
+        session = await connectAs(server);
+        ok(await tc.check(session.call, session.read, repo, prep), `B8 ${id}: through the agent's own client — ${tc.what}`);
+        if (id === 's1-changed-decision') {
+          const s6 = SCENARIOS.find((x) => x.id === 's6-fact-arrives-mid-task');
+          const repo6 = makeRepo('klypix-cobench-b8s6-');
+          const home6 = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-cobench-b8home6-'));
+          let prep6 = null; let live = null;
+          try {
+            s6.build(repo6);
+            prep6 = await agentMail.prepare({ repo: repo6, scenario: s6, agent: { id: 'claude' }, sessionIds: { agent: 'bench-agent-s6' }, benchHome: home6 });
+            live = await connectAs(prep6.mcpServers['agent-mail']);
+            await register(live.call, repo6);
+            const before = await live.call('fetch_inbox', { project_key: repo6.dir, agent_name: AGENT_MAIL_SEAT, include_bodies: true });
+            const out = await agentMail.later({ repo: repo6, scenario: s6, agent: { id: 'claude' }, sessionIds: { agent: 'bench-agent-s6' }, benchHome: home6, prep: prep6 });
+            const after = await live.call('fetch_inbox', { project_key: repo6.dir, agent_name: AGENT_MAIL_SEAT, include_bodies: true, unread_only: true });
+            ok(!bodies(before.value).some((b) => /MINOR units/.test(b)) && out.delivered.length === 1 && out.notePosted === true && bodies(after.value).some((b) => /MINOR units/.test(b)),
+              'B8 s6: the mid-task decision is mailed to the seat while the agent\'s session is live (read back); the agent\'s next fetch_inbox hands it over as unread');
+          } catch (err) { ok(false, `B8 s6: ${String(err?.message || err).split('\n')[0]}`); }
+          finally { await live?.close(); prep6?.cleanup?.(); repo6.remove(); try { fs.rmSync(home6, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); } catch { /* */ } }
+        }
+      } catch (err) {
+        ok(false, `B8 ${id}: ${String(err?.message || err).split('\n')[0]}`);
+      } finally {
+        await session?.close();
+        const url = prep?.agentMail?.url;
+        prep?.cleanup?.();
+        if (url) {
+          let gone = false;
+          for (let i = 0; i < 25 && !gone; i++) { try { await fetch(url.replace(/\/mcp\/$/, '/health/liveness')); } catch { gone = true; } if (!gone) await new Promise((r) => setTimeout(r, 200)); }
+          ok(gone, `B8 ${id}: cleanup stops the run's serve-http`);
+        }
+        repo.remove();
+        try { fs.rmSync(benchHome, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); } catch { /* */ }
+      }
+    }
+    ok(!fs.existsSync(path.join(sandbox, '.local', 'share', 'mcp-agent-mail')), 'B8: no Agent Mail run wrote a store into the (sandboxed) user home');
   }
 }
 

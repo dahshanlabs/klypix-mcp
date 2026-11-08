@@ -63,6 +63,7 @@ so the agent cannot read or game them. There is no LLM judge.
 | `agents-md-appended` | The other session appended to `AGENTS.md` / `CLAUDE.md` (the out-of-date line left in). |
 | `klypix` | The other session used KLYPIX: decisions as brain cards (a replaced one archived with a "superseded by" arrow), live work as a lane row, an ended session as an expired row. **KLYPIX never edits the notes file**: whatever it said before is still there, and KLYPIX's signal has to beat it. The agent gets **only the klypix-mcp server** (plugin mode) and the project rules `klypix link` writes — no hooks. Those rules go into `AGENTS.md`, which Codex loads itself. `klypix link` writes no `CLAUDE.md` target, because Claude Code's rules channel is hooks, so **Claude Code sees the rules only if it opens `AGENTS.md`**; otherwise its only pointer is the server's own instructions. (Round 2: Claude consulted KLYPIX in exactly the 31 of 35 runs in which it opened `AGENTS.md`.) Plugin mode means keyword-only `brain_ask`. This is not the default install, and whether hooks change the result is not measured. |
 | `klypix-installed` | What `npx klypix-mcp install` gives a Claude Code user: the server **not** in plugin mode, the five hooks the installer wires (SessionStart, UserPromptSubmit `--prompt`, Stop `--capture`, PostToolUse `--live`, PreToolUse `--guard`; the self-test checks them against `bin/klypix-install.mjs`) and search by meaning when `KLYPIX_BENCH_SEMANTIC_DIR` points at a prepared copy of its runtime and model. The hooks go into the run repo's `.claude/settings.json` (kept out of git) and run this checkout's hook through a wrapper pinned to the run's throwaway home, so no hook touches the user's own KLYPIX. **n/a for Codex**: Codex reads hooks only from the user's own `CODEX_HOME` (project-level hooks are not read), so running them would run the user's installed KLYPIX — not measured. |
+| `agent-mail` | **MCP Agent Mail 0.3.40** (the Rust rewrite, `Dicklesworthstone/mcp_agent_mail_rust`, pinned; adapter in `conditions-agent-mail.mjs`; Windows x64 release binary, verified on Windows 11 on 2026-11-08). The other session uses Agent Mail's own tools the way its instruction blurb tells a session to: its identity is a `register_agent` row (`task_description` = its intent); its work on files is an exclusive `file_reservation_paths` lease on those files, `reason` = its intent and branch, ttl 3600 s (the README's own example) — so a live peer is a lease the agent's `check_file_reservation_conflicts` / `file_reservation_paths` reports as a conflict with its holder (S2, S10); a decision or finding is a `send_message` to the agent's mailbox (S1, S3; S6 mid-task, which the agent sees at its next `fetch_inbox` — Agent Mail has no push); a session that stopped while holding a lease (S5-family, S9) is left to **Agent Mail's own expiry**: its lease is taken with the smallest ttl the server accepts (60 s) and the bench waits until Agent Mail reports the paths clear — nothing is released by hand, and the store is never written directly. **The seat.** Agent Mail delivers to *named* mailboxes only (`broadcast` is rejected; its `project:<slug>` mailbox reaches only agents registered before the send — verified), `send_message` refuses an unregistered name, and Agent Mail's blurb prescribes no fixed name (the `AGENT_NAME` env var it mentions is read by the pre-commit guard only; `register_agent` ignores it — verified). So the bench pre-registers one mailbox for the agent's seat, **`BlueLake`** (a name from Agent Mail's own docs; it refuses any name that is not one of its adjective+noun pairs), and adds **one line** after Agent Mail's blurb saying that this checkout's mailbox is `BlueLake`; the other session (`GreenCastle`) addresses it. That is the bench's reading of the product — a team that gives each seat a fixed Agent Mail name — and the only documented route by which a note from a session that has *ended* reaches one that starts later. The repo gets exactly what `am docs insert-blurbs` writes (Agent Mail's blurb in CLAUDE.md and AGENTS.md, between its `<!-- am:blurb -->` markers) plus that seat line; no MCP config, no pre-commit guard. Transport is one `am serve-http --no-tui --no-auth` per run on a free loopback port with `STORAGE_ROOT` in the run's throwaway home — the configuration Agent Mail's installer writes — because two stdio servers cannot share a storage root (starting a second closed the first's connection; verified). Both agents reach it by URL. **Known deviation:** Agent Mail stamps "now" and its store cannot be backdated by the bench, so a session that stopped two days or five hours ago reads in `list_agents` as active about a minute ago; its lease is expired all the same. Every such row records `agentMail.endedActorAgeDistorted`. **n/a**: S7 (no dated-log shape), S9s (Agent Mail records no last words), the crowd scenarios. Runs only where `KLYPIX_BENCH_AGENT_MAIL_DIR` names a 0.3.40 install; otherwise listed as not measured. |
 | `concord` | **Concord MCP 0.20.0** (`@concord-ai/concord-mcp`, pinned; adapter in `conditions-concord.mjs`). The other session uses Concord's own five tools the way Concord's instructions tell a session to: its work is a `start_work` task (title = its intent, `expected_files` = the files it is on, `branch` when it has one), so a live peer is a claim the agent's own `start_work` collides with (S2, S10); a decision or finding is an `update_work` record on that task (S1, S4, S8; S6 mid-task, plus a `prompt` to the agent); a session that finished and left marks its task review-ready with `finish_work` (S3 — Concord's workspace view lists active and review-ready tasks only, so a task closed as `complete` takes its notes out of `inspect_work`'s view; review-ready is the generous reading); a session that stopped mid-work leaves its claim, which Concord's own presence rules flag as **stale** once the owner has been away 30 minutes (S5-family, S9). Concord has no automatic work record, so in S9 it carries the claim — title, files, branch — and no last prompt or reply; the fact counts as delivered when the stale claim lists that title. The repo gets exactly what `concord setup` writes except its MCP registrations (`.concord/` with its self-ignoring `.gitignore`; Concord's instruction block in CLAUDE.md, AGENTS.md, `.codex/`, `.cursor/`, `.github/`, `.agents/`); the harness supplies the pinned server under the same `concord` key. **Claude Code reads the CLAUDE.md block natively**, which the KLYPIX condition's AGENTS.md rules do not get. No Concord plugin or hooks (the bench's Claude reads project settings only), so a live prompt has no reachable endpoint and Concord's own notice says so in the first tool result; identity is the documented operator path (`CONCORD_AGENT_ID`); telemetry and update checks off; every Concord process runs in the run's throwaway home. The one bench write outside Concord's tools is backdating an ended session's timestamps to when it really stopped (the tools stamp "now"), as the KLYPIX condition writes an ended lane row at its real age. **n/a**: S7 (a dated six-month log has no faithful Concord shape), S9s (Concord records no last words), the crowd scenarios (KLYPIX's own capture engine). Runs only where `KLYPIX_BENCH_CONCORD_DIR` names a 0.20.0 install; otherwise listed as not measured. |
 
 From round 3, Codex gets the KLYPIX server's tools approved
@@ -77,31 +78,32 @@ always writes the facts, in the right file, committed. Real teams forget.
 **Not measured yet** (listed in every report, never simulated):
 KLYPIX's hooks on **Codex** (they live only in the user's own `CODEX_HOME`),
 Claude Code cross-session messaging, Claude Code's and Codex's native session
-resume (S9 makes every handoff cross-vendor so no native resume applies), **MCP
-Agent Mail** and memory tools such as OpenMemory. Each needs an adapter
-verified against a pinned version before any number is published. KLYPIX's
-hooks on **Claude Code** are measured from round 3 (`klypix-installed`);
-**Concord** is measured from the 2026-11-08 pilot (`concord`, above).
+resume (S9 makes every handoff cross-vendor so no native resume applies), memory
+tools such as OpenMemory, **Clash** and **Agent-MCP**. Clash is a Claude Code
+hook that detects cross-worktree conflicts and keeps no memory, so only the
+overlapping-work scenarios (S2, S10) could apply to it, and no adapter exists.
+Agent-MCP has no adapter. Each needs an adapter verified against a pinned
+version before any number is published. KLYPIX's hooks on **Claude Code** are
+measured from round 3 (`klypix-installed`); **Concord** from the 2026-11-08
+pilot and **MCP Agent Mail** from the 2026-11-08 competitors run (`concord` and
+`agent-mail`, above).
 
-**MCP Agent Mail — status, honest** (`conditions-agent-mail.mjs`, `runnable:false`).
-The maintained version is the Rust rewrite
-(`Dicklesworthstone/mcp_agent_mail_rust`); its latest release, v0.3.40
-(2026-11-01), ships a Windows x64 asset
-(`mcp-agent-mail-x86_64-pc-windows-msvc.zip`), so the earlier "Linux/macOS
-binaries only" note was out of date. On 2026-11-08 that zip was downloaded,
-its SHA-256 matched the published `.sha256`, and the binary started over stdio
-on this Windows 11 machine (`am serve-stdio` with an existing `STORAGE_ROOT`;
-~5 s to first reply; MCP protocol 2024-11-05; `tools/list` answered — the names
-are in the module header). That is all that was verified. The adapter is a
-skeleton: the planned mapping (`ensure_project`, `register_agent`,
-`file_reservation_paths` for a live peer, `send_message` for a decision,
-`fetch_inbox` / `search_messages` to read back) has not been run against the
-server, and one design question is unsettled — Agent Mail delivers to **named**
-mailboxes (broadcast is rejected) and an agent under test has no name before it
-registers, so how a note from an ended session reaches it (a thread the agent is
-told to read, search, or a pre-created identity) is a choice about the product
-that must be made and documented before any number is published. The project's
-own release notes call native Windows unverified. No Agent Mail number exists.
+**MCP Agent Mail — what was verified** (2026-11-08, Windows 11 x64, v0.3.40, the
+release zip's SHA-256 matching its published `.sha256`; the project's own release
+notes call native Windows unverified). Through the wire, as the bench starts it:
+`am serve-http` comes up in ~5 s and answers `/health/liveness`; `ensure_project`
+takes the repo's absolute path; `register_agent` refuses any name that is not
+one of its adjective+noun pairs and treats a reused name as the same identity
+(the inbox is the seat's); `file_reservation_paths` enforces a 60 s minimum ttl
+and an expired lease stops blocking (`check_file_reservation_conflicts` →
+`conflict_free`), while `resource://file_reservations/<slug>?active_only=false`
+still lists it; `send_message` refuses an unregistered recipient and
+`broadcast`; the `project:<slug>` mailbox is not handed to an agent registered
+after the send; `fetch_inbox(mark_read: false)` reads without marking; a second
+HTTP client sees a message the moment it is sent; a stdio server refuses to
+start while the HTTP server owns the root, and a second stdio server closed the
+first. The self-test's B8 repeats the delivery checks (S1, S2, S3, S5, S10, and
+S6 mid-task) against the live server before any model is called.
 
 ## Fairness rules
 
@@ -144,7 +146,15 @@ preserves the existing result rows, including failures, and explains why they
 are not an evaluation of the current build. The
 [2026-11-08 Concord pilot](results/2026-11-08-concord-pilot.md) is the first
 run of a third-party channel: **n = 1 per cell, Claude Code only — it proves
-the adapter end to end and ranks nothing.**
+the adapter end to end and ranks nothing.** The
+[2026-11-08 competitors run](results/2026-11-08-competitors.md) is the first
+published comparison against Concord and Agent Mail: nine scenarios × five
+conditions (`none`, `agents-md-kept`, `klypix`, `concord`, `agent-mail`) with
+Claude Code at **n = 4** (the planned fifth pass was stopped at the budget cap;
+it continues the same experiment with `--resume`), and a Codex subset at n = 3.
+Its plain-words summary names only differences whose intervals do not overlap,
+and its machine-readable twin is
+`results/2026-11-08-competitors.summary.json` (`summary.mjs`).
 
 ```bash
 # Free: scripted oracle, no model calls. Proves graders and delivery.
@@ -181,8 +191,36 @@ Concord versions can never be pooled. The `concord` CLI is **not** on the
 agent's PATH (and not in Claude's allow-list): the five MCP tools are the
 channel, as they are for KLYPIX.
 
-`--shuffle <seed>` interleaves the runs reproducibly. To continue an interrupted
-run, repeat the **same command** with `--resume`. The output must match the
+**Agent Mail** likewise runs only against a pinned local binary:
+
+```bash
+# Download the v0.3.40 release asset for your platform (Windows: mcp-agent-mail-x86_64-pc-windows-msvc.zip),
+# check its SHA-256 against the published .sha256, and unzip it into one folder.
+KLYPIX_BENCH_AGENT_MAIL_DIR=/tmp/cobench-competitors/agent-mail/v0.3.40 node bench/coordination/run.mjs --dry-run --condition agent-mail
+```
+
+Another version is refused with the reason (`am --version` is read; the adapter
+is verified against 0.3.40 only). Every Agent Mail row records the version
+(`channelServer`), the seat and the other session's names, the serve-http start-up
+time, the lease (its expiry) and, for a stopped session, how long the bench
+waited for Agent Mail's own expiry. The `am` CLI is **not** on the agent's PATH:
+the MCP tools are the channel.
+
+`--shuffle <seed>` interleaves the runs reproducibly. `--run-major` orders the
+plan pass by pass (every cell's run 1, then every cell's run 2, …; each pass
+shuffled with its own seed), and `--up-to-run <k>` executes only passes 1..k
+now, so a first pass at n = 2 across every cell can catch an adapter failure
+before the rest is spent; the experiment identity still carries the full run
+count, and the **same command** with `--resume` (and without `--up-to-run`)
+fills the remaining passes of the same experiment. `--shard i/N` executes every
+N-th run of the plan, so N processes can share one experiment, each with its own
+`--out`; their files are concatenated afterwards (one experiment identity). To
+continue an interrupted run, repeat the **same command** with `--resume`.
+
+To run the bench itself with a sandboxed `HOME` / `USERPROFILE` (so nothing it
+starts can reach your own KLYPIX), set `KLYPIX_BENCH_AGENT_PROFILE` to your real
+profile: only the agent CLI gets it back, because its login lives there. Every
+condition server keeps its own pinned throwaway home. The output must match the
 recorded source fingerprints, server revision, CLI versions, requested models,
 effort, budget, timeout, scenario/condition selection, run count, semantic assets
 and shuffle seed. Changed configurations need a new output file. Pin explicit
@@ -217,7 +255,13 @@ the pinned Concord install is present it does the same for Concord: the agent's
 own Concord server, started as the bench starts it, must show the other
 session's decision (S1), the overlap on its file (S2, S10), the review-ready
 task with its finding (S3), the stale claim two days old (S5) and the stopped
-session's claim without a plan (S9).
+session's claim without a plan (S9). Where the pinned Agent Mail binary is
+present it does the same for Agent Mail (B8): the agent's own HTTP client of
+the run's `serve-http`, registering as the seat, must find the decision in its
+inbox (S1), the live peer's exclusive lease and its note (S2), the ended
+session's finding (S3), the live lease of a session that wrote no mail (S10),
+the expired lease of a session that stopped (S5, waited out for real) and a
+mid-task mail arriving as unread (S6); and cleanup must stop the server.
 
 ## Honest limits
 
@@ -276,5 +320,25 @@ session's claim without a plan (S9).
   is what the agent can find. A Concord session that had also called
   `finish_work outcome: handoff` would be the generous notes condition's twin,
   not "nobody wrote a note", and is not run.
+- **Agent Mail's seat is a reading.** Agent Mail has no way to address a session
+  that has not registered yet, so the bench pre-registers the agent's mailbox
+  (`BlueLake`) and tells the agent its name in one line after Agent Mail's own
+  blurb. A team that lets every session auto-generate a name would not get an
+  ended session's mail this way (it would have to search threads); that
+  variant is not run. Both agents also read Agent Mail's blurb natively
+  (CLAUDE.md and AGENTS.md), as they read Concord's — more directly than
+  KLYPIX's AGENTS.md rules reach Claude in the `klypix` condition.
+- **Agent Mail's stopped sessions are the right age in one place only.** Their
+  lease is expired by Agent Mail's own ttl (the bench waits it out; nothing is
+  released by hand), but Agent Mail stamps "now" and the bench never writes its
+  store, so the stopped session's identity reads as active about a minute ago
+  instead of two days or five hours ago. The S5-family and S9 Agent Mail cells
+  carry that distortion (`agentMail.endedActorAgeDistorted`); an agent that
+  reads `list_agents` sees a fresher session than the scenario describes.
+- **Agent Mail without its guard, over HTTP.** No pre-commit guard is installed
+  (its blurb mentions one as a tip), and the server runs in HTTP mode because
+  two stdio servers cannot share a storage root. Agent Mail has no push: a
+  mid-task mail (S6) reaches the agent only when it polls its inbox, which is
+  what its blurb tells it to do.
 - **Small samples prove little.** Five runs that all pass give an interval of
   roughly 57–100%. Publish only what the intervals support.

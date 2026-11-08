@@ -1,0 +1,191 @@
+{
+  "generatedAt": "2026-11-08T01:15:43.427Z",
+  "agents": [
+    {
+      "key": "claude",
+      "label": "Claude Code (headless)",
+      "versions": [
+        "2.1.226 (Claude Code)"
+      ],
+      "models": [
+        "claude-haiku-4-5-20251001+claude-opus-5[1m]"
+      ]
+    }
+  ],
+  "conditions": [
+    {
+      "key": "klypix",
+      "label": "KLYPIX",
+      "version": "1.111.0"
+    },
+    {
+      "key": "concord",
+      "label": "Concord",
+      "version": "0.20.0"
+    }
+  ],
+  "scenarios": [
+    {
+      "key": "s1-changed-decision",
+      "label": "A decision changed today",
+      "role": null,
+      "cells": [
+        {
+          "condition": "klypix",
+          "n": 1,
+          "pass": 1,
+          "fail": 0,
+          "invalid": 0,
+          "ci": [
+            0.2065,
+            1
+          ]
+        },
+        {
+          "condition": "concord",
+          "n": 1,
+          "pass": 1,
+          "fail": 0,
+          "invalid": 0,
+          "ci": [
+            0.2065,
+            1
+          ]
+        }
+      ]
+    },
+    {
+      "key": "s2-overlapping-work",
+      "label": "Two sessions on overlapping work",
+      "role": null,
+      "cells": [
+        {
+          "condition": "klypix",
+          "n": 1,
+          "pass": 0,
+          "fail": 1,
+          "invalid": 0,
+          "ci": [
+            0,
+            0.7935
+          ]
+        },
+        {
+          "condition": "concord",
+          "n": 1,
+          "pass": 0,
+          "fail": 1,
+          "invalid": 0,
+          "ci": [
+            0,
+            0.7935
+          ]
+        }
+      ]
+    },
+    {
+      "key": "s3-note-from-closed-session",
+      "label": "A note left by a session that has ended",
+      "role": null,
+      "cells": [
+        {
+          "condition": "klypix",
+          "n": 1,
+          "pass": 1,
+          "fail": 0,
+          "invalid": 0,
+          "ci": [
+            0.2065,
+            1
+          ]
+        },
+        {
+          "condition": "concord",
+          "n": 1,
+          "pass": 1,
+          "fail": 0,
+          "invalid": 0,
+          "ci": [
+            0.2065,
+            1
+          ]
+        }
+      ]
+    },
+    {
+      "key": "s9-continue-stopped-session",
+      "label": "Continue the work a stopped session left",
+      "role": null,
+      "cells": [
+        {
+          "condition": "klypix",
+          "n": 1,
+          "pass": 1,
+          "fail": 0,
+          "invalid": 0,
+          "ci": [
+            0.2065,
+            1
+          ]
+        },
+        {
+          "condition": "concord",
+          "n": 1,
+          "pass": 0,
+          "fail": 1,
+          "invalid": 0,
+          "ci": [
+            0,
+            0.7935
+          ]
+        }
+      ]
+    },
+    {
+      "key": "s10-live-peer-wrote-nothing",
+      "label": "A live session that has written nothing",
+      "role": null,
+      "cells": [
+        {
+          "condition": "klypix",
+          "n": 1,
+          "pass": 1,
+          "fail": 0,
+          "invalid": 0,
+          "ci": [
+            0.2065,
+            1
+          ]
+        },
+        {
+          "condition": "concord",
+          "n": 1,
+          "pass": 1,
+          "fail": 0,
+          "invalid": 0,
+          "ci": [
+            0.2065,
+            1
+          ]
+        }
+      ]
+    }
+  ],
+  "notMeasured": [
+    {
+      "name": "MCP Agent Mail (Rust rewrite, pinned 0.3.40)",
+      "reason": "no verified binary on PATH (KLYPIX_BENCH_AGENT_MAIL_BIN unset); a Windows x64 release asset exists (mcp-agent-mail-x86_64-pc-windows-msvc.zip, v0.3.40; the project calls native Windows unverified); the adapter (register_agent, file_reservation_paths, send_message, fetch_inbox) is a skeleton that has not been verified against the running server, and how a note reaches an agent that has not yet registered a mailbox name is unsettled — no number is published until both are"
+    },
+    {
+      "name": "Claude Code cross-session messaging",
+      "reason": "needs two LIVE Claude sessions; cannot reach a closed session or another vendor, so S3/S4 do not apply by design"
+    },
+    {
+      "name": "Memory tool (OpenMemory MCP)",
+      "reason": "third-party server not installed here; adapter must be verified against a pinned version before any result is published"
+    }
+  ],
+  "source": "2026-11-08-concord-pilot.jsonl",
+  "experimentId": "2488c91abc3597c55c989f7558baa8faa58ca190badc7da250bbefef224327ce",
+  "runs": 10
+}

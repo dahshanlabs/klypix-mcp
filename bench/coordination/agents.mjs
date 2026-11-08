@@ -35,6 +35,21 @@ export function cleanAgentEnv(env = process.env) {
   return Object.fromEntries(Object.entries(env).filter(([k]) => !LEAKY_ENV.test(k)));
 }
 
+/**
+ * The environment the agent CLI itself starts with. The bench process may run
+ * with a sandboxed HOME / USERPROFILE (so nothing it does can reach the user's
+ * own KLYPIX); the agent CLI still needs the user's login, which lives in the
+ * real profile. `KLYPIX_BENCH_AGENT_PROFILE` names that profile for the CLI
+ * ONLY — every condition server keeps its own pinned home (they set HOME and
+ * USERPROFILE explicitly, or are reached by URL), and the variable itself is
+ * stripped with every other KLYPIX_* name.
+ */
+export function agentProcessEnv(env = process.env) {
+  const clean = cleanAgentEnv(env);
+  const profile = env.KLYPIX_BENCH_AGENT_PROFILE;
+  return profile ? { ...clean, HOME: profile, USERPROFILE: profile } : clean;
+}
+
 function killTree(child) {
   if (!child?.pid) return;
   if (process.platform === 'win32') spawnSync('taskkill', ['/T', '/F', '/PID', String(child.pid)], { windowsHide: true });
@@ -201,7 +216,7 @@ export const claude = {
   label: 'Claude Code (headless)',
   available: () => !!resolveCli('claude'),
   async version() {
-    const r = await run(resolveCli('claude'), ['--version'], { cwd: os.tmpdir(), env: cleanAgentEnv(), timeoutMs: 30_000 });
+    const r = await run(resolveCli('claude'), ['--version'], { cwd: os.tmpdir(), env: agentProcessEnv(), timeoutMs: 30_000 });
     return r.stdout.trim();
   },
   async run({ repo, prompt, mcpServers = {}, sessionId, timeoutMs, model = null, maxBudgetUsd = null, onEvent = null }) {
@@ -212,7 +227,7 @@ export const claude = {
       '--permission-mode', 'acceptEdits', '--allowedTools', claudeAllowedTools(mcpServers).join(','),
       ...(model ? ['--model', model] : []),
       ...(maxBudgetUsd ? ['--max-budget-usd', String(maxBudgetUsd)] : [])];
-    const env = { ...cleanAgentEnv(), MCP_TIMEOUT: String(MCP_STARTUP_TIMEOUT_SEC * 1000) };
+    const env = { ...agentProcessEnv(), MCP_TIMEOUT: String(MCP_STARTUP_TIMEOUT_SEC * 1000) };
     const r = await run(resolveCli('claude'), args, { cwd: repo.dir, env, timeoutMs, input: prompt, onEvent });
     try { fs.rmSync(cfg, { force: true }); } catch { /* */ }
     const p = parseClaudeResult(r.stdout);
@@ -244,8 +259,13 @@ export const MCP_STARTUP_TIMEOUT_SEC = 120;
 
 export function codexMcpOverrides(mcpServers = {}) {
   return Object.entries(mcpServers).flatMap(([name, s]) => [
-    '-c', `mcp_servers.${name}.command=${tomlString(s.command)}`,
-    '-c', `mcp_servers.${name}.args=${tomlArray(s.args || [])}`,
+    // A server the bench already runs (Agent Mail's `am serve-http`) is reached
+    // by URL — the shape Agent Mail's own installer writes for Codex; a stdio
+    // server is started by Codex from command + args.
+    ...(s.url ? ['-c', `mcp_servers.${name}.url=${tomlString(s.url)}`] : [
+      '-c', `mcp_servers.${name}.command=${tomlString(s.command)}`,
+      '-c', `mcp_servers.${name}.args=${tomlArray(s.args || [])}`,
+    ]),
     '-c', `mcp_servers.${name}.startup_timeout_sec=${MCP_STARTUP_TIMEOUT_SEC}`,
     // Claude may use every tool of the condition's server (claudeAllowedTools);
     // Codex gets the same: without this its approval policy refuses every
@@ -262,7 +282,7 @@ export function codexMcpOverrides(mcpServers = {}) {
  * neither read with a shell nor edit (seen on the first live run, 2026-10-11).
  */
 export function codexGlobalRulesFingerprint(env = process.env) {
-  const file = path.join(env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'AGENTS.md');
+  const file = path.join(env.CODEX_HOME || path.join(env.KLYPIX_BENCH_AGENT_PROFILE || os.homedir(), '.codex'), 'AGENTS.md');
   try { const text = fs.readFileSync(file, 'utf8'); return { sha: crypto.createHash('sha256').update(text).digest('hex').slice(0, 12), klypix: /klypix/i.test(text) }; } catch { return null; }
 }
 
@@ -320,13 +340,13 @@ export const codex = {
   label: 'OpenAI Codex CLI (exec)',
   available: () => !!resolveCli('codex'),
   async version() {
-    const r = await run(resolveCli('codex'), ['--version'], { cwd: os.tmpdir(), env: cleanAgentEnv(), timeoutMs: 30_000 });
+    const r = await run(resolveCli('codex'), ['--version'], { cwd: os.tmpdir(), env: agentProcessEnv(), timeoutMs: 30_000 });
     return r.stdout.trim();
   },
   async run({ repo, prompt, mcpServers = {}, timeoutMs, model = null, effort = null, onEvent = null }) {
     const args = ['exec', '--json', '--ephemeral', '--ignore-user-config', '--skip-git-repo-check',
       '-s', 'workspace-write', '-C', repo.dir, ...(model ? ['-m', model] : []), ...(effort ? ['-c', `model_reasoning_effort="${effort}"`] : []), ...codexPlatformOverrides(), ...codexGitWritable(repo.dir), ...codexMcpOverrides(mcpServers), '-'];
-    const r = await run(resolveCli('codex'), args, { cwd: repo.dir, env: cleanAgentEnv(), timeoutMs, input: prompt, onEvent });
+    const r = await run(resolveCli('codex'), args, { cwd: repo.dir, env: agentProcessEnv(), timeoutMs, input: prompt, onEvent });
     const p = parseCodexEvents(r.stdout);
     const channelUp = codexChannelUp(Object.keys(mcpServers), p.mcpCalls, r.stderr);
     return {

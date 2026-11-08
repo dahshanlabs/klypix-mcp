@@ -1,0 +1,60 @@
+{
+  "fixture": true,
+  "note": "FIXTURE for test/bench-card.mjs — fictional numbers that exercise every column and the 'not run' cell. Not a measurement; never render it into docs. The renderer prints a FIXTURE banner when this flag is set.",
+  "generatedAt": "2026-01-01T00:00:00.000Z",
+  "agents": [
+    { "key": "claude", "label": "Claude Code (headless)", "versions": ["0.0.0 (fixture)"], "models": ["fixture-model"] }
+  ],
+  "conditions": [
+    { "key": "none", "label": "none", "version": null },
+    { "key": "agents-md-kept", "label": "notes file (tidy)", "version": null },
+    { "key": "klypix", "label": "KLYPIX", "version": "0.0.0" },
+    { "key": "concord", "label": "Concord", "version": "0.0.0" },
+    { "key": "agent-mail", "label": "Agent Mail", "version": "0.0.0" }
+  ],
+  "scenarios": [
+    {
+      "key": "s1-changed-decision",
+      "label": "A decision changed today",
+      "role": null,
+      "cells": [
+        { "condition": "none", "n": 5, "pass": 0, "fail": 5, "invalid": 0, "ci": [0, 0.4345] },
+        { "condition": "agents-md-kept", "n": 5, "pass": 5, "fail": 0, "invalid": 0, "ci": [0.5655, 1] },
+        { "condition": "klypix", "n": 5, "pass": 4, "fail": 1, "invalid": 1, "ci": [0.3755, 0.9638] },
+        { "condition": "concord", "n": 5, "pass": 3, "fail": 2, "invalid": 0, "ci": [0.2312, 0.8824] },
+        { "condition": "agent-mail", "n": 0, "pass": 0, "fail": 0, "invalid": 0, "ci": [null, null] }
+      ]
+    },
+    {
+      "key": "s4-root-cause-from-other-vendor",
+      "label": "Another vendor's session found the root cause",
+      "role": "control",
+      "cells": [
+        { "condition": "none", "n": 5, "pass": 5, "fail": 0, "invalid": 0, "ci": [0.5655, 1] },
+        { "condition": "agents-md-kept", "n": 5, "pass": 5, "fail": 0, "invalid": 0, "ci": [0.5655, 1] },
+        { "condition": "klypix", "n": 5, "pass": 5, "fail": 0, "invalid": 0, "ci": [0.5655, 1] },
+        { "condition": "concord", "n": 1, "pass": 1, "fail": 0, "invalid": 0, "ci": [0.2065, 1] },
+        { "condition": "agent-mail", "n": 0, "pass": 0, "fail": 0, "invalid": 2, "ci": [null, null] }
+      ]
+    },
+    {
+      "key": "s9-continue-stopped-session",
+      "label": "Continue the work a stopped session left",
+      "role": null,
+      "cells": [
+        { "condition": "none", "n": 10, "pass": 1, "fail": 9, "invalid": 0, "ci": [0.0179, 0.4041] },
+        { "condition": "agents-md-kept", "n": 10, "pass": 2, "fail": 8, "invalid": 0, "ci": [0.0567, 0.5098] },
+        { "condition": "klypix", "n": 10, "pass": 10, "fail": 0, "invalid": 0, "ci": [0.7225, 1] },
+        { "condition": "concord", "n": 10, "pass": 6, "fail": 4, "invalid": 0, "ci": [0.3126, 0.8318] },
+        { "condition": "agent-mail", "n": 10, "pass": 7, "fail": 3, "invalid": 0, "ci": [0.3968, 0.8922] }
+      ]
+    }
+  ],
+  "notMeasured": [
+    { "name": "Clash", "reason": "fixture reason — a Claude Code hook across git worktrees; no adapter in this kit" },
+    { "name": "Agent-MCP", "reason": "fixture reason — needs its own server; adapter not written" }
+  ],
+  "source": "fixture",
+  "experimentId": null,
+  "runs": 86
+}

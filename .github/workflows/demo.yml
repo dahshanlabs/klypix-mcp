@@ -10,6 +10,10 @@ name: Render README demo GIF
 #   demo-worktrees.tape  — two sessions in two linked git worktrees of one
 #                          repository; the heads-up spans the worktrees
 #                          (docs/demo/demo-worktrees.gif).
+#   bench.tape           — the coordination bench's result card, drawn by
+#                          bench/coordination/render-card.mjs from the newest
+#                          results/*.summary.json — no typed numbers, no demo
+#                          repo, no tmux (docs/demo/bench.gif).
 #
 # Manual trigger only. The GIF is uploaded as an artifact — download it, look
 # at it, and commit it deliberately. This job never writes to the repository:
@@ -25,6 +29,7 @@ on:
         options:
           - demo.tape
           - demo-worktrees.tape
+          - bench.tape
 
 permissions:
   contents: read
@@ -53,12 +58,15 @@ jobs:
         run: |
           set -euo pipefail
           case "$TAPE" in
-            demo.tape|demo-worktrees.tape) ;;
+            demo.tape|demo-worktrees.tape|bench.tape) ;;
             *) echo "::error::unknown tape '$TAPE' — add it to docs/demo/ and to this workflow's choices"; exit 1 ;;
           esac
           [ -f "docs/demo/$TAPE" ] || { echo "::error::docs/demo/$TAPE does not exist"; exit 1; }
           echo "gif=docs/demo/${TAPE%.tape}.gif" >> "$GITHUB_OUTPUT"
           echo "artifact=${TAPE%.tape}-gif" >> "$GITHUB_OUTPUT"
+          # The bench card is one mostly-static pane of text, far smaller than a
+          # two-pane tmux recording; its "crashed early" floor is lower.
+          if [ "$TAPE" = bench.tape ]; then echo "min_bytes=40000" >> "$GITHUB_OUTPUT"; else echo "min_bytes=200000" >> "$GITHUB_OUTPUT"; fi
 
       - name: Setup Node
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
@@ -70,15 +78,25 @@ jobs:
         run: npm ci
 
       - name: Install tmux
+        if: env.TAPE != 'bench.tape'
         run: sudo apt-get update -qq && sudo apt-get install -y -qq tmux
 
       - name: Seed the fictional demo repository
-        if: env.TAPE != 'demo-worktrees.tape'
+        if: env.TAPE == 'demo.tape'
         run: node docs/demo/setup.mjs
 
       - name: Seed the fictional demo repository with a linked worktree
         if: env.TAPE == 'demo-worktrees.tape'
         run: node docs/demo/setup-worktrees.mjs
+
+      # The bench tape prints a file, so the file is checked before the render:
+      # a card with no summary behind it fails here, not as a blank GIF.
+      - name: Check the bench summary the card will draw from
+        if: env.TAPE == 'bench.tape'
+        run: |
+          set -euo pipefail
+          node test/bench-card.mjs
+          BENCH_CARD_DELAY_MS=0 node bench/coordination/render-card.mjs --no-color
 
       - name: Render with VHS
         uses: charmbracelet/vhs-action@f6d7db07a432fcd3b06772628d36a57f96d95dcf # v2
@@ -100,14 +118,37 @@ jobs:
       - name: Assert the render is plausible
         env:
           GIF: ${{ steps.names.outputs.gif }}
+          MIN: ${{ steps.names.outputs.min_bytes }}
         run: |
           set -euo pipefail
           SIZE=$(stat -c%s "$GIF")
-          echo "$GIF: ${SIZE} bytes"
+          echo "$GIF: ${SIZE} bytes (floor ${MIN})"
           # A tape that crashed early renders a near-empty GIF; a runaway one
           # bloats past what a README should carry. Both fail here, not in review.
-          [ "$SIZE" -gt 200000 ] || { echo "::error::$GIF is suspiciously small — the tape likely crashed"; exit 1; }
+          [ "$SIZE" -gt "$MIN" ] || { echo "::error::$GIF is suspiciously small — the tape likely crashed"; exit 1; }
           [ "$SIZE" -lt 12000000 ] || { echo "::error::$GIF exceeds 12MB — tighten the tape before shipping it"; exit 1; }
+
+      # The chart GIF for the top of the README: the same summary file, drawn as
+      # animated bars by matplotlib (bench/coordination/render-chart.py).
+      - name: Render the bench chart
+        if: env.TAPE == 'bench.tape'
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet matplotlib==3.11.2 pillow==12.2.0
+          python3 bench/coordination/render-chart.py -o docs/demo/bench-chart.gif --png docs/demo/bench-chart.png
+          SIZE=$(stat -c%s docs/demo/bench-chart.gif)
+          echo "bench-chart.gif: ${SIZE} bytes"
+          [ "$SIZE" -gt 30000 ] || { echo "::error::bench-chart.gif is suspiciously small"; exit 1; }
+
+      - name: Upload the bench chart
+        if: env.TAPE == 'bench.tape'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bench-chart
+          path: |
+            docs/demo/bench-chart.gif
+            docs/demo/bench-chart.png
+          retention-days: 14
 
       - name: Upload the GIF
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

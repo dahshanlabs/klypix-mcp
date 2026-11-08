@@ -14,7 +14,7 @@
 
 </div>
 
-![Coordination bench, Claude Code, 4 runs per cell, 176 graded runs: KLYPIX against no shared channel, a notes file kept tidy, Concord MCP 0.20.0 and MCP Agent Mail 0.3.40 on nine scenarios. KLYPIX passes 4 of 4 where Concord and Agent Mail pass 0 of 4 on a stale work-in-progress note, its held-out twin, a decision made mid-task and continuing a stopped session's work; every channel fails the overlapping-work scenario that a tidy notes file passes.](docs/demo/bench-chart.gif)
+![Coordination bench scoreboard, Claude Code, 4 runs per test, 176 graded runs: KLYPIX against no shared channel, a notes file kept tidy, Concord MCP 0.20.0 and MCP Agent Mail 0.3.40 on nine scenarios. KLYPIX passes 4 of 4 where Concord and Agent Mail pass 0 of 4 on a stale work-in-progress note, its held-out twin, a decision made mid-task and continuing a stopped session's work; every channel fails the overlapping-work scenario that a tidy notes file passes.](docs/demo/bench-scoreboard.png)
 
 <sub>Real Claude Code sessions, hidden tests, no LLM judge, 8 Nov 2026. Drawn by CI from
 [the results file](bench/coordination/results/2026-11-08-competitors.md); every row is published,

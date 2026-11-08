@@ -126,3 +126,11 @@ next to the card when `tape = bench.tape` and uploads `bench-chart`
 python -m pip install matplotlib pillow
 python bench/coordination/render-chart.py            # newest summary -> docs/demo/bench-chart.gif
 ```
+
+## The bench scoreboard (README top)
+
+`render-chart.py --rows <out.png>` draws the same summary as a still
+scoreboard: one row per scenario, one column per tool, pass/n in each cell,
+shaded by pass rate (never by vendor), KLYPIX's column outlined. It reads on a
+phone, which the animated bars did not. The workflow writes it as
+`docs/demo/bench-scoreboard.png` beside the GIF.

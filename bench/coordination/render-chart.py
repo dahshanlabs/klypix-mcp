@@ -223,12 +223,109 @@ def build(summary, out_gif=None, out_png=None, frames=36, hold=30, agent=None):
     plt.close(fig)
 
 
+def build_rows(summary, out_png, agent=None):
+    """Still, phone-readable scoreboard: one row per scenario, one column per
+    tool, pass/n in each cell, shaded by pass rate (never by vendor). Same data
+    and rules as build()."""
+    from matplotlib.patches import FancyBboxPatch
+    agents = summary.get("agents") or []
+    agent = agent or (agents[0] if agents and isinstance(agents[0], str) else None)
+    conds, scen = for_agent(summary, agent) if agent else (summary["conditions"], summary["scenarios"])
+    ncond, nscen = len(conds), len(scen)
+    ns = [c.get("n") or 0 for s in scen for c in s["cells"] if (c.get("n") or 0) > 0]
+    small = sum(1 for n in ns if n < 5)
+    lo_n, hi_n = (min(ns), max(ns)) if ns else (0, 0)
+
+    label_w, cell_w, cell_h = 4.3, 1.5, 0.62
+    top_h, bottom_h = 2.45, 1.3
+    fig_w = label_w + ncond * cell_w + 0.4
+    fig_h = top_h + nscen * cell_h + bottom_h
+    fig = plt.figure(figsize=(fig_w, fig_h), dpi=120)
+    fig.patch.set_facecolor(BG)
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.set_xlim(0, fig_w)
+    ax.set_ylim(fig_h, 0)
+    ax.axis("off")
+
+    def shade(rate):
+        # dark slate at 0%, brand emerald at 100%, linear in between
+        a, b = (0x1f, 0x29, 0x25), (0x10, 0xb9, 0x81)
+        return "#%02x%02x%02x" % tuple(round(a[i] + (b[i] - a[i]) * rate) for i in range(3))
+
+    date = str(summary.get("generatedAt", ""))[:10]
+    runs = sum((c.get("n") or 0) + (c.get("invalid") or 0) for s in scen for c in s["cells"])
+    who = AGENT_LABELS.get(agent, agent) if agent else ""
+    ax.text(0.35, 0.55, "Does the agent act on what another session knew?", color=INK, fontsize=21,
+            fontweight="bold", va="center")
+    ax.text(0.35, 1.0, f"Real agents, hidden tests, no LLM judge · {date} · {runs} graded runs · {who}",
+            color=MUTED, fontsize=12.5, va="center")
+
+    hy = top_h - 0.42
+    for j, c in enumerate(conds):
+        x = label_w + j * cell_w + cell_w / 2
+        nm = SHORT.get(c["key"], c["label"].split(" (")[0])
+        ver = short_version(c.get("version"))
+        is_k = c["key"] == "klypix"
+        ax.text(x, hy - 0.12, wrap_label(nm, 12), color=EMERALD if is_k else INK, fontsize=13,
+                fontweight="bold" if is_k else "normal", ha="center", va="bottom")
+        if ver:
+            ax.text(x, hy + 0.06, ver, color=MUTED, fontsize=10.5, ha="center", va="top")
+
+    for i, s in enumerate(scen):
+        y = top_h + i * cell_h
+        ax.text(label_w - 0.2, y + cell_h / 2, wrap_label(s["label"], 30), color=INK, fontsize=13,
+                ha="right", va="center", linespacing=1.15)
+        for j, cond in enumerate(conds):
+            x = label_w + j * cell_w
+            cell = next((c for c in s["cells"] if c["condition"] == cond["key"]), None)
+            n = (cell or {}).get("n") or 0
+            pad = 0.07
+            if n:
+                rate = cell["pass"] / n
+                ax.add_patch(FancyBboxPatch((x + pad, y + pad), cell_w - 2 * pad, cell_h - 2 * pad,
+                                            boxstyle="round,pad=0,rounding_size=0.08", linewidth=0,
+                                            facecolor=shade(rate), zorder=2))
+                ax.text(x + cell_w / 2, y + cell_h / 2, f"{cell['pass']}/{n}", color="#ffffff" if rate >= 0.5 else INK,
+                        fontsize=16, fontweight="bold", ha="center", va="center", zorder=3)
+            else:
+                ax.add_patch(FancyBboxPatch((x + pad, y + pad), cell_w - 2 * pad, cell_h - 2 * pad,
+                                            boxstyle="round,pad=0,rounding_size=0.08", linewidth=1,
+                                            edgecolor=GRID, facecolor=BG, zorder=2))
+                ax.text(x + cell_w / 2, y + cell_h / 2,
+                        "n/a" if (cell or {}).get("notApplicable") else "not run",
+                        color=MUTED, fontsize=12, ha="center", va="center", zorder=3)
+        kx = next((label_w + j * cell_w for j, c in enumerate(conds) if c["key"] == "klypix"), None)
+    if kx is not None:
+        ax.add_patch(FancyBboxPatch((kx + 0.02, top_h - 0.02), cell_w - 0.04, nscen * cell_h + 0.04,
+                                    boxstyle="round,pad=0,rounding_size=0.1", linewidth=1.6,
+                                    edgecolor=EMERALD, facecolor="none", zorder=4))
+
+    per = f"{lo_n}" if lo_n == hi_n else f"{lo_n}-{hi_n}"
+    by = top_h + nscen * cell_h + 0.38
+    note = (f"Passes out of {per} runs per test. With so few runs, only big gaps (like 4/4 against 0/4) are real differences."
+            if small else "Passes out of runs per test.")
+    ax.text(0.35, by, note, color=MUTED, fontsize=11.5, va="center")
+    nm = summary.get("notMeasured") or []
+    tail = "Every row is published, including the one KLYPIX loses."
+    if nm:
+        tail = "Not measured: " + ", ".join(x["name"].split(" (")[0] for x in nm) + ".  " + tail
+    ax.text(0.35, by + 0.34, tail, color=MUTED, fontsize=11.5, va="center")
+    caveats = [x for x in (summary.get("caveats") or []) if isinstance(x, str)]
+    if any(c["key"] == "concord" for c in conds):
+        caveats = caveats or ["Concord's live-delivery plugin was not enabled in this run."]
+    for k, line in enumerate(caveats[:2]):
+        ax.text(0.35, by + 0.68 + 0.34 * k, line, color=MUTED, fontsize=11.5, va="center")
+    fig.savefig(out_png, facecolor=BG)
+    plt.close(fig)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("summary", nargs="?")
     ap.add_argument("-o", "--out", default=None)
     ap.add_argument("--png", default=None)
     ap.add_argument("--agent", default=None, help="claude or codex (default: the first agent in the file)")
+    ap.add_argument("--rows", default=None, help="also write the still, phone-readable row chart (PNG) here")
     a = ap.parse_args()
     path = a.summary or newest_summary()
     if not path or not os.path.exists(path):
@@ -239,8 +336,11 @@ def main():
     except (ValueError, json.JSONDecodeError) as e:
         print(f"render-chart: {path}: {e}", file=sys.stderr)
         sys.exit(2)
-    out = a.out if (a.out or a.png) else os.path.join(HERE, "..", "..", "docs", "demo", "bench-chart.gif")
-    build(summary, out_gif=out, out_png=a.png, agent=a.agent)
+    out = a.out if (a.out or a.png or a.rows) else os.path.join(HERE, "..", "..", "docs", "demo", "bench-chart.gif")
+    if a.rows:
+        build_rows(summary, a.rows, agent=a.agent)
+    if a.out or a.png or not a.rows:
+        build(summary, out_gif=out, out_png=a.png, agent=a.agent)
     print(f"render-chart: {path} -> {out or ''} {a.png or ''}".strip())
 
 

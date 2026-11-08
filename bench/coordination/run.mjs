@@ -9,6 +9,9 @@
 //       [--klypix-bin <path>]   (the KLYPIX server to measure; default this checkout's bin/klypix-mcp.mjs)
 //       [--codex-effort <low|medium|high|xhigh|max>]   (pinned on every Codex run and recorded; default: the model's own)
 //       [--shuffle <seed>]   (seeded random run order across all cells; recorded per row)
+//       [--run-major]   (every cell's run 1 before any cell's run 2, …; with --shuffle each pass is shuffled)
+//       [--up-to-run <k>]   (execute passes 1..k now — e.g. n=2 across every cell to catch adapter failures —
+//                            then `--resume` with the same command and without it fills the rest of the SAME experiment)
 //       [--resume]   (skip runs the --out file already finished; re-run errored ones)
 //       KLYPIX_BENCH_SEMANTIC_DIR=<dir>   (a prepared copy of semantic/ + hf-cache/ for klypix-installed)
 //
@@ -161,6 +164,9 @@ export async function runOne({ scenario, condition, agent, run, timeoutMs, keep 
       ...(isKlypixCondition(condition) && klypixServer ? { klypixServer } : {}),
       // A third-party channel names the build it measured the same way (Concord: its package version).
       ...(prep.channelServer ? { channelServer: prep.channelServer } : {}),
+      // What the third-party channel held (names, lease, waits), so a row can be audited without its transcript.
+      ...(prep.concord ? { concord: prep.concord } : {}),
+      ...(prep.agentMail ? { agentMail: prep.agentMail } : {}),
       ...(isKlypixCondition(condition) ? { actorListed: prep.actorListed ?? null, semantic: prep.semantic ?? false } : {}),
       ...(hookRuns ? { hookRuns } : {}),
       ...(g.named != null ? { named: g.named, namedSentence: g.namedSentence ?? null } : {}),
@@ -241,9 +247,23 @@ async function main() {
   // order, so no condition always runs last or under the same machine load;
   // each row records its position.
   let plan = [];
-  for (const scenario of scenarios) for (const condition of runnable) for (const agent of agents) for (let run = 1; run <= runs; run++) plan.push({ scenario, condition, agent, run });
   const seed = opt('shuffle', null);
-  if (seed != null) shuffleInPlace(plan, Number(seed) || 1);
+  const runMajor = flag('run-major');
+  if (runMajor) {
+    // Pass by pass: every cell's first run, then every cell's second, … so a
+    // batch cut after pass k has the same n in every cell. Each pass is
+    // shuffled with its own seed so no condition always runs last.
+    const cells = [];
+    for (const scenario of scenarios) for (const condition of runnable) for (const agent of agents) cells.push({ scenario, condition, agent });
+    for (let run = 1; run <= runs; run++) {
+      const pass = cells.map((c) => ({ ...c, run }));
+      if (seed != null) shuffleInPlace(pass, (Number(seed) || 1) + run);
+      plan.push(...pass);
+    }
+  } else {
+    for (const scenario of scenarios) for (const condition of runnable) for (const agent of agents) for (let run = 1; run <= runs; run++) plan.push({ scenario, condition, agent, run });
+    if (seed != null) shuffleInPlace(plan, Number(seed) || 1);
+  }
   plan.forEach((p, order) => { p.order = order; });
   const experiment = {
     schema: 1,
@@ -255,6 +275,7 @@ async function main() {
     codexGlobalRules: agents.some(a => a.id === 'codex') ? codexGlobalRulesFingerprint() : null,
     scenarios: scenarios.map(s => s.id), conditions: runnable.map(c => c.id), runs, timeoutMs,
     shuffleSeed: seed == null ? null : Number(seed) || 1, semantic: semanticBefore,
+    order: runMajor ? 'run-major' : 'cell-major',
   };
   const id = experimentId(experiment);
   if (out && fs.existsSync(out) && fs.statSync(out).size && !flag('resume')) throw new Error('--out already contains results; use --resume with the same configuration or choose a new file');
@@ -271,7 +292,22 @@ async function main() {
     if (previous.discardedTail) console.warn('resume: discarded an unfinished final JSON line');
     console.log(`resume: ${before - plan.length} finished run(s) skipped, ${plan.length} to go`);
   }
-  if (seed != null) console.log(`order: shuffled (seed ${Number(seed) || 1})`);
+  // A pass limit executes only runs 1..k of the plan now; the experiment (and
+  // its identity) still says `runs`, so a later --resume fills the rest.
+  // A shard i/N executes every N-th run of the plan (by plan order), so N
+  // processes can share one experiment; each writes its own --out, and the
+  // files are concatenated afterwards (same experiment identity).
+  const shard = opt('shard', null);
+  if (shard) {
+    const [i, nShards] = shard.split('/').map(Number);
+    if (!(nShards >= 1 && i >= 1 && i <= nShards)) throw new Error('--shard must be i/N with 1 <= i <= N');
+    const before = plan.length; plan = plan.filter((p) => p.order % nShards === i - 1);
+    console.log(`shard ${i}/${nShards}: ${plan.length} of ${before} pending run(s)`);
+  }
+  const upToRun = Number(opt('up-to-run', '0')) || 0;
+  if (upToRun) { const before = plan.length; plan = plan.filter((p) => p.run <= upToRun); console.log(`up to run ${upToRun}: ${plan.length} of ${before} pending run(s) this pass`); }
+  if (seed != null) console.log(`order: shuffled (seed ${Number(seed) || 1}${runMajor ? ', run-major' : ''})`);
+  let spentUsd = 0; let priced = 0;
   for (const { scenario, condition, agent, run, order } of plan) {
     // A condition a scenario cannot apply to (a copy-paste at start cannot
     // carry a decision made later; an appended notes file byte-identical to
@@ -286,11 +322,13 @@ async function main() {
     r.order = order;
     if (seed != null) r.shuffleSeed = Number(seed) || 1;
     results.push(r);
+    if (Number.isFinite(r.costUsd)) { spentUsd += r.costUsd; priced += 1; }
     console.log(notApplicable
       ? `n/a   ${scenario.id}  ${condition.id}  ${agent.id}#${run}  (${notApplicable})`
-      : `${r.success ? 'PASS' : 'fail'}  ${scenario.id}  ${condition.id}  ${agent.id}#${run}${r.staleAction ? '  stale-action' : ''}${r.collision ? '  merge-conflict' : ''}${r.handled === true && !r.success ? '  handled(flagged)' : ''}${r.error ? `  error: ${r.error.split('\n')[0].slice(0, 120)}` : ''}`);
+      : `${r.success ? 'PASS' : 'fail'}  ${scenario.id}  ${condition.id}  ${agent.id}#${run}${r.staleAction ? '  stale-action' : ''}${r.collision ? '  merge-conflict' : ''}${r.handled === true && !r.success ? '  handled(flagged)' : ''}${r.invalid ? '  INVALID' : ''}${Number.isFinite(r.costUsd) ? `  $${r.costUsd.toFixed(2)} (total $${spentUsd.toFixed(2)})` : ''}${r.error ? `  error: ${r.error.split('\n')[0].slice(0, 120)}` : ''}`);
     if (out) fs.appendFileSync(out, `${JSON.stringify({ ...r, at: new Date().toISOString() })}\n`);
   }
+  if (priced) console.log(`cost this pass: $${spentUsd.toFixed(2)} over ${priced} priced run(s)`);
   if (semanticDir) {
     const after = semanticDirFingerprint(semanticDir);
     const same = JSON.stringify(after) === JSON.stringify(semanticBefore);

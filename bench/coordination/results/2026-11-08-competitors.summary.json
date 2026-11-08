@@ -1,0 +1,873 @@
+{
+  "generatedAt": "2026-11-08T13:15:09.234Z",
+  "agents": [
+    "claude",
+    "codex"
+  ],
+  "experiments": [
+    {
+      "file": "2026-11-08-competitors.jsonl",
+      "experimentId": "4a55efd3aaabc7ec26c2b8db034da2ad56cb70af93989707171d636a06f7cf60",
+      "agents": [
+        "claude"
+      ],
+      "rows": 180
+    },
+    {
+      "file": "2026-11-08-competitors-codex.jsonl",
+      "experimentId": "ca37cb1439fd63d63201369538a7e8034a6bfc48bd5db65d6787d8cc8d761fff",
+      "agents": [
+        "codex"
+      ],
+      "rows": 36
+    }
+  ],
+  "conditions": [
+    {
+      "key": "none",
+      "label": "No shared channel",
+      "version": null
+    },
+    {
+      "key": "agents-md-kept",
+      "label": "AGENTS.md / CLAUDE.md, kept tidy (stale line replaced)",
+      "version": null
+    },
+    {
+      "key": "klypix",
+      "label": "KLYPIX (MCP server + AGENTS.md rules, no hooks)",
+      "version": "klypix-mcp 1.112.0 @ 5156221"
+    },
+    {
+      "key": "concord",
+      "label": "Concord MCP 0.20.0 (server + its instruction blocks, no plugin)",
+      "version": "concord 0.20.0"
+    },
+    {
+      "key": "agent-mail",
+      "label": "MCP Agent Mail 0.3.40 (server + its AGENTS.md blurb; a named seat mailbox)",
+      "version": "agent-mail 0.3.40"
+    }
+  ],
+  "scenarios": [
+    {
+      "key": "s1-changed-decision",
+      "label": "A decision changed today",
+      "role": null,
+      "cells": [
+        {
+          "agent": "claude",
+          "condition": "concord",
+          "n": 4,
+          "pass": 3,
+          "fail": 1,
+          "invalid": 0,
+          "ci": [
+            0.301,
+            0.954
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "claude",
+          "condition": "none",
+          "n": 4,
+          "pass": 0,
+          "fail": 4,
+          "invalid": 0,
+          "ci": [
+            0,
+            0.49
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "claude",
+          "condition": "agent-mail",
+          "n": 4,
+          "pass": 0,
+          "fail": 4,
+          "invalid": 0,
+          "ci": [
+            0,
+            0.49
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "claude",
+          "condition": "klypix",
+          "n": 4,
+          "pass": 4,
+          "fail": 0,
+          "invalid": 0,
+          "ci": [
+            0.51,
+            1
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "claude",
+          "condition": "agents-md-kept",
+          "n": 4,
+          "pass": 4,
+          "fail": 0,
+          "invalid": 0,
+          "ci": [
+            0.51,
+            1
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "codex",
+          "condition": "concord",
+          "n": 3,
+          "pass": 0,
+          "fail": 3,
+          "invalid": 0,
+          "ci": [
+            0,
+            0.562
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "codex",
+          "condition": "klypix",
+          "n": 3,
+          "pass": 3,
+          "fail": 0,
+          "invalid": 0,
+          "ci": [
+            0.438,
+            1
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "codex",
+          "condition": "agent-mail",
+          "n": 3,
+          "pass": 2,
+          "fail": 1,
+          "invalid": 0,
+          "ci": [
+            0.208,
+            0.939
+          ],
+          "notApplicable": null
+        }
+      ]
+    },
+    {
+      "key": "s2-overlapping-work",
+      "label": "Two sessions on overlapping work",
+      "role": null,
+      "cells": [
+        {
+          "agent": "claude",
+          "condition": "concord",
+          "n": 4,
+          "pass": 0,
+          "fail": 4,
+          "invalid": 0,
+          "ci": [
+            0,
+            0.49
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "claude",
+          "condition": "agent-mail",
+          "n": 4,
+          "pass": 0,
+          "fail": 4,
+          "invalid": 0,
+          "ci": [
+            0,
+            0.49
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "claude",
+          "condition": "agents-md-kept",
+          "n": 4,
+          "pass": 4,
+          "fail": 0,
+          "invalid": 0,
+          "ci": [
+            0.51,
+            1
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "claude",
+          "condition": "klypix",
+          "n": 4,
+          "pass": 0,
+          "fail": 4,
+          "invalid": 0,
+          "ci": [
+            0,
+            0.49
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "claude",
+          "condition": "none",
+          "n": 4,
+          "pass": 0,
+          "fail": 4,
+          "invalid": 0,
+          "ci": [
+            0,
+            0.49
+          ],
+          "notApplicable": null
+        }
+      ]
+    },
+    {
+      "key": "s3-note-from-closed-session",
+      "label": "A note left by a session that has ended",
+      "role": null,
+      "cells": [
+        {
+          "agent": "claude",
+          "condition": "concord",
+          "n": 4,
+          "pass": 4,
+          "fail": 0,
+          "invalid": 0,
+          "ci": [
+            0.51,
+            1
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "claude",
+          "condition": "agents-md-kept",
+          "n": 4,
+          "pass": 4,
+          "fail": 0,
+          "invalid": 0,
+          "ci": [
+            0.51,
+            1
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "claude",
+          "condition": "agent-mail",
+          "n": 4,
+          "pass": 2,
+          "fail": 2,
+          "invalid": 0,
+          "ci": [
+            0.15,
+            0.85
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "claude",
+          "condition": "klypix",
+          "n": 4,
+          "pass": 4,
+          "fail": 0,
+          "invalid": 0,
+          "ci": [
+            0.51,
+            1
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "claude",
+          "condition": "none",
+          "n": 4,
+          "pass": 0,
+          "fail": 4,
+          "invalid": 0,
+          "ci": [
+            0,
+            0.49
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "codex",
+          "condition": "concord",
+          "n": 3,
+          "pass": 0,
+          "fail": 3,
+          "invalid": 0,
+          "ci": [
+            0,
+            0.562
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "codex",
+          "condition": "agent-mail",
+          "n": 3,
+          "pass": 3,
+          "fail": 0,
+          "invalid": 0,
+          "ci": [
+            0.438,
+            1
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "codex",
+          "condition": "klypix",
+          "n": 3,
+          "pass": 3,
+          "fail": 0,
+          "invalid": 0,
+          "ci": [
+            0.438,
+            1
+          ],
+          "notApplicable": null
+        }
+      ]
+    },
+    {
+      "key": "s5-stale-wip-note",
+      "label": "A WIP note that outlived its session",
+      "role": null,
+      "cells": [
+        {
+          "agent": "claude",
+          "condition": "klypix",
+          "n": 4,
+          "pass": 4,
+          "fail": 0,
+          "invalid": 0,
+          "ci": [
+            0.51,
+            1
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "claude",
+          "condition": "agent-mail",
+          "n": 4,
+          "pass": 0,
+          "fail": 4,
+          "invalid": 0,
+          "ci": [
+            0,
+            0.49
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "claude",
+          "condition": "concord",
+          "n": 4,
+          "pass": 0,
+          "fail": 4,
+          "invalid": 0,
+          "ci": [
+            0,
+            0.49
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "claude",
+          "condition": "none",
+          "n": 4,
+          "pass": 0,
+          "fail": 4,
+          "invalid": 0,
+          "ci": [
+            0,
+            0.49
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "claude",
+          "condition": "agents-md-kept",
+          "n": 4,
+          "pass": 4,
+          "fail": 0,
+          "invalid": 0,
+          "ci": [
+            0.51,
+            1
+          ],
+          "notApplicable": null
+        }
+      ]
+    },
+    {
+      "key": "s6-fact-arrives-mid-task",
+      "label": "A decision made while the agent is working",
+      "role": null,
+      "cells": [
+        {
+          "agent": "claude",
+          "condition": "concord",
+          "n": 4,
+          "pass": 0,
+          "fail": 4,
+          "invalid": 0,
+          "ci": [
+            0,
+            0.49
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "claude",
+          "condition": "klypix",
+          "n": 4,
+          "pass": 4,
+          "fail": 0,
+          "invalid": 0,
+          "ci": [
+            0.51,
+            1
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "claude",
+          "condition": "agent-mail",
+          "n": 4,
+          "pass": 0,
+          "fail": 4,
+          "invalid": 0,
+          "ci": [
+            0,
+            0.49
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "claude",
+          "condition": "none",
+          "n": 4,
+          "pass": 0,
+          "fail": 4,
+          "invalid": 0,
+          "ci": [
+            0,
+            0.49
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "claude",
+          "condition": "agents-md-kept",
+          "n": 4,
+          "pass": 3,
+          "fail": 1,
+          "invalid": 0,
+          "ci": [
+            0.301,
+            0.954
+          ],
+          "notApplicable": null
+        }
+      ]
+    },
+    {
+      "key": "s5b-dead-note-held-out",
+      "label": "A \"hands off\" note whose work is finished (held out)",
+      "role": null,
+      "cells": [
+        {
+          "agent": "claude",
+          "condition": "klypix",
+          "n": 4,
+          "pass": 4,
+          "fail": 0,
+          "invalid": 0,
+          "ci": [
+            0.51,
+            1
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "claude",
+          "condition": "concord",
+          "n": 4,
+          "pass": 0,
+          "fail": 4,
+          "invalid": 0,
+          "ci": [
+            0,
+            0.49
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "claude",
+          "condition": "agent-mail",
+          "n": 4,
+          "pass": 0,
+          "fail": 4,
+          "invalid": 0,
+          "ci": [
+            0,
+            0.49
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "claude",
+          "condition": "none",
+          "n": 4,
+          "pass": 0,
+          "fail": 4,
+          "invalid": 0,
+          "ci": [
+            0,
+            0.49
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "claude",
+          "condition": "agents-md-kept",
+          "n": 4,
+          "pass": 4,
+          "fail": 0,
+          "invalid": 0,
+          "ci": [
+            0.51,
+            1
+          ],
+          "notApplicable": null
+        }
+      ]
+    },
+    {
+      "key": "s5c-valid-note-held-out",
+      "label": "A \"hands off\" note whose work is still in progress (held out)",
+      "role": "harm check",
+      "cells": [
+        {
+          "agent": "claude",
+          "condition": "klypix",
+          "n": 4,
+          "pass": 4,
+          "fail": 0,
+          "invalid": 0,
+          "ci": [
+            0.51,
+            1
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "claude",
+          "condition": "concord",
+          "n": 4,
+          "pass": 4,
+          "fail": 0,
+          "invalid": 0,
+          "ci": [
+            0.51,
+            1
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "claude",
+          "condition": "agent-mail",
+          "n": 4,
+          "pass": 4,
+          "fail": 0,
+          "invalid": 0,
+          "ci": [
+            0.51,
+            1
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "claude",
+          "condition": "agents-md-kept",
+          "n": 0,
+          "pass": 0,
+          "fail": 0,
+          "invalid": 0,
+          "ci": null,
+          "notApplicable": "a tidy notes file keeps a true note — identical to the no-channel condition"
+        },
+        {
+          "agent": "claude",
+          "condition": "none",
+          "n": 4,
+          "pass": 4,
+          "fail": 0,
+          "invalid": 0,
+          "ci": [
+            0.51,
+            1
+          ],
+          "notApplicable": null
+        }
+      ]
+    },
+    {
+      "key": "s9-continue-stopped-session",
+      "label": "Continue the work a stopped session left",
+      "role": null,
+      "cells": [
+        {
+          "agent": "claude",
+          "condition": "concord",
+          "n": 4,
+          "pass": 0,
+          "fail": 4,
+          "invalid": 0,
+          "ci": [
+            0,
+            0.49
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "claude",
+          "condition": "agent-mail",
+          "n": 4,
+          "pass": 0,
+          "fail": 4,
+          "invalid": 0,
+          "ci": [
+            0,
+            0.49
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "claude",
+          "condition": "agents-md-kept",
+          "n": 4,
+          "pass": 4,
+          "fail": 0,
+          "invalid": 0,
+          "ci": [
+            0.51,
+            1
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "claude",
+          "condition": "klypix",
+          "n": 4,
+          "pass": 4,
+          "fail": 0,
+          "invalid": 0,
+          "ci": [
+            0.51,
+            1
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "claude",
+          "condition": "none",
+          "n": 4,
+          "pass": 0,
+          "fail": 4,
+          "invalid": 0,
+          "ci": [
+            0,
+            0.49
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "codex",
+          "condition": "agent-mail",
+          "n": 3,
+          "pass": 0,
+          "fail": 3,
+          "invalid": 0,
+          "ci": [
+            0,
+            0.562
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "codex",
+          "condition": "concord",
+          "n": 3,
+          "pass": 0,
+          "fail": 3,
+          "invalid": 0,
+          "ci": [
+            0,
+            0.562
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "codex",
+          "condition": "klypix",
+          "n": 3,
+          "pass": 3,
+          "fail": 0,
+          "invalid": 0,
+          "ci": [
+            0.438,
+            1
+          ],
+          "notApplicable": null
+        }
+      ]
+    },
+    {
+      "key": "s10-live-peer-wrote-nothing",
+      "label": "A live session that has written nothing",
+      "role": null,
+      "cells": [
+        {
+          "agent": "claude",
+          "condition": "concord",
+          "n": 4,
+          "pass": 4,
+          "fail": 0,
+          "invalid": 0,
+          "ci": [
+            0.51,
+            1
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "claude",
+          "condition": "agents-md-kept",
+          "n": 4,
+          "pass": 4,
+          "fail": 0,
+          "invalid": 0,
+          "ci": [
+            0.51,
+            1
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "claude",
+          "condition": "none",
+          "n": 4,
+          "pass": 1,
+          "fail": 3,
+          "invalid": 0,
+          "ci": [
+            0.046,
+            0.699
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "claude",
+          "condition": "agent-mail",
+          "n": 4,
+          "pass": 4,
+          "fail": 0,
+          "invalid": 0,
+          "ci": [
+            0.51,
+            1
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "claude",
+          "condition": "klypix",
+          "n": 4,
+          "pass": 3,
+          "fail": 1,
+          "invalid": 0,
+          "ci": [
+            0.301,
+            0.954
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "codex",
+          "condition": "agent-mail",
+          "n": 3,
+          "pass": 0,
+          "fail": 3,
+          "invalid": 0,
+          "ci": [
+            0,
+            0.562
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "codex",
+          "condition": "klypix",
+          "n": 3,
+          "pass": 0,
+          "fail": 3,
+          "invalid": 0,
+          "ci": [
+            0,
+            0.562
+          ],
+          "notApplicable": null
+        },
+        {
+          "agent": "codex",
+          "condition": "concord",
+          "n": 3,
+          "pass": 0,
+          "fail": 3,
+          "invalid": 0,
+          "ci": [
+            0,
+            0.562
+          ],
+          "notApplicable": null
+        }
+      ]
+    }
+  ],
+  "notMeasured": [
+    {
+      "name": "Claude Code cross-session messaging",
+      "reason": "needs two LIVE Claude sessions; cannot reach a closed session or another vendor, so S3/S4 do not apply by design"
+    },
+    {
+      "name": "Memory tool (OpenMemory MCP)",
+      "reason": "third-party server not installed here; adapter must be verified against a pinned version before any result is published"
+    },
+    {
+      "name": "Clash (Claude Code hook)",
+      "reason": "a Claude Code hook that detects cross-worktree conflicts and keeps no memory, so only the overlapping-work scenarios (S2, S10) could apply, and no adapter exists"
+    },
+    {
+      "name": "Agent-MCP",
+      "reason": "no adapter exists; nothing is measured until one is verified against a pinned version"
+    }
+  ]
+}

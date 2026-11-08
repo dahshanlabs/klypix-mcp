@@ -1,0 +1,16 @@
+{
+  "model": "claude-haiku-5-5",
+  "effort": "medium",
+  "stageBudgetUsd": 0.5,
+  "maxContextTokens": 1000000,
+  "maxOutputTokens": 128000,
+  "requestOutputLimitTokens": 4096,
+  "inputWorstUsdPerMillion": 1,
+  "outputUsdPerMillion": 2.5,
+  "geographyMultiplier": 1.1,
+  "priceSource": "https://platform.claude.com/docs/en/about-claude/pricing",
+  "limitsSource": "https://platform.claude.com/docs/en/models/overview",
+  "verifiedAt": "2026-11-08",
+  "accountingBasis": "CLI-reported API-equivalent estimates; actual subscription invoice unknown",
+  "reservationNote": "$0.50 process budget plus $1.452 worst extra call (full context and output; expensive cache write; geographic multiplier), rounded up to $1.96. The envelope does not rely on the smaller output environment setting."
+}

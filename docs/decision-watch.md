@@ -1,5 +1,8 @@
 # Decision changes during a task
 
+Experimental feature specification. This behavior is not part of the 1.112.1
+repair release and has no measured competitive advantage yet.
+
 `brain_sync` automatically remembers the card revisions it supplies in a task's
 context capsule. No watch list or extra call is needed. At a later checkpoint or
 completion, it compares those cards with the current brain and reports meaningful

@@ -510,6 +510,9 @@ try {
         ['klypix-conformance.mjs', 'klypix-conformance.mjs'],
         ['klypix-runtime.mjs', 'klypix-runtime.mjs'],
         ['klypix-semantic-warm.mjs', 'klypix-semantic-warm.mjs'],
+        // klypix-check: the dispatcher's `check <files>` verb imports it lazily;
+        // staged so a hook on an installed machine gets the live-overlap answer.
+        ['klypix-check.mjs', 'klypix-check.mjs'],
     ]) {
         const s = path.join(BIN, src); if (exists(s)) staged.push({ dst, content: flatten(fs.readFileSync(s, 'utf8')) });
     }

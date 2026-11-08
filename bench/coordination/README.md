@@ -63,6 +63,7 @@ so the agent cannot read or game them. There is no LLM judge.
 | `agents-md-appended` | The other session appended to `AGENTS.md` / `CLAUDE.md` (the out-of-date line left in). |
 | `klypix` | The other session used KLYPIX: decisions as brain cards (a replaced one archived with a "superseded by" arrow), live work as a lane row, an ended session as an expired row. **KLYPIX never edits the notes file**: whatever it said before is still there, and KLYPIX's signal has to beat it. The agent gets **only the klypix-mcp server** (plugin mode) and the project rules `klypix link` writes — no hooks. Those rules go into `AGENTS.md`, which Codex loads itself. `klypix link` writes no `CLAUDE.md` target, because Claude Code's rules channel is hooks, so **Claude Code sees the rules only if it opens `AGENTS.md`**; otherwise its only pointer is the server's own instructions. (Round 2: Claude consulted KLYPIX in exactly the 31 of 35 runs in which it opened `AGENTS.md`.) Plugin mode means keyword-only `brain_ask`. This is not the default install, and whether hooks change the result is not measured. |
 | `klypix-installed` | What `npx klypix-mcp install` gives a Claude Code user: the server **not** in plugin mode, the five hooks the installer wires (SessionStart, UserPromptSubmit `--prompt`, Stop `--capture`, PostToolUse `--live`, PreToolUse `--guard`; the self-test checks them against `bin/klypix-install.mjs`) and search by meaning when `KLYPIX_BENCH_SEMANTIC_DIR` points at a prepared copy of its runtime and model. The hooks go into the run repo's `.claude/settings.json` (kept out of git) and run this checkout's hook through a wrapper pinned to the run's throwaway home, so no hook touches the user's own KLYPIX. **n/a for Codex**: Codex reads hooks only from the user's own `CODEX_HOME` (project-level hooks are not read), so running them would run the user's installed KLYPIX — not measured. |
+| `concord` | **Concord MCP 0.20.0** (`@concord-ai/concord-mcp`, pinned; adapter in `conditions-concord.mjs`). The other session uses Concord's own five tools the way Concord's instructions tell a session to: its work is a `start_work` task (title = its intent, `expected_files` = the files it is on, `branch` when it has one), so a live peer is a claim the agent's own `start_work` collides with (S2, S10); a decision or finding is an `update_work` record on that task (S1, S4, S8; S6 mid-task, plus a `prompt` to the agent); a session that finished and left marks its task review-ready with `finish_work` (S3 — Concord's workspace view lists active and review-ready tasks only, so a task closed as `complete` takes its notes out of `inspect_work`'s view; review-ready is the generous reading); a session that stopped mid-work leaves its claim, which Concord's own presence rules flag as **stale** once the owner has been away 30 minutes (S5-family, S9). Concord has no automatic work record, so in S9 it carries the claim — title, files, branch — and no last prompt or reply; the fact counts as delivered when the stale claim lists that title. The repo gets exactly what `concord setup` writes except its MCP registrations (`.concord/` with its self-ignoring `.gitignore`; Concord's instruction block in CLAUDE.md, AGENTS.md, `.codex/`, `.cursor/`, `.github/`, `.agents/`); the harness supplies the pinned server under the same `concord` key. **Claude Code reads the CLAUDE.md block natively**, which the KLYPIX condition's AGENTS.md rules do not get. No Concord plugin or hooks (the bench's Claude reads project settings only), so a live prompt has no reachable endpoint and Concord's own notice says so in the first tool result; identity is the documented operator path (`CONCORD_AGENT_ID`); telemetry and update checks off; every Concord process runs in the run's throwaway home. The one bench write outside Concord's tools is backdating an ended session's timestamps to when it really stopped (the tools stamp "now"), as the KLYPIX condition writes an ended lane row at its real age. **n/a**: S7 (a dated six-month log has no faithful Concord shape), S9s (Concord records no last words), the crowd scenarios (KLYPIX's own capture engine). Runs only where `KLYPIX_BENCH_CONCORD_DIR` names a 0.20.0 install; otherwise listed as not measured. |
 
 From round 3, Codex gets the KLYPIX server's tools approved
 (`default_tools_approval_mode = "approve"` on that server only), as Claude's
@@ -76,10 +77,31 @@ always writes the facts, in the right file, committed. Real teams forget.
 **Not measured yet** (listed in every report, never simulated):
 KLYPIX's hooks on **Codex** (they live only in the user's own `CODEX_HOME`),
 Claude Code cross-session messaging, Claude Code's and Codex's native session
-resume (S9 makes every handoff cross-vendor so no native resume applies), MCP
-Agent Mail, Concord, and memory tools such as OpenMemory. Each needs an adapter
+resume (S9 makes every handoff cross-vendor so no native resume applies), **MCP
+Agent Mail** and memory tools such as OpenMemory. Each needs an adapter
 verified against a pinned version before any number is published. KLYPIX's
-hooks on **Claude Code** are measured from round 3 (`klypix-installed`).
+hooks on **Claude Code** are measured from round 3 (`klypix-installed`);
+**Concord** is measured from the 2026-11-08 pilot (`concord`, above).
+
+**MCP Agent Mail — status, honest** (`conditions-agent-mail.mjs`, `runnable:false`).
+The maintained version is the Rust rewrite
+(`Dicklesworthstone/mcp_agent_mail_rust`); its latest release, v0.3.40
+(2026-11-01), ships a Windows x64 asset
+(`mcp-agent-mail-x86_64-pc-windows-msvc.zip`), so the earlier "Linux/macOS
+binaries only" note was out of date. On 2026-11-08 that zip was downloaded,
+its SHA-256 matched the published `.sha256`, and the binary started over stdio
+on this Windows 11 machine (`am serve-stdio` with an existing `STORAGE_ROOT`;
+~5 s to first reply; MCP protocol 2024-11-05; `tools/list` answered — the names
+are in the module header). That is all that was verified. The adapter is a
+skeleton: the planned mapping (`ensure_project`, `register_agent`,
+`file_reservation_paths` for a live peer, `send_message` for a decision,
+`fetch_inbox` / `search_messages` to read back) has not been run against the
+server, and one design question is unsettled — Agent Mail delivers to **named**
+mailboxes (broadcast is rejected) and an agent under test has no name before it
+registers, so how a note from an ended session reaches it (a thread the agent is
+told to read, search, or a pre-created identity) is a choice about the product
+that must be made and documented before any number is published. The project's
+own release notes call native Windows unverified. No Agent Mail number exists.
 
 ## Fairness rules
 
@@ -119,7 +141,10 @@ hooks on **Claude Code** are measured from round 3 (`klypix-installed`).
 
 The [round-3 historical reconciliation](results/2026-10-13-round3-reconciliation.md)
 preserves the existing result rows, including failures, and explains why they
-are not an evaluation of the current build.
+are not an evaluation of the current build. The
+[2026-11-08 Concord pilot](results/2026-11-08-concord-pilot.md) is the first
+run of a third-party channel: **n = 1 per cell, Claude Code only — it proves
+the adapter end to end and ranks nothing.**
 
 ```bash
 # Free: scripted oracle, no model calls. Proves graders and delivery.
@@ -140,6 +165,21 @@ on disk for inspection. `--timeout` is per run, in seconds (default 600).
 `--klypix-bin` points the KLYPIX condition at another server build — for
 example a released tag's checkout — so two versions can be compared on the same
 scenarios; every KLYPIX row records the server's version and commit.
+
+**Concord** runs only against a pinned local install, never a global one:
+
+```bash
+mkdir -p /tmp/cobench-competitors/concord && cd /tmp/cobench-competitors/concord
+npm init -y >/dev/null && npm install @concord-ai/concord-mcp@0.20.0
+KLYPIX_BENCH_CONCORD_DIR=/tmp/cobench-competitors/concord node bench/coordination/run.mjs --dry-run --condition concord
+```
+
+Another version at that path is refused with the reason (the adapter is
+verified against 0.20.0 only). Every Concord row records the package version
+(`channelServer`), and the experiment identity carries it, so rows from two
+Concord versions can never be pooled. The `concord` CLI is **not** on the
+agent's PATH (and not in Claude's allow-list): the five MCP tools are the
+channel, as they are for KLYPIX.
 
 `--shuffle <seed>` interleaves the runs reproducibly. To continue an interrupted
 run, repeat the **same command** with `--resume`. The output must match the
@@ -172,7 +212,12 @@ writable root, so it can commit and merge like Claude.
 The self-test (`node test/coordination-bench.mjs`) runs the dry run, proves each
 grader separates the right answer from the naive one, checks every invalid-run
 reason, and starts the real klypix-mcp server the way an agent would to check
-that its first `brain_sync` shows the agent what the other session knew.
+that its first `brain_sync` shows the agent what the other session knew. Where
+the pinned Concord install is present it does the same for Concord: the agent's
+own Concord server, started as the bench starts it, must show the other
+session's decision (S1), the overlap on its file (S2, S10), the review-ready
+task with its finding (S3), the stale claim two days old (S5) and the stopped
+session's claim without a plan (S9).
 
 ## Honest limits
 
@@ -212,5 +257,24 @@ that its first `brain_sync` shows the agent what the other session knew.
   vary between the two.
 - **One machine.** KLYPIX's lane is machine-local; a teammate on another PC is
   out of scope here, as it is in the product.
+- **Concord without its plugin.** The `concord` condition is Concord's MCP
+  server plus the instruction blocks `concord setup` writes; its Claude Code
+  plugin (hooks + idle monitor for live messages) is not installed, because the
+  bench's Claude reads project settings only. Live `prompt` delivery therefore
+  has no endpoint, and Concord's own first-call notice tells the agent its
+  adapter "needs attention" — both are what a user without the plugin sees.
+  Concord's `CLAUDE.md` block, on the other hand, IS read by Claude natively,
+  so Concord's rules reach Claude more directly than KLYPIX's AGENTS.md rules do
+  in the `klypix` condition.
+- **Concord's S3 is a reading.** A finished session's task is left
+  review-ready so its finding stays in the workspace view; a task closed as
+  `complete` would leave the view and survive only in `.concord/` artifacts and
+  per-task inspection. That choice is stated here so a number is never read as
+  "Concord's only possible behaviour".
+- **Concord's S9 carries less than KLYPIX's by design of the product.** Concord
+  records no last prompt or reply; the stopped session's claim (title, files)
+  is what the agent can find. A Concord session that had also called
+  `finish_work outcome: handoff` would be the generous notes condition's twin,
+  not "nobody wrote a note", and is not run.
 - **Small samples prove little.** Five runs that all pass give an interval of
   roughly 57–100%. Publish only what the intervals support.

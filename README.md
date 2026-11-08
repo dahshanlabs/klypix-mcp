@@ -14,6 +14,13 @@
 
 </div>
 
+![Coordination bench, Claude Code, 4 runs per cell, 176 graded runs: KLYPIX against no shared channel, a notes file kept tidy, Concord MCP 0.20.0 and MCP Agent Mail 0.3.40 on nine scenarios. KLYPIX passes 4 of 4 where Concord and Agent Mail pass 0 of 4 on a stale work-in-progress note, its held-out twin, a decision made mid-task and continuing a stopped session's work; every channel fails the overlapping-work scenario that a tidy notes file passes.](docs/demo/bench-chart.gif)
+
+<sub>Real Claude Code sessions, hidden tests, no LLM judge, 8 Nov 2026. Drawn by CI from
+[the results file](bench/coordination/results/2026-11-08-competitors.md); every row is published,
+including the one KLYPIX loses. Four runs per cell, so only bars whose lines do not overlap are
+differences.</sub>
+
 One `brain.klypix` file, committed with your code, holds what the project decided, what was
 corrected, and what is still open. Claude Code, Codex, Cursor and other MCP coding tools read it
 when a session starts and add to it as they work. When two sessions plan to touch the same file,
@@ -93,18 +100,26 @@ how deep each integration goes.
 ## The numbers, including the ones we lose
 
 The [coordination bench](bench/coordination/README.md) runs real Claude Code and Codex sessions on
-seeded repositories and grades them with hidden tests. Every result is in
-[`bench/coordination/results/`](bench/coordination/results/):
+seeded repositories and grades them with hidden tests; there is no LLM judge. The full run of
+8 November 2026 put klypix-mcp 1.112.0 next to Concord MCP 0.20.0, MCP Agent Mail 0.3.40, a notes
+file kept tidy by hand, and no shared channel
+([write-up](bench/coordination/results/2026-11-08-competitors.md)):
 
-- A **tidy, hand-edited notes file beat klypix-mcp** on a stale "hands off" note whose work was
-  finished: 0 of 5 against 5 of 5. The brain still carried the dead line.
-- **klypix-mcp beat having no channel** when the next session had to continue work a stopped
-  session left without writing anything down: 5 of 5 against 0 of 5.
+- **Clear wins over Concord and Agent Mail** on four of nine scenarios: a work-in-progress note
+  that outlived its session, its held-out twin, a decision made while the agent was working, and
+  continuing the work a stopped session left. KLYPIX 4 of 4 each, both others 0 of 4.
+- **Ties** on a changed decision, a note from an ended session, a live session that wrote nothing,
+  and the harm check.
+- **One loss, shared by every channel:** on two sessions changing overlapping work, a tidy notes
+  file passed 4 of 4 and KLYPIX, Concord and Agent Mail 0 of 4. All three delivered the warning;
+  the agents chose to tell the human rather than merge.
+- **A notes file kept tidy by hand ties KLYPIX on most scenarios.** What it needs is a person who
+  keeps it tidy.
+- **Codex,** 3 runs each on four scenarios: KLYPIX 9 of 12, Agent Mail 5 of 12, Concord 0 of 12.
+  Three runs is too few to call any single scenario.
 
-- **Against Concord MCP, first pilot, one run per cell:** both passed three scenarios; Concord
-  missed "continue a stopped session's work" (the plan lived in a prompt it does not record); both
-  failed the strict overlap grade by refusing to merge unfinished work and warning the human.
-  [Ten runs, $6](bench/coordination/results/2026-11-08-concord-pilot.md). Not a ranking yet.
+Four runs per cell (five were planned; the run stopped at its budget). Clash and Agent-MCP are not
+measured: no adapter exists. Claude spend $88.99; no run was invalid.
 
 npm download counts for this package are mostly its own updater checking for new versions; do not
 read them as users.

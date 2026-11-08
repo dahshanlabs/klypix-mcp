@@ -128,6 +128,28 @@ jobs:
           [ "$SIZE" -gt "$MIN" ] || { echo "::error::$GIF is suspiciously small — the tape likely crashed"; exit 1; }
           [ "$SIZE" -lt 12000000 ] || { echo "::error::$GIF exceeds 12MB — tighten the tape before shipping it"; exit 1; }
 
+      # The chart GIF for the top of the README: the same summary file, drawn as
+      # animated bars by matplotlib (bench/coordination/render-chart.py).
+      - name: Render the bench chart
+        if: env.TAPE == 'bench.tape'
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet matplotlib==3.11.2 pillow==12.2.0
+          python3 bench/coordination/render-chart.py -o docs/demo/bench-chart.gif --png docs/demo/bench-chart.png
+          SIZE=$(stat -c%s docs/demo/bench-chart.gif)
+          echo "bench-chart.gif: ${SIZE} bytes"
+          [ "$SIZE" -gt 30000 ] || { echo "::error::bench-chart.gif is suspiciously small"; exit 1; }
+
+      - name: Upload the bench chart
+        if: env.TAPE == 'bench.tape'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bench-chart
+          path: |
+            docs/demo/bench-chart.gif
+            docs/demo/bench-chart.png
+          retention-days: 14
+
       - name: Upload the GIF
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

@@ -111,3 +111,18 @@ real run, disclosed here on purpose: every frame is genuine output; only the
 dead air between server responses is compressed. The pane driver word-wraps
 its output at ~72 columns (the ~77-col post-split pane minus slack for wide glyphs like — and ·) so lines printed before the split are not clipped
 when the pane narrows (tmux does not rewrap existing rows).
+
+## The bench chart
+
+`bench/coordination/render-chart.py` draws the same `*.summary.json` the card
+uses as animated bars: one group per scenario, one bar per condition, height =
+pass rate, thin line = the 95% interval, label = pass/n. KLYPIX is emerald,
+every other condition a neutral grey. A cell with fewer than five runs puts a
+visible caveat on the chart. The *Render README demo GIF* workflow renders it
+next to the card when `tape = bench.tape` and uploads `bench-chart`
+(`bench-chart.gif` + a still `bench-chart.png`). Locally:
+
+```bash
+python -m pip install matplotlib pillow
+python bench/coordination/render-chart.py            # newest summary -> docs/demo/bench-chart.gif
+```

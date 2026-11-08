@@ -101,6 +101,11 @@ seeded repositories and grades them with hidden tests. Every result is in
 - **klypix-mcp beat having no channel** when the next session had to continue work a stopped
   session left without writing anything down: 5 of 5 against 0 of 5.
 
+- **Against Concord MCP, first pilot, one run per cell:** both passed three scenarios; Concord
+  missed "continue a stopped session's work" (the plan lived in a prompt it does not record); both
+  failed the strict overlap grade by refusing to merge unfinished work and warning the human.
+  [Ten runs, $6](bench/coordination/results/2026-11-08-concord-pilot.md). Not a ranking yet.
+
 npm download counts for this package are mostly its own updater checking for new versions; do not
 read them as users.
 

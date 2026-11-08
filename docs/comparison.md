@@ -32,7 +32,7 @@ measured numbers live, and it says plainly which tools are **not measured**.
 | Tools exposed to the agent | 6 by default (`core`), 29 or 30 with `all` | 5 | 45 tools, 25 resources | CLI and hook, no MCP tools | MCP tools |
 | Hosts with a documented setup | Claude Code (hooks), Codex, Cursor, Cline, VS Code, Gemini CLI, Antigravity, Windsurf, Aider, Claude plugin | Claude Code, Codex, Cursor, Gemini CLI, Grok Build, Goose, Antigravity, Copilot CLI, Devin CLI, Conductor | Claude Code, Codex, Gemini CLI, Oh My Pi, Copilot CLI | Claude Code | MCP clients |
 | A person's view | The KLYPIX workspace (optional, Windows) and the web viewer; `klypix-read` prints the brain as text | `concord dashboard` terminal view, `HANDOFF.md`, `REVIEW_PACKET.md` | Terminal console and web UI | Conflict matrix in the terminal | Web dashboard |
-| Published benchmark | [Yes, including the rows it loses](../bench/coordination/results/) | Not found | Not found | Not found | Not found |
+| Published benchmark | [Yes, including the rows it loses](../bench/coordination/results/) | Measured in our bench ([pilot](../bench/coordination/results/2026-11-08-concord-pilot.md)); none of its own found | Not found | Not found | Not found |
 | Licence | MIT | MIT | MIT with a rider | MIT | Not checked |
 | GitHub stars, 8 Nov 2026 | 10 | 995 | 237 (the Python original: 2,233, deprecated) | 65 | 1,304 |
 
@@ -53,6 +53,12 @@ plainly:
   session left without writing anything down: 5 of 5 against 0 of 5, because the stopped session's
   last prompt, reply and commits were recorded automatically.
 
-Concord and Agent Mail appear in that bench as conditions only where an adapter exists and was run;
-see the results folder for what was and was not measured. We publish every row, including the ones
+Concord MCP now has a verified adapter (pinned 0.20.0) and a first pilot of
+[ten runs, n=1 per cell](../bench/coordination/results/2026-11-08-concord-pilot.md): both channels
+passed the changed-decision, closed-session-note and silent-live-peer scenarios; Concord failed
+"continue a stopped session's work" because the plan lived in the stopped session's last prompt, which
+Concord does not record and klypix-mcp does; both failed the strict overlapping-work grade by declining
+to merge another session's unfinished work and warning the human instead. One run per cell is not a
+ranking. MCP Agent Mail has a Windows build and answers a tool list here, but its adapter is not run
+yet; the results folder says so. We publish every row, including the ones
 we lose, because a comparison you cannot rerun is an advertisement.

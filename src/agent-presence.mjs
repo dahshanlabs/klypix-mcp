@@ -1265,6 +1265,19 @@ const scopeKey = (file) => String(file || '').replace(/\\/g, '/').replace(/^\.\/
 // its own constant so writers and tests agree on the LRU bound.
 export const OBSERVED_FILES_CAP = 20;
 
+// Read-only lane health for callers that must tell "no live sessions" apart
+// from "could not read the lane" (`klypix-mcp check <files>` exits 2 on the
+// latter so a hook can decide). Never writes, never prunes.
+//   { ok: true,  missing: true  }  — no lane yet: nobody has been here
+//   { ok: true,  missing: false }  — readable
+//   { ok: false, reason }          — unreadable or corrupt; `reason` says which
+export function readLaneStatus({ brainPath, home } = {}) {
+  if (!brainPath) return { ok: false, missing: false, reason: 'no-brain', file: null };
+  const file = laneFileFor(brainPath, home);
+  const result = readLaneChecked(file);
+  return { ok: result.ok, missing: Boolean(result.missing), reason: result.reason || null, file };
+}
+
 export function listActiveSessions({ brainPath, home, now = Date.now() }) {
   if (!brainPath) return [];
   const lane = readLane(laneFileFor(brainPath, home));

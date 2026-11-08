@@ -29,7 +29,7 @@ measured numbers live, and it says plainly which tools are **not measured**.
 | What it remembers | The project: decisions, corrections, open questions, handoffs, a brief at session start | The task: context, decisions and evidence attached to a task; handoff and review packets | Messages, threads, reservations | Nothing; it detects conflicts | Tasks and context for its agents |
 | Across computers | Peer to peer, encrypted, self-hostable relay, no account | Concord Cloud, account | Local HTTP server | No | Its server |
 | Telemetry | None | On by default to getconcord.ai, opt-out | Not stated in the README we read | Not stated | Not stated |
-| Tools exposed to the agent | 6 by default (`core`), 28 or 29 with `all` | 5 | 45 tools, 25 resources | CLI and hook, no MCP tools | MCP tools |
+| Tools exposed to the agent | 6 by default (`core`), 29 or 30 with `all` | 5 | 45 tools, 25 resources | CLI and hook, no MCP tools | MCP tools |
 | Hosts with a documented setup | Claude Code (hooks), Codex, Cursor, Cline, VS Code, Gemini CLI, Antigravity, Windsurf, Aider, Claude plugin | Claude Code, Codex, Cursor, Gemini CLI, Grok Build, Goose, Antigravity, Copilot CLI, Devin CLI, Conductor | Claude Code, Codex, Gemini CLI, Oh My Pi, Copilot CLI | Claude Code | MCP clients |
 | A person's view | The KLYPIX workspace (optional, Windows) and the web viewer; `klypix-read` prints the brain as text | `concord dashboard` terminal view, `HANDOFF.md`, `REVIEW_PACKET.md` | Terminal console and web UI | Conflict matrix in the terminal | Web dashboard |
 | Published benchmark | [Yes, including the rows it loses](../bench/coordination/results/) | Not found | Not found | Not found | Not found |

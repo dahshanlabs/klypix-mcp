@@ -91,7 +91,7 @@ has the details.
 | **Claude Desktop** | A one-time config entry | The KLYPIX app's Settings, or by hand |
 | **Claude, as a plugin** | One pinned version, keyword search, no hooks | [klypix-plugin](https://github.com/dahshanlabs/klypix-plugin) |
 
-klypix-mcp has 28 MCP tools on Linux and macOS and 29 on Windows, where `show_in_klypix` is
+klypix-mcp has 29 MCP tools on Linux and macOS and 30 on Windows, where `show_in_klypix` is
 added (one fewer in plugin mode, which leaves out `prepare_video`). `npx klypix-mcp doctor` shows
 the count for your install.
 

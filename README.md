@@ -26,7 +26,7 @@ Three things worth knowing before you install:
 - **Agents read plain text.** The brief lands in `AGENTS.md` / `CLAUDE.md` as a managed block,
   so every tool that reads instruction files already understands it.
 - **Six tools by default.** `brain_sync`, `brain_note`, `brain_ask`, `brain_message`,
-  `brain_handoff`, `brain_rules`. The other 22 are one flag away.
+  `brain_handoff`, `brain_rules`. The other 23 (24 on Windows) are one flag away.
 
 ![Two real MCP sessions on one project: Session B declares a file Session A already declared, and the server's exact-file-overlap heads-up fires; Session A then records a correction that supersedes its stale card](https://raw.githubusercontent.com/dahshanlabs/klypix-mcp/master/docs/demo/demo.gif)
 

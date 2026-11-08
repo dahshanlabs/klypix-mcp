@@ -420,7 +420,22 @@ try {
         } else {
             console.log(`• Installed brain v${decision.installedVersion} is newer than this package v${VERSION} — not downgrading. Re-run with --force to override.`);
         }
-        if (!RUNTIME_ONLY) reportCodex(wireCodex());
+        if (!RUNTIME_ONLY) {
+            reportCodex(wireCodex());
+            // An explicit --tools is a request about the PROJECT's MCP entries, not
+            // about the engine; a preserved (dev-owned or newer) engine must not
+            // swallow it, or `install --tools all` silently leaves .mcp.json on core.
+            if (TOOLS_POLICY.explicit && !NO_PROJECT) {
+                console.log(`✓ tools: KLYPIX_TOOLS=${TOOLS_POLICY.value} is written into every MCP entry this run touches${TOOLS_POLICY.parsed?.names ? ` (${TOOLS_POLICY.parsed.names.size} tool${TOOLS_POLICY.parsed.names.size === 1 ? '' : 's'})` : ' (every tool)'}; reconnect the editor to pick it up.`);
+                try {
+                    const report = await runSetup({ verifyAll: VERIFY_ALL, tools: TOOLS_POLICY });
+                    if (SETUP_JSON) console.log(JSON.stringify(report, null, 2));
+                    else console.log(renderBrief(report));
+                } catch (e) {
+                    console.error(`⚠ project setup could not finish: ${e?.message || e}`);
+                }
+            }
+        }
         process.exit(0);
     }
 

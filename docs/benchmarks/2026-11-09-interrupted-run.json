@@ -1,0 +1,77 @@
+{
+  "schema": 1,
+  "kind": "interrupted-experiment-diagnostic-audit",
+  "recordedAt": "2026-11-08T22:06:01.120Z",
+  "sourceCommit": "6788b78b867efa59a896144adcd1cddae5eb9c04",
+  "protocolCommit": "d238536627c480abea4c320219e1aa0287aac36c",
+  "planned": 30,
+  "attempted": 2,
+  "notStarted": 28,
+  "firstAttemptOrderMatches": true,
+  "rawRowsUnchanged": true,
+  "noReruns": true,
+  "comparisonVerdict": "inconclusive-no-winner",
+  "reason": "Missing synchronization between native tool execution/checkpoint arrival and stdout-based observation aborted valid notes exposure and limits code-revision telemetry.",
+  "administrativeHold": {
+    "id": "administrative-hold-exposure-audit-20261109",
+    "reservedUsd": 48,
+    "noPaidCall": true,
+    "settledUsd": 0,
+    "heldOnlyToStopNewTrials": true
+  },
+  "cost": {
+    "apiEquivalentUsd": 0.03482057,
+    "chargedAgainstBudgetUsd": 0.06,
+    "outstandingReservedUsd": 0,
+    "ledgerHalted": false,
+    "budgetLimitUsd": 50,
+    "remainingConservativeBudgetUsd": 49.94,
+    "actualSubscriptionInvoice": "unknown"
+  },
+  "attempts": [
+    {
+      "runId": "unchanged-control-notes-notification-r1-8603721e",
+      "condition": "notes-notification",
+      "scenario": "unchanged-control",
+      "originalCategory": "exposure-unverified",
+      "originalFailure": "initial-policy-exposure-unverified",
+      "originalSuccess": false,
+      "knownForegroundApiEquivalentUsd": 0.0072846199999999995,
+      "administrativeAnnotation": "Actual Read exposure exists in the retained transcript; the live checkpoint aborted before stdout delivery.",
+      "comparisonEligible": false
+    },
+    {
+      "runId": "corrected-decision-klypix-improved-r1-397aa6dc",
+      "condition": "klypix-improved",
+      "scenario": "corrected-decision",
+      "originalCategory": "accounting-ineligible",
+      "originalFailure": null,
+      "originalSuccess": false,
+      "knownForegroundApiEquivalentUsd": 0.02753595,
+      "administrativeAnnotation": "The original row captured the still-open administrative hold as uncertain cost. Final ledger confirms all actual foreground receipts and a zero-cost hold release; this is not missing model spend.",
+      "comparisonEligible": false
+    }
+  ],
+  "deliveryEvidence": {
+    "checkpointAt": "2026-11-08T22:00:54.776Z",
+    "stdoutFileCreatedAt": "2026-11-08T22:01:06.173Z",
+    "stdoutFileCreationAfterCheckpointMs": 11396.934326171875,
+    "replayedExposureCount": 1,
+    "source": "Explicit successful Read of CLAUDE.md; not only startup injection"
+  },
+  "artifactObservation": {
+    "condition": "klypix-improved",
+    "currentPolicyCodeCorrect": true,
+    "shippingPreserved": true,
+    "rawObservedRevisions": 1,
+    "rawStaleRevisions": 0,
+    "interpretation": "Single final artifact check only. Buffered tool results can coalesce intermediate source revisions, so zero observed stale revisions is not established zero rework."
+  },
+  "inputHashes": {
+    "experiment": "fbc5bc686eb2824e69878a92aedf2afa69b147667e4d550ce71f68a9ba1feef9",
+    "resultsJsonl": "0e74a8377db77b9550cee8f89f9de9ae74f4eec9de13ec808434f479bd0e1952",
+    "runSummary": "5143959923b5731d085ef6cac51d2ef9175fbf02d585788b150ad6bca781e18e",
+    "finalLedger": "8ba27137670dc687a344d978fe3d4cc8129ebf6f41a1e29119870724d01f9e63",
+    "notesConsumer": "5a00161dcf66a24a10ead06ced665df54f293f6a3d0150d93884ca4413ecfb3e"
+  }
+}

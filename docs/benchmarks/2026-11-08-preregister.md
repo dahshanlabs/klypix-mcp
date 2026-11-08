@@ -4,11 +4,12 @@ Recorded 8 November 2026, before any paid model call in this experiment.
 This is a small, developer-authored pilot. It cannot establish a general product
 ranking, a statistical result across teams, or a 100× advantage.
 
-**Setup update:** the original [preflight report](2026-11-08-setup-result.md)
-records a native semantic-search setup failure. The subsequent
-[recovery amendment](2026-11-09-setup-recovery.md) verifies native semantic
-write/search before any paid call. The comparison remains unexecuted at $0;
-these pass marks are unchanged and no winner is claimed.
+**Execution update:** the original [preflight report](2026-11-08-setup-result.md)
+and [recovery amendment](2026-11-09-setup-recovery.md) remain published. The first
+run stopped after two attempts because stdout-based observation missed a real
+notes read. The [diagnostic report](2026-11-09-interrupted-run.md) retains both
+attempts and $0.03482057 in API-equivalent cost; 28 cells did not start. These
+pass marks remain unchanged. No comparison winner or continuation pass is claimed.
 
 ## Conditions and setup requirements
 

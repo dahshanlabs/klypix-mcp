@@ -73,6 +73,39 @@ setup script, renders `docs/demo/<tape name>.gif` and uploads it as the
 `<tape name>-gif` artifact. The committed `demo.gif` is untouched by a
 worktrees render.
 
+## The bench card — `bench.tape`
+
+A third tape, with no tmux and no demo repo: it runs
+`node bench/coordination/render-card.mjs`, which prints the coordination bench's
+result card row by row — one row per scenario, one column per condition, each
+cell `pass/n`, a small bar and the 95% Wilson interval, colour by pass rate
+only (never by vendor), then the "Not measured" conditions with the kit's own
+reason and the line that points at `bench/coordination/results/`.
+
+**Every number is read from a file.** The renderer opens the newest
+`bench/coordination/results/*.summary.json`; that file is written by
+`bench/coordination/summarize.mjs` from a results `.jsonl`, with
+`lib/stats.mjs` computing the intervals and `scenarios.mjs` / `conditions.mjs`
+supplying titles, labels and the not-measured reasons. Nothing is typed into
+the tape or the renderer, so when the results change the GIF is re-rendered,
+not edited. Any cell with n < 5 puts a visible caveat line on the card — the
+2026-11-08 Concord pilot is all n = 1 and says so on screen.
+
+```bash
+node bench/coordination/summarize.mjs bench/coordination/results/<run>.jsonl \
+     bench/coordination/results/<run>.summary.json     # once per results file
+node bench/coordination/render-card.mjs                 # newest summary, with delays
+node bench/coordination/render-card.mjs <file> --no-delay --no-color   # plain text
+vhs docs/demo/bench.tape                                # writes docs/demo/bench.gif
+```
+
+In CI: *Render README demo GIF* → `tape` = `bench.tape`. The workflow skips the
+tmux install and both seeding steps, runs `test/bench-card.mjs` and prints the
+card to the log before VHS draws it, then uploads `bench-gif`. The 1.4×
+playback step applies to this tape too. `test/bench-card.mjs` (in `npm test`)
+checks that the printed numbers equal the JSON, that the n < 5 caveat appears
+for the pilot, and that a missing file renders nothing but a clear error.
+
 **Playback is sped up 1.4× by the workflow's ffmpeg step** — a timelapse of a
 real run, disclosed here on purpose: every frame is genuine output; only the
 dead air between server responses is compressed. The pane driver word-wraps

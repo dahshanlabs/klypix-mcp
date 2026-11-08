@@ -36,6 +36,9 @@ fs.mkdirSync(vault, { recursive: true });
 const env = {
   ...process.env, HOME: home, USERPROFILE: home, KLYPIX_AUTO_UPDATE: '0',
   KLYPIX_VAULT: vault, KLYPIX_APP_BRIDGE_DIR: path.join(tmp, 'bridge'),
+  // The freeze pins EVERY schema: force the `all` tool profile (the default for a
+  // server without KLYPIX_TOOLS, but a developer's shell may carry `core`).
+  KLYPIX_TOOLS: 'all',
 };
 delete env.KLYPIX_BRAIN;
 

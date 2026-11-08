@@ -31,9 +31,16 @@ function parseTomlArgs(block) {
   return out;
 }
 
+// The string-valued env an entry declares (KLYPIX_TOOLS, the tool profile, is
+// the one KLYPIX writes). The verifier passes it to the child it launches, so a
+// `core` entry is proved as the 6 tools the editor will see, not as `all`.
+const stringEnv = (env) => Object.fromEntries(
+  Object.entries(env && typeof env === 'object' && !Array.isArray(env) ? env : {}).filter(([, v]) => typeof v === 'string'),
+);
+
 /**
  * Read a written MCP config and return the launch spec an editor would use.
- * @returns {{ ok: boolean, command?: string, args?: string[], cwd?: string, why?: string }}
+ * @returns {{ ok: boolean, command?: string, args?: string[], cwd?: string, env?: object, why?: string }}
  */
 export function readLaunchSpec(file) {
   if (!fs.existsSync(file)) return { ok: false, why: 'config file not written' };
@@ -48,7 +55,7 @@ export function readLaunchSpec(file) {
     if (!name) return { ok: false, why: 'no klypix server entry' };
     const entry = parsed.servers[name];
     if (!entry.command) return { ok: false, why: 'entry has no command' };
-    return { ok: true, command: entry.command, args: parseTomlArgs(entry.raw), cwd: entry.cwd || undefined };
+    return { ok: true, command: entry.command, args: parseTomlArgs(entry.raw), cwd: entry.cwd || undefined, env: stringEnv(entry.env) };
   }
 
   let cfg;
@@ -69,6 +76,7 @@ export function readLaunchSpec(file) {
     command: String(entry.command),
     args: Array.isArray(entry.args) ? entry.args.map(String) : [],
     cwd: entry.cwd ? String(entry.cwd) : undefined,
+    env: stringEnv(entry.env),
   };
 }
 
@@ -96,8 +104,9 @@ export async function verifyMcpConfig({ file, projectDir, timeoutMs = VERIFY_TIM
   const started = Date.now();
   let client = null;
   try {
+    // The entry's own env rides on top of ours, as the editor would pass it.
     const childEnv = Object.fromEntries(
-      Object.entries({ ...env, KLYPIX_AUTO_UPDATE: '0', KLYPIX_RERANK: '0' })
+      Object.entries({ ...env, ...(spec.env || {}), KLYPIX_AUTO_UPDATE: '0', KLYPIX_RERANK: '0' })
         .filter(([, v]) => typeof v === 'string'),
     );
     const transport = new StdioClientTransport({
@@ -128,6 +137,7 @@ export async function verifyMcpConfig({ file, projectDir, timeoutMs = VERIFY_TIM
       ok: tools.length > 0,
       toolCount: tools.length,
       hasBrainSync: tools.some((t) => t?.name === 'brain_sync'),
+      tools: spec.env?.KLYPIX_TOOLS || null,
       ms: Date.now() - started,
       ...(tools.length ? {} : { why: 'server started but offered no tools' }),
     };

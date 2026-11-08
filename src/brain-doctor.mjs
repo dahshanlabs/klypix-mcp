@@ -26,6 +26,10 @@ import path from 'path';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { auditProject, codexGlobalInstructionsInstalled, resolveVersion } from './agent-rules.mjs';
+// Namespace view of the same module for exports newer than the static names
+// above (projectMcpConfigFiles / readMcpEntryEnv, 1.112.0): a doctor beside an
+// older agent-rules mid-install must degrade, not fail to link.
+import * as agentRules from './agent-rules.mjs';
 import { detectEditors } from './editor-detect.mjs';
 import { codexPresenceHookStatus } from './codex-hooks.mjs';
 import { renderReceiptSummary, summarizeReceipts } from './finding-routing.mjs';
@@ -47,6 +51,11 @@ try { autoUpdateLib = await import('./mcp-auto-update.mjs'); } catch { autoUpdat
 // inspect() synchronous for its existing callers.
 let fmtLib = null;
 try { fmtLib = await import('./klypix-format.mjs'); } catch { fmtLib = null; }
+// The tool profile (KLYPIX_TOOLS, 1.112.0): which of the registered verbs a
+// connection actually serves. Absent in an older bundle → the TOOLS line
+// reports the manifest alone, as before.
+let toolProfileLib = null;
+try { toolProfileLib = await import('./tool-profile.mjs'); } catch { toolProfileLib = null; }
 let gitCaptureLib = null;
 try { gitCaptureLib = await import('./git-capture-install.mjs'); } catch { gitCaptureLib = null; }
 let historyLib = null;
@@ -202,7 +211,42 @@ const appToolsHere = (env = process.env) => process.platform === 'win32' || env.
 // register it in plugin mode (KLYPIX_PLUGIN=1); the count applies that rule too.
 const NOT_IN_PLUGIN_MODE = new Set(['prepare_video']);
 const pluginModeHere = (env = process.env) => String(env.KLYPIX_PLUGIN ?? '').trim() === '1';
-function inspectTools(brainDir, pkgRoot) {
+
+// The tool PROFILE a connection serves (src/tool-profile.mjs). Resolution, in
+// order: KLYPIX_TOOLS in this process's env (inside the worker — the brain_doctor
+// tool — that IS the live profile); else the KLYPIX_TOOLS the project's MCP
+// entries will launch the server with (what the CLI doctor can know); else the
+// default, `all`. Entries that disagree are reported as mixed, never averaged.
+function inspectToolProfile(names, projectDir, env = process.env) {
+  if (!toolProfileLib || typeof toolProfileLib.resolveToolProfile !== 'function') return null;
+  const own = String(env.KLYPIX_TOOLS ?? '').trim();
+  let source = 'default';
+  let raw = '';
+  let entries = [];
+  if (own) { source = 'env'; raw = own; }
+  else if (projectDir && typeof agentRules.projectMcpConfigFiles === 'function' && typeof agentRules.readMcpEntryEnv === 'function') {
+    for (const { file } of agentRules.projectMcpConfigFiles(projectDir)) {
+      let entryEnv = null;
+      try { entryEnv = agentRules.readMcpEntryEnv(file); } catch { entryEnv = null; }
+      if (entryEnv) entries.push({ file: path.relative(projectDir, file).replace(/\\/g, '/'), tools: String(entryEnv.KLYPIX_TOOLS ?? '').trim() || null });
+    }
+    const values = [...new Set(entries.map((e) => e.tools || ''))];
+    if (values.length === 1 && values[0]) { source = entries.length === 1 ? entries[0].file : `${entries.length} MCP configs`; raw = values[0]; }
+    else if (values.length > 1) { source = 'mixed'; }
+  }
+  const resolved = toolProfileLib.resolveToolProfile({ KLYPIX_TOOLS: raw });
+  const selected = names.filter((n) => toolProfileLib.toolAllowed(resolved, n));
+  return {
+    name: source === 'mixed' ? 'mixed' : resolved.profile,
+    source,
+    env: raw || null,
+    count: selected.length,
+    selected,
+    unknown: resolved.unknown,
+    entries: entries.filter((e) => e.tools),
+  };
+}
+function inspectTools(brainDir, pkgRoot, projectDir = null) {
   // Prefer the DEPLOYED server (what this machine's brain actually exposes); fall back
   // to the running package's server file. Regex the registration list — no import, no
   // spawning the stdio server.
@@ -229,9 +273,15 @@ function inspectTools(brainDir, pkgRoot) {
     const uniqueNames = [...new Set(names)]
       .filter(n => appToolsHere() || !APP_ONLY_TOOLS.has(n))
       .filter(n => !pluginModeHere() || !NOT_IN_PLUGIN_MODE.has(n));
-    if (uniqueNames.length) return { names: uniqueNames, count: uniqueNames.length, source: f.startsWith(brainDir) ? 'deployed' : 'package', hash: sha(uniqueNames.slice().sort().join(',')).slice(0, 8) };
+    if (uniqueNames.length) {
+      return {
+        names: uniqueNames, count: uniqueNames.length, source: f.startsWith(brainDir) ? 'deployed' : 'package',
+        hash: sha(uniqueNames.slice().sort().join(',')).slice(0, 8),
+        profile: inspectToolProfile(uniqueNames, projectDir),
+      };
+    }
   }
-  return { names: [], count: 0, source: null, hash: null };
+  return { names: [], count: 0, source: null, hash: null, profile: null };
 }
 
 // ── APP BRIDGE (advisory) ─────────────────────────────────────────────────────
@@ -1133,7 +1183,7 @@ export function inspect(opts = {}) {
     try { provenance = { available: true, ...provenanceLib.provenanceCounts(brainPath, { home }) }; }
     catch { provenance = null; }
   }
-  const tools = inspectTools(brainDir, PKG_ROOT);
+  const tools = inspectTools(brainDir, PKG_ROOT, projectDir);
   const appBridge = inspectAppBridge();
   // ── CHECKOUT (release-state visibility, 2026-08-14 incident) ──────────────
   // Advisory, never a verdict layer: when the PROJECT itself is a versioned
@@ -1827,8 +1877,17 @@ export function render(r, opts = {}) {
     L.push(`${ok} ${c.bold}JUDGMENTS${c.rst} ${j.total} recorded (${j.byVerdict?.yes || 0} yes / ${j.byVerdict?.no || 0} no)${since} · rejected-prompt pool ${rej.total}${srcBits ? ` ${c.dim}(${srcBits})${c.rst}` : ''}`);
   }
 
-  // TOOLS
-  L.push(`${ok} ${c.bold}TOOLS${c.rst}    ${r.tools.count} MCP verb(s)${r.tools.hash ? ` ${c.dim}[#${r.tools.hash}, ${r.tools.source}]${c.rst}` : ''}${r.tools.count ? `: ${c.dim}${r.tools.names.join(', ')}${c.rst}` : ''}`);
+  // TOOLS — the manifest (every verb this build can register) and the PROFILE
+  // (which of them a connection serves: KLYPIX_TOOLS, src/tool-profile.mjs).
+  {
+    const p = r.tools.profile;
+    const reduced = p && p.name !== 'all' && p.name !== 'mixed';
+    const where = !p ? '' : p.source === 'env' ? `KLYPIX_TOOLS=${p.env} in this process` : p.source === 'default' ? 'no KLYPIX_TOOLS — the default' : p.source === 'mixed' ? `MCP configs disagree: ${p.entries.map((e) => `${e.file}=${e.tools}`).join(', ')}` : `KLYPIX_TOOLS=${p.env} in ${p.source}`;
+    const listed = reduced ? p.selected : r.tools.names;
+    L.push(`${ok} ${c.bold}TOOLS${c.rst}    ${reduced ? `${p.count} of ${r.tools.count}` : r.tools.count} MCP verb(s)${r.tools.hash ? ` ${c.dim}[#${r.tools.hash}, ${r.tools.source}]${c.rst}` : ''}${p ? ` · profile ${c.bold}${p.name}${c.rst} ${c.dim}(${where})${c.rst}` : ''}${listed.length ? `: ${c.dim}${listed.join(', ')}${c.rst}` : ''}`);
+    if (p?.unknown?.length) L.push(`${warn}${c.yel}KLYPIX_TOOLS names ${p.unknown.length === 1 ? 'something that is not a tool' : 'things that are not tools'}: ${p.unknown.join(', ')} — the server ignores them${c.rst}`);
+    if (p?.name === 'mixed') L.push(`${warn}${c.yel}the project's MCP entries launch different tool profiles — \`npx klypix-mcp install --tools <core|all>\` writes one value into all of them${c.rst}`);
+  }
 
   // APP BRIDGE (advisory; never the token or the pipe name)
   if (r.appBridge?.known) {

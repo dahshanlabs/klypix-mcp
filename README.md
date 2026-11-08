@@ -72,6 +72,7 @@ environment. A comma list such as `KLYPIX_TOOLS=brain_sync,brain_note` also work
 - **A one-line check for hooks and CI.** `npx klypix-mcp check src/auth.ts` exits 1 when a live
   session on this computer is working on that file, 0 when none is, 2 when it cannot tell. Use it
   in a pre-edit hook or a pre-commit step; you decide what to do with the answer.
+  [Hook and CI snippets](docs/check-command.md).
 - **A file you own.** The brain is a plain ZIP in your repo, versioned with git, mergeable card by
   card. MIT-licensed. Brain data stays in your files; your agent's model provider still receives
   what the agent reads.

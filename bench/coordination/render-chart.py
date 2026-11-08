@@ -146,7 +146,7 @@ def build(summary, out_gif=None, out_png=None, frames=36, hold=30, agent=None):
                             fontsize=8.5, alpha=0.0, zorder=5)
             else:
                 whisk.append((None, None, None))
-                t = ax.text(x, 0.02, "not\nrun", ha="center", va="bottom", color=MUTED, fontsize=7.5,
+                t = ax.text(x, 0.02, "n/a" if (cell or {}).get("notApplicable") else "not\nrun", ha="center", va="bottom", color=MUTED, fontsize=7.5,
                             alpha=0.0, zorder=5)
             texts.append((t, rate))
 

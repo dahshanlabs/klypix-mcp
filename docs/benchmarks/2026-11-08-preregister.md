@@ -11,6 +11,10 @@ notes read. The [diagnostic report](2026-11-09-interrupted-run.md) retains both
 attempts and $0.03482057 in API-equivalent cost; 28 cells did not start. These
 pass marks remain unchanged. No comparison winner or continuation pass is claimed.
 
+The [second-experiment amendment](2026-11-09-native-observation-amendment.md)
+replaces the observational transport identically for all arms, preserves the
+original attempts and spending, and fixes the source before further model calls.
+
 ## Conditions and setup requirements
 
 1. One ordinary `CLAUDE.md` document maintained by AI, with a standing rule to

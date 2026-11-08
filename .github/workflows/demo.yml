@@ -135,7 +135,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 -m pip install --quiet matplotlib==3.11.2 pillow==12.2.0
-          python3 bench/coordination/render-chart.py -o docs/demo/bench-chart.gif --png docs/demo/bench-chart.png
+          python3 bench/coordination/render-chart.py -o docs/demo/bench-chart.gif --png docs/demo/bench-chart.png --rows docs/demo/bench-scoreboard.png
           SIZE=$(stat -c%s docs/demo/bench-chart.gif)
           echo "bench-chart.gif: ${SIZE} bytes"
           [ "$SIZE" -gt 30000 ] || { echo "::error::bench-chart.gif is suspiciously small"; exit 1; }
@@ -148,6 +148,7 @@ jobs:
           path: |
             docs/demo/bench-chart.gif
             docs/demo/bench-chart.png
+            docs/demo/bench-scoreboard.png
           retention-days: 14
 
       - name: Upload the GIF

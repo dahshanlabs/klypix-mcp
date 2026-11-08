@@ -41,6 +41,11 @@ condition's ordinary workflow. The continuing consumer must actually receive the
 initial policy before a neutral timing checkpoint. The checkpoint supplies no
 policy; every condition gets the same subsequent harmless inspection boundary.
 
+If an observed normal memory retrieval fails to return the initial policy, retain
+that as a measured retrieval failure. Missing or unauditable delivery traces are
+instead unverified exposure. Neither can establish the causal update comparison;
+both remain visible with their costs and neither is silently removed.
+
 Record final correctness, preservation of unrelated behavior, delivered alerts,
 intermediate source revisions, elapsed time and all model costs. A notification,
 acknowledgment or self-reported adaptation is not a successful implementation.
@@ -54,8 +59,8 @@ unobserved writes within a tool invocation.
 **Feature continuation pass mark — all conditions must hold:**
 
 - At least **30% fewer stale code revisions** than the strongest notes control.
-  Choose the stronger notes control by the lower total stale-revision count;
-  break ties by lower total model cost. Use the three changed-decision repetitions
+  Choose the stronger notes control by higher final correctness, then lower total
+  stale-revision count, then lower total model cost. Use the three changed-decision repetitions
   per condition. If its count is zero, reduction is undefined and there is **no
   demonstrated advantage** on this endpoint.
 - No lower final-correctness rate than that control, and no new unrelated-code
@@ -87,7 +92,10 @@ continuity, **not actual multi-day retention or time-based decay**.
 **Personal-memory pass mark: at least 7 of 8 answers correct, with zero unsupported
 factual claims.** Current facts, historical facts and appropriate abstention are
 scored separately. A known answer must have supporting context actually supplied
-to the final session through the product or documented native instruction path.
+  to the final session through a normal retrieval tool. All conditions must verify
+  their cited sources in that final session, even if startup already supplied the
+  facts. Opening the notes file qualifies. This is retrieval-assisted recall,
+  and its additional cost is included for every condition.
 Accept equivalent wording under a rubric fixed before running. Publish answer
 values, source support, automatic grades and any separately identified review.
 
@@ -114,3 +122,15 @@ after credential and private-path review.
 A successful pilot still requires independent real-team validation. A tie with
 notes plus a small hook is a reason to withhold a differentiation claim, not to
 weaken the baseline.
+
+## Clarifications before execution
+
+No paid calls or outcomes exist. Before running, the strongest-control selection
+was clarified to prioritize final correctness before stale-revision count, so an
+incorrect or empty implementation is not favored for producing few revisions.
+Final source verification was also made explicit and identical across the personal
+memory conditions, avoiding unequal proof standards for native startup context.
+The numerical 30%, 10% and 7/8 pass marks are unchanged.
+The distinction between a measured retrieval omission and unverified exposure was
+also fixed before execution, so genuine retrieval failures cannot disappear from
+the reported denominator.

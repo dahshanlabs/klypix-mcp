@@ -1,0 +1,248 @@
+{
+  "schema": 1,
+  "seed": "decision-change-pilot-20261108",
+  "paidCalls": 0,
+  "reason": "Required claude-mem native semantic setup unavailable; entire paid matrix remains unexecuted",
+  "plan": [
+    {
+      "order": 1,
+      "block": "early-change",
+      "condition": "notes-notification",
+      "scenario": "unchanged-control",
+      "repetition": 1,
+      "status": "not-started"
+    },
+    {
+      "order": 2,
+      "block": "early-change",
+      "condition": "klypix-improved",
+      "scenario": "corrected-decision",
+      "repetition": 1,
+      "status": "not-started"
+    },
+    {
+      "order": 3,
+      "block": "personal-longitudinal",
+      "condition": "notes-native",
+      "scenario": null,
+      "repetition": 1,
+      "status": "not-started"
+    },
+    {
+      "order": 4,
+      "block": "early-change",
+      "condition": "claude-mem",
+      "scenario": "unrelated-control",
+      "repetition": 1,
+      "status": "not-started"
+    },
+    {
+      "order": 5,
+      "block": "early-change",
+      "condition": "klypix-improved",
+      "scenario": "unchanged-control",
+      "repetition": 1,
+      "status": "not-started"
+    },
+    {
+      "order": 6,
+      "block": "early-change",
+      "condition": "notes-native",
+      "scenario": "corrected-decision",
+      "repetition": 1,
+      "status": "not-started"
+    },
+    {
+      "order": 7,
+      "block": "personal-longitudinal",
+      "condition": "claude-mem",
+      "scenario": null,
+      "repetition": 1,
+      "status": "not-started"
+    },
+    {
+      "order": 8,
+      "block": "early-change",
+      "condition": "klypix-released",
+      "scenario": "unrelated-control",
+      "repetition": 1,
+      "status": "not-started"
+    },
+    {
+      "order": 9,
+      "block": "early-change",
+      "condition": "notes-native",
+      "scenario": "unchanged-control",
+      "repetition": 1,
+      "status": "not-started"
+    },
+    {
+      "order": 10,
+      "block": "early-change",
+      "condition": "claude-mem",
+      "scenario": "corrected-decision",
+      "repetition": 1,
+      "status": "not-started"
+    },
+    {
+      "order": 11,
+      "block": "personal-longitudinal",
+      "condition": "klypix-released",
+      "scenario": null,
+      "repetition": 1,
+      "status": "not-started"
+    },
+    {
+      "order": 12,
+      "block": "early-change",
+      "condition": "notes-notification",
+      "scenario": "unrelated-control",
+      "repetition": 1,
+      "status": "not-started"
+    },
+    {
+      "order": 13,
+      "block": "early-change",
+      "condition": "claude-mem",
+      "scenario": "unchanged-control",
+      "repetition": 1,
+      "status": "not-started"
+    },
+    {
+      "order": 14,
+      "block": "early-change",
+      "condition": "klypix-released",
+      "scenario": "corrected-decision",
+      "repetition": 1,
+      "status": "not-started"
+    },
+    {
+      "order": 15,
+      "block": "personal-longitudinal",
+      "condition": "notes-notification",
+      "scenario": null,
+      "repetition": 1,
+      "status": "not-started"
+    },
+    {
+      "order": 16,
+      "block": "early-change",
+      "condition": "klypix-improved",
+      "scenario": "unrelated-control",
+      "repetition": 1,
+      "status": "not-started"
+    },
+    {
+      "order": 17,
+      "block": "early-change",
+      "condition": "klypix-released",
+      "scenario": "unchanged-control",
+      "repetition": 1,
+      "status": "not-started"
+    },
+    {
+      "order": 18,
+      "block": "early-change",
+      "condition": "notes-notification",
+      "scenario": "corrected-decision",
+      "repetition": 1,
+      "status": "not-started"
+    },
+    {
+      "order": 19,
+      "block": "personal-longitudinal",
+      "condition": "klypix-improved",
+      "scenario": null,
+      "repetition": 1,
+      "status": "not-started"
+    },
+    {
+      "order": 20,
+      "block": "early-change",
+      "condition": "notes-native",
+      "scenario": "unrelated-control",
+      "repetition": 1,
+      "status": "not-started"
+    },
+    {
+      "order": 21,
+      "block": "early-change",
+      "condition": "klypix-improved",
+      "scenario": "corrected-decision",
+      "repetition": 2,
+      "status": "not-started"
+    },
+    {
+      "order": 22,
+      "block": "early-change",
+      "condition": "notes-native",
+      "scenario": "corrected-decision",
+      "repetition": 2,
+      "status": "not-started"
+    },
+    {
+      "order": 23,
+      "block": "early-change",
+      "condition": "claude-mem",
+      "scenario": "corrected-decision",
+      "repetition": 2,
+      "status": "not-started"
+    },
+    {
+      "order": 24,
+      "block": "early-change",
+      "condition": "klypix-released",
+      "scenario": "corrected-decision",
+      "repetition": 2,
+      "status": "not-started"
+    },
+    {
+      "order": 25,
+      "block": "early-change",
+      "condition": "notes-notification",
+      "scenario": "corrected-decision",
+      "repetition": 2,
+      "status": "not-started"
+    },
+    {
+      "order": 26,
+      "block": "early-change",
+      "condition": "notes-native",
+      "scenario": "corrected-decision",
+      "repetition": 3,
+      "status": "not-started"
+    },
+    {
+      "order": 27,
+      "block": "early-change",
+      "condition": "claude-mem",
+      "scenario": "corrected-decision",
+      "repetition": 3,
+      "status": "not-started"
+    },
+    {
+      "order": 28,
+      "block": "early-change",
+      "condition": "klypix-released",
+      "scenario": "corrected-decision",
+      "repetition": 3,
+      "status": "not-started"
+    },
+    {
+      "order": 29,
+      "block": "early-change",
+      "condition": "notes-notification",
+      "scenario": "corrected-decision",
+      "repetition": 3,
+      "status": "not-started"
+    },
+    {
+      "order": 30,
+      "block": "early-change",
+      "condition": "klypix-improved",
+      "scenario": "corrected-decision",
+      "repetition": 3,
+      "status": "not-started"
+    }
+  ]
+}

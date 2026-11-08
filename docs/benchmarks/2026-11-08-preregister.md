@@ -4,6 +4,10 @@ Recorded 8 November 2026, before any paid model call in this experiment.
 This is a small, developer-authored pilot. It cannot establish a general product
 ranking, a statistical result across teams, or a 100× advantage.
 
+**Setup update:** the [preflight report](2026-11-08-setup-result.md) records a
+native semantic-search setup failure. The entire paid comparison remains
+unexecuted at $0; these pass marks are unchanged and no winner is claimed.
+
 ## Conditions and setup requirements
 
 1. One ordinary `CLAUDE.md` document maintained by AI, with a standing rule to

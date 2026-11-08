@@ -1,0 +1,26 @@
+{
+  "recordedAt": "2026-11-08T21:15:56.580Z",
+  "readiness": "setup-unavailable",
+  "modelCalls": 0,
+  "knownSpendUsd": 0,
+  "credentialCopiesRemaining": 0,
+  "workerAndWrapperBootPassed": true,
+  "nativeSearchReceipt": "semantic-preflight-zYO8PZ/native-readiness-receipt.json",
+  "nativeSemanticReady": false,
+  "nativeWorkerStopped": true,
+  "directMcp": {
+    "ok": false,
+    "source": "Observed no-cost tool execution output",
+    "error": "MCP error -32001: Request timed out",
+    "requestTimeoutMs": 120000,
+    "installedPackages": 109,
+    "embeddingAddQueryAttempted": false
+  },
+  "dependencyPrewarm": {
+    "managedPython": "3.13.14",
+    "chromaMcp": "0.2.6",
+    "chromaDb": "1.5.9",
+    "standaloneHelpPassed": true
+  },
+  "temporaryFailedBuildRemoval": "Blocked by automatic approval review; artifact left untouched"
+}

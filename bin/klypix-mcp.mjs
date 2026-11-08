@@ -27,6 +27,8 @@ const USAGE = [
   'Verbs:',
   '  install [--force] [--codex-hooks]   set up everything: machine engine + Claude hooks, then THIS project —',
   '          [--no-project] [--json]     brain, config for the editors you actually have, merge driver, verified',
+  '          [--tools core|all|a,b,c]    which MCP tools the entries it writes register (KLYPIX_TOOLS): a NEW entry',
+  '                                      gets `core` (6 tools) by default; an existing entry keeps its setting (none = all)',
   '  link [dir] [--check]                project this project\'s 14 managed agent config files (--check audits, writes nothing, exits 1 on drift)',
   '  doctor [--npm] [--all] [--json]     read-only self-check; exits 1 on drift',
   '  sessions [--json]                   closed agent sessions of this project and the notes waiting for them',

@@ -70,6 +70,7 @@ import * as autoUpdateModule from '../src/mcp-auto-update.mjs';
 import * as brainFormat from '../src/klypix-format.mjs';
 import * as crowd from '../src/crowd-safeguards.mjs';
 import * as crowdReview from '../src/crowd-review.mjs';
+import { resolveToolProfile, toolAllowed, toolProfileLabel, toolProfileInstructions, TOOLS_ENV } from '../src/tool-profile.mjs';
 
 // Real package version for the MCP handshake (was hardcoded '1.0.0', which
 // misled every client/version diagnosis — it could never reflect the true release).
@@ -263,10 +264,21 @@ if (PLUGIN_MODE) log(`plugin mode · package worker only · auto-update off · n
 if (vaultArgIdx < 0 && !process.env.KLYPIX_VAULT) {
   log(`DEFAULT ROOT: no --vault/KLYPIX_VAULT — vault fell back to ${VAULT}. Pass the project root via brain_sync {project} (or configure --vault) so this connection serves a real project.`);
 }
+// Tool profile (src/tool-profile.mjs): KLYPIX_TOOLS in this process's env — set
+// by the MCP server entry the editor launches — picks `core`, `all`, or a list
+// of tool names. No KLYPIX_TOOLS means `all`, so every existing install, the
+// Claude plugin and hand-written entries keep every tool. The filter sits in the
+// registerTool wrapper below; the server's instructions say when a reduced
+// profile is running, so an agent knows why a tool its project block names is
+// not here.
+const TOOL_PROFILE = resolveToolProfile(process.env);
+for (const warning of TOOL_PROFILE.warnings) log(warning);
 const server = new McpServer(
   { name: 'klypix-canvas', version: PKG_VERSION },
   {
-    instructions: KLYPIX_MCP_INSTRUCTIONS,
+    instructions: TOOL_PROFILE.names
+      ? `${KLYPIX_MCP_INSTRUCTIONS} ${toolProfileInstructions(TOOL_PROFILE)}`
+      : KLYPIX_MCP_INSTRUCTIONS,
     capabilities: { logging: {} },
   },
 );
@@ -364,8 +376,22 @@ const projectChangedToolResult = () => ({
 // including MCP Apps, so operations, messages, and delivery share one session.
 // Contradictory identity fails closed: the handler does not run and no queued
 // message is offered or acknowledged.
+//
+// The tool profile is applied here too: a tool outside KLYPIX_TOOLS is not
+// registered at all (it is absent from tools/list and cannot be called), and
+// the caller gets an inert handle. ext-apps' registerAppTool (canvas_view) and
+// app-tools.mjs register through this same method, so one filter covers every
+// tool. Every registration is recorded so the report before connect can name a
+// requested tool this process does not have (plugin mode, another platform).
+const TOOLS_SEEN = new Set();
+const INERT_TOOL = Object.freeze({ enabled: false, enable() {}, disable() {}, update() {}, remove() {} });
 const registerToolRaw = server.registerTool.bind(server);
-server.registerTool = (name, config, handler) => registerToolRaw(name, config, async (args, extra) => {
+server.registerTool = (name, config, handler) => {
+  TOOLS_SEEN.add(name);
+  if (!toolAllowed(TOOL_PROFILE, name)) return INERT_TOOL;
+  return registerToolFiltered(name, config, handler);
+};
+const registerToolFiltered = (name, config, handler) => registerToolRaw(name, config, async (args, extra) => {
   // brain_sync's project and exact-file declarations are routing authority.
   // Validate them before generic request identity adoption so a rejected call
   // cannot rekey a session, touch a lane, register a project, self-heal a
@@ -2092,6 +2118,15 @@ if (typeof sdkListTools === 'function') {
   });
 } else {
   log('tools/list schema shaping unavailable in this SDK; published schemas follow zod as-is');
+}
+// Every registerTool call has run by now (app tools and canvas_view included):
+// say what this connection serves, and name any selected tool this process
+// cannot register here (prepare_video in plugin mode, show_in_klypix off
+// Windows) so a shortfall is explained on stderr rather than guessed at.
+{
+  const registered = [...TOOLS_SEEN].filter((name) => toolAllowed(TOOL_PROFILE, name));
+  const notHere = TOOL_PROFILE.names ? [...TOOL_PROFILE.names].filter((name) => !TOOLS_SEEN.has(name)) : [];
+  log(`tools · profile ${toolProfileLabel(TOOL_PROFILE)}${TOOL_PROFILE.source === 'env' ? ` (${TOOLS_ENV}=${TOOL_PROFILE.raw})` : ` (no ${TOOLS_ENV})`} · ${registered.length} registered${notHere.length ? ` · not available in this process: ${notHere.join(', ')}` : ''}`);
 }
 await server.connect(transport);
 // Most sessions use brain_sync/presence and should not pay for a private model

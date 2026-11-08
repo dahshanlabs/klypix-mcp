@@ -16,6 +16,17 @@
 //   npx klypix-mcp install --no-semantic  # never (also KLYPIX_SEMANTIC=0)
 //   A person running install in a terminal gets search by meaning by default;
 //   scripted, CI and agent-run installs (no terminal) only with --semantic.
+//   npx klypix-mcp install --tools core|all|a,b,c   # which MCP tools the server registers
+//   TOOL PROFILE DEFAULT RULE (src/tool-profile.mjs): every MCP server entry this
+//   command CREATES gets `env.KLYPIX_TOOLS = "core"` (6 tools: brain_sync,
+//   brain_note, brain_ask, brain_message, brain_handoff, brain_rules), in every
+//   editor config it generates (.mcp.json, .cursor/mcp.json, .vscode/mcp.json,
+//   .cline/mcp.json, .gemini/settings.json, .codex/config.toml). An entry that
+//   already exists keeps the KLYPIX_TOOLS it has — or has none and stays `all`,
+//   because a server started WITHOUT the variable registers everything: existing
+//   installs, hand-written and Claude Desktop entries, and the Claude plugin
+//   (KLYPIX_PLUGIN=1) are unchanged. `--tools X` writes X into every entry it
+//   touches, existing ones included.
 //
 // Never-throws-silently: it's an explicit CLI, so it reports what it did and exits
 // non-zero on a real failure. Never wires a broken settings.json (refuse + restore).
@@ -40,6 +51,7 @@ import { acquireInstallLockSync, releaseInstallLockSync } from '../src/install-l
 import { collectRepoState } from '../src/repo-state.mjs';
 import { runSetup, renderBrief } from '../src/setup.mjs';
 import { SEMANTIC_RUNTIME_MANIFEST, dirBytes, pruneSemanticRuntime, semanticInstallDecision } from '../src/semantic-install.mjs';
+import { CORE_TOOLS, KNOWN_TOOLS, NEW_INSTALL_PROFILE, parseToolSelection } from '../src/tool-profile.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PKG_ROOT = path.resolve(__dirname, '..');
@@ -69,6 +81,26 @@ const ALLOW_UNTAGGED = process.argv.includes('--allow-untagged')
 // set: the right card in the top 5 for 54 questions with it, 19 without.
 const SEMANTIC_FLAG = process.argv.includes('--semantic');
 const NO_SEMANTIC = process.argv.includes('--no-semantic') || process.env.KLYPIX_SEMANTIC === '0';
+// --tools core|all|a,b,c (also --tools=X): the KLYPIX_TOOLS policy for the MCP
+// entries this run writes. Given → every entry it touches gets that value;
+// absent → only a NEW entry gets `core` (the default rule in the header).
+const TOOLS_POLICY = (() => {
+    const eq = process.argv.find(a => a.startsWith('--tools='));
+    const at = process.argv.indexOf('--tools');
+    const value = eq ? eq.slice('--tools='.length) : at >= 0 ? process.argv[at + 1] : undefined;
+    if (eq === undefined && at < 0) return { value: NEW_INSTALL_PROFILE, onlyNew: true, explicit: false };
+    if (!value || value.startsWith('--')) {
+        console.error('✗ --tools needs a value: core, all, or a comma list of tool names (e.g. --tools brain_sync,brain_note)');
+        process.exit(2);
+    }
+    const parsed = parseToolSelection(value);
+    if (parsed.unknown.length) console.error(`⚠ --tools: not KLYPIX tools, the server will ignore them: ${parsed.unknown.join(', ')}  (tools: ${KNOWN_TOOLS.join(', ')})`);
+    if (parsed.profile === 'empty') {
+        console.error(`✗ --tools "${value}" names no KLYPIX tool. Profiles: core, all. Tools: ${KNOWN_TOOLS.join(', ')}`);
+        process.exit(2);
+    }
+    return { value: value.trim(), onlyNew: false, explicit: true, parsed };
+})();
 
 const HOME = os.homedir();
 const CLAUDE_DIR = path.join(HOME, '.claude');
@@ -122,6 +154,7 @@ function wireCodex() {
             // process and KLYPIX vault to this exact project on this machine.
             entry: mcpServerEntry({ vault: boundProject }),
             cwd: boundProject,
+            tools: TOOLS_POLICY,
         })
         : { ok: true, action: 'skipped-no-project-brain', path: projectConfig };
     // Pre-1.35 installed a global `--vault "."` entry. A global Codex process
@@ -312,7 +345,10 @@ function migrateProjectMcpConfig() {
         if (entry.command === 'node' && args[0] && !path.isAbsolute(String(args[0]))) return null;
         const vi = args.indexOf('--vault');
         const vault = vi >= 0 && args[vi + 1] ? args[vi + 1] : '.';
-        const next = mcpServerEntry({ vault });   // local now that the bundle is installed
+        // The entry's env (its tool profile among it) is the person's; an
+        // explicit --tools is the one thing that may change it here.
+        const env = { ...(entry.env && typeof entry.env === 'object' ? entry.env : {}), ...(TOOLS_POLICY.explicit ? { KLYPIX_TOOLS: TOOLS_POLICY.value } : {}) };
+        const next = mcpServerEntry({ vault, env });   // local now that the bundle is installed
         if (JSON.stringify(entry) === JSON.stringify(next)) return null;   // already correct
         servers['klypix-canvas'] = next;
         try { fs.writeFileSync(file + '.klypix-bak', raw, 'utf8'); } catch { /* best-effort backup */ }
@@ -354,7 +390,9 @@ const flatten = (code) => code
     // video-prep: the worker's prepare_video tool imports it lazily.
     // crowd-safeguards / crowd-review: the worker's brain_sync crowd block and
     // brain_review tool import them directly.
-    .replace(/\.\.\/src\/(bench|brain-doctor|agent-presence|agent-rules|capture-gap|enrichment|finding-routing|mcp-presence|mcp-supervisor|mcp-auto-update|presence-relay|repo-state|semantic-memory|runtime-inspector|project-graph|git-capture-install|app-lease|app-tools|app-bridge-protocol|app-bridge-client|session-handoff|brain-rules|video-prep|crowd-safeguards|crowd-review)\.mjs/g, './$1.mjs')
+    // tool-profile (1.112.0): the worker's tool profile (KLYPIX_TOOLS); agent-rules
+    // and brain-doctor import it as a sibling already.
+    .replace(/\.\.\/src\/(bench|brain-doctor|agent-presence|agent-rules|capture-gap|enrichment|finding-routing|mcp-presence|mcp-supervisor|mcp-auto-update|presence-relay|repo-state|semantic-memory|runtime-inspector|project-graph|git-capture-install|app-lease|app-tools|app-bridge-protocol|app-bridge-client|session-handoff|brain-rules|video-prep|crowd-safeguards|crowd-review|tool-profile)\.mjs/g, './$1.mjs')
     .replace(/klypix-worker\.mjs/g, 'klypix-mcp-worker.mjs')
     .replace(/const PKG_VERSION = \(\(\) => \{[\s\S]*?\}\)\(\);/, `const PKG_VERSION = '${VERSION}'; // baked at install (flat layout has no package.json)`);
 
@@ -500,7 +538,7 @@ try {
     // a newer klypix-format cannot. merge-brains and the driver ship here so
     // brain-history's restore merge, the KLYPIX core and the git driver all
     // find one engine in this directory.
-    for (const f of ['global-brain-hook.mjs', 'klypix-format.mjs', 'brain-graveyard.mjs', 'merge-brains.mjs', 'klypix-merge-driver.mjs', 'capture-gap.mjs', 'brain-semantic.mjs', 'semantic-memory.mjs', 'enrichment.mjs', 'provenance.mjs', 'brain-note.mjs', 'brain-evidence.mjs', 'crowd-safeguards.mjs', 'crowd-review.mjs', 'brain-git-hook.mjs', 'git-capture-install.mjs', 'brain-history.mjs', 'app-lease.mjs', 'klypix-core.mjs', 'app-bridge-protocol.mjs', 'app-bridge-client.mjs', 'app-tools.mjs', 'card-files.mjs', 'brain-write-lock.mjs', 'brain-rules.mjs', 'agent-rules.mjs', 'brain-doctor.mjs', 'editor-detect.mjs', 'agent-presence.mjs', 'mcp-presence.mjs', 'repo-state.mjs', 'result-reconcile.mjs', 'finding-routing.mjs', 'presence-relay.mjs', 'network-bridge.mjs', 'mcp-supervisor.mjs', 'mcp-auto-update.mjs', 'runtime-inspector.mjs', 'project-graph.mjs', 'bench.mjs', 'codex-brain-hook.mjs', 'codex-hooks.mjs', 'session-handoff.mjs', 'live-projection.mjs', 'whose.mjs', 'whose-classify.mjs', 'whose-ledger.mjs', 'whose-rescue.mjs', 'video-prep.mjs', 'canvas-view-app.html']) {
+    for (const f of ['global-brain-hook.mjs', 'klypix-format.mjs', 'tool-profile.mjs', 'brain-graveyard.mjs', 'merge-brains.mjs', 'klypix-merge-driver.mjs', 'capture-gap.mjs', 'brain-semantic.mjs', 'semantic-memory.mjs', 'enrichment.mjs', 'provenance.mjs', 'brain-note.mjs', 'brain-evidence.mjs', 'crowd-safeguards.mjs', 'crowd-review.mjs', 'brain-git-hook.mjs', 'git-capture-install.mjs', 'brain-history.mjs', 'app-lease.mjs', 'klypix-core.mjs', 'app-bridge-protocol.mjs', 'app-bridge-client.mjs', 'app-tools.mjs', 'card-files.mjs', 'brain-write-lock.mjs', 'brain-rules.mjs', 'agent-rules.mjs', 'brain-doctor.mjs', 'editor-detect.mjs', 'agent-presence.mjs', 'mcp-presence.mjs', 'repo-state.mjs', 'result-reconcile.mjs', 'finding-routing.mjs', 'presence-relay.mjs', 'network-bridge.mjs', 'mcp-supervisor.mjs', 'mcp-auto-update.mjs', 'runtime-inspector.mjs', 'project-graph.mjs', 'bench.mjs', 'codex-brain-hook.mjs', 'codex-hooks.mjs', 'session-handoff.mjs', 'live-projection.mjs', 'whose.mjs', 'whose-classify.mjs', 'whose-ledger.mjs', 'whose-rescue.mjs', 'video-prep.mjs', 'canvas-view-app.html']) {
         const s = path.join(SRC, f); if (exists(s)) staged.push({ dst: f, content: fs.readFileSync(s, 'utf8') });
     }
     for (const [src, dst] of [
@@ -713,8 +751,13 @@ try {
     //    was silent. A runtime-only refresh deliberately skips it: that path
     //    exists to preserve every host/project config byte.
     if (!RUNTIME_ONLY && !NO_PROJECT) {
+        if (TOOLS_POLICY.explicit) {
+            console.log(`✓ tools: KLYPIX_TOOLS=${TOOLS_POLICY.value} is written into every MCP entry this run touches${TOOLS_POLICY.parsed?.names ? ` (${TOOLS_POLICY.parsed.names.size} tool${TOOLS_POLICY.parsed.names.size === 1 ? '' : 's'})` : ' (every tool)'}; reconnect the editor to pick it up.`);
+        } else {
+            console.log(`• tools: a NEW MCP entry gets the core profile (KLYPIX_TOOLS=core — ${CORE_TOOLS.join(', ')}); an existing entry keeps its setting (none = all tools). Every tool: npx klypix-mcp install --tools all`);
+        }
         try {
-            const report = await runSetup({ verifyAll: VERIFY_ALL });
+            const report = await runSetup({ verifyAll: VERIFY_ALL, tools: TOOLS_POLICY });
             if (SETUP_JSON) console.log(JSON.stringify(report, null, 2));
             else console.log(renderBrief(report));
         } catch (e) {

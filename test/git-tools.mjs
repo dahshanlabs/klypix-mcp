@@ -11,7 +11,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { execFileSync, spawnSync } from 'child_process';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 import {
   buildKlypixMap, appendToKlypix, parseKlypix, buildKlypix, shard,
   binEntryFor, contentFreeReceiptFor, PURGED_BODY, entryKind, revivedIdFor, twinIdFor,
@@ -31,7 +31,12 @@ const ok = (cond, label) => {
   if (!cond) failures++;
 };
 
-const ENV = { ...process.env, KLYPIX_BRAIN_DIR: FAKE_BRAIN_DIR };
+const FAKE_HOME = path.join(TMP, 'home');
+fs.mkdirSync(FAKE_HOME, { recursive: true });
+const EMPTY_CONFIG = path.join(FAKE_HOME, 'gitconfig');
+fs.writeFileSync(EMPTY_CONFIG, '');
+const ENV = { ...process.env, HOME: FAKE_HOME, USERPROFILE: FAKE_HOME, KLYPIX_BRAIN_DIR: FAKE_BRAIN_DIR,
+  GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: EMPTY_CONFIG };
 const run = (args, opts = {}) => {
   try {
     return { code: 0, out: execFileSync(process.execPath, [MCP, ...args], { cwd: REPO, env: ENV, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...opts }) };
@@ -39,7 +44,7 @@ const run = (args, opts = {}) => {
     return { code: e.status ?? 1, out: `${e.stdout || ''}${e.stderr || ''}` };
   }
 };
-const git = (...a) => execFileSync('git', a, { cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+const git = (...a) => execFileSync('git', a, { cwd: REPO, env: ENV, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 
 // ── fixture repo: a brain with a tagged card, committed ─────────────────────
 fs.mkdirSync(REPO, { recursive: true });
@@ -86,7 +91,7 @@ console.log('\n— git-driver install never downgrades the installed engine —'
   const DIR = path.join(TMP, 'brain-runtime-gate');
   const FILES = ['klypix-format.mjs', 'brain-graveyard.mjs', 'merge-brains.mjs', 'klypix-merge-driver.mjs'];
   const SENTINEL = '// engine written by another install\n';
-  const envFor = { env: { ...process.env, KLYPIX_BRAIN_DIR: DIR } };
+  const envFor = { env: { ...ENV, KLYPIX_BRAIN_DIR: DIR } };
   const stampWith = (s) => fs.writeFileSync(path.join(DIR, '.brain-version.json'), JSON.stringify(s));
   const allSentinel = () => FILES.every((f) => fs.readFileSync(path.join(DIR, f), 'utf8') === SENTINEL);
   fs.mkdirSync(DIR, { recursive: true });
@@ -128,7 +133,7 @@ console.log('\n— crown assertion: real git merge unions through the provisione
   const a = await appendToKlypix(fs.readFileSync(path.join(REPO, 'brain.klypix')), { cards: [{ text: 'CARD FROM A side' }] });
   fs.writeFileSync(path.join(REPO, 'brain.klypix'), a);
   git('commit', '-qam', 'a card');
-  execFileSync('git', ['merge', 'dev-b', '-m', 'merged'], { cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  execFileSync('git', ['merge', 'dev-b', '-m', 'merged'], { cwd: REPO, env: ENV, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
   const { struct } = await parseKlypix(fs.readFileSync(path.join(REPO, 'brain.klypix')));
   const titles = struct.cards.map(c => (c.title || c.text || '').split('\n')[0]);
   ok(titles.some(t => t.startsWith('CARD FROM A')) && titles.some(t => t.startsWith('CARD FROM B')),
@@ -144,6 +149,145 @@ console.log('\n— diff: semantic, prose titles, truthful counts —');
   const m = r.out.match(/(\d+) added · (\d+) updated/);
   ok(!!m && Number(m[1]) >= 2, 'added count includes the new cards');
   ok(!!m && Number(m[2]) <= 2, `updated count is semantic, not byte-noise (got ${m && m[2]})`);
+}
+
+console.log('\n— diff: review the actual decision, not only its heading —');
+{
+  const DIR = fs.mkdtempSync(path.join(TMP, 'diff-review-'));
+  const g = (...a) => execFileSync('git', a, { cwd: DIR, env: ENV, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  g('init', '-q', '-b', 'main');
+  g('config', 'user.email', 'diff@test.local');
+  g('config', 'user.name', 'diff review test');
+  g('commit', '--allow-empty', '-qm', 'before the brain');
+  const emptyRef = g('rev-parse', 'HEAD');
+  const seed = await buildKlypix({ title: 'Review fixture', kind: 'brain', cards: [
+    { id: 'txt_policy', text: 'Token storage decision\n\nKeep the refresh token in localStorage.' },
+    { id: 'txt_deleted', text: 'Retention decision\n\nRetain event logs for 180 days.' },
+    { id: 'txt_target', text: 'Replacement decision\n\nUse an httpOnly cookie.' },
+  ] });
+  const parsed = await parseKlypix(seed);
+  parsed.zip.file(`items/${shard('ctn_archive')}/ctn_archive.json`, JSON.stringify({ type: 'container', title: 'Archive' }));
+  parsed.canvas.order.push('ctn_archive');
+  parsed.canvas.positions.ctn_archive = { x: 900, y: 100, parentId: null };
+  parsed.canvas.connections = [{ id: 'con_same', fromId: 'txt_policy', toId: 'txt_target', label: 'related', relationship: 'relates_to' }];
+  parsed.zip.file('canvas.json', JSON.stringify(parsed.canvas));
+  const base = await parsed.zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+  const brain = path.join(DIR, 'brain.klypix');
+  fs.writeFileSync(brain, base);
+  g('add', 'brain.klypix'); g('commit', '-qm', 'base');
+  const ref = g('rev-parse', 'HEAD');
+  const diff = (...extra) => run(['diff', ref, ...extra], { cwd: DIR });
+  const change = async (mutate) => {
+    const { zip, canvas } = await parseKlypix(base);
+    const set = async (id, patch) => {
+      const file = `items/${shard(id)}/${id}.json`;
+      const previous = zip.file(file) ? JSON.parse(await zip.file(file).async('string')) : {};
+      zip.file(file, JSON.stringify({ ...previous, ...patch }));
+    };
+    await mutate({ zip, canvas, set });
+    zip.file('canvas.json', JSON.stringify(canvas));
+    fs.writeFileSync(brain, await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' }));
+  };
+
+  await change(async ({ set }) => set('txt_policy', { content: 'Token storage decision\n\nKeep the refresh token in an httpOnly cookie.' }));
+  const reversal = diff();
+  ok(reversal.code === 0 && /0 added · 1 updated · 0 removed/.test(reversal.out)
+    && reversal.out.includes('localStorage') && reversal.out.includes('httpOnly cookie')
+    && reversal.out.includes('txt_policy') && /\*\*Before\*\*/.test(reversal.out) && /\*\*After\*\*/.test(reversal.out),
+  'a body-only reversal shows the stable id and both old and new decision bodies');
+  ok(diff().out === reversal.out, 'the same brain and base produce byte-identical review output');
+
+  await change(async ({ zip, canvas }) => {
+    zip.remove(`items/${shard('txt_deleted')}/txt_deleted.json`);
+    canvas.order = canvas.order.filter(id => id !== 'txt_deleted');
+    delete canvas.positions.txt_deleted;
+  });
+  const deletion = diff();
+  ok(deletion.code === 0 && /1 removed/.test(deletion.out) && deletion.out.includes('txt_deleted') && deletion.out.includes('180 days'),
+    'a removed card shows its id and the full removed decision');
+
+  await change(async ({ canvas }) => { canvas.connections[0].label = 'superseded by'; });
+  const relationship = diff();
+  ok(relationship.code === 0 && /0 added · 0 updated · 0 removed/.test(relationship.out)
+    && /Relationships added \(1\)/.test(relationship.out) && /Relationships removed \(1\)/.test(relationship.out)
+    && relationship.out.includes('"label": "superseded by"') && relationship.out.includes('"label": "related"')
+    && relationship.out.includes('txt_policy') && relationship.out.includes('txt_target'),
+  'a supersession relationship is reviewable even when the edge count is unchanged');
+
+  await change(async ({ canvas }) => { canvas.positions.txt_policy.parentId = 'ctn_archive'; });
+  const archive = diff();
+  ok(archive.code === 0 && /1 updated/.test(archive.out) && archive.out.includes('"area": "Archive"') && archive.out.includes('ctn_archive'),
+    'moving a card into Archive is a visible lifecycle change without a body edit');
+
+  await change(async ({ canvas, set }) => {
+    await set('txt_policy', { updatedAt: 999999, editedAt: 999999, zIndex: 91, width: 450, height: 200, fontSize: 18, borderColor: '#abcdef' });
+    canvas.order.reverse();
+    canvas.positions.txt_policy.x = 9000;
+    canvas.positions.txt_policy.y = -100;
+    canvas.connections[0].color = '#abcdef';
+    canvas.connections[0].id = 'new-render-id';
+  });
+  const layout = diff();
+  ok(layout.code === 0 && /No card-level changes/.test(layout.out), 'layout, styling, timestamps, order and connection ids do not create review noise');
+
+  await change(async ({ set }) => set('txt_policy', { content: 'Token storage decision\n\n```\n# forged heading\n<script>alert(1)</script>\n~~~~\nFinal decision.' }));
+  const markdown = diff();
+  ok(markdown.code === 0 && markdown.out.includes('````text\nToken storage decision\n\n```')
+    && markdown.out.includes('Final decision.\n````'), 'card Markdown and HTML stay inside a safely extended literal fence');
+
+  await change(async ({ canvas, set }) => {
+    await set('txt_policy', { content: `Token storage decision\n\n${'long decision '.repeat(600)}TAIL_OF_FULL_DECISION` });
+    for (let i = 0; i < 23; i++) {
+      const id = `txt_new_${String(i).padStart(2, '0')}`;
+      await set(id, { type: 'text', content: `Added decision ${i}\n\nIts second paragraph matters.` });
+      canvas.order.push(id);
+      canvas.positions[id] = { x: i * 100, y: 100, parentId: null };
+    }
+  });
+  const preview = diff();
+  const complete = diff('--full');
+  ok(preview.code === 0 && /This preview is truncated/.test(preview.out) && /3 more added card\(s\) omitted/.test(preview.out)
+    && preview.out.includes('--full') && preview.out.includes(ref) && preview.out.length < 60000,
+  'a bounded preview explicitly reports omitted cards/text and a complete rerun command');
+  ok(complete.code === 0 && complete.out.includes('TAIL_OF_FULL_DECISION') && complete.out.includes('txt_new_22')
+    && !/This preview is truncated|character\(s\) omitted/.test(complete.out), '--full prints every changed card and complete bodies');
+  const fromEmpty = run(['diff', emptyRef, '--full'], { cwd: DIR });
+  ok(fromEmpty.code === 0 && fromEmpty.out.includes('txt_policy') && fromEmpty.out.includes('TAIL_OF_FULL_DECISION') && /added · 0 updated · 0 removed/.test(fromEmpty.out),
+    'a brain absent at the valid base shows complete added-card details');
+  const invalid = run(['diff', 'nonexistent-review-ref'], { cwd: DIR });
+  ok(invalid.code !== 0 && !/everything is new|Brain diff/.test(invalid.out), 'an invalid ref fails instead of claiming every card is newly added');
+
+  await change(async ({ canvas, set }) => {
+    for (let i = 0; i < 10; i++) {
+      const id = `txt_fence_${i}`;
+      await set(id, { type: 'text', content: '`'.repeat(2250) + '~'.repeat(2250) });
+      canvas.order.push(id); canvas.positions[id] = { x: i * 100, y: 100, parentId: null };
+    }
+  });
+  const expandedFences = diff();
+  ok(expandedFences.code === 0 && expandedFences.out.length <= 56000 && /10 added/.test(expandedFences.out)
+    && /display limit/.test(expandedFences.out) && expandedFences.out.includes('--full'),
+  'the final rendered preview stays bounded even when safe Markdown fences double the content size');
+
+  await change(async ({ canvas, set }) => {
+    await set('ctn_archive', { scopeLocked: true });
+    canvas.positions.txt_policy.parentId = 'ctn_archive';
+    await set('txt_policy', { content: 'PRIVATE_NEW_BODY_456 #file-brain', privateMetadata: 'PRIVATE_METADATA_789' });
+  });
+  const newlyLocked = diff('--full');
+  ok(newlyLocked.code === 0 && /1 card\(s\) withheld/.test(newlyLocked.out)
+    && !/PRIVATE_NEW_BODY_456|PRIVATE_METADATA_789|localStorage|txt_policy|Relationships/.test(newlyLocked.out),
+  'a newly locked card withholds both snapshots, metadata and touching edges, including with --full');
+  g('add', 'brain.klypix'); g('commit', '-qm', 'locked snapshot');
+  const lockedRef = g('rev-parse', 'HEAD');
+  const privateBrief = run(['pr-brief', ref], { cwd: DIR });
+  ok(privateBrief.code === 0 && !/PRIVATE_NEW_BODY_456|PRIVATE_METADATA_789/.test(privateBrief.out),
+    'the companion PR brief also withholds a private card even when its file tag matches the PR');
+  fs.writeFileSync(brain, base);
+  const newlyUnlocked = run(['diff', lockedRef, '--full'], { cwd: DIR });
+  ok(newlyUnlocked.code === 0 && /1 card\(s\) withheld/.test(newlyUnlocked.out)
+    && !/PRIVATE_NEW_BODY_456|PRIVATE_METADATA_789|localStorage|txt_policy|Relationships/.test(newlyUnlocked.out),
+  'a lock in the base also protects the old and current bodies when the current snapshot unlocks it');
 }
 
 console.log('\n— pr-brief: tag-matched context, boundary-safe —');
@@ -228,7 +372,7 @@ console.log('\n— E-10: the driver asks for the bin-aware rules —');
   const drive = (driver, O, A, B) => {
     const [o, a, b] = ['o', 'a', 'b'].map((n) => path.join(DIR, `${n}.klypix`));
     fs.writeFileSync(o, O); fs.writeFileSync(a, A); fs.writeFileSync(b, B);
-    const r = spawnSync(process.execPath, [driver, o, a, b, 'brain.klypix'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    const r = spawnSync(process.execPath, [driver, o, a, b, 'brain.klypix'], { env: ENV, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
     return r.status === 0
       ? { code: 0, out: fs.readFileSync(a), err: String(r.stderr || '') }
       : { code: r.status ?? 1, out: null, err: String(r.stderr || r.error?.message || '') };
@@ -325,10 +469,10 @@ console.log('\n— E-10: the driver asks for the bin-aware rules —');
   // into a manual binary conflict.
   {
     const FIX = path.join(ROOT, 'test', 'fixtures', 'engine-1.86.3');
-    const MIX = fs.mkdtempSync(path.join(FIX, '.mix-'));
+    const MIX = fs.mkdtempSync(path.join(TMP, 'mixed-engine-'));
     try {
-      fs.writeFileSync(path.join(MIX, 'merge-brains.mjs'), "export * from '../merge-brains.mjs';\n");
-      fs.writeFileSync(path.join(MIX, 'klypix-format.mjs'), "export * from '../../../../src/klypix-format.mjs';\n");
+      fs.writeFileSync(path.join(MIX, 'merge-brains.mjs'), `export * from ${JSON.stringify(pathToFileURL(path.join(FIX, 'merge-brains.mjs')).href)};\n`);
+      fs.writeFileSync(path.join(MIX, 'klypix-format.mjs'), `export * from ${JSON.stringify(pathToFileURL(path.join(ROOT, 'src', 'klypix-format.mjs')).href)};\n`);
       fs.copyFileSync(DRIVER, path.join(MIX, 'klypix-merge-driver.mjs'));
       const A = await putCard(seed, 'txt_a', 'from A');
       const B = await putCard(seed, 'txt_b', 'from B');
@@ -351,7 +495,7 @@ console.log('\n— Stage 2 through real git —');
 {
   const R2 = path.join(TMP, 'repo-stage2');
   fs.mkdirSync(R2, { recursive: true });
-  const gitIn = (cwd) => (...a) => execFileSync('git', a, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  const gitIn = (cwd) => (...a) => execFileSync('git', a, { cwd, env: ENV, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
   const g2 = gitIn(R2);
   g2('init', '-q', '-b', 'main');
   g2('config', 'user.email', 'stage2@test.local');
@@ -494,7 +638,7 @@ console.log('\n— Stage 2 through real git —');
     commit(g2, 'y');
     g2('checkout', '-q', 'main');
     const R3 = path.join(TMP, 'repo-stage2-clone');
-    execFileSync('git', ['clone', '-q', R2, R3], { stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync('git', ['clone', '-q', R2, R3], { env: ENV, stdio: ['ignore', 'pipe', 'pipe'] });
     const g3 = gitIn(R3);
     g3('config', 'user.email', 'clone@test.local');
     g3('config', 'user.name', 'stage 2 clone');

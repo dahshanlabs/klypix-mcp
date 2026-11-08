@@ -2212,7 +2212,7 @@ export async function opBrainNote({ vault, canvas, text: noteText, area, marker 
     // below the plain 0.6 bar; say WHAT was archived and how to undo, so the
     // widened match is always confirmable rather than silent.
     const corr = (Array.isArray(s.corrections) && s.corrections.length)
-      ? `\n↩︎ correction supersede: ${s.corrections.map(c => `"${c.old}"${c.area ? ` [${c.area}]` : ''} (overlap ${c.overlap})`).join('; ')} — archived + arrowed to your note. If it grabbed the wrong card, restore it from Archive or re-run with marker "~".`
+      ? `\n↩︎ correction supersede: ${s.corrections.map(c => `"${c.old}"${c.area ? ` [${c.area}]` : ''} (overlap ${c.overlap})`).join('; ')} — archived + arrowed to your note. If it grabbed the wrong card, restore it from Archive; marker "~" does not restore archived cards.`
       : '';
     // Name the resolved brain explicitly (basename + how) so a write never lands
     // in a surprise file silently — the write-side twin of the read-op stamp.

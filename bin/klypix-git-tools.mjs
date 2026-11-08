@@ -4,7 +4,7 @@
 //
 //   git-driver [install|status] [repo]   register the card-level .klypix merge
 //                                        driver for a repo, zero-command
-//   diff [ref] [--brain <path>]          readable brain diff vs a git ref
+//   diff [ref] [--brain <path>] [--full] readable brain diff vs a git ref
 //   pr-brief [baseRef] [--brain <path>]  brain cards touching the files
 //                                        changed since baseRef (PR comment)
 //
@@ -233,89 +233,173 @@ async function gitDriver() {
 
 // ── diff ────────────────────────────────────────────────────────────────────
 
-function renderCardList(title, entries, cap = 20) {
-  if (!entries.length) return [];
-  const lines = [`**${title} (${entries.length})**`];
-  for (const e of entries.slice(0, cap)) lines.push(`- ${e}`);
-  // Truncation notice is NEVER subject to the cap it reports.
-  if (entries.length > cap) lines.push(`- …and ${entries.length - cap} more`);
-  lines.push('');
-  return lines;
-}
+const stableJson = (value) => JSON.stringify(value, (_key, v) =>
+  v && typeof v === 'object' && !Array.isArray(v)
+    ? Object.fromEntries(Object.keys(v).sort().map(k => [k, v[k]])) : v, 2);
+
+// Review decisions, not canvas styling. Keep other fields (including evidence,
+// authorship, locks and lifecycle metadata) visible rather than silently losing
+// a meaningful edit to an unfamiliar card type.
+const DIFF_DISPLAY_FIELDS = new Set([
+  'id', 'updatedAt', 'editedAt', 'zIndex', 'zKey', 'x', 'y', 'w', 'h',
+  'width', 'height', 'rotation', 'fontSize', 'fontFamily', 'fontStyle', 'fontWeight',
+  'textAlign', 'verticalAlign', 'textDecoration', 'heading', 'border',
+  'color', 'textColor', 'backgroundColor', 'borderColor', 'borderWidth',
+  'opacity', 'collapsed', 'authoredWidth', 'authoredInParent',
+]);
+const compareText = (a, b) => a < b ? -1 : a > b ? 1 : 0;
+const longestRun = (text, pattern, floor) => {
+  let length = floor;
+  for (const match of text.matchAll(pattern)) length = Math.max(length, match[0].length);
+  return length;
+};
+
+// A card can itself contain fences, HTML and Markdown headings. A fence longer
+// than anything in its body keeps every byte inert on the PR page.
+const literalBlock = (value) => {
+  const text = String(value);
+  const ticks = longestRun(text, /`+/g, 2), tildes = longestRun(text, /~+/g, 2);
+  const fence = ticks <= tildes ? '`'.repeat(ticks + 1) : '~'.repeat(tildes + 1);
+  return `${fence}text\n${text}\n${fence}`;
+};
+const inlineLiteral = (value) => {
+  const text = String(value).replace(/[\r\n]/g, ' ');
+  const fence = '`'.repeat(longestRun(text, /`+/g, 0) + 1);
+  return `${fence} ${text} ${fence}`;
+};
+const shellQuote = (value) => process.platform === 'win32'
+  ? `'${String(value).replace(/'/g, "''")}'`
+  : `'${String(value).replace(/'/g, "'\"'\"'")}'`;
 
 async function brainDiff() {
   const ref = positional[0] || 'HEAD';
+  const full = args.includes('--full');
   const brain = findBrain(flag('--brain'));
   if (!brain) { console.error('No brain.klypix found (searched upward from cwd; use --brain <path>).'); process.exit(1); }
   const toplevel = await repoToplevel(path.dirname(brain));
   if (!toplevel) { console.error(`Brain is not inside a git repository: ${brain}`); process.exit(1); }
   const rel = path.relative(toplevel, brain).replace(/\\/g, '/');
 
-  const { format, merge } = await loadEngine();
+  const { format } = await loadEngine();
   const current = fs.readFileSync(brain);
 
+  // An invalid revision is an error, not evidence that every card is new.
+  const commit = await gitText(toplevel, 'rev-parse', '--verify', `${ref}^{commit}`);
   let baseBuf = null;
-  try { baseBuf = Buffer.from(await git(toplevel, ['show', `${ref}:${rel}`], { encoding: 'buffer' })); }
+  try { baseBuf = Buffer.from(await git(toplevel, ['show', `${commit}:${rel}`], { encoding: 'buffer' })); }
   catch { baseBuf = null; }
 
-  const out = [`### 🧠 Brain diff — \`${rel}\` vs \`${ref}\``, ''];
-  if (!baseBuf || baseBuf.length === 0) {
-    const { struct } = await format.parseKlypix(current);
-    out.push(`The brain does not exist at \`${ref}\` — everything is new here (${struct.cards.length} cards).`);
-    console.log(out.join('\n'));
-    return;
+  const out = [`### 🧠 Brain diff — ${inlineLiteral(rel)} vs ${inlineLiteral(ref)}`, ''];
+  const completeCommand = () => literalBlock(`npx klypix-mcp diff ${shellQuote(commit)} --brain ${shellQuote(rel)} --full`);
+  const [baseParsed, curParsed] = await Promise.all([
+    baseBuf?.length ? format.parseKlypix(baseBuf) : null, format.parseKlypix(current),
+  ]);
+  // A lock in EITHER version applies to the whole comparison. Otherwise adding
+  // a lock would leak the former body as a removal (and unlocking would leak it
+  // as an addition). --full changes truncation only, never this boundary.
+  const hidden = new Set();
+  for (const parsed of [baseParsed, curParsed]) {
+    if (parsed) for (const id of format.scopeLockState(parsed.items).hiddenIds) hidden.add(id);
   }
-
-  // SEMANTIC diff, never byte diff: .klypix re-serialization is deliberately
-  // non-reproducible (zip metadata, zIndex renumbering), so comparing raw item
-  // bytes reports the whole brain as "updated" (live-reproduced: 1308 false
-  // updates over 8 commits). Parse both sides and compare key-sorted JSON with
-  // display-derived fields stripped — the same discipline as the sync core.
-  const stable = (v) => JSON.stringify(v, (_k, val) =>
-    (val && typeof val === 'object' && !Array.isArray(val))
-      ? Object.fromEntries(Object.keys(val).sort().map(x => [x, val[x]]))
-      : val);
-  const cardMap = async (buf) => {
-    const { zip, canvas } = await format.parseKlypix(buf);
-    const ids = [...new Set([...(Array.isArray(canvas.order) ? canvas.order : []), ...Object.keys(canvas.positions || {})])];
+  if (hidden.size) out.push(`_${hidden.size} card(s) withheld: inside an AI-hidden box in at least one compared version. Their bodies, metadata and connected relationships are omitted._`, '');
+  const cardMap = async (parsed) => {
+    if (!parsed) return { map: new Map(), connections: new Map() };
+    const { zip, canvas, struct } = parsed;
+    const areas = new Map(struct.cards.filter(c => c.type === 'container').map(c => [c.id, c.title || '']));
+    const ids = [...new Set([...(Array.isArray(canvas.order) ? canvas.order : []), ...Object.keys(canvas.positions || {})])].sort(compareText);
     const m = new Map();
     for (const id of ids) {
+      if (hidden.has(id)) continue;
       const f = zip.file(`items/${format.shard(id)}/${id}.json`);
-      if (!f) continue;
-      try {
-        const item = JSON.parse(await f.async('string'));
-        m.set(id, {
-          sig: stable({ ...item, zIndex: undefined }),
-          title: firstLine(item.content || item.title || '') || `\`${id}\``,
-        });
-      } catch { /* unreadable item — skip rather than mis-report */ }
+      if (!f) throw new Error(`cannot review missing card ${id}`);
+      const item = JSON.parse(await f.async('string'));
+      const meaningful = Object.fromEntries(Object.entries(item).filter(([key]) => !DIFF_DISPLAY_FIELDS.has(key)));
+      // Moving into Archive changes lifecycle even when the words do not.
+      meaningful.parentId = canvas.positions?.[id]?.parentId || null;
+      if (meaningful.parentId) meaningful.area = areas.get(meaningful.parentId) || '';
+      const { content, ...metadata } = meaningful;
+      m.set(id, { id, sig: stableJson(meaningful), body: content == null ? '' : typeof content === 'string' ? content : stableJson(content), metadata });
     }
-    return { map: m, connections: Array.isArray(canvas.connections) ? canvas.connections.length : 0 };
+    const connections = new Map();
+    for (const cn of (canvas.connections || [])) {
+      if (hidden.has(cn.fromId) || hidden.has(cn.toId)) continue;
+      const semantic = { fromId: cn.fromId, toId: cn.toId, label: cn.label || '', relationship: cn.relationship || '' };
+      const key = stableJson(semantic);
+      connections.set(key, semantic);
+    }
+    return { map: m, connections };
   };
-  void merge; // brainDelta stays the live-apply engine; diff is semantic by design
 
-  const [baseSide, curSide] = await Promise.all([cardMap(baseBuf), cardMap(current)]);
+  const [baseSide, curSide] = await Promise.all([cardMap(baseParsed), cardMap(curParsed)]);
   const added = [], updated = [], removed = [];
   for (const [id, cur] of curSide.map) {
     const prev = baseSide.map.get(id);
-    if (!prev) added.push(cur.title);
-    else if (prev.sig !== cur.sig) updated.push(cur.title);
+    if (!prev) added.push({ id, after: cur });
+    else if (prev.sig !== cur.sig) updated.push({ id, before: prev, after: cur });
   }
   for (const [id, prev] of baseSide.map) {
-    if (!curSide.map.has(id)) removed.push(prev.title);
+    if (!curSide.map.has(id)) removed.push({ id, before: prev });
   }
-  const connDelta = curSide.connections - baseSide.connections;
+  const addedLinks = [...curSide.connections.keys()].filter(k => !baseSide.connections.has(k)).sort(compareText);
+  const removedLinks = [...baseSide.connections.keys()].filter(k => !curSide.connections.has(k)).sort(compareText);
 
-  if (!added.length && !updated.length && !removed.length && !connDelta) {
+  if (!added.length && !updated.length && !removed.length && !addedLinks.length && !removedLinks.length) {
     out.push('No card-level changes.');
   } else {
+    const entryCap = full ? Infinity : 20;
+    let remaining = full ? Infinity : 32000;
+    let truncated = false;
+    const renderValue = (value) => {
+      const text = String(value);
+      const count = Math.min(text.length, remaining, full ? Infinity : 4500);
+      remaining -= count;
+      if (count < text.length) truncated = true;
+      return `${literalBlock(text.slice(0, count))}${count < text.length ? `\n_Truncated: ${text.length - count} character(s) omitted._` : ''}`;
+    };
+    const renderCards = (title, entries) => {
+      if (!entries.length) return;
+      out.push(`**${title} (${entries.length})**`, '');
+      for (const entry of entries.slice(0, entryCap)) {
+        out.push(`#### Card ${inlineLiteral(entry.id)}`, '');
+        for (const [label, side] of [['Before', entry.before], ['After', entry.after]]) {
+          if (!side) continue;
+          out.push(`**${label}**`, '', renderValue(side.body), '');
+          out.push(`**${label} metadata**`, '', renderValue(stableJson(side.metadata)), '');
+        }
+      }
+      if (entries.length > entryCap) {
+        truncated = true;
+        out.push(`_${entries.length - entryCap} more ${title.toLowerCase()} card(s) omitted._`, '');
+      }
+    };
+    const renderLinks = (title, entries) => {
+      if (!entries.length) return;
+      out.push(`**${title} (${entries.length})**`, '');
+      for (const entry of entries.slice(0, entryCap)) out.push(renderValue(entry), '');
+      if (entries.length > entryCap) { truncated = true; out.push(`_${entries.length - entryCap} more relationship(s) omitted._`, ''); }
+    };
     out.push(`**${added.length} added · ${updated.length} updated · ${removed.length} removed**`, '');
-    out.push(...renderCardList('Added', added));
-    out.push(...renderCardList('Updated', updated));
-    out.push(...renderCardList('Removed', removed));
-    if (connDelta) out.push(`_${connDelta > 0 ? '+' : ''}${connDelta} connection(s)._`);
+    renderCards('Added', added);
+    renderCards('Updated', updated);
+    renderCards('Removed', removed);
+    renderLinks('Relationships added', addedLinks);
+    renderLinks('Relationships removed', removedLinks);
+    if (truncated) {
+      out.push('**This preview is truncated.** From the repository root, print the complete diff (or redirect it to a file):', '',
+        completeCommand());
+    }
   }
-  console.log(out.join('\n'));
+  const rendered = out.join('\n');
+  // Host comment limits count the fencing and labels too. Adversarial bodies
+  // with long runs of BOTH fence characters can roughly double their rendered
+  // size; never ship an oversized preview that GitHub simply refuses to post.
+  if (!full && rendered.length > 56000) {
+    console.log([out[0], '', `**${added.length} added · ${updated.length} updated · ${removed.length} removed**`,
+      `${addedLinks.length} relationship(s) added · ${removedLinks.length} removed.`,
+      hidden.size ? `${hidden.size} AI-hidden card(s) withheld from both versions.` : '', '',
+      '**This preview is truncated:** rendered content exceeds the display limit. From the repository root, print the complete diff (or redirect it to a file):', '',
+      completeCommand()].filter(Boolean).join('\n\n'));
+  } else console.log(rendered);
 }
 
 // ── pr-brief ────────────────────────────────────────────────────────────────
@@ -347,7 +431,7 @@ async function prBrief() {
   if (!changed.length) { console.log('_No changed files — no brain context to attach._'); return; }
 
   const { format } = await loadEngine();
-  const { struct } = await format.parseKlypix(fs.readFileSync(brain));
+  const { struct } = format.scopeLockedView(await format.parseKlypix(fs.readFileSync(brain)));
 
   const perFile = new Map();   // file -> [card first lines]
   let total = 0;

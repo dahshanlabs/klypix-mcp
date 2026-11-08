@@ -6119,6 +6119,45 @@ const cueMatch = (a, b, bar) => {
     return (coef >= bar || (inter >= CUE_STRONG_SHARED && coef >= CUE_RELAXED_COEF)) ? coef : 0;
 };
 
+// A correction cue states intent, not the identity of the card to retire.
+// Capture used to count routing/provenance words as identity: a long strategy
+// correction mentioning "release" and "auto-merge" archived "Release: tagged
+// v1.64.0 #release #auto". Require shared subject words, and refuse close rivals
+// instead of letting file order pick a target. This stricter gate is write-side
+// only; reconcile can still suggest weaker pairs for a person to review.
+const CORRECTION_GENERIC = new Set([
+    ...CORRECTION_META, ...RESOLUTION_GENERIC, ...STOPWORDS,
+    'auto', 'before', 'after', 'earlier', 'later', 'only', 'never', 'always', 'since',
+    'both', 'through', 'already', 'must', 'most', 'some', 'other', 'another',
+    'decision', 'decisions', 'previous', 'original',
+]);
+const correctionSubjectTokens = (card) => {
+    let body = String(card.text || '').replace(/(^|\s)#[\p{L}\p{N}_-]+/gu, ' ');
+    const prefix = `${String(card.area || '').trim()}:`;
+    if (prefix.length > 1 && body.toLowerCase().startsWith(prefix.toLowerCase())) body = body.slice(prefix.length);
+    return new Set([...tokenSet(body)].filter(w => !CORRECTION_GENERIC.has(w)));
+};
+const correctionVersions = (text) => new Set((String(text || '').toLowerCase()
+    .match(/\bv?\d+\.\d+\.\d+(?:-[\da-z.-]+)?\b/g) || []).map(v => v.replace(/^v/, '')));
+function correctionTargetMatch(source, target, sourceTokens) {
+    const targetTokens = correctionSubjectTokens(target);
+    let shared = 0;
+    for (const token of sourceTokens) if (targetTokens.has(token)) shared++;
+    const similarity = shared / Math.max(1, Math.min(sourceTokens.size, targetTokens.size));
+    const plausible = shared >= 2 && similarity >= CORRECTION_SUPERSEDE_AT;
+    const refusal = { score: 0, plausible, shared };
+    const milestone = isMilestoneCard(target);
+    if (milestone) {
+        // A historical ship record needs substantial coverage of its own
+        // subject and, where present, its release version. Similar discussion
+        // of a later release must not erase the earlier event.
+        const versions = correctionVersions(source.text);
+        if ([...correctionVersions(target.text)].some(v => !versions.has(v))) return { ...refusal, plausible: false, excluded: true };
+    }
+    if (shared < 3 || (milestone && coverageOf(targetTokens, sourceTokens) < 0.6)) return refusal;
+    return { score: cueMatch(sourceTokens, targetTokens, CORRECTION_SUPERSEDE_AT), plausible, shared };
+}
+
 // A correction chain can make a full round trip: A→B→C, where C deliberately
 // restores A's stance. The ordinary supersede path correctly preserves A→B→C,
 // but C used to carry no read-alone receipt of that history. Detect only the
@@ -7665,6 +7704,8 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
             // cards outlived their corrections in the field.
             const isCorrection = hasCorrectionCue(card.text);
             const nTokCmp = isCorrection ? stripCueMeta(nTok) : nTok;   // cue meta words dilute the denominator
+            const subjectTokens = isCorrection ? correctionSubjectTokens(card) : null;
+            const correctionMatches = [], possibleCorrections = [];
             let best = null, bestScore = 0;
             for (const c of liveTextCards()) {
                 if (!isCorrection && area && !sameAreaKey(c.area, area)) continue;
@@ -7673,10 +7714,34 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                 // agreeing decision, and one session's assessment never replaces
                 // another's. Only an explicit closes: link or an id-addressed resolve ends one.
                 if (/⚖️?\s*OBJECTION|🔎\s*ASSESSMENT/u.test(c.text)) continue;
-                // cueMatch returns 0 unless it clears the widened bar (ratio OR
-                // absolute subject mass) — so for corrections, any non-zero fires.
-                const s = isCorrection ? cueMatch(nTokCmp, tokenSet(c.text), CORRECTION_SUPERSEDE_AT) : overlapScore(nTok, tokenSet(c.text));
+                const rawScore = isCorrection ? cueMatch(nTokCmp, tokenSet(c.text), CORRECTION_SUPERSEDE_AT) : 0;
+                const match = isCorrection ? correctionTargetMatch(card, c, subjectTokens) : null;
+                const s = isCorrection ? match.score : overlapScore(nTok, tokenSet(c.text));
+                if (isCorrection) {
+                    if (rawScore || s || match.plausible) possibleCorrections.push({ card: c, score: s || rawScore, rawScore, plausible: match.plausible, eligible: !!s, weakIdentity: match.shared > 0 && !match.excluded });
+                    if (s) correctionMatches.push({ card: c, score: s });
+                }
                 if (s > bestScore) { bestScore = s; best = c; }
+            }
+            if (isCorrection) {
+                correctionMatches.sort((a, b) => b.score - a.score);
+                // A tiny intended target can fail the three-anchor archive
+                // gate while a richer incidental mention passes. Such a
+                // refusal must veto automatic fallback to the richer card.
+                const bestRawScore = best ? possibleCorrections.find(m => m.card.id === best.id)?.rawScore || 0 : 0;
+                const plausibleRival = m => m.plausible || (m.weakIdentity && m.rawScore >= bestRawScore);
+                const weakRival = best && possibleCorrections.some(m => !m.eligible && plausibleRival(m));
+                const ambiguous = weakRival || (correctionMatches.length > 1
+                    && correctionMatches[0].score - correctionMatches[1].score < 0.1);
+                if (ambiguous || (!best && possibleCorrections.length)) {
+                    const review = (ambiguous ? possibleCorrections.filter(m => plausibleRival(m) || m.eligible) : possibleCorrections)
+                        .sort((a, b) => b.score - a.score);
+                    (stats.correctionRefused ||= []).push({
+                        reason: ambiguous ? 'ambiguous' : 'weak-subject',
+                        candidates: review.slice(0, 5).map(({ card: c }) => ({ id: c.id, title: c.title || String(c.text).slice(0, 80), area: c.area || null })),
+                    });
+                    best = null;
+                }
             }
             if (best && (isCorrection ? bestScore > 0 : bestScore >= SUPERSEDE_AT)) {
                 // Detect the round-trip BEFORE mutating B. The normal lifecycle
@@ -7698,8 +7763,8 @@ export async function captureIntoBrain(buffer, { cards = [], resolutions = [], u
                 }
                 stats.superseded++;
                 // Surface the widened match for confirmation: the caller tells the
-                // agent what was archived and how to undo (restore from Archive /
-                // re-run with ~) — the widened bar acts WITH a visible receipt.
+                // agent what was archived and how to undo (restore from Archive;
+                // an in-place ~ update does not restore an archived card).
                 if (wasCross) stats.corrections.push({ old: (best.title || String(best.text).replace(/^↩︎\s*/, '').slice(0, 80)), area: best.area || null, overlap: Math.round(bestScore * 100) / 100 });
             }
         }
@@ -8714,6 +8779,11 @@ export function findSkillObsolescenceCandidates(struct, milestones, { coverAt = 
 export function formatCaptureReceipts(stats, { maxEach = 3 } = {}) {
     const s = stats || {};
     const lines = [];
+    for (const f of (Array.isArray(s.correctionRefused) ? s.correctionRefused : []).slice(0, maxEach)) {
+        const why = f.reason === 'ambiguous' ? 'several cards match too closely' : 'shared wording does not identify a confident target';
+        const candidates = f.candidates.map(c => `(id ${c.id}) "${c.title}"${c.area ? ` [${c.area}]` : ''}`).join(' · ');
+        lines.push(`⚠️ correction kept as a new card: ${why}; no card was archived by this correction. Possible matches for review (not confirmed targets): ${candidates}. Review the intended statement before correcting a specific card.`);
+    }
     const reAdopted = Math.max(0, Number(s.reAdopted) || 0);
     if (reAdopted) {
         lines.push(`↪ re-adoption recorded: ${reAdopted} returning decision${reAdopted === 1 ? '' : 's'} now ${reAdopted === 1 ? 'carries' : 'carry'} a dated read-alone receipt and provenance edge to the earlier stance.`);

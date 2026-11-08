@@ -801,6 +801,14 @@ before.
 This warns. It does not prevent. Nothing blocks an edit. A session that never declared its files
 and was never observed editing is invisible to the file and folder checks.
 
+At task completion, live file reservations are released normally. A separate
+`completionIntegration` report rechecks up to six local peer branches seen during that task,
+including peers that have stopped. It retains unresolved files and branch references for the
+final reply. Missing refs, unavailable probes and incomplete checks are **unknown**, not clear.
+This evidence is local to the MCP worker and is lost on worker restart; it covers committed
+text merges only, not uncommitted work or behavioral compatibility. A sent coordination
+message does not establish agreed ownership or merge order.
+
 ### Teammates on other computers (KLYPIX network)
 
 ![KLYPIX network: agent sessions on two computers declare the same file, the project brain warns before either edits it, and a note from one session lands in the other](https://klypix.com/network/klypix-network.gif)
@@ -1278,10 +1286,17 @@ For review, two commands turn a binary blob into something a human can read:
 
 ```bash
 npx klypix-mcp diff main            # card-level: what was added / updated / removed
+npx klypix-mcp diff main --full     # complete visible card text when the preview is truncated
 npx klypix-mcp pr-brief origin/main # the brain cards that reference this PR's changed files
 ```
 
 `diff` compares meaning rather than bytes (a re-save restamps timestamps; that is not a change).
+It shows stable card IDs, before/after decision bodies and metadata, and added or removed
+relationships, including changed supersession links. The default preview is bounded and
+names the command for the full output when text is omitted. Content hidden from AI in either
+snapshot remains withheld, including relationships touching it; `--full` does not bypass that
+boundary. A position or style-only re-save does not appear as a changed decision;
+moving a card into a different area, including Archive, does appear.
 `pr-brief` matches a card's `#file-…` evidence anchors against the changed paths, so a reviewer
 sees the decisions already recorded about the code in front of them. `examples/github/brain-pr.yml`
 wires both into a sticky pull-request comment using nothing but the checkout and the default

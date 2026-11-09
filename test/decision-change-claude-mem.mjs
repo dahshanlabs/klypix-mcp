@@ -10,7 +10,7 @@ import { createObserverBudgetBroker, observerWrapperSource, isolatedEnvironment,
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-cmem-adapter-test-'));
 let index = 0;
-async function runWrapper({ body, limit = 10, armBudget = 5, model = OBSERVER_MODEL, args, bunPath }) {
+async function runWrapper({ body, limit = 10, armBudget = 5, model = OBSERVER_MODEL, args, bunPath, authMethod, apiKey }) {
   const dir = path.join(root, String(++index)); fs.mkdirSync(dir);
   const ledger = new BudgetLedger(path.join(dir, 'ledger.jsonl'), { limitUsd: limit });
   const broker = await createObserverBudgetBroker({ ledger, totalBudgetUsd: armBudget });
@@ -18,7 +18,7 @@ async function runWrapper({ body, limit = 10, armBudget = 5, model = OBSERVER_MO
   const marker = path.join(dir, 'argv.json');
   fs.writeFileSync(fake, `import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(marker)}, JSON.stringify({args:process.argv.slice(2),outputCap:process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS,haiku:process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL,sonnet:process.env.ANTHROPIC_DEFAULT_SONNET_MODEL}));\n${body}`);
   fs.writeFileSync(wrapper, observerWrapperSource({ command: process.execPath, prefixArgs: [fake], model: OBSERVER_MODEL,
-    brokerUrl: broker.url, brokerToken: broker.token }));
+    brokerUrl: broker.url, brokerToken: broker.token, authMethod }));
   let command = process.execPath, prefix = [wrapper];
   if (bunPath) {
     command = path.join(dir, process.platform === 'win32' ? 'wrapper.exe' : 'wrapper'); prefix = [];
@@ -29,7 +29,7 @@ async function runWrapper({ body, limit = 10, armBudget = 5, model = OBSERVER_MO
   }
   const output = await new Promise((resolve, reject) => {
     const child = spawn(command, [...prefix, ...(args || ['--model', model, '--output-format', 'stream-json'])], {
-      env: isolatedEnvironment(dir), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
+      env: { ...isolatedEnvironment(dir), ...(apiKey ? { ANTHROPIC_API_KEY: apiKey } : {}) }, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
     });
     let stdout = '', stderr = '';
     child.stdout.on('data', c => { stdout += c; }); child.stderr.on('data', c => { stderr += c; });
@@ -59,6 +59,8 @@ try {
   assert.equal(settings.CLAUDE_MEM_MODEL, 'haiku');
   assert.equal(settings.CLAUDE_MEM_TIER_SMART_MODEL, 'sonnet');
   assert.equal(settings.CLAUDE_MEM_TIER_SUMMARY_MODEL, '');
+  const apiSettings = claudeMemSettings({ dataDir: root, observerProfile: root, workerPort: 1234, observerExecutable: 'fixture', authMethod: 'api-key' });
+  assert.deepEqual(apiSettings, { ...settings, CLAUDE_MEM_CLAUDE_AUTH_METHOD: 'api-key' }, 'Billing changes only authentication; all native model/tier/feature settings remain equal');
   for (const key of ['CLAUDE_MEM_WORK_VIEW_AGENT', 'CLAUDE_MEM_WORK_VIEW_COPY_PROVIDER', 'CLAUDE_MEM_CHROMA_ENABLED', 'CLAUDE_MEM_SEMANTIC_INJECT', 'CLAUDE_MEM_QUOTA_FALLBACK_PROVIDER']) assert.equal(settings[key], undefined, `${key} must inherit the pinned product default`);
   const env = isolatedEnvironment(root, { HOME: 'do-not-use', USERPROFILE: 'do-not-use', PATH: process.env.PATH,
     CLAUDE_MEM_DATA_DIR: 'live-memory', CLAUDE_CONFIG_DIR: 'live-settings', ANTHROPIC_API_KEY: 'synthetic-secret',
@@ -82,6 +84,17 @@ try {
   assert.equal(success.marker.haiku, 'claude-haiku-5-5');
   assert.equal(success.marker.sonnet, 'claude-sonnet-5-5');
   assert.equal(JSON.parse(success.stdout).total_cost_usd, 0.12, 'The SDK stream remains unchanged');
+
+  const apiKey = `sk-ant-${'OFFLINE_CANARY_'.repeat(4)}`;
+  const missingApi = await runWrapper({ authMethod: 'api-key', body: `throw Error('must not launch');` });
+  assert.notEqual(missingApi.code, 0); assert.equal(missingApi.marker, null);
+  assert.equal(missingApi.ledger.reservations.length, 0, 'Missing native API credentials refuse before reserve or OAuth fallback');
+  const apiBody = `const key=process.env.ANTHROPIC_API_KEY; process.stdout.write(JSON.stringify({type:'system',echo:key}).slice(0,35)); process.stderr.write(key.slice(0,20)); setTimeout(()=>{process.stdout.write(JSON.stringify({type:'system',echo:key}).slice(35)+'\\n');process.stderr.write(key.slice(20)); console.log(JSON.stringify({type:'result',total_cost_usd:0.12,modelUsage:{'claude-haiku-5-5':{}}}));},20);`;
+  const api = await runWrapper({ authMethod: 'api-key', apiKey, body: apiBody, bunPath: process.env.KLYPIX_TEST_BUN });
+  assert.equal(api.code, 0, api.stderr); assert.equal(api.ledger.spentCents, 12);
+  assert.equal(api.stdout.includes(apiKey) || api.stderr.includes(apiKey), false, 'Observer key never enters forwarded stdout/stderr');
+  assert.ok(api.stdout.includes('[REDACTED_API_KEY]')); assert.equal(api.stderr, '[REDACTED_API_KEY]');
+  assert.equal(JSON.stringify(api.marker).includes(apiKey), false, 'Observer argv and model receipts contain no credential');
 
   // The pinned SDK emits --model=haiku (Mr at bundle offset 4011693),
   // while its base format flags remain split tokens. Keep its argv intact.

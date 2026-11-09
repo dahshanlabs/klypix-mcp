@@ -9,21 +9,24 @@ import { createFixture, fileHash } from './scenarios.mjs';
 import { PERSONAL_SESSIONS, personalCapturePrompt, personalRecallPrompt, gradePersonalRecall } from './personal-scenario.mjs';
 import { costBetween } from './ledger.mjs';
 import { applyFlushOutcome, finalizeOutcome } from './outcomes.mjs';
+import { authenticationMetadata } from './auth.mjs';
 
 export async function runPersonalReplay({ conditionId, runId, outDir, ledger, limits, approved,
-  releasedRoot, improvedRoot, credentialFile, claudeMem = {}, protocol = 'early-boundary-v2' }) {
+  releasedRoot, improvedRoot, credentialFile, claudeMem = {}, protocol = 'early-boundary-v2', authentication = null }) {
+  const auth = authenticationMetadata(authentication);
+  authentication?.assertPublic({ conditionId, runId, outDir, limits, releasedRoot, improvedRoot, credentialFile, claudeMem });
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-decision-change-personal-'));
   const home = path.join(scratch, 'home'), repoDir = path.join(scratch, 'repo');
   const artifacts = path.join(outDir, runId); fs.mkdirSync(artifacts, { recursive: true });
-  const row = { runId, block: 'personal-longitudinal-v1', condition: conditionId, protocol, measurementTransport: MEASUREMENT_TRANSPORT,
+  const row = { runId, block: 'personal-longitudinal-v1', condition: conditionId, protocol, measurementTransport: MEASUREMENT_TRANSPORT, authentication: auth,
     scope: 'One persistent isolated project/profile; six chronological capture sessions plus final recall; simulated days with real timestamps',
     startedAt: new Date().toISOString(), budgetBefore: ledger.snapshot(), stages: [], firstAttempt: true, success: false };
   let adapter; let recallSession;
   try {
-    const env = prepareClaudeHome(home, { credentialFile });
+    const env = prepareClaudeHome(home, { credentialFile, authentication });
     createFixture(repoDir, env);
     const codeHash = fileHash(path.join(repoDir, 'lib/invoice.mjs'));
-    adapter = await prepareCondition({ id: conditionId, repoDir, home, ledger, releasedRoot, improvedRoot, claudeMem, protocol });
+    adapter = await prepareCondition({ id: conditionId, repoDir, home, ledger, releasedRoot, improvedRoot, claudeMem, protocol, authentication });
     row.configuration = adapter.metadata;
     if (adapter.metadata?.paidReady === false) { row.notMeasured = adapter.metadata.reason || 'Adapter not ready'; return row; }
     await adapter.start?.({ allowPaid: approved === true });
@@ -36,7 +39,7 @@ export async function runPersonalReplay({ conditionId, runId, outDir, ledger, li
       }
       const sessionId = crypto.randomUUID();
       if (role === 'personal-recall') recallSession = sessionId;
-      const result = await runClaudeStage({ approved, id: `${runId}-${role}`, role, repoDir, home, prompt, sessionId,
+      const result = await runClaudeStage({ approved, id: `${runId}-${role}`, role, repoDir, home, prompt, sessionId, authentication,
         config: { ...adapter.agentConfig, env: { ...env, ...adapter.agentConfig?.env } }, ledger, limits,
         transcriptDir: artifacts, timeoutMs: 180_000 });
       row.stages.push({ role, ...result });

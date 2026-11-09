@@ -234,6 +234,7 @@ try {
   fs.writeFileSync(path.join(repo, 'lib/shipping.mjs'), 'export const shippingCents=()=>0;');
   assert.equal(gradeFixture(repo, CASES[0], shippingHash).success, false, 'unrelated edits fail harm check');
   await import('./test-passive-audit.mjs');
+  await import('../../test/decision-change-auth.mjs');
   console.log('decision-change self-test: budget, isolation, exposure, native hook parity, passive native audit, generic notes notice, observational rework and harm graders passed (zero model calls)');
 } finally {
   const target = fs.realpathSync(root);

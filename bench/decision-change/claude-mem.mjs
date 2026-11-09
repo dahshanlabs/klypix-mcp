@@ -8,6 +8,7 @@ import { randomBytes, randomUUID, createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { freshEnvironment } from './isolation.mjs';
+import { authenticationMetadata, createCredentialRedactor, redactProcessCredential } from './auth.mjs';
 
 const execFileAsync = promisify(execFile);
 export const CLAUDE_MEM_VERSION = '15.12.0';
@@ -72,11 +73,12 @@ export function isolatedEnvironment(home, env = process.env, dependencyHome = ho
   };
 }
 
-export function claudeMemSettings({ dataDir, observerProfile, workerPort, observerExecutable }) {
+export function claudeMemSettings({ dataDir, observerProfile, workerPort, observerExecutable, authMethod = 'subscription' }) {
+  if (!['subscription', 'api-key'].includes(authMethod)) throw new Error('Unsupported native Claude authentication method');
   return {
     CLAUDE_MEM_DATA_DIR: dataDir, CLAUDE_MEM_WORKER_PORT: String(workerPort),
     CLAUDE_MEM_WORKER_HOST: '127.0.0.1', CLAUDE_MEM_RUNTIME: 'worker',
-    CLAUDE_MEM_PROVIDER: 'claude', CLAUDE_MEM_CLAUDE_AUTH_METHOD: 'subscription',
+    CLAUDE_MEM_PROVIDER: 'claude', CLAUDE_MEM_CLAUDE_AUTH_METHOD: authMethod,
     CLAUDE_MEM_CLAUDE_CONFIG_DIR: observerProfile, CLAUDE_CODE_PATH: observerExecutable,
     // Preserve the published defaults, including the distinct smart tier.
     // Only alias resolution in the accounting proxy is pinned for reproducibility.
@@ -114,15 +116,17 @@ export function nativeHookSettings(manifest, cliPath, pluginRoot, nodePath = pro
 
 export function hookAuditSource(auditFile) {
   return `import fs from 'node:fs';import {spawn} from 'node:child_process';
+${redactProcessCredential.toString()}
 const [cli,...args]=process.argv.slice(2);const chunks=[];for await(const chunk of process.stdin)chunks.push(chunk);const input=Buffer.concat(chunks);let event={};try{event=JSON.parse(input.toString());}catch{}
 const child=spawn(process.execPath,[cli,...args],{env:process.env,stdio:['pipe','pipe','pipe'],windowsHide:true});let output='',truncated=false;
 child.stdout.on('data',chunk=>{process.stdout.write(chunk);if(output.length+chunk.length<=4194304)output+=chunk.toString();else truncated=true;});child.stderr.pipe(process.stderr);
-child.on('error',()=>process.exit(1));child.on('close',code=>{if(code===0&&['SessionStart','UserPromptSubmit','PreToolUse'].includes(event.hook_event_name)){try{fs.appendFileSync(${JSON.stringify(auditFile)},JSON.stringify({sessionId:event.session_id,hookEvent:event.hook_event_name,role:process.env.BENCH_DECISION_ROLE||null,exitCode:code,stdout:output,truncated,at:new Date().toISOString()})+'\\n',{mode:0o600});}catch{process.stderr.write('Benchmark hook exposure audit could not be written.\\n');}}process.exit(code??1);});child.stdin.end(input);
+child.on('error',()=>process.exit(1));child.on('close',code=>{if(code===0&&['SessionStart','UserPromptSubmit','PreToolUse'].includes(event.hook_event_name)){try{fs.appendFileSync(${JSON.stringify(auditFile)},redactProcessCredential(JSON.stringify({sessionId:event.session_id,hookEvent:event.hook_event_name,role:process.env.BENCH_DECISION_ROLE||null,exitCode:code,stdout:output,truncated,at:new Date().toISOString()}))+'\\n',{mode:0o600});}catch{process.stderr.write('Benchmark hook exposure audit could not be written.\\n');}}process.exit(code??1);});child.stdin.end(input);
 `;
 }
 
 /** One loopback broker shares the parent's durable ledger with native children. */
-export async function createObserverBudgetBroker({ ledger, totalBudgetUsd, processCapUsd = 0.5, enabled = true }) {
+export async function createObserverBudgetBroker({ ledger, totalBudgetUsd, processCapUsd = 0.5, enabled = true, authMethod = 'subscription' }) {
+  if (!['subscription', 'api-key'].includes(authMethod)) throw new Error('Unsupported observer authentication method');
   positive(totalBudgetUsd, 'Observer total budget');
   positive(processCapUsd, 'Observer process cap');
   const token = randomBytes(24).toString('hex');
@@ -147,13 +151,13 @@ export async function createObserverBudgetBroker({ ledger, totalBudgetUsd, proce
         const id = `claude-mem-observer-${randomUUID()}`;
         try {
           ledger.reserve({ id, kind: 'observer', maxUsd: reserveUsd,
-            meta: { version: CLAUDE_MEM_VERSION, model, processCapUsd, oneCallMarginUsd: OBSERVER_ENVELOPES[model].oneCallUsd } });
+            meta: { version: CLAUDE_MEM_VERSION, model, processCapUsd, oneCallMarginUsd: OBSERVER_ENVELOPES[model].oneCallUsd, authMethod } });
         } catch (error) {
           refusals.push({ model, reserveUsd, reason: String(error.message).slice(0, 250), at: new Date().toISOString() });
           throw error;
         }
         reserved += reserveUsd;
-        records.set(id, { id, model, reserveUsd, status: 'reserved', cost: null, inFlight: true, pid: body.pid, childPid: null, capped: false });
+        records.set(id, { id, model, reserveUsd, status: 'reserved', cost: null, inFlight: true, pid: body.pid, childPid: null, capped: false, authMethod });
         return answer(200, { id, processCapUsd, reservedUsd: reserveUsd });
       }
       const record = records.get(body.id);
@@ -181,7 +185,7 @@ export async function createObserverBudgetBroker({ ledger, totalBudgetUsd, proce
     const reserveUsd = record.reserveUsd;
     record.status = known ? 'settled' : 'unknown'; reserved -= reserveUsd;
     spent += known ? roundUp(record.cost) : reserveUsd;
-    if (known) ledger.settle(record.id, { actualUsd: record.cost, usage: { model: record.model, capped: record.capped, accounting: 'CLI-reported API-equivalent', version: CLAUDE_MEM_VERSION } });
+    if (known) ledger.settle(record.id, { actualUsd: record.cost, usage: { model: record.model, capped: record.capped, accounting: 'CLI-reported API-equivalent', version: CLAUDE_MEM_VERSION, authMethod } });
     else { accepting = false; ledger.unknown(record.id, { reason: 'Observer exited without a finalized, idle cost receipt' }); }
   }
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
@@ -207,7 +211,8 @@ export async function createObserverBudgetBroker({ ledger, totalBudgetUsd, proce
 
 /** Compile this unchanged protocol proxy as a native executable on Windows. */
 export function observerWrapperSource(config) {
-  return `import { spawn } from 'node:child_process';
+  return `import { spawn } from 'node:child_process';import {StringDecoder} from 'node:string_decoder';
+${createCredentialRedactor.toString()}
 const config=${JSON.stringify({ ...config, aliases: OBSERVER_MODEL_ALIASES, pricedModels: Object.keys(OBSERVER_ENVELOPES), fastModel: OBSERVER_MODEL })};
 const args=process.argv.slice(2);
 const probe=(args.length===1&&['--version','-v','--help','-h'].includes(args[0]))||(JSON.stringify(args)===JSON.stringify(['--permission-mode','dontAsk','--version']))||(args[0]==='auth'&&args[1]==='status'&&args.slice(2).every(a=>a==='--json'));
@@ -218,6 +223,7 @@ try {
  if(probe){child=spawn(config.command,[...(config.prefixArgs||[]),...args],{env:process.env,stdio:'inherit',windowsHide:true});child.on('error',()=>process.exit(1));child.on('close',code=>process.exit(code??1));}
  else {
   if(args.includes('--'))throw Error('Unexpected observer option terminator');
+  if(config.authMethod==='api-key'&&!/^sk-ant-[A-Za-z0-9_-]{20,}$/.test(process.env.ANTHROPIC_API_KEY||''))throw Error('Native API credential missing; OAuth fallback refused');
   const requestedModel=singleOption('--model'), model=config.aliases[requestedModel]||requestedModel;
   if(!config.pricedModels.includes(model))throw Error('Unpriced observer model refused');
   const allowedModels=[model,config.fastModel];
@@ -228,16 +234,18 @@ try {
   delete childEnv.CLAUDE_CODE_MAX_OUTPUT_TOKENS;
   child=spawn(config.command,[...(config.prefixArgs||[]),...args,'--max-budget-usd',String(grant.processCapUsd)],{env:childEnv,stdio:['pipe','pipe','pipe'],windowsHide:true});
   await post('/progress',{id:grant.id,inFlight:true,childPid:child.pid});
-  child.stderr.pipe(process.stderr);
+  const secret=config.authMethod==='api-key'?process.env.ANTHROPIC_API_KEY:'';
+  const stdoutRedactor=createCredentialRedactor(secret),stderrRedactor=createCredentialRedactor(secret);
+  child.stderr.on('data',chunk=>process.stderr.write(stderrRedactor.write(chunk)));
   let input='',output='';
   const queue=fn=>{chain=chain.then(fn).catch(error=>{accountingFailed=true;known=false;child.kill();process.stderr.write('Observer accounting stopped: '+error.message+'\\n');});};
   const heartbeat=setInterval(()=>queue(async()=>{const control=await post('/heartbeat',{id:grant.id});if(control.stop&&!inFlight){child.stdin.end();}}),300);
   process.stdin.on('data',chunk=>{input+=chunk.toString();let i;while((i=input.indexOf('\\n'))>=0){const line=input.slice(0,i);input=input.slice(i+1);queue(async()=>{let frame;try{frame=JSON.parse(line);}catch{}if(frame?.type==='user'){inFlight=true;lastResult=false;await post('/progress',{id:grant.id,inFlight:true});}child.stdin.write(line+'\\n');});}});
   process.stdin.on('end',()=>queue(async()=>{if(input)child.stdin.write(input);child.stdin.end();}));
-  child.stdout.on('data',chunk=>{process.stdout.write(chunk);output+=chunk.toString();let i;while((i=output.indexOf('\\n'))>=0){const line=output.slice(0,i);output=output.slice(i+1);let frame;try{frame=JSON.parse(line);}catch{}if(frame?.type==='result'){if(Object.keys(frame.modelUsage||{}).some(used=>!allowedModels.includes(used))){accountingFailed=true;known=false;lastResult=false;child.kill();continue;}if(Number.isFinite(frame.total_cost_usd)&&frame.total_cost_usd>=0&&!(frame.is_error&&frame.total_cost_usd===0)&&(cost===null||frame.total_cost_usd>=cost)){cost=frame.total_cost_usd;inFlight=false;known=true;lastResult=true;const receipt={id:grant.id,inFlight:false,cost,capped:frame.subtype==='error_max_budget_usd'};queue(()=>post('/progress',receipt));}else{accountingFailed=true;known=false;lastResult=false;child.kill();}}}});
+  child.stdout.on('data',chunk=>{process.stdout.write(stdoutRedactor.write(chunk));output+=chunk.toString();let i;while((i=output.indexOf('\\n'))>=0){const line=output.slice(0,i);output=output.slice(i+1);let frame;try{frame=JSON.parse(line);}catch{}if(frame?.type==='result'){if(Object.keys(frame.modelUsage||{}).some(used=>!allowedModels.includes(used))){accountingFailed=true;known=false;lastResult=false;child.kill();continue;}if(Number.isFinite(frame.total_cost_usd)&&frame.total_cost_usd>=0&&!(frame.is_error&&frame.total_cost_usd===0)&&(cost===null||frame.total_cost_usd>=cost)){cost=frame.total_cost_usd;inFlight=false;known=true;lastResult=true;const receipt={id:grant.id,inFlight:false,cost,capped:frame.subtype==='error_max_budget_usd'};queue(()=>post('/progress',receipt));}else{accountingFailed=true;known=false;lastResult=false;child.kill();}}}});
   child.on('error',()=>{known=false;});
   for(const signal of ['SIGTERM','SIGINT'])process.on(signal,()=>child.kill(signal));
-  child.on('close',async code=>{clearInterval(heartbeat);process.stdin.pause();await chain;const settledKnown=!accountingFailed&&known&&lastResult&&!inFlight;try{await post('/settle',{id:grant.id,known:settledKnown});}catch{process.exitCode=1;}if(!settledKnown)process.stderr.write('Observer final cost unavailable; full reservation charged and ledger halted.\\n');process.exit(process.exitCode||code||(settledKnown?0:1));});
+  child.on('close',async code=>{clearInterval(heartbeat);process.stdout.write(stdoutRedactor.end());process.stderr.write(stderrRedactor.end());process.stdin.pause();await chain;const settledKnown=!accountingFailed&&known&&lastResult&&!inFlight;try{await post('/settle',{id:grant.id,known:settledKnown});}catch{process.exitCode=1;}if(!settledKnown)process.stderr.write('Observer final cost unavailable; full reservation charged and ledger halted.\\n');process.exit(process.exitCode||code||(settledKnown?0:1));});
  }
 }catch(error){process.stderr.write('Observer launch refused: '+error.message+'\\n');if(grant)try{await post('/settle',{id:grant.id,known:false});}catch{}process.exit(1);}
 `;
@@ -255,18 +263,21 @@ function writeJson(file, value) { fs.writeFileSync(file, `${JSON.stringify(value
 export async function prepareClaudeMem({ repoDir, home, ledger, observerBudgetUsd, env = process.env,
   packageDir = env.KLYPIX_BENCH_CLAUDE_MEM_PACKAGE, bunPath = env.KLYPIX_BENCH_BUN,
   claudePath = env.KLYPIX_BENCH_CLAUDE_EXE, credentialFile,
-  processCapUsd = 0.5, dependencyHome = home } = {}) {
+  processCapUsd = 0.5, dependencyHome = home, authentication = null } = {}) {
+  const auth = authenticationMetadata(authentication);
+  authentication?.assertPublic({ repoDir, home, packageDir, bunPath, claudePath, credentialFile, processCapUsd, dependencyHome });
   const metadata = { paidReady: false, version: CLAUDE_MEM_VERSION, observerEnvelope: OBSERVER_ENVELOPE,
     observerEnvelopes: OBSERVER_ENVELOPES, observerAliases: OBSERVER_MODEL_ALIASES,
     source: `https://github.com/thedotmack/claude-mem/tree/v${CLAUDE_MEM_VERSION}`,
     readme: `https://github.com/thedotmack/claude-mem/blob/v${CLAUDE_MEM_VERSION}/README.md#quick-start`,
     defaultsSource: `https://github.com/thedotmack/claude-mem/blob/v${CLAUDE_MEM_VERSION}/src/shared/SettingsDefaultsManager.ts`,
-    runtime: 'worker', configuration: 'README-supported Claude subscription provider; native handlers and shipped memory-search skill; isolated worker',
+    authentication: auth, oauthCredentialCopied: auth.method === 'subscription',
+    runtime: 'worker', configuration: `README-supported Claude ${auth.method} provider; native handlers and shipped memory-search skill; isolated worker`,
     deviations: ['Absolute pinned CLI replaces global hook launcher; installer-only hooks omitted',
-      'README-supported no-sign-in Claude subscription path selected; hosted trial/account not used',
+      `Documented Claude ${auth.method} authentication selected; hosted trial/account not used`,
       'Haiku/Sonnet aliases resolved to verified current IDs; default tier routing, capture, recall, Chroma and My Work retained',
       'Include all sources enabled using the README documented cross-host option; telemetry disabled',
-      'Observer CLI dollar cap plus worst-one-call reservation; cap-hit runs invalid, API-equivalent cost, subscription invoice unknown'] };
+      'Observer CLI dollar cap plus worst-one-call reservation; cap-hit runs invalid, CLI API-equivalent cost; invoice not independently queried'] };
   const unavailable = reason => ({ id: 'claude-mem', label: `claude-mem ${CLAUDE_MEM_VERSION}`, version: CLAUDE_MEM_VERSION,
     agentConfig: null, metadata: { ...metadata, reason },
     start: async () => { throw new Error(reason); }, flush: async () => ({ ok: false, details: reason }), close: async () => {} });
@@ -277,26 +288,30 @@ export async function prepareClaudeMem({ repoDir, home, ledger, observerBudgetUs
   if (!ledger || !observerBudgetUsd || observerBudgetUsd < observerReservationUsd(processCapUsd, 'sonnet')) return unavailable('No sufficient shared observer budget envelope for the default Haiku and Sonnet tiers');
   const pkg = JSON.parse(fs.readFileSync(path.join(packageDir, 'package.json'), 'utf8'));
   if (pkg.name !== 'claude-mem' || pkg.version !== CLAUDE_MEM_VERSION) throw new Error('claude-mem package must be pinned to 15.12.0');
-  const credentialSource = credentialFile || path.join(home, '.claude', '.credentials.json');
-  if (!fs.existsSync(credentialSource)) return unavailable('No authorized Claude OAuth credential file available');
-  const credentials = JSON.parse(fs.readFileSync(credentialSource, 'utf8'));
-  const oauth = credentials.claudeAiOauth;
-  if (!oauth?.accessToken || !Number.isFinite(oauth.expiresAt) || oauth.expiresAt <= Date.now() + 5 * 60_000) return unavailable('Claude OAuth credential unavailable or near expiry; no interactive login attempted');
+  let oauth;
+  if (auth.method === 'subscription') {
+    const credentialSource = credentialFile || path.join(home, '.claude', '.credentials.json');
+    if (!fs.existsSync(credentialSource)) return unavailable('No authorized Claude OAuth credential file available');
+    oauth = JSON.parse(fs.readFileSync(credentialSource, 'utf8')).claudeAiOauth;
+    if (!oauth?.accessToken || !Number.isFinite(oauth.expiresAt) || oauth.expiresAt <= Date.now() + 5 * 60_000) return unavailable('Claude OAuth credential unavailable or near expiry; no interactive login attempted');
+  } else if (fs.existsSync(path.join(home, '.claude', '.credentials.json'))) {
+    throw new Error('API-key benchmark requires a fresh home without OAuth credentials');
+  }
   const root = path.join(fs.realpathSync(home), '.claude-mem-benchmark');
   if (fs.existsSync(root)) throw new Error('Refusing to reuse a claude-mem benchmark profile');
   fs.mkdirSync(root, { mode: 0o700 });
   const observerProfile = path.join(root, 'observer-profile'), dataDir = path.join(root, 'data'), binDir = path.join(root, 'bin');
   for (const dir of [observerProfile, dataDir, binDir, path.join(home, 'tmp')]) fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const authCopy = path.join(observerProfile, '.credentials.json');
+  const authCopy = oauth ? path.join(observerProfile, '.credentials.json') : null;
   // Only the OAuth credential is copied; no MCP tokens, settings, memory or projects.
-  writeJson(authCopy, { claudeAiOauth: oauth });
+  if (authCopy) writeJson(authCopy, { claudeAiOauth: oauth });
   let broker;
   try {
   if (process.platform === 'win32') {
     const principal = `${env.USERDOMAIN ? `${env.USERDOMAIN}\\` : ''}${env.USERNAME}`;
     if (!env.USERNAME) throw new Error('Cannot restrict temporary credential ACL without the Windows account name');
     await execFileAsync('icacls.exe', [observerProfile, '/inheritance:r', '/grant:r', `${principal}:(OI)(CI)F`], { windowsHide: true });
-    await execFileAsync('icacls.exe', [authCopy, '/inheritance:r', '/grant:r', `${principal}:F`], { windowsHide: true });
+    if (authCopy) await execFileAsync('icacls.exe', [authCopy, '/inheritance:r', '/grant:r', `${principal}:F`], { windowsHide: true });
   }
   const vendor = path.join(root, 'vendor'); fs.cpSync(packageDir, vendor, { recursive: true });
   const pluginRoot = path.join(vendor, 'plugin'), cli = path.join(vendor, 'dist/npx-cli/index.js');
@@ -309,17 +324,18 @@ export async function prepareClaudeMem({ repoDir, home, ledger, observerBudgetUs
   const isolatedEnv = isolatedEnvironment(home, env, dependencyHome);
   metadata.defaultEmbeddingCache = seedDefaultEmbeddingCache(home, dependencyHome);
   const port = await freePort();
-  broker = await createObserverBudgetBroker({ ledger, totalBudgetUsd: observerBudgetUsd, processCapUsd, enabled: false });
+  broker = await createObserverBudgetBroker({ ledger, totalBudgetUsd: observerBudgetUsd, processCapUsd, enabled: false, authMethod: auth.method });
   const wrapperJs = path.join(binDir, 'observer-wrapper.js');
   const wrapperExe = path.join(binDir, process.platform === 'win32' ? 'observer-wrapper.exe' : 'observer-wrapper');
-  fs.writeFileSync(wrapperJs, observerWrapperSource({ command: claudePath, model: OBSERVER_MODEL,
+  fs.writeFileSync(wrapperJs, observerWrapperSource({ command: claudePath, model: OBSERVER_MODEL, authMethod: auth.method,
     brokerUrl: broker.url, brokerToken: broker.token }), { mode: 0o600 });
   await execFileAsync(bunPath, ['build', '--compile', wrapperJs, '--outfile', wrapperExe], { cwd: root, env: isolatedEnv, windowsHide: true, timeout: 180_000 });
   const help = await execFileAsync(wrapperExe, ['--help'], { env: isolatedEnv, windowsHide: true, timeout: 15_000 });
   if (!help.stdout.includes('--max-budget-usd')) throw new Error('Observer Claude CLI has no dollar-cap flag');
-  const settings = claudeMemSettings({ dataDir, observerProfile, workerPort: port, observerExecutable: wrapperExe });
+  const settings = claudeMemSettings({ dataDir, observerProfile, workerPort: port, observerExecutable: wrapperExe, authMethod: auth.method });
   writeJson(path.join(dataDir, 'settings.json'), settings);
   const runEnv = { ...isolatedEnv, ...settings, CLAUDE_PLUGIN_ROOT: pluginRoot,
+    ...(authentication ? { CLAUDE_MEM_ENV_FILE: authentication.envFile } : {}),
     BUN_INSTALL: path.dirname(path.dirname(bunPath)), PATH: `${path.dirname(bunPath)}${path.delimiter}${isolatedEnv.PATH || isolatedEnv.Path || ''}` };
   const hookAuditFile = path.join(root, 'hook-exposure.jsonl'), hookAuditWrapper = path.join(binDir, 'hook-audit.mjs');
   fs.writeFileSync(hookAuditWrapper, hookAuditSource(hookAuditFile), { mode: 0o600 });
@@ -405,12 +421,12 @@ export async function prepareClaudeMem({ repoDir, home, ledger, observerBudgetUs
     async close() {
       if (closed) return; closed = true;
       try { await broker.drain(); if (started) await runCli(['stop']); }
-      finally { await broker.close(); fs.rmSync(authCopy, { force: true }); }
+      finally { await broker.close(); if (authCopy) fs.rmSync(authCopy, { force: true }); }
     },
   };
   } catch (error) {
     if (broker) await broker.close();
-    fs.rmSync(authCopy, { force: true });
+    if (authCopy) fs.rmSync(authCopy, { force: true });
     throw error;
   }
 }

@@ -6,7 +6,7 @@ import { sourceFingerprint } from '../coordination/lib/results.mjs';
 import { freshEnvironment } from './isolation.mjs';
 import { prepareKlypixHooks, auditHookSource, readHookAudit, deliveredHookEvidence } from './native-hooks.mjs';
 
-export async function prepareCondition({ id, repoDir, home, ledger, releasedRoot, improvedRoot, claudeMem = {}, protocol = 'early-boundary-v2' }) {
+export async function prepareCondition({ id, repoDir, home, ledger, releasedRoot, improvedRoot, claudeMem = {}, protocol = 'early-boundary-v2', authentication = null }) {
   if (id === 'notes-native' || id === 'notes-notification') {
     const rule = '\n## Maintaining shared project understanding\nRead the current project decisions at task start. When a durable decision changes, update these ordinary project notes so they state the current decision and preserve unrelated guidance. Before declaring a task complete, re-read the current notes and verify the finished work against them.\n';
     fs.appendFileSync(path.join(repoDir, 'CLAUDE.md'), rule);
@@ -35,7 +35,7 @@ export async function prepareCondition({ id, repoDir, home, ledger, releasedRoot
   }; }
   if (id === 'claude-mem') {
     const { prepareClaudeMem } = await import('./claude-mem.mjs');
-    const adapter = await prepareClaudeMem({ repoDir, home, ledger, ...claudeMem });
+    const adapter = await prepareClaudeMem({ repoDir, home, ledger, ...claudeMem, authentication });
     return { ...adapter, instructions: adapter.instructions || 'Use claude-mem through its supported host integration to preserve the durable project decision. Do not mirror the policy into project instruction files.' };
   }
   const root = id === 'klypix-released' ? releasedRoot : id === 'klypix-improved' ? improvedRoot : null;

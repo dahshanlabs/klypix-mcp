@@ -5,6 +5,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
+import { redactProcessCredential } from './auth.mjs';
 
 export const MEASUREMENT_TRANSPORT = 'native-audit-v3';
 const EVENTS = ['PostToolUse', 'PostToolUseFailure', 'PostToolBatch'];
@@ -105,14 +106,14 @@ export function recordPassiveAudit(config, event) {
     // Capture bytes now, before the host continues. Reading a file later when
     // stdout finally arrives can collapse several edits into the final state.
     try {
-      const source = fs.readFileSync(path.join(config.repoDir, 'lib/invoice.mjs'), 'utf8');
+      const source = redactProcessCredential(fs.readFileSync(path.join(config.repoDir, 'lib/invoice.mjs'), 'utf8'));
       record.snapshot = { source, hash: crypto.createHash('sha256').update(source).digest('hex') };
     } catch (error) { record.snapshot = { error: error.message }; }
   }
   record.at = Date.now();
   const id = `${record.at}-${crypto.randomUUID()}`;
   const temporary = path.join(config.dir, `${id}.tmp`), target = path.join(config.dir, `${id}.event.json`);
-  fs.writeFileSync(temporary, JSON.stringify(record), { flag: 'wx', mode: 0o600 });
+  fs.writeFileSync(temporary, redactProcessCredential(JSON.stringify(record)), { flag: 'wx', mode: 0o600 });
   fs.renameSync(temporary, target);
   return record;
 }

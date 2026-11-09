@@ -13,6 +13,7 @@ import { CASES, matchesInitialPolicy, initialPrompt, consumerPrompt, createFixtu
 import { createTelemetry, notificationMetrics, gradeRevisions } from './metrics.mjs';
 import { runPersonalReplay } from './personal-run.mjs';
 import { applyFlushOutcome, finalizeOutcome } from './outcomes.mjs';
+import { authenticationMetadata, loadBenchmarkAuthentication } from './auth.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '../..');
@@ -20,14 +21,16 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const writeJson = (file, value) => fs.writeFileSync(file, JSON.stringify(value, null, 2));
 
 export async function runWorkflow({ conditionId, scenario, runId, outDir, ledger, limits, approved,
-  releasedRoot, improvedRoot = ROOT, credentialFile, claudeMem = {}, timeoutMs = 600_000, protocol = 'early-boundary-v2' }) {
+  releasedRoot, improvedRoot = ROOT, credentialFile, claudeMem = {}, timeoutMs = 600_000, protocol = 'early-boundary-v2', authentication = null }) {
+  const auth = authenticationMetadata(authentication);
+  authentication?.assertPublic({ conditionId, scenario, runId, outDir, limits, releasedRoot, improvedRoot, credentialFile, claudeMem });
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-decision-change-'));
   const home = path.join(scratch, 'home'); const repoDir = path.join(scratch, 'repo');
   const artifacts = path.join(outDir, runId); fs.mkdirSync(artifacts, { recursive: true });
   let homeEnv; let originalCode; let shippingHash; let telemetry;
   const gatePath = path.join(scratch, 'checkpoint');
   const sessionIds = {};
-  const row = { runId, condition: conditionId, scenario: scenario.id,
+  const row = { runId, condition: conditionId, scenario: scenario.id, authentication: auth,
     block: 'early-change', protocol, measurementTransport: MEASUREMENT_TRANSPORT, budgetBefore: ledger.snapshot(),
     scope: 'same-host active-session change; controlled barrier; developer-authored fixture',
     startedAt: new Date().toISOString(), stages: [], firstAttempt: true, success: false };
@@ -36,7 +39,7 @@ export async function runWorkflow({ conditionId, scenario, runId, outDir, ledger
   const stage = async (role, prompt, config = {}) => {
     const sessionId = sessionIds[role] = crypto.randomUUID();
     startedRoles.add(role);
-    const result = await runClaudeStage({ approved, id: `${runId}-${role}`, role, repoDir, home,
+    const result = await runClaudeStage({ approved, id: `${runId}-${role}`, role, repoDir, home, authentication,
       prompt, sessionId, config: { ...adapter.agentConfig, ...config,
         env: { ...homeEnv, ...adapter.agentConfig?.env, ...config.env } },
       ledger, limits, transcriptDir: artifacts, timeoutMs: role === 'consumer' ? timeoutMs : 120_000,
@@ -47,12 +50,12 @@ export async function runWorkflow({ conditionId, scenario, runId, outDir, ledger
     return result;
   };
   try {
-    homeEnv = prepareClaudeHome(home, { credentialFile });
+    homeEnv = prepareClaudeHome(home, { credentialFile, authentication });
     createFixture(repoDir, homeEnv);
     originalCode = fileHash(path.join(repoDir, 'lib/invoice.mjs'));
     shippingHash = fileHash(path.join(repoDir, 'lib/shipping.mjs'));
     telemetry = createTelemetry({ repoDir });
-    adapter = await prepareCondition({ id: conditionId, repoDir, home, ledger, releasedRoot, improvedRoot, claudeMem, protocol });
+    adapter = await prepareCondition({ id: conditionId, repoDir, home, ledger, releasedRoot, improvedRoot, claudeMem, protocol, authentication });
     row.configuration = adapter.metadata;
     if (adapter.metadata?.paidReady === false) {
       row.notMeasured = adapter.metadata.reason || 'Adapter not ready for bounded paid execution';
@@ -76,7 +79,7 @@ export async function runWorkflow({ conditionId, scenario, runId, outDir, ledger
     // activity cannot use the funds needed for the pending producer update.
     for (const role of ['consumer', 'producer-update']) {
       ledger.reserve({ id: `${runId}-${role}`, kind: `agent:${role}`, maxUsd: stageReserve,
-        meta: { model: limits.model, stageBudgetUsd: limits.stageBudgetUsd, pricing: limits.priceSource, prepaid: true } });
+        meta: { model: limits.model, stageBudgetUsd: limits.stageBudgetUsd, pricing: limits.priceSource, prepaid: true, authMethod: auth.method } });
       preReservedRoles.add(role);
     }
     const gateServer = { command: process.execPath, args: [path.join(HERE, 'gate.mjs'), gatePath] };
@@ -281,6 +284,9 @@ async function main() {
   if (conditions.includes('klypix-released') && !releasedRoot) throw new Error('--released-root must identify the exact released source build');
   const credentialFile = opt('credential-file');
   const claudeMem = opt('claude-mem-config') ? JSON.parse(fs.readFileSync(opt('claude-mem-config'), 'utf8')) : {};
+  const authentication = await loadBenchmarkAuthentication({ method: opt('auth-method', 'subscription'), apiKeyPipe: opt('api-key-pipe') });
+  try {
+  authentication?.assertPublic({ limits, claudeMem, credentialFile, outDir, ledgerPath, protocolRevision });
   const output = path.join(outDir, 'results.jsonl');
   if (fs.existsSync(output) && fs.statSync(output).size) throw new Error('Use a new output directory; paid retries must never replace prior outcomes');
   const correctedRepetitions = Number(opt('corrected-repetitions', '3'));
@@ -304,14 +310,15 @@ async function main() {
       personal: 'At least 7 of 8 source-supported answers, zero unsupported claims, all seven sessions completed; one replay per condition',
       continuation: 'At least 30% fewer stale-policy-correct code revisions than strongest notes control, no final-accuracy regression, at most 10% higher total model cost; complete matched data required; zero baseline rework means no demonstrated advantage' },
     releasedRoot, improvedRoot: ROOT, integration: 'same-host controlled active-session update; no cross-tool ranking claim',
-    budgetBasis: 'CLI API-equivalent estimates including observer; actual subscription invoice unknown',
+    authentication: authenticationMetadata(authentication),
+    budgetBasis: 'CLI API-equivalent estimates including observer; provider invoice not independently queried',
     nativeSessionPersistence: true, sourceHashes: Object.fromEntries(fs.readdirSync(HERE).filter(f => f.endsWith('.mjs')).map(f => [f, fileHash(path.join(HERE, f))])) });
   const { attempted, stopReason } = await runPlanRows(plan, { ledger,
     reserveFor: ({ block }) => reservePerStage * (block === 'early-change' ? 2 : 1),
     execute: async ({ block, scenario, conditionId, repetition }) => {
     const runId = `${scenario?.id || block}-${conditionId}-r${repetition}-${crypto.randomUUID().slice(0, 8)}`;
     const common = { conditionId, scenario, runId, outDir, ledger, limits, approved: true,
-      releasedRoot, improvedRoot: ROOT, credentialFile, claudeMem, protocol };
+      releasedRoot, improvedRoot: ROOT, credentialFile, claudeMem, protocol, authentication };
     const row = block === 'early-change' ? await runWorkflow(common) : await runPersonalReplay(common);
     row.repetition = repetition;
     return row;
@@ -322,6 +329,7 @@ async function main() {
   writeJson(path.join(outDir, 'run-summary.json'), { attempted, planned: plan.length, stopReason,
     notStarted: planned.slice(attempted).map(item => ({ ...item, outcomeCategory: 'not-started', reason: stopReason })), budget: ledger.snapshot() });
   if (stopReason) console.log(`Stopped: ${stopReason}. Remaining planned rows are recorded as not started.`);
+  } finally { authentication?.dispose(); }
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

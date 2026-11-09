@@ -5,6 +5,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { resolveCli, parseClaudeResult, claudeAllowedTools } from '../coordination/agents.mjs';
 import { freshEnvironment } from './isolation.mjs';
 import { preparePassiveAudit } from './passive-audit.mjs';
+import { authenticationMetadata, spawnEnvironment } from './auth.mjs';
 
 export const normalized = text => String(text || '').replace(/\s+/g, ' ').trim();
 
@@ -33,13 +34,17 @@ export function inspectClaude() {
     loggedIn: status.loggedIn === true, authMethod: status.authMethod || null, apiProvider: status.apiProvider || null };
 }
 
-export function prepareClaudeHome(home, { credentialFile = null } = {}) {
+export function prepareClaudeHome(home, { credentialFile = null, authentication = null } = {}) {
+  const auth = authenticationMetadata(authentication);
   const config = path.join(home, '.claude');
   fs.mkdirSync(config, { recursive: true });
   fs.mkdirSync(path.join(home, 'tmp'), { recursive: true });
+  if (auth.method === 'api-key' && fs.existsSync(path.join(config, '.credentials.json'))) {
+    throw new Error('API-key benchmark requires a fresh home without OAuth credentials');
+  }
   // Copy auth only, never the user's rules/settings/hooks/history. Contents are
   // never printed or embedded in any artifact. Caller owns and removes home.
-  if (credentialFile) {
+  if (credentialFile && auth.method === 'subscription') {
     const real = fs.realpathSync(home);
     const rel = path.relative(os.tmpdir(), real);
     if (!rel || rel.startsWith('..') || path.isAbsolute(rel)
@@ -99,8 +104,11 @@ export function isNormalMemoryRetrieval(response) {
 }
 
 export async function runClaudeStage({ approved, id, role, repoDir, home, prompt, sessionId,
-  config = {}, ledger, limits, transcriptDir, timeoutMs = 300_000, onEvent = null, onAuditReady = null, preReserved = false }) {
+  config = {}, ledger, limits, transcriptDir, timeoutMs = 300_000, onEvent = null, onAuditReady = null, preReserved = false,
+  authentication = null }) {
   if (approved !== true) throw new Error('First paid run requires root budget review; no model call started');
+  const auth = authenticationMetadata(authentication);
+  authentication?.assertPublic({ config, prompt, id, role, sessionId, limits });
   const cli = resolveCli('claude');
   if (!cli) throw new Error('Claude CLI unavailable');
   const audit = preparePassiveAudit({ home, repoDir, sessionId, settings: config.settings });
@@ -111,7 +119,7 @@ export async function runClaudeStage({ approved, id, role, repoDir, home, prompt
     if (!prior || prior.status !== 'reserved' || prior.maxCents < Math.ceil(maximum * 100)) throw new Error('Missing sufficient prepaid stage reservation');
     if (ledger.snapshot().halted) throw new Error('Budget accounting halted before prepaid stage start');
   } else ledger.reserve({ id, kind: `agent:${role}`, maxUsd: maximum,
-    meta: { model: limits.model, stageBudgetUsd: limits.stageBudgetUsd, pricing: limits.priceSource, basis: 'CLI API-equivalent estimate; subscription invoice unknown' } });
+    meta: { model: limits.model, stageBudgetUsd: limits.stageBudgetUsd, pricing: limits.priceSource, authMethod: auth.method, basis: 'CLI-reported API-equivalent estimate; provider invoice not independently queried' } });
   const mcpServers = config.mcpServers || {};
   fs.mkdirSync(transcriptDir, { recursive: true });
   const mcpFile = path.join(transcriptDir, `${id}.mcp.json`);
@@ -136,7 +144,8 @@ export async function runClaudeStage({ approved, id, role, repoDir, home, prompt
   const telemetryErrors = [];
   const observedResults = new Set();
   const result = await new Promise(resolve => {
-    const child = spawn(cli.command, args, { cwd: repoDir, env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn(cli.command, args, { cwd: repoDir, env: spawnEnvironment(env, authentication), windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    const stdoutRedactor = authentication?.streamRedactor(), stderrRedactor = authentication?.streamRedactor();
     const kill = () => {
       if (process.platform === 'win32') spawnSync('taskkill', ['/T', '/F', '/PID', String(child.pid)], { windowsHide: true, stdio: 'ignore' });
       else child.kill('SIGKILL');
@@ -151,17 +160,24 @@ export async function runClaudeStage({ approved, id, role, repoDir, home, prompt
       try { if (!telemetryErrors.length) onEvent?.(event); }
       catch (error) { telemetryErrors.push(`Event observer failed: ${error.message}`); }
     };
-    child.stdout.on('data', chunk => {
-      const text = chunk.toString(); stdout += text; fs.appendFileSync(stdoutFile, text); pending += text;
+    const acceptStdout = text => {
+      stdout += text; fs.appendFileSync(stdoutFile, text); pending += text;
       let newline;
       while ((newline = pending.indexOf('\n')) >= 0) {
         const line = pending.slice(0, newline); pending = pending.slice(newline + 1);
         observeLine(line);
       }
-    });
-    child.stderr.on('data', chunk => { const text = chunk.toString(); stderr += text; fs.appendFileSync(stderrFile, text); });
+    };
+    const acceptStderr = text => { stderr += text; fs.appendFileSync(stderrFile, text); };
+    child.stdout.on('data', chunk => acceptStdout(stdoutRedactor ? stdoutRedactor.write(chunk) : chunk.toString()));
+    child.stderr.on('data', chunk => acceptStderr(stderrRedactor ? stderrRedactor.write(chunk) : chunk.toString()));
     child.on('error', error => { clearTimeout(timer); resolve({ code: null, error: error.message }); });
-    child.on('close', code => { clearTimeout(timer); if (pending.trim()) observeLine(pending); resolve({ code }); });
+    child.on('close', code => {
+      clearTimeout(timer);
+      if (stdoutRedactor) acceptStdout(stdoutRedactor.end());
+      if (stderrRedactor) acceptStderr(stderrRedactor.end());
+      if (pending.trim()) observeLine(pending); resolve({ code });
+    });
     child.stdin.end(prompt);
   });
   const parsed = parseClaudeResult(stdout);
@@ -190,5 +206,6 @@ export async function runClaudeStage({ approved, id, role, repoDir, home, prompt
     stdoutFile, stderrFile, auditDirectory, sessionId, telemetryErrors,
     nativeAuditFinalized: nativeAudit?.finalized === true,
     pendingNativeResults: nativeAudit?.pending?.map(call => ({ toolUseId: call.toolUseId, tool: call.tool })) || [],
-    error: result.error || parsed.resultError || telemetryErrors[0] || (unpricedModel ? 'Unpriced side model appeared; review required before more paid work' : null), unpricedModel };
+    error: result.error || parsed.resultError || telemetryErrors[0] || (unpricedModel ? 'Unpriced side model appeared; review required before more paid work' : null), unpricedModel,
+    authentication: auth };
 }

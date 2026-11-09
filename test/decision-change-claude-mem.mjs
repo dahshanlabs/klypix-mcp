@@ -3,14 +3,14 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { BudgetLedger } from '../bench/decision-change/ledger.mjs';
 import { createObserverBudgetBroker, observerWrapperSource, isolatedEnvironment,
   observerReservationUsd, OBSERVER_MODEL, claudeMemSettings, prepareClaudeMem, seedDefaultEmbeddingCache } from '../bench/decision-change/claude-mem.mjs';
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-cmem-adapter-test-'));
 let index = 0;
-async function runWrapper({ body, limit = 10, armBudget = 5, model = OBSERVER_MODEL }) {
+async function runWrapper({ body, limit = 10, armBudget = 5, model = OBSERVER_MODEL, args, bunPath }) {
   const dir = path.join(root, String(++index)); fs.mkdirSync(dir);
   const ledger = new BudgetLedger(path.join(dir, 'ledger.jsonl'), { limitUsd: limit });
   const broker = await createObserverBudgetBroker({ ledger, totalBudgetUsd: armBudget });
@@ -19,8 +19,16 @@ async function runWrapper({ body, limit = 10, armBudget = 5, model = OBSERVER_MO
   fs.writeFileSync(fake, `import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(marker)}, JSON.stringify({args:process.argv.slice(2),outputCap:process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS,haiku:process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL,sonnet:process.env.ANTHROPIC_DEFAULT_SONNET_MODEL}));\n${body}`);
   fs.writeFileSync(wrapper, observerWrapperSource({ command: process.execPath, prefixArgs: [fake], model: OBSERVER_MODEL,
     brokerUrl: broker.url, brokerToken: broker.token }));
+  let command = process.execPath, prefix = [wrapper];
+  if (bunPath) {
+    command = path.join(dir, process.platform === 'win32' ? 'wrapper.exe' : 'wrapper'); prefix = [];
+    const build = spawnSync(bunPath, ['build', '--compile', wrapper, '--outfile', command], {
+      cwd: dir, env: isolatedEnvironment(dir), encoding: 'utf8', windowsHide: true, timeout: 180_000,
+    });
+    assert.equal(build.status, 0, 'Explicit test-only Bun must compile the fake observer proxy');
+  }
   const output = await new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [wrapper, '--model', model, '--output-format', 'stream-json'], {
+    const child = spawn(command, [...prefix, ...(args || ['--model', model, '--output-format', 'stream-json'])], {
       env: isolatedEnvironment(dir), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
     });
     let stdout = '', stderr = '';
@@ -74,6 +82,42 @@ try {
   assert.equal(success.marker.haiku, 'claude-haiku-5-5');
   assert.equal(success.marker.sonnet, 'claude-sonnet-5-5');
   assert.equal(JSON.parse(success.stdout).total_cost_usd, 0.12, 'The SDK stream remains unchanged');
+
+  // The pinned SDK emits --model=haiku (Mr at bundle offset 4011693),
+  // while its base format flags remain split tokens. Keep its argv intact.
+  const sdkArgs = ['--output-format', 'stream-json', '--verbose', '--input-format', 'stream-json', '--model=haiku'];
+  const sdk = await runWrapper({ args: sdkArgs, body: `console.log(JSON.stringify({type:'result',total_cost_usd:0.12,modelUsage:{'claude-haiku-5-5':{}}}));` });
+  assert.equal(sdk.code, 0, sdk.stderr); assert.equal(sdk.ledger.spentCents, 12);
+  assert.deepEqual(sdk.marker.args.slice(0, sdkArgs.length), sdkArgs, 'Native SDK argument form is forwarded unchanged');
+  const equals = await runWrapper({ args: ['--model=haiku', '--output-format=stream-json'],
+    body: `console.log(JSON.stringify({type:'result',total_cost_usd:0.12}));` });
+  assert.equal(equals.code, 0, equals.stderr);
+  for (const args of [
+    ['--output-format=stream-json'], ['--model=', '--output-format=stream-json'],
+    ['--model', '--output-format=stream-json'], ['--model=unknown-model', '--output-format=stream-json'],
+    ['--model=haiku', '--model=haiku', '--output-format=stream-json'],
+    ['--model=haiku', '--model', 'sonnet', '--output-format=stream-json'],
+    ['--model', 'haiku', '--model', 'sonnet', '--output-format', 'stream-json'],
+    ['--model=haiku', '--input-format=stream-json'],
+    ['--model=haiku', '--output-format=json', '--input-format=stream-json'],
+    ['--model=haiku', '--output-format=stream-json', '--output-format', 'stream-json'],
+    [...sdkArgs, '--max-budget-usd=999'], [...sdkArgs, '--max-budget-usd', '999'],
+    ['--', ...sdkArgs],
+  ]) {
+    const rejected = await runWrapper({ args, body: `console.log('must not run');` });
+    assert.notEqual(rejected.code, 0); assert.equal(rejected.marker, null);
+    assert.equal(rejected.ledger.reservations.length, 0, 'Invalid/ambiguous options are refused before any reservation or child');
+  }
+  if (process.env.KLYPIX_TEST_BUN) {
+    const compiled = await runWrapper({ args: sdkArgs, bunPath: process.env.KLYPIX_TEST_BUN,
+      body: `console.log(JSON.stringify({type:'result',total_cost_usd:0.12,modelUsage:{'claude-haiku-5-5':{}}}));` });
+    assert.equal(compiled.code, 0, compiled.stderr); assert.equal(compiled.ledger.spentCents, 12);
+    assert.deepEqual(compiled.marker.args.slice(0, sdkArgs.length), sdkArgs, 'Actual Bun-compiled proxy accepts the pinned SDK form');
+    const rejected = await runWrapper({ args: [...sdkArgs, '--model=sonnet'], bunPath: process.env.KLYPIX_TEST_BUN,
+      body: `console.log('must not run');` });
+    assert.notEqual(rejected.code, 0); assert.equal(rejected.marker, null);
+    assert.equal(rejected.ledger.reservations.length, 0, 'Compiled proxy rejects ambiguous models before reserving');
+  }
 
   const exhausted = await runWrapper({ limit: 1, body: `console.log(JSON.stringify({type:'result',total_cost_usd:0}));` });
   assert.notEqual(exhausted.code, 0); assert.equal(exhausted.marker, null, 'No child runs before reservation');

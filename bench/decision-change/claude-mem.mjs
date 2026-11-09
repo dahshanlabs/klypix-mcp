@@ -211,17 +211,18 @@ export function observerWrapperSource(config) {
 const config=${JSON.stringify({ ...config, aliases: OBSERVER_MODEL_ALIASES, pricedModels: Object.keys(OBSERVER_ENVELOPES), fastModel: OBSERVER_MODEL })};
 const args=process.argv.slice(2);
 const probe=(args.length===1&&['--version','-v','--help','-h'].includes(args[0]))||(JSON.stringify(args)===JSON.stringify(['--permission-mode','dontAsk','--version']))||(args[0]==='auth'&&args[1]==='status'&&args.slice(2).every(a=>a==='--json'));
+function singleOption(name){const values=[];for(let i=0;i<args.length;i++){if(args[i]===name){const value=args[++i];if(!value||value.startsWith('-'))throw Error('Missing observer option value: '+name);values.push(value);}else if(args[i].startsWith(name+'='))values.push(args[i].slice(name.length+1));}if(values.length!==1||!values[0]||values[0].startsWith('-'))throw Error('Missing or ambiguous observer option: '+name);return values[0];}
 async function post(route,body){const r=await fetch(config.brokerUrl+route,{method:'POST',headers:{authorization:'Bearer '+config.brokerToken,'content-type':'application/json'},body:JSON.stringify(body),signal:AbortSignal.timeout(10000)});const v=await r.json();if(!r.ok)throw Error(v.error||'Observer budget denied');return v;}
 let child,grant,known=false,cost=null,inFlight=true,chain=Promise.resolve(),lastResult=false,accountingFailed=false;
 try {
  if(probe){child=spawn(config.command,[...(config.prefixArgs||[]),...args],{env:process.env,stdio:'inherit',windowsHide:true});child.on('error',()=>process.exit(1));child.on('close',code=>process.exit(code??1));}
  else {
-  const modelIndex=args.indexOf('--model');
-  const requestedModel=args[modelIndex+1], model=config.aliases[requestedModel]||requestedModel;
-  if(modelIndex<0||!config.pricedModels.includes(model))throw Error('Unpriced observer model refused');
+  if(args.includes('--'))throw Error('Unexpected observer option terminator');
+  const requestedModel=singleOption('--model'), model=config.aliases[requestedModel]||requestedModel;
+  if(!config.pricedModels.includes(model))throw Error('Unpriced observer model refused');
   const allowedModels=[model,config.fastModel];
   if(args.some(a=>a==='--max-budget-usd'||a.startsWith('--max-budget-usd=')))throw Error('Unexpected observer budget flag');
-  if(!args.includes('stream-json'))throw Error('Observer requires stream-json cost receipts');
+  if(singleOption('--output-format')!=='stream-json')throw Error('Observer requires stream-json cost receipts');
   grant=await post('/reserve',{pid:process.pid,model});
   const childEnv={...process.env,ANTHROPIC_DEFAULT_HAIKU_MODEL:config.aliases.haiku,ANTHROPIC_DEFAULT_SONNET_MODEL:config.aliases.sonnet,ANTHROPIC_SMALL_FAST_MODEL:config.fastModel};
   delete childEnv.CLAUDE_CODE_MAX_OUTPUT_TOKENS;

@@ -1,0 +1,150 @@
+{
+  "schema": 1,
+  "kind": "native-observer-api-setup-diagnostic-outcome",
+  "version": "native-observer-api-setup-probe-v3",
+  "runId": "native-observer-api-setup-915c9d50-50a2-46ad-a437-1d5aabe5d18d",
+  "sourceRevision": "eaa5ebd4d6fb9e6b0a4631356128771da46690d2",
+  "protocolRevision": "ec5960923c48a4799b9353a9490c11084f6b5d00",
+  "startedAt": "2026-11-09T12:14:37.065Z",
+  "finishedAt": "2026-11-09T12:16:04.468Z",
+  "originalSuccess": true,
+  "independentVerificationPassed": true,
+  "classification": "native-api-setup-verified-not-benchmark",
+  "benchmarkTrial": false,
+  "comparisonWinner": null,
+  "fifthMatrixStarted": false,
+  "passMarksChanged": false,
+  "defaultsWeakened": false,
+  "authentication": {
+    "method": "api-key",
+    "transport": "DPAPI at rest; current-user Windows named pipe; spawn-only environment"
+  },
+  "originalGates": {
+    "noManualSave": true,
+    "ordinaryProducerToolWork": true,
+    "producerQueueDrained": true,
+    "automaticObservation": true,
+    "nativeSearchFindsObservation": true,
+    "defaultSemanticRoundTrip": true,
+    "consumerMemoryOnly": true,
+    "consumerRetrievedSameObservation": true,
+    "consumerAnswer": true,
+    "consumerQueueDrained": true,
+    "dependenciesHealthy": true,
+    "accountingComplete": true,
+    "noObserverTransportErrors": true,
+    "ownCleanup": true,
+    "apiAuthentication": true
+  },
+  "originalFailure": null,
+  "gateCounts": {
+    "passed": 15,
+    "failed": 0,
+    "notReached": 0
+  },
+  "observed": {
+    "automaticSupportingObservations": 2,
+    "linkedRetrievedObservations": 2,
+    "automaticObservationIds": [
+      1,
+      2
+    ],
+    "defaultSemanticRoundTrip": true,
+    "semanticHitProvenance": "Default native search does not identify whether each hit was lexical or semantic; no vector-hit claim.",
+    "observerDiagnosticCounts": {
+      "Observer launch refused:": 0,
+      "Observer accounting stopped:": 0,
+      "Observer final cost unavailable": 0,
+      "Generator paused for transport": 0,
+      "SDK stream ended without a result": 0
+    },
+    "stages": [
+      {
+        "role": "setup-producer",
+        "model": "claude-haiku-5-5",
+        "authentication": {
+          "method": "api-key",
+          "transport": "DPAPI at rest; current-user Windows named pipe; spawn-only environment"
+        },
+        "completed": true,
+        "nativeAuditFinalized": true,
+        "pendingResults": 0,
+        "telemetryErrorCount": 0,
+        "costUsd": 0.005036485,
+        "stdoutSha256": "6e0daf0ac0ee3456fdedbb84260f487cad6d05ace7bc7870a7b6b880f9d3524c"
+      },
+      {
+        "role": "setup-consumer",
+        "model": "claude-haiku-5-5",
+        "authentication": {
+          "method": "api-key",
+          "transport": "DPAPI at rest; current-user Windows named pipe; spawn-only environment"
+        },
+        "completed": true,
+        "nativeAuditFinalized": true,
+        "pendingResults": 0,
+        "telemetryErrorCount": 0,
+        "costUsd": 0.0025737200000000003,
+        "stdoutSha256": "9996ba4bbab2fe82ba1fbb0ffd93d00c184a4226a28a63ddeccfa484ffadb69b"
+      }
+    ]
+  },
+  "accounting": {
+    "asOf": "2026-11-09T12:16:04.468Z",
+    "allObservedCostsKnownAndSettled": true,
+    "previousFourExperimentsApiEquivalentUsd": 0.16204134,
+    "previousFailedSubscriptionSetupApiEquivalentUsd": 0.004952850000000001,
+    "previousFailedApiSetupUsageEstimateUsd": 0.009019665,
+    "thisApiSetupUsageEstimateUsd": 0.009886540000000001,
+    "thisSetupChargedAgainstCapUsd": 0.04,
+    "foregroundApiUsageEstimateUsd": 0.007610205,
+    "observerApiUsageEstimateUsd": 0.002276335,
+    "globalKnownUsageEstimateUsd": 0.18590039500000002,
+    "globalChargedAgainstCapUsd": 0.39,
+    "aggregateCapUsd": 50,
+    "remainingConservativeAllowanceUsd": 49.61,
+    "settledLedgerReservations": 41,
+    "outstandingReservedUsd": 0,
+    "halted": false,
+    "basis": "API-key CLI usage estimates plus separately retained API-equivalent subscription estimates; provider invoices not independently reconciled.",
+    "reservationIds": [
+      "claude-mem-observer-b068d2f9-7a91-4299-b8da-15bfe85a11eb",
+      "claude-mem-observer-f34cbf02-ba8c-47bd-831d-4900fb31a6a4",
+      "native-observer-api-setup-915c9d50-50a2-46ad-a437-1d5aabe5d18d-setup-consumer",
+      "native-observer-api-setup-915c9d50-50a2-46ad-a437-1d5aabe5d18d-setup-producer"
+    ],
+    "pooledIntoBenchmarkScores": false
+  },
+  "cleanup": {
+    "nativeCloseReturned": true,
+    "workerPortClosed": true,
+    "knownProcessCount": 6,
+    "remainingKnownProcessCount": 0,
+    "copiedOAuthCredentials": false,
+    "temporaryEvidenceFoldersRetained": true
+  },
+  "priorEvidence": {
+    "publishedInterruptedExperiments": 4,
+    "priorBenchmarkAttemptsPreserved": 9,
+    "priorFailedSetupDiagnosticsPreserved": 2,
+    "priorSetupReceiptHashes": [
+      "513d564f4c06ef85a3cef64fca39dc1cd448fe5931ef9e0fee325a992c73632b",
+      "5fa9742801785e014253f5b2623e19fd742467f767c373fc972969af1fed6115"
+    ],
+    "comparisonStillRequiresSeparateFrozenMatrix": true
+  },
+  "inputHashes": {
+    "originalReceipt": "522cf576801e78a6ca9390bda8e03a1d3329aa9263385df16559bc46dd1f040b",
+    "probeScript": "6f73d6bcd8dae41b4410df4ae327f023db97372362c0450fc65d62f9617104b8",
+    "ledgerThroughThisProbe": "65209c1bb7940c14d6deda923a08d95cedf87ef859098525fd01126a5748251a",
+    "ledgerThroughThisProbeBytes": 23778,
+    "preProbeLedgerPrefix": "da1032f20ca1865684c87c3b9f4786bd033471023f1f32fc0c1a739b90cf2e6a",
+    "preProbeLedgerPrefixBytes": 21297,
+    "nativeAuditReconciliations": {
+      "setup-producer": "fe6869b528b9527efeb797fd255fa62dcbd326f19c93e936281165f3c48cffe2",
+      "setup-consumer": "4b658d002ea3ea95e78c7a582d5f53f7f18080f62111b1814a2c03ac2a0ef18d"
+    }
+  },
+  "sourceReceiptPreserved": true,
+  "sanitization": "Selected gate states, hashes, synthetic observation IDs and costs; no raw streams, configuration, credential locations or secrets."
+}

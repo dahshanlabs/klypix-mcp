@@ -1,0 +1,1183 @@
+{
+  "schema": 5,
+  "recordedAt": "2026-11-09T12:18:19.802Z",
+  "kind": "fifth-experiment-pre-run-freeze",
+  "experimentOrdinal": 5,
+  "experimentLabel": "observer-sdk-compatible-v1",
+  "measurementTransport": "native-audit-v3",
+  "authentication": {
+    "method": "api-key",
+    "transport": "DPAPI at rest; current-user Windows named pipe; spawn-only environment"
+  },
+  "sourceCommit": "eaa5ebd4d6fb9e6b0a4631356128771da46690d2",
+  "sourceTree": "b5672bc2cbc74d72b299c392ba7bd6ae58e48447",
+  "sourceClean": true,
+  "releasedCommit": "918329342562a2273b5e1877054d89096320eba2",
+  "priorProtocolCommit": "ec5960923c48a4799b9353a9490c11084f6b5d00",
+  "protocolCommit": "ec5960923c48a4799b9353a9490c11084f6b5d00",
+  "protocolAmendmentFile": "docs/benchmarks/2026-11-09-observer-sdk-compatible-amendment.md",
+  "protocolAmendmentPending": true,
+  "newExperimentModelCalls": 0,
+  "reviewedApiScope": {
+    "baseCommit": "a5d5a9777a72e28f0d94a0971fd40eba8dad761c",
+    "sourceCommit": "eaa5ebd4d6fb9e6b0a4631356128771da46690d2",
+    "files": [
+      "bench/decision-change/adapters.mjs",
+      "bench/decision-change/agent.mjs",
+      "bench/decision-change/auth.mjs",
+      "bench/decision-change/claude-mem.mjs",
+      "bench/decision-change/native-hooks.mjs",
+      "bench/decision-change/passive-audit.mjs",
+      "bench/decision-change/personal-run.mjs",
+      "bench/decision-change/run.mjs",
+      "bench/decision-change/self-test.mjs",
+      "test/decision-change-auth.mjs",
+      "test/decision-change-claude-mem.mjs"
+    ],
+    "sha256": "b60a83a28504834c0058ee83f45f3268d5de2fc81c55b102c5102bb3d0f24d0c"
+  },
+  "changesSinceFourthExperiment": [
+    "bench/decision-change/adapters.mjs",
+    "bench/decision-change/agent.mjs",
+    "bench/decision-change/auth.mjs",
+    "bench/decision-change/claude-mem.mjs",
+    "bench/decision-change/native-hooks.mjs",
+    "bench/decision-change/passive-audit.mjs",
+    "bench/decision-change/personal-run.mjs",
+    "bench/decision-change/run.mjs",
+    "bench/decision-change/self-test.mjs",
+    "test/decision-change-auth.mjs",
+    "test/decision-change-claude-mem.mjs"
+  ],
+  "priorDiagnostics": {
+    "docs/benchmarks/2026-11-09-interrupted-run.md": {
+      "sha256": "24bcb454adbac3d0d88edc2106e74ec9785030d4e0e8dea14b1151354d75d384",
+      "gitBlob": "b2fee9a610d574f01667560aec251e83d65e86da"
+    },
+    "docs/benchmarks/2026-11-09-interrupted-run.json": {
+      "sha256": "1edc7b9660ea8f6e39778a92b3d975a947359e88f9df10193698dc1aa8f98807",
+      "gitBlob": "896cdc1cc94951f8b361bacb657d31e434dc6959"
+    },
+    "docs/benchmarks/2026-11-09-native-audit-v1-result.md": {
+      "sha256": "24c909eb157c8c7463b09fd3d9cc648d2dfc0e8a87e3999b9fe128673d0ed7b5",
+      "gitBlob": "5bda2e1eb8cfe053fdd50fda3cf675dec64c4bbb"
+    },
+    "docs/benchmarks/2026-11-09-native-audit-v1-result.json": {
+      "sha256": "5410fa3056f9bb3a564df4068672b5ba8e2eab337dc3a0d862ef5c7f66f16182",
+      "gitBlob": "20f51399c059f98862311b6e7b09bf362f6219a1"
+    },
+    "docs/benchmarks/2026-11-09-native-audit-v2-result.md": {
+      "sha256": "39f24805034cc3e42c191b76f7a237f46504b5a442b26a763c2101779f12aa3f",
+      "gitBlob": "e031792f3a0e74bd4337b5585c6d236650bf183e"
+    },
+    "docs/benchmarks/2026-11-09-native-audit-v2-result.json": {
+      "sha256": "4656d015573de136799de923b90e0ac342ff147a749b452bc64a86ef1b9a3e38",
+      "gitBlob": "48ea17ead832153f2885bf0fb02ea19c1695b913"
+    },
+    "docs/benchmarks/2026-11-09-native-audit-v3-result.md": {
+      "sha256": "9c25b030627d9c78926c60905cb03001ca29ea9fbb94d2da19c45057c9f17520",
+      "gitBlob": "b1fb2ce2933b7608c88a3882db5c42b5d454abc1"
+    },
+    "docs/benchmarks/2026-11-09-native-audit-v3-result.json": {
+      "sha256": "5b971b2bb0423e7f530b6b296856f8b1304586719d90a5f5cc91a51386fae220",
+      "gitBlob": "7a607543509100f3d18a0fa17919e74dbdf17f23"
+    }
+  },
+  "priorAttemptCount": 9,
+  "priorAttempts": [
+    {
+      "ordinal": 1,
+      "runId": "unchanged-control-notes-notification-r1-8603721e",
+      "condition": "notes-notification",
+      "scenario": "unchanged-control",
+      "originalCategory": "exposure-unverified",
+      "originalSuccess": false,
+      "knownApiEquivalentUsd": 0.0072846199999999995
+    },
+    {
+      "ordinal": 1,
+      "runId": "corrected-decision-klypix-improved-r1-397aa6dc",
+      "condition": "klypix-improved",
+      "scenario": "corrected-decision",
+      "originalCategory": "accounting-ineligible",
+      "originalSuccess": false,
+      "knownApiEquivalentUsd": 0.02753595
+    },
+    {
+      "ordinal": 2,
+      "runId": "unchanged-control-notes-notification-r1-9d1b6f27",
+      "condition": "notes-notification",
+      "scenario": "unchanged-control",
+      "originalCategory": "pass",
+      "originalSuccess": true,
+      "knownApiEquivalentUsd": 0.01113393
+    },
+    {
+      "ordinal": 2,
+      "runId": "corrected-decision-klypix-improved-r1-3f15c10f",
+      "condition": "klypix-improved",
+      "scenario": "corrected-decision",
+      "originalCategory": "setup-not-measured",
+      "originalSuccess": false,
+      "knownApiEquivalentUsd": 0.0130822
+    },
+    {
+      "ordinal": 3,
+      "runId": "unchanged-control-notes-notification-r1-276714b2",
+      "condition": "notes-notification",
+      "scenario": "unchanged-control",
+      "originalCategory": "setup-not-measured",
+      "originalSuccess": false,
+      "knownApiEquivalentUsd": 0.00914283
+    },
+    {
+      "ordinal": 4,
+      "runId": "unchanged-control-notes-notification-r1-0156416c",
+      "condition": "notes-notification",
+      "scenario": "unchanged-control",
+      "originalCategory": "pass",
+      "originalSuccess": true,
+      "knownApiEquivalentUsd": 0.01148703
+    },
+    {
+      "ordinal": 4,
+      "runId": "corrected-decision-klypix-improved-r1-a3113ba4",
+      "condition": "klypix-improved",
+      "scenario": "corrected-decision",
+      "originalCategory": "pass",
+      "originalSuccess": true,
+      "knownApiEquivalentUsd": 0.025894600000000004
+    },
+    {
+      "ordinal": 4,
+      "runId": "personal-longitudinal-notes-native-r1-1a64537a",
+      "condition": "notes-native",
+      "scenario": null,
+      "originalCategory": "pass",
+      "originalSuccess": true,
+      "knownApiEquivalentUsd": 0.05222123
+    },
+    {
+      "ordinal": 4,
+      "runId": "unrelated-control-claude-mem-r1-154dfc08",
+      "condition": "claude-mem",
+      "scenario": "unrelated-control",
+      "originalCategory": "accounting-ineligible",
+      "originalSuccess": false,
+      "knownApiEquivalentUsd": 0.004258949999999999
+    }
+  ],
+  "billingDisclosure": "The fifth matrix uses Anthropic API-key billing for all five conditions and background observers. Foreground model and limits are unchanged; claude-mem retains its native Haiku/Sonnet observer tiers. Previous subscription usage remains separately labeled API-equivalent estimates. Provider invoices are not independently reconciled.",
+  "priorExperiments": [
+    {
+      "ordinal": 1,
+      "sourceCommit": "6788b78b867efa59a896144adcd1cddae5eb9c04",
+      "protocolCommit": "d238536627c480abea4c320219e1aa0287aac36c",
+      "attempted": 2,
+      "notStarted": 28,
+      "apiEquivalentUsd": 0.03482057,
+      "chargedAgainstBudgetUsd": 0.06,
+      "publishedReportFile": "docs/benchmarks/2026-11-09-interrupted-run.json",
+      "publishedReportSha256": "1edc7b9660ea8f6e39778a92b3d975a947359e88f9df10193698dc1aa8f98807",
+      "comparisonEligible": false
+    },
+    {
+      "ordinal": 2,
+      "sourceCommit": "fa306f0bda28e8026491729e373a93a78db2f8f9",
+      "protocolCommit": "ef80f2a6bd58c3b702621ffad32e13ab25d7beb6",
+      "attempted": 2,
+      "notStarted": 28,
+      "apiEquivalentUsd": 0.02421613,
+      "chargedAgainstBudgetUsd": 0.05,
+      "publishedReportFile": "docs/benchmarks/2026-11-09-native-audit-v1-result.json",
+      "publishedReportSha256": "5410fa3056f9bb3a564df4068672b5ba8e2eab337dc3a0d862ef5c7f66f16182",
+      "comparisonEligible": false
+    },
+    {
+      "ordinal": 3,
+      "sourceCommit": "86699a5b2de41823d1ae303e67966dde404bd50d",
+      "protocolCommit": "aff4814a0634c9df1fd2903fedbe67122b0b6f4f",
+      "attempted": 1,
+      "notStarted": 29,
+      "apiEquivalentUsd": 0.00914283,
+      "chargedAgainstBudgetUsd": 0.03,
+      "publishedReportFile": "docs/benchmarks/2026-11-09-native-audit-v2-result.json",
+      "publishedReportSha256": "4656d015573de136799de923b90e0ac342ff147a749b452bc64a86ef1b9a3e38",
+      "comparisonEligible": false
+    },
+    {
+      "ordinal": 4,
+      "sourceCommit": "7a0fd6026c293996e7762268d69ae9591c21d0f0",
+      "protocolCommit": "a9f5c93dddfd524e28f35971af5fbc5d530def7e",
+      "attempted": 4,
+      "notStarted": 26,
+      "apiEquivalentUsd": 0.09386181,
+      "chargedAgainstBudgetUsd": 0.15,
+      "publishedReportFile": "docs/benchmarks/2026-11-09-native-audit-v3-result.json",
+      "publishedReportSha256": "5b971b2bb0423e7f530b6b296856f8b1304586719d90a5f5cc91a51386fae220",
+      "comparisonEligible": false
+    }
+  ],
+  "setupDiagnostics": [
+    {
+      "receiptSha256": "513d564f4c06ef85a3cef64fca39dc1cd448fe5931ef9e0fee325a992c73632b",
+      "version": "native-observer-setup-probe-v1",
+      "runId": "native-observer-setup-01ff3142-4157-42b7-b5d5-156a197cb922",
+      "sourceRevision": "a5d5a9777a72e28f0d94a0971fd40eba8dad761c",
+      "protocolRevision": "479a45308778a2162cb80c5b2bf0ef86b59de486",
+      "scriptSha256": "f8b243dedc18bdc1ad5962a9529453f657ac644a46bd08c71265394a83447c3a",
+      "authentication": {
+        "method": "subscription"
+      },
+      "successful": false,
+      "newKnownApiEquivalentUsd": 0.004952850000000001,
+      "chargedAgainstBudgetUsd": 0.02,
+      "reservationIds": [
+        "claude-mem-observer-ee977e0a-de3b-4468-8c51-a4f533941e52",
+        "native-observer-setup-01ff3142-4157-42b7-b5d5-156a197cb922-setup-producer"
+      ],
+      "ledgerBaselineSha256": "888cc39f1dd2b3ea45de4bcef14d9c69157994da2893343fe649918a44a1ce4e",
+      "ledgerBaselineBytes": 17651,
+      "interpretation": "Earlier failed setup retained, not pooled into comparison scores"
+    },
+    {
+      "receiptSha256": "5fa9742801785e014253f5b2623e19fd742467f767c373fc972969af1fed6115",
+      "version": "native-observer-api-setup-probe-v2",
+      "runId": "native-observer-api-setup-b6065899-ede5-4da4-b87d-2381f9948cef",
+      "sourceRevision": "6a053eb3dee0894ba900220cf64558281cd63a98",
+      "protocolRevision": "299a84066b213f0ed1dc524fad7af0390925b421",
+      "scriptSha256": "4a0f5eb0f69e4abfc233c0308e600ad17b581521cafa0cfee65e816eb3579ff5",
+      "authentication": {
+        "method": "api-key",
+        "transport": "DPAPI at rest; current-user Windows named pipe; spawn-only environment"
+      },
+      "successful": false,
+      "newKnownApiEquivalentUsd": 0.009019665,
+      "chargedAgainstBudgetUsd": 0.04,
+      "reservationIds": [
+        "claude-mem-observer-2fbc1ec2-7ec0-4693-b529-a13df5bae538",
+        "claude-mem-observer-334d7762-5403-488a-b0a3-a8762abe56f9",
+        "native-observer-api-setup-b6065899-ede5-4da4-b87d-2381f9948cef-setup-consumer",
+        "native-observer-api-setup-b6065899-ede5-4da4-b87d-2381f9948cef-setup-producer"
+      ],
+      "ledgerBaselineSha256": "dc0c2d8df5eb5d5e3033478afa28c61a8c63ac97a10bd15785a28e3bb15b0e49",
+      "ledgerBaselineBytes": 18807,
+      "interpretation": "Earlier failed setup retained, not pooled into comparison scores"
+    },
+    {
+      "receiptSha256": "522cf576801e78a6ca9390bda8e03a1d3329aa9263385df16559bc46dd1f040b",
+      "version": "native-observer-api-setup-probe-v3",
+      "runId": "native-observer-api-setup-915c9d50-50a2-46ad-a437-1d5aabe5d18d",
+      "sourceRevision": "eaa5ebd4d6fb9e6b0a4631356128771da46690d2",
+      "protocolRevision": "ec5960923c48a4799b9353a9490c11084f6b5d00",
+      "scriptSha256": "6f73d6bcd8dae41b4410df4ae327f023db97372362c0450fc65d62f9617104b8",
+      "authentication": {
+        "method": "api-key",
+        "transport": "DPAPI at rest; current-user Windows named pipe; spawn-only environment"
+      },
+      "successful": true,
+      "newKnownApiEquivalentUsd": 0.009886540000000001,
+      "chargedAgainstBudgetUsd": 0.04,
+      "reservationIds": [
+        "claude-mem-observer-b068d2f9-7a91-4299-b8da-15bfe85a11eb",
+        "claude-mem-observer-f34cbf02-ba8c-47bd-831d-4900fb31a6a4",
+        "native-observer-api-setup-915c9d50-50a2-46ad-a437-1d5aabe5d18d-setup-consumer",
+        "native-observer-api-setup-915c9d50-50a2-46ad-a437-1d5aabe5d18d-setup-producer"
+      ],
+      "ledgerBaselineSha256": "da1032f20ca1865684c87c3b9f4786bd033471023f1f32fc0c1a739b90cf2e6a",
+      "ledgerBaselineBytes": 21297,
+      "interpretation": "Native setup verification only; not a comparison result"
+    }
+  ],
+  "setupDiagnostic": {
+    "receiptSha256": "522cf576801e78a6ca9390bda8e03a1d3329aa9263385df16559bc46dd1f040b",
+    "version": "native-observer-api-setup-probe-v3",
+    "runId": "native-observer-api-setup-915c9d50-50a2-46ad-a437-1d5aabe5d18d",
+    "sourceRevision": "eaa5ebd4d6fb9e6b0a4631356128771da46690d2",
+    "protocolRevision": "ec5960923c48a4799b9353a9490c11084f6b5d00",
+    "scriptSha256": "6f73d6bcd8dae41b4410df4ae327f023db97372362c0450fc65d62f9617104b8",
+    "authentication": {
+      "method": "api-key",
+      "transport": "DPAPI at rest; current-user Windows named pipe; spawn-only environment"
+    },
+    "successful": true,
+    "newKnownApiEquivalentUsd": 0.009886540000000001,
+    "chargedAgainstBudgetUsd": 0.04,
+    "reservationIds": [
+      "claude-mem-observer-b068d2f9-7a91-4299-b8da-15bfe85a11eb",
+      "claude-mem-observer-f34cbf02-ba8c-47bd-831d-4900fb31a6a4",
+      "native-observer-api-setup-915c9d50-50a2-46ad-a437-1d5aabe5d18d-setup-consumer",
+      "native-observer-api-setup-915c9d50-50a2-46ad-a437-1d5aabe5d18d-setup-producer"
+    ],
+    "ledgerBaselineSha256": "da1032f20ca1865684c87c3b9f4786bd033471023f1f32fc0c1a739b90cf2e6a",
+    "ledgerBaselineBytes": 21297,
+    "interpretation": "Native setup verification only; not a comparison result"
+  },
+  "baselineSharedLedger": {
+    "sha256": "65209c1bb7940c14d6deda923a08d95cedf87ef859098525fd01126a5748251a",
+    "byteLength": 23778,
+    "budgetLimitUsd": 50,
+    "knownApiEquivalentUsd": 0.18590039500000002,
+    "chargedAgainstBudgetUsd": 0.39,
+    "remainingConservativeBudgetUsd": 49.61,
+    "outstandingReservedUsd": 0,
+    "allReservationsSettledAndKnown": true,
+    "halted": false,
+    "oneGlobalBudgetContinues": true,
+    "reservationCountIncludingZeroCostAdministrativeHolds": 41,
+    "reservations": [
+      {
+        "id": "unchanged-control-notes-notification-r1-8603721e-producer-initial",
+        "kind": "agent:producer-initial",
+        "status": "settle",
+        "actualUsd": 0.004885779999999999,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "unchanged-control-notes-notification-r1-8603721e-consumer",
+        "kind": "agent:consumer",
+        "status": "settle",
+        "actualUsd": 0.00239884,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "unchanged-control-notes-notification-r1-8603721e-producer-update",
+        "kind": "agent:producer-update",
+        "status": "settle",
+        "actualUsd": 0,
+        "actualCents": 0,
+        "maxCents": 196
+      },
+      {
+        "id": "corrected-decision-klypix-improved-r1-397aa6dc-producer-initial",
+        "kind": "agent:producer-initial",
+        "status": "settle",
+        "actualUsd": 0.00476251,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "corrected-decision-klypix-improved-r1-397aa6dc-consumer",
+        "kind": "agent:consumer",
+        "status": "settle",
+        "actualUsd": 0.0139032,
+        "actualCents": 2,
+        "maxCents": 196
+      },
+      {
+        "id": "corrected-decision-klypix-improved-r1-397aa6dc-producer-update",
+        "kind": "agent:producer-update",
+        "status": "settle",
+        "actualUsd": 0.008870240000000001,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "administrative-hold-exposure-audit-20261109",
+        "kind": "administrative-hold",
+        "status": "settle",
+        "actualUsd": 0,
+        "actualCents": 0,
+        "maxCents": 4800
+      },
+      {
+        "id": "unchanged-control-notes-notification-r1-9d1b6f27-producer-initial",
+        "kind": "agent:producer-initial",
+        "status": "settle",
+        "actualUsd": 0.00270397,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "unchanged-control-notes-notification-r1-9d1b6f27-consumer",
+        "kind": "agent:consumer",
+        "status": "settle",
+        "actualUsd": 0.0051306699999999995,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "unchanged-control-notes-notification-r1-9d1b6f27-producer-update",
+        "kind": "agent:producer-update",
+        "status": "settle",
+        "actualUsd": 0.0032992900000000007,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "corrected-decision-klypix-improved-r1-3f15c10f-producer-initial",
+        "kind": "agent:producer-initial",
+        "status": "settle",
+        "actualUsd": 0.00539824,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "corrected-decision-klypix-improved-r1-3f15c10f-consumer",
+        "kind": "agent:consumer",
+        "status": "settle",
+        "actualUsd": 0.00768396,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "corrected-decision-klypix-improved-r1-3f15c10f-producer-update",
+        "kind": "agent:producer-update",
+        "status": "settle",
+        "actualUsd": 0,
+        "actualCents": 0,
+        "maxCents": 196
+      },
+      {
+        "id": "unchanged-control-notes-notification-r1-276714b2-producer-initial",
+        "kind": "agent:producer-initial",
+        "status": "settle",
+        "actualUsd": 0.00278069,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "unchanged-control-notes-notification-r1-276714b2-consumer",
+        "kind": "agent:consumer",
+        "status": "settle",
+        "actualUsd": 0.00276601,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "unchanged-control-notes-notification-r1-276714b2-producer-update",
+        "kind": "agent:producer-update",
+        "status": "settle",
+        "actualUsd": 0.00359613,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "unchanged-control-notes-notification-r1-0156416c-producer-initial",
+        "kind": "agent:producer-initial",
+        "status": "settle",
+        "actualUsd": 0.00282853,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "unchanged-control-notes-notification-r1-0156416c-consumer",
+        "kind": "agent:consumer",
+        "status": "settle",
+        "actualUsd": 0.00531952,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "unchanged-control-notes-notification-r1-0156416c-producer-update",
+        "kind": "agent:producer-update",
+        "status": "settle",
+        "actualUsd": 0.00333898,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "corrected-decision-klypix-improved-r1-a3113ba4-producer-initial",
+        "kind": "agent:producer-initial",
+        "status": "settle",
+        "actualUsd": 0.0048366600000000004,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "corrected-decision-klypix-improved-r1-a3113ba4-consumer",
+        "kind": "agent:consumer",
+        "status": "settle",
+        "actualUsd": 0.012840210000000003,
+        "actualCents": 2,
+        "maxCents": 196
+      },
+      {
+        "id": "corrected-decision-klypix-improved-r1-a3113ba4-producer-update",
+        "kind": "agent:producer-update",
+        "status": "settle",
+        "actualUsd": 0.008217730000000001,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "personal-longitudinal-notes-native-r1-1a64537a-personal-day-1",
+        "kind": "agent:personal-day-1",
+        "status": "settle",
+        "actualUsd": 0.0067788200000000005,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "personal-longitudinal-notes-native-r1-1a64537a-personal-day-2",
+        "kind": "agent:personal-day-2",
+        "status": "settle",
+        "actualUsd": 0.007839250000000002,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "personal-longitudinal-notes-native-r1-1a64537a-personal-day-3",
+        "kind": "agent:personal-day-3",
+        "status": "settle",
+        "actualUsd": 0.00775797,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "personal-longitudinal-notes-native-r1-1a64537a-personal-day-4",
+        "kind": "agent:personal-day-4",
+        "status": "settle",
+        "actualUsd": 0.008816599999999999,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "personal-longitudinal-notes-native-r1-1a64537a-personal-day-5",
+        "kind": "agent:personal-day-5",
+        "status": "settle",
+        "actualUsd": 0.008257730000000001,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "personal-longitudinal-notes-native-r1-1a64537a-personal-day-6",
+        "kind": "agent:personal-day-6",
+        "status": "settle",
+        "actualUsd": 0.00959094,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "personal-longitudinal-notes-native-r1-1a64537a-personal-recall",
+        "kind": "agent:personal-recall",
+        "status": "settle",
+        "actualUsd": 0.00317992,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "unrelated-control-claude-mem-r1-154dfc08-producer-initial",
+        "kind": "agent:producer-initial",
+        "status": "settle",
+        "actualUsd": 0.004258949999999999,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "administrative-hold-cmem-model-mapping-20261109",
+        "kind": "administrative-hold",
+        "status": "settle",
+        "actualUsd": 0,
+        "actualCents": 0,
+        "maxCents": 4971
+      },
+      {
+        "id": "native-observer-setup-01ff3142-4157-42b7-b5d5-156a197cb922-setup-producer",
+        "kind": "agent:setup-producer",
+        "status": "settle",
+        "actualUsd": 0.0039108500000000004,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "claude-mem-observer-ee977e0a-de3b-4468-8c51-a4f533941e52",
+        "kind": "observer",
+        "status": "settle",
+        "actualUsd": 0.0010420000000000002,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "native-observer-api-setup-b6065899-ede5-4da4-b87d-2381f9948cef-setup-producer",
+        "kind": "agent:setup-producer",
+        "status": "settle",
+        "actualUsd": 0.004153759999999999,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "claude-mem-observer-2fbc1ec2-7ec0-4693-b529-a13df5bae538",
+        "kind": "observer",
+        "status": "settle",
+        "actualUsd": 0.00170937,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "native-observer-api-setup-b6065899-ede5-4da4-b87d-2381f9948cef-setup-consumer",
+        "kind": "agent:setup-consumer",
+        "status": "settle",
+        "actualUsd": 0.0025509599999999997,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "claude-mem-observer-334d7762-5403-488a-b0a3-a8762abe56f9",
+        "kind": "observer",
+        "status": "settle",
+        "actualUsd": 0.000605575,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "native-observer-api-setup-915c9d50-50a2-46ad-a437-1d5aabe5d18d-setup-producer",
+        "kind": "agent:setup-producer",
+        "status": "settle",
+        "actualUsd": 0.005036485,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "claude-mem-observer-b068d2f9-7a91-4299-b8da-15bfe85a11eb",
+        "kind": "observer",
+        "status": "settle",
+        "actualUsd": 0.001693135,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "native-observer-api-setup-915c9d50-50a2-46ad-a437-1d5aabe5d18d-setup-consumer",
+        "kind": "agent:setup-consumer",
+        "status": "settle",
+        "actualUsd": 0.0025737200000000003,
+        "actualCents": 1,
+        "maxCents": 196
+      },
+      {
+        "id": "claude-mem-observer-f34cbf02-ba8c-47bd-831d-4900fb31a6a4",
+        "kind": "observer",
+        "status": "settle",
+        "actualUsd": 0.0005832,
+        "actualCents": 1,
+        "maxCents": 196
+      }
+    ],
+    "administrativeHolds": [
+      {
+        "id": "administrative-hold-exposure-audit-20261109",
+        "reservedUsd": 48,
+        "noPaidCall": true,
+        "settledUsd": 0
+      },
+      {
+        "id": "administrative-hold-cmem-model-mapping-20261109",
+        "reservedUsd": 49.71,
+        "noPaidCall": true,
+        "settledUsd": 0
+      }
+    ],
+    "accountingBasis": "CLI-reported API-equivalent prior subscription estimates and API setup usage estimates; provider invoices are not independently reconciled"
+  },
+  "registeredPlanSha256": "a0db7a9b3cc9801705f96c42c72bdb7f42d8225f5628b99ef396caa542970695",
+  "registeredPassMarksSha256": "047fde1f22f7f4764c52640a6e396ec6ea01c31e233514d75032be30b2bed975",
+  "registeredLimitsSha256": "8ee34022024b27383752e6ade2c04f47f021733eea609c72db75cc984741030e",
+  "originalExperimentFileSha256": "fbc5bc686eb2824e69878a92aedf2afa69b147667e4d550ce71f68a9ba1feef9",
+  "fourthExperimentFileSha256": "2a9375475635f39740a15794a7c0752e5762b237d0192de785e9542b72b78ea3",
+  "unchangedTaskAndLimitFiles": {
+    "bench/decision-change/scenarios.mjs": {
+      "originalGitBlob": "7ea39757fe35dd1697aa4a68efadc02b446de625",
+      "currentGitBlob": "7ea39757fe35dd1697aa4a68efadc02b446de625",
+      "unchanged": true
+    },
+    "bench/decision-change/personal-scenario.mjs": {
+      "originalGitBlob": "7e41bf801ee71274c0b98772f816a39d418ea76a",
+      "currentGitBlob": "7e41bf801ee71274c0b98772f816a39d418ea76a",
+      "unchanged": true
+    },
+    "bench/decision-change/pilot-limits.json": {
+      "originalGitBlob": "5aff18e336266768bf033d36567401256ab8978b",
+      "currentGitBlob": "5aff18e336266768bf033d36567401256ab8978b",
+      "unchanged": true
+    }
+  },
+  "runtimePassMarkDeclarationSha256": "bfd3d2164a49430802eb82db68fb05178b5ee6cd7a0cc8c0e751f2be4ef405d1",
+  "observation": {
+    "delivery": "Common passive PostToolBatch observer records exact serialized model-bound tool results",
+    "codeSnapshots": "Common passive PostToolUse and PostToolUseFailure observer records contemporaneous invoice file revisions",
+    "typedNonexecution": "After CLI exit only: exact final stdout session, assistant tool ID/name/input and serialized result binding plus is_error=true and typed user-rejected/reject-config metadata can resolve a pending missing completion as failed and not executed. No journal is read inside a hook.",
+    "livePending": "Unmatched native batches remain pending and are excluded from positive exposure and rework. Checkpoint continuation requires separately paired prior policy or valid native context. No final score is eligible before complete reconciliation.",
+    "proofPrivacy": "Only small matched final stdout provenance is retained; no thinking or unrelated messages are exported.",
+    "permissionPolicyChanged": false,
+    "unknownMissingCompletionsFailClosed": true,
+    "allConditionsIdentical": true,
+    "addsModelGuidance": false,
+    "changesVendorMemoryWorkflow": false,
+    "artifactLocation": "Fresh task-owned system temporary storage; final export occurs after execution"
+  },
+  "changedFileCount": 37,
+  "sourceFiles": {
+    "bench/decision-change/adapters.mjs": {
+      "rawSha256": "3258003eb97a4e8244c441f1c1b47bde27d4e499b8f5f2af2897c16de8940da4",
+      "lfNormalizedSha256": "a1db03a442d239ea8378a218b570a214b54cfa8236ca105bfde386348fdb40a0",
+      "gitBlob": "6ae457240e3f945cce33bec2771f5fd33bea5dfb"
+    },
+    "bench/decision-change/agent.mjs": {
+      "rawSha256": "a4e7f802499a0b51d8a23b711dc00a4aa6d8d7b3b9e7e790ccefe684e334f420",
+      "lfNormalizedSha256": "9ce824dd97e879939f26e845908e43bc699b9b5ddb55bf990c5af6bb5edd19d9",
+      "gitBlob": "45ddbb37cd586128b5cc188f75e2318589f796d8"
+    },
+    "bench/decision-change/auth.mjs": {
+      "rawSha256": "09dd95459d969b2425c7859cbdfe21796666244f7e60b008aa635396239d27c0",
+      "lfNormalizedSha256": "09dd95459d969b2425c7859cbdfe21796666244f7e60b008aa635396239d27c0",
+      "gitBlob": "4785252a1818929eec140bfa3e57771b6de0f528"
+    },
+    "bench/decision-change/claude-mem.mjs": {
+      "rawSha256": "b9dc4852ba741743b3f7cecc7200507669edbf76b3e4f256df697c6ccec3f701",
+      "lfNormalizedSha256": "823d2213726ef774cbd0b761bdd7571dd37c501e115d6d9dc0a269f3869f5a34",
+      "gitBlob": "7431690ca8d4bf02d31401fbf045ba6fc3ec1dfc"
+    },
+    "bench/decision-change/gate.mjs": {
+      "rawSha256": "b150b2988161ba110f1adfbac2e57af9a4cd661b416a4126349a631fe4d7fc6c",
+      "lfNormalizedSha256": "3c1e382faccb376c4b971694af87207d9ca6b4d349d5d8b971235d207e1e009e",
+      "gitBlob": "1ee72c9f9403aac85a4bf13a4a310e6cf0794dd0"
+    },
+    "bench/decision-change/isolation.mjs": {
+      "rawSha256": "d9fd3b5a4f8b2ff74a0ec10ed9c9f149c69caa21855f23da0fbd05c9b0679e97",
+      "lfNormalizedSha256": "140ef9afab8d6986a5b85c84406b2eb5836029a0213f208cff34858c5da927c0",
+      "gitBlob": "dc8f12e75c9f5f8549b88f671922b4c316b83e91"
+    },
+    "bench/decision-change/ledger.mjs": {
+      "rawSha256": "4b69ef977c4cc3bcef2f212a8f6db90eb76a6512a95f20b4233f968e3ffda61c",
+      "lfNormalizedSha256": "5b49f2837bde7760dcff5fd305215ac96ffc4e0477e0886aadfa26bc111eb229",
+      "gitBlob": "25e7f8bea3e0bc483d7844ff88b235ba1e18e997"
+    },
+    "bench/decision-change/metrics.mjs": {
+      "rawSha256": "43226be03f4c2022c5c44beabb2dbd61e51d5c98bb1f0a2624f68c8a65dd1be3",
+      "lfNormalizedSha256": "90de9355a1fb40fc634e99732c93b17ee981ff9432435b235b4ef205de922d9a",
+      "gitBlob": "8266003c14bd331a8926c42dc7caaf120afe52e1"
+    },
+    "bench/decision-change/native-hooks.mjs": {
+      "rawSha256": "2b4fe6fb00109e471bf8687b97bb405a148681fd62afa7661cb0c65c10f0a96d",
+      "lfNormalizedSha256": "fbdabc93e49c1908d31d0761359fe8f08f611da0478a4216c062b7386f783f0d",
+      "gitBlob": "bcd6b3227ecb2dcc569dd42a8e17f0ff60ffa4d1"
+    },
+    "bench/decision-change/notes-notify-hook.mjs": {
+      "rawSha256": "21371875c1ee847df36b5638e24a05b3008216b304556e018041f9e1f8eccfa8",
+      "lfNormalizedSha256": "5835c58c1635a55faed1e39bdba31fdcf34ec999584641d00910c8a59d4dd8e4",
+      "gitBlob": "f4f8f3b6873b6b86c6e8f0dfe23191872f034727"
+    },
+    "bench/decision-change/outcomes.mjs": {
+      "rawSha256": "cb62f16356fcb351a6f3256f1d2dd49457d0cfe8c7dca23a2216f0e17991bfcd",
+      "lfNormalizedSha256": "c8aced7e4473fa392b761b1ca76bdb904a2978ae4d73c4c3f542d28adc05588f",
+      "gitBlob": "18532757b8fa0bcf920061f09cb2f59a905dbbdb"
+    },
+    "bench/decision-change/passive-audit.mjs": {
+      "rawSha256": "739637d70febe4ceb3b0b136c600ea8ebb79450aa8d7d701424a29f6adc9fdfc",
+      "lfNormalizedSha256": "739637d70febe4ceb3b0b136c600ea8ebb79450aa8d7d701424a29f6adc9fdfc",
+      "gitBlob": "fbba825dc355cf2117c1f6525ac97b9af923e946"
+    },
+    "bench/decision-change/personal-run.mjs": {
+      "rawSha256": "e5169fab9602af861ba9c952bc076d2800882086ab859e8dabfbfe187c39c48d",
+      "lfNormalizedSha256": "674047cb94f594e5936966b9a4aa66757544a1962641d5600b0781ac1f0feee8",
+      "gitBlob": "74f34fcd43dfa10cdb83af3c28411b7291d63949"
+    },
+    "bench/decision-change/personal-scenario.mjs": {
+      "rawSha256": "20fc553f206a92481677e58fd208dab2b2227dbb2cb891903948963930f1073c",
+      "lfNormalizedSha256": "392848283b2fbd9d3a7e267ab41554227a1e39c092970571f2e6a29b1b2c4245",
+      "gitBlob": "7e41bf801ee71274c0b98772f816a39d418ea76a"
+    },
+    "bench/decision-change/pilot-limits.json": {
+      "rawSha256": "0891bc1cadf5f13904b0752723521dc69b38b5bce91656f2082b6a4e8f1ef04a",
+      "lfNormalizedSha256": "92779b75879898db9cf639527a2b57f09c651f33d15be7582378498d60ac54b8",
+      "gitBlob": "5aff18e336266768bf033d36567401256ab8978b"
+    },
+    "bench/decision-change/run.mjs": {
+      "rawSha256": "7e3e1f0b689ddf0b69603643e96c069f14677477833861b8081f9b88bfb739d2",
+      "lfNormalizedSha256": "43691f8338ecc87346103e1c8823ac82a6bf90dacd47dd08be320de492a10c40",
+      "gitBlob": "d6222a7f8ea64b65060b6d814c4c35c2ca6b2185"
+    },
+    "bench/decision-change/scenarios.mjs": {
+      "rawSha256": "68b62ba7a6161edd716580fef001b3d61046129b944588a669e9ce07a0056567",
+      "lfNormalizedSha256": "6be4f2d6efdfa37b606d068fac9887f85fa25fa08d7de5f3b9044e483cac6f02",
+      "gitBlob": "7ea39757fe35dd1697aa4a68efadc02b446de625"
+    },
+    "bench/decision-change/self-test.mjs": {
+      "rawSha256": "6401fe8ab387c8621bcee6ceaace9097695b8bb27e8408f44d7f04d7ef6d6542",
+      "lfNormalizedSha256": "a747652fec2611c92f5908400a25bfcbba927bf2c8887473813dcf683a6e9f1e",
+      "gitBlob": "d8768c7ea8deda7103e4e34734248fd9541f2ed1"
+    },
+    "bench/decision-change/test-passive-audit.mjs": {
+      "rawSha256": "d6e44c6b27008d5812e8900dcee419c3cbcb1ecf6731b684f88d95b8fb4e5858",
+      "lfNormalizedSha256": "d6e44c6b27008d5812e8900dcee419c3cbcb1ecf6731b684f88d95b8fb4e5858",
+      "gitBlob": "2e98a0be9256f6f88915048eeea891591ef0dfd2"
+    },
+    "bin/klypix-install.mjs": {
+      "rawSha256": "b0e2a8d5f635131995667b021d9557a311b145a01b91bf0042496803e55ba6ea",
+      "lfNormalizedSha256": "02ea527dbe39efd50dc23d97ceb9003c7d6398bddf80a97f50dceac595a0ee0e",
+      "gitBlob": "d51837d5d18d1762a011507c9a000e247975068e"
+    },
+    "bin/klypix-worker.mjs": {
+      "rawSha256": "d79d3b83cce72de4259e5a30fed79a3679012133a1c705fabe6660906676b8a3",
+      "lfNormalizedSha256": "ca49cecd0f142ab1241750decb5e7bfb5c3b346660cb4289fddebba579d6907d",
+      "gitBlob": "017d7b45b5bbc84a3991861ac1e84a00e0a37eda"
+    },
+    "docs/claude-mem-setup-audit-2026-11-08.md": {
+      "rawSha256": "0069c66ce95a49365f1dafd6c0ed3d3237dd265ab3ba5e431862ff475baf940b",
+      "lfNormalizedSha256": "e0eb4b8e0955b71a720e4d431902154498e5c73a1713fbebcb282a711e325dd8",
+      "gitBlob": "c66f9deed97b98e027d9e91b7433a3eddc99cd06"
+    },
+    "docs/decision-change-benchmark.md": {
+      "rawSha256": "5f50ebe52cde875c7685cf745510597dac8cc8f720f85bf9275846167ae9bb99",
+      "lfNormalizedSha256": "726a510062c6d08727d2e59b1a2a569290868b28d2bc55e5f609c9fa453de66f",
+      "gitBlob": "0700e6a191a2f8b7ee470362fc812d3081169576"
+    },
+    "docs/decision-watch.md": {
+      "rawSha256": "a46c08f2e0266fb72946712505db1886ea8a74824283b8bee6eb2e4a98649717",
+      "lfNormalizedSha256": "9a34888b21c79f3bbee5bbcb28275b63b70e7b5a6447974de9d517b92260d9b1",
+      "gitBlob": "acfc06ee4ebe00e18bf92971424663ab874f7ae7"
+    },
+    "docs/differentiation-review-2026-11-08.md": {
+      "rawSha256": "3b0476c5102a61dcd428f5a4e05b270da8c468a719fd2e950d1a869a108abf71",
+      "lfNormalizedSha256": "51df915409206176ea55ef5eaff5f21112f38111d7c85a4b971f359cb45a843f",
+      "gitBlob": "9c9046fa6f5d02a16826ab312698bcff652a8e8e"
+    },
+    "package.json": {
+      "rawSha256": "51cbf783238efb69b3400a28fdadd1d374ca6746e039f3cba94e1820b39e048c",
+      "lfNormalizedSha256": "108190e660e3bf4ed29c250cf266bdd1cf8dc771a422bf70fa4f77979e1d7d1a",
+      "gitBlob": "469aa0315441a8d5f123597108a02090df2532bf"
+    },
+    "src/codex-brain-hook.mjs": {
+      "rawSha256": "5e3f0826313510b7a6fdc868cf1cc90d284652434560dc6597ffe4b4f8495ba1",
+      "lfNormalizedSha256": "c3459068f871795f313ec7a1a25333e5ac10e77fb8cc6a4692a1d5062ab0a14c",
+      "gitBlob": "4867fe208f1f32442b3d053ce16a9f89331a84b5"
+    },
+    "src/decision-watch-boundary.mjs": {
+      "rawSha256": "1b7d494c13e27b4477585108144e51eaf973a9f3cc37b8844f4ba5d8a5a321eb",
+      "lfNormalizedSha256": "b8f54d77259a71f18d79939e54e473d2e2db8a7da509823a334c2201a851cf0d",
+      "gitBlob": "b64c8ce5382b7eb3a4b3cc6ad271dbfe25dbe4b9"
+    },
+    "src/decision-watch.mjs": {
+      "rawSha256": "02afd613356c05edb23fdee16d51ff22c2c649b75e7a359d7bf5a7963e791c91",
+      "lfNormalizedSha256": "0bc07c380632b58bb37e3ff3f7527ad33f72207bcc1a259658b58d20ddf20645",
+      "gitBlob": "ca1aa6c80e26025a57d31971c2d808124a8daab3"
+    },
+    "src/global-brain-hook.mjs": {
+      "rawSha256": "73c044aa7d2d12563dc9af17914f9d8c6339157f9a9467553f048c63db60dc2a",
+      "lfNormalizedSha256": "8514f0dddad4b8f12167f8ac0432868eb82175f781e1c22396e805cf0cd7803a",
+      "gitBlob": "ef356a15b52cad85fb429209e4ae5466510b07d3"
+    },
+    "src/klypix-core.mjs": {
+      "rawSha256": "7013efd8097d1783394740162d2b20206ed209ceaa288fc7f79fba77511d1fc1",
+      "lfNormalizedSha256": "e2ac2a25b64aca230e3bc0abedc5456b5763ce7812e8880d289e32123b4dddbf",
+      "gitBlob": "30ab0c215089fbd511e28b8c99c72403cee6d6c0"
+    },
+    "src/mcp-presence.mjs": {
+      "rawSha256": "7adfdfb412f5e7f7b2d08396139af8a9ef0b092fa672dffd2f8fe623a881151e",
+      "lfNormalizedSha256": "048dc8f91f905cb49b8582421ef2e1dbf83a4a8b94d38caeb96c495542035fe4",
+      "gitBlob": "f0cf1cde6b635bfba8fe3d981b6644f7f17f2b1b"
+    },
+    "test/_schema-additions.mjs": {
+      "rawSha256": "a7cbbb501765557c36136d66d0522558171121adda26bbea7c5940806d2a974a",
+      "lfNormalizedSha256": "5f16fd814fd31aadf1d1222d4465e8c1155fd3207e8857c0ad7a4fb89fc6e03a",
+      "gitBlob": "b05a8ae7993595f2e3dc2912e33b199eaca1cddc"
+    },
+    "test/decision-change-auth.mjs": {
+      "rawSha256": "36ce8e72ffede74f6e1652674c2b4f897a9dcfaf4bad42e9747b55af1b30160e",
+      "lfNormalizedSha256": "36ce8e72ffede74f6e1652674c2b4f897a9dcfaf4bad42e9747b55af1b30160e",
+      "gitBlob": "15e718ea35ee8b46ccc76fb743ca7d3be81d7d6b"
+    },
+    "test/decision-change-claude-mem.mjs": {
+      "rawSha256": "57221a1aa88fd80cb09bb5b4c24829b847c054a7f1a02ef7ce48a610dc08da99",
+      "lfNormalizedSha256": "a3db5a01b9ff85c1e8dc1a000ec5fa7d5973b7610bc421fb15d2b4b5c129cd14",
+      "gitBlob": "b527acb12d4bd5524420f265241b710ac6ac9049"
+    },
+    "test/decision-watch-hooks.mjs": {
+      "rawSha256": "89be4e41711003afdf09e7857c79d5e6e87193208d4d6ad12d6a7f1abd6be6aa",
+      "lfNormalizedSha256": "b27ee4e0e878839c67245ac27c618370d844a854cfd6259053fa6303d158e5a7",
+      "gitBlob": "fc3af4476f327b6e11c7b3b17dbc315e09866c33"
+    },
+    "test/decision-watch.mjs": {
+      "rawSha256": "88b6a912339414b000610f363946690cd09eafb27cca1e36dee36cbc853e9432",
+      "lfNormalizedSha256": "632db27fa25153d66d8b537246ad4506682b26a1f1224855f9cce5cdb31a9182",
+      "gitBlob": "58a9932ae803bd517c9da847a8b0fc8524838f5f"
+    }
+  },
+  "sourceFilesAggregateSha256": "9acaf5a48bf93930c04d238766e81e547bbbc0e624dd48dc1444ba6be5baf151",
+  "lineEndingNote": "Raw hashes bind working bytes; normalized hashes explain CRLF checkouts; Git blobs bind committed source. Earlier results stay intact.",
+  "foregroundLimits": {
+    "model": "claude-haiku-5-5",
+    "effort": "medium",
+    "stageBudgetUsd": 0.5,
+    "maxContextTokens": 1000000,
+    "maxOutputTokens": 128000,
+    "requestOutputLimitTokens": 4096,
+    "inputWorstUsdPerMillion": 1,
+    "outputUsdPerMillion": 2.5,
+    "geographyMultiplier": 1.1,
+    "priceSource": "https://platform.claude.com/docs/en/about-claude/pricing",
+    "limitsSource": "https://platform.claude.com/docs/en/models/overview",
+    "verifiedAt": "2026-11-08",
+    "accountingBasis": "CLI-reported API-equivalent estimates; actual subscription invoice unknown",
+    "reservationNote": "$0.50 process budget plus $1.452 worst extra call (full context and output; expensive cache write; geographic multiplier), rounded up to $1.96. The envelope does not rely on the smaller output environment setting."
+  },
+  "observer": {
+    "product": "claude-mem",
+    "version": "15.12.0",
+    "provider": "claude",
+    "defaultModel": "haiku",
+    "smartTier": "sonnet",
+    "aliases": {
+      "haiku": "claude-haiku-5-5",
+      "sonnet": "claude-sonnet-5-5"
+    },
+    "processCapUsd": 0.5,
+    "trialObserverEnvelopeUsd": 12.62,
+    "sharedGlobalLedger": true,
+    "nativeArgumentCompatibility": "Equals and split model/output arguments supported without changing native defaults or forwarding; invalid/ambiguous options still refused"
+  },
+  "cli": {
+    "readiness": "verified-static-no-model-calls",
+    "version": "2.1.319 (Claude Code)",
+    "sha256": "2e055732c9d03d22700d9046251a8370b673607bfcc9e4d16a1b0e8fb1345cbd",
+    "packageIntegrity": "sha512-wncPKSYL/zvjs84k7wZEj+IGQx/LjqQNhgnQhzDEibP0yAVBguAs4p8nBfFAEDbDdUc4Z2co+OaKZV1t02xINA==",
+    "packageTarball": "https://registry.npmjs.org/@anthropic-ai/claude-code-win32-x64/-/claude-code-win32-x64-2.1.319.tgz",
+    "sourceEvidenceSha256": "0bd080f6086a40e26d97d3be8991127cfd943a5968940738562159b8c57ef9e7",
+    "pricingRecognition": {
+      "models": [
+        "claude-haiku-5-5",
+        "claude-sonnet-5-5"
+      ],
+      "haikuUsdPerMillion": {
+        "input": 0.1,
+        "output": 0.5,
+        "cacheWrite5m": 0.125,
+        "cacheWrite1h": 0.2,
+        "cacheRead": 0.01,
+        "longPromptAboveTokens": 100000,
+        "longPrompt": {
+          "input": 0.5,
+          "output": 2.5,
+          "cacheWrite5m": 0.625,
+          "cacheWrite1h": 1,
+          "cacheRead": 0.05
+        }
+      },
+      "sonnetUsdPerMillion": {
+        "input": 2,
+        "output": 10,
+        "cacheWrite5m": 2.5,
+        "cacheWrite1h": 4,
+        "cacheRead": 0.1
+      },
+      "modelConfigSource": "https://code.claude.com/docs/en/model-config",
+      "pricingSource": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "verifiedFrom": "Published native executable bundled model catalog and tariff functions"
+    },
+    "budgetEnforcement": {
+      "guard": "limit !== undefined && !(spentThisProcess < limit)",
+      "spentThisProcess": "totalCostUSD - restoredCostUSD",
+      "mainLoopBreak": "budget_exhausted",
+      "resultSubtype": "error_max_budget_usd",
+      "nanFailsClosed": true,
+      "unknownModelPricing": "Default model tariff fallback with unknown marker; never automatically zero",
+      "scope": "Static verification only; no model/API invocation",
+      "managedPricing": "Trusted organization/embedding-host pricing can override list estimates; no local managed file or OS registry policy detected"
+    }
+  },
+  "protocol": "early-boundary-v2",
+  "seed": "decision-change-pilot-20261108",
+  "conditions": [
+    "klypix-released",
+    "klypix-improved",
+    "notes-native",
+    "notes-notification",
+    "claude-mem"
+  ],
+  "correctedRepetitions": 3,
+  "earlyTrials": 25,
+  "personalReplays": 5,
+  "sessionsPerPersonalReplay": 7,
+  "correlatedQuestionsPerReplay": 8,
+  "plan": [
+    {
+      "block": "early-change",
+      "case": "unchanged-control",
+      "condition": "notes-notification",
+      "repetition": 1
+    },
+    {
+      "block": "early-change",
+      "case": "corrected-decision",
+      "condition": "klypix-improved",
+      "repetition": 1
+    },
+    {
+      "block": "personal-longitudinal",
+      "case": null,
+      "condition": "notes-native",
+      "repetition": 1
+    },
+    {
+      "block": "early-change",
+      "case": "unrelated-control",
+      "condition": "claude-mem",
+      "repetition": 1
+    },
+    {
+      "block": "early-change",
+      "case": "unchanged-control",
+      "condition": "klypix-improved",
+      "repetition": 1
+    },
+    {
+      "block": "early-change",
+      "case": "corrected-decision",
+      "condition": "notes-native",
+      "repetition": 1
+    },
+    {
+      "block": "personal-longitudinal",
+      "case": null,
+      "condition": "claude-mem",
+      "repetition": 1
+    },
+    {
+      "block": "early-change",
+      "case": "unrelated-control",
+      "condition": "klypix-released",
+      "repetition": 1
+    },
+    {
+      "block": "early-change",
+      "case": "unchanged-control",
+      "condition": "notes-native",
+      "repetition": 1
+    },
+    {
+      "block": "early-change",
+      "case": "corrected-decision",
+      "condition": "claude-mem",
+      "repetition": 1
+    },
+    {
+      "block": "personal-longitudinal",
+      "case": null,
+      "condition": "klypix-released",
+      "repetition": 1
+    },
+    {
+      "block": "early-change",
+      "case": "unrelated-control",
+      "condition": "notes-notification",
+      "repetition": 1
+    },
+    {
+      "block": "early-change",
+      "case": "unchanged-control",
+      "condition": "claude-mem",
+      "repetition": 1
+    },
+    {
+      "block": "early-change",
+      "case": "corrected-decision",
+      "condition": "klypix-released",
+      "repetition": 1
+    },
+    {
+      "block": "personal-longitudinal",
+      "case": null,
+      "condition": "notes-notification",
+      "repetition": 1
+    },
+    {
+      "block": "early-change",
+      "case": "unrelated-control",
+      "condition": "klypix-improved",
+      "repetition": 1
+    },
+    {
+      "block": "early-change",
+      "case": "unchanged-control",
+      "condition": "klypix-released",
+      "repetition": 1
+    },
+    {
+      "block": "early-change",
+      "case": "corrected-decision",
+      "condition": "notes-notification",
+      "repetition": 1
+    },
+    {
+      "block": "personal-longitudinal",
+      "case": null,
+      "condition": "klypix-improved",
+      "repetition": 1
+    },
+    {
+      "block": "early-change",
+      "case": "unrelated-control",
+      "condition": "notes-native",
+      "repetition": 1
+    },
+    {
+      "block": "early-change",
+      "case": "corrected-decision",
+      "condition": "klypix-improved",
+      "repetition": 2
+    },
+    {
+      "block": "early-change",
+      "case": "corrected-decision",
+      "condition": "notes-native",
+      "repetition": 2
+    },
+    {
+      "block": "early-change",
+      "case": "corrected-decision",
+      "condition": "claude-mem",
+      "repetition": 2
+    },
+    {
+      "block": "early-change",
+      "case": "corrected-decision",
+      "condition": "klypix-released",
+      "repetition": 2
+    },
+    {
+      "block": "early-change",
+      "case": "corrected-decision",
+      "condition": "notes-notification",
+      "repetition": 2
+    },
+    {
+      "block": "early-change",
+      "case": "corrected-decision",
+      "condition": "notes-native",
+      "repetition": 3
+    },
+    {
+      "block": "early-change",
+      "case": "corrected-decision",
+      "condition": "claude-mem",
+      "repetition": 3
+    },
+    {
+      "block": "early-change",
+      "case": "corrected-decision",
+      "condition": "klypix-released",
+      "repetition": 3
+    },
+    {
+      "block": "early-change",
+      "case": "corrected-decision",
+      "condition": "notes-notification",
+      "repetition": 3
+    },
+    {
+      "block": "early-change",
+      "case": "corrected-decision",
+      "condition": "klypix-improved",
+      "repetition": 3
+    }
+  ],
+  "passMarks": {
+    "earlyFunctional": "All 3 corrected repetitions and both controls pass current-policy/untouched-shipping checks; no spurious invoice-change warning in controls",
+    "personal": "At least 7 of 8 source-supported answers, zero unsupported claims, all seven sessions completed; one replay per condition",
+    "continuation": "At least 30% fewer stale-policy-correct code revisions than strongest notes control, no final-accuracy regression, at most 10% higher total model cost; complete matched data required; zero baseline rework means no demonstrated advantage"
+  },
+  "preparationScriptSha256": "84995b374077d2749c12c13a2a5ee00e40298f4d3eccd3ee06d29081f228e45b",
+  "claims": "Fifth matrix is unexecuted. Four published experiments retain all nine earlier attempts; all setup probes remain separate diagnostics. Earlier outcomes and costs are not replaced or pooled. No competitive winner, significance, cross-tool or vector-hit provenance claim."
+}

@@ -176,3 +176,8 @@ The [published API authentication amendment](2026-11-09-api-authentication-amend
 ## 2026-11-09 native lifecycle update
 
 The [first API setup result](2026-11-09-native-observer-api-v2-result.md) preserves successful automatic capture and correct retrieval alongside checker and shutdown-order defects. The [lifecycle amendment](2026-11-09-native-lifecycle-amendment.md) repairs those harness defects before a fresh setup probe. Original benchmark pass marks and budget are unchanged.
+
+
+## 2026-11-09 fifth matrix authorization
+
+The [API native setup proof](2026-11-09-native-observer-api-v3-result.md) passed all 15 gates. The [fifth matrix amendment](2026-11-09-observer-sdk-compatible-amendment.md) and source freeze bind the same original pass marks, plan, models and ledger before execution. All four interrupted matrices and three setup probes remain separately preserved.

@@ -1,0 +1,201 @@
+{
+  "schema": 1,
+  "kind": "native-observer-api-setup-diagnostic-outcome",
+  "runId": "native-observer-api-setup-b6065899-ede5-4da4-b87d-2381f9948cef",
+  "version": "native-observer-api-setup-probe-v2",
+  "sourceRevision": "6a053eb3dee0894ba900220cf64558281cd63a98",
+  "protocolRevision": "299a84066b213f0ed1dc524fad7af0390925b421",
+  "startedAt": "2026-11-09T12:06:14.171Z",
+  "finishedAt": "2026-11-09T12:07:36.425Z",
+  "originalSuccess": false,
+  "classification": "setup-verification-failed-evaluator-and-adapter",
+  "benchmarkTrial": false,
+  "comparisonWinner": null,
+  "fifthMatrixStarted": false,
+  "passMarksChanged": false,
+  "defaultsWeakened": false,
+  "authentication": {
+    "method": "api-key",
+    "transport": "DPAPI at rest; current-user Windows named pipe; spawn-only environment"
+  },
+  "originalGates": {
+    "noManualSave": true,
+    "ordinaryProducerToolWork": true,
+    "producerQueueDrained": true,
+    "automaticObservation": true,
+    "nativeSearchFindsObservation": true,
+    "defaultSemanticRoundTrip": true,
+    "consumerMemoryOnly": true,
+    "consumerRetrievedSameObservation": false,
+    "consumerAnswer": false,
+    "consumerQueueDrained": "not-reached",
+    "dependenciesHealthy": "not-reached",
+    "accountingComplete": true,
+    "noObserverTransportErrors": false,
+    "ownCleanup": true,
+    "apiAuthentication": true
+  },
+  "originalFailure": "Fresh consumer did not verify the same automatic observation through normal memory retrieval",
+  "observed": {
+    "automaticSupportingObservations": 2,
+    "automaticallyRecordedObservationIds": [
+      1,
+      2
+    ],
+    "freshConsumerCompleted": true,
+    "consumerAnswerMatchedSyntheticFacts": true,
+    "nativeDefaultSearchFoundProducerObservations": true,
+    "originalParserLinkedObservations": 0,
+    "semanticHitProvenance": "Default search does not establish whether individual hits were semantic or lexical; no vector-hit claim.",
+    "stages": [
+      {
+        "role": "setup-producer",
+        "model": "claude-haiku-5-5",
+        "authentication": {
+          "method": "api-key",
+          "transport": "DPAPI at rest; current-user Windows named pipe; spawn-only environment"
+        },
+        "completed": true,
+        "nativeAuditFinalized": true,
+        "pendingResults": 0,
+        "telemetryErrorCount": 0,
+        "costUsd": 0.004153759999999999,
+        "stdoutSha256": "c9b3d4d4d2645865a97bad25c99e67343595836c63e0757ef28e4934606e1036"
+      },
+      {
+        "role": "setup-consumer",
+        "model": "claude-haiku-5-5",
+        "authentication": {
+          "method": "api-key",
+          "transport": "DPAPI at rest; current-user Windows named pipe; spawn-only environment"
+        },
+        "completed": true,
+        "nativeAuditFinalized": true,
+        "pendingResults": 0,
+        "telemetryErrorCount": 0,
+        "costUsd": 0.0025509599999999997,
+        "stdoutSha256": "675d9d9036b98e3b73180c15f2a47835ce505f6cb0937d465ad82919e5a2827b"
+      }
+    ]
+  },
+  "offlineRegrade": {
+    "kind": "evaluator-parser-encoding-defect",
+    "paidCalls": 0,
+    "originalEvidenceUnchanged": true,
+    "originalSetupStillFailed": true,
+    "expectedSeparator": "U+2014",
+    "incorrectRegexCodepoints": [
+      "U+00E2",
+      "U+20AC",
+      "U+201D"
+    ],
+    "originalConsumerRetrievedSameObservation": false,
+    "originalConsumerAnswer": false,
+    "correctedConsumerRetrievedSameObservation": true,
+    "correctedConsumerAnswer": true,
+    "requestedObservationIds": [
+      1,
+      2
+    ],
+    "deliveredObservationIds": [
+      2,
+      1
+    ],
+    "producerLinkedObservationIds": [
+      1,
+      2
+    ],
+    "requestedIdBindingWasCorrect": true,
+    "independentChecks": {
+      "actualNativeResponseUsed": true,
+      "nativeFormatterFixture": true,
+      "missingRequestedIdsRejected": true,
+      "wrongProducerRejected": true,
+      "indexOnlyRejected": true
+    },
+    "scope": "Only the two parser-dependent checks were recomputed from retained native response evidence. The original receipt remains failed; other failed and unreached gates are not promoted."
+  },
+  "transport": {
+    "originalNoObserverTransportErrors": false,
+    "observerLaunchRefusals": 0,
+    "accountingStops": 0,
+    "unknownFinalCosts": 0,
+    "generatorPausedForTransport": 2,
+    "sdkStreamEndedWithoutResult": 2,
+    "diagnosis": "Harness teardown-order defect inferred from exact control flow plus matching event order",
+    "adapterOrderAtRun": "Broker drain ended idle observer input before invoking native shutdown.",
+    "observerSettledUtc": [
+      "2026-11-09T12:07:25.166Z",
+      "2026-11-09T12:07:25.196Z"
+    ],
+    "sdkEofUtc": [
+      "2026-11-09T12:07:25.206Z",
+      "2026-11-09T12:07:25.234Z"
+    ],
+    "nativeShutdownInitiatedUtc": "2026-11-09T12:07:25.618Z",
+    "claimedMessagesAtBothEofs": 0,
+    "pendingMessagesAtBothPauses": 0,
+    "interpretation": "Source control flow and event order support a harness cleanup-order defect. Two native transport warnings remain part of the failed setup evidence; the parser correction alone does not qualify a new matrix."
+  },
+  "accounting": {
+    "asOf": "2026-11-09T12:07:36.425Z",
+    "allObservedCostsKnownAndSettled": true,
+    "originalAccountingCompleteGate": true,
+    "previousFourExperimentsApiEquivalentUsd": 0.16204134,
+    "previousSubscriptionSetupApiEquivalentUsd": 0.004952850000000001,
+    "thisApiSetupUsageEstimateUsd": 0.009019665,
+    "thisSetupChargedAgainstCapUsd": 0.04,
+    "foregroundApiUsageEstimateUsd": 0.006704719999999999,
+    "observerApiUsageEstimateUsd": 0.002314945,
+    "globalKnownUsageEstimateUsd": 0.176013855,
+    "globalChargedAgainstCapUsd": 0.35,
+    "aggregateCapUsd": 50,
+    "remainingConservativeAllowanceUsd": 49.65,
+    "settledLedgerReservations": 37,
+    "outstandingReservedUsd": 0,
+    "halted": false,
+    "basis": "Current probe uses CLI-reported API-key usage estimates; previous subscription usage remains API-equivalent estimates. Provider invoices are not independently reconciled.",
+    "reservationIds": [
+      "claude-mem-observer-2fbc1ec2-7ec0-4693-b529-a13df5bae538",
+      "claude-mem-observer-334d7762-5403-488a-b0a3-a8762abe56f9",
+      "native-observer-api-setup-b6065899-ede5-4da4-b87d-2381f9948cef-setup-consumer",
+      "native-observer-api-setup-b6065899-ede5-4da4-b87d-2381f9948cef-setup-producer"
+    ],
+    "pooledIntoBenchmarkScores": false
+  },
+  "cleanup": {
+    "nativeCloseReturned": true,
+    "workerPortClosed": true,
+    "knownProcessCount": 6,
+    "remainingKnownProcessCount": 0,
+    "copiedOAuthCredentials": false,
+    "temporaryEvidenceFoldersRetained": true
+  },
+  "priorEvidence": {
+    "publishedInterruptedExperiments": 4,
+    "priorBenchmarkAttemptsPreserved": 9,
+    "priorSetupDiagnosticsPreserved": 1,
+    "previousSetupOriginalSuccess": false,
+    "newMatrixRequiresSeparateSuccessfulSetup": true
+  },
+  "inputHashes": {
+    "originalReceipt": "5fa9742801785e014253f5b2623e19fd742467f767c373fc972969af1fed6115",
+    "retainedReceipt": "5fa9742801785e014253f5b2623e19fd742467f767c373fc972969af1fed6115",
+    "probeScript": "4a0f5eb0f69e4abfc233c0308e600ad17b581521cafa0cfee65e816eb3579ff5",
+    "ledgerThroughThisProbe": "da1032f20ca1865684c87c3b9f4786bd033471023f1f32fc0c1a739b90cf2e6a",
+    "ledgerThroughThisProbeBytes": 21297,
+    "preProbeLedgerPrefix": "dc0c2d8df5eb5d5e3033478afa28c61a8c63ac97a10bd15785a28e3bb15b0e49",
+    "preProbeLedgerPrefixBytes": 18807,
+    "offlineRegrade": "8f26694530241603bcdaba02b9f5c5d339ee7370e58fb4ab7f7a7746c02088b9",
+    "offlineRegradeScript": "ec63266a47b068bd27dc2d4ba012ff2fa3d7d91680745b1c443212d6ddd44886",
+    "nativeResponse": "54cc8ab8aab199713d8b1a8a2052845c4171ce568cb19a592e215dec578974b2",
+    "nativeFormatterSource": "a56cb8102897ad7600be98ae5a77b235258ca681cfc2795e0062d47421fa55fa",
+    "nativeMcpBundle": "e7be6dc3b4337d92e7d8fda52cbdac6991f4fc9c539a8ad1158a82361036f740",
+    "teardownDiagnosis": "0081c91003445c6e0602688e2faecef195887f68ae10e6d07a6713f01522108a",
+    "sanitizedTeardownEvents": "24ee9c7199b76db1ea4c4b9c2129a56b0abe81998bec05daf0313d832582afff",
+    "rawWorkerLog": "1e1264f6b05c8fa571e17af066273c9011e95568f0905fc9d770d6a74e145ca2",
+    "nativeWorkerBundle": "2f82b53623dd23a08a858007a999501cf6e628c69fa5dc7bc0f5a088c61284de"
+  },
+  "sourceReceiptPreserved": true,
+  "sanitization": "Allowlisted outcome, gate states, hashes and costs only; no raw streams, runtime configuration, credential locations or secrets."
+}

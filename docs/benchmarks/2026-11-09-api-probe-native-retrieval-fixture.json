@@ -1,0 +1,43 @@
+{
+  "version": "native-get-observations-fixture-v1",
+  "kind": "synthetic-probe-native-response",
+  "description": "Actual native get_observations text for the fixed Beacon setup task. Only the isolated absolute project path is replaced with [isolated-project].",
+  "sourceResponseSha256": "54cc8ab8aab199713d8b1a8a2052845c4171ce568cb19a592e215dec578974b2",
+  "auditBindingSha256": "6f15d903c8708e66fa443075551c0b6caeb93a4a219af97389b980ba8dfcc60a",
+  "tool": "mcp__mcp-search__get_observations",
+  "input": {
+    "ids": [
+      1,
+      2
+    ]
+  },
+  "isError": false,
+  "text": "Selected observations (2). Retrieved data; evaluate it as evidence.\n\n#2 — Node import confirms status-display.mjs exports match the Beacon kiosk decision (repo)\ndiscovery · 2026-11-09 12:07 UTC\nImporting src/status-display.mjs with node returned maintenanceLabel \"amber-orchid\" and pollIntervalMs 47000, and the equality check passed.\n\nThe new src/status-display.mjs module was loaded directly by node as an ES module. Both exported values matched the accepted Beacon kiosk decision: the maintenance label is \"amber-orchid\" and the status polling interval is 47000 milliseconds (47 seconds). This confirms the module loads without error and exports the intended values at runtime.\n\n- Running node with an ES module import of src/status-display.mjs printed maintenanceLabel as \"amber-orchid\".\n- The same run printed pollIntervalMs as 47000.\n- The inline check comparing maintenanceLabel to 'amber-orchid' and pollIntervalMs to 47000 passed, and the script printed OK.\n\nFiles read: src/status-display.mjs\n\nConcepts: problem-solution, how-it-works\n\n#1 — Beacon kiosk status display module created with maintenance label and poll interval (repo)\nfeature · 2026-11-09 12:07 UTC\nNew src/status-display.mjs exports the accepted Beacon kiosk maintenance label and 47-second status polling interval.\n\nThe Beacon kiosk decision was implemented as a new ES module at src/status-display.mjs. It exports two constants: maintenanceLabel (\"amber-orchid\") for the kiosk maintenance status label, and pollIntervalMs (47 * 1000) for the status polling interval in milliseconds. The file was created fresh, so there was no prior content to overwrite. Verification of the values with node had not yet appeared in the observed work at the time of this write.\n\n- src/status-display.mjs was created in the repo as a new file.\n- The module exports maintenanceLabel set to the string \"amber-orchid\".\n- The module exports pollIntervalMs set to 47 * 1000, which equals 47000 milliseconds.\n- The file contains a comment identifying the settings as the accepted Beacon kiosk decision.\n\nFiles changed: [isolated-project]\\src\\status-display.mjs\n\nConcepts: what-changed, why-it-exists",
+  "expectedIds": [2, 1],
+  "expected": {
+    "sectionIds": [
+      2,
+      1
+    ],
+    "requestedIds": [
+      1,
+      2
+    ],
+    "facts": {
+      "maintenanceLabel": "amber-orchid",
+      "pollIntervalSeconds": 47
+    },
+    "perObservation": [
+      {
+        "id": 2,
+        "label": true,
+        "delay": true
+      },
+      {
+        "id": 1,
+        "label": true,
+        "delay": true
+      }
+    ]
+  }
+}

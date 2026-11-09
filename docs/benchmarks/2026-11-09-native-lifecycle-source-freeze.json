@@ -1,0 +1,97 @@
+{
+  "schema": 1,
+  "kind": "native-lifecycle-setup-pre-run-freeze",
+  "recordedAt": "2026-11-09T12:13:59.120729+00:00",
+  "sourceCommit": "eaa5ebd4d6fb9e6b0a4631356128771da46690d2",
+  "sourceTree": "b5672bc2cbc74d72b299c392ba7bd6ae58e48447",
+  "sourceClean": true,
+  "previousSourceCommit": "6a053eb3dee0894ba900220cf64558281cd63a98",
+  "changedFiles": [
+    "bench/decision-change/claude-mem.mjs",
+    "test/decision-change-claude-mem.mjs"
+  ],
+  "reviewedScope": {
+    "baseCommit": "a5d5a9777a72e28f0d94a0971fd40eba8dad761c",
+    "sourceCommit": "eaa5ebd4d6fb9e6b0a4631356128771da46690d2",
+    "files": [
+      "bench/decision-change/adapters.mjs",
+      "bench/decision-change/agent.mjs",
+      "bench/decision-change/auth.mjs",
+      "bench/decision-change/claude-mem.mjs",
+      "bench/decision-change/native-hooks.mjs",
+      "bench/decision-change/passive-audit.mjs",
+      "bench/decision-change/personal-run.mjs",
+      "bench/decision-change/run.mjs",
+      "bench/decision-change/self-test.mjs",
+      "test/decision-change-auth.mjs",
+      "test/decision-change-claude-mem.mjs"
+    ]
+  },
+  "priorProtocolCommit": "299a84066b213f0ed1dc524fad7af0390925b421",
+  "protocolBinding": "The commit containing this freeze publishes the lifecycle amendment before paid setup; the probe records that exact protocol revision.",
+  "newProbeModelCalls": 0,
+  "authentication": {
+    "method": "api-key",
+    "transport": "DPAPI at rest; current-user Windows named pipe; spawn-only environment"
+  },
+  "unchanged": {
+    "productCode": true,
+    "originalPassMarks": true,
+    "promptsAndAnswers": true,
+    "modelsAndEffort": true,
+    "seedAndPlan": true,
+    "nativeVendorAndDefaults": true,
+    "originalSetupAcceptanceGates": true,
+    "measurementTransport": "native-audit-v3"
+  },
+  "hashBasis": "Exact executed working-tree bytes; Windows source/helper files may have CRLF while Git normalizes public blobs to LF. New v3 probe source is ASCII with LF.",
+  "sourceHashes": {
+    "adapters.mjs": "3258003eb97a4e8244c441f1c1b47bde27d4e499b8f5f2af2897c16de8940da4",
+    "agent.mjs": "a4e7f802499a0b51d8a23b711dc00a4aa6d8d7b3b9e7e790ccefe684e334f420",
+    "auth.mjs": "09dd95459d969b2425c7859cbdfe21796666244f7e60b008aa635396239d27c0",
+    "claude-mem.mjs": "b9dc4852ba741743b3f7cecc7200507669edbf76b3e4f256df697c6ccec3f701",
+    "gate.mjs": "b150b2988161ba110f1adfbac2e57af9a4cd661b416a4126349a631fe4d7fc6c",
+    "isolation.mjs": "d9fd3b5a4f8b2ff74a0ec10ed9c9f149c69caa21855f23da0fbd05c9b0679e97",
+    "ledger.mjs": "4b69ef977c4cc3bcef2f212a8f6db90eb76a6512a95f20b4233f968e3ffda61c",
+    "metrics.mjs": "43226be03f4c2022c5c44beabb2dbd61e51d5c98bb1f0a2624f68c8a65dd1be3",
+    "native-hooks.mjs": "2b4fe6fb00109e471bf8687b97bb405a148681fd62afa7661cb0c65c10f0a96d",
+    "notes-notify-hook.mjs": "21371875c1ee847df36b5638e24a05b3008216b304556e018041f9e1f8eccfa8",
+    "outcomes.mjs": "cb62f16356fcb351a6f3256f1d2dd49457d0cfe8c7dca23a2216f0e17991bfcd",
+    "passive-audit.mjs": "739637d70febe4ceb3b0b136c600ea8ebb79450aa8d7d701424a29f6adc9fdfc",
+    "personal-run.mjs": "e5169fab9602af861ba9c952bc076d2800882086ab859e8dabfbfe187c39c48d",
+    "personal-scenario.mjs": "20fc553f206a92481677e58fd208dab2b2227dbb2cb891903948963930f1073c",
+    "run.mjs": "7e3e1f0b689ddf0b69603643e96c069f14677477833861b8081f9b88bfb739d2",
+    "scenarios.mjs": "68b62ba7a6161edd716580fef001b3d61046129b944588a669e9ce07a0056567",
+    "self-test.mjs": "6401fe8ab387c8621bcee6ceaace9097695b8bb27e8408f44d7f04d7ef6d6542",
+    "test-passive-audit.mjs": "d6e44c6b27008d5812e8900dcee419c3cbcb1ecf6731b684f88d95b8fb4e5858"
+  },
+  "probe": {
+    "file": "docs/benchmarks/2026-11-09-native-observer-api-setup-probe-v3.mjs",
+    "sha256": "6f73d6bcd8dae41b4410df4ae327f023db97372362c0450fc65d62f9617104b8",
+    "fixtureSha256": "3f6661908f202b13fef7e88ea5ae3c6efdc569c728937a443b93ee274806fb00",
+    "originalApiProbeSha256": "4a0f5eb0f69e4abfc233c0308e600ad17b581521cafa0cfee65e816eb3579ff5"
+  },
+  "offlineEvidence": {
+    "bindingRegradeSha256": "8f26694530241603bcdaba02b9f5c5d339ee7370e58fb4ab7f7a7746c02088b9",
+    "teardownDiagnosisSha256": "0081c91003445c6e0602688e2faecef195887f68ae10e6d07a6713f01522108a",
+    "focusedLifecycleTests": "passed",
+    "independentSourceReview": "passed; native SDK marks shutdown then closes input with Windows grace period",
+    "nativeFixtureSelfTest": "passed",
+    "modelCalls": 0
+  },
+  "baselineSharedLedger": {
+    "sha256": "da1032f20ca1865684c87c3b9f4786bd033471023f1f32fc0c1a739b90cf2e6a",
+    "bytes": 21297,
+    "capUsd": 50,
+    "settledReservations": 37,
+    "knownApiEquivalentUsd": 0.176013855,
+    "conservativelyChargedUsd": 0.35,
+    "outstandingUsd": 0,
+    "halted": false
+  },
+  "retainedFailedApiSetup": {
+    "receiptSha256": "5fa9742801785e014253f5b2623e19fd742467f767c373fc972969af1fed6115",
+    "reportFile": "docs/benchmarks/2026-11-09-native-observer-api-v2-result.json",
+    "reportSha256": "2e8b334fe425bff0b9cb69177817e021444ed234c67f3ec9a96eb0d012a806e6"
+  }
+}

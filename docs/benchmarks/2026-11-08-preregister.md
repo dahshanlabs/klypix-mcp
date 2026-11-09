@@ -171,3 +171,8 @@ the reported denominator.
 ## 2026-11-09 API authentication update
 
 The [published API authentication amendment](2026-11-09-api-authentication-amendment.md) switches every future arm to the authorized API account after the native subscription quota guard paused setup. Original pass marks and the single $50 ledger are unchanged. The separate API capture/recall probe must pass before a new complete matrix. All previous outcomes remain published.
+
+
+## 2026-11-09 native lifecycle update
+
+The [first API setup result](2026-11-09-native-observer-api-v2-result.md) preserves successful automatic capture and correct retrieval alongside checker and shutdown-order defects. The [lifecycle amendment](2026-11-09-native-lifecycle-amendment.md) repairs those harness defects before a fresh setup probe. Original benchmark pass marks and budget are unchanged.

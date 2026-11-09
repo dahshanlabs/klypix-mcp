@@ -4,6 +4,13 @@ This developer-authored, same-computer pilot measures a specific correctness pro
 
 **Execution record:** the [first run](benchmarks/2026-11-09-interrupted-run.md), [second run](benchmarks/2026-11-09-native-audit-v1-result.md), [third run](benchmarks/2026-11-09-native-audit-v2-result.md) and [fourth run](benchmarks/2026-11-09-native-audit-v3-result.md) are published with all nine attempts retained. The fourth run has valid passes for a notes control, one prototype correction case and AI-kept notes' personal replay (8/8 supported answers). It stopped because the benchmark wrapper rejected claude-mem's native model-option syntax before automatic capture could run. This is a setup failure, not a competitor loss. Total known API-equivalent usage is $0.16204134; no comparative winner is established. The tasks, permissions and pass marks below remain unchanged. Publish all attempts, including ties, KLYPIX losses and budget stops.
 
+**Setup follow-up:** the [native observer probe](benchmarks/2026-11-09-native-observer-setup-result.md)
+confirms the launcher repair works. claude-mem then paused under its unchanged
+default subscription-quota guard (reported 97% usage versus 93% threshold), before
+storing observations. Recall was not started. This diagnostic adds $0.00495285;
+global known API-equivalent usage is **$0.16699419** under the original $50 cap.
+No fifth matrix has started, and this quota limitation is not a competitor loss.
+
 ## Conditions and planned blocks
 
 The revised early-boundary block has five conditions, three repetitions of a changed-decision case and one repetition of each of two controls: **25 planned trials**. The separate personal-memory block adds **five seven-session replays**, one per condition. These do not replace the early-change trials. The total plan is 110 foreground model sessions plus native observer work. The shared $50 cap may prevent completion; completion is not promised.

@@ -1,0 +1,121 @@
+{
+  "schema": 1,
+  "kind": "native-observer-setup-diagnostic-outcome",
+  "runId": "native-observer-setup-01ff3142-4157-42b7-b5d5-156a197cb922",
+  "sourceRevision": "a5d5a9777a72e28f0d94a0971fd40eba8dad761c",
+  "protocolRevision": "479a45308778a2162cb80c5b2bf0ef86b59de486",
+  "startedAt": "2026-11-09T11:36:15.472Z",
+  "finishedAt": "2026-11-09T11:37:33.527Z",
+  "originalSuccess": false,
+  "classification": "setup-unavailable-native-quota-guard",
+  "benchmarkTrial": false,
+  "comparisonWinner": null,
+  "fifthMatrixStarted": false,
+  "passMarksChanged": false,
+  "defaultsWeakened": false,
+  "stages": {
+    "producer": {
+      "completed": true,
+      "model": "claude-haiku-5-5",
+      "nativeAuditFinalized": true,
+      "pendingResults": 0,
+      "telemetryErrorCount": 0,
+      "knownApiEquivalentUsd": 0.0039108500000000004
+    },
+    "observer": {
+      "launched": true,
+      "model": "claude-haiku-5-5",
+      "settled": true,
+      "capped": false,
+      "refusedLaunches": 0,
+      "knownApiEquivalentUsd": 0.0010420000000000002
+    },
+    "consumer": {
+      "started": false
+    }
+  },
+  "capture": {
+    "supportingAutomaticObservations": 0,
+    "rawAutomaticObservationGate": false,
+    "totalStoredObservations": 0,
+    "totalStoredSummaries": 0,
+    "pendingMessageRows": 0,
+    "originalFailure": "Automatic observations tied to the producer session do not jointly support both facts",
+    "fullCaptureAndRecallEstablished": false
+  },
+  "diagnosis": {
+    "mechanism": "Native preventive subscription quota guard",
+    "kind": "limit_guard",
+    "window": "seven_day",
+    "reportedUsagePercent": 97,
+    "nativePauseThresholdPercent": 93,
+    "guardArmedAt": "2026-11-09T11:37:14.414Z",
+    "reportedWindowResetAt": "2026-11-10T23:00:00.000Z",
+    "nativeObserverHealthKind": "quota_guard",
+    "observedProviderRefusal": false,
+    "nativeDefaultThresholdSource": {
+      "bundleSha256": "2f82b53623dd23a08a858007a999501cf6e628c69fa5dc7bc0f5a088c61284de",
+      "defaultOffsetUtf16": 627060,
+      "weeklyThreshold": 0.93
+    },
+    "earliestNativeRecheckAt": "2026-11-09T12:07:14.4140000+00:00",
+    "recheckGuaranteesReadiness": false,
+    "interpretation": "The native guard paused automatic capture to reserve allowance for interactive work. This is not evidence of provider account exhaustion or a competitor performance loss.",
+    "nextMatrixRequirement": "A separate successful native automatic capture and independent recall probe under unchanged defaults is required before another full matrix."
+  },
+  "accounting": {
+    "originalAccountingCompleteGate": false,
+    "allObservedCostsKnownAndSettled": true,
+    "gateInterpretation": "The raw accountingComplete gate also requires at least three workflow reservations. This interrupted probe made only two (producer and observer); its false value does not indicate unknown cost.",
+    "priorExperimentsApiEquivalentUsd": 0.16204134000000003,
+    "probeApiEquivalentUsd": 0.004952850000000001,
+    "probeChargedAgainstCapUsd": 0.02,
+    "globalApiEquivalentUsd": 0.16699419000000001,
+    "globalChargedAgainstCapUsd": 0.31,
+    "aggregateCapUsd": 50,
+    "remainingConservativeAllowanceUsd": 49.69,
+    "settledLedgerReservations": 33,
+    "outstandingReservedUsd": 0,
+    "halted": false,
+    "subscriptionInvoiceCost": "unknown",
+    "reservationIds": [
+      "claude-mem-observer-ee977e0a-de3b-4468-8c51-a4f533941e52",
+      "native-observer-setup-01ff3142-4157-42b7-b5d5-156a197cb922-setup-producer"
+    ]
+  },
+  "cleanup": {
+    "nativeCloseReturned": true,
+    "knownProcessCount": 4,
+    "remainingKnownProcessCount": 0,
+    "workerPortClosed": true,
+    "credentialCopiesRemoved": true,
+    "temporaryEvidenceFoldersRetained": true,
+    "forcedStopOrRecursiveDeletionAttempted": false
+  },
+  "priorEvidence": {
+    "completedMatrices": 0,
+    "publishedInterruptedExperiments": 4,
+    "priorBenchmarkAttemptsPreserved": 9,
+    "priorReport": "2026-11-09-native-audit-v3-result.json",
+    "priorReportSha256": "5b971b2bb0423e7f530b6b296856f8b1304586719d90a5f5cc91a51386fae220",
+    "thisProbePooledIntoBenchmarkScores": false
+  },
+  "inputHashes": {
+    "originalProbeReceipt": "513d564f4c06ef85a3cef64fca39dc1cd448fe5931ef9e0fee325a992c73632b",
+    "publishedProbeScript": "f8b243dedc18bdc1ad5962a9529453f657ac644a46bd08c71265394a83447c3a",
+    "ledger": "dc0c2d8df5eb5d5e3033478afa28c61a8c63ac97a10bd15785a28e3bb15b0e49",
+    "preProbeLedgerPrefix": "888cc39f1dd2b3ea45de4bcef14d9c69157994da2893343fe649918a44a1ce4e",
+    "nativeQuotaGuard": "e147a65968a753fbce7c41dc61cd5d7e2634c7fd838488baa90e84ed02b3511b",
+    "nativeObserverHealth": "82a1a3e8701661cc4a8bd6d2fd85f627b839c4750235c6192662f837f794ef93",
+    "sanitizedGuardDiagnosis": "7e51b8af1a56da4c11b2f33998d91446889bd19111bd14c953addbbd419f8938",
+    "sanitizedWorkerEvents": "e5ba4df281c1c5cb262b2eda60fbcd0f85becd15835a80747f6ece5bb4034a82"
+  },
+  "limitations": [
+    "Native rate_limit_event frame was not separately retained by the proxy; the persisted native guard reason records 97% and the reported reset.",
+    "Foreground and the first observer request succeeded; whole-account hard exhaustion is not established.",
+    "The probe stopped before consumer recall and before its post-capture semantic deep check; initial semantic readiness was true.",
+    "The receipt accountingComplete gate is false because the full two-stage setup did not finish, while actual incurred cost is fully settled."
+  ],
+  "sourceReceiptPreserved": true,
+  "sanitization": "Selected outcome, guard state, hashes and settled costs only; raw streams, profile identifiers, credentials and runtime settings remain private."
+}

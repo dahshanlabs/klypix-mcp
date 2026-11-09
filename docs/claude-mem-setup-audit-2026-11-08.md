@@ -162,3 +162,11 @@ Before another complete comparison, require a separate native automatic-capture
 and cross-session retrieval probe with all observer costs settled in the original
 $50 ledger. Manual `save_memory`, an empty queue or a healthy process alone do
 not satisfy it. Model defaults, permissions, scenarios and pass marks stay unchanged.
+
+The [published probe result](benchmarks/2026-11-09-native-observer-setup-result.md)
+confirms the repaired wrapper launched a real observer and settled its cost.
+Automatic capture then paused at claude-mem's default subscription safeguard:
+reported weekly usage was 97%, above its 93% threshold. No observations were
+stored and independent recall did not start. This is not an observed provider
+rejection or benchmark loss. The guard remains unchanged; successful automatic
+capture and recall are still required before another complete matrix.

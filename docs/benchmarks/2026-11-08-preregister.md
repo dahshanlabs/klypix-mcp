@@ -31,6 +31,10 @@ winner or feature-continuation pass is established; the pass marks below are unc
 The [native-observer setup probe plan](2026-11-09-observer-setup-probe-plan.md)
 requires verified automatic capture and retrieval before another complete matrix.
 Its diagnostic calls share the same original budget and never count as benchmark cells.
+The [setup result](2026-11-09-native-observer-setup-result.md) confirms the repaired
+observer launched, but claude-mem's default 93% quota guard paused capture at
+reported weekly usage of 97%. No observation was stored and recall did not start.
+Total known usage is now $0.16699419; no fifth matrix or comparative winner exists.
 
 ## Conditions and setup requirements
 

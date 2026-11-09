@@ -141,3 +141,24 @@ The final proof used ordinary native tools and disposable setup data, not a mode
 | `vocab.txt` | `07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3` |
 
 The focused adapter suite passes after this change, including the six-file allowlist, absence of database copying and refusal to overwrite an existing profile cache. The original blocked build artifact remains untouched.
+
+## Native observer follow-up — 9 November 2026
+
+The [fourth experiment](benchmarks/2026-11-09-native-audit-v3-result.md) reached
+claude-mem's native observer for the first time. Worker and semantic health were
+ready, but the benchmark cost wrapper rejected the SDK's `--model=haiku` syntax:
+it recognized only split `--model haiku`. Two launches were refused before any
+observer reservation or model call. Correct Haiku/Sonnet tier settings remained
+in place. This is an adapter compatibility failure, not a competitor loss.
+
+The [repair](https://github.com/dahshanlabs/klypix-mcp/commit/a5d5a9777a72e28f0d94a0971fd40eba8dad761c)
+accepts both argument forms, forwards the native arguments unchanged and rejects
+ambiguous/missing model or output-format options and injected budget flags.
+Focused tests and 16 cases through the actual Bun-compiled proxy passed without
+credentials or paid calls. Proof receipt SHA-256:
+`e47783b380f0016a849b78e4981b811cd1b0bfa07a200197d2461a3c3307bd8e`.
+
+Before another complete comparison, require a separate native automatic-capture
+and cross-session retrieval probe with all observer costs settled in the original
+$50 ledger. Manual `save_memory`, an empty queue or a healthy process alone do
+not satisfy it. Model defaults, permissions, scenarios and pass marks stay unchanged.

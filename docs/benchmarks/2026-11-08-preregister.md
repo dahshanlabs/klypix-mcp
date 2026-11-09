@@ -22,6 +22,12 @@ retains one more interrupted attempt and 29 unstarted cells. Across all three
 experiments, five attempts and $0.06817953 are preserved; no winner is established.
 The [fourth amendment](2026-11-09-final-reconciliation-amendment.md) removes the
 live-journal dependency and requires final typed reconciliation before scoring.
+Its [result](2026-11-09-native-audit-v3-result.md) preserves three valid passes
+and one claude-mem setup failure: the benchmark wrapper rejected the native SDK's
+equals-form model option before an observer model could start. This is not a
+competitor loss. All nine attempts across four experiments remain visible, with
+$0.16204134 in known API-equivalent usage under the original $50 cap. No comparison
+winner or feature-continuation pass is established; the pass marks below are unchanged.
 
 ## Conditions and setup requirements
 

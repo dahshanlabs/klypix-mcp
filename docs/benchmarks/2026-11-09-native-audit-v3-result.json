@@ -1,0 +1,283 @@
+{
+  "schema": 1,
+  "kind": "fourth-experiment-interruption-audit",
+  "sourceCommit": "7a0fd6026c293996e7762268d69ae9591c21d0f0",
+  "protocolCommit": "a9f5c93dddfd524e28f35971af5fbc5d530def7e",
+  "measurementTransport": "native-audit-v3",
+  "planned": 30,
+  "attempted": 4,
+  "notStarted": 26,
+  "rawStopReason": "Isolated profile cleanup requires review",
+  "stopAnnotation": "Administrative review hold prevented the next model launch after observer adapter setup failed. The hold subsequently settled at zero.",
+  "firstAttemptsPreserved": true,
+  "reruns": 0,
+  "comparisonVerdict": "inconclusive-no-winner",
+  "postprocessor": {
+    "version": "native-audit-v3-report-1.3",
+    "sha256": "652909e90f84d6aa4bb7cb7d50558be75d355cd8f1b1949000305b4c9541db0e",
+    "eligibilityCheck": "Report independently requires every present stage to have finalized native audit, no pending results and no telemetry errors; raw outcomes remain preserved."
+  },
+  "results": [
+    {
+      "runId": "unchanged-control-notes-notification-r1-0156416c",
+      "condition": "notes-notification",
+      "scenario": "unchanged-control",
+      "block": "early-change",
+      "originalCategory": "pass",
+      "originalSuccess": true,
+      "failure": null,
+      "originalApiEquivalentUsd": 0.01148703,
+      "settledKnownApiEquivalentUsd": 0.01148703,
+      "interpretation": "Valid measured pass retained.",
+      "observedCodeRevisions": 1,
+      "staleCodeRevisions": 0,
+      "decisionNotices": 0,
+      "genericNotesNotices": 0,
+      "noticeBeforeFirstCodeRevision": null,
+      "cleanupErrorRecorded": false
+    },
+    {
+      "runId": "corrected-decision-klypix-improved-r1-a3113ba4",
+      "condition": "klypix-improved",
+      "scenario": "corrected-decision",
+      "block": "early-change",
+      "originalCategory": "pass",
+      "originalSuccess": true,
+      "failure": null,
+      "originalApiEquivalentUsd": 0.025894600000000004,
+      "settledKnownApiEquivalentUsd": 0.025894600000000004,
+      "interpretation": "Valid measured pass retained.",
+      "observedCodeRevisions": 1,
+      "staleCodeRevisions": 0,
+      "decisionNotices": 4,
+      "genericNotesNotices": 0,
+      "noticeBeforeFirstCodeRevision": true,
+      "cleanupErrorRecorded": false
+    },
+    {
+      "runId": "personal-longitudinal-notes-native-r1-1a64537a",
+      "condition": "notes-native",
+      "scenario": null,
+      "block": "personal-longitudinal-v1",
+      "originalCategory": "pass",
+      "originalSuccess": true,
+      "failure": null,
+      "originalApiEquivalentUsd": 0.05222123,
+      "settledKnownApiEquivalentUsd": 0.05222123,
+      "interpretation": "Valid measured pass retained.",
+      "personalCorrect": 8,
+      "personalUnsupportedClaims": 0,
+      "sessionsCompleted": 7,
+      "correlatedAnswers": true,
+      "cleanupErrorRecorded": false
+    },
+    {
+      "runId": "unrelated-control-claude-mem-r1-154dfc08",
+      "condition": "claude-mem",
+      "scenario": "unrelated-control",
+      "block": "early-change",
+      "originalCategory": "accounting-ineligible",
+      "originalSuccess": false,
+      "failure": "product-capture-not-ready:producer-initial",
+      "originalApiEquivalentUsd": null,
+      "settledKnownApiEquivalentUsd": 0.004258949999999999,
+      "interpretation": "Adapter setup unavailable; not a product loss. Original accounting-ineligible label retained; it included the then-open review hold.",
+      "cleanupErrorRecorded": true
+    }
+  ],
+  "observations": {
+    "notesControl": "AI-maintained notes plus a generic notification passed unchanged policy and preserved shipping with complete audit evidence.",
+    "prototype": "The improved KLYPIX corrected-decision row passed; advisory context preceded one current-policy-correct code revision. Two typed host denials were resolved after CLI exit, with no unresolved audit results.",
+    "personalNotes": "AI-maintained notes/native passed one seven-session personal replay: 8/8 source-supported answers, zero unsupported claims. These answers are correlated, not eight independent trials.",
+    "competitorSetup": "claude-mem native worker and semantic dependency health were ready. The benchmark observer wrapper rejected two SDK launches before any observer model reservation; capture did not drain. This is adapter setup failure, not competitor performance.",
+    "modelConfiguration": {
+      "provider": "claude",
+      "defaultModel": "haiku",
+      "tierRouting": "true",
+      "simple": "haiku",
+      "summary": "",
+      "fast": "haiku",
+      "smart": "sonnet"
+    },
+    "observerLaunchRefusals": 2,
+    "observerReservations": 0,
+    "observerPaidUsd": 0,
+    "argumentCompatibilityDiagnosis": "Pinned SDK emits --model=haiku; the benchmark wrapper recognized only split --model haiku. This caused the observed pre-reservation refusal despite correct model configuration. Pinned input/output-format arguments are split; equals-output support is robustness coverage, not a second observed failure.",
+    "diagnosisEvidenceScope": "Worker log proves the pre-reservation refusals. Pinned source proves equals-form model serialization, and the actual Bun-compiled old wrapper reproduces that refusal without credentials, model calls or broker reservations.",
+    "permissionPolicyChanged": false,
+    "passMarksChanged": false,
+    "argumentProof": {
+      "pinnedBundleSha256": "2f82b53623dd23a08a858007a999501cf6e628c69fa5dc7bc0f5a088c61284de",
+      "modelBuilderOffset": 4011693,
+      "modelFlagOffset": 4018113,
+      "currentOutputFormat": "split tokens",
+      "noProviderCompiledProof": true,
+      "proofModelCalls": 0,
+      "proofCredentialsUsed": false
+    }
+  },
+  "priorExperiments": [
+    {
+      "label": "original-stdout-diagnostic",
+      "sourceCommit": "6788b78b867efa59a896144adcd1cddae5eb9c04",
+      "protocolCommit": "d238536627c480abea4c320219e1aa0287aac36c",
+      "publishedReportSha256": "1edc7b9660ea8f6e39778a92b3d975a947359e88f9df10193698dc1aa8f98807",
+      "attempted": 2,
+      "notStarted": 28,
+      "knownApiEquivalentUsd": 0.03482057,
+      "chargedAgainstBudgetUsd": 0.06,
+      "administrativeHoldPaidUsd": 0,
+      "attempts": [
+        {
+          "experiment": "original-stdout-diagnostic",
+          "id": "unchanged-control-notes-notification-r1-8603721e",
+          "condition": "notes-notification",
+          "scenario": "unchanged-control",
+          "firstAttempt": true,
+          "originalCategory": "exposure-unverified",
+          "originalSuccess": false,
+          "pooledIntoCurrentComparison": false,
+          "knownApiEquivalentUsd": 0.0072846199999999995
+        },
+        {
+          "experiment": "original-stdout-diagnostic",
+          "id": "corrected-decision-klypix-improved-r1-397aa6dc",
+          "condition": "klypix-improved",
+          "scenario": "corrected-decision",
+          "firstAttempt": true,
+          "originalCategory": "accounting-ineligible",
+          "originalSuccess": false,
+          "pooledIntoCurrentComparison": false,
+          "knownApiEquivalentUsd": 0.02753595
+        }
+      ]
+    },
+    {
+      "label": "second-native-audit-v1",
+      "sourceCommit": "fa306f0bda28e8026491729e373a93a78db2f8f9",
+      "protocolCommit": "ef80f2a6bd58c3b702621ffad32e13ab25d7beb6",
+      "publishedReportSha256": "5410fa3056f9bb3a564df4068672b5ba8e2eab337dc3a0d862ef5c7f66f16182",
+      "attempted": 2,
+      "notStarted": 28,
+      "knownApiEquivalentUsd": 0.02421613,
+      "chargedAgainstBudgetUsd": 0.05,
+      "attempts": [
+        {
+          "experiment": "second-native-audit-v1",
+          "id": "unchanged-control-notes-notification-r1-9d1b6f27",
+          "condition": "notes-notification",
+          "scenario": "unchanged-control",
+          "firstAttempt": true,
+          "originalCategory": "pass",
+          "originalSuccess": true,
+          "pooledIntoCurrentComparison": false,
+          "knownApiEquivalentUsd": 0.01113393
+        },
+        {
+          "experiment": "second-native-audit-v1",
+          "id": "corrected-decision-klypix-improved-r1-3f15c10f",
+          "condition": "klypix-improved",
+          "scenario": "corrected-decision",
+          "firstAttempt": true,
+          "originalCategory": "setup-not-measured",
+          "originalSuccess": false,
+          "pooledIntoCurrentComparison": false,
+          "knownApiEquivalentUsd": 0.0130822
+        }
+      ]
+    },
+    {
+      "label": "third-native-audit-v2",
+      "sourceCommit": "86699a5b2de41823d1ae303e67966dde404bd50d",
+      "protocolCommit": "aff4814a0634c9df1fd2903fedbe67122b0b6f4f",
+      "publishedReportSha256": "4656d015573de136799de923b90e0ac342ff147a749b452bc64a86ef1b9a3e38",
+      "attempted": 1,
+      "notStarted": 29,
+      "knownApiEquivalentUsd": 0.00914283,
+      "chargedAgainstBudgetUsd": 0.030000000000000013,
+      "attempts": [
+        {
+          "experiment": "third-native-audit-v2",
+          "id": "unchanged-control-notes-notification-r1-276714b2",
+          "condition": "notes-notification",
+          "scenario": "unchanged-control",
+          "firstAttempt": true,
+          "originalCategory": "setup-not-measured",
+          "originalSuccess": false,
+          "pooledIntoCurrentComparison": false,
+          "knownApiEquivalentUsd": 0.00914283
+        }
+      ]
+    }
+  ],
+  "cost": {
+    "priorPublishedExperimentsApiEquivalentUsd": 0.06817953,
+    "priorConservativeChargeUsd": 0.14,
+    "baselineLedgerSha256": "7bc35b9346cdf2b4957ce29e094d6d5d072f225d16a1c9669fac0c88fdb9af2e",
+    "priorReservationIds": [
+      "administrative-hold-exposure-audit-20261109",
+      "corrected-decision-klypix-improved-r1-397aa6dc-consumer",
+      "corrected-decision-klypix-improved-r1-397aa6dc-producer-initial",
+      "corrected-decision-klypix-improved-r1-397aa6dc-producer-update",
+      "corrected-decision-klypix-improved-r1-3f15c10f-consumer",
+      "corrected-decision-klypix-improved-r1-3f15c10f-producer-initial",
+      "corrected-decision-klypix-improved-r1-3f15c10f-producer-update",
+      "unchanged-control-notes-notification-r1-276714b2-consumer",
+      "unchanged-control-notes-notification-r1-276714b2-producer-initial",
+      "unchanged-control-notes-notification-r1-276714b2-producer-update",
+      "unchanged-control-notes-notification-r1-8603721e-consumer",
+      "unchanged-control-notes-notification-r1-8603721e-producer-initial",
+      "unchanged-control-notes-notification-r1-8603721e-producer-update",
+      "unchanged-control-notes-notification-r1-9d1b6f27-consumer",
+      "unchanged-control-notes-notification-r1-9d1b6f27-producer-initial",
+      "unchanged-control-notes-notification-r1-9d1b6f27-producer-update"
+    ],
+    "priorAdministrativeHoldPaidUsd": 0,
+    "newKnownApiEquivalentUsd": 0.09386181,
+    "globalKnownApiEquivalentUsd": 0.16204134000000003,
+    "globalApiEquivalentUsd": 0.16204134000000003,
+    "globalChargedAgainstBudgetUsd": 0.29,
+    "globalOutstandingReservedUsd": 0,
+    "globalBudgetLimitUsd": 50,
+    "globalHalted": false,
+    "newUnattributedReservations": 0,
+    "administrativeReviewHold": {
+      "id": "administrative-hold-cmem-model-mapping-20261109",
+      "reservedUsd": 49.71,
+      "noPaidCall": true,
+      "settledUsd": 0,
+      "chargedUsd": 0,
+      "interpretation": "A review stop, not model spending; retained in the original ledger."
+    },
+    "matchedConditionCostsExcludeAllPriorExperiments": true,
+    "capIncludesAllFourExperiments": true,
+    "subscriptionInvoiceCost": "unknown"
+  },
+  "inputHashes": {
+    "experiment": "2a9375475635f39740a15794a7c0752e5762b237d0192de785e9542b72b78ea3",
+    "resultsJsonl": "b304510f3f331cd643bd4026824d7cb69bbafc92e62517f39c1d121ea5502936",
+    "runSummary": "39f2c6006416981e6c42220a6d464db05088078f4ec72cb83c75d82408099995",
+    "ledger": "888cc39f1dd2b3ea45de4bcef14d9c69157994da2893343fe649918a44a1ce4e",
+    "setupReceipt": "2bc8791813996a37d44508c1d0016844f6c38ed207177634b005b6ca59ef1968",
+    "setupEventLog": "2c4b1e7aa52f3f8abbe1cd26b386702b0285ce9250c702f200ca8bcea8cb5ae8",
+    "pinnedSdkArgumentProof": "dfdcfbfaf07a517c6e6b3a98ed6a5330f5b8932b6df92ad8e438c76f86e12bc8",
+    "compiledWrapperArgumentProof": "8ddb1dfdea912bb79ddb8fbb4de6605062faab78fc5c2027dd187317e1e5c8c7"
+  },
+  "cleanup": {
+    "originalCleanupError": "EPERM removing the isolated temporary profile",
+    "credentialsRemoved": true,
+    "fullCleanupCompleted": false,
+    "residualStateRetained": true,
+    "automaticApprovalReviewRejectedCleanup": true,
+    "rejectedAction": "Stopping verified experiment-owned residual processes and deleting the validated isolated scratch directory",
+    "statedReason": "Blocked by policy; no more specific reason supplied",
+    "bypassAttempted": false,
+    "futureRunRequirement": "Use fresh isolation; do not reuse the retained profile",
+    "laterReadOnlyStatus": {
+      "reportedBy": "Root agent read-only check after the pause",
+      "residualWorkerExitedNaturally": true,
+      "profileDirectoryRetained": true,
+      "credentialCopyAbsent": true
+    }
+  }
+}

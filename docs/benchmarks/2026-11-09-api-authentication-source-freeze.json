@@ -1,0 +1,117 @@
+{
+  "schema": 1,
+  "kind": "api-authentication-setup-pre-run-freeze",
+  "recordedAt": "2026-11-09T12:05:20.229167+00:00",
+  "sourceCommit": "6a053eb3dee0894ba900220cf64558281cd63a98",
+  "sourceTree": "6e264b1ad9becbcf6b0a9414e29aea23033c4d02",
+  "sourceClean": true,
+  "reviewedScope": {
+    "baseCommit": "a5d5a9777a72e28f0d94a0971fd40eba8dad761c",
+    "sourceCommit": "6a053eb3dee0894ba900220cf64558281cd63a98",
+    "files": [
+      "bench/decision-change/adapters.mjs",
+      "bench/decision-change/agent.mjs",
+      "bench/decision-change/auth.mjs",
+      "bench/decision-change/claude-mem.mjs",
+      "bench/decision-change/native-hooks.mjs",
+      "bench/decision-change/passive-audit.mjs",
+      "bench/decision-change/personal-run.mjs",
+      "bench/decision-change/run.mjs",
+      "bench/decision-change/self-test.mjs",
+      "test/decision-change-auth.mjs",
+      "test/decision-change-claude-mem.mjs"
+    ]
+  },
+  "priorProtocolCommit": "20a1da3a4df83718c8058e8852327a4222cf7e95",
+  "amendmentFile": "docs/benchmarks/2026-11-09-api-authentication-amendment.md",
+  "protocolBinding": "The commit containing this freeze publishes the amendment before paid API setup. The probe records that exact protocol commit.",
+  "newApiModelCalls": 0,
+  "authentication": {
+    "method": "api-key",
+    "transport": "DPAPI at rest; current-user Windows named pipe; spawn-only environment"
+  },
+  "unchanged": {
+    "productCode": true,
+    "originalPassMarks": true,
+    "modelAndEffort": true,
+    "seedAndPlan": true,
+    "semanticDependenciesAndNativeTierDefaults": true,
+    "measurementTransport": "native-audit-v3",
+    "files": {
+      "scenarios.mjs": "68b62ba7a6161edd716580fef001b3d61046129b944588a669e9ce07a0056567",
+      "personal-scenario.mjs": "20fc553f206a92481677e58fd208dab2b2227dbb2cb891903948963930f1073c",
+      "pilot-limits.json": "0891bc1cadf5f13904b0752723521dc69b38b5bce91656f2082b6a4e8f1ef04a",
+      "ledger.mjs": "4b69ef977c4cc3bcef2f212a8f6db90eb76a6512a95f20b4233f968e3ffda61c",
+      "metrics.mjs": "43226be03f4c2022c5c44beabb2dbd61e51d5c98bb1f0a2624f68c8a65dd1be3",
+      "outcomes.mjs": "cb62f16356fcb351a6f3256f1d2dd49457d0cfe8c7dca23a2216f0e17991bfcd",
+      "gate.mjs": "b150b2988161ba110f1adfbac2e57af9a4cd661b416a4126349a631fe4d7fc6c",
+      "notes-notify-hook.mjs": "21371875c1ee847df36b5638e24a05b3008216b304556e018041f9e1f8eccfa8",
+      "isolation.mjs": "d9fd3b5a4f8b2ff74a0ec10ed9c9f149c69caa21855f23da0fbd05c9b0679e97"
+    }
+  },
+  "sourceHashes": {
+    "adapters.mjs": "3258003eb97a4e8244c441f1c1b47bde27d4e499b8f5f2af2897c16de8940da4",
+    "agent.mjs": "a4e7f802499a0b51d8a23b711dc00a4aa6d8d7b3b9e7e790ccefe684e334f420",
+    "auth.mjs": "09dd95459d969b2425c7859cbdfe21796666244f7e60b008aa635396239d27c0",
+    "claude-mem.mjs": "58c2dcbf7ed410e280dab72929c75d3314e6cc974ede14f2d3a6fbcd26c798c3",
+    "gate.mjs": "b150b2988161ba110f1adfbac2e57af9a4cd661b416a4126349a631fe4d7fc6c",
+    "isolation.mjs": "d9fd3b5a4f8b2ff74a0ec10ed9c9f149c69caa21855f23da0fbd05c9b0679e97",
+    "ledger.mjs": "4b69ef977c4cc3bcef2f212a8f6db90eb76a6512a95f20b4233f968e3ffda61c",
+    "metrics.mjs": "43226be03f4c2022c5c44beabb2dbd61e51d5c98bb1f0a2624f68c8a65dd1be3",
+    "native-hooks.mjs": "2b4fe6fb00109e471bf8687b97bb405a148681fd62afa7661cb0c65c10f0a96d",
+    "notes-notify-hook.mjs": "21371875c1ee847df36b5638e24a05b3008216b304556e018041f9e1f8eccfa8",
+    "outcomes.mjs": "cb62f16356fcb351a6f3256f1d2dd49457d0cfe8c7dca23a2216f0e17991bfcd",
+    "passive-audit.mjs": "739637d70febe4ceb3b0b136c600ea8ebb79450aa8d7d701424a29f6adc9fdfc",
+    "personal-run.mjs": "e5169fab9602af861ba9c952bc076d2800882086ab859e8dabfbfe187c39c48d",
+    "personal-scenario.mjs": "20fc553f206a92481677e58fd208dab2b2227dbb2cb891903948963930f1073c",
+    "run.mjs": "7e3e1f0b689ddf0b69603643e96c069f14677477833861b8081f9b88bfb739d2",
+    "scenarios.mjs": "68b62ba7a6161edd716580fef001b3d61046129b944588a669e9ce07a0056567",
+    "self-test.mjs": "6401fe8ab387c8621bcee6ceaace9097695b8bb27e8408f44d7f04d7ef6d6542",
+    "test-passive-audit.mjs": "d6e44c6b27008d5812e8900dcee419c3cbcb1ecf6731b684f88d95b8fb4e5858"
+  },
+  "setupProbe": {
+    "file": "docs/benchmarks/2026-11-09-native-observer-api-setup-probe.mjs",
+    "sha256": "4a0f5eb0f69e4abfc233c0308e600ad17b581521cafa0cfee65e816eb3579ff5",
+    "priorSubscriptionProbeSha256": "f8b243dedc18bdc1ad5962a9529453f657ac644a46bd08c71265394a83447c3a",
+    "promptsAndOriginalGatesUnchanged": true
+  },
+  "helper": {
+    "file": "docs/benchmarks/2026-11-09-serve-anthropic-key.ps1",
+    "sha256": "b6e6f5756f8c385957548ba11ee0a743b4b0543187ae9a8b0f59ca19396a9f59"
+  },
+  "offlineProofs": {
+    "nativeLoaderReceiptSha256": "9544cfa8b2d9ca39a6a7360eb798b7d3b81c8c5d0f9bf276b4bf1998e92d2cd6",
+    "compiledObserverProxyReceiptSha256": "045f92deaed1ed12042cc133a0def57584dc72e142a1ab5320b6cd5a7eb7957e",
+    "helperNegativeReceiptSha256": "0f51f9ba782674bc1eac7785f6af9f7c2a467908f852103241bfc58e9682cfcc",
+    "paidCalls": 0
+  },
+  "baselineSharedLedger": {
+    "sha256": "dc0c2d8df5eb5d5e3033478afa28c61a8c63ac97a10bd15785a28e3bb15b0e49",
+    "bytes": 18807,
+    "capUsd": 50,
+    "settledReservations": 33,
+    "knownApiEquivalentUsd": 0.16699419,
+    "conservativelyChargedUsd": 0.31,
+    "outstandingUsd": 0,
+    "halted": false
+  },
+  "retainedPriorResults": {
+    "2026-11-09-interrupted-run.json": "1edc7b9660ea8f6e39778a92b3d975a947359e88f9df10193698dc1aa8f98807",
+    "2026-11-09-native-audit-v1-result.json": "5410fa3056f9bb3a564df4068672b5ba8e2eab337dc3a0d862ef5c7f66f16182",
+    "2026-11-09-native-audit-v2-result.json": "4656d015573de136799de923b90e0ac342ff147a749b452bc64a86ef1b9a3e38",
+    "2026-11-09-native-audit-v3-result.json": "5b971b2bb0423e7f530b6b296856f8b1304586719d90a5f5cc91a51386fae220",
+    "2026-11-09-native-observer-setup-result.json": "3e894b60afa570651413658e6e12cd2584a8273d869ed49712ebb0f7d416f5e6"
+  },
+  "validation": [
+    "focused API authentication and generated-hook artifact tests passed",
+    "claude-mem adapter tests passed",
+    "benchmark self-test passed",
+    "independent actual Bun native-loader proof passed",
+    "independent compiled observer proxy proof passed",
+    "git diff --check passed"
+  ],
+  "ci": {
+    "runId": 42614027666,
+    "statusAtFreeze": "in_progress"
+  }
+}

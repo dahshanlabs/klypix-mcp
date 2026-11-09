@@ -192,9 +192,10 @@ export async function createObserverBudgetBroker({ ledger, totalBudgetUsd, proce
   return {
     url: `http://127.0.0.1:${server.address().port}`, token,
     enable() { if (stopping) throw new Error('Observer broker is closing'); accepting = true; },
+    disableReservations() { accepting = false; },
     snapshot: () => ({ spentUsd: spent, reservedUsd: reserved, records: [...records.values()].map(r => ({ ...r })), refusals: [...refusals] }),
-    async drain({ deadlineMs = 10_000 } = {}) {
-      accepting = false; stopping = true;
+    async drain({ deadlineMs = 10_000, requestIdleExit = true } = {}) {
+      accepting = false; stopping ||= requestIdleExit;
       const deadline = Date.now() + deadlineMs;
       while (Date.now() < deadline && [...records.values()].some(r => r.status === 'reserved')) await sleep(100);
       return ![...records.values()].some(r => r.status === 'reserved');
@@ -207,6 +208,18 @@ export async function createObserverBudgetBroker({ ledger, totalBudgetUsd, proce
       await new Promise(resolve => server.close(resolve));
     },
   };
+}
+
+// Let the native worker mark its sessions as shutting down before their SDK
+// streams end. Its stop CLI may return before daemon cleanup has finished, so
+// settlement must wait without requesting an early EOF from idle proxies.
+export async function closeNativeObserver(broker, stopWorker) {
+  broker.disableReservations();
+  try { await stopWorker(); }
+  finally {
+    try { await broker.drain({ requestIdleExit: false }); }
+    finally { await broker.close(); }
+  }
 }
 
 /** Compile this unchanged protocol proxy as a native executable on Windows. */
@@ -420,8 +433,8 @@ export async function prepareClaudeMem({ repoDir, home, ledger, observerBudgetUs
     },
     async close() {
       if (closed) return; closed = true;
-      try { await broker.drain(); if (started) await runCli(['stop']); }
-      finally { await broker.close(); if (authCopy) fs.rmSync(authCopy, { force: true }); }
+      try { await closeNativeObserver(broker, async () => { if (started) await runCli(['stop']); }); }
+      finally { if (authCopy) fs.rmSync(authCopy, { force: true }); }
     },
   };
   } catch (error) {

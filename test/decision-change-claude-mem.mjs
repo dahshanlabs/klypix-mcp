@@ -6,7 +6,7 @@ import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { BudgetLedger } from '../bench/decision-change/ledger.mjs';
 import { createObserverBudgetBroker, observerWrapperSource, isolatedEnvironment,
-  observerReservationUsd, OBSERVER_MODEL, claudeMemSettings, prepareClaudeMem, seedDefaultEmbeddingCache } from '../bench/decision-change/claude-mem.mjs';
+  observerReservationUsd, OBSERVER_MODEL, claudeMemSettings, prepareClaudeMem, seedDefaultEmbeddingCache, closeNativeObserver } from '../bench/decision-change/claude-mem.mjs';
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'klypix-cmem-adapter-test-'));
 let index = 0;
@@ -177,6 +177,53 @@ try {
   assert.equal((await send(broker.token)).status, 200);
   assert.equal((await send(broker.token)).status, 409, 'Arm envelope includes open child reservations');
   await broker.close(); assert.equal(ledger.snapshot().halted, true);
+
+  // A native stop command can return BEFORE its daemon aborts SDK sessions.
+  // Exercise the real proxy/broker: an idle result must remain open until the
+  // fake native daemon marks shutdown, not be ended by the broker heartbeat.
+  const shutdownDir = path.join(root, 'native-shutdown'); fs.mkdirSync(shutdownDir);
+  const shutdownLedger = new BudgetLedger(path.join(shutdownDir, 'ledger.jsonl'), { limitUsd: 10 });
+  const shutdownBroker = await createObserverBudgetBroker({ ledger: shutdownLedger, totalBudgetUsd: 5 });
+  const abortMarker = path.join(shutdownDir, 'native-abort'), eofMarker = path.join(shutdownDir, 'eof.json');
+  const shutdownFake = path.join(shutdownDir, 'cli.mjs'), shutdownProxy = path.join(shutdownDir, 'proxy.mjs');
+  fs.writeFileSync(shutdownFake, `import fs from 'node:fs'; console.log(JSON.stringify({type:'result',total_cost_usd:0.12}));process.stdin.resume();process.stdin.on('end',()=>{fs.writeFileSync(${JSON.stringify(eofMarker)},JSON.stringify({nativeAbortBeforeEof:fs.existsSync(${JSON.stringify(abortMarker)})}));});`);
+  fs.writeFileSync(shutdownProxy, observerWrapperSource({ command: process.execPath, prefixArgs: [shutdownFake],
+    brokerUrl: shutdownBroker.url, brokerToken: shutdownBroker.token }));
+  const shutdownChild = spawn(process.execPath, [shutdownProxy, '--model=haiku', '--output-format=stream-json'], {
+    cwd: shutdownDir, env: isolatedEnvironment(shutdownDir), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
+  });
+  let shutdownOutput = '', shutdownError = '';
+  const shutdownExit = new Promise(resolve => shutdownChild.on('close', resolve));
+  shutdownChild.stdout.on('data', chunk => { shutdownOutput += chunk; });
+  shutdownChild.stderr.on('data', chunk => { shutdownError += chunk; });
+  const shutdownDeadline = setTimeout(() => shutdownChild.kill(), 12_000);
+  try {
+    const readyDeadline = Date.now() + 5000;
+    while (!shutdownOutput.includes('"type":"result"') && Date.now() < readyDeadline) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.ok(shutdownOutput.includes('"type":"result"'), 'Fake native observer reached a complete idle result');
+    await closeNativeObserver(shutdownBroker, async () => {
+      const denied = await fetch(`${shutdownBroker.url}/reserve`, { method: 'POST',
+        headers: { authorization: `Bearer ${shutdownBroker.token}`, 'content-type': 'application/json' }, body: '{}' });
+      assert.equal(denied.status, 409, 'New reservations disabled before native stop');
+      // Mimic the actual vendor CLI: return now, daemon abort happens later.
+      setTimeout(() => { fs.writeFileSync(abortMarker, 'shutdown'); shutdownChild.stdin.end(); }, 700);
+    });
+    assert.equal(await shutdownExit, 0, shutdownError);
+    assert.equal(JSON.parse(fs.readFileSync(eofMarker)).nativeAbortBeforeEof, true, 'Broker must never force EOF ahead of the native abort');
+    assert.equal(shutdownLedger.snapshot().halted, false);
+    assert.equal(shutdownLedger.snapshot().spentCents, 12, 'Finalized known receipt survives orderly native shutdown');
+    assert.equal(shutdownLedger.snapshot().reservedCents, 0);
+  } finally { clearTimeout(shutdownDeadline); await shutdownBroker.close(); }
+
+  // Native stop failure still runs the accounting finalizer and preserves the
+  // original error; finalizer failure cannot silently imply zero spend.
+  const closeCalls = [];
+  await assert.rejects(closeNativeObserver({
+    disableReservations: () => closeCalls.push('disable'),
+    drain: async options => { assert.equal(options.requestIdleExit, false); closeCalls.push('drain'); },
+    close: async () => closeCalls.push('accounting-close'),
+  }, async () => { closeCalls.push('native-stop'); throw Error('synthetic native stop failure'); }), /synthetic native stop failure/);
+  assert.deepEqual(closeCalls, ['disable', 'native-stop', 'drain', 'accounting-close']);
 
   const notReady = await prepareClaudeMem({ home: root, repoDir: root, env: {} });
   assert.equal(notReady.metadata.paidReady, false);

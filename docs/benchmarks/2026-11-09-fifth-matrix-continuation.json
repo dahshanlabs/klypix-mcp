@@ -1,0 +1,317 @@
+{
+  "schema": 1,
+  "kind": "prepaid-same-matrix-continuation-review",
+  "recordedAt": "2026-11-09T12:36:40.466018+00:00",
+  "sourceUnchanged": true,
+  "previousProtocolCommit": "3ac202037d8da4a3c4d9b95955ba113da06cfaa0",
+  "resumedModelCalls": 0,
+  "runnerFile": "docs/benchmarks/2026-11-09-resume-fifth-matrix.mjs",
+  "runnerSha256": "72593ccb2ab55891af056e10ffa2934db67c9023818d8165e220523a2179fc56",
+  "continuationManifestSha256": "8252249ac29fe13106ff82b8d27083d55a4c75f6c985843e404a22bce4784daf",
+  "continuation": {
+    "schema": 1,
+    "kind": "same-source-matrix-continuation",
+    "sourceCommit": "eaa5ebd4d6fb9e6b0a4631356128771da46690d2",
+    "experimentSha256": "058c73c25151371b7cf7aa041356203e49b6c13bc27f7cf5f6714d860492feb5",
+    "freezeSha256": "edf2ed2d57b5a761795254693cd13c9ef0dff1a947fa5cf5c384668310193273",
+    "originalResultsPrefix": {
+      "sha256": "97756075c5a09aad12df5ba48e55bdc7f6d43c00d38b5a75021c4ec6b8dbc340",
+      "byteLength": 314816,
+      "rowCount": 4
+    },
+    "originalSummarySha256": "e4152f663b80fb2fbbc43ad5226007d47a11d07ec27374499b2201144e0483f6",
+    "originalLedgerPrefix": {
+      "sha256": "624ed5388092263e71555b8cf260e22065b3f05fd889a36d2031d83065314274",
+      "byteLength": 35291
+    },
+    "planSha256": "a0db7a9b3cc9801705f96c42c72bdb7f42d8225f5628b99ef396caa542970695",
+    "remainingPlan": [
+      {
+        "block": "early-change",
+        "case": "unchanged-control",
+        "condition": "klypix-improved",
+        "repetition": 1
+      },
+      {
+        "block": "early-change",
+        "case": "corrected-decision",
+        "condition": "notes-native",
+        "repetition": 1
+      },
+      {
+        "block": "personal-longitudinal",
+        "case": null,
+        "condition": "claude-mem",
+        "repetition": 1
+      },
+      {
+        "block": "early-change",
+        "case": "unrelated-control",
+        "condition": "klypix-released",
+        "repetition": 1
+      },
+      {
+        "block": "early-change",
+        "case": "unchanged-control",
+        "condition": "notes-native",
+        "repetition": 1
+      },
+      {
+        "block": "early-change",
+        "case": "corrected-decision",
+        "condition": "claude-mem",
+        "repetition": 1
+      },
+      {
+        "block": "personal-longitudinal",
+        "case": null,
+        "condition": "klypix-released",
+        "repetition": 1
+      },
+      {
+        "block": "early-change",
+        "case": "unrelated-control",
+        "condition": "notes-notification",
+        "repetition": 1
+      },
+      {
+        "block": "early-change",
+        "case": "unchanged-control",
+        "condition": "claude-mem",
+        "repetition": 1
+      },
+      {
+        "block": "early-change",
+        "case": "corrected-decision",
+        "condition": "klypix-released",
+        "repetition": 1
+      },
+      {
+        "block": "personal-longitudinal",
+        "case": null,
+        "condition": "notes-notification",
+        "repetition": 1
+      },
+      {
+        "block": "early-change",
+        "case": "unrelated-control",
+        "condition": "klypix-improved",
+        "repetition": 1
+      },
+      {
+        "block": "early-change",
+        "case": "unchanged-control",
+        "condition": "klypix-released",
+        "repetition": 1
+      },
+      {
+        "block": "early-change",
+        "case": "corrected-decision",
+        "condition": "notes-notification",
+        "repetition": 1
+      },
+      {
+        "block": "personal-longitudinal",
+        "case": null,
+        "condition": "klypix-improved",
+        "repetition": 1
+      },
+      {
+        "block": "early-change",
+        "case": "unrelated-control",
+        "condition": "notes-native",
+        "repetition": 1
+      },
+      {
+        "block": "early-change",
+        "case": "corrected-decision",
+        "condition": "klypix-improved",
+        "repetition": 2
+      },
+      {
+        "block": "early-change",
+        "case": "corrected-decision",
+        "condition": "notes-native",
+        "repetition": 2
+      },
+      {
+        "block": "early-change",
+        "case": "corrected-decision",
+        "condition": "claude-mem",
+        "repetition": 2
+      },
+      {
+        "block": "early-change",
+        "case": "corrected-decision",
+        "condition": "klypix-released",
+        "repetition": 2
+      },
+      {
+        "block": "early-change",
+        "case": "corrected-decision",
+        "condition": "notes-notification",
+        "repetition": 2
+      },
+      {
+        "block": "early-change",
+        "case": "corrected-decision",
+        "condition": "notes-native",
+        "repetition": 3
+      },
+      {
+        "block": "early-change",
+        "case": "corrected-decision",
+        "condition": "claude-mem",
+        "repetition": 3
+      },
+      {
+        "block": "early-change",
+        "case": "corrected-decision",
+        "condition": "klypix-released",
+        "repetition": 3
+      },
+      {
+        "block": "early-change",
+        "case": "corrected-decision",
+        "condition": "notes-notification",
+        "repetition": 3
+      },
+      {
+        "block": "early-change",
+        "case": "corrected-decision",
+        "condition": "klypix-improved",
+        "repetition": 3
+      }
+    ],
+    "originalRows": [
+      "unchanged-control-notes-notification-r1-c9600456",
+      "corrected-decision-klypix-improved-r1-23d690dc",
+      "personal-longitudinal-notes-native-r1-92c8623c",
+      "unrelated-control-claude-mem-r1-9ec39fe6"
+    ],
+    "runnerSha256": "72593ccb2ab55891af056e10ffa2934db67c9023818d8165e220523a2179fc56",
+    "policy": "append only; no reruns; only post-grade EPERM cleanup quiescence may resolve",
+    "startedAt": "2026-11-09T12:35:44.482Z"
+  },
+  "initialQuiescenceReceiptFileSha256": "4eda03aaa79322f6ee505760fecf62801b29472d3e70677379f3a074a0f18d5f",
+  "initialQuiescenceReceipt": {
+    "schema": 1,
+    "kind": "post-grade-scratch-cleanup-quiescence",
+    "runId": "unrelated-control-claude-mem-r1-9ec39fe6",
+    "sourceCommit": "eaa5ebd4d6fb9e6b0a4631356128771da46690d2",
+    "experimentSha256": "058c73c25151371b7cf7aa041356203e49b6c13bc27f7cf5f6714d860492feb5",
+    "resultRowSha256": "e9df4bd2a00d50f3e40188e5423a78d6e7a59b943ac76147544f5f4a97a21536",
+    "resultFileSha256": "b596decfeb12de65041d414d4f82341b75dfb99c68d6076454e0709dcf3af2cf",
+    "cleanupErrorSha256": "e0b92298903b0c6148213abc4e2da6581773cc014ba318377191ac41a83d9ec8",
+    "observedAt": "2026-11-09T12:35:45.460Z",
+    "originalResultsPrefix": {
+      "sha256": "97756075c5a09aad12df5ba48e55bdc7f6d43c00d38b5a75021c4ec6b8dbc340",
+      "byteLength": 314816,
+      "rowCount": 4
+    },
+    "resultsPrefix": {
+      "sha256": "97756075c5a09aad12df5ba48e55bdc7f6d43c00d38b5a75021c4ec6b8dbc340",
+      "byteLength": 314816,
+      "rowCount": 4
+    },
+    "originalSummarySha256": "e4152f663b80fb2fbbc43ad5226007d47a11d07ec27374499b2201144e0483f6",
+    "freezeSha256": "edf2ed2d57b5a761795254693cd13c9ef0dff1a947fa5cf5c384668310193273",
+    "quiescence": {
+      "workerPortClosed": true,
+      "remainingKnownPids": [],
+      "knownProcessCount": 7,
+      "knownPids": [
+        5352,
+        29448,
+        23716,
+        33456,
+        30796,
+        19968,
+        4352
+      ],
+      "ownRuntimeProcesses": [],
+      "nativeShutdownComplete": true,
+      "observerRecordsAllSettled": true,
+      "pendingNativeResults": 0,
+      "telemetryErrors": 0,
+      "oauthCredentialCopied": false
+    },
+    "noDeletionOrForceKill": true,
+    "retainedScratch": true,
+    "ledgerPrefix": {
+      "sha256": "624ed5388092263e71555b8cf260e22065b3f05fd889a36d2031d83065314274",
+      "byteLength": 35291,
+      "reservationIds": [
+        "unchanged-control-notes-notification-r1-8603721e-producer-initial",
+        "unchanged-control-notes-notification-r1-8603721e-consumer",
+        "unchanged-control-notes-notification-r1-8603721e-producer-update",
+        "corrected-decision-klypix-improved-r1-397aa6dc-producer-initial",
+        "corrected-decision-klypix-improved-r1-397aa6dc-consumer",
+        "corrected-decision-klypix-improved-r1-397aa6dc-producer-update",
+        "administrative-hold-exposure-audit-20261109",
+        "unchanged-control-notes-notification-r1-9d1b6f27-producer-initial",
+        "unchanged-control-notes-notification-r1-9d1b6f27-consumer",
+        "unchanged-control-notes-notification-r1-9d1b6f27-producer-update",
+        "corrected-decision-klypix-improved-r1-3f15c10f-producer-initial",
+        "corrected-decision-klypix-improved-r1-3f15c10f-consumer",
+        "corrected-decision-klypix-improved-r1-3f15c10f-producer-update",
+        "unchanged-control-notes-notification-r1-276714b2-producer-initial",
+        "unchanged-control-notes-notification-r1-276714b2-consumer",
+        "unchanged-control-notes-notification-r1-276714b2-producer-update",
+        "unchanged-control-notes-notification-r1-0156416c-producer-initial",
+        "unchanged-control-notes-notification-r1-0156416c-consumer",
+        "unchanged-control-notes-notification-r1-0156416c-producer-update",
+        "corrected-decision-klypix-improved-r1-a3113ba4-producer-initial",
+        "corrected-decision-klypix-improved-r1-a3113ba4-consumer",
+        "corrected-decision-klypix-improved-r1-a3113ba4-producer-update",
+        "personal-longitudinal-notes-native-r1-1a64537a-personal-day-1",
+        "personal-longitudinal-notes-native-r1-1a64537a-personal-day-2",
+        "personal-longitudinal-notes-native-r1-1a64537a-personal-day-3",
+        "personal-longitudinal-notes-native-r1-1a64537a-personal-day-4",
+        "personal-longitudinal-notes-native-r1-1a64537a-personal-day-5",
+        "personal-longitudinal-notes-native-r1-1a64537a-personal-day-6",
+        "personal-longitudinal-notes-native-r1-1a64537a-personal-recall",
+        "unrelated-control-claude-mem-r1-154dfc08-producer-initial",
+        "administrative-hold-cmem-model-mapping-20261109",
+        "native-observer-setup-01ff3142-4157-42b7-b5d5-156a197cb922-setup-producer",
+        "claude-mem-observer-ee977e0a-de3b-4468-8c51-a4f533941e52",
+        "native-observer-api-setup-b6065899-ede5-4da4-b87d-2381f9948cef-setup-producer",
+        "claude-mem-observer-2fbc1ec2-7ec0-4693-b529-a13df5bae538",
+        "native-observer-api-setup-b6065899-ede5-4da4-b87d-2381f9948cef-setup-consumer",
+        "claude-mem-observer-334d7762-5403-488a-b0a3-a8762abe56f9",
+        "native-observer-api-setup-915c9d50-50a2-46ad-a437-1d5aabe5d18d-setup-producer",
+        "claude-mem-observer-b068d2f9-7a91-4299-b8da-15bfe85a11eb",
+        "native-observer-api-setup-915c9d50-50a2-46ad-a437-1d5aabe5d18d-setup-consumer",
+        "claude-mem-observer-f34cbf02-ba8c-47bd-831d-4900fb31a6a4",
+        "unchanged-control-notes-notification-r1-c9600456-producer-initial",
+        "unchanged-control-notes-notification-r1-c9600456-consumer",
+        "unchanged-control-notes-notification-r1-c9600456-producer-update",
+        "corrected-decision-klypix-improved-r1-23d690dc-producer-initial",
+        "corrected-decision-klypix-improved-r1-23d690dc-consumer",
+        "corrected-decision-klypix-improved-r1-23d690dc-producer-update",
+        "personal-longitudinal-notes-native-r1-92c8623c-personal-day-1",
+        "personal-longitudinal-notes-native-r1-92c8623c-personal-day-2",
+        "personal-longitudinal-notes-native-r1-92c8623c-personal-day-3",
+        "personal-longitudinal-notes-native-r1-92c8623c-personal-day-4",
+        "personal-longitudinal-notes-native-r1-92c8623c-personal-day-5",
+        "personal-longitudinal-notes-native-r1-92c8623c-personal-day-6",
+        "personal-longitudinal-notes-native-r1-92c8623c-personal-recall",
+        "unrelated-control-claude-mem-r1-9ec39fe6-producer-initial",
+        "claude-mem-observer-0a98f252-1335-4f4e-95e2-ac9b854fc988",
+        "unrelated-control-claude-mem-r1-9ec39fe6-consumer",
+        "unrelated-control-claude-mem-r1-9ec39fe6-producer-update",
+        "claude-mem-observer-71ca8587-d77d-4c84-82b4-945d30ed2c11",
+        "claude-mem-observer-bbea5e07-2d58-42ab-accb-d31bab356f40"
+      ],
+      "knownApiEquivalentUsd": 0.2730538950000001,
+      "chargedAgainstBudgetUsd": 0.59
+    }
+  },
+  "originalInterruptionSnapshotPreserved": true,
+  "nativeSourceCi": {
+    "runId": 42615186229,
+    "conclusion": "success"
+  },
+  "publicationBinding": "The commit containing this review publishes the exact runner and administrative policy before paid continuation.",
+  "interpretation": "Post-grade filesystem cleanup resolution only; no correctness/rework/cost/pass-mark changes and no repeated cases."
+}

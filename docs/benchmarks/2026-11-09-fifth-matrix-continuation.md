@@ -1,0 +1,15 @@
+# Continue the fifth matrix after temporary-worker shutdown
+
+The fifth matrix completed four valid cases in its frozen order: the notes-with-notice unchanged control, the KLYPIX prototype corrected-decision case, the AI-kept notes seven-session replay (8/8 supported answers), and claude-mem's unrelated-change control. All four passed. The runner then stopped because Windows refused deletion of claude-mem's temporary profile while Chroma was still shutting down. Scoring, native audits and final cost settlement had already completed.
+
+The interruption snapshot preserves all original results, their raw cleanup error, the original experiment and the summary listing 26 unstarted cases. The results prefix is 314816 bytes with SHA-256 `97756075c5a09aad12df5ba48e55bdc7f6d43c00d38b5a75021c4ec6b8dbc340`. The interrupted summary SHA-256 is `e4152f663b80fb2fbbc43ad5226007d47a11d07ec27374499b2201144e0483f6`; experiment SHA-256 is `058c73c25151371b7cf7aa041356203e49b6c13bc27f7cf5f6714d860492feb5`.
+
+Read-only review confirmed the native worker and known observer processes ended, its port closed, and no process referring to that isolated runtime remained. Chroma completed shutdown nine seconds after the row had been finalized. The temporary directory remains retained; it is not forcibly deleted and no process is forcibly killed for this continuation.
+
+Resume the remaining 26 cases in exactly the same order, using the frozen `eaa5ebd4d6fb9e6b0a4631356128771da46690d2` workflow functions, models, settings, fixtures, seed, pass marks, API account and original ledger. No completed case is repeated, removed or replaced. Keep the original experiment and append new rows. A final cumulative summary must retain a reference to the interruption and continuation evidence.
+
+A post-measurement cleanup error may be resolved only after a bounded check confirms native process/port shutdown, absence of copied OAuth credentials, finalized audits and settled known costs. Each resolution is recorded separately and bound to the original row, results prefix, experiment and ledger. All other instrumentation, accounting and execution stop conditions remain in force. The report preserves the raw cleanup error and identifies its independently verified resolution; it changes none of the correctness, rework, recall or cost measurements and none of the quantitative pass marks.
+
+At interruption, the original ledger had 60 settled reservations, **$0.273053895** in known usage estimates and **$0.59** charged conservatively against $50, with no open reservation or unknown cost. The fifth matrix's four cases cost $0.087153500. This remains the same fifth experiment, not a new attempt or replacement budget. Its complete outcome will be published regardless of which condition wins.
+
+The [reviewed continuation runner](2026-11-09-resume-fifth-matrix.mjs) and [bound administrative receipt](2026-11-09-fifth-matrix-continuation.json) are published before paid continuation. Independent review and the real no-model preflight passed.

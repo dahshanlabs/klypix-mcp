@@ -181,3 +181,8 @@ The [first API setup result](2026-11-09-native-observer-api-v2-result.md) preser
 ## 2026-11-09 fifth matrix authorization
 
 The [API native setup proof](2026-11-09-native-observer-api-v3-result.md) passed all 15 gates. The [fifth matrix amendment](2026-11-09-observer-sdk-compatible-amendment.md) and source freeze bind the same original pass marks, plan, models and ledger before execution. All four interrupted matrices and three setup probes remain separately preserved.
+
+
+## 2026-11-09 completed result
+
+All 30 planned attempts completed under the original pass marks. The [complete result](2026-11-09-fair-comparison-result.md), [machine-readable report](2026-11-09-fair-comparison-result.json) and [independent reconciliation](2026-11-09-fair-comparison-review.json) preserve every outcome and all prior attempts. The decision-watch prototype failed its continuation gate and remains unreleased. AI-kept notes with a simple change notice passed 5/5 early cases; the prototype passed 3/5 and cost 83.34% more in that block. All five personal replays returned correct values, while both KLYPIX variants failed the unchanged citation requirement. Total known CLI-reported usage across all experiments and setup was $0.7580817, conservatively charged $1.78 against the original $50 cap.

@@ -1,0 +1,31 @@
+{
+  "completePlannedAttempts": 30,
+  "passes": 19,
+  "measuredFailures": 11,
+  "finalizedStages": 109,
+  "rawResultArtifactsMatch": true,
+  "allConditionMetricsMatchUnmodifiedBaseScorer": true,
+  "interruptionPrefixesPreserved": true,
+  "cleanupReviewsResolved": 6,
+  "ledgerReservations": 175,
+  "allLedgerReservationsSettled": true,
+  "ledgerKnownUsageUsd": 0.7580817000000001,
+  "chargedAgainstOriginalCapUsd": 1.78,
+  "outstandingReservedUsd": 0,
+  "halted": false,
+  "sourceCheckedScoresUnchanged": true,
+  "knownFactValuesCorrect": 35,
+  "correctUnknownAbstentions": 5,
+  "inputHashes": {
+    "experiment": "058c73c25151371b7cf7aa041356203e49b6c13bc27f7cf5f6714d860492feb5",
+    "results": "33eab63f1d30c922865059ea746774567e6fb2634aafb8697151cfd074b4ba1a",
+    "summary": "6a01c1b440423390430bcb20c3938998c09685218451f3d2c8111d1d9104ef2d",
+    "ledger": "e1334f54421c12aee044e6c5cb122c94276a69d47fd452ccb4ddaadf1df4c03e"
+  },
+  "reportHashes": {
+    "json": "4a645007c35f6361b7e2bde7f63aa76450c8da219edeb56db1a41a4a00d5b552",
+    "markdown": "fcd8625966cead61fa29671000eb9851cb580ed63e2846992b74559fc76f8b1e",
+    "lead": "20312f7b155c8116e52a1ca1611a4ff19447dbc490d68e4ea6a59ff9bfa486ab",
+    "postprocessor": "9a09e5e1d23309cae77caf6df9c6172c7fc8ea5dd0129ff11cb30787959ca641"
+  }
+}

@@ -28,6 +28,9 @@ equals-form model option before an observer model could start. This is not a
 competitor loss. All nine attempts across four experiments remain visible, with
 $0.16204134 in known API-equivalent usage under the original $50 cap. No comparison
 winner or feature-continuation pass is established; the pass marks below are unchanged.
+The [native-observer setup probe plan](2026-11-09-observer-setup-probe-plan.md)
+requires verified automatic capture and retrieval before another complete matrix.
+Its diagnostic calls share the same original budget and never count as benchmark cells.
 
 ## Conditions and setup requirements
 
